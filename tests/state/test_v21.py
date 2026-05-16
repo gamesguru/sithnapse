@@ -466,6 +466,160 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
             expected,
         )
 
+    def test_conflicted_subgraph_preserves_power_levels(self) -> None:
+        """Regression test ported from Complement's
+        TestMSC4297StateResolutionV2_1_includes_conflicted_subgraph.
+
+        Scenario: Creator creates a room, gives Alice PL 100. Alice promotes
+        Bob to PL 50, Bob promotes Charlie to PL 50 (PL3). Eve joins citing
+        the ORIGINAL power levels (PL1) in her auth_events — this is "dodgy"
+        and creates a conflicted subgraph where one side has PL1 and the other
+        has PL3.
+
+        State resolution must preserve PL3 (with bob:50, charlie:50), not
+        regress to PL1 (empty users dict).
+        """
+        # 1. Alice creates the room.
+        e1_create = self.create_event(
+            EventTypes.Create,
+            "",
+            sender=ALICE,
+            content={"creator": ALICE},
+            auth_events=[],
+        )
+        # 2. Alice joins.
+        e2_ma = self.create_event(
+            EventTypes.Member,
+            ALICE,
+            sender=ALICE,
+            content=MEMBERSHIP_CONTENT_JOIN,
+            auth_events=[],
+            room_id=e1_create.room_id,
+        )
+        # 3. Initial power levels (alice is creator, implicit PL 100 in V12).
+        e3_power1 = self.create_event(
+            EventTypes.PowerLevels,
+            "",
+            sender=ALICE,
+            content={"users": {}},
+            auth_events=[e2_ma.event_id],
+            room_id=e1_create.room_id,
+        )
+        # 4. Join rules = public.
+        e4_jr = self.create_event(
+            EventTypes.JoinRules,
+            "",
+            sender=ALICE,
+            content={"join_rule": JoinRules.PUBLIC},
+            auth_events=[e2_ma.event_id, e3_power1.event_id],
+            room_id=e1_create.room_id,
+        )
+        # 5. Bob joins.
+        e5_mb = self.create_event(
+            EventTypes.Member,
+            BOB,
+            sender=BOB,
+            content=MEMBERSHIP_CONTENT_JOIN,
+            auth_events=[e3_power1.event_id, e4_jr.event_id],
+            room_id=e1_create.room_id,
+        )
+        # 6. Charlie joins.
+        e6_mc = self.create_event(
+            EventTypes.Member,
+            CHARLIE,
+            sender=CHARLIE,
+            content=MEMBERSHIP_CONTENT_JOIN,
+            auth_events=[e3_power1.event_id, e4_jr.event_id],
+            room_id=e1_create.room_id,
+        )
+        # 7. Alice promotes Bob to PL 50 (alice omitted — implicit PL 100).
+        e7_power2 = self.create_event(
+            EventTypes.PowerLevels,
+            "",
+            sender=ALICE,
+            content={"users": {BOB: 50}},
+            auth_events=[e2_ma.event_id, e3_power1.event_id],
+            room_id=e1_create.room_id,
+        )
+        # 8. Bob promotes Charlie to PL 50.
+        e8_power3 = self.create_event(
+            EventTypes.PowerLevels,
+            "",
+            sender=BOB,
+            content={"users": {BOB: 50, CHARLIE: 50}},
+            auth_events=[e5_mb.event_id, e7_power2.event_id],
+            room_id=e1_create.room_id,
+        )
+        # 9. Zara joins citing PL3 (correct).
+        e9_mz = self.create_event(
+            EventTypes.Member,
+            ZARA,
+            sender=ZARA,
+            content=MEMBERSHIP_CONTENT_JOIN,
+            auth_events=[e8_power3.event_id, e4_jr.event_id],
+            room_id=e1_create.room_id,
+        )
+        # 10. Eve joins citing PL1 (DODGY — old power levels).
+        e10_me = self.create_event(
+            EventTypes.Member,
+            EVELYN,
+            sender=EVELYN,
+            content=MEMBERSHIP_CONTENT_JOIN,
+            auth_events=[e3_power1.event_id, e4_jr.event_id],
+            room_id=e1_create.room_id,
+        )
+
+        # The "dodgy" state fork: has Eve with old PL1.
+        dodgy_state: StateMap[str] = {
+            (EventTypes.Create, ""): e1_create.event_id,
+            (EventTypes.Member, ALICE): e2_ma.event_id,
+            (EventTypes.Member, BOB): e5_mb.event_id,
+            (EventTypes.Member, CHARLIE): e6_mc.event_id,
+            (EventTypes.Member, EVELYN): e10_me.event_id,
+            (EventTypes.PowerLevels, ""): e3_power1.event_id,  # /!\ DODGY /!\
+            (EventTypes.JoinRules, ""): e4_jr.event_id,
+        }
+
+        # The correct state fork: has Zara with PL3.
+        correct_state: StateMap[str] = {
+            (EventTypes.Create, ""): e1_create.event_id,
+            (EventTypes.Member, ALICE): e2_ma.event_id,
+            (EventTypes.Member, BOB): e5_mb.event_id,
+            (EventTypes.Member, CHARLIE): e6_mc.event_id,
+            (EventTypes.Member, ZARA): e9_mz.event_id,
+            (EventTypes.PowerLevels, ""): e8_power3.event_id,
+            (EventTypes.JoinRules, ""): e4_jr.event_id,
+        }
+
+        # Resolution must pick PL3 (alice:100, bob:50, charlie:50), not PL1.
+        expected: StateMap[str] = {
+            (EventTypes.Create, ""): e1_create.event_id,
+            (EventTypes.Member, ALICE): e2_ma.event_id,
+            (EventTypes.Member, BOB): e5_mb.event_id,
+            (EventTypes.Member, CHARLIE): e6_mc.event_id,
+            (EventTypes.Member, EVELYN): e10_me.event_id,
+            (EventTypes.Member, ZARA): e9_mz.event_id,
+            (EventTypes.PowerLevels, ""): e8_power3.event_id,
+            (EventTypes.JoinRules, ""): e4_jr.event_id,
+        }
+
+        self.get_resolution_and_verify_expected(
+            [dodgy_state, correct_state],
+            [
+                e1_create,
+                e2_ma,
+                e3_power1,
+                e4_jr,
+                e5_mb,
+                e6_mc,
+                e7_power2,
+                e8_power3,
+                e9_mz,
+                e10_me,
+            ],
+            expected,
+        )
+
     async def _get_auth_difference_and_conflicted_subgraph(
         self,
         room_id: str,
