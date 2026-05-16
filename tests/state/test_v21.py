@@ -354,6 +354,118 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
             expected,
         )
 
+    def test_supplemental_merge_does_not_clobber_auth_chain(self) -> None:
+        """Regression test: in V2.1, the supplemental merge from resolved_state
+        must NOT override an event's own auth_events.
+
+        Scenario: join_rules forks (public vs invite). Bob joined when the room
+        was public, so his auth chain contains join_rules=public. After the
+        control pass resolves join_rules to invite, the supplemental merge in V2
+        would overwrite bob's auth state with join_rules=invite, causing bob's
+        join to fail auth with 'not invited to invite-only room'.
+
+        V2.1 must skip the supplemental merge so bob authenticates against his
+        own auth chain (which has join_rules=public) and survives resolution.
+        """
+        # 1. Alice creates a room.
+        e1_create = self.create_event(
+            EventTypes.Create,
+            "",
+            sender=ALICE,
+            content={"creator": ALICE},
+            auth_events=[],
+        )
+        # 2. Alice joins.
+        e2_ma1 = self.create_event(
+            EventTypes.Member,
+            ALICE,
+            sender=ALICE,
+            content=MEMBERSHIP_CONTENT_JOIN,
+            auth_events=[],
+            room_id=e1_create.room_id,
+        )
+        # 3. Power levels.
+        e3_power = self.create_event(
+            EventTypes.PowerLevels,
+            "",
+            sender=ALICE,
+            content={"users": {}},
+            auth_events=[e2_ma1.event_id],
+            room_id=e1_create.room_id,
+        )
+        # 4. Join rules = public.
+        e4_jr1 = self.create_event(
+            EventTypes.JoinRules,
+            "",
+            sender=ALICE,
+            content={"join_rule": JoinRules.PUBLIC},
+            auth_events=[e2_ma1.event_id, e3_power.event_id],
+            room_id=e1_create.room_id,
+        )
+        # 5. Bob joins (auth chain has join_rules=public).
+        e5_mb = self.create_event(
+            EventTypes.Member,
+            BOB,
+            sender=BOB,
+            content=MEMBERSHIP_CONTENT_JOIN,
+            auth_events=[e3_power.event_id, e4_jr1.event_id],
+            room_id=e1_create.room_id,
+        )
+        # 6. Join rules = invite (fork).
+        e6_jr2 = self.create_event(
+            EventTypes.JoinRules,
+            "",
+            sender=ALICE,
+            content={"join_rule": JoinRules.INVITE},
+            auth_events=[e2_ma1.event_id, e3_power.event_id],
+            room_id=e1_create.room_id,
+        )
+        # 7. Alice leaves.
+        e7_ma2 = self.create_event(
+            EventTypes.Member,
+            ALICE,
+            sender=ALICE,
+            content=MEMBERSHIP_CONTENT_LEAVE,
+            auth_events=[e3_power.event_id, e2_ma1.event_id],
+            room_id=e1_create.room_id,
+        )
+
+        # State set 1: has bob, has JR2 (invite)
+        state_with_bob: StateMap[str] = {
+            (EventTypes.Create, ""): e1_create.event_id,
+            (EventTypes.Member, ALICE): e7_ma2.event_id,
+            (EventTypes.Member, BOB): e5_mb.event_id,
+            (EventTypes.PowerLevels, ""): e3_power.event_id,
+            (EventTypes.JoinRules, ""): e6_jr2.event_id,
+        }
+
+        # State set 2: does NOT have bob, has JR1 (public)
+        # This makes bob's membership conflicted, forcing it through
+        # iterative_auth_checks where the supplemental merge applies.
+        state_without_bob: StateMap[str] = {
+            (EventTypes.Create, ""): e1_create.event_id,
+            (EventTypes.Member, ALICE): e7_ma2.event_id,
+            (EventTypes.PowerLevels, ""): e3_power.event_id,
+            (EventTypes.JoinRules, ""): e4_jr1.event_id,
+        }
+
+        # Bob must survive: his auth chain has JR1=public, which should be used
+        # for his auth check (V2.1 skips supplemental merge).
+        # JR2 wins the control pass (newer timestamp).
+        expected: StateMap[str] = {
+            (EventTypes.Create, ""): e1_create.event_id,
+            (EventTypes.Member, ALICE): e7_ma2.event_id,
+            (EventTypes.Member, BOB): e5_mb.event_id,
+            (EventTypes.PowerLevels, ""): e3_power.event_id,
+            (EventTypes.JoinRules, ""): e6_jr2.event_id,
+        }
+
+        self.get_resolution_and_verify_expected(
+            [state_with_bob, state_without_bob],
+            [e1_create, e2_ma1, e3_power, e4_jr1, e5_mb, e6_jr2, e7_ma2],
+            expected,
+        )
+
     async def _get_auth_difference_and_conflicted_subgraph(
         self,
         room_id: str,

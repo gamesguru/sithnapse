@@ -710,13 +710,20 @@ async def _iterative_auth_checks(
                 if ev.rejected_reason is None:
                     auth_events[(ev.type, ev.state_key)] = ev
 
-        for key in event_auth.auth_types_for_event(room_version, event):
-            if key in resolved_state:
-                ev_id = resolved_state[key]
-                ev = await _get_event(room_id, ev_id, event_map, state_res_store)
+        # In V2.1 (MSC4297), each event authenticates purely against its own
+        # auth_events chain, NOT supplemented by the accumulated resolved_state.
+        # This is the key behavioral difference: V2.1 starts from the empty set
+        # precisely so that events are evaluated against their own auth chain,
+        # preventing cascading auth failures when conflicting state (e.g.
+        # join_rules=invite) contaminates the accumulated resolved_state.
+        if room_version.state_res != StateResolutionVersions.V2_1:
+            for key in event_auth.auth_types_for_event(room_version, event):
+                if key in resolved_state:
+                    ev_id = resolved_state[key]
+                    ev = await _get_event(room_id, ev_id, event_map, state_res_store)
 
-                if ev.rejected_reason is None:
-                    auth_events[key] = event_map[ev_id]
+                    if ev.rejected_reason is None:
+                        auth_events[key] = event_map[ev_id]
 
         if event.rejected_reason is not None:
             # Do not admit previously rejected events into state.
