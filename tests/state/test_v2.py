@@ -1296,14 +1296,13 @@ class DAGReplayTestCase(unittest.TestCase):
         "remote-dag-tgmfqAWaBc978M80V9_nutra.tk-v11-merged.jsonl",
     )
 
-    def _load_events(self, path: str) -> list[EventBase]:
-        """Load JSONL events with V11 auth semantics.
+    def _load_events(self, path: str) -> tuple[list[EventBase], dict[str, str]]:
+        """Load JSONL events natively as V11.
 
-        Events are loaded as V1 FrozenEvents to preserve the original event_ids
-        (V4+ format computes event_ids from content hashes, but rewriting
-        auth/prev references would change the hash — chicken-and-egg problem).
-        After construction, room_version is patched to V11 so that auth checks
-        use V11 semantics (implicit_room_creator, knock_restricted, etc.).
+        Strips non-canonical fields and lets Synapse compute event_ids from
+        the content hash. Returns the events and an old→new event_id mapping
+        (the computed IDs differ from the originals due to V11 redaction rules
+        affecting the reference hash).
         """
         raw_events = []
         with open(path) as f:
@@ -1313,22 +1312,19 @@ class DAGReplayTestCase(unittest.TestCase):
                     raw_events.append(json.loads(line))
 
         events = []
+        old_to_new: dict[str, str] = {}
         for raw in raw_events:
             original_id = raw.pop("event_id", None)
             raw.pop("signatures", None)
             raw.pop("hashes", None)
             raw.pop("unsigned", None)
             ev = make_event_from_dict(raw, room_version=RoomVersions.V11)
-            # Sanity check: computed event_id must match the original
             if original_id:
-                assert ev.event_id == original_id, (
-                    f"Event ID mismatch: computed {ev.event_id} != "
-                    f"original {original_id}"
-                )
+                old_to_new[original_id] = ev.event_id
             events.append(ev)
 
         events.sort(key=lambda e: (e.depth, e.origin_server_ts))
-        return events
+        return events, old_to_new
 
     def test_replay_nutra_tk_dag_bot_membership(self) -> None:
         """Replay the full nutra.tk DAG through V2 state resolution.
@@ -1342,7 +1338,8 @@ class DAGReplayTestCase(unittest.TestCase):
         if not os.path.exists(self.JSONL_PATH):
             self.skipTest(f"JSONL not found: {self.JSONL_PATH}")
 
-        events = self._load_events(self.JSONL_PATH)
+        events, old_to_new = self._load_events(self.JSONL_PATH)
+        new_to_old = {v: k for k, v in old_to_new.items()}
         self.assertGreater(len(events), 0)
 
         room_id = events[0].room_id
@@ -1356,7 +1353,11 @@ class DAGReplayTestCase(unittest.TestCase):
 
         for ev in events:
             event_map[ev.event_id] = ev
-            prev_ids = ev.prev_event_ids()
+            # Also store under the original JSONL ID so auth chain lookups work
+            old_id = new_to_old.get(ev.event_id)
+            if old_id:
+                event_map[old_id] = ev
+            prev_ids = [old_to_new.get(p, p) for p in ev.prev_event_ids()]
 
             state_before: StateMap[str]
             if not prev_ids:
@@ -1365,7 +1366,9 @@ class DAGReplayTestCase(unittest.TestCase):
                 state_before = dict(state_at.get(prev_ids[0], {}))
             else:
                 # FORK MERGE - run V2 state resolution
-                state_sets = [state_at[pid] for pid in prev_ids if pid in state_at]
+                state_sets = [
+                    state_at[pid] for pid in prev_ids if pid in state_at
+                ]
                 if len(state_sets) < 2:
                     state_before = dict(state_sets[0]) if state_sets else {}
                 else:
@@ -1405,7 +1408,10 @@ class DAGReplayTestCase(unittest.TestCase):
                         if jr:
                             jr_ev = event_map.get(jr)
                             if jr_ev:
-                                print(f"  Resolved join_rules: {jr_ev.content}")
+                                print(
+                                    f"  Resolved join_rules: "
+                                    f"{jr_ev.content}"
+                                )
                         eviction_depths.append(ev.depth)
 
             state_after = dict(state_before)
@@ -1460,7 +1466,8 @@ class DAGReplayTestCase(unittest.TestCase):
         if not os.path.exists(self.JSONL_PATH):
             self.skipTest(f"JSONL not found: {self.JSONL_PATH}")
 
-        events = self._load_events(self.JSONL_PATH)
+        events, old_to_new = self._load_events(self.JSONL_PATH)
+        new_to_old = {v: k for k, v in old_to_new.items()}
         self.assertGreater(len(events), 0)
 
         # First, replay the FULL DAG to get correct state at depth 336
@@ -1478,7 +1485,10 @@ class DAGReplayTestCase(unittest.TestCase):
 
         for ev in pre_join_events:
             event_map[ev.event_id] = ev
-            prev_ids = ev.prev_event_ids()
+            old_id = new_to_old.get(ev.event_id)
+            if old_id:
+                event_map[old_id] = ev
+            prev_ids = [old_to_new.get(p, p) for p in ev.prev_event_ids()]
 
             if not prev_ids:
                 state_before: StateMap[str] = {}
@@ -1538,7 +1548,10 @@ class DAGReplayTestCase(unittest.TestCase):
 
         for ev in post_join_events:
             event_map[ev.event_id] = ev
-            prev_ids = ev.prev_event_ids()
+            old_id = new_to_old.get(ev.event_id)
+            if old_id:
+                event_map[old_id] = ev
+            prev_ids = [old_to_new.get(p, p) for p in ev.prev_event_ids()]
 
             if not prev_ids:
                 state_before = {}
