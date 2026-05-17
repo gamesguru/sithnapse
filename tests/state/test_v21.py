@@ -441,7 +441,8 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
 
         # State set 2: does NOT have bob, has JR1 (public)
         # This makes bob's membership conflicted, forcing it through
-        # iterative_auth_checks where the supplemental merge applies.
+        # iterative_auth_checks: the path where the supplemental merge would
+        # previously have applied before the V2.1 change.
         state_without_bob: StateMap[str] = {
             (EventTypes.Create, ""): e1_create.event_id,
             (EventTypes.Member, ALICE): e7_ma2.event_id,
