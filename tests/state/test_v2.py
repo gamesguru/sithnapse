@@ -1591,3 +1591,129 @@ class DAGReplayTestCase(unittest.TestCase):
             recovery_depth,
             "Bot should not have been recovered via V2 state resolution",
         )
+
+    def test_replay_nutra_tk_dag_catgirl_v21(self) -> None:
+        """Prove V2.1 self-heals corrupted ingestion state.
+
+        The catgirl bug: bot's membership was missing from the corrupted
+        /state response at depth 336. Under V2, the bot never recovers
+        because the supplemental merge poisons auth checks.
+
+        Under V2.1 (V12+), the bot RECOVERS at the first fork merge
+        where its membership appears in at least one fork. Without the
+        supplemental merge, the iterative auth checks start from {} and
+        the bot's join auths cleanly against its own auth chain.
+
+        This proves that upgrading to V12 is sufficient to self-heal
+        rooms affected by the catgirl bug — no surgical repair needed.
+        """
+        if not os.path.exists(self.JSONL_PATH):
+            self.skipTest(f"JSONL not found: {self.JSONL_PATH}")
+
+        events = self._load_events(self.JSONL_PATH)
+        self.assertGreater(len(events), 0)
+
+        room_id = events[0].room_id
+        event_map: dict[str, EventBase] = {}
+        state_at: dict[str, StateMap[str]] = {}
+
+        target = "@bot:nutra.tk"
+        bot_key = (EventTypes.Member, target)
+
+        catgirl_join_depth = 336
+        pre_join_events = [ev for ev in events if ev.depth <= catgirl_join_depth]
+        post_join_events = [ev for ev in events if ev.depth > catgirl_join_depth]
+
+        # Phase 1: Build correct state up to depth 336
+        for ev in pre_join_events:
+            event_map[ev.event_id] = ev
+            prev_ids = ev.prev_event_ids()
+
+            if not prev_ids:
+                state_before: StateMap[str] = {}
+            elif len(prev_ids) == 1:
+                state_before = dict(state_at.get(prev_ids[0], {}))
+            else:
+                state_sets = [state_at[pid] for pid in prev_ids if pid in state_at]
+                if len(state_sets) < 2:
+                    state_before = dict(state_sets[0]) if state_sets else {}
+                else:
+                    store = TestStateResolutionStore(event_map)
+                    state_before = self.successResultOf(
+                        defer.ensureDeferred(
+                            resolve_events_with_store(
+                                FakeClock(),
+                                room_id,
+                                RoomVersions.V12,
+                                state_sets,
+                                event_map=event_map,
+                                state_res_store=store,
+                            )
+                        )
+                    )
+
+            state_after = dict(state_before)
+            if ev.is_state():
+                state_after[(ev.type, ev.state_key)] = ev.event_id
+            state_at[ev.event_id] = state_after
+
+        # Phase 2: Corrupt state (remove bot)
+        last_pre = pre_join_events[-1]
+        corrupted_state = dict(state_at[last_pre.event_id])
+        self.assertIn(bot_key, corrupted_state)
+        del corrupted_state[bot_key]
+        state_at[last_pre.event_id] = corrupted_state
+
+        # Phase 3: Replay with V2.1 (V12) state resolution
+        recovery_depth = None
+
+        for ev in post_join_events:
+            event_map[ev.event_id] = ev
+            prev_ids = ev.prev_event_ids()
+
+            if not prev_ids:
+                state_before = {}
+            elif len(prev_ids) == 1:
+                state_before = dict(state_at.get(prev_ids[0], {}))
+            else:
+                state_sets = [state_at[pid] for pid in prev_ids if pid in state_at]
+                if len(state_sets) < 2:
+                    state_before = dict(state_sets[0]) if state_sets else {}
+                else:
+                    store = TestStateResolutionStore(event_map)
+                    state_before = self.successResultOf(
+                        defer.ensureDeferred(
+                            resolve_events_with_store(
+                                FakeClock(),
+                                room_id,
+                                RoomVersions.V12,
+                                state_sets,
+                                event_map=event_map,
+                                state_res_store=store,
+                            )
+                        )
+                    )
+
+                    if bot_key in state_before and not recovery_depth:
+                        recovery_depth = ev.depth
+
+            state_after = dict(state_before)
+            if ev.is_state():
+                state_after[(ev.type, ev.state_key)] = ev.event_id
+            state_at[ev.event_id] = state_after
+
+        # V2.1 DOES recover the bot! Without the supplemental merge,
+        # the bot's membership passes auth at the first fork merge
+        # where it appears in at least one state set.
+        self.assertIsNotNone(
+            recovery_depth,
+            "Bot should recover via V2.1 — self-healing proves the fix works",
+        )
+
+        # Verify bot is in final state
+        final_state = state_at.get(events[-1].event_id, {})
+        self.assertIn(
+            bot_key,
+            final_state,
+            "Bot should be in final state after V2.1 self-healing",
+        )
