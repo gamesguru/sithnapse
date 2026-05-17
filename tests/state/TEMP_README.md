@@ -49,7 +49,7 @@ Existing upstream tests plus:
 
 ### `test_v2.py::DAGReplayTestCase` — Real-World DAG Replay
 
-Replays 848 production events from `tests/jsonl/remote-dag-tgmfqAWaBc978M80V9_nutra.tk-v11-merged.jsonl`
+Replays 848 production events from `tests/state/remote-dag-tgmfqAWaBc978M80V9_nutra.tk-v11-merged.jsonl`
 through Synapse's `resolve_events_with_store()` using `RoomVersions.V2`:
 
 | Test                                           | Scenario                                                                                                      | Finding                                                                                                              |

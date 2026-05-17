@@ -1541,7 +1541,6 @@ class DAGReplayTestCase(unittest.TestCase):
         state_at[last_pre.event_id] = corrupted_state
 
         # Phase 3: Replay remaining events with corrupted state
-        eviction_count = 0
         recovery_depth = None
 
         for ev in post_join_events:
@@ -1614,4 +1613,12 @@ class DAGReplayTestCase(unittest.TestCase):
         else:
             print("  Final: NOT IN STATE")
         print(f"{'='*60}")
+
+        # V2 state res shouldn't recover dropped member from corrupt state.
+        # The member is absent from affected server's view and never enters
+        # the conflict set, so no merge can surface it.
+        self.assertIsNone(
+            recovery_depth,
+            "Bot should not have been recovered via V2 state resolution",
+        )
 
