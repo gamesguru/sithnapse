@@ -1440,6 +1440,13 @@ class DAGReplayTestCase(unittest.TestCase):
             f"{eviction_summary}; {final_summary}"
         )
 
+        # Bot should never be evicted during state resolution merges.
+        self.assertEqual(
+            eviction_depths,
+            [],
+            f"Bot was evicted during merge resolution at depths: {eviction_depths}",
+        )
+
         # Bot should be in the final state
         self.assertIn(bot_key, final_state, diagnostic_message)
 
