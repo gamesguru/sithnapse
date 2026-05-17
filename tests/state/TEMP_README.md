@@ -74,7 +74,7 @@ through Synapse's `resolve_events_with_store()` using `RoomVersions.V2`:
 | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
 | `test_replay_nutra_tk_dag_bot_membership`      | Full DAG (omniscient view), traces `@bot:nutra.tk` through all 21 fork merges                                 | Bot survives — no eviction with complete information                                                                 |
 | `test_replay_nutra_tk_dag_catgirl_perspective` | Bot removed from state at depth 336 (simulating catgirl's corrupted `/state` response), then replay continues | Bot **never recovers** — permanently absent. V2 has no mechanism to surface a member that isn't in the conflict set. |
-| `test_replay_nutra_tk_dag_catgirl_v21`         | Same corrupted state, replayed through V2.1 (V12) AND V2 in the same test                                    | V2.1 **self-heals** at depth 412; V2 does NOT recover. Proves the fix works and that V2 is the broken baseline.     |
+| `test_replay_nutra_tk_dag_catgirl_v21`         | Same corrupted state, replayed through V2.1 (V12) AND V2 in the same test                                     | V2.1 **self-heals** at depth 412; V2 does NOT recover. Proves the fix works and that V2 is the broken baseline.      |
 
 The JSONL contains real PDUs from the `#general:nutra.tk` room (V11), loaded
 natively as V11 `FrozenEventV3` events. Non-canonical fields (`event_id`,
@@ -87,11 +87,11 @@ which are asserted to match the originals.
 With the V2.1 supplemental merge patch reverted (`git show 788e6aedc2^:synapse/state/v2.py`),
 the full suite was re-run to confirm:
 
-| Test | Unpatched Result | Patched Result |
-| ---- | ---------------- | -------------- |
-| `test_supplemental_merge_does_not_clobber_auth_chain` (V21) | **FAILED** — Bob evicted by supplemental merge | PASSED |
-| `test_replay_nutra_tk_dag_catgirl_v21` | PASSED — self-heals via start-from-`{}` (pre-existing V12 change) | PASSED |
-| All other tests (24) | PASSED | PASSED |
+| Test                                                        | Unpatched Result                                                  | Patched Result |
+| ----------------------------------------------------------- | ----------------------------------------------------------------- | -------------- |
+| `test_supplemental_merge_does_not_clobber_auth_chain` (V21) | **FAILED** — Bob evicted by supplemental merge                    | PASSED         |
+| `test_replay_nutra_tk_dag_catgirl_v21`                      | PASSED — self-heals via start-from-`{}` (pre-existing V12 change) | PASSED         |
+| All other tests (24)                                        | PASSED                                                            | PASSED         |
 
 The catgirl self-healing is driven by the V2.1 start-from-empty-set change
 (line 182 of v2.py), which is part of the broader V12 room version support.
@@ -147,7 +147,8 @@ Final: join (depth=820)
 ============================================================
 PASSED
 
-tests/state/test_v2.py::DAGReplayTestCase::test_replay_nutra_tk_dag_catgirl_perspective
+tests/state/test_v2.py::DAGReplayTestCase::test_replay_nutra_tk_dag_catgirl_missing_events PASSED
+tests/state/test_v2.py::DAGReplayTestCase::test_replay_nutra_tk_dag_catgirl_perspective PASSED
 Correct state at depth 336:
   Bot in state: True
   Bot membership: join (depth=24)
@@ -158,8 +159,9 @@ CATGIRL SIMULATION:
   Bot NEVER recovered
   Final: join (depth=820)
 ============================================================
-PASSED
 
+tests/state/test_v2.py::DAGReplayTestCase::test_replay_nutra_tk_dag_catgirl_v21 PASSED
+tests/state/test_v2.py::V12DAGReplayTestCase::test_replay_v12_nex_missing_events SKIPPED
 tests/state/test_v21.py::StateResV21TestCase::test_conflicted_subgraph_preserves_power_levels PASSED
 tests/state/test_v21.py::StateResV21TestCase::test_incomplete_dag_picks_stale_membership PASSED
 tests/state/test_v21.py::StateResV21TestCase::test_state_reset_replay_conflicted_subgraph PASSED
@@ -168,7 +170,7 @@ tests/state/test_v21.py::StateResV21TestCase::test_supplemental_merge_does_not_c
 tests/state/test_v21.py::StateResV21TestCase::test_v21_cve_auth_bypass_without_supplemental_merge PASSED
 tests/state/test_v21.py::StateResV21TestCase::test_v21_self_corrects_corrupted_state PASSED
 
-======================== 25 passed in 5.82s ========================
+================== 27 passed, 1 skipped, 9 warnings in 24.53s ==================
 ```
 
 ### Interpreting the DAG Replay Results
@@ -203,6 +205,14 @@ only recovery for case 2. The V2.1 fix addresses the supplemental merge poison
 case, but the corrupted initial state problem is a separate ingestion-layer
 issue.
 
+**IMPORTANT**: The `test_replay_nutra_tk_dag_catgirl_v21` test proves V2.1
+self-heals corrupted _state tracking_ (bot removed from state_at but events
+still exist in event_map). This is NOT the same as missing events. The
+`test_replay_nutra_tk_dag_catgirl_missing_events` test proves that when events
+are completely absent from the DAG, neither V2 nor V2.1 can recover -- state
+resolution cannot surface a member whose events are backfilled or isolated
+by a discontinuity.
+
 ### Category 3: Per-Server Auth Chain Divergence
 
 The `test_incomplete_dag_picks_stale_membership` test proves a third failure
@@ -215,6 +225,27 @@ approaches 1. The fix is not in state resolution (which is correct given its
 inputs) but in the federation ingestion layer: aggressive auth chain
 pre-fetching, retry on transient failures, and admin tools (`unreject-room`,
 `set-state-event`) for manual reconciliation.
+
+### Category 4: V12 Federation Gaps (Spam Attack Aftermath)
+
+**Room**: `!sM2LwqNHGQOgLf35gqxPMy9D7oYde2q9ADg8HPBM3kE` (unredacted lounge, V12)
+**Scale**: 81K events, 2494 fork merges, 100+ servers
+
+**Forensic finding**: `ruma-lean` confirms V2 and V2.1 produce **identical**
+resolved state (1789 events) on the full merged DAG. Both include
+`@nex:nexy7574.co.uk` as joined with the correct avatar. The divergence between
+servers is purely data completeness:
+
+| Server             | `@nex:nexy7574.co.uk` (main)      | `@nex:synapse.nexy7574.co.uk` |
+| ------------------ | --------------------------------- | ----------------------------- |
+| unredacted.org     | [ok] depth 69605, correct avatar  | [ok] depth 31795              |
+| matrix.org         | [!] depth 31842, **stale** avatar | [ok] depth 31795              |
+| starstruck.systems | [ok] present                      | [x] **missing entirely**      |
+
+Every server has a different "swiss cheese" pattern of missing events from the
+spam attacks. No state resolution algorithm change can recover events that were
+never ingested. The fix is ingestion-side: multi-server backfill with auth chain
+pre-fetching on fork merges.
 
 ---
 

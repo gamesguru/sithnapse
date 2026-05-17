@@ -18,6 +18,7 @@
 #
 #
 import itertools
+import logging
 from typing import Sequence
 
 from twisted.internet import defer
@@ -44,6 +45,8 @@ from synapse.util.duration import Duration
 from tests import unittest
 from tests.state.test_v2 import TestStateResolutionStore
 
+logger = logging.getLogger(__name__)
+
 ALICE = "@alice:example.com"
 BOB = "@bob:example.com"
 CHARLIE = "@charlie:example.com"
@@ -58,13 +61,6 @@ MEMBERSHIP_CONTENT_LEAVE = {"membership": Membership.LEAVE}
 MEMBERSHIP_CONTENT_BAN = {"membership": Membership.BAN}
 
 
-ORIGIN_SERVER_TS = 0
-
-
-def monotonic_timestamp() -> int:
-    global ORIGIN_SERVER_TS
-    ORIGIN_SERVER_TS += 1
-    return ORIGIN_SERVER_TS
 
 
 class FakeClock:
@@ -92,6 +88,11 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
 
         self.register_user("user", "pass")
         self.token = self.login("user", "pass")
+        self._ts_counter = 1000
+
+    def monotonic_timestamp(self) -> int:
+        self._ts_counter += 1
+        return self._ts_counter
 
     def test_state_reset_replay_conflicted_subgraph(self) -> None:
         # 1. Alice creates a room.
@@ -1049,7 +1050,7 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
         # First we try everything in-memory to check that the test case works.
         event_map = {ev.event_id: ev for ev in events}
         for ev in events:
-            print(f"{ev.event_id} => {ev.type} {ev.state_key} => {ev.content}")
+            logger.debug("%s => %s %s => %s", ev.event_id, ev.type, ev.state_key, ev.content)
         resolution = self.get_success(
             resolve_events_with_store(
                 FakeClock(),
@@ -1070,9 +1071,13 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
                 TestStateResolutionStore(event_map),
             )
         )
-        # we should never see the create event in the auth diff. If we do, this implies the
+        # We should never see the create event in the auth diff. If we do, the
         # conflicted subgraph is wrong and is returning too many old events.
-        assert events[0].event_id not in got_auth_diff
+        self.assertNotIn(
+            events[0].event_id,
+            got_auth_diff,
+            "Create event incorrectly found in auth difference",
+        )
 
         # now let's make the room exist on the DB, some queries rely on there being a row in
         # the rooms table when persisting. Guard against duplicate inserts when a test calls
@@ -1116,13 +1121,12 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
             # no matter how many events are persisted, the overall diff should always be the same.
             self.assertEqual(got_auth_diff, got_auth_diff2)
 
-        # now we will drip feed in `events` one-by-one, persisting them then resolving with the
-        # rest. This ensures we correctly handle mixed persisted/unpersisted events. We will finish
-        # with doing the test with all persisted events.
-        while len(events) > 0:
-            event_to_persist = events.pop(0)
+        # Drip-feed events one-by-one, persisting then re-resolving.
+        # Ensures correct handling of mixed persisted/unpersisted events.
+        unpersisted_events = list(events)
+        while unpersisted_events:
+            event_to_persist = unpersisted_events.pop(0)
             self.persist_event(event_to_persist)
-            # now retest
             resolve_and_check()
 
     def persist_event(
@@ -1161,7 +1165,7 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
             "depth": 5,
             "prev_events": prev_events,
             "auth_events": auth_events,
-            "origin_server_ts": monotonic_timestamp(),
+            "origin_server_ts": self.monotonic_timestamp(),
             "hashes": {},
         }
         if event_type != EventTypes.Create:
