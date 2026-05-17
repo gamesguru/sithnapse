@@ -33,6 +33,24 @@ Two changes, both gated on `StateResolutionVersions.V2_1`:
 
 See `synapse/state/v2.py`, specifically `_iterative_auth_checks()`.
 
+### Remediation for V11 Rooms
+
+The V2.1 fix is gated behind `StateResolutionVersions.V2_1`, which only V12+
+rooms use. **Standard V11 rooms still run V2 state resolution and remain
+vulnerable to the supplemental merge bug.** There is no in-place fix because
+room version semantics are immutable once shipped per the Matrix spec.
+
+Options for affected V11 rooms:
+
+1. **Room upgrade to V12** — the intended path. Creates a new room with V2.1
+   state resolution. Members must re-join via the upgrade tombstone.
+2. **Surgical DAG repair** — use `force-set-state` / `unreject-room` admin
+   tools (continuwuity) to manually restore evicted membership on the affected
+   server. This doesn't fix the algorithm, just patches the symptoms.
+3. **Spec amendment** — propose retroactively changing V11 to use V2.1.
+   Extremely unlikely to be accepted since it would change resolution behavior
+   for all existing V11 rooms across the federation.
+
 ---
 
 ## Test Files
@@ -57,12 +75,13 @@ through Synapse's `resolve_events_with_store()` using `RoomVersions.V2`:
 | `test_replay_nutra_tk_dag_bot_membership`      | Full DAG (omniscient view), traces `@bot:nutra.tk` through all 21 fork merges                                 | Bot survives — no eviction with complete information                                                                 |
 | `test_replay_nutra_tk_dag_catgirl_perspective` | Bot removed from state at depth 336 (simulating catgirl's corrupted `/state` response), then replay continues | Bot **never recovers** — permanently absent. V2 has no mechanism to surface a member that isn't in the conflict set. |
 
-The JSONL contains real PDUs from the `#general:nutra.tk` room (V11), loaded as V1
-`FrozenEvent`s to preserve the original `event_id`s (V4+ format computes IDs from
-content hashes, breaking DAG references). After construction, `room_version` is
-patched to V11 so auth checks use the correct semantics.
+The JSONL contains real PDUs from the `#general:nutra.tk` room (V11), loaded
+natively as V11 `FrozenEventV3` events. Non-canonical fields (`event_id`,
+`signatures`, `unsigned`) are stripped; the `hashes` field is preserved as it's
+part of the reference hash. Synapse recomputes event_ids from the content hash,
+which are asserted to match the originals.
 
-### `test_v21.py` — V2.1 State Resolution (HydraV11 / V12+)
+### `test_v21.py` — V2.1 State Resolution (V12+)
 
 | Test                                                  | What It Proves                                                                                                                                                                                                                                                                  |
 | ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
