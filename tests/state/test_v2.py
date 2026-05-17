@@ -1421,24 +1421,27 @@ class DAGReplayTestCase(unittest.TestCase):
 
         final_state = state_at.get(events[-1].event_id, {})
 
-        print(f"\n{'='*60}")
-        print(f"REPLAY: {len(events)} events, {merge_count} merges")
         if eviction_depths:
-            print(f"BOT EVICTED at depths: {eviction_depths}")
+            eviction_summary = f"BOT EVICTED at depths: {eviction_depths}"
         else:
-            print("Bot was NEVER evicted with full DAG")
+            eviction_summary = "Bot was NEVER evicted with full DAG"
+
         bot_final = final_state.get(bot_key)
         if bot_final:
             bev = event_map[bot_final]
-            print(
+            final_summary = (
                 f"Final: {bev.content.get('membership')} (depth={bev.depth})"
             )
         else:
-            print("Final: NOT IN STATE")
-        print(f"{'='*60}")
+            final_summary = "Final: NOT IN STATE"
+
+        diagnostic_message = (
+            f"REPLAY: {len(events)} events, {merge_count} merges; "
+            f"{eviction_summary}; {final_summary}"
+        )
 
         # Bot should be in the final state
-        self.assertIn(bot_key, final_state)
+        self.assertIn(bot_key, final_state, diagnostic_message)
 
     def test_replay_nutra_tk_dag_catgirl_perspective(self) -> None:
         """Simulate catgirl.cloud's state divergence.
@@ -1529,9 +1532,13 @@ class DAGReplayTestCase(unittest.TestCase):
 
         # Phase 2: Create CORRUPTED state (remove bot membership)
         corrupted_state = dict(correct_state)
-        had_bot = bot_key in corrupted_state
-        if had_bot:
-            del corrupted_state[bot_key]
+        self.assertIn(
+            bot_key,
+            corrupted_state,
+            "Expected bot membership to be present before corrupting state",
+        )
+        had_bot = True
+        del corrupted_state[bot_key]
         print(
             f"  Corrupted state: removed bot "
             f"(had_bot={had_bot})"

@@ -171,7 +171,7 @@ issue.
 # All state res tests
 .venv/bin/python -m pytest tests/state/test_v2.py tests/state/test_v21.py -v -s
 
-# Just the DAG replay (requires JSONL file in tests/jsonl/)
+# Just the DAG replay (requires JSONL file in tests/state/)
 .venv/bin/python -m pytest tests/state/test_v2.py::DAGReplayTestCase -v -s
 
 # Just the V2.1 fix validation
