@@ -62,14 +62,15 @@ The JSONL contains real PDUs from the `#general:nutra.tk` room (V11), loaded as 
 
 ### `test_v21.py` — V2.1 State Resolution (HydraV11 / V12+)
 
-| Test                                                  | What It Proves                                                                                                                                                                                              |
-| ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `test_state_reset_replay_conflicted_subgraph`         | Dodgy `auth_events` citing old power levels don't cause PL regression. PL3 (bob:50, charlie:50) survives.                                                                                                   |
-| `test_state_reset_start_empty_set`                    | Conflicted join_rules resolve correctly even when the sender's membership isn't conflicted.                                                                                                                 |
-| `test_supplemental_merge_does_not_clobber_auth_chain` | **Key regression test**: Bob joins under PUBLIC, fork flips JR to INVITE. V2 would evict Bob (supplemental merge poisons his auth); V2.1 keeps him (auths against own chain).                               |
-| `test_conflicted_subgraph_preserves_power_levels`     | Ported from Complement (`TestMSC4297StateResolutionV2_1_includes_conflicted_subgraph`). Dodgy Eve citing old PLs doesn't regress PL state.                                                                  |
-| `test_v21_cve_auth_bypass_without_supplemental_merge` | **Security proof**: removing the supplemental merge doesn't open a CVE. Eve can't replay old PLs to change the topic — the control pass still resolves PLs first, and Eve is PL 0 under the resolved state. |
-| `test_v21_self_corrects_corrupted_state`              | Corrupted server missing a ban self-heals when merging with a healthy server.                                                                                                                               |
+| Test                                                  | What It Proves                                                                                                                                                                                                                                                                  |
+| ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `test_state_reset_replay_conflicted_subgraph`         | Dodgy `auth_events` citing old power levels don't cause PL regression. PL3 (bob:50, charlie:50) survives.                                                                                                                                                                       |
+| `test_state_reset_start_empty_set`                    | Conflicted join_rules resolve correctly even when the sender's membership isn't conflicted.                                                                                                                                                                                     |
+| `test_supplemental_merge_does_not_clobber_auth_chain` | **Key regression test**: Bob joins under PUBLIC, fork flips JR to INVITE. V2 would evict Bob (supplemental merge poisons his auth); V2.1 keeps him (auths against own chain).                                                                                                   |
+| `test_conflicted_subgraph_preserves_power_levels`     | Ported from Complement (`TestMSC4297StateResolutionV2_1_includes_conflicted_subgraph`). Dodgy Eve citing old PLs doesn't regress PL state.                                                                                                                                      |
+| `test_v21_cve_auth_bypass_without_supplemental_merge` | **Security proof**: removing the supplemental merge doesn't open a CVE. Eve can't replay old PLs to change the topic -- the control pass still resolves PLs first, and Eve is PL 0 under the resolved state.                                                                    |
+| `test_v21_self_corrects_corrupted_state`              | Corrupted server missing a ban self-heals when merging with a healthy server.                                                                                                                                                                                                   |
+| `test_incomplete_dag_picks_stale_membership`          | **Data completeness proof**: with incomplete DAG (missing rejoin), Eve resolves as LEFT (wrong). With complete DAG, Eve resolves as JOINED with updated profile. Same algorithm, different inputs -- proves state resets are a federation ingestion issue, not a state res bug. |
 
 The V2.1 test harness (`get_resolution_and_verify_expected`) drip-feeds events
 into the DB one-by-one, re-resolving after each persistence to verify:
@@ -122,13 +123,14 @@ CATGIRL SIMULATION:
 PASSED
 
 tests/state/test_v21.py::StateResV21TestCase::test_conflicted_subgraph_preserves_power_levels PASSED
+tests/state/test_v21.py::StateResV21TestCase::test_incomplete_dag_picks_stale_membership PASSED
 tests/state/test_v21.py::StateResV21TestCase::test_state_reset_replay_conflicted_subgraph PASSED
 tests/state/test_v21.py::StateResV21TestCase::test_state_reset_start_empty_set PASSED
 tests/state/test_v21.py::StateResV21TestCase::test_supplemental_merge_does_not_clobber_auth_chain PASSED
 tests/state/test_v21.py::StateResV21TestCase::test_v21_cve_auth_bypass_without_supplemental_merge PASSED
 tests/state/test_v21.py::StateResV21TestCase::test_v21_self_corrects_corrupted_state PASSED
 
-======================== 24 passed in 5.82s ========================
+======================== 25 passed in 5.82s ========================
 ```
 
 ### Interpreting the DAG Replay Results
@@ -162,6 +164,19 @@ never conflicted. The `heal-room` / force re-resolution admin command is the
 only recovery for case 2. The V2.1 fix addresses the supplemental merge poison
 case, but the corrupted initial state problem is a separate ingestion-layer
 issue.
+
+### Category 3: Per-Server Auth Chain Divergence
+
+The `test_incomplete_dag_picks_stale_membership` test proves a third failure
+mode observed in production (c10y eggtopic room, `@stratself:muoi.me`): servers
+that rejected events in a user's auth chain (content hash mismatch, signature
+failure, transient fetch failure) permanently resolve that user's membership to
+a stale or absent state. With ~160 membership updates forming a 160-link auth
+chain, the probability of at least one link being rejected on any given server
+approaches 1. The fix is not in state resolution (which is correct given its
+inputs) but in the federation ingestion layer: aggressive auth chain
+pre-fetching, retry on transient failures, and admin tools (`unreject-room`,
+`set-state-event`) for manual reconciliation.
 
 ---
 
