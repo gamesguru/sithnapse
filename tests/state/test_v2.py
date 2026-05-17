@@ -1296,13 +1296,12 @@ class DAGReplayTestCase(unittest.TestCase):
         "remote-dag-tgmfqAWaBc978M80V9_nutra.tk-v11-merged.jsonl",
     )
 
-    def _load_events(self, path: str) -> tuple[list[EventBase], dict[str, str]]:
+    def _load_events(self, path: str) -> list[EventBase]:
         """Load JSONL events natively as V11.
 
-        Strips non-canonical fields and lets Synapse compute event_ids from
-        the content hash. Returns the events and an old→new event_id mapping
-        (the computed IDs differ from the originals due to V11 redaction rules
-        affecting the reference hash).
+        Strips event_id, signatures, and unsigned (non-canonical fields) and
+        lets Synapse recompute the event_id from the reference hash. The hashes
+        field is preserved as it's part of the reference hash input.
         """
         raw_events = []
         with open(path) as f:
@@ -1312,19 +1311,19 @@ class DAGReplayTestCase(unittest.TestCase):
                     raw_events.append(json.loads(line))
 
         events = []
-        old_to_new: dict[str, str] = {}
         for raw in raw_events:
             original_id = raw.pop("event_id", None)
             raw.pop("signatures", None)
-            raw.pop("hashes", None)
             raw.pop("unsigned", None)
             ev = make_event_from_dict(raw, room_version=RoomVersions.V11)
             if original_id:
-                old_to_new[original_id] = ev.event_id
+                assert ev.event_id == original_id, (
+                    f"Event ID mismatch: {ev.event_id} != {original_id}"
+                )
             events.append(ev)
 
         events.sort(key=lambda e: (e.depth, e.origin_server_ts))
-        return events, old_to_new
+        return events
 
     def test_replay_nutra_tk_dag_bot_membership(self) -> None:
         """Replay the full nutra.tk DAG through V2 state resolution.
@@ -1338,8 +1337,7 @@ class DAGReplayTestCase(unittest.TestCase):
         if not os.path.exists(self.JSONL_PATH):
             self.skipTest(f"JSONL not found: {self.JSONL_PATH}")
 
-        events, old_to_new = self._load_events(self.JSONL_PATH)
-        new_to_old = {v: k for k, v in old_to_new.items()}
+        events = self._load_events(self.JSONL_PATH)
         self.assertGreater(len(events), 0)
 
         room_id = events[0].room_id
@@ -1353,11 +1351,7 @@ class DAGReplayTestCase(unittest.TestCase):
 
         for ev in events:
             event_map[ev.event_id] = ev
-            # Also store under the original JSONL ID so auth chain lookups work
-            old_id = new_to_old.get(ev.event_id)
-            if old_id:
-                event_map[old_id] = ev
-            prev_ids = [old_to_new.get(p, p) for p in ev.prev_event_ids()]
+            prev_ids = ev.prev_event_ids()
 
             state_before: StateMap[str]
             if not prev_ids:
@@ -1466,8 +1460,7 @@ class DAGReplayTestCase(unittest.TestCase):
         if not os.path.exists(self.JSONL_PATH):
             self.skipTest(f"JSONL not found: {self.JSONL_PATH}")
 
-        events, old_to_new = self._load_events(self.JSONL_PATH)
-        new_to_old = {v: k for k, v in old_to_new.items()}
+        events = self._load_events(self.JSONL_PATH)
         self.assertGreater(len(events), 0)
 
         # First, replay the FULL DAG to get correct state at depth 336
@@ -1485,10 +1478,7 @@ class DAGReplayTestCase(unittest.TestCase):
 
         for ev in pre_join_events:
             event_map[ev.event_id] = ev
-            old_id = new_to_old.get(ev.event_id)
-            if old_id:
-                event_map[old_id] = ev
-            prev_ids = [old_to_new.get(p, p) for p in ev.prev_event_ids()]
+            prev_ids = ev.prev_event_ids()
 
             if not prev_ids:
                 state_before: StateMap[str] = {}
@@ -1548,10 +1538,7 @@ class DAGReplayTestCase(unittest.TestCase):
 
         for ev in post_join_events:
             event_map[ev.event_id] = ev
-            old_id = new_to_old.get(ev.event_id)
-            if old_id:
-                event_map[old_id] = ev
-            prev_ids = [old_to_new.get(p, p) for p in ev.prev_event_ids()]
+            prev_ids = ev.prev_event_ids()
 
             if not prev_ids:
                 state_before = {}
