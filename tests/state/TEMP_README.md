@@ -74,12 +74,29 @@ through Synapse's `resolve_events_with_store()` using `RoomVersions.V2`:
 | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
 | `test_replay_nutra_tk_dag_bot_membership`      | Full DAG (omniscient view), traces `@bot:nutra.tk` through all 21 fork merges                                 | Bot survives — no eviction with complete information                                                                 |
 | `test_replay_nutra_tk_dag_catgirl_perspective` | Bot removed from state at depth 336 (simulating catgirl's corrupted `/state` response), then replay continues | Bot **never recovers** — permanently absent. V2 has no mechanism to surface a member that isn't in the conflict set. |
+| `test_replay_nutra_tk_dag_catgirl_v21`         | Same corrupted state, replayed through V2.1 (V12) AND V2 in the same test                                    | V2.1 **self-heals** at depth 412; V2 does NOT recover. Proves the fix works and that V2 is the broken baseline.     |
 
 The JSONL contains real PDUs from the `#general:nutra.tk` room (V11), loaded
 natively as V11 `FrozenEventV3` events. Non-canonical fields (`event_id`,
 `signatures`, `unsigned`) are stripped; the `hashes` field is preserved as it's
 part of the reference hash. Synapse recomputes event_ids from the content hash,
 which are asserted to match the originals.
+
+#### Baseline Verification (unpatched v2.py)
+
+With the V2.1 supplemental merge patch reverted (`git show 788e6aedc2^:synapse/state/v2.py`),
+the full suite was re-run to confirm:
+
+| Test | Unpatched Result | Patched Result |
+| ---- | ---------------- | -------------- |
+| `test_supplemental_merge_does_not_clobber_auth_chain` (V21) | **FAILED** — Bob evicted by supplemental merge | PASSED |
+| `test_replay_nutra_tk_dag_catgirl_v21` | PASSED — self-heals via start-from-`{}` (pre-existing V12 change) | PASSED |
+| All other tests (24) | PASSED | PASSED |
+
+The catgirl self-healing is driven by the V2.1 start-from-empty-set change
+(line 182 of v2.py), which is part of the broader V12 room version support.
+The supplemental merge patch is specifically needed for the synthetic
+join_rules eviction scenario (`test_supplemental_merge_does_not_clobber_auth_chain`).
 
 ### `test_v21.py` — V2.1 State Resolution (V12+)
 
