@@ -58,7 +58,9 @@ through Synapse's `resolve_events_with_store()` using `RoomVersions.V2`:
 | `test_replay_nutra_tk_dag_catgirl_perspective` | Bot removed from state at depth 336 (simulating catgirl's corrupted `/state` response), then replay continues | Bot **never recovers** — permanently absent. V2 has no mechanism to surface a member that isn't in the conflict set. |
 
 The JSONL contains real PDUs from the `#general:nutra.tk` room (V11), loaded as V1
-`FrozenEvent`s to preserve the original `event_id`s while running the V2 algorithm.
+`FrozenEvent`s to preserve the original `event_id`s (V4+ format computes IDs from
+content hashes, breaking DAG references). After construction, `room_version` is
+patched to V11 so auth checks use the correct semantics.
 
 ### `test_v21.py` — V2.1 State Resolution (HydraV11 / V12+)
 

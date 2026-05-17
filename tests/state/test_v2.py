@@ -1297,7 +1297,14 @@ class DAGReplayTestCase(unittest.TestCase):
     )
 
     def _load_events(self, path: str) -> list[EventBase]:
-        """Load JSONL and convert to V1 FrozenEvents (preserves event_ids)."""
+        """Load JSONL events with V11 auth semantics.
+
+        Events are loaded as V1 FrozenEvents to preserve the original event_ids
+        (V4+ format computes event_ids from content hashes, but rewriting
+        auth/prev references would change the hash — chicken-and-egg problem).
+        After construction, room_version is patched to V11 so that auth checks
+        use V11 semantics (implicit_room_creator, knock_restricted, etc.).
+        """
         raw_events = []
         with open(path) as f:
             for line in f:
@@ -1307,17 +1314,17 @@ class DAGReplayTestCase(unittest.TestCase):
 
         events = []
         for raw in raw_events:
-            # V11 uses event_format 3 which rejects explicit event_ids.
-            # Use V1 format to preserve the original event_ids from the JSONL
-            # while still running V2 state resolution algorithm.
-            if raw.get("auth_events") and isinstance(raw["auth_events"][0], str):
-                raw["auth_events"] = [(eid, {}) for eid in raw["auth_events"]]
-            if raw.get("prev_events") and isinstance(raw["prev_events"][0], str):
-                raw["prev_events"] = [(eid, {}) for eid in raw["prev_events"]]
-            raw.pop("unsigned", None)
+            original_id = raw.pop("event_id", None)
             raw.pop("signatures", None)
             raw.pop("hashes", None)
-            ev = make_event_from_dict(raw, room_version=RoomVersions.V1)
+            raw.pop("unsigned", None)
+            ev = make_event_from_dict(raw, room_version=RoomVersions.V11)
+            # Sanity check: computed event_id must match the original
+            if original_id:
+                assert ev.event_id == original_id, (
+                    f"Event ID mismatch: computed {ev.event_id} != "
+                    f"original {original_id}"
+                )
             events.append(ev)
 
         events.sort(key=lambda e: (e.depth, e.origin_server_ts))
@@ -1358,9 +1365,7 @@ class DAGReplayTestCase(unittest.TestCase):
                 state_before = dict(state_at.get(prev_ids[0], {}))
             else:
                 # FORK MERGE - run V2 state resolution
-                state_sets = [
-                    state_at[pid] for pid in prev_ids if pid in state_at
-                ]
+                state_sets = [state_at[pid] for pid in prev_ids if pid in state_at]
                 if len(state_sets) < 2:
                     state_before = dict(state_sets[0]) if state_sets else {}
                 else:
@@ -1400,10 +1405,7 @@ class DAGReplayTestCase(unittest.TestCase):
                         if jr:
                             jr_ev = event_map.get(jr)
                             if jr_ev:
-                                print(
-                                    f"  Resolved join_rules: "
-                                    f"{jr_ev.content}"
-                                )
+                                print(f"  Resolved join_rules: {jr_ev.content}")
                         eviction_depths.append(ev.depth)
 
             state_after = dict(state_before)
@@ -1471,12 +1473,8 @@ class DAGReplayTestCase(unittest.TestCase):
 
         # Phase 1: Build correct state up to depth 336
         catgirl_join_depth = 336
-        pre_join_events = [
-            ev for ev in events if ev.depth <= catgirl_join_depth
-        ]
-        post_join_events = [
-            ev for ev in events if ev.depth > catgirl_join_depth
-        ]
+        pre_join_events = [ev for ev in events if ev.depth <= catgirl_join_depth]
+        post_join_events = [ev for ev in events if ev.depth > catgirl_join_depth]
 
         for ev in pre_join_events:
             event_map[ev.event_id] = ev
@@ -1487,15 +1485,9 @@ class DAGReplayTestCase(unittest.TestCase):
             elif len(prev_ids) == 1:
                 state_before = dict(state_at.get(prev_ids[0], {}))
             else:
-                state_sets = [
-                    state_at[pid]
-                    for pid in prev_ids
-                    if pid in state_at
-                ]
+                state_sets = [state_at[pid] for pid in prev_ids if pid in state_at]
                 if len(state_sets) < 2:
-                    state_before = (
-                        dict(state_sets[0]) if state_sets else {}
-                    )
+                    state_before = dict(state_sets[0]) if state_sets else {}
                 else:
                     store = TestStateResolutionStore(event_map)
                     state_before = self.successResultOf(
@@ -1524,9 +1516,7 @@ class DAGReplayTestCase(unittest.TestCase):
         if bot_key in correct_state:
             bev = event_map[correct_state[bot_key]]
             print(
-                f"  Bot membership: "
-                f"{bev.content.get('membership')} "
-                f"(depth={bev.depth})"
+                f"  Bot membership: {bev.content.get('membership')} (depth={bev.depth})"
             )
 
         # Phase 2: Create CORRUPTED state (remove bot membership)
@@ -1538,10 +1528,7 @@ class DAGReplayTestCase(unittest.TestCase):
         )
         had_bot = True
         del corrupted_state[bot_key]
-        print(
-            f"  Corrupted state: removed bot "
-            f"(had_bot={had_bot})"
-        )
+        print(f"  Corrupted state: removed bot (had_bot={had_bot})")
 
         # Reset state_at for the last event to use corrupted state
         state_at[last_pre.event_id] = corrupted_state
@@ -1558,15 +1545,9 @@ class DAGReplayTestCase(unittest.TestCase):
             elif len(prev_ids) == 1:
                 state_before = dict(state_at.get(prev_ids[0], {}))
             else:
-                state_sets = [
-                    state_at[pid]
-                    for pid in prev_ids
-                    if pid in state_at
-                ]
+                state_sets = [state_at[pid] for pid in prev_ids if pid in state_at]
                 if len(state_sets) < 2:
-                    state_before = (
-                        dict(state_sets[0]) if state_sets else {}
-                    )
+                    state_before = dict(state_sets[0]) if state_sets else {}
                 else:
                     store = TestStateResolutionStore(event_map)
                     state_before = self.successResultOf(
@@ -1584,10 +1565,7 @@ class DAGReplayTestCase(unittest.TestCase):
 
                     if bot_key in state_before and not recovery_depth:
                         recovery_depth = ev.depth
-                        print(
-                            f"\n  Bot RECOVERED at depth "
-                            f"{ev.depth} via state res!"
-                        )
+                        print(f"\n  Bot RECOVERED at depth {ev.depth} via state res!")
 
             state_after = dict(state_before)
             if ev.is_state():
@@ -1596,29 +1574,20 @@ class DAGReplayTestCase(unittest.TestCase):
 
         final_state = state_at.get(events[-1].event_id, {})
 
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print("CATGIRL SIMULATION:")
-        print(
-            f"  Bot removed from state at depth "
-            f"{catgirl_join_depth}"
-        )
+        print(f"  Bot removed from state at depth {catgirl_join_depth}")
         if recovery_depth:
-            print(
-                f"  Bot RECOVERED at depth {recovery_depth} "
-                f"via state resolution"
-            )
+            print(f"  Bot RECOVERED at depth {recovery_depth} via state resolution")
         else:
             print("  Bot NEVER recovered")
         bot_final = final_state.get(bot_key)
         if bot_final:
             bev = event_map[bot_final]
-            print(
-                f"  Final: {bev.content.get('membership')} "
-                f"(depth={bev.depth})"
-            )
+            print(f"  Final: {bev.content.get('membership')} (depth={bev.depth})")
         else:
             print("  Final: NOT IN STATE")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
         # V2 state res shouldn't recover dropped member from corrupt state.
         # The member is absent from affected server's view and never enters
@@ -1627,4 +1596,3 @@ class DAGReplayTestCase(unittest.TestCase):
             recovery_depth,
             "Bot should not have been recovered via V2 state resolution",
         )
-
