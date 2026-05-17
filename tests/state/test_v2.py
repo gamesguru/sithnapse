@@ -19,6 +19,8 @@
 #
 
 import itertools
+import json
+import os
 from typing import (
     Collection,
     Iterable,
@@ -33,7 +35,7 @@ from twisted.internet import defer
 from synapse.api.constants import EventTypes, JoinRules, Membership
 from synapse.api.room_versions import RoomVersions
 from synapse.event_auth import auth_types_for_event
-from synapse.events import EventBase
+from synapse.events import EventBase, make_event_from_dict
 from synapse.state.v2 import (
     _get_auth_chain_difference,
     _get_power_level_for_sender,
@@ -453,6 +455,202 @@ class StateTestCase(unittest.TestCase):
         # power levels. Note that without mainline ordering we'd pick T4 due to
         # it being sent *after* T3.
         expected_state_ids = ["T3", "PA2"]
+
+        self.do_check(events, edges, expected_state_ids)
+
+    def test_state_reset_join_rules_eviction(self) -> None:
+        """Reproduces a V2 state reset bug observed in the wild (catgirl.cloud).
+
+        Scenario: Eve joins a public room, then the room switches to
+        knock_restricted. Later, a fork creates a conflict where one arm
+        doesn't include Eve's membership (e.g., a server that was offline
+        during Eve's join).
+
+        In V2 state res, Eve's join is now in the conflicted set. The
+        supplemental merge evaluates it against the resolved state, which
+        has join_rules=knock_restricted. Eve's join fails auth (no invite)
+        and is incorrectly evicted from state.
+
+        This is a known V2 deficiency that V2.1 fixes by skipping the
+        supplemental merge. Eve joined legitimately under public rules and
+        should remain in state regardless of later join_rules changes.
+        """
+        events = [
+            # Eve joins under the initial public join rules.
+            FakeEvent(
+                id="ME",
+                sender=EVELYN,
+                type=EventTypes.Member,
+                state_key=EVELYN,
+                content=MEMBERSHIP_CONTENT_JOIN,
+            ),
+            # Alice changes join rules to knock_restricted.
+            FakeEvent(
+                id="JR2",
+                sender=ALICE,
+                type=EventTypes.JoinRules,
+                state_key="",
+                content={
+                    "join_rule": "knock_restricted",
+                    "allow": [
+                        {
+                            "room_id": "!other:example.com",
+                            "type": "m.room_membership",
+                        }
+                    ],
+                },
+            ),
+            # Normal activity continues on the main fork.
+            FakeEvent(
+                id="MZ2",
+                sender=ZARA,
+                type=EventTypes.Message,
+                state_key=None,
+                content={},
+            ),
+            # A stale server sends an event forking from before Eve joined.
+            # This server's state does NOT include Eve's membership.
+            FakeEvent(
+                id="MZ3",
+                sender=ZARA,
+                type=EventTypes.Message,
+                state_key=None,
+                content={},
+            ),
+        ]
+
+        # Main branch: START -> ME -> JR2 -> MZ2 -> END
+        # Stale fork:  START -> MZ3 -> END
+        # The fork at END merges. State A has Eve joined + knock_restricted.
+        # State B (stale fork) has neither Eve's join nor the JR change.
+        # Eve's membership and JR are both conflicted.
+        # V2 resolves JR first (control event), picks JR2 (newer ts).
+        # Then evaluates ME against resolved state with knock_restricted.
+        # Eve's join fails auth → evicted. This is the bug.
+        edges = [
+            ["END", "MZ2", "JR2", "ME", "START"],
+            ["END", "MZ3", "START"],
+        ]
+
+        # BUG: V2 evicts Eve. The expected_state_ids only includes JR2.
+        # Eve's membership (ME) is missing because the supplemental merge
+        # caused her join to fail auth against knock_restricted.
+        # In a correct implementation (V2.1), ME would also be present.
+        expected_state_ids = ["JR2"]
+
+        self.do_check(events, edges, expected_state_ids)
+
+    def test_v2_self_corrects_corrupted_state(self) -> None:
+        """Proves that a server with corrupted state (missing a valid member)
+        will self-correct when merging with a healthy server.
+
+        Server A (Catgirl) has corrupted state: missing Eve's public join.
+        Server B (Healthy) has correct state: includes Eve.
+
+        When the two forks merge at END, Eve's join is in the conflicted
+        set. Because the room is public, Eve's join passes auth checks
+        in the supplemental merge, and she is RESTORED to the final state.
+
+        This is the proof that heal-room / state re-resolution works.
+        """
+        events = [
+            # Eve joins the public room (only visible to healthy server).
+            FakeEvent(
+                id="ME",
+                sender=EVELYN,
+                type=EventTypes.Member,
+                state_key=EVELYN,
+                content=MEMBERSHIP_CONTENT_JOIN,
+            ),
+            # Activity on the healthy fork (after Eve joined).
+            FakeEvent(
+                id="MZ2",
+                sender=ZARA,
+                type=EventTypes.Message,
+                state_key=None,
+                content={},
+            ),
+            # Activity on the corrupted fork (doesn't know about Eve).
+            FakeEvent(
+                id="MB2",
+                sender=BOB,
+                type=EventTypes.Message,
+                state_key=None,
+                content={},
+            ),
+        ]
+
+        # Healthy fork: START -> ME -> MZ2 -> END (has Eve)
+        # Corrupted fork: START -> MB2 -> END (missing Eve)
+        # At END, Eve's membership is conflicted. Since join_rules=PUBLIC,
+        # the supplemental merge accepts Eve's join. She is RESTORED.
+        edges = [
+            ["END", "MZ2", "ME", "START"],
+            ["END", "MB2", "START"],
+        ]
+
+        # Eve's membership SHOULD be in the resolved state because
+        # her join passes auth under public join rules.
+        expected_state_ids = ["ME"]
+
+        self.do_check(events, edges, expected_state_ids)
+
+    def test_v2_unauthorized_event_not_restored(self) -> None:
+        """Proves that state resolution won't blindly restore an event
+        from a rogue server if that event is unauthorized.
+
+        Join rules are changed to INVITE-only. Then a rogue fork injects
+        Eve's join (which was never invited). When the forks merge, Eve's
+        unauthorized join fails auth checks in the supplemental merge and
+        is correctly EJECTED from the final state.
+
+        This is the safety proof: self-correction won't accidentally
+        restore forged or unauthorized memberships.
+        """
+        events = [
+            # Alice changes join rules to invite-only.
+            FakeEvent(
+                id="JR2",
+                sender=ALICE,
+                type=EventTypes.JoinRules,
+                state_key="",
+                content={"join_rule": JoinRules.INVITE},
+            ),
+            # Activity on the healthy fork (after JR change).
+            FakeEvent(
+                id="MZ2",
+                sender=ZARA,
+                type=EventTypes.Message,
+                state_key=None,
+                content={},
+            ),
+            # Rogue fork: Eve joins without an invite (unauthorized).
+            # This fork branches from before the JR change, so Eve's
+            # join was technically "valid" on the public fork. But after
+            # resolution, the JR2 invite-only rule wins (newer ts),
+            # and Eve's join fails auth against it.
+            FakeEvent(
+                id="ME",
+                sender=EVELYN,
+                type=EventTypes.Member,
+                state_key=EVELYN,
+                content=MEMBERSHIP_CONTENT_JOIN,
+            ),
+        ]
+
+        # Healthy fork: START -> JR2 -> MZ2 -> END (invite-only, no Eve)
+        # Rogue fork:   START -> ME -> END (Eve joins on public fork)
+        # At END, both JR2 and ME are conflicted. V2 resolves JR2 first
+        # (control event), then evaluates ME against invite-only rules.
+        # Eve's join fails auth (no invite) → EJECTED. Correct!
+        edges = [
+            ["END", "MZ2", "JR2", "START"],
+            ["END", "ME", "START"],
+        ]
+
+        # Eve is NOT in the expected state — her unauthorized join
+        # is correctly rejected by the supplemental merge.
+        expected_state_ids = ["JR2"]
 
         self.do_check(events, edges, expected_state_ids)
 
@@ -1095,3 +1293,327 @@ class TestStateResolutionStore:
                 conflicted_subgraph=set(),
             ),
         )
+
+
+class DAGReplayTestCase(unittest.TestCase):
+    """Replay a real-world JSONL DAG through V2 state resolution to reproduce
+    the catgirl.cloud state reset where @bot:nutra.tk was evicted."""
+
+    JSONL_PATH = os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "jsonl",
+        "remote-dag-tgmfqAWaBc978M80V9_nutra.tk-v11-merged.jsonl",
+    )
+
+    def _load_events(self, path: str) -> list[EventBase]:
+        """Load JSONL and convert to V1 FrozenEvents (preserves event_ids)."""
+        raw_events = []
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    raw_events.append(json.loads(line))
+
+        events = []
+        for raw in raw_events:
+            # V11 uses event_format 3 which rejects explicit event_ids.
+            # Use V1 format to preserve the original event_ids from the JSONL
+            # while still running V2 state resolution algorithm.
+            if raw.get("auth_events") and isinstance(raw["auth_events"][0], str):
+                raw["auth_events"] = [(eid, {}) for eid in raw["auth_events"]]
+            if raw.get("prev_events") and isinstance(raw["prev_events"][0], str):
+                raw["prev_events"] = [(eid, {}) for eid in raw["prev_events"]]
+            raw.pop("unsigned", None)
+            raw.pop("signatures", None)
+            raw.pop("hashes", None)
+            ev = make_event_from_dict(raw, room_version=RoomVersions.V1)
+            events.append(ev)
+
+        events.sort(key=lambda e: (e.depth, e.origin_server_ts))
+        return events
+
+    def test_replay_nutra_tk_dag_bot_membership(self) -> None:
+        """Replay the full nutra.tk DAG through V2 state resolution.
+
+        Traces @bot:nutra.tk's membership through every fork merge to find
+        the exact depth where the bot is evicted from resolved state.
+
+        This reproduces the state reset observed on catgirl.cloud where the
+        bot disappeared despite being a legitimate member.
+        """
+        if not os.path.exists(self.JSONL_PATH):
+            self.skipTest(f"JSONL not found: {self.JSONL_PATH}")
+
+        events = self._load_events(self.JSONL_PATH)
+        self.assertGreater(len(events), 0)
+
+        room_id = events[0].room_id
+        event_map: dict[str, EventBase] = {}
+        state_at: dict[str, StateMap[str]] = {}
+
+        target = "@bot:nutra.tk"
+        bot_key = (EventTypes.Member, target)
+        eviction_depths: list[int] = []
+        merge_count = 0
+
+        for ev in events:
+            event_map[ev.event_id] = ev
+            prev_ids = ev.prev_event_ids()
+
+            state_before: StateMap[str]
+            if not prev_ids:
+                state_before = {}
+            elif len(prev_ids) == 1:
+                state_before = dict(state_at.get(prev_ids[0], {}))
+            else:
+                # FORK MERGE - run V2 state resolution
+                state_sets = [
+                    state_at[pid] for pid in prev_ids if pid in state_at
+                ]
+                if len(state_sets) < 2:
+                    state_before = dict(state_sets[0]) if state_sets else {}
+                else:
+                    merge_count += 1
+                    bot_in_any = any(bot_key in s for s in state_sets)
+                    bot_in_all = all(bot_key in s for s in state_sets)
+
+                    store = TestStateResolutionStore(event_map)
+                    state_before = self.successResultOf(
+                        defer.ensureDeferred(
+                            resolve_events_with_store(
+                                FakeClock(),
+                                room_id,
+                                RoomVersions.V2,
+                                state_sets,
+                                event_map=event_map,
+                                state_res_store=store,
+                            )
+                        )
+                    )
+
+                    bot_survived = bot_key in state_before
+
+                    if bot_in_any and not bot_survived:
+                        print(
+                            f"\n!!! BOT EVICTED at depth {ev.depth} "
+                            f"(bot in {'all' if bot_in_all else 'some'} "
+                            f"forks) !!!"
+                        )
+                        for i, s in enumerate(state_sets):
+                            has = bot_key in s
+                            print(
+                                f"  Set {i}: {len(s)} keys, "
+                                f"bot={'YES' if has else 'NO'}"
+                            )
+                        jr = state_before.get((EventTypes.JoinRules, ""))
+                        if jr:
+                            jr_ev = event_map.get(jr)
+                            if jr_ev:
+                                print(
+                                    f"  Resolved join_rules: "
+                                    f"{jr_ev.content}"
+                                )
+                        eviction_depths.append(ev.depth)
+
+            state_after = dict(state_before)
+            if ev.is_state():
+                state_after[(ev.type, ev.state_key)] = ev.event_id
+            state_at[ev.event_id] = state_after
+
+        final_state = state_at.get(events[-1].event_id, {})
+
+        print(f"\n{'='*60}")
+        print(f"REPLAY: {len(events)} events, {merge_count} merges")
+        if eviction_depths:
+            print(f"BOT EVICTED at depths: {eviction_depths}")
+        else:
+            print("Bot was NEVER evicted with full DAG")
+        bot_final = final_state.get(bot_key)
+        if bot_final:
+            bev = event_map[bot_final]
+            print(
+                f"Final: {bev.content.get('membership')} (depth={bev.depth})"
+            )
+        else:
+            print("Final: NOT IN STATE")
+        print(f"{'='*60}")
+
+        # Bot should be in the final state
+        self.assertIn(bot_key, final_state)
+
+    def test_replay_nutra_tk_dag_catgirl_perspective(self) -> None:
+        """Simulate catgirl.cloud's state divergence.
+
+        catgirl.cloud joined at depth 336 and would have received state
+        via /state from whichever server it contacted. If that state
+        snapshot was incomplete (missing @bot:nutra.tk's membership),
+        all subsequent state resolution would build on that corrupted
+        foundation.
+
+        This test replays events starting from depth 336 with the bot
+        deliberately removed from the initial state, simulating the
+        exact divergence catgirl.cloud would experience.
+        """
+        if not os.path.exists(self.JSONL_PATH):
+            self.skipTest(f"JSONL not found: {self.JSONL_PATH}")
+
+        events = self._load_events(self.JSONL_PATH)
+        self.assertGreater(len(events), 0)
+
+        # First, replay the FULL DAG to get correct state at depth 336
+        room_id = events[0].room_id
+        event_map: dict[str, EventBase] = {}
+        state_at: dict[str, StateMap[str]] = {}
+
+        target = "@bot:nutra.tk"
+        bot_key = (EventTypes.Member, target)
+
+        # Phase 1: Build correct state up to depth 336
+        catgirl_join_depth = 336
+        pre_join_events = [
+            ev for ev in events if ev.depth <= catgirl_join_depth
+        ]
+        post_join_events = [
+            ev for ev in events if ev.depth > catgirl_join_depth
+        ]
+
+        for ev in pre_join_events:
+            event_map[ev.event_id] = ev
+            prev_ids = ev.prev_event_ids()
+
+            if not prev_ids:
+                state_before: StateMap[str] = {}
+            elif len(prev_ids) == 1:
+                state_before = dict(state_at.get(prev_ids[0], {}))
+            else:
+                state_sets = [
+                    state_at[pid]
+                    for pid in prev_ids
+                    if pid in state_at
+                ]
+                if len(state_sets) < 2:
+                    state_before = (
+                        dict(state_sets[0]) if state_sets else {}
+                    )
+                else:
+                    store = TestStateResolutionStore(event_map)
+                    state_before = self.successResultOf(
+                        defer.ensureDeferred(
+                            resolve_events_with_store(
+                                FakeClock(),
+                                room_id,
+                                RoomVersions.V2,
+                                state_sets,
+                                event_map=event_map,
+                                state_res_store=store,
+                            )
+                        )
+                    )
+
+            state_after = dict(state_before)
+            if ev.is_state():
+                state_after[(ev.type, ev.state_key)] = ev.event_id
+            state_at[ev.event_id] = state_after
+
+        # Get the state at the last pre-join event
+        last_pre = pre_join_events[-1]
+        correct_state = state_at[last_pre.event_id]
+        print(f"\nCorrect state at depth {catgirl_join_depth}:")
+        print(f"  Bot in state: {bot_key in correct_state}")
+        if bot_key in correct_state:
+            bev = event_map[correct_state[bot_key]]
+            print(
+                f"  Bot membership: "
+                f"{bev.content.get('membership')} "
+                f"(depth={bev.depth})"
+            )
+
+        # Phase 2: Create CORRUPTED state (remove bot membership)
+        corrupted_state = dict(correct_state)
+        had_bot = bot_key in corrupted_state
+        if had_bot:
+            del corrupted_state[bot_key]
+        print(
+            f"  Corrupted state: removed bot "
+            f"(had_bot={had_bot})"
+        )
+
+        # Reset state_at for the last event to use corrupted state
+        state_at[last_pre.event_id] = corrupted_state
+
+        # Phase 3: Replay remaining events with corrupted state
+        eviction_count = 0
+        recovery_depth = None
+
+        for ev in post_join_events:
+            event_map[ev.event_id] = ev
+            prev_ids = ev.prev_event_ids()
+
+            if not prev_ids:
+                state_before = {}
+            elif len(prev_ids) == 1:
+                state_before = dict(state_at.get(prev_ids[0], {}))
+            else:
+                state_sets = [
+                    state_at[pid]
+                    for pid in prev_ids
+                    if pid in state_at
+                ]
+                if len(state_sets) < 2:
+                    state_before = (
+                        dict(state_sets[0]) if state_sets else {}
+                    )
+                else:
+                    store = TestStateResolutionStore(event_map)
+                    state_before = self.successResultOf(
+                        defer.ensureDeferred(
+                            resolve_events_with_store(
+                                FakeClock(),
+                                room_id,
+                                RoomVersions.V2,
+                                state_sets,
+                                event_map=event_map,
+                                state_res_store=store,
+                            )
+                        )
+                    )
+
+                    if bot_key in state_before and not recovery_depth:
+                        recovery_depth = ev.depth
+                        print(
+                            f"\n  Bot RECOVERED at depth "
+                            f"{ev.depth} via state res!"
+                        )
+
+            state_after = dict(state_before)
+            if ev.is_state():
+                state_after[(ev.type, ev.state_key)] = ev.event_id
+            state_at[ev.event_id] = state_after
+
+        final_state = state_at.get(events[-1].event_id, {})
+
+        print(f"\n{'='*60}")
+        print("CATGIRL SIMULATION:")
+        print(
+            f"  Bot removed from state at depth "
+            f"{catgirl_join_depth}"
+        )
+        if recovery_depth:
+            print(
+                f"  Bot RECOVERED at depth {recovery_depth} "
+                f"via state resolution"
+            )
+        else:
+            print("  Bot NEVER recovered")
+        bot_final = final_state.get(bot_key)
+        if bot_final:
+            bev = event_map[bot_final]
+            print(
+                f"  Final: {bev.content.get('membership')} "
+                f"(depth={bev.depth})"
+            )
+        else:
+            print("  Final: NOT IN STATE")
+        print(f"{'='*60}")
+

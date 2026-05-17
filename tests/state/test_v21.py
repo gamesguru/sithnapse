@@ -55,6 +55,7 @@ ROOM_ID = "!test:example.com"
 MEMBERSHIP_CONTENT_JOIN = {"membership": Membership.JOIN}
 MEMBERSHIP_CONTENT_INVITE = {"membership": Membership.INVITE}
 MEMBERSHIP_CONTENT_LEAVE = {"membership": Membership.LEAVE}
+MEMBERSHIP_CONTENT_BAN = {"membership": Membership.BAN}
 
 
 ORIGIN_SERVER_TS = 0
@@ -619,6 +620,218 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
                 e10_me,
             ],
             expected,
+        )
+
+    def test_v21_cve_auth_bypass_without_supplemental_merge(self) -> None:
+        """
+        SECURITY TEST: Proves that the V2.1 state resolution prevents a
+        Power Level Replay Attack.
+
+        Scenario: Alice creates a room, joins, sets up power levels giving
+        Eve admin (PL 100), then demotes Eve to PL 0. Eve crafts a topic
+        change citing the OLD power levels (where she was still admin) in
+        her auth_events, attempting to bypass the demotion.
+
+        V2.1 must resolve the power levels first (control pass picks the
+        demotion), then evaluate Eve's topic against the resolved PL state.
+        Eve's topic must be rejected because she is PL 0 under the resolved
+        state, regardless of which auth_events she declares.
+        """
+        # 1. Room setup.
+        e1_create = self.create_event(
+            EventTypes.Create,
+            "",
+            sender=ALICE,
+            content={"creator": ALICE},
+            auth_events=[],
+        )
+        e2_ma = self.create_event(
+            EventTypes.Member,
+            ALICE,
+            sender=ALICE,
+            content=MEMBERSHIP_CONTENT_JOIN,
+            auth_events=[],
+            room_id=e1_create.room_id,
+        )
+        e3_eve_join = self.create_event(
+            EventTypes.Member,
+            EVELYN,
+            sender=EVELYN,
+            content=MEMBERSHIP_CONTENT_JOIN,
+            auth_events=[],
+            room_id=e1_create.room_id,
+        )
+
+        # 2. Alice gives Eve admin (PL 100).
+        e4_pl1 = self.create_event(
+            EventTypes.PowerLevels,
+            "",
+            sender=ALICE,
+            content={"users": {EVELYN: 100}},
+            auth_events=[e2_ma.event_id],
+            room_id=e1_create.room_id,
+        )
+
+        # 3. Alice demotes Eve to PL 0.
+        e5_pl2 = self.create_event(
+            EventTypes.PowerLevels,
+            "",
+            sender=ALICE,
+            content={"users": {EVELYN: 0}},
+            auth_events=[e2_ma.event_id, e4_pl1.event_id],
+            room_id=e1_create.room_id,
+        )
+
+        # Alice sets the legitimate topic.
+        e6_topic_safe = self.create_event(
+            EventTypes.Topic,
+            "",
+            sender=ALICE,
+            content={"topic": "Safe Room"},
+            auth_events=[e2_ma.event_id, e5_pl2.event_id],
+            room_id=e1_create.room_id,
+        )
+
+        # 4. THE ATTACK: Eve changes the topic, maliciously citing
+        #    the old PL (e4_pl1) where she was still admin.
+        e7_attack = self.create_event(
+            EventTypes.Topic,
+            "",
+            sender=EVELYN,
+            content={"topic": "Hacked by Eve"},
+            auth_events=[e3_eve_join.event_id, e4_pl1.event_id],
+            room_id=e1_create.room_id,
+        )
+
+        state_a: StateMap[str] = {
+            (EventTypes.Create, ""): e1_create.event_id,
+            (EventTypes.Member, ALICE): e2_ma.event_id,
+            (EventTypes.Member, EVELYN): e3_eve_join.event_id,
+            (EventTypes.PowerLevels, ""): e5_pl2.event_id,
+            (EventTypes.Topic, ""): e6_topic_safe.event_id,
+        }
+
+        # Malicious fork: cites old PL where Eve was admin.
+        state_b: StateMap[str] = {
+            (EventTypes.Create, ""): e1_create.event_id,
+            (EventTypes.Member, ALICE): e2_ma.event_id,
+            (EventTypes.Member, EVELYN): e3_eve_join.event_id,
+            (EventTypes.PowerLevels, ""): e4_pl1.event_id,
+            (EventTypes.Topic, ""): e7_attack.event_id,
+        }
+
+        # Expected secure outcome:
+        # e5_pl2 wins the control pass (newer timestamp).
+        # Eve is PL 0 under e5_pl2 -> her topic fails auth -> Alice's topic wins.
+        expected_secure_state: StateMap[str] = {
+            (EventTypes.Create, ""): e1_create.event_id,
+            (EventTypes.Member, ALICE): e2_ma.event_id,
+            (EventTypes.Member, EVELYN): e3_eve_join.event_id,
+            (EventTypes.PowerLevels, ""): e5_pl2.event_id,
+            (EventTypes.Topic, ""): e6_topic_safe.event_id,
+        }
+
+        self.get_resolution_and_verify_expected(
+            [state_a, state_b],
+            [e1_create, e2_ma, e3_eve_join, e4_pl1, e5_pl2, e6_topic_safe, e7_attack],
+            expected_secure_state,
+        )
+
+    def test_v21_self_corrects_corrupted_state(self) -> None:
+        """
+        Proves that a server with "stuck" or corrupted state will naturally
+        self-correct and converge with the rest of the network as soon as a
+        new federated event triggers a state merge.
+
+        State resolution is a pure function of the DAG. If Server A has
+        broken state and Server B has the correct state, merging the two
+        forks forces re-evaluation against the full DAG, producing the
+        mathematically correct result.
+        """
+        # 1. Base events
+        e1_create = self.create_event(
+            EventTypes.Create,
+            "",
+            sender=ALICE,
+            content={"creator": ALICE},
+            auth_events=[],
+        )
+        e2_ma = self.create_event(
+            EventTypes.Member,
+            ALICE,
+            sender=ALICE,
+            content=MEMBERSHIP_CONTENT_JOIN,
+            auth_events=[],
+            room_id=e1_create.room_id,
+        )
+        e3_pl = self.create_event(
+            EventTypes.PowerLevels,
+            "",
+            sender=ALICE,
+            content={"users": {BOB: 50}},
+            auth_events=[e2_ma.event_id],
+            room_id=e1_create.room_id,
+        )
+        e4_eve_join = self.create_event(
+            EventTypes.Member,
+            EVELYN,
+            sender=EVELYN,
+            content=MEMBERSHIP_CONTENT_JOIN,
+            auth_events=[e3_pl.event_id],
+            room_id=e1_create.room_id,
+        )
+        e5_bob_join = self.create_event(
+            EventTypes.Member,
+            BOB,
+            sender=BOB,
+            content=MEMBERSHIP_CONTENT_JOIN,
+            auth_events=[e3_pl.event_id],
+            room_id=e1_create.room_id,
+        )
+
+        # Bob (legitimate mod) bans Eve.
+        e6_ban_eve = self.create_event(
+            EventTypes.Member,
+            EVELYN,
+            sender=BOB,
+            content=MEMBERSHIP_CONTENT_BAN,
+            auth_events=[e5_bob_join.event_id, e3_pl.event_id, e4_eve_join.event_id],
+            room_id=e1_create.room_id,
+        )
+
+        # Server A (Buggy/Corrupted): somehow lost Bob's ban during a
+        # previous bad resolution. Eve is still shown as joined.
+        corrupted_state_server_a: StateMap[str] = {
+            (EventTypes.Create, ""): e1_create.event_id,
+            (EventTypes.Member, ALICE): e2_ma.event_id,
+            (EventTypes.PowerLevels, ""): e3_pl.event_id,
+            (EventTypes.Member, BOB): e5_bob_join.event_id,
+            (EventTypes.Member, EVELYN): e4_eve_join.event_id,
+        }
+
+        # Server B (Healthy): has the correct state with Eve banned.
+        healthy_state_server_b: StateMap[str] = {
+            (EventTypes.Create, ""): e1_create.event_id,
+            (EventTypes.Member, ALICE): e2_ma.event_id,
+            (EventTypes.PowerLevels, ""): e3_pl.event_id,
+            (EventTypes.Member, BOB): e5_bob_join.event_id,
+            (EventTypes.Member, EVELYN): e6_ban_eve.event_id,
+        }
+
+        # When resolving the forks, V2.1 evaluates e6_ban_eve natively.
+        # Bob is PL 50, the ban succeeds, the room heals.
+        expected_healed_state: StateMap[str] = {
+            (EventTypes.Create, ""): e1_create.event_id,
+            (EventTypes.Member, ALICE): e2_ma.event_id,
+            (EventTypes.PowerLevels, ""): e3_pl.event_id,
+            (EventTypes.Member, BOB): e5_bob_join.event_id,
+            (EventTypes.Member, EVELYN): e6_ban_eve.event_id,
+        }
+
+        self.get_resolution_and_verify_expected(
+            [corrupted_state_server_a, healthy_state_server_b],
+            [e1_create, e2_ma, e3_pl, e4_eve_join, e5_bob_join, e6_ban_eve],
+            expected_healed_state,
         )
 
     async def _get_auth_difference_and_conflicted_subgraph(
