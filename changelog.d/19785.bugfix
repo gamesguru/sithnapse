@@ -1,0 +1,1 @@
+Fix V2.1 state resolution (MSC4297) supplemental merge poisoning auth chain state during fork resolution, preventing membership resets in federated V12+ rooms.
