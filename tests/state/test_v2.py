@@ -1360,9 +1360,7 @@ class DAGReplayTestCase(unittest.TestCase):
                 state_before = dict(state_at.get(prev_ids[0], {}))
             else:
                 # FORK MERGE - run V2 state resolution
-                state_sets = [
-                    state_at[pid] for pid in prev_ids if pid in state_at
-                ]
+                state_sets = [state_at[pid] for pid in prev_ids if pid in state_at]
                 if len(state_sets) < 2:
                     state_before = dict(state_sets[0]) if state_sets else {}
                 else:
@@ -1402,10 +1400,7 @@ class DAGReplayTestCase(unittest.TestCase):
                         if jr:
                             jr_ev = event_map.get(jr)
                             if jr_ev:
-                                print(
-                                    f"  Resolved join_rules: "
-                                    f"{jr_ev.content}"
-                                )
+                                print(f"  Resolved join_rules: {jr_ev.content}")
                         eviction_depths.append(ev.depth)
 
             state_after = dict(state_before)

@@ -1098,7 +1098,7 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
                 resolve_events_with_store(
                     FakeClock(),
                     room_id,
-                    RoomVersions.HydraV11,
+                    RoomVersions.V12,
                     state_maps,
                     event_map=event_map,
                     state_res_store=store,
@@ -1170,5 +1170,5 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
             pdu["room_id"] = room_id
         return event_from_pdu_json(
             pdu,
-            RoomVersions.HydraV11,
+            RoomVersions.V12,
         )
