@@ -1717,3 +1717,82 @@ class DAGReplayTestCase(unittest.TestCase):
             final_state,
             "Bot should be in final state after V2.1 self-healing",
         )
+
+        # Phase 4: Prove this ONLY works because of the V2.1 code change.
+        # Re-run the exact same corrupted state through V2 resolution —
+        # the bot should NOT recover, proving V2.1 is the differentiator.
+        event_map_v2: dict[str, EventBase] = {}
+        state_at_v2: dict[str, StateMap[str]] = {}
+
+        for ev in pre_join_events:
+            event_map_v2[ev.event_id] = ev
+            prev_ids = ev.prev_event_ids()
+            if not prev_ids:
+                sb: StateMap[str] = {}
+            elif len(prev_ids) == 1:
+                sb = dict(state_at_v2.get(prev_ids[0], {}))
+            else:
+                sets = [state_at_v2[p] for p in prev_ids if p in state_at_v2]
+                if len(sets) < 2:
+                    sb = dict(sets[0]) if sets else {}
+                else:
+                    sb = self.successResultOf(
+                        defer.ensureDeferred(
+                            resolve_events_with_store(
+                                FakeClock(),
+                                room_id,
+                                RoomVersions.V2,
+                                sets,
+                                event_map=event_map_v2,
+                                state_res_store=TestStateResolutionStore(event_map_v2),
+                            )
+                        )
+                    )
+            sa = dict(sb)
+            if ev.is_state():
+                sa[(ev.type, ev.state_key)] = ev.event_id
+            state_at_v2[ev.event_id] = sa
+
+        # Apply the same corruption
+        corrupted_v2 = dict(state_at_v2[last_pre.event_id])
+        del corrupted_v2[bot_key]
+        state_at_v2[last_pre.event_id] = corrupted_v2
+
+        recovery_v2 = None
+        for ev in post_join_events:
+            event_map_v2[ev.event_id] = ev
+            prev_ids = ev.prev_event_ids()
+            if not prev_ids:
+                sb = {}
+            elif len(prev_ids) == 1:
+                sb = dict(state_at_v2.get(prev_ids[0], {}))
+            else:
+                sets = [state_at_v2[p] for p in prev_ids if p in state_at_v2]
+                if len(sets) < 2:
+                    sb = dict(sets[0]) if sets else {}
+                else:
+                    sb = self.successResultOf(
+                        defer.ensureDeferred(
+                            resolve_events_with_store(
+                                FakeClock(),
+                                room_id,
+                                RoomVersions.V2,
+                                sets,
+                                event_map=event_map_v2,
+                                state_res_store=TestStateResolutionStore(event_map_v2),
+                            )
+                        )
+                    )
+                    if bot_key in sb and not recovery_v2:
+                        recovery_v2 = ev.depth
+            sa = dict(sb)
+            if ev.is_state():
+                sa[(ev.type, ev.state_key)] = ev.event_id
+            state_at_v2[ev.event_id] = sa
+
+        # V2 does NOT recover — proving the self-healing is solely
+        # due to the V2.1 code change in _iterative_auth_checks.
+        self.assertIsNone(
+            recovery_v2,
+            "V2 must NOT recover the bot — only V2.1 self-heals",
+        )
