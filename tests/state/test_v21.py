@@ -474,14 +474,14 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
 
         Scenario: Creator creates a room, gives Alice PL 100. Alice promotes
         Bob to PL 50, Bob promotes Charlie to PL 50 (PL3). Eve joins citing
-        the ORIGINAL power levels (PL1) in her auth_events — this is "dodgy"
+        the ORIGINAL power levels (PL1) in her auth_events -- this is "dodgy"
         and creates a conflicted subgraph where one side has PL1 and the other
         has PL3.
 
         State resolution must preserve PL3 (with bob:50, charlie:50), not
         regress to PL1 (empty users dict).
         """
-        # 1. Alice creates the room.
+        # Alice creates the room.
         e1_create = self.create_event(
             EventTypes.Create,
             "",
@@ -489,7 +489,7 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
             content={"creator": ALICE},
             auth_events=[],
         )
-        # 2. Alice joins.
+        # Alice joins.
         e2_ma = self.create_event(
             EventTypes.Member,
             ALICE,
@@ -498,7 +498,7 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
             auth_events=[],
             room_id=e1_create.room_id,
         )
-        # 3. Initial power levels (alice is creator, implicit PL 100 in V12).
+        # Initial power levels (alice is creator, implicit PL 100 in V12).
         e3_power1 = self.create_event(
             EventTypes.PowerLevels,
             "",
@@ -507,7 +507,7 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
             auth_events=[e2_ma.event_id],
             room_id=e1_create.room_id,
         )
-        # 4. Join rules = public.
+        # Join rules = public.
         e4_jr = self.create_event(
             EventTypes.JoinRules,
             "",
@@ -516,7 +516,7 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
             auth_events=[e2_ma.event_id, e3_power1.event_id],
             room_id=e1_create.room_id,
         )
-        # 5. Bob joins.
+        # Bob joins.
         e5_mb = self.create_event(
             EventTypes.Member,
             BOB,
@@ -525,7 +525,7 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
             auth_events=[e3_power1.event_id, e4_jr.event_id],
             room_id=e1_create.room_id,
         )
-        # 6. Charlie joins.
+        # Charlie joins.
         e6_mc = self.create_event(
             EventTypes.Member,
             CHARLIE,
@@ -534,7 +534,7 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
             auth_events=[e3_power1.event_id, e4_jr.event_id],
             room_id=e1_create.room_id,
         )
-        # 7. Alice promotes Bob to PL 50 (alice omitted — implicit PL 100).
+        # Alice PROMOTES Bob to PL 50 (alice omitted - implicit PL 100).
         e7_power2 = self.create_event(
             EventTypes.PowerLevels,
             "",
@@ -543,7 +543,7 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
             auth_events=[e2_ma.event_id, e3_power1.event_id],
             room_id=e1_create.room_id,
         )
-        # 8. Bob promotes Charlie to PL 50.
+        # Bob promotes Charlie to PL 50.
         e8_power3 = self.create_event(
             EventTypes.PowerLevels,
             "",
@@ -552,7 +552,7 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
             auth_events=[e5_mb.event_id, e7_power2.event_id],
             room_id=e1_create.room_id,
         )
-        # 9. Zara joins citing PL3 (correct).
+        # Zara joins, citing PL3 (correct).
         e9_mz = self.create_event(
             EventTypes.Member,
             ZARA,
@@ -561,7 +561,7 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
             auth_events=[e8_power3.event_id, e4_jr.event_id],
             room_id=e1_create.room_id,
         )
-        # 10. Eve joins citing PL1 (DODGY — old power levels).
+        # Eve joins, citing PL1 (DODGY - old power levels).
         e10_me = self.create_event(
             EventTypes.Member,
             EVELYN,
@@ -570,6 +570,8 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
             auth_events=[e3_power1.event_id, e4_jr.event_id],
             room_id=e1_create.room_id,
         )
+
+        # -- END SETUP --
 
         # The "dodgy" state fork: has Eve with old PL1.
         dodgy_state: StateMap[str] = {
@@ -637,7 +639,7 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
         Eve's topic must be rejected because she is PL 0 under the resolved
         state, regardless of which auth_events she declares.
         """
-        # 1. Room setup.
+        # Room setup.
         e1_create = self.create_event(
             EventTypes.Create,
             "",
@@ -662,7 +664,7 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
             room_id=e1_create.room_id,
         )
 
-        # 2. Alice gives Eve admin (PL 100).
+        # Alice gives Eve admin (PL 100).
         e4_pl1 = self.create_event(
             EventTypes.PowerLevels,
             "",
@@ -672,7 +674,7 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
             room_id=e1_create.room_id,
         )
 
-        # 3. Alice demotes Eve to PL 0.
+        # Alice DEMOTES Eve to PL 0.
         e5_pl2 = self.create_event(
             EventTypes.PowerLevels,
             "",
@@ -692,8 +694,8 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
             room_id=e1_create.room_id,
         )
 
-        # 4. THE ATTACK: Eve changes the topic, maliciously citing
-        #    the old PL (e4_pl1) where she was still admin.
+        # THE ATTACK: Eve changes the topic, maliciously citing
+        # the old PL (e4_pl1) where she was still admin.
         e7_attack = self.create_event(
             EventTypes.Topic,
             "",
@@ -748,7 +750,7 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
         forks forces re-evaluation against the full DAG, producing the
         mathematically correct result.
         """
-        # 1. Base events
+        # Base events
         e1_create = self.create_event(
             EventTypes.Create,
             "",
@@ -832,6 +834,162 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
             [corrupted_state_server_a, healthy_state_server_b],
             [e1_create, e2_ma, e3_pl, e4_eve_join, e5_bob_join, e6_ban_eve],
             expected_healed_state,
+        )
+
+    def test_incomplete_dag_picks_stale_membership(self) -> None:
+        """
+        Proves that incomplete local DAG data causes state resolution to pick
+        a stale membership event, and that providing the complete event set
+        self-corrects to the latest join with updated profile info.
+
+        Real-world scenario (earthtopic c10y):
+        - User joins (join1: plain displayname, no avatar)
+        - User leaves
+        - User rejoins (join2: updated displayname + avatar_url)
+        - Server A rejected join2 during ingestion (e.g. auth chain cascade)
+        - Server A resolves with incomplete data → picks join1 (stale profile)
+        - Server B has complete data → picks join2 (correct profile)
+        - When A gets the missing event, resolution self-corrects
+        """
+        # Room setup
+        e1_create = self.create_event(
+            EventTypes.Create,
+            "",
+            sender=ALICE,
+            content={"creator": ALICE},
+            auth_events=[],
+        )
+        e2_ma = self.create_event(
+            EventTypes.Member,
+            ALICE,
+            sender=ALICE,
+            content=MEMBERSHIP_CONTENT_JOIN,
+            auth_events=[],
+            room_id=e1_create.room_id,
+        )
+        e3_pl = self.create_event(
+            EventTypes.PowerLevels,
+            "",
+            sender=ALICE,
+            content={"users": {}},
+            auth_events=[e2_ma.event_id],
+            room_id=e1_create.room_id,
+        )
+        e4_jr = self.create_event(
+            EventTypes.JoinRules,
+            "",
+            sender=ALICE,
+            content={"join_rule": JoinRules.PUBLIC},
+            auth_events=[e2_ma.event_id, e3_pl.event_id],
+            room_id=e1_create.room_id,
+        )
+
+        # Eve joins with plain profile (join1)
+        e5_eve_join1 = self.create_event(
+            EventTypes.Member,
+            EVELYN,
+            sender=EVELYN,
+            content={
+                "membership": Membership.JOIN,
+                "displayname": "Eve",
+            },
+            auth_events=[e3_pl.event_id, e4_jr.event_id],
+            room_id=e1_create.room_id,
+        )
+
+        # Eve leaves
+        e6_eve_leave = self.create_event(
+            EventTypes.Member,
+            EVELYN,
+            sender=EVELYN,
+            content=MEMBERSHIP_CONTENT_LEAVE,
+            auth_events=[e3_pl.event_id, e5_eve_join1.event_id],
+            room_id=e1_create.room_id,
+        )
+
+        # Eve REJOINS with updated profile (join2)
+        e7_eve_join2 = self.create_event(
+            EventTypes.Member,
+            EVELYN,
+            sender=EVELYN,
+            content={
+                "membership": Membership.JOIN,
+                "displayname": "Eve [Updated]",
+                "avatar_url": "mxc://example.com/avatar",
+            },
+            auth_events=[e3_pl.event_id, e4_jr.event_id, e6_eve_leave.event_id],
+            room_id=e1_create.room_id,
+        )
+
+        # --- Test 1: Incomplete DAG (join2 missing, simulating rejection) ---
+        # Server A only knows about join1 and the leave. The rejoin (join2)
+        # was rejected during ingestion due to an auth chain cascade failure.
+        incomplete_state_a: StateMap[str] = {
+            (EventTypes.Create, ""): e1_create.event_id,
+            (EventTypes.Member, ALICE): e2_ma.event_id,
+            (EventTypes.PowerLevels, ""): e3_pl.event_id,
+            (EventTypes.JoinRules, ""): e4_jr.event_id,
+            (EventTypes.Member, EVELYN): e5_eve_join1.event_id,
+        }
+
+        # Server B saw the leave but not the rejoin (different fork)
+        incomplete_state_b: StateMap[str] = {
+            (EventTypes.Create, ""): e1_create.event_id,
+            (EventTypes.Member, ALICE): e2_ma.event_id,
+            (EventTypes.PowerLevels, ""): e3_pl.event_id,
+            (EventTypes.JoinRules, ""): e4_jr.event_id,
+            (EventTypes.Member, EVELYN): e6_eve_leave.event_id,
+        }
+
+        # With incomplete data, resolution picks join1 (stale profile, no avatar)
+        # because join2 is not available to the resolver.
+        stale_expected: StateMap[str] = {
+            (EventTypes.Create, ""): e1_create.event_id,
+            (EventTypes.Member, ALICE): e2_ma.event_id,
+            (EventTypes.PowerLevels, ""): e3_pl.event_id,
+            (EventTypes.JoinRules, ""): e4_jr.event_id,
+            (EventTypes.Member, EVELYN): e5_eve_join1.event_id,
+        }
+
+        # Without join2, resolution picks join1 over leave (join1 is in one
+        # fork's state, leave is in the other's - join1 wins the tiebreak).
+        self.get_resolution_and_verify_expected(
+            [incomplete_state_a, incomplete_state_b],
+            [e1_create, e2_ma, e3_pl, e4_jr, e5_eve_join1, e6_eve_leave],
+            stale_expected,
+        )
+
+        # --- Test 2: Complete DAG (join2 present) → self-corrects ---
+        # Now Server C has the complete data including join2.
+        complete_state_c: StateMap[str] = {
+            (EventTypes.Create, ""): e1_create.event_id,
+            (EventTypes.Member, ALICE): e2_ma.event_id,
+            (EventTypes.PowerLevels, ""): e3_pl.event_id,
+            (EventTypes.JoinRules, ""): e4_jr.event_id,
+            (EventTypes.Member, EVELYN): e7_eve_join2.event_id,
+        }
+
+        # With COMPLETE data, resolution picks join2 (latest, correct profile)
+        correct_expected: StateMap[str] = {
+            (EventTypes.Create, ""): e1_create.event_id,
+            (EventTypes.Member, ALICE): e2_ma.event_id,
+            (EventTypes.PowerLevels, ""): e3_pl.event_id,
+            (EventTypes.JoinRules, ""): e4_jr.event_id,
+            (EventTypes.Member, EVELYN): e7_eve_join2.event_id,
+        }
+
+        self.get_resolution_and_verify_expected(
+            [incomplete_state_a, complete_state_c],
+            [
+                e1_create,
+                e2_ma,
+                e3_pl,
+                e4_jr,
+                e5_eve_join1,
+                e6_eve_leave,
+                e7_eve_join2,
+            ],
+            correct_expected,
         )
 
     async def _get_auth_difference_and_conflicted_subgraph(
