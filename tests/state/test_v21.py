@@ -409,11 +409,7 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
             BOB,
             sender=BOB,
             content=MEMBERSHIP_CONTENT_JOIN,
-            auth_events=[
-                e1_create.event_id,
-                e3_power.event_id,
-                e4_jr1.event_id,
-            ],
+            auth_events=[e3_power.event_id, e4_jr1.event_id],
             room_id=e1_create.room_id,
         )
         # 6. Join rules = invite (fork).
@@ -703,11 +699,7 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
             "",
             sender=EVELYN,
             content={"topic": "Hacked by Eve"},
-            auth_events=[
-                e1_create.event_id,
-                e3_eve_join.event_id,
-                e4_pl1.event_id,
-            ],
+            auth_events=[e3_eve_join.event_id, e4_pl1.event_id],
             room_id=e1_create.room_id,
         )
 
