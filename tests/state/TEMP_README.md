@@ -10,14 +10,14 @@ members get evicted when join_rules change across a DAG fork.
 ### Mechanism
 
 1. Two forks diverge. Fork A changes `join_rules` from `public` →
-   `knock_restricted`. Fork B is a stale server that doesn't have the change.
+   `invite`. Fork B is a stale server that doesn't have the change.
 2. At merge, both `join_rules` and some memberships end up in the conflicted set.
 3. The control pass resolves `join_rules` first (power event) — picks
-   `knock_restricted` (newer timestamp).
+   `invite` (newer timestamp).
 4. The supplemental merge then **replaces** each leftover event's
-   `join_rules=public` auth reference with the resolved `knock_restricted`.
+   `join_rules=public` auth reference with the resolved `invite`.
 5. A member who joined legitimately under public rules now fails auth against
-   `knock_restricted` → **evicted from state**.
+   `invite` (not invited) → **evicted from state**.
 
 This is the root cause of the catgirl.cloud state reset where `@bot:nutra.tk`
 disappeared from room state despite being a legitimate member.
@@ -41,11 +41,11 @@ See `synapse/state/v2.py`, specifically `_iterative_auth_checks()`.
 
 Existing upstream tests plus:
 
-| Test                                      | What It Proves                                                                                                                                                            |
-| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `test_state_reset_join_rules_eviction`    | The supplemental merge bug: Eve joins a public room, JR changes to `knock_restricted`, a stale fork forces conflict. V2 evicts Eve. This is the documented V2 deficiency. |
-| `test_v2_self_corrects_corrupted_state`   | The supplemental merge _upside_: a missing member is restored when join_rules stay `PUBLIC`, because the supplemental merge re-injects the correct auth context.          |
-| `test_v2_unauthorized_event_not_restored` | Safety proof: an unauthorized join from a rogue fork is correctly rejected by the supplemental merge.                                                                     |
+| Test                                      | What It Proves                                                                                                                                                   |
+| ----------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `test_state_reset_join_rules_eviction`    | The supplemental merge bug: Eve joins a public room, JR changes to `invite`, a stale fork forces conflict. V2 evicts Eve. This is the documented V2 deficiency.  |
+| `test_v2_self_corrects_corrupted_state`   | The supplemental merge _upside_: a missing member is restored when join_rules stay `PUBLIC`, because the supplemental merge re-injects the correct auth context. |
+| `test_v2_unauthorized_event_not_restored` | Safety proof: an unauthorized join from a rogue fork is correctly rejected by the supplemental merge.                                                            |
 
 ### `test_v2.py::DAGReplayTestCase` — Real-World DAG Replay
 
@@ -152,11 +152,11 @@ is **permanently lost** — V2 state resolution never naturally surfaces a membe
 that isn't in the conflict set. The `Final: join (depth=820)` is from the bot
 re-joining later, not from state res recovering it.
 
-| Scenario                                                               | Bot evicted?      | Root cause                                                       |
-| ---------------------------------------------------------------------- | ----------------- | ---------------------------------------------------------------- |
-| Full DAG (omniscient view)                                             | No                | Supplemental merge works correctly with public JR                |
-| Catgirl perspective (corrupted initial state)                          | Yes — permanently | Missing from initial state, never enters conflict set            |
-| Synthetic fork with JR change (`test_state_reset_join_rules_eviction`) | Yes               | Supplemental merge poisons auth with resolved `knock_restricted` |
+| Scenario                                                               | Bot evicted?      | Root cause                                             |
+| ---------------------------------------------------------------------- | ----------------- | ------------------------------------------------------ |
+| Full DAG (omniscient view)                                             | No                | Supplemental merge works correctly with public JR      |
+| Catgirl perspective (corrupted initial state)                          | Yes — permanently | Missing from initial state, never enters conflict set  |
+| Synthetic fork with JR change (`test_state_reset_join_rules_eviction`) | Yes               | Supplemental merge poisons auth with resolved `invite` |
 
 The catgirl bug is two problems composing: (1) corrupted initial state from
 `/state` or `/send_join`, and (2) V2 has no mechanism to recover state that was

@@ -1075,8 +1075,10 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
         assert events[0].event_id not in got_auth_diff
 
         # now let's make the room exist on the DB, some queries rely on there being a row in
-        # the rooms table when persisting
-        try:
+        # the rooms table when persisting. Guard against duplicate inserts when a test calls
+        # this helper multiple times for the same room.
+        existing = self.get_success(self.store.get_room(room_id))
+        if not existing:
             self.get_success(
                 self.store.store_room(
                     room_id,
@@ -1085,8 +1087,6 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
                     events[0].room_version,
                 )
             )
-        except Exception:
-            pass  # Room already exists from a prior resolution pass
 
         def resolve_and_check() -> None:
             event_map = {ev.event_id: ev for ev in events}

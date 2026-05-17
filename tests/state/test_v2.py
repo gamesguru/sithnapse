@@ -462,13 +462,13 @@ class StateTestCase(unittest.TestCase):
         """Reproduces a V2 state reset bug observed in the wild (catgirl.cloud).
 
         Scenario: Eve joins a public room, then the room switches to
-        knock_restricted. Later, a fork creates a conflict where one arm
+        invite-only. Later, a fork creates a conflict where one arm
         doesn't include Eve's membership (e.g., a server that was offline
         during Eve's join).
 
         In V2 state res, Eve's join is now in the conflicted set. The
         supplemental merge evaluates it against the resolved state, which
-        has join_rules=knock_restricted. Eve's join fails auth (no invite)
+        has join_rules=invite. Eve's join fails auth (she was never invited)
         and is incorrectly evicted from state.
 
         This is a known V2 deficiency that V2.1 fixes by skipping the
@@ -484,21 +484,13 @@ class StateTestCase(unittest.TestCase):
                 state_key=EVELYN,
                 content=MEMBERSHIP_CONTENT_JOIN,
             ),
-            # Alice changes join rules to knock_restricted.
+            # Alice changes join rules to invite-only.
             FakeEvent(
                 id="JR2",
                 sender=ALICE,
                 type=EventTypes.JoinRules,
                 state_key="",
-                content={
-                    "join_rule": "knock_restricted",
-                    "allow": [
-                        {
-                            "room_id": "!other:example.com",
-                            "type": "m.room_membership",
-                        }
-                    ],
-                },
+                content={"join_rule": JoinRules.INVITE},
             ),
             # Normal activity continues on the main fork.
             FakeEvent(
@@ -521,12 +513,12 @@ class StateTestCase(unittest.TestCase):
 
         # Main branch: START -> ME -> JR2 -> MZ2 -> END
         # Stale fork:  START -> MZ3 -> END
-        # The fork at END merges. State A has Eve joined + knock_restricted.
+        # The fork at END merges. State A has Eve joined + invite JR.
         # State B (stale fork) has neither Eve's join nor the JR change.
         # Eve's membership and JR are both conflicted.
         # V2 resolves JR first (control event), picks JR2 (newer ts).
-        # Then evaluates ME against resolved state with knock_restricted.
-        # Eve's join fails auth → evicted. This is the bug.
+        # Then evaluates ME against resolved state with invite JR.
+        # Eve's join fails auth (not invited) -> evicted. This is the bug.
         edges = [
             ["END", "MZ2", "JR2", "ME", "START"],
             ["END", "MZ3", "START"],
@@ -534,7 +526,7 @@ class StateTestCase(unittest.TestCase):
 
         # BUG: V2 evicts Eve. The expected_state_ids only includes JR2.
         # Eve's membership (ME) is missing because the supplemental merge
-        # caused her join to fail auth against knock_restricted.
+        # caused her join to fail auth against invite-only join rules.
         # In a correct implementation (V2.1), ME would also be present.
         expected_state_ids = ["JR2"]
 
