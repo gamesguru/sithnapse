@@ -266,3 +266,145 @@ pre-fetching on fork merges.
     tests/state/test_v2.py::StateTestCase::test_v2_self_corrects_corrupted_state \
     tests/state/test_v2.py::StateTestCase::test_v2_unauthorized_event_not_restored -v -s
 ```
+
+---
+
+## Architectural Principle: Never Mix Network I/O with State Resolution
+
+State resolution must remain a **pure, deterministic, CPU-bound function**:
+`f(state_sets, event_map) → resolved_state`. It must never trigger network
+calls (`/backfill`, `/get_missing_events`, `/event/{id}`) internally.
+
+### Why
+
+1. **Distributed Deadlocks**: Server A waits on Server B to resolve state,
+   while Server B is paused waiting on Server A for a different room.
+2. **Transaction Exhaustion**: State resolution runs inside database
+   transactions or tight locks. Suspending for HTTP round-trips starves the
+   reactor and exhausts connection pools during spam storms.
+3. **Denial of Service (Tarpitting)**: An adversary sends an event citing
+   thousands of missing `auth_events`. If state res blocks to fetch them,
+   the server dies.
+
+### The Correct Architecture
+
+Gap detection and fetching must happen in the **ingestion pipeline**, before
+state resolution is invoked:
+
+1. When the federation handler computes `state_sets` for a fork merge, it
+   checks for missing `auth_events` in the event store.
+2. If missing, it **parks the PDU**, fires an asynchronous fetcher to
+   retrieve the missing subgraph from federation peers.
+3. Only when the auth chain is complete does it hand the data to
+   `resolve_events_with_store()`.
+
+This keeps the state resolution engine testable, deterministic, and safe
+from network-induced failures.
+
+---
+
+## Design: `heal-room` Admin API
+
+### Problem
+
+Rooms with "swiss cheese" DAGs (missing event subgraphs from federation
+gaps) have permanently divergent state. No state resolution algorithm can
+recover events that don't exist in the local store. Server admins currently
+have no automated way to repair these rooms.
+
+### Architecture: Outlier Injection
+
+Do **not** feed missing historical events through `handle_new_event`. That
+function is designed for strict, linear, real-time timeline ingestion and
+will reject events with broken `prev_events` chains. Instead, use the
+**outlier persistence path**.
+
+```
+POST /_synapse/admin/v1/rooms/{roomId}/heal
+{
+    "peers": ["matrix.org", "codestorm.net"],
+    "dry_run": true
+}
+```
+
+### Steps
+
+1. **Diff**: Query `/state_ids` from N healthy federation peers at the
+   room's current forward extremities. Diff against local state to identify
+   missing event IDs.
+
+2. **Fetch**: Retrieve missing events via
+   `GET /_matrix/federation/v1/event/{eventId}` from whichever peer has
+   them. Validate signatures and content hashes.
+
+3. **Persist as Outliers**: Insert via `outlier=True` persistence. Outliers
+   bypass the strict `prev_events` DAG continuity checks but are still
+   validated for signatures and `auth_events`. They sit in the database
+   purely to satisfy state and auth-chain lookups.
+
+4. **Re-resolve**: Force state recalculation (`compute_state_after_events`)
+   at the forward extremities. The newly injected outliers are seamlessly
+   pulled into the conflict set during resolution.
+
+### Why Outliers
+
+- Outliers bypass `prev_events` ordering — critical because the missing
+  events may be from arbitrary depths in the DAG.
+- Outliers are still signature-verified and auth-validated — no security
+  compromise.
+- State resolution already knows how to include outlier events in auth
+  chain walks via `get_auth_chain_difference`.
+- `unreject-room` already demonstrates the pattern of bulk-clearing
+  rejection markers and forcing re-resolution.
+
+### Response
+
+```json
+{
+    "status": "healed",
+    "events_fetched": 42,
+    "events_persisted": 38,
+    "events_rejected": 4,
+    "state_keys_recovered": [
+        ["m.room.member", "@nex:nexy7574.co.uk"],
+        ["m.room.member", "@someone:example.com"]
+    ],
+    "peers_queried": ["matrix.org", "codestorm.net"]
+}
+```
+
+### Future: Anti-Entropy Protocol
+
+The `heal-room` API is a tactical admin tool. The strategic fix is an
+**anti-entropy protocol** where servers periodically exchange lightweight
+hashes of their room state (Merkle Search Trees or Invertible Bloom Lookup
+Tables), detect divergence in O(log N) time, and automatically trigger
+outlier fetches to self-heal in the background. See MSC2286 and Pinecone/P2P
+Matrix research for prior art.
+
+---
+
+## Rejection Cascade Firewall (Future Work)
+
+### Problem
+
+Current behavior: if event A fails signature verification, every event B
+where `A ∈ B.prev_events` is also rejected. This cascading rejection is
+correct for security but devastating for data completeness during spam
+storms — a single malformed spam event can orphan thousands of legitimate
+events.
+
+### Proposed Mitigation: Decouple Timeline from State Integrity
+
+Stop conflating conversational topology (`prev_events`) with cryptographic
+state validity (`auth_events`):
+
+- If event B arrives and its `prev_event` A is rejected or missing, **but
+  B's `auth_events` are perfectly valid**, persist B as a `soft_failed`
+  outlier.
+- B loses its chronological placement in the UI timeline, but because state
+  resolution only cares about `auth_events`, B's state mutations (e.g., a
+  membership join) survive the next state resolution merge.
+- This confines rejection blast radius to the `auth_events` chain (where
+  it's cryptographically meaningful) rather than the `prev_events` chain
+  (where it's merely topological).
