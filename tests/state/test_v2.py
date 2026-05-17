@@ -1301,8 +1301,6 @@ class DAGReplayTestCase(unittest.TestCase):
 
     JSONL_PATH = os.path.join(
         os.path.dirname(__file__),
-        "..",
-        "jsonl",
         "remote-dag-tgmfqAWaBc978M80V9_nutra.tk-v11-merged.jsonl",
     )
 
