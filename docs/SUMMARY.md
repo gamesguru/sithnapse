@@ -108,6 +108,7 @@
     - [Streams](development/synapse_architecture/streams.md)
     - [TCP Replication](tcp_replication.md)
     - [Faster remote joins](development/synapse_architecture/faster_joins.md)
+    - [State DAGs and LCA](development/synapse_architecture/state_dags_and_lca.md)
   - [Internal Documentation](development/internal_documentation/README.md)
     - [Single Sign-On]()
       - [SAML](development/saml.md)
