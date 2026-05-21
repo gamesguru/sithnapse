@@ -1,0 +1,1 @@
+"synapse" "md5_password_hash_here"
