@@ -200,3 +200,13 @@ trusted_key_servers:
 
 password_config:
    enabled: true
+
+caches:
+  global_factor: 2.0
+  expiry_time: 1h
+
+gc_min_interval: [10.0, 10.0, 10.0]
+federation_client_timeout: 30000
+
+experimental_features:
+  faster_joins: true
