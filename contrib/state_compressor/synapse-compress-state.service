@@ -1,0 +1,11 @@
+[Unit]
+Description=Compress Synapse Database State Groups
+After=network.target postgresql.service matrix-synapse.service
+
+[Service]
+Type=oneshot
+User=synapse
+Group=synapse
+ExecStart=/opt/synapse/contrib/state_compressor/compress-synapse-state.sh
+StandardOutput=journal
+StandardError=journal
