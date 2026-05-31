@@ -40,6 +40,7 @@ from synapse.api.room_versions import RoomVersion, StateResolutionVersions
 from synapse.events import EventBase, is_creator
 from synapse.storage.databases.main.event_federation import StateDifference
 from synapse.types import MutableStateMap, StateMap, StrCollection
+from synapse.util.async_helpers import yieldable_gather_results
 from synapse.util.duration import Duration
 
 logger = logging.getLogger(__name__)
@@ -141,11 +142,31 @@ async def resolve_events_with_store(
         )
     )
 
-    events = await state_res_store.get_events(
-        [eid for eid in full_conflicted_set if eid not in event_map],
-        allow_rejected=True,
+    events_to_fetch = {eid for eid in full_conflicted_set if eid not in event_map}
+    events_to_fetch.update(
+        eid for eid in unconflicted_state.values() if eid not in event_map
     )
-    event_map.update(events)
+
+    if events_to_fetch:
+        events = await state_res_store.get_events(
+            list(events_to_fetch), allow_rejected=True
+        )
+        event_map.update(events)
+
+    # We also pre-fetch the immediate auth events of the conflicted events, as
+    # they are likely to be needed.
+    auth_events_to_fetch = {
+        aid
+        for eid in full_conflicted_set
+        if eid in event_map
+        for aid in event_map[eid].auth_event_ids()
+        if aid not in event_map
+    }
+    if auth_events_to_fetch:
+        events = await state_res_store.get_events(
+            list(auth_events_to_fetch), allow_rejected=True
+        )
+        event_map.update(events)
 
     # everything in the event map should be in the right room
     for event in event_map.values():
@@ -806,16 +827,14 @@ async def _mainline_sort(
     event_ids = list(event_ids)
 
     order_map = {}
-    for idx, ev_id in enumerate(event_ids, start=1):
+
+    async def get_depth(ev_id: str) -> None:
         depth = await _get_mainline_depth_for_event(
             clock, event_map[ev_id], mainline_map, event_map, state_res_store
         )
         order_map[ev_id] = (depth, event_map[ev_id].origin_server_ts, ev_id)
 
-        # We await occasionally when we're working with large data sets to
-        # ensure that we don't block the reactor loop for too long.
-        if idx % _AWAIT_AFTER_ITERATIONS == 0:
-            await clock.sleep(Duration(seconds=0))
+    await yieldable_gather_results(get_depth, event_ids)
 
     event_ids.sort(key=lambda ev_id: order_map[ev_id])
 

@@ -90,7 +90,7 @@ from synapse.types import (
     get_domain_from_id,
 )
 from synapse.types.state import StateFilter
-from synapse.util.async_helpers import Linearizer, concurrently_execute
+from synapse.util.async_helpers import Linearizer, concurrently_execute, yieldable_gather_results
 from synapse.util.duration import Duration
 from synapse.util.iterutils import batch_iter, partition, sorted_topologically
 from synapse.util.retryutils import NotRetryingDestination
@@ -1187,7 +1187,7 @@ class FederationEventHandler:
 
             # Ask the remote server for the states we don't
             # know about
-            for missing_prev in missing_prevs:
+            async def get_state(missing_prev: str) -> StateMap[str]:
                 logger.info(
                     "_compute_event_context_with_maybe_missing_prevs(event_id=%s): Requesting state from %s for missing prev_event %s",
                     event_id,
@@ -1199,13 +1199,12 @@ class FederationEventHandler:
                     # note that if any of the missing prevs share missing state or
                     # auth events, the requests to fetch those events are deduped
                     # by the get_pdu_cache in federation_client.
-                    remote_state_map = (
-                        await self._get_state_ids_after_missing_prev_event(
-                            dest, room_id, missing_prev
-                        )
+                    return await self._get_state_ids_after_missing_prev_event(
+                        dest, room_id, missing_prev
                     )
 
-                    state_maps.append(remote_state_map)
+            state_maps_missing = await yieldable_gather_results(get_state, missing_prevs)
+            state_maps.extend(state_maps_missing)
 
             # Get the state of the events we know about. We do this *after*
             # trying to fetch missing state over federation as that might fail
