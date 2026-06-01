@@ -39,18 +39,49 @@ The v2.2 logic would be applied during the iterative auth check for each event:
 5.  **Final Auth Check**:
     - Pass the resulting `local_auth_map` to `check_state_dependent_auth_rules`.
 
-## Determinism and the Divergence Risk
+## Determinism, Discord, and DAG Healing
 
-A critical requirement of Matrix state resolution is that it must be a **pure, deterministic function** of the DAG. Every homeserver in a room must reach the exact same resolved state to maintain a single source of truth.
+A critical requirement of Matrix state resolution is that it must be a **pure, deterministic function** of the DAG. However, as documented in the "Federated DAG Membership Anomalies" report, Room Version 12 is currently in a state of **active discord**.
 
-### Can v12 rooms run v2.2?
+Servers frequently disagree on membership (e.g., Anomaly 1: matrix.org vs. nutra.tk) because the v2.1 algorithm is too fragile—it rejects events when a single "parent" auth event is missing, even when a valid "grandparent" is available to provide the necessary authority.
 
-Technically, a homeserver _could_ implement v2.2 logic (the BFS recursive walk and ancestry check) for existing Room Version 12 rooms. However, this carries a significant risk of **State Divergence**:
+### The "Healing" Argument for v2.2
 
-- **The Robustness Gap:** If a v2.2 server uses a "grandparent" event to authorize a message that a strict v2.1 server rejects (because it only looks at immediate missing "parents"), the two servers will diverge.
-- **The Security Gap:** If a v2.2 server rejects a "Time-Travel Promotion" attack that a strict v2.1 server (lacking the ancestry check) accepts, the room will partition.
+While v12.1 is the formal standard for mandating these checks, there is a strong pragmatic case for allowing v2.2 logic to run on existing v12 rooms:
 
-To prevent these "split-brain" scenarios, **State Resolution v2.2 is strictly bound to Room Version 12.1**. This ensures that all servers in the room are protocol-mandated to use the robust BFS walk and mandatory ancestry checks, guaranteeing consensus across the federation.
+1.  **Resolution of Existing Divergence:** V12 rooms are _already_ diverged because different servers have different "holes" in their local DAGs. The current algorithm (v2.1) is unable to bridge these holes.
+2.  **Convergence via Robustness:** State Res v2.2's BFS recursive walk acts as a **DAG Healer**. By utilizing transitive authority, it allows servers with slightly different DAG coverage to reach the **same mathematically correct state**.
+3.  **Correcting the "Set Problem":** v2.2 shifts the resolution from a "Graph Link" problem (which fails at every gap) to a "Set Reconciliation" problem (which succeeds as long as the necessary authority exists somewhere in the set).
+
+In this light, upgrading to v2.2 is not just a "change in logic"—it is the implementation of a more robust mathematical model that **enables consensus** in environments where v2.1 currently guarantees discord.
+
+## Self-Correction of Existing Corruption
+
+A common concern in distributed systems is whether a protocol change can fix a state that is **already corrupt**. In the case of Matrix State Resolution, the answer for v2.2 is a resounding **yes**.
+
+### How v2.2 Heals "Catgirl and Bot"
+
+In Anomaly 2 (catgirl.cloud vs. @bot), the room is currently "corrupt" because catgirl.cloud has dropped the bot's membership from its resolved state. Under v2.1, any new events from the bot or attempts to "re-join" fail because the immediate parent auth event is missing from the local context, and v2.1 is too fragile to look further.
+
+**State Res v2.2 fixes this via "The Fresh Start" property:**
+
+1.  **Pure Function:** State resolution does not "update" the previous state; it re-calculates the state of a conflict set from scratch using the available DAG.
+2.  **Transitive Recovery:** When a new merge event arrives, a server running v2.2 will re-evaluate the conflicted membership events. Even if the immediate "parent" join is still missing, the **BFS Recursive Walk** will reach back to the "grandparent" authority (e.g., the `m.room.create` event or a stable `m.room.power_levels`).
+3.  **Admission of the "Vished":** Because v2.2 finds this transitive authority, it can successfully authorize and admit the bot's membership into the new resolved state.
+
+By allowing previously "un-authorizable" events to finally pass authentication, v2.2 enables a diverged server to **automatically align its reality** with the rest of the federation as soon as a merge occurs. Corruption is not permanent; it is merely a result of the algorithm being too blind to see the proof of authority that already exists in the DAG.
+
+### The Mechanism of Re-appearance: How the "Magic" Works
+
+To understand how members "magically" re-appear, we must look at the transition from **rejection** to **admission** during a fork merge:
+
+1.  **The Event is Present, but the Parent is Missing:** In a diverged room like "Catgirl and Bot," the bot's join event is physically present in the server's DAG (having been received via federation), but it is currently **excluded** from the resolved state because the server is missing the immediate PDU that authorized it.
+2.  **Iterative Re-evaluation:** When a new merge event triggers state resolution, the bot's join event enters the **Conflict Set**.
+3.  **v2.1 Failure (The Wall):** As the resolver iterates through the conflict set, it reaches the bot's join. It looks for the immediate `auth_event_id` (the "parent"). It's missing. The resolver logs a warning, considers the event unauthorized, and **skips it**. The bot remains missing.
+4.  **v2.2 Success (The Bridge):** Under v2.2, the resolver reaches the same join event. It sees the parent is missing, but instead of giving up, it performs the **BFS Recursive Walk**. It finds the "grandparent" (e.g., the room's `m.room.create` event).
+5.  **Admission to State:** Because the "grandparent" provides valid authority, the bot's join event **passes authentication**. The resolver then inserts this event into the room's `resolved_state` map.
+
+**The Result:** The member "re-appears" because they are now part of the room's active state dictionary. Any subsequent messages from that member, which were previously being rejected as "unauthorized" by the server, will now find the member's join in the resolved state and pass auth instantly. The "magic" is simply the algorithm choosing to see the proof of authority that was there all along.
 
 ## Versioning Summary
 
