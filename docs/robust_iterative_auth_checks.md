@@ -6,9 +6,11 @@ This document proposes **State Resolution v2.2**, an evolution of the v2.1 algor
 
 Currently, Synapse's state resolution follows the Matrix specification strictly by only inspecting the immediate `auth_event_ids()` provided by an event. While this is spec-compliant, it makes the resolution process fragile when dealing with incomplete auth chains from remote servers.
 
-## The v2.2 Algorithm: Robust BFS Recursive Walk
+## The v2.2 Algorithm: Transitive Authorization (via recusive BFS)
 
-State Res v2.2 introduces a **Breadth-First Search (BFS) recursive walk** of the local `auth_events` during the iterative check phase. This ensures that the resolver has the most complete possible picture of the author's intended authorization context.
+State Res v2.2 introduces a **Breadth-First Search (BFS) recursive walk** of the local `auth_events` during the iterative check phase. This formally codifies the **Principle of Transitive Authorization**: if an author cites a chain of authority, the resolver should utilize the most specific (nearest) ancestors available in the local DAG to validate the author's intent.
+
+By walking the auth chain recursively, v2.2 ensures that the resolver has the most complete possible picture of the author's intended authorization context, even if intermediate "parent" events are missing.
 
 ### Why BFS?
 
@@ -36,6 +38,19 @@ The v2.2 logic would be applied during the iterative auth check for each event:
     - This check prevents authors from bypassing demotions by omitting all Power Level events from their chain—a vulnerability present in naive v2.1 implementations.
 5.  **Final Auth Check**:
     - Pass the resulting `local_auth_map` to `check_state_dependent_auth_rules`.
+
+## Determinism and the Divergence Risk
+
+A critical requirement of Matrix state resolution is that it must be a **pure, deterministic function** of the DAG. Every homeserver in a room must reach the exact same resolved state to maintain a single source of truth.
+
+### Can v12 rooms run v2.2?
+
+Technically, a homeserver _could_ implement v2.2 logic (the BFS recursive walk and ancestry check) for existing Room Version 12 rooms. However, this carries a significant risk of **State Divergence**:
+
+- **The Robustness Gap:** If a v2.2 server uses a "grandparent" event to authorize a message that a strict v2.1 server rejects (because it only looks at immediate missing "parents"), the two servers will diverge.
+- **The Security Gap:** If a v2.2 server rejects a "Time-Travel Promotion" attack that a strict v2.1 server (lacking the ancestry check) accepts, the room will partition.
+
+To prevent these "split-brain" scenarios, **State Resolution v2.2 is strictly bound to Room Version 12.1**. This ensures that all servers in the room are protocol-mandated to use the robust BFS walk and mandatory ancestry checks, guaranteeing consensus across the federation.
 
 ## Versioning Summary
 
