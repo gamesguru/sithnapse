@@ -625,20 +625,20 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
             expected,
         )
 
-    def test_v21_cve_auth_bypass_without_supplemental_merge(self) -> None:
+    def test_v21_cve_auth_bypass_kick_scenario(self) -> None:
         """
-        SECURITY TEST: Proves that the V2.1 state resolution prevents a
-        Power Level Replay Attack.
+        SECURITY TEST: Proves whether removing the supplemental merge
+        re-opens a Power Level Replay Attack (CVE).
 
         Scenario: Alice creates a room, joins, sets up power levels giving
-        Eve admin (PL 100), then demotes Eve to PL 0. Eve crafts a topic
-        change citing the OLD power levels (where she was still admin) in
-        her auth_events, attempting to bypass the demotion.
+        Eve admin (PL 100). Charlie joins. Alice demotes Eve to PL 0.
+        Eve crafts a kick of Charlie citing the OLD power levels (where she was
+        still admin) in her auth_events, attempting to bypass the demotion.
 
-        V2.1 must resolve the power levels first (control pass picks the
-        demotion), then evaluate Eve's topic against the resolved PL state.
-        Eve's topic must be rejected because she is PL 0 under the resolved
-        state, regardless of which auth_events she declares.
+        If the supplemental merge is disabled, Eve's kick authenticates against
+        her historical PL100. It then enters the conflict set with Charlie's join.
+        If Eve's kick has a newer timestamp, it wins the tie-breaker and
+        Charlie is kicked, proving a CVE.
         """
         # Room setup.
         e1_create = self.create_event(
@@ -656,17 +656,33 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
             auth_events=[],
             room_id=e1_create.room_id,
         )
-        e3_eve_join = self.create_event(
+        e2_join_rules = self.create_event(
+            EventTypes.JoinRules,
+            "",
+            sender=ALICE,
+            content={"join_rule": "public"},
+            auth_events=[e2_ma.event_id],
+            room_id=e1_create.room_id,
+        )
+        e3_charlie_join = self.create_event(
+            EventTypes.Member,
+            CHARLIE,
+            sender=CHARLIE,
+            content=MEMBERSHIP_CONTENT_JOIN,
+            auth_events=[e2_join_rules.event_id],
+            room_id=e1_create.room_id,
+        )
+        e4_eve_join = self.create_event(
             EventTypes.Member,
             EVELYN,
             sender=EVELYN,
             content=MEMBERSHIP_CONTENT_JOIN,
-            auth_events=[],
+            auth_events=[e2_join_rules.event_id],
             room_id=e1_create.room_id,
         )
 
         # Alice gives Eve admin (PL 100).
-        e4_pl1 = self.create_event(
+        e5_pl1 = self.create_event(
             EventTypes.PowerLevels,
             "",
             sender=ALICE,
@@ -676,67 +692,59 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
         )
 
         # Alice DEMOTES Eve to PL 0.
-        e5_pl2 = self.create_event(
+        e6_pl2 = self.create_event(
             EventTypes.PowerLevels,
             "",
             sender=ALICE,
             content={"users": {EVELYN: 0}},
-            auth_events=[e2_ma.event_id, e4_pl1.event_id],
+            auth_events=[e2_ma.event_id, e5_pl1.event_id],
             room_id=e1_create.room_id,
         )
 
-        # Alice sets the legitimate topic.
-        e6_topic_safe = self.create_event(
-            EventTypes.Topic,
-            "",
-            sender=ALICE,
-            content={"topic": "Safe Room"},
-            auth_events=[e2_ma.event_id, e5_pl2.event_id],
-            room_id=e1_create.room_id,
-        )
-
-        # THE ATTACK: Eve changes the topic, maliciously citing
-        # the old PL (e4_pl1) where she was still admin.
-        e7_attack = self.create_event(
-            EventTypes.Topic,
-            "",
+        # THE ATTACK: Eve kicks Charlie, maliciously citing
+        # the old PL (e5_pl1) where she was still admin.
+        e7_attack_kick = self.create_event(
+            EventTypes.Member,
+            CHARLIE,
             sender=EVELYN,
-            content={"topic": "Hacked by Eve"},
-            auth_events=[e3_eve_join.event_id, e4_pl1.event_id],
+            content={"membership": "leave"},
+            auth_events=[e4_eve_join.event_id, e5_pl1.event_id],
             room_id=e1_create.room_id,
         )
 
         state_a: StateMap[str] = {
             (EventTypes.Create, ""): e1_create.event_id,
+            (EventTypes.JoinRules, ""): e2_join_rules.event_id,
             (EventTypes.Member, ALICE): e2_ma.event_id,
-            (EventTypes.Member, EVELYN): e3_eve_join.event_id,
-            (EventTypes.PowerLevels, ""): e5_pl2.event_id,
-            (EventTypes.Topic, ""): e6_topic_safe.event_id,
+            (EventTypes.Member, CHARLIE): e3_charlie_join.event_id,
+            (EventTypes.Member, EVELYN): e4_eve_join.event_id,
+            (EventTypes.PowerLevels, ""): e6_pl2.event_id,
         }
 
-        # Malicious fork: cites old PL where Eve was admin.
+        # Malicious fork: cites old PL where Eve was admin, and Charlie is kicked.
         state_b: StateMap[str] = {
             (EventTypes.Create, ""): e1_create.event_id,
+            (EventTypes.JoinRules, ""): e2_join_rules.event_id,
             (EventTypes.Member, ALICE): e2_ma.event_id,
-            (EventTypes.Member, EVELYN): e3_eve_join.event_id,
-            (EventTypes.PowerLevels, ""): e4_pl1.event_id,
-            (EventTypes.Topic, ""): e7_attack.event_id,
+            (EventTypes.Member, CHARLIE): e7_attack_kick.event_id,
+            (EventTypes.Member, EVELYN): e4_eve_join.event_id,
+            (EventTypes.PowerLevels, ""): e5_pl1.event_id,
         }
 
-        # Expected secure outcome:
-        # e5_pl2 wins the control pass (newer timestamp).
-        # Eve is PL 0 under e5_pl2 -> her topic fails auth -> Alice's topic wins.
+        # The algorithm will resolve between state_a and state_b.
+        # We expect Eve's kick to be REJECTED, and Charlie to remain joined.
         expected_secure_state: StateMap[str] = {
             (EventTypes.Create, ""): e1_create.event_id,
+            (EventTypes.JoinRules, ""): e2_join_rules.event_id,
             (EventTypes.Member, ALICE): e2_ma.event_id,
-            (EventTypes.Member, EVELYN): e3_eve_join.event_id,
-            (EventTypes.PowerLevels, ""): e5_pl2.event_id,
-            (EventTypes.Topic, ""): e6_topic_safe.event_id,
+            (EventTypes.Member, CHARLIE): e3_charlie_join.event_id,
+            (EventTypes.Member, EVELYN): e4_eve_join.event_id,
+            (EventTypes.PowerLevels, ""): e6_pl2.event_id,
         }
 
         self.get_resolution_and_verify_expected(
             [state_a, state_b],
-            [e1_create, e2_ma, e3_eve_join, e4_pl1, e5_pl2, e6_topic_safe, e7_attack],
+            [e1_create, e2_ma, e2_join_rules, e3_charlie_join, e4_eve_join, e5_pl1, e6_pl2, e7_attack_kick],
             expected_secure_state,
         )
 
