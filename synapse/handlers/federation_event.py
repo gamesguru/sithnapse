@@ -90,7 +90,11 @@ from synapse.types import (
     get_domain_from_id,
 )
 from synapse.types.state import StateFilter
-from synapse.util.async_helpers import Linearizer, concurrently_execute, yieldable_gather_results
+from synapse.util.async_helpers import (
+    Linearizer,
+    concurrently_execute,
+    yieldable_gather_results,
+)
 from synapse.util.duration import Duration
 from synapse.util.iterutils import batch_iter, partition, sorted_topologically
 from synapse.util.retryutils import NotRetryingDestination
@@ -1203,7 +1207,9 @@ class FederationEventHandler:
                         dest, room_id, missing_prev
                     )
 
-            state_maps_missing = await yieldable_gather_results(get_state, missing_prevs)
+            state_maps_missing = await yieldable_gather_results(
+                get_state, missing_prevs
+            )
             state_maps.extend(state_maps_missing)
 
             # Get the state of the events we know about. We do this *after*
