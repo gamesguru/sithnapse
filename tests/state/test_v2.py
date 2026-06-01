@@ -29,7 +29,6 @@ from typing import (
 )
 
 import attr
-import pytest
 
 from twisted.internet import defer
 
@@ -1935,9 +1934,9 @@ class V12DAGReplayTestCase(unittest.TestCase):
         events.sort(key=lambda e: (e.depth, e.origin_server_ts))
         return events
 
-    @pytest.mark.skipif(
+    @unittest.skipIf(
         not os.environ.get("RUN_SLOW"),
-        reason="81K events too slow for CI (~10min). "
+        "81K events too slow for CI (~10min). "
         "Validated via ruma-lean: V2 and V2.1 produce identical state. "
         "Run with: RUN_SLOW=1 pytest -k test_replay_v12_nex -xvs",
     )
