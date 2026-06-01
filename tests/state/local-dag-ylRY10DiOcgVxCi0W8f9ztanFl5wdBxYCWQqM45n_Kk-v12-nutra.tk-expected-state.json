@@ -1,0 +1,311 @@
+{
+  "auth_chain_size": 72,
+  "duration_ms": 0,
+  "heads": [
+    "$-ErrVEjC_pxCOHKt5w2nZz479Jj5CH3-LvSyiFChJOI",
+    "$gv3gCVhj5NufusLHfgX4JQ6momNx_sR33grMbX8Ingw",
+    "$iHpxW5hus23AYUzTpeifitpT85eHlZTdnEkES5FN93M",
+    "$tS_ReYuvIIu4iFjCT4v6VWgo7OJ1wA11bCQoOq-YhkI"
+  ],
+  "max_depth": 3509,
+  "membership": {
+    "invite": {
+      "count": 1,
+      "users": [
+        {
+          "depth": 3374,
+          "displayname": "",
+          "event_id": "$76TMM42K6fgAy5Sr_sf5YzW6VvYlTAjSK0FTQFEv9so",
+          "user_id": "@logn:unredacted.org"
+        }
+      ]
+    },
+    "join": {
+      "count": 21,
+      "users": [
+        {
+          "depth": 59,
+          "displayname": "Cat",
+          "event_id": "$q0Pngvkj_pKkJenWeXlV6ioUoXuSAVLQXFZICu-sd0Y",
+          "user_id": "@cat:feline.support"
+        },
+        {
+          "depth": 2805,
+          "displayname": "Cat Disruptor 6000",
+          "event_id": "$MhHtA_I3XQn_aVHjbwusQEmw5lqE3rXhT3bTO1XUmqY",
+          "user_id": "@cat:maunium.net"
+        },
+        {
+          "depth": 265,
+          "displayname": "Crazy_Nicc",
+          "event_id": "$_j9ncnbfXXRUQ1Y-cPJU1O4tO7s7SW5v9O6D-7wwY4U",
+          "user_id": "@crazy_nicc:hnvn.de"
+        },
+        {
+          "depth": 615,
+          "displayname": "erents",
+          "event_id": "$gtz9BB6Aip9uYtPN03D69RpCBB8rmwpLsIghrO0RRBY",
+          "user_id": "@erents:dapperepoging.nl"
+        },
+        {
+          "depth": 3285,
+          "displayname": "ext_logn 🏳️‍⚧️",
+          "event_id": "$xd0g8DWGSejDGYBAMImWFC5_byW-YNpUw4kCr2YtAYk",
+          "user_id": "@ext_logn:kludgecs.com"
+        },
+        {
+          "depth": 649,
+          "displayname": "gg [ZK shane]",
+          "event_id": "$h1mlcMwKDS-cycwJr1SRfxWO_6n5cuzhEbuJfd6yf8w",
+          "user_id": "@gg:nutra.tk"
+        },
+        {
+          "depth": 928,
+          "displayname": "",
+          "event_id": "$ryFdP1Gm9O40O9SohLKZN0MBh-4RFYMe72SVIc08fxQ",
+          "user_id": "@kim:sosnowkadub.de"
+        },
+        {
+          "depth": 670,
+          "displayname": "LogN [uwu]",
+          "event_id": "$yOdx2qkGaTX40MraQFvhux9kB7WrP_Euw5NSWeAshFE",
+          "user_id": "@logn:uwu.zirco.dev"
+        },
+        {
+          "depth": 3324,
+          "displayname": "LogN",
+          "event_id": "$awpfvCpzzuYIN4gdf5HU82Pzh8gO3_5qFxkAuaiDHjY",
+          "user_id": "@logn:zirco.dev"
+        },
+        {
+          "depth": 672,
+          "displayname": "lveneris",
+          "event_id": "$Dgsv-oP7vncQbFB6JSc0sP-O1euEAAW-BTurVdyD8jA",
+          "user_id": "@lveneris:kludgecs.com"
+        },
+        {
+          "depth": 616,
+          "displayname": "mangotcf [any pronouns, surprise me]",
+          "event_id": "$Ua3c_wpE4686VvBnWv9lLpmc0G1TbAk3x-myINQ2Qj4",
+          "user_id": "@mangotcf:mangotcf.ru"
+        },
+        {
+          "depth": 241,
+          "displayname": "mscbot",
+          "event_id": "$DpfofWp18SBC6WXFFUHJub3dSrM_k9uWvBdwyPcdK4c",
+          "user_id": "@mscbot:matrix.org"
+        },
+        {
+          "depth": 73,
+          "displayname": "nex (it/she) 🏳️‍⚧️",
+          "event_id": "$kcvvMbqajfxqkFbRxJDQMSu_JGzkp8rPRGRY8vvdCtE",
+          "user_id": "@nex:nexy7574.co.uk"
+        },
+        {
+          "depth": 45,
+          "displayname": "nex (it/its) [starstruck]",
+          "event_id": "$WzWLWCoswAzhiMQV7Kj5AxW5BdrJTD9QPvnf-9ef4cA",
+          "user_id": "@nex:starstruck.systems"
+        },
+        {
+          "depth": 28,
+          "displayname": "plate [star]",
+          "event_id": "$bX3weYwBAy5QZMbktsczHPO1p0SgkFhHxYf2lk1WOeg",
+          "user_id": "@plate:starstruck.systems"
+        },
+        {
+          "depth": 2556,
+          "displayname": "Reminder",
+          "event_id": "$6PcQA6QgpEmbtoz8Uw7xwqXfMleTwM5aBCOIuJ48UQM",
+          "user_id": "@reminder:maunium.net"
+        },
+        {
+          "depth": 155,
+          "displayname": "ggwombat 🏴🚩",
+          "event_id": "$TN_r2amxtcHiHRjPPsVIrDOXhyRFJFy-0QGVT85rzss",
+          "user_id": "@shane:wombatx.me"
+        },
+        {
+          "depth": 637,
+          "displayname": "Sky",
+          "event_id": "$TXkydSgsknKY0e9eFO0SyuDHOkCkEKvx2Oyk7Vkk4RM",
+          "user_id": "@sky:codestorm.net"
+        },
+        {
+          "depth": 1699,
+          "displayname": "stratself [federated.nexus]",
+          "event_id": "$tgSLBGShVfNEpjNxTo1hMPiv1T-RtDz42MO9Zal9TY4",
+          "user_id": "@stratself:federated.nexus"
+        },
+        {
+          "depth": 23,
+          "displayname": "stratself",
+          "event_id": "$xgt3Xl05iZrTkPx6VsfCKFAcRtqm9ZEzmYyK__QoOZI",
+          "user_id": "@stratself:muoi.me"
+        },
+        {
+          "depth": 969,
+          "displayname": "Tobias Fella",
+          "event_id": "$umjE2hcCdUO6qAWjNg66p5EOubhtRHHsPAjsJ3w85P8",
+          "user_id": "@tobiasfella:kde.org"
+        }
+      ]
+    },
+    "leave": {
+      "count": 11,
+      "users": [
+        {
+          "depth": 883,
+          "displayname": "aranjedeath 🍊",
+          "event_id": "$7rBzVS2lkPBTKYvb7U0aW7mTDPKwJ6FyGBk4DI69-ZY",
+          "user_id": "@aranjedeath:explodie.org"
+        },
+        {
+          "depth": 3279,
+          "displayname": "",
+          "event_id": "$1xKH_lH6EsFdJyhuERkiLP43bK2ScC7kHb1gRQdoTmA",
+          "user_id": "@bot.vela:nhjkl.com"
+        },
+        {
+          "depth": 666,
+          "displayname": "Caufa (strat's matridge)",
+          "event_id": "$5DmDHnaUCObGInq5BR6kx6fxL7h6fOe7QQBrH24qwIM",
+          "user_id": "@caufa:muoi.me"
+        },
+        {
+          "depth": 3205,
+          "displayname": "",
+          "event_id": "$lQzDw9VjXPC8tNaOWt4GQv_zDa1CKGnclJGpmCT4XDc",
+          "user_id": "@char:zirco.dev"
+        },
+        {
+          "depth": 3509,
+          "displayname": "",
+          "event_id": "$-ErrVEjC_pxCOHKt5w2nZz479Jj5CH3-LvSyiFChJOI",
+          "user_id": "@gamesguru:unredacted.org"
+        },
+        {
+          "depth": 3504,
+          "displayname": "QuadRadical (Ping)",
+          "event_id": "$cM8Sx1DUu-Ioz6gZ56bBMAI7xAwGGMIdLcVreHxBHMs",
+          "user_id": "@quadradical:federated.nexus"
+        },
+        {
+          "depth": 2554,
+          "displayname": "",
+          "event_id": "$odqBbCBa7J371wN6iA-_ITV5isWNF6UMXnXkYqS5arI",
+          "user_id": "@reminder:codestorm.net"
+        },
+        {
+          "depth": 3206,
+          "displayname": "",
+          "event_id": "$uoKHyZAjXR-K03aujkNUpn7x_OIibIsSiXO4ibgYtz4",
+          "user_id": "@ring0:zirco.dev"
+        },
+        {
+          "depth": 968,
+          "displayname": "",
+          "event_id": "$Aq_DgSCw0Q4bvsslozzkRHQ12AWRB68BAWkj39wf5TQ",
+          "user_id": "@sys:31a05b.net"
+        },
+        {
+          "depth": 3502,
+          "displayname": "",
+          "event_id": "$tcDr_86qkXwG4ECZq-oyWYrKSYqlSj6ALNeffiTAh1k",
+          "user_id": "@vel:heizle.net"
+        },
+        {
+          "depth": 3278,
+          "displayname": "",
+          "event_id": "$Xt3LozdiPyiy6stqT2y7RlvQP3JUt4G0Lp4MQse8ZYw",
+          "user_id": "@vel:nhjkl.com"
+        }
+      ]
+    }
+  },
+  "min_depth": 1,
+  "resolved_state_size": 44,
+  "root_event_id": "$ylRY10DiOcgVxCi0W8f9ztanFl5wdBxYCWQqM45n_Kk",
+  "state": [
+    {
+      "depth": 261,
+      "event_id": "$niAckwtntGI1DrfHyWVUW3zkwvZcQmo_UwpPUCe_Lx0",
+      "sender": "@logn:zirco.dev",
+      "state_key": "",
+      "type": "m.room.canonical_alias"
+    },
+    {
+      "depth": 1,
+      "event_id": "$ylRY10DiOcgVxCi0W8f9ztanFl5wdBxYCWQqM45n_Kk",
+      "sender": "@logn:zirco.dev",
+      "state_key": "",
+      "type": "m.room.create"
+    },
+    {
+      "depth": 6,
+      "event_id": "$TJkwY8Z9AuNf7aGW3_7iNd1KkccDeU-4nCKZ2S7gu5Y",
+      "sender": "@logn:zirco.dev",
+      "state_key": "",
+      "type": "m.room.guest_access"
+    },
+    {
+      "depth": 5,
+      "event_id": "$qhKQhKpR10UkfCpLPtTBRgB0XsHuNH7H7Y6JJ6pt9EA",
+      "sender": "@logn:zirco.dev",
+      "state_key": "",
+      "type": "m.room.history_visibility"
+    },
+    {
+      "depth": 1508,
+      "event_id": "$C2M-j-XNs-9gseH6bxCVtYxVT_ntFcF3vfsX3ctVsvM",
+      "sender": "@logn:zirco.dev",
+      "state_key": "",
+      "type": "m.room.join_rules"
+    },
+    {
+      "depth": 886,
+      "event_id": "$_Q3S8YFD90o8QNCYH0jqKHEI3R4ZGUQtBvXmleEayts",
+      "sender": "@logn:zirco.dev",
+      "state_key": "",
+      "type": "m.room.name"
+    },
+    {
+      "depth": 2570,
+      "event_id": "$HK8IK22MxZT42iHvwVjGDae0G2L_ugUJYLbFaE7h3LI",
+      "sender": "@logn:zirco.dev",
+      "state_key": "",
+      "type": "m.room.pinned_events"
+    },
+    {
+      "depth": 3507,
+      "event_id": "$Irpf2AAiTf8HpukkYlSo30owzLM4RrZ2576rt9dddn4",
+      "sender": "@logn:zirco.dev",
+      "state_key": "",
+      "type": "m.room.power_levels"
+    },
+    {
+      "depth": 2050,
+      "event_id": "$LRP_8cG0-Lmu4rxbl0uNFnPCNX4ZRsUdpagUCSdx-yw",
+      "sender": "@ring0:zirco.dev",
+      "state_key": "",
+      "type": "m.room.server_acl"
+    },
+    {
+      "depth": 3508,
+      "event_id": "$gVJ1GyA8UP-314t4_NHMpTyXZdrbyLfaRkZKPh7niZk",
+      "sender": "@logn:zirco.dev",
+      "state_key": "",
+      "type": "m.room.tombstone"
+    },
+    {
+      "depth": 263,
+      "event_id": "$4hpB0CEHXz_8P2_qnFeTNU5efOfOg-xZQfWryyNfCQ4",
+      "sender": "@logn:zirco.dev",
+      "state_key": "",
+      "type": "m.room.topic"
+    }
+  ],
+  "status": "success",
+  "total_events": 3779,
+  "version": "V2_1"
+}
