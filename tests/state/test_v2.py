@@ -1934,12 +1934,6 @@ class V12DAGReplayTestCase(unittest.TestCase):
         events.sort(key=lambda e: (e.depth, e.origin_server_ts))
         return events
 
-    @unittest.skipIf(
-        not os.environ.get("RUN_SLOW"),
-        "81K events too slow for CI (~10min). "
-        "Validated via ruma-lean: V2 and V2.1 produce identical state. "
-        "Run with: RUN_SLOW=1 pytest -k test_replay_v12_nex -xvs",
-    )
     def test_replay_v12_nex_missing_events(self) -> None:
         """Prove V2.1 cannot recover @nex:nexy7574.co.uk when events are
         missing from a V12 room (matrix.org perspective).
@@ -1952,6 +1946,13 @@ class V12DAGReplayTestCase(unittest.TestCase):
         This proves the same principle as the nutra.tk test: missing
         events cannot be recovered by any state resolution algorithm.
         """
+        if not os.environ.get("RUN_SLOW"):
+            self.skipTest(
+                "81K events too slow for CI (~10min). "
+                "Validated via ruma-lean: V2 and V2.1 produce identical state. "
+                "Run with: RUN_SLOW=1 pytest -k test_replay_v12_nex -xvs"
+            )
+
         if not os.path.exists(self.JSONL_PATH):
             self.skipTest(f"JSONL not found: {self.JSONL_PATH}")
 
