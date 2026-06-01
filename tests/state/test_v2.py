@@ -2038,3 +2038,70 @@ class V12DAGReplayTestCase(unittest.TestCase):
             "V2.1 must NOT recover nex when events are missing "
             "from DAG -- this requires ingestion-side repair",
         )
+
+    def test_benchmark_new_files_d1_3509(self) -> None:
+        self._run_v12_benchmark("local-dag-ylRY10DiOcgVxCi0W8f9ztanFl5wdBxYCWQqM45n_Kk-v12-nutra.tk-d1-3509.jsonl")
+
+    def test_benchmark_new_files_merged(self) -> None:
+        self._run_v12_benchmark("local-dag-ylRY10DiOcgVxCi0W8f9ztanFl5wdBxYCWQqM45n_Kk-v12-nutra.tk-merged.jsonl")
+
+    def _run_v12_benchmark(self, filename: str) -> None:
+        import time
+        path = os.path.join(os.path.dirname(__file__), filename)
+        if not os.path.exists(path):
+            self.skipTest(f"JSONL not found: {path}")
+
+        events = self._load_events_v12(path)
+        self.assertGreater(len(events), 0)
+
+        room_id = events[0].room_id
+        event_map: dict[str, EventBase] = {}
+        state_at: dict[str, StateMap[str]] = {}
+        merge_count = 0
+
+        start_time = time.time()
+
+        for ev in events:
+            event_map[ev.event_id] = ev
+            prev_ids = ev.prev_event_ids()
+
+            if not prev_ids:
+                state_before: StateMap[str] = {}
+            elif len(prev_ids) == 1:
+                state_before = dict(state_at.get(prev_ids[0], {}))
+            else:
+                state_sets = [state_at[pid] for pid in prev_ids if pid in state_at]
+                if len(state_sets) < 2:
+                    state_before = dict(state_sets[0]) if state_sets else {}
+                else:
+                    merge_count += 1
+                    try:
+                        store = TestStateResolutionStore(event_map)
+                        state_before = self.successResultOf(
+                            defer.ensureDeferred(
+                                resolve_events_with_store(
+                                    FakeClock(),
+                                    room_id,
+                                    RoomVersions.V12,
+                                    state_sets,
+                                    event_map=event_map,
+                                    state_res_store=store,
+                                )
+                            )
+                        )
+                    except Exception:
+                        state_before = dict(state_sets[0])
+
+            state_after = dict(state_before)
+            if ev.is_state():
+                state_after[(ev.type, ev.state_key)] = ev.event_id
+            state_at[ev.event_id] = state_after
+
+        duration = time.time() - start_time
+        print(f"\n{'='*60}")
+        print(f"BENCHMARK: {filename}")
+        print(f"Events processed: {len(events)}")
+        print(f"State merges resolved: {merge_count}")
+        print(f"Total time: {duration:.2f} seconds")
+        print(f"Final state size: {len(state_at.get(events[-1].event_id, {}))}")
+        print(f"{'='*60}\n")
