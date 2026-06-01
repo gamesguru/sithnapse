@@ -1416,7 +1416,8 @@ class DAGReplayTestCase(unittest.TestCase):
 
         final_state = state_at.get(events[-1].event_id, {})
         self.assertEqual(
-            eviction_depths, [],
+            eviction_depths,
+            [],
             f"Bot was evicted at depths: {eviction_depths}",
         )
         self.assertIn(bot_key, final_state, "Bot was NOT in the final state")
@@ -1984,9 +1985,9 @@ class V12DAGReplayTestCase(unittest.TestCase):
         merge_count = 0
 
         total = len(non_nex_events)
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"V12 REPLAY: {total} events (stripped {len(nex_event_ids)} nex events)")
-        print(f"{'='*60}", flush=True)
+        print(f"{'=' * 60}", flush=True)
 
         for i, ev in enumerate(non_nex_events):
             if i % 5000 == 0:
@@ -2040,7 +2041,9 @@ class V12DAGReplayTestCase(unittest.TestCase):
         )
 
     def test_benchmark_new_files_d1_3509(self) -> None:
-        self._run_v12_benchmark("local-dag-ylRY10DiOcgVxCi0W8f9ztanFl5wdBxYCWQqM45n_Kk-v12-nutra.tk-d1-3509.jsonl")
+        self._run_v12_benchmark(
+            "local-dag-ylRY10DiOcgVxCi0W8f9ztanFl5wdBxYCWQqM45n_Kk-v12-nutra.tk-d1-3509.jsonl"
+        )
 
     def test_v21_prevents_supplemental_merge_eviction_on_real_dag(self) -> None:
         """Prove that V2.1 fixes the supplemental merge vulnerability.
@@ -2073,7 +2076,9 @@ class V12DAGReplayTestCase(unittest.TestCase):
             elif len(prev_ids) == 1:
                 state_before = dict(state_at_v11.get(prev_ids[0], {}))
             else:
-                state_sets = [state_at_v11[pid] for pid in prev_ids if pid in state_at_v11]
+                state_sets = [
+                    state_at_v11[pid] for pid in prev_ids if pid in state_at_v11
+                ]
                 if len(state_sets) < 2:
                     state_before = dict(state_sets[0]) if state_sets else {}
                 else:
@@ -2116,7 +2121,9 @@ class V12DAGReplayTestCase(unittest.TestCase):
             elif len(prev_ids) == 1:
                 state_before = dict(state_at_v12.get(prev_ids[0], {}))
             else:
-                state_sets = [state_at_v12[pid] for pid in prev_ids if pid in state_at_v12]
+                state_sets = [
+                    state_at_v12[pid] for pid in prev_ids if pid in state_at_v12
+                ]
                 if len(state_sets) < 2:
                     state_before = dict(state_sets[0]) if state_sets else {}
                 else:
@@ -2148,7 +2155,7 @@ class V12DAGReplayTestCase(unittest.TestCase):
         v12_keys = set(final_state_v12.keys())
 
         missing_in_v11 = v12_keys - v11_keys
-        print(f"\n\n{'='*60}")
+        print(f"\n\n{'=' * 60}")
         print(f"V11 (V2) State Size: {len(final_state_v11)}")
         print(f"V12 (V2.1) State Size: {len(final_state_v12)}")
         print(f"Events wrongfully evicted by V2: {len(missing_in_v11)}")
@@ -2160,17 +2167,22 @@ class V12DAGReplayTestCase(unittest.TestCase):
                 print(f"  - EVICTED: {skey} (membership: {ev.membership})")
             else:
                 print(f"  - EVICTED: {etype} {skey}")
-        print(f"{'='*60}\n\n")
+        print(f"{'=' * 60}\n\n")
 
         # V11 (V2) is vulnerable and evicts members, ending up with 37 state events.
         # V12 (V2.1) correctly preserves all valid members, ending up with 44 state events.
         # Note: on the fixed branch, simulating V11 might yield unexpected results if it hits a KeyError,
         # but running the develop logic on the V12 events definitively gives 37.
         # We will assert the fixed V12 logic is 44.
-        self.assertEqual(len(final_state_v12), 44, "V12 (V2.1) should preserve members and yield 44 events")
+        self.assertEqual(
+            len(final_state_v12),
+            44,
+            "V12 (V2.1) should preserve members and yield 44 events",
+        )
 
     def _run_v12_benchmark(self, filename: str) -> None:
         import time
+
         path = os.path.join(os.path.dirname(__file__), filename)
         if not os.path.exists(path):
             self.skipTest(f"JSONL not found: {path}")
@@ -2222,10 +2234,10 @@ class V12DAGReplayTestCase(unittest.TestCase):
             state_at[ev.event_id] = state_after
 
         duration = time.time() - start_time
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"BENCHMARK: {filename}")
         print(f"Events processed: {len(events)}")
         print(f"State merges resolved: {merge_count}")
         print(f"Total time: {duration:.2f} seconds")
         print(f"Final state size: {len(state_at.get(events[-1].event_id, {}))}")
-        print(f"{'='*60}\n")
+        print(f"{'=' * 60}\n")

@@ -61,8 +61,6 @@ MEMBERSHIP_CONTENT_LEAVE = {"membership": Membership.LEAVE}
 MEMBERSHIP_CONTENT_BAN = {"membership": Membership.BAN}
 
 
-
-
 class FakeClock:
     async def sleep(self, duration: Duration) -> None:
         defer.succeed(None)
@@ -744,7 +742,16 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
 
         self.get_resolution_and_verify_expected(
             [state_a, state_b],
-            [e1_create, e2_ma, e2_join_rules, e3_charlie_join, e4_eve_join, e5_pl1, e6_pl2, e7_attack_kick],
+            [
+                e1_create,
+                e2_ma,
+                e2_join_rules,
+                e3_charlie_join,
+                e4_eve_join,
+                e5_pl1,
+                e6_pl2,
+                e7_attack_kick,
+            ],
             expected_secure_state,
         )
 
@@ -1058,7 +1065,9 @@ class StateResV21TestCase(unittest.HomeserverTestCase):
         # First we try everything in-memory to check that the test case works.
         event_map = {ev.event_id: ev for ev in events}
         for ev in events:
-            logger.debug("%s => %s %s => %s", ev.event_id, ev.type, ev.state_key, ev.content)
+            logger.debug(
+                "%s => %s %s => %s", ev.event_id, ev.type, ev.state_key, ev.content
+            )
         resolution = self.get_success(
             resolve_events_with_store(
                 FakeClock(),
