@@ -142,31 +142,27 @@ async def resolve_events_with_store(
         )
     )
 
-    events_to_fetch = {eid for eid in full_conflicted_set if eid not in event_map}
-    events_to_fetch.update(
-        eid for eid in unconflicted_state.values() if eid not in event_map
-    )
+    # We want to pre-fetch all the events we'll need during the iterative auth
+    # checks, so that we don't have to do any sequential I/O.
+    #
+    # We start with the conflicted events and the unconflicted state.
+    to_fetch = {eid for eid in full_conflicted_set if eid not in event_map}
+    to_fetch.update(eid for eid in unconflicted_state.values() if eid not in event_map)
 
-    if events_to_fetch:
-        events = await state_res_store.get_events(
-            list(events_to_fetch), allow_rejected=True
-        )
-        event_map.update(events)
+    # We iteratively fetch the auth chain to ensure everything is in event_map.
+    # This is a concurrent "wide" fetch of the auth DAG.
+    while to_fetch:
+        fetched = await state_res_store.get_events(list(to_fetch), allow_rejected=True)
+        event_map.update(fetched)
 
-    # We also pre-fetch the immediate auth events of the conflicted events, as
-    # they are likely to be needed.
-    auth_events_to_fetch = {
-        aid
-        for eid in full_conflicted_set
-        if eid in event_map
-        for aid in event_map[eid].auth_event_ids()
-        if aid not in event_map
-    }
-    if auth_events_to_fetch:
-        events = await state_res_store.get_events(
-            list(auth_events_to_fetch), allow_rejected=True
-        )
-        event_map.update(events)
+        new_to_fetch = set()
+        for eid in to_fetch:
+            ev = event_map.get(eid)
+            if ev:
+                for aid in ev.auth_event_ids():
+                    if aid not in event_map:
+                        new_to_fetch.add(aid)
+        to_fetch = new_to_fetch
 
     # everything in the event map should be in the right room
     for event in event_map.values():
@@ -719,9 +715,11 @@ async def _iterative_auth_checks(
 
         auth_events = {}
         for aid in event.auth_event_ids():
-            ev = await _get_event(
-                room_id, aid, event_map, state_res_store, allow_none=True
-            )
+            ev = event_map.get(aid)
+            if not ev:
+                ev = await _get_event(
+                    room_id, aid, event_map, state_res_store, allow_none=True
+                )
 
             if not ev:
                 logger.warning(
@@ -734,7 +732,9 @@ async def _iterative_auth_checks(
         for key in event_auth.auth_types_for_event(room_version, event):
             if key in resolved_state:
                 ev_id = resolved_state[key]
-                ev = await _get_event(room_id, ev_id, event_map, state_res_store)
+                ev = event_map.get(ev_id)
+                if not ev:
+                    ev = await _get_event(room_id, ev_id, event_map, state_res_store)
 
                 if ev.rejected_reason is None:
                     auth_events[key] = event_map[ev_id]
