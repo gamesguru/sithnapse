@@ -1,8 +1,9 @@
+from typing import Mapping
+
 from synapse.api.constants import EventTypes
 from synapse.api.room_versions import RoomVersion, RoomVersions
 from synapse.events import EventBase
 from synapse.storage.databases.main.event_federation import StateDifference
-from synapse.storage.databases.main.events_worker import EventRedactBehaviour
 from synapse.types import StateMap, StrCollection
 from synapse.util.duration import Duration
 
@@ -360,14 +361,12 @@ class PathologyTestCase(StateResV21TestCase):
 
 
 class MockStateResolutionStore:
-    def __init__(self, event_map):
+    def __init__(self, event_map: Mapping[str, EventBase]):
         self.event_map = event_map
 
     async def get_events(
         self,
         event_ids: StrCollection,
-        redact_behaviour: EventRedactBehaviour = EventRedactBehaviour.as_is,
-        get_prev_content: bool = False,
         allow_rejected: bool = False,
     ) -> dict[str, EventBase]:
         return {eid: self.event_map[eid] for eid in event_ids if eid in self.event_map}
