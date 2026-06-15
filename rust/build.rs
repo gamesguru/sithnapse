@@ -55,6 +55,7 @@ fn main() -> Result<(), std::io::Error> {
     println!("cargo:rustc-env=SYNAPSE_RUSTC_VERSION={}", rustc_version,);
 
     // Link C++ standard library for RocksDB static compilation
+    println!("cargo:rustc-link-lib=static=rocksdb");
     println!("cargo:rustc-link-lib=dylib=stdc++");
     println!("cargo:rustc-link-lib=dylib=z");
     println!("cargo:rustc-link-lib=dylib=bz2");

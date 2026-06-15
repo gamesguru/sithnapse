@@ -4,19 +4,17 @@ import unittest
 from synapse.synapse_rust import rocksdb_engine
 
 class TestNativeRocksDBEngine(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
+    def setUp(self):
         # Create a temporary directory for the RocksDB test store
-        cls.test_dir = tempfile.mkdtemp()
+        self.test_dir = tempfile.mkdtemp()
         
         # Initialize our native Rust engine
         print("Initializing native Rust RocksDB Engine...")
-        rocksdb_engine.open_db(cls.test_dir)
+        rocksdb_engine.open_db(self.test_dir)
 
-    @classmethod
-    def tearDownClass(cls):
+    def tearDown(self):
         # Clean up the DB files after testing
-        shutil.rmtree(cls.test_dir, ignore_errors=True)
+        shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def test_put_and_get(self):
         """Test that we can write and read back a value bypassing the GIL."""
