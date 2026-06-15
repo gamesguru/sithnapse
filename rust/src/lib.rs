@@ -17,6 +17,7 @@ pub mod matrix_const;
 pub mod msc4388_rendezvous;
 pub mod push;
 pub mod rendezvous;
+pub mod rocksdb_engine;
 pub mod room_versions;
 pub mod segmenter;
 pub mod types;
@@ -69,6 +70,7 @@ fn synapse_rust(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     events::register_module(py, m)?;
     http_client::register_module(py, m)?;
     rendezvous::register_module(py, m)?;
+    rocksdb_engine::register_module(py, m)?;
     msc4388_rendezvous::register_module(py, m)?;
     segmenter::register_module(py, m)?;
     room_versions::register_module(py, m)?;

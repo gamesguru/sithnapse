@@ -54,6 +54,9 @@ fn main() -> Result<(), std::io::Error> {
         .unwrap_or_else(|_| "unknown".to_string());
     println!("cargo:rustc-env=SYNAPSE_RUSTC_VERSION={}", rustc_version,);
 
+    // Link C++ standard library for RocksDB static compilation
+    println!("cargo:rustc-link-lib=dylib=stdc++");
+
     // The default rules don't pick up trivial changes to the workspace config
     // files, but we need to rebuild if those change to pick up the changed
     // hashes.
