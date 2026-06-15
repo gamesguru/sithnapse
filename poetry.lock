@@ -2741,95 +2741,6 @@ pygments = ">=2.13.0,<3.0.0"
 jupyter = ["ipywidgets (>=7.5.1,<9)"]
 
 [[package]]
-name = "rocksdict"
-version = "0.3.29"
-description = "Rocksdb Python Binding"
-optional = false
-python-versions = "*"
-groups = ["main"]
-files = [
-    {file = "rocksdict-0.3.29-cp310-cp310-macosx_10_14_x86_64.whl", hash = "sha256:b2b152074716a54b1a839911f0925bb0a1483d50c92e9e9c7cb2b1e892b77f05"},
-    {file = "rocksdict-0.3.29-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:58942a1879f0491984cb3e8987b6874a17733ebe5a4ca65d21acab0a4fa3e1be"},
-    {file = "rocksdict-0.3.29-cp310-cp310-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:cef7490fd12208579f9bb46808bd446aa9ebf18d30e2d0721a705cf7d6ddaa58"},
-    {file = "rocksdict-0.3.29-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:e36895cebd6a472610f2ae9d7c4a22e11bf6a663c117e75ddcd245edac61394f"},
-    {file = "rocksdict-0.3.29-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:9b1050ee7758430d5fc42a45002b1a19d91e3f461796a13457da0886a6088d0a"},
-    {file = "rocksdict-0.3.29-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:10d73002dc4635360a87d4229d6101c93267144ecbdcaefdffdd72579121e523"},
-    {file = "rocksdict-0.3.29-cp310-cp310-musllinux_1_2_aarch64.whl", hash = "sha256:60c98bf0d7bf937cbaef48c542623e99bfac8a83af9e206a069fdf414f282004"},
-    {file = "rocksdict-0.3.29-cp310-cp310-musllinux_1_2_x86_64.whl", hash = "sha256:9945bd63282615c71aafaec504fc8145aa0ec0f2dbcc711c9b11c40865c5ac68"},
-    {file = "rocksdict-0.3.29-cp310-cp310-win_amd64.whl", hash = "sha256:0bc84ae422fda82bf5496fcc8cbeda30d1e9b3808790150d7992ab458f4fac73"},
-    {file = "rocksdict-0.3.29-cp311-cp311-macosx_10_14_x86_64.whl", hash = "sha256:69f671398830c2b30e980d578c1c7e7cfe526ef2dc76df87d25cbe8c90a450b4"},
-    {file = "rocksdict-0.3.29-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:cd7e3d765414d4469f9ac06cc411218cdff8e365f0aa91c726b70e61413a18e1"},
-    {file = "rocksdict-0.3.29-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:e9a4290ffbdacfdd843b849ab1c82df661dcc0303bfb79f78249659454c29e1e"},
-    {file = "rocksdict-0.3.29-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:63a7d734e684bce1d2e102bbf0f443558d8f6d5d451472bbe18198decd3fa93b"},
-    {file = "rocksdict-0.3.29-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:f595d5438490450e2c6f797da491005e77c862f441ca2c4ed7346db6487a2983"},
-    {file = "rocksdict-0.3.29-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:63ebb60cde75a872c24b96837a9a373c68db229016a9284132ef06e0ee82d477"},
-    {file = "rocksdict-0.3.29-cp311-cp311-musllinux_1_2_aarch64.whl", hash = "sha256:02c90d022b930d2f57578b91f5a12ee615cf3af346465fcfa7ada08421c67a59"},
-    {file = "rocksdict-0.3.29-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:9afa768ff0cb2d7fd1a3989684f7a93cfb2022f252ff48c3619abae99c0def57"},
-    {file = "rocksdict-0.3.29-cp311-cp311-win_amd64.whl", hash = "sha256:eed84c0bde6b9c40a016beb7f8003c8df9c95d128a72491f2d859f63dcf19477"},
-    {file = "rocksdict-0.3.29-cp312-cp312-macosx_10_14_x86_64.whl", hash = "sha256:226d6deac44d50a4539181789bb551e7f961d7d1a2e56df5b2e049e5e863b1a0"},
-    {file = "rocksdict-0.3.29-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:d8c9a8f61d851f2f0c20452e321f3b999f85750119c91d41c09d6658d1caee97"},
-    {file = "rocksdict-0.3.29-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:3a987b63388dfb96de6ec10292611d696e3384c0e1361aa5b032e415008c2ff1"},
-    {file = "rocksdict-0.3.29-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:988dd3e2449d126b992057e03705efbb7ec92bf37918667000b80faac5e01482"},
-    {file = "rocksdict-0.3.29-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:bec97acb9ac9797f26ecd75d25a3523c571907960c381c9dcab606979ac9c1c2"},
-    {file = "rocksdict-0.3.29-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:36d336d9d796d08923badb2df778365676cd5a66b4762ffc2d0b952dfca8b276"},
-    {file = "rocksdict-0.3.29-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:a1ecc14495fbfddaaa87aacd48bf789184d9ac7d014e77a0b2ec2a15eac07ea5"},
-    {file = "rocksdict-0.3.29-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:afa57cdd72a4b83ed17648c5d4965d9e2951d4acfebc6b5d228c951a500002be"},
-    {file = "rocksdict-0.3.29-cp312-cp312-win_amd64.whl", hash = "sha256:062c759fb15fe9e3699914790583eeac4031f4c89dc2f64aba503c3de6c21812"},
-    {file = "rocksdict-0.3.29-cp313-cp313-macosx_10_14_x86_64.whl", hash = "sha256:b881e786360e6caa12b29170cae2bbb4e7b95aff737b3f2c0426d4a66d322985"},
-    {file = "rocksdict-0.3.29-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:6195956c1ad600827ea1b782752031caba671073fa1b60d50991d07b596984ea"},
-    {file = "rocksdict-0.3.29-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:4effb7f611243cb821d9be0b8115a9f5ab61dc0321245c2bb0501703ae7f89c0"},
-    {file = "rocksdict-0.3.29-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:66866e1226cd49e20e37125320893059c3f43307999b06e323971f23e7dd5219"},
-    {file = "rocksdict-0.3.29-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:b286433f9ffbd7dbcc274f331f7e0ba5556f797fd9b3bcad46d2b42c4042066d"},
-    {file = "rocksdict-0.3.29-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:a9f1589664b138d92dfbd709714509c339dbacb096dc708b5cd1245f823ede58"},
-    {file = "rocksdict-0.3.29-cp313-cp313-musllinux_1_2_aarch64.whl", hash = "sha256:d272421ed42a4dfbcaef61afb9799589a80e9329874ea76076470b03ec901c6a"},
-    {file = "rocksdict-0.3.29-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:1eb9af720898b7d2365e1577d46fc1f746d5a5bbe791d45462b33d30fd65d2a7"},
-    {file = "rocksdict-0.3.29-cp313-cp313-win_amd64.whl", hash = "sha256:9b0ebdeb51210d8cc50a8c4bf86e0fd69d300b5ed322e5d1dd7ace7a9176d342"},
-    {file = "rocksdict-0.3.29-cp314-cp314-macosx_10_14_x86_64.whl", hash = "sha256:449e5edc731018abcf043213ab97ccbbca81ba1c4041454847532c464dd460d2"},
-    {file = "rocksdict-0.3.29-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:fb12366bf75cb28c9126eec84524a9ba7d1a81934d6fec2b873ed6ed142361e6"},
-    {file = "rocksdict-0.3.29-cp314-cp314-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:961012099f10c146da68241af8e098cd7e534b705e7b2f2f629c242449ec2366"},
-    {file = "rocksdict-0.3.29-cp314-cp314-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:56e818b919531f38020cfcd055721361990eb22e5f4fbe64f08ec1708b4e9271"},
-    {file = "rocksdict-0.3.29-cp314-cp314-manylinux_2_28_aarch64.whl", hash = "sha256:8bd5e4e3863f61e6f6537f6419e20f5d76051e72553a49353fbdc8c81ead0399"},
-    {file = "rocksdict-0.3.29-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:cb5f0a75a4d490822a4f09a76bc1fee24979c0ae04e0efb2a83aeb8f37457ef9"},
-    {file = "rocksdict-0.3.29-cp314-cp314-musllinux_1_2_aarch64.whl", hash = "sha256:372a96002f412121fda7853810baa396f06356c30b90973ed64784318379b41a"},
-    {file = "rocksdict-0.3.29-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:092a0e6540de764bd196879bf2c93141e073e8f80f1b81a0b8ccb417d3e67cc8"},
-    {file = "rocksdict-0.3.29-cp314-cp314-win_amd64.whl", hash = "sha256:73ebb2ea670492c22a77b6042980953583cfcb2c62d2699f1afbbecdbe02cc6f"},
-    {file = "rocksdict-0.3.29-cp37-cp37m-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:e8f8f2d993ae0edc9796e5cd3ddbcf693d8e5f0d65449139c11878c6e3572ad8"},
-    {file = "rocksdict-0.3.29-cp37-cp37m-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:b917a2af27d05c36006ef61452b7022b79f2ca6c97188a28c9156c29fd425b12"},
-    {file = "rocksdict-0.3.29-cp37-cp37m-manylinux_2_28_aarch64.whl", hash = "sha256:62b6fe2d7ccecb233433f11c98b7d4dad59494314239b959d2531f18c39729e3"},
-    {file = "rocksdict-0.3.29-cp37-cp37m-manylinux_2_28_x86_64.whl", hash = "sha256:e0bbe3a94bb3360e5910c885bd153258e79feba4492f88f5e6f62009a3c0ab73"},
-    {file = "rocksdict-0.3.29-cp37-cp37m-musllinux_1_2_aarch64.whl", hash = "sha256:a44b1e61d4fbfc65fbccf36212be418ae3fdc062f60679ae8c1340e6a4647952"},
-    {file = "rocksdict-0.3.29-cp37-cp37m-musllinux_1_2_x86_64.whl", hash = "sha256:741daf71d5d0e9c6f9723dbccde784124b784cfd2d972d7f18b4d3d60ab2112a"},
-    {file = "rocksdict-0.3.29-cp37-cp37m-win_amd64.whl", hash = "sha256:6ac33cb22a7aeda1464fec63a9e942b7a4fd50efe6bbe610e65ef590e39d7ef8"},
-    {file = "rocksdict-0.3.29-cp38-cp38-macosx_10_14_x86_64.whl", hash = "sha256:5797ee0ad06cc14af1f395758df04e768950568d70c29920f34de9afae2b3c37"},
-    {file = "rocksdict-0.3.29-cp38-cp38-macosx_11_0_arm64.whl", hash = "sha256:b001a6784cc7281ab9c88d10216170cd04c9fdcc3ff7fb4827a6dc2a7695648e"},
-    {file = "rocksdict-0.3.29-cp38-cp38-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:84b12c70c102720e1c1083581602cc3ef6a2a7d09c62fa274dcf7a59492fb02f"},
-    {file = "rocksdict-0.3.29-cp38-cp38-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:74f5a2392514bd5cfb9d4b27959dc139f3e56899bae0fe87e46a2fb119252ced"},
-    {file = "rocksdict-0.3.29-cp38-cp38-manylinux_2_28_aarch64.whl", hash = "sha256:78628bcb3acd94a9832e26322c5d379d328ed021123ddfbccb126bd7667a5644"},
-    {file = "rocksdict-0.3.29-cp38-cp38-manylinux_2_28_x86_64.whl", hash = "sha256:746de002eeedd2d5570ffc7b32afb1746ddb8a353b101514398edffa1a57660c"},
-    {file = "rocksdict-0.3.29-cp38-cp38-musllinux_1_2_aarch64.whl", hash = "sha256:0d65702498c93f54bb057f3a6087bc64024324789c4367215a300393f2d7593a"},
-    {file = "rocksdict-0.3.29-cp38-cp38-musllinux_1_2_x86_64.whl", hash = "sha256:fe55508578585076e207dff5c8386d0ae54534f4143c66e424c85535730e92b2"},
-    {file = "rocksdict-0.3.29-cp38-cp38-win_amd64.whl", hash = "sha256:67703879935906b758cbf80d60f111d4746f9d5cd93ecf6a98931d1cc27e8683"},
-    {file = "rocksdict-0.3.29-cp39-cp39-macosx_10_14_x86_64.whl", hash = "sha256:bd69598ffb4a81dd459294cdb08f6559dc113d49197bc3d78d8e06ebcad5228b"},
-    {file = "rocksdict-0.3.29-cp39-cp39-macosx_11_0_arm64.whl", hash = "sha256:e52b0e15a144df2b4f5f73b5f517619435a93f20bf8973451f277ee44ecc8a9f"},
-    {file = "rocksdict-0.3.29-cp39-cp39-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:c74fa3e4ff771946500360f37641eec5af226cf0016dcd1d5997ca85022faa8f"},
-    {file = "rocksdict-0.3.29-cp39-cp39-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:e3517834e3f6926f531726ca813eed1b47eba221863e7f8e3ea7c0206449e0bd"},
-    {file = "rocksdict-0.3.29-cp39-cp39-manylinux_2_28_aarch64.whl", hash = "sha256:7bc74044ea8e1108390c292e5a96c36ad806e05663381f64a32e3fb0c5dc1455"},
-    {file = "rocksdict-0.3.29-cp39-cp39-manylinux_2_28_x86_64.whl", hash = "sha256:af77f5b474020a66358f5fa4e849659d773ba04253328133eb3cbdfe103f107f"},
-    {file = "rocksdict-0.3.29-cp39-cp39-musllinux_1_2_aarch64.whl", hash = "sha256:c0a89370caab1e940b2ded2f7bc7209fed39bb55c9fbc2e7a87dd2cfd0154df6"},
-    {file = "rocksdict-0.3.29-cp39-cp39-musllinux_1_2_x86_64.whl", hash = "sha256:80226d345ba86251b2ed8374b2575b7f2d2c563cbda70297041abea3efccc3b2"},
-    {file = "rocksdict-0.3.29-cp39-cp39-win_amd64.whl", hash = "sha256:e12d254480d1fff45940dd37c3814c6e9c582fcb0a1400775f5f35653cb47540"},
-    {file = "rocksdict-0.3.29-pp311-pypy311_pp73-macosx_10_14_x86_64.whl", hash = "sha256:9bb766e3afb2092092edd6e3f9488d002c4ac216ce0143c2dd2b8cb3f696ccf4"},
-    {file = "rocksdict-0.3.29-pp311-pypy311_pp73-macosx_11_0_arm64.whl", hash = "sha256:3e825e13ed532b30c38f7f927fc296dd2d72e619c5b766db8424a261874e7e87"},
-    {file = "rocksdict-0.3.29-pp311-pypy311_pp73-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:e498312ff5203a2f41c58808259d4a40a78e28ebcc243a760ca8dea82ed13025"},
-    {file = "rocksdict-0.3.29-pp311-pypy311_pp73-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:4e36663be98b9cbdab3b77fd655e91751e7444c8870d33e3de1935fc86171a01"},
-    {file = "rocksdict-0.3.29-pp311-pypy311_pp73-manylinux_2_28_aarch64.whl", hash = "sha256:1474ee839c65fc5cba5bab47ae5c73ce02118e30f681012c7e9b67db0ebbccca"},
-    {file = "rocksdict-0.3.29-pp311-pypy311_pp73-manylinux_2_28_x86_64.whl", hash = "sha256:c9b7a2d1aea49eca32dc76340b48b3b8b83788206b6769d8e4fda963130ee6f2"},
-    {file = "rocksdict-0.3.29-pp311-pypy311_pp73-musllinux_1_2_aarch64.whl", hash = "sha256:5176a033a80e6f4009336e64f93f3a0c5e2d81927bf674c21755010200c8cf4e"},
-    {file = "rocksdict-0.3.29-pp311-pypy311_pp73-musllinux_1_2_x86_64.whl", hash = "sha256:302b14fa11844247ef14365c58535c0ca80357b94d7c6b08a6ae3fc212eee2c1"},
-    {file = "rocksdict-0.3.29-pp311-pypy311_pp73-win_amd64.whl", hash = "sha256:701d81b041c948026e35baa762d0af5283d4ad976240c412861e5095d4f29bad"},
-]
-
-[[package]]
 name = "rpds-py"
 version = "0.30.0"
 description = "Python bindings to Rust's persistent data structures (rpds)"
@@ -3841,4 +3752,4 @@ url-preview = ["lxml"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10.0,<4.0.0"
-content-hash = "647bd82d11fb2a1ebf6517e93841388b338d7e2ac4f7c19c289278f2ca719e94"
+content-hash = "88f1913a5839cb3cf2e98ff88dbbe1223f59e00bc428c1cd15b3d2ae906675aa"
