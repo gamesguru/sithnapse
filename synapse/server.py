@@ -516,7 +516,7 @@ class HomeServer(metaclass=abc.ABCMeta):
                 pass
             except Exception as e:
                 logger.warning("Failed to remove system event trigger: %s", str(e))
-                
+
             try:
                 defer.ensureDeferred(shutdown_handler.func(**shutdown_handler.kwargs))
             except Exception as e:
