@@ -5,20 +5,25 @@
 import json
 import os
 import re
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Mapping, Optional
 
 from synapse.storage.engines._base import BaseDatabaseEngine
-from synapse.storage.engines.rocksdb_schema import ROCKSDB_TABLE_SCHEMAS, get_rocksdb_key
-from synapse.storage.types import Connection, Cursor
+from synapse.storage.engines.rocksdb_schema import (
+    ROCKSDB_TABLE_SCHEMAS,
+    get_rocksdb_key,
+)
 
 # Let's try to import rocksdict, but fall back to a file-backed dictionary mock.
 try:
     import rocksdict
+
     HAS_ROCKSDICT = True
 except ImportError:
     HAS_ROCKSDICT = False
 
-print(f"RocksDB Engine Translation Layer Initialized. rocksdict installed: {HAS_ROCKSDICT}")
+print(
+    f"RocksDB Engine Translation Layer Initialized. rocksdict installed: {HAS_ROCKSDICT}"
+)
 
 
 class RocksdbMockDB:
@@ -26,18 +31,21 @@ class RocksdbMockDB:
     A persistent key-value database. Uses rocksdict if available,
     otherwise falls back to a JSON-serialized local file dictionary.
     """
+
     def __init__(self, db_path: str = "rocksdb_experimental_store"):
         self.db_path = db_path
         self.has_rocksdict = HAS_ROCKSDICT
         self._db: Any = None
-        self._fallback_store: Dict[str, bytes] = {}
+        self._fallback_store: dict[str, bytes] = {}
 
         if self.has_rocksdict:
             try:
                 # Use rocksdict to open/create RocksDB
                 self._db = rocksdict.Rdict(db_path)
             except Exception as e:
-                print(f"Failed to load rocksdict, falling back to local file-backed dictionary: {e}")
+                print(
+                    f"Failed to load rocksdict, falling back to local file-backed dictionary: {e}"
+                )
                 self.has_rocksdict = False
 
         if not self.has_rocksdict:
@@ -48,7 +56,9 @@ class RocksdbMockDB:
                     with open(self.json_file, "r") as f:
                         data = json.load(f)
                         # Re-encode keys and values to bytes
-                        self._fallback_store = {k: v.encode("utf-8") for k, v in data.items()}
+                        self._fallback_store = {
+                            k: v.encode("utf-8") for k, v in data.items()
+                        }
                 except Exception as e:
                     print(f"Error loading fallback JSON DB: {e}")
                     self._fallback_store = {}
@@ -78,7 +88,7 @@ class RocksdbMockDB:
         else:
             self._fallback_store.pop(key.decode("utf-8"), None)
 
-    def scan_prefix(self, prefix: bytes) -> List[Tuple[bytes, bytes]]:
+    def scan_prefix(self, prefix: bytes) -> list[tuple[bytes, bytes]]:
         results = []
         prefix_str = prefix.decode("utf-8")
         if self.has_rocksdict:
@@ -105,7 +115,9 @@ class RocksdbMockDB:
             # Save the fallback memory store back to JSON
             try:
                 with open(self.json_file, "w") as f:
-                    data = {k: v.decode("utf-8") for k, v in self._fallback_store.items()}
+                    data = {
+                        k: v.decode("utf-8") for k, v in self._fallback_store.items()
+                    }
                     json.dump(data, f, indent=2)
             except Exception as e:
                 print(f"Failed to commit/save fallback JSON DB: {e}")
@@ -124,15 +136,20 @@ def get_global_db() -> RocksdbMockDB:
 
 # --- DBAPI2 COMPLIANT INTERFACE FOR ROCKSDB ---
 
+
 class RocksdbCursor:
     def __init__(self, db: RocksdbMockDB):
         self._db = db
-        self.description: Optional[List[Tuple[str, Any, None, None, None, None, bool]]] = None
+        self.description: Optional[
+            list[tuple[str, Any, None, None, None, None, bool]]
+        ] = None
         self.rowcount: int = -1
-        self._results: List[Tuple[Any, ...]] = []
+        self._results: list[tuple[Any, ...]] = []
         self._results_index: int = 0
 
-    def execute(self, sql: str, params: Optional[Tuple[Any, ...]] = None) -> "RocksdbCursor":
+    def execute(
+        self, sql: str, params: Optional[tuple[Any, ...]] = None
+    ) -> "RocksdbCursor":
         # Clear previous state
         self._results = []
         self._results_index = 0
@@ -152,8 +169,9 @@ class RocksdbCursor:
         )
         if insert_match:
             table = insert_match.group(1).lower()
-            cols = [c.strip() for k in insert_match.group(2).split(",") for c in [k.strip()]]
-            vals_placeholder = insert_match.group(3)
+            cols = [
+                c.strip() for k in insert_match.group(2).split(",") for c in [k.strip()]
+            ]
 
             schema = ROCKSDB_TABLE_SCHEMAS.get(table)
             if not schema:
@@ -200,7 +218,7 @@ class RocksdbCursor:
                     cols_to_select = []
 
             # Filter rows
-            all_rows: List[Dict[str, Any]] = []
+            all_rows: list[dict[str, Any]] = []
 
             # See if we can optimize by matching primary key directly in WHERE clause
             is_pk_lookup = False
@@ -245,7 +263,9 @@ class RocksdbCursor:
                 self._results.append(res_tuple)
 
             self.rowcount = len(self._results)
-            self.description = [(col, None, None, None, None, None, True) for col in cols_to_select]
+            self.description = [
+                (col, None, None, None, None, None, True) for col in cols_to_select
+            ]
             return self
 
         # 3. MATCH UPDATE
@@ -262,8 +282,8 @@ class RocksdbCursor:
 
             schema = ROCKSDB_TABLE_SCHEMAS.get(table)
             set_cols = re.findall(r"(\w+)\s*=\s*\?", sets_str)
-            set_vals = params[:len(set_cols)]
-            where_vals = params[len(set_cols):]
+            set_vals = params[: len(set_cols)]
+            where_vals = params[len(set_cols) :]
 
             # Scan and update
             prefix = f"{table}:".encode("utf-8")
@@ -330,15 +350,15 @@ class RocksdbCursor:
         self.rowcount = 0
         return self
 
-    def fetchone(self) -> Optional[Tuple[Any, ...]]:
+    def fetchone(self) -> Optional[tuple[Any, ...]]:
         if self._results_index < len(self._results):
             res = self._results[self._results_index]
             self._results_index += 1
             return res
         return None
 
-    def fetchall(self) -> List[Tuple[Any, ...]]:
-        res = self._results[self._results_index:]
+    def fetchall(self) -> list[tuple[Any, ...]]:
+        res = self._results[self._results_index :]
         self._results_index = len(self._results)
         return res
 
@@ -371,6 +391,7 @@ def connect(*args: Any, **kwargs: Any) -> RocksdbConnection:
 
 
 # --- SYNAPSE DATABASE ENGINE WRAPPER ---
+
 
 class RocksdbEngine(BaseDatabaseEngine[RocksdbConnection, RocksdbCursor]):
     def __init__(self, database_config: Mapping[str, Any]):
@@ -410,7 +431,7 @@ class RocksdbEngine(BaseDatabaseEngine[RocksdbConnection, RocksdbCursor]):
 
     @property
     def server_version(self) -> str:
-        return "rocksdb-experimental-v1"
+        return "94-rocksdb-001-ef678ce914"
 
     @property
     def row_id_name(self) -> str:
@@ -419,7 +440,9 @@ class RocksdbEngine(BaseDatabaseEngine[RocksdbConnection, RocksdbCursor]):
     def in_transaction(self, conn: RocksdbConnection) -> bool:
         return False
 
-    def attempt_to_set_autocommit(self, conn: RocksdbConnection, autocommit: bool) -> None:
+    def attempt_to_set_autocommit(
+        self, conn: RocksdbConnection, autocommit: bool
+    ) -> None:
         pass
 
     def attempt_to_set_isolation_level(

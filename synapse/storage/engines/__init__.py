@@ -59,6 +59,7 @@ except ImportError:
                 f"Cannot create {cls.__name__} -- rocksdb module is not installed"
             )
 
+
 def create_engine(database_config: Mapping[str, Any]) -> BaseDatabaseEngine:
     name = database_config["name"]
 

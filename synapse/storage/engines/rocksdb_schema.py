@@ -103,7 +103,13 @@ ROCKSDB_TABLE_SCHEMAS: dict[str, TableSchema] = {
     ),
     "account_data": TableSchema(
         primary_keys=("user_id", "account_data_type"),
-        columns=["user_id", "account_data_type", "stream_id", "content", "instance_name"],
+        columns=[
+            "user_id",
+            "account_data_type",
+            "stream_id",
+            "content",
+            "instance_name",
+        ],
     ),
     "room_account_data": TableSchema(
         primary_keys=("user_id", "room_id", "account_data_type"),

@@ -4,6 +4,7 @@
 
 import os
 import unittest
+
 from synapse.storage.engines.rocksdb import connect
 
 

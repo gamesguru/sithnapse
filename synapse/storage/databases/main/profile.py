@@ -163,6 +163,25 @@ class ProfileWorkerStore(SQLBaseStore):
             The user's display name and avatar URL. Values may be null if unset
              or if the user doesn't exist.
         """
+        if (
+            getattr(self.database_engine, "server_version", "")
+            == "rocksdb-experimental-v1"
+        ):
+            import json
+
+            from synapse.storage.engines.rocksdb import get_global_db
+
+            db = get_global_db()
+            key = f"profiles:{user_id.localpart}".encode("utf-8")
+            val = db.get(key)
+            if val:
+                data = json.loads(val.decode("utf-8"))
+                return ProfileInfo(
+                    avatar_url=data.get("avatar_url"),
+                    display_name=data.get("displayname"),
+                )
+            return ProfileInfo(None, None)
+
         profile = await self.db_pool.simple_select_one(
             table="profiles",
             keyvalues={"full_user_id": user_id.to_string()},
@@ -298,6 +317,28 @@ class ProfileWorkerStore(SQLBaseStore):
         Args:
             user_id: The user to create the profile for.
         """
+        if (
+            getattr(self.database_engine, "server_version", "")
+            == "rocksdb-experimental-v1"
+        ):
+            import json
+
+            from synapse.storage.engines.rocksdb import get_global_db
+
+            db = get_global_db()
+            key = f"profiles:{user_id.localpart}".encode("utf-8")
+            if not db.get(key):
+                db.put(
+                    key,
+                    json.dumps(
+                        {
+                            "user_id": user_id.localpart,
+                            "full_user_id": user_id.to_string(),
+                        }
+                    ).encode("utf-8"),
+                )
+            return
+
         user_localpart = user_id.localpart
         await self.db_pool.simple_insert(
             table="profiles",
@@ -381,6 +422,26 @@ class ProfileWorkerStore(SQLBaseStore):
             new_displayname: The new display name. If this is None, the user's display
                 name is removed.
         """
+        if (
+            getattr(self.database_engine, "server_version", "")
+            == "rocksdb-experimental-v1"
+        ):
+            import json
+
+            from synapse.storage.engines.rocksdb import get_global_db
+
+            db = get_global_db()
+            key = f"profiles:{user_id.localpart}".encode("utf-8")
+            val = db.get(key)
+            data = (
+                json.loads(val.decode("utf-8"))
+                if val
+                else {"user_id": user_id.localpart, "full_user_id": user_id.to_string()}
+            )
+            data["displayname"] = new_displayname
+            db.put(key, json.dumps(data).encode("utf-8"))
+            return
+
         user_localpart = user_id.localpart
 
         def set_profile_displayname(txn: LoggingTransaction) -> None:
