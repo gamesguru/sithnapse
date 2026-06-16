@@ -80,3 +80,9 @@ book/
 
 # Don't include users' poetry configs
 /poetry.toml
+
+# Test artifacts and sandbox directories generated during local test runs
+/server.*.cnf
+/server.*.crt
+/server.csr
+/tests.*/
