@@ -13,6 +13,7 @@
 #
 
 import json
+
 from immutabledict import immutabledict
 
 from synapse.synapse_rust.events import JsonObject
@@ -29,7 +30,7 @@ class OrjsonTestCase(TestCase):
         data = {"string": "hello", "integer": 42, "boolean": True, "list": [1, 2, 3]}
         encoded = json_encoder.encode(data)
         self.assertIsInstance(encoded, str)
-        
+
         decoded = json_decoder.decode(encoded)
         self.assertEqual(decoded, data)
 
@@ -38,7 +39,7 @@ class OrjsonTestCase(TestCase):
         d = immutabledict({"key": "value"})
         encoded = json_encoder.encode(d)
         self.assertEqual(encoded, '{"key":"value"}')
-        
+
         decoded = json_decoder.decode(encoded)
         self.assertEqual(decoded, {"key": "value"})
 
@@ -47,7 +48,7 @@ class OrjsonTestCase(TestCase):
         obj = JsonObject({"key": "value"})
         encoded = json_encoder.encode(obj)
         self.assertEqual(encoded, '{"key":"value"}')
-        
+
         decoded = json_decoder.decode(encoded)
         self.assertEqual(decoded, {"key": "value"})
 
@@ -64,8 +65,9 @@ class OrjsonTestCase(TestCase):
 
     def test_unsupported_type_error(self) -> None:
         """Test that serializing an unsupported type raises TypeError."""
+
         class Unsupported:
             pass
-        
+
         with self.assertRaises(TypeError):
             json_encoder.encode(Unsupported())

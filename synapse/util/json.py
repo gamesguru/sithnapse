@@ -15,8 +15,8 @@
 
 from typing import Any
 
-from immutabledict import immutabledict
 import orjson
+from immutabledict import immutabledict
 
 from synapse.synapse_rust.events import JsonObject
 
