@@ -58,11 +58,7 @@ fn main() -> Result<(), std::io::Error> {
     println!("cargo:rustc-link-lib=static=rocksdb");
     println!("cargo:rustc-link-lib=dylib=stdc++");
     println!("cargo:rustc-link-lib=dylib=z");
-    println!("cargo:rustc-link-lib=dylib=bz2");
-    println!("cargo:rustc-link-lib=dylib=lz4");
-    println!("cargo:rustc-link-lib=dylib=zstd");
-    println!("cargo:rustc-link-lib=dylib=snappy");
-    println!("cargo:rustc-link-lib=dylib=uring");
+    println!("cargo:rustc-link-lib=static=bz2");
 
     // The default rules don't pick up trivial changes to the workspace config
     // files, but we need to rebuild if those change to pick up the changed
