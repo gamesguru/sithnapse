@@ -13,22 +13,15 @@
 #
 #
 
-import json
-from typing import (
-    Any,
-)
+from typing import Any
 
 from immutabledict import immutabledict
+import orjson
 
 from synapse.synapse_rust.events import JsonObject
 
 
-def _reject_invalid_json(val: Any) -> None:
-    """Do not allow Infinity, -Infinity, or NaN values in JSON."""
-    raise ValueError("Invalid JSON value: '%s'" % val)
-
-
-def _handle_extra_mappings(obj: Any) -> dict[Any, Any]:
+def _handle_extra_mappings(obj: Any) -> Any:
     """Helper for json_encoder. Makes immutabledicts and JsonObjects
     serializable
     """
@@ -50,13 +43,21 @@ def _handle_extra_mappings(obj: Any) -> dict[Any, Any]:
     )
 
 
-# A custom JSON encoder which:
-#   * handles immutabledicts
-#   * produces valid JSON (no NaNs etc)
-#   * reduces redundant whitespace
-json_encoder = json.JSONEncoder(
-    allow_nan=False, separators=(",", ":"), default=_handle_extra_mappings
-)
+class OrjsonEncoder:
+    """A custom high-performance JSON encoder wrapper that uses orjson."""
 
-# Create a custom decoder to reject Python extensions to JSON.
-json_decoder = json.JSONDecoder(parse_constant=_reject_invalid_json)
+    def encode(self, obj: Any) -> str:
+        # orjson.dumps returns bytes; we decode it to a UTF-8 string to be
+        # compatible with json.JSONEncoder.encode().
+        return orjson.dumps(obj, default=_handle_extra_mappings).decode("utf-8")
+
+
+class OrjsonDecoder:
+    """A custom high-performance JSON decoder wrapper that uses orjson."""
+
+    def decode(self, s: str | bytes) -> Any:
+        return orjson.loads(s)
+
+
+json_encoder = OrjsonEncoder()
+json_decoder = OrjsonDecoder()
