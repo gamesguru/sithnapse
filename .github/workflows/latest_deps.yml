@@ -23,6 +23,7 @@ concurrency:
 
 env:
   RUST_VERSION: 1.87.0
+  UV_HTTP_RETRIES: 5
 
 jobs:
   check_repo:
@@ -49,22 +50,25 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-      # The dev dependencies aren't exposed in the wheel metadata (at least with current
-      # poetry-core versions), so we install with poetry.
-      - uses: matrix-org/setup-python-poetry@5bbf6603c5c930615ec8a29f1b5d7d258d905aa4 # v2.0.0
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
         with:
-          python-version: "3.x"
-          poetry-version: "2.4.1"
-          extras: "all"
+          version: "0.5.31"
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync --all-extras --upgrade
+
       # Dump installed versions for debugging.
-      - run: poetry run pip list > before.txt
+      - run: uv run --no-sync pip list > before.txt
       # Upgrade all runtime dependencies only. This is intended to mimic a fresh
       # `pip install matrix-synapse[all]` as closely as possible.
-      - run: poetry update --without dev
-      - run: poetry run pip list > after.txt && (diff -u before.txt after.txt || true)
+      - run: uv pip install -U -e .[all]
+      - run: uv run --no-sync pip list > after.txt && (diff -u before.txt after.txt || true)
       - name: Remove unhelpful options from mypy config
         run: sed -e '/warn_unused_ignores = True/d' -e '/warn_redundant_casts = True/d' -i mypy.ini
-      - run: poetry run mypy
+      - run: uv run --no-sync mypy
   trial:
     needs: check_repo
     if: needs.check_repo.outputs.should_run_workflow == 'true'
@@ -159,14 +163,17 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-      - name: Ensure sytest runs `pip install`
-        # Delete the lockfile so sytest will `pip install` rather than `poetry install`
-        run: rm /src/poetry.lock
-        working-directory: /src
       - name: Prepare test blacklist
         run: cat sytest-blacklist .ci/worker-blacklist > synapse-blacklist-with-workers
+      - name: Install dependencies using uv
+        run: |
+          /venv/bin/pip install uv
+          ln -s -T /venv /src/.venv
+          /venv/bin/uv sync --all-extras --upgrade
+        working-directory: /src
+
       - name: Run SyTest
-        run: /bootstrap.sh synapse
+        run: .github/workflows/sytest-wrapper.sh upgrade
         working-directory: /src
       - name: Summarise results.tap
         if: ${{ always() }}

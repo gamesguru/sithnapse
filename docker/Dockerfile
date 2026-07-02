@@ -15,14 +15,11 @@
 #    DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile --build-arg PYTHON_VERSION=3.10 .
 #
 
-# Irritatingly, there is no blessed guide on how to distribute an application with its
-# poetry-managed environment in a docker image. We have opted for
-# `poetry export | pip install -r /dev/stdin`, but beware: we have experienced bugs in
-# in `poetry export` in the past.
+# We use `uv` to generate a strict requirements.txt from our lockfile,
+# which is then installed into the image.
 
 ARG DEBIAN_VERSION=trixie
 ARG PYTHON_VERSION=3.13
-ARG POETRY_VERSION=2.4.1
 
 ###
 ### Stage 0: generate requirements.txt
@@ -33,8 +30,8 @@ FROM --platform=$BUILDPLATFORM ghcr.io/astral-sh/uv:python${PYTHON_VERSION}-${DE
 
 WORKDIR /synapse
 
-# Copy just what we need to run `poetry export`...
-COPY pyproject.toml poetry.lock /synapse/
+# Copy just what we need to run `uv export`...
+COPY pyproject.toml uv.lock /synapse/
 
 
 # If specified, we won't verify the hashes of dependencies.
@@ -42,22 +39,20 @@ COPY pyproject.toml poetry.lock /synapse/
 # reason, such as when a git repository is used directly as a dependency.
 ARG TEST_ONLY_SKIP_DEP_HASH_VERIFICATION
 
-# If specified, we won't use the Poetry lockfile.
+# If specified, we won't use the lockfile.
 # Instead, we'll just install what a regular `pip install` would from PyPI.
-ARG TEST_ONLY_IGNORE_POETRY_LOCKFILE
+ARG TEST_ONLY_IGNORE_LOCKFILE
 
 # This silences a warning as uv isn't able to do hardlinks between its cache
 # (mounted as --mount=type=cache) and the target directory.
 ENV UV_LINK_MODE=copy
 
-# Export the dependencies, but only if we're actually going to use the Poetry lockfile.
+# Export the dependencies, but only if we're actually going to use the lockfile.
 # Otherwise, just create an empty requirements file so that the Dockerfile can
 # proceed.
-ARG POETRY_VERSION
 RUN --mount=type=cache,target=/root/.cache/uv \
-  if [ -z "$TEST_ONLY_IGNORE_POETRY_LOCKFILE" ]; then \
-    uvx --with poetry-plugin-export==1.9.0 \
-        poetry@${POETRY_VERSION} export --extras all -o /synapse/requirements.txt ${TEST_ONLY_SKIP_DEP_HASH_VERIFICATION:+--without-hashes}; \
+  if [ -z "$TEST_ONLY_IGNORE_LOCKFILE" ]; then \
+    uv export --all-extras --frozen --no-emit-project --output-file /synapse/requirements.txt ${TEST_ONLY_SKIP_DEP_HASH_VERIFICATION:+--no-hashes}; \
   else \
     touch /synapse/requirements.txt; \
   fi
@@ -88,10 +83,11 @@ ENV CARGO_NET_GIT_FETCH_WITH_CLI=$CARGO_NET_GIT_FETCH_WITH_CLI
 # the whole synapse project, so that this layer in the Docker cache can be
 # used while you develop on the source
 #
-# This is aiming at installing the `[tool.poetry.depdendencies]` from pyproject.toml.
+# This is aiming at installing the dependencies from pyproject.toml.
 COPY --from=requirements /synapse/requirements.txt /synapse/
+COPY pyproject.toml uv.lock /synapse/
 RUN --mount=type=cache,target=/root/.cache/uv \
-  uv pip install --prefix="/install" --no-deps -r /synapse/requirements.txt
+  cd /synapse && uv pip install --system --prefix="/install" --no-deps -r requirements.txt
 
 # Copy over the rest of the synapse source code.
 COPY synapse /synapse/synapse/
@@ -100,7 +96,7 @@ COPY rust /synapse/rust/
 COPY pyproject.toml README.rst build_rust.py Cargo.toml Cargo.lock /synapse/
 
 # Repeat of earlier build argument declaration, as this is a new build stage.
-ARG TEST_ONLY_IGNORE_POETRY_LOCKFILE
+ARG TEST_ONLY_IGNORE_LOCKFILE
 
 # Install the synapse package itself.
 # If we have populated requirements.txt, we don't install any dependencies
@@ -109,10 +105,10 @@ RUN \
   --mount=type=cache,target=/root/.cache/uv \
   --mount=type=cache,target=/synapse/target,sharing=locked \
   --mount=type=cache,target=${CARGO_HOME}/registry,sharing=locked \
-  if [ -z "$TEST_ONLY_IGNORE_POETRY_LOCKFILE" ]; then \
-    uv pip install --prefix="/install" --no-deps /synapse[all]; \
+  if [ -z "$TEST_ONLY_IGNORE_LOCKFILE" ]; then \
+    uv pip install --system --prefix="/install" --no-deps /synapse[all]; \
   else \
-    uv pip install --prefix="/install" /synapse[all]; \
+    uv pip install --system --prefix="/install" /synapse[all]; \
   fi
 
 ###

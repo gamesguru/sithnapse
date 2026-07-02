@@ -78,11 +78,27 @@ Next, open a terminal and install dependencies as follows:
 
 ```sh
 cd path/where/you/have/cloned/the/repository
-poetry install --extras all
+uv sync --all-extras
 ```
 
 This will install the runtime and developer dependencies for the project.  Be sure to check
-that the `poetry install` step completed cleanly.
+that the `uv sync` step completed cleanly.
+
+### Pro Tip: Faster development environment with `uv`
+
+To bypass Poetry's slow dependency resolution and installation times, we highly recommend using [uv](https://github.com/astral-sh/uv), a fast Python package installer and resolver written in Rust.
+
+If you only need the core dependencies and unit test tooling (and want to avoid compiling optional enterprise SSO C-bindings), you can sync the virtual environment using our `core_dev` dependency group:
+
+```shell
+uv sync --group core_dev
+```
+
+To install everything (all optional extras), use:
+
+```shell
+uv sync --all-extras
+```
 
 For OSX users, be sure to set `PKG_CONFIG_PATH` to support `icu4c`. Run `brew info icu4c` for more details.
 
@@ -105,7 +121,7 @@ Now edit `homeserver.yaml`, things you might want to change include:
 And then run Synapse with the following command:
 
 ```sh
-poetry run python -m synapse.app.homeserver -c homeserver.yaml
+uv run python -m synapse.app.homeserver -c homeserver.yaml
 ```
 
 If you get an error like the following:
@@ -114,7 +130,7 @@ If you get an error like the following:
 importlib.metadata.PackageNotFoundError: matrix-synapse
 ```
 
-this probably indicates that the `poetry install` step did not complete cleanly - go back and
+this probably indicates that the `uv sync` step did not complete cleanly - go back and
 resolve any issues and re-run until successful.
 
 # 5. Get in touch.
@@ -155,13 +171,13 @@ to check that your contributions render correctly. The docs are written in
 
 ## Making changes to the Rust code
 
-When changes are made to any Rust code then you must call either `poetry install`
+When changes are made to any Rust code then you must call either `uv sync`
 or `maturin develop` (if installed) to rebuild the Rust code.
 
-You can use `poetry install -v` or `-vv` to get more info about build failures.
+You can use `uv sync -v` or `-vv` to get more info about build failures.
 
 Using [`maturin`](https://github.com/PyO3/maturin)
-is quicker than `poetry install`, so is recommended when making frequent
+is quicker than `uv sync`, so is recommended when making frequent
 changes to the Rust code.
 
 
@@ -181,7 +197,7 @@ The linters look at your code and do two things:
 The linter takes no time at all to run as soon as you've [downloaded the dependencies](#4-install-the-dependencies).
 
 ```sh
-poetry run ./scripts-dev/lint.sh
+uv run ./scripts-dev/lint.sh
 ```
 
 Note that this script *will modify your files* to fix styling errors.
@@ -191,13 +207,13 @@ If you wish to restrict the linters to only the files changed since the last com
 (much faster!), you can instead run:
 
 ```sh
-poetry run ./scripts-dev/lint.sh -d
+uv run ./scripts-dev/lint.sh -d
 ```
 
 Or if you know exactly which files you wish to lint, you can instead run:
 
 ```sh
-poetry run ./scripts-dev/lint.sh path/to/file1.py path/to/file2.py path/to/folder
+uv run ./scripts-dev/lint.sh path/to/file1.py path/to/file2.py path/to/folder
 ```
 
 ## Run the unit tests (Twisted trial).
@@ -206,20 +222,20 @@ The unit tests run parts of Synapse, including your changes, to see if anything
 was broken. They are slower than the linters but will typically catch more errors.
 
 ```sh
-poetry run trial tests
+uv run trial tests
 ```
 
 You can run unit tests in parallel by specifying `-jX` argument to `trial` where `X` is the number of parallel runners you want. To use 4 cpu cores, you would run them like:
 
 ```sh
-poetry run trial -j4 tests
+uv run trial -j4 tests
 ```
 
 If you wish to only run *some* unit tests, you may specify
 another module instead of `tests` - or a test class or a method:
 
 ```sh
-poetry run trial tests.rest.admin.test_room tests.handlers.test_admin.ExfiltrateData.test_invite
+uv run trial tests.rest.admin.test_room tests.handlers.test_admin.ExfiltrateData.test_invite
 ```
 
 If your tests fail, you may wish to look at the logs (the default log level is `ERROR`):
@@ -231,7 +247,7 @@ less _trial_temp/test.log
 To increase the log level for the tests, set `SYNAPSE_TEST_LOG_LEVEL`:
 
 ```sh
-SYNAPSE_TEST_LOG_LEVEL=DEBUG poetry run trial tests
+SYNAPSE_TEST_LOG_LEVEL=DEBUG uv run trial tests
 ```
 
 By default, tests will use an in-memory SQLite database for test data. For additional
@@ -242,7 +258,7 @@ database state to be stored in a file named `test.db` under the trial process'
 working directory. Typically, this ends up being `_trial_temp/test.db`. For example:
 
 ```sh
-SYNAPSE_TEST_PERSIST_SQLITE_DB=1 poetry run trial tests
+SYNAPSE_TEST_PERSIST_SQLITE_DB=1 uv run trial tests
 ```
 
 The database file can then be inspected with:
@@ -284,7 +300,7 @@ then something is already bound to port 5432. You're probably already running po
 Once you have a postgres server running, invoke `trial` in a second terminal:
 
 ```shell
-SYNAPSE_POSTGRES=1 SYNAPSE_POSTGRES_HOST=127.0.0.1 SYNAPSE_POSTGRES_USER=postgres SYNAPSE_POSTGRES_PASSWORD=mysecretpassword poetry run trial tests
+SYNAPSE_POSTGRES=1 SYNAPSE_POSTGRES_HOST=127.0.0.1 SYNAPSE_POSTGRES_USER=postgres SYNAPSE_POSTGRES_PASSWORD=mysecretpassword uv run trial tests
 ````
 
 #### Using an existing Postgres installation

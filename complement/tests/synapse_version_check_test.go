@@ -46,7 +46,7 @@ func TestSynapseVersion(t *testing.T) {
 		checkoutSynapseVersion := runCommand(
 			t,
 			[]string{
-				"poetry",
+				"uv",
 				"run",
 				"python",
 				"-c",

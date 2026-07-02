@@ -47,10 +47,13 @@ jobs:
         if: github.event_name == 'push'
         with:
           ref: master
-      # We use `poetry` in `complement.sh`
-      - uses: matrix-org/setup-python-poetry@5bbf6603c5c930615ec8a29f1b5d7d258d905aa4 # v2.0.0
+      # We use `uv` in `complement.sh`
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
         with:
-          poetry-version: "2.4.1"
+          version: "0.5.31"
+          enable-cache: true
+          python-version: "3.12"
       - name: Login to registry
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:

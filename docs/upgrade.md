@@ -40,12 +40,12 @@ this document.
         ```
         Include any relevant extras between square brackets, e.g. `pip install --upgrade ".[postgres,oidc]"`.
 
-    3.  If you're using `poetry` to manage a Synapse installation, run:
+    3.  If you're using `uv` to manage a Synapse installation from a source checkout, run:
         ```bash
-        poetry install
+        uv sync
         ```
-        Include any relevant extras with `--extras`, e.g. `poetry install --extras postgres --extras oidc`.
-        It's probably easiest to run `poetry install --extras all`.
+        Include any relevant extras with `--extra`, e.g. `uv sync --extra postgres --extra oidc`.
+        It's probably easiest to run `uv sync --all-extras`.
 
     4.  Restart Synapse:
 
@@ -748,10 +748,10 @@ and device replication will resume as normal.
 ## Minimum version of Poetry is now 1.3.2
 
 The minimum supported version of Poetry is now 1.3.2 (previously 1.2.0, [since
-Synapse 1.67](#upgrading-to-v1670)). If you have used `poetry install` to
+Synapse 1.67](#upgrading-to-v1670)). If you have used `poetry` to
 install Synapse from a source checkout, you should upgrade poetry: see its
 [installation instructions](https://python-poetry.org/docs/#installation).
-For all other installation methods, no acction is required.
+For all other installation methods, no action is required.
 
 # Upgrading to v1.74.0
 
