@@ -368,11 +368,12 @@ class TransportLayerClient:
         ignore_backoff = False
         retry_on_dns_fail = False
 
-        if membership == Membership.LEAVE:
-            # we particularly want to do our best to send leave events. The
-            # problem is that if it fails, we won't retry it later, so if the
-            # remote server was just having a momentary blip, the room will be
-            # out of sync.
+        if membership in (Membership.LEAVE, Membership.JOIN, Membership.KNOCK):
+            # we particularly want to do our best to send leave, join and knock
+            # events. The problem is that if it fails, we won't retry it later,
+            # so if the remote server was just having a momentary blip, the room
+            # will be out of sync or the client's join/knock attempt will be
+            # blocked.
             ignore_backoff = True
             retry_on_dns_fail = True
 
