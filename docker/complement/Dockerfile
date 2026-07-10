@@ -36,6 +36,9 @@ RUN gosu postgres initdb --locale=C --encoding=UTF-8 --auth-host password
 RUN echo "ALTER USER postgres PASSWORD 'somesecret'" | gosu postgres postgres --single
 RUN echo "CREATE DATABASE synapse" | gosu postgres postgres --single
 
+# Temporarily pin TLS dependencies to fix Complement federation tests
+RUN pip install pyopenssl==26.0.0 cryptography==46.0.7 service-identity==24.2.0
+
 # Extend the shared homeserver config to disable rate-limiting,
 # set Complement's static shared secret, enable registration, amongst other
 # tweaks to get Synapse ready for testing.

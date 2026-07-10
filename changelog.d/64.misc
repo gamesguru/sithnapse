@@ -1,0 +1,1 @@
+Consolidate SyTest execution into a centralized workflow wrapper, migrate CI runners to uv for faster dependency resolution, pre-create the PostgreSQL sytest_template database to quiet test-setup connection warnings, and harden the GHA pipelines with robust network fetch retries.

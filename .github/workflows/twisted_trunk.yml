@@ -21,6 +21,7 @@ concurrency:
 
 env:
   RUST_VERSION: 1.87.0
+  UV_HTTP_RETRIES: 5
 
 jobs:
   check_repo:
@@ -50,18 +51,19 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-      - uses: matrix-org/setup-python-poetry@5bbf6603c5c930615ec8a29f1b5d7d258d905aa4 # v2.0.0
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
         with:
-          python-version: "3.x"
-          extras: "all"
-          poetry-version: "2.4.1"
+          version: "0.5.31"
+          enable-cache: true
+          python-version: "3.12"
       - run: |
-          poetry remove twisted
-          poetry add --extras tls git+https://github.com/twisted/twisted.git#${{ inputs.twisted_ref || 'trunk' }}
-          poetry install --no-interaction --extras "all test"
+          uv remove twisted
+          uv add "twisted[tls] @ git+https://github.com/twisted/twisted.git#${{ inputs.twisted_ref || 'trunk' }}"
+          uv sync --all-extras
       - name: Remove unhelpful options from mypy config
         run: sed -e '/warn_unused_ignores = True/d' -e '/warn_redundant_casts = True/d' -i mypy.ini
-      - run: poetry run mypy
+      - run: uv run mypy
 
   trial:
     needs: check_repo
@@ -78,16 +80,17 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-      - uses: matrix-org/setup-python-poetry@5bbf6603c5c930615ec8a29f1b5d7d258d905aa4 # v2.0.0
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
         with:
-          python-version: "3.x"
-          extras: "all test"
-          poetry-version: "2.4.1"
+          version: "0.5.31"
+          enable-cache: true
+          python-version: "3.12"
       - run: |
-          poetry remove twisted
-          poetry add --extras tls git+https://github.com/twisted/twisted.git#trunk
-          poetry install --no-interaction --extras "all test"
-      - run: poetry run trial --jobs 2 tests
+          uv remove twisted
+          uv add "twisted[tls] @ git+https://github.com/twisted/twisted.git#trunk"
+          uv sync --all-extras
+      - run: uv run trial --jobs 2 tests
       - name: Dump logs
         # Logs are most useful when the command fails, always include them.
         if: ${{ always() }}
@@ -124,18 +127,19 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Patch dependencies
-        # Note: The poetry commands want to create a virtualenv in /src/.venv/,
+        # Note: The uv commands want to create a virtualenv in /src/.venv/,
         #       but the sytest-synapse container expects it to be in /venv/.
-        #       We symlink it before running poetry so that poetry actually
+        #       We symlink it before running uv so that uv actually
         #       ends up installing to `/venv`.
         run: |
+          /venv/bin/pip install uv
           ln -s -T /venv /src/.venv
-          poetry remove twisted
-          poetry add --extras tls git+https://github.com/twisted/twisted.git#trunk
-          poetry install --no-interaction --extras "all test"
+          /venv/bin/uv remove twisted
+          /venv/bin/uv add "twisted[tls] @ git+https://github.com/twisted/twisted.git#trunk"
+          /venv/bin/uv sync --all-extras
         working-directory: /src
       - name: Run SyTest
-        run: /bootstrap.sh synapse
+        run: .github/workflows/sytest-wrapper.sh offline
         working-directory: /src
         env:
           # Use offline mode to avoid reinstalling the pinned version of

@@ -46,11 +46,10 @@ configuration file and the full Matrix ID of the user to export:
 python -m synapse.app.admin_cmd -c <config_file> export-data <user_id> --output-directory <directory_path>
 ```
 
-If you uses [Poetry](../../development/dependencies.md#managing-dependencies-with-poetry)
-to run Synapse:
+If you use [uv](../../development/dependencies.md#managing-dependencies-with-uv) to run Synapse:
 
 ```console
-poetry run python -m synapse.app.admin_cmd -c <config_file> export-data <user_id> --output-directory <directory_path>
+uv run python -m synapse.app.admin_cmd -c <config_file> export-data <user_id> --output-directory <directory_path>
 ```
 
 The directory to store the export data in can be customised with the

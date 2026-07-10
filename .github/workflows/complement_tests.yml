@@ -19,6 +19,8 @@ permissions:
 
 env:
   RUST_VERSION: 1.87.0
+  UV_HTTP_RETRIES: 5
+  DOCKER_BUILD_ARGS: "--cache-from=type=gha --cache-to=type=gha,mode=max"
 
 jobs:
   complement:
@@ -55,12 +57,13 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-      # We use `poetry` in `complement.sh`
-      - uses: matrix-org/setup-python-poetry@5bbf6603c5c930615ec8a29f1b5d7d258d905aa4 # v2.0.0
+      # We use `uv` in `complement.sh`
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
         with:
-          poetry-version: "2.4.1"
-          # Matches the `path` where we checkout Synapse above
-          working-directory: "synapse"
+          version: "0.5.31"
+          enable-cache: true
+          python-version: "3.12"
 
       - name: Prepare Complement's Prerequisites
         run: synapse/.ci/scripts/setup_complement_prerequisites.sh
@@ -75,12 +78,9 @@ jobs:
         if: ${{ inputs.use_twisted_trunk }}
         run: |
           set -x
-          DEBIAN_FRONTEND=noninteractive sudo apt-get install -yqq python3 pipx
-          pipx install poetry==2.4.1
-
-          poetry remove -n twisted
-          poetry add -n --extras tls git+https://github.com/twisted/twisted.git#trunk
-          poetry lock
+          uv remove twisted
+          uv add "twisted[tls] @ git+https://github.com/twisted/twisted.git#trunk"
+          uv lock
         working-directory: synapse
 
       # Run the image sanity check test first as this is the first thing we want to know

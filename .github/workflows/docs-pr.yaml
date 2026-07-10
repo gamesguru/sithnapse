@@ -28,7 +28,7 @@ jobs:
         with:
           python-version: "3.x"
 
-      - run: "pip install 'packaging>=20.0' 'GitPython>=3.1.20'"
+      - run: "python -m pip install 'packaging>=20.0' 'GitPython>=3.1.20'"
 
       - name: Build the documentation
         # mdbook will only create an index.html if we're including docs/README.md in SUMMARY.md.
@@ -56,6 +56,12 @@ jobs:
         uses: peaceiris/actions-mdbook@ee69d230fe19748b7abf22df32acaa93833fad08 # v2.0.0
         with:
           mdbook-version: '0.5.2'
+
+      - name: Setup python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.x"
+      - run: "python -m pip install 'packaging>=20.0' 'GitPython>=3.1.20'"
 
       - name: Setup htmltest
         run: |

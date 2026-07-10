@@ -1,0 +1,1 @@
+Migrate the repository from Poetry to the `uv` package manager for local development and GitHub Actions CI pipelines.
