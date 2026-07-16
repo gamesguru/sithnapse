@@ -1,0 +1,1 @@
+Migrate the repository's package management and CI pipelines from Poetry to `uv` for faster local dependency synchronization, setup, and more robust network fetches in GitHub Actions. Contributed by @gamesguru.

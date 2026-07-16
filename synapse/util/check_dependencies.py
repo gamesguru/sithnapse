@@ -48,8 +48,8 @@ class DependencyException(Exception):
         return "\n".join(
             [
                 "Missing Requirements: %s" % (", ".join(self.dependencies),),
-                "To install run:",
-                "    pip install --upgrade --force %s" % (" ".join(self.dependencies),),
+                "To install, run `uv sync` (from a source checkout), or run:",
+                "  pip install --upgrade --force %s" % (" ".join(self.dependencies),),
                 "",
             ]
         )
@@ -60,7 +60,7 @@ class DependencyException(Exception):
             yield '"' + i + '"'
 
 
-DEV_EXTRAS = {"lint", "mypy", "test", "dev"}
+DEV_EXTRAS = {"lint", "mypy", "test", "dev", "sytest"}
 ALL_EXTRAS = metadata.metadata(DISTRIBUTION_NAME).get_all("Provides-Extra")
 assert ALL_EXTRAS is not None
 RUNTIME_EXTRAS = set(ALL_EXTRAS) - DEV_EXTRAS
@@ -88,15 +88,9 @@ def _is_dev_dependency(req: Requirement) -> bool:
 
 
 def _should_ignore_runtime_requirement(req: Requirement) -> bool:
-    # This is a build-time dependency. Irritatingly, `poetry build` ignores the
-    # requirements listed in the [build-system] section of pyproject.toml, so in order
-    # to support `poetry install --without dev` we have to mark it as a runtime dependency.
-    # See discussion on https://github.com/python-poetry/poetry/issues/6154 (it sounds
-    # like the poetry authors don't consider this a bug?)
-    #
-    # In any case, workaround this by ignoring setuptools_rust here. (It might be
-    # slightly cleaner to put `setuptools_rust` in a `build` extra or similar, but for
-    # now let's do something quick and dirty.
+    # This is a build-time dependency. It is marked as a runtime dependency
+    # in pyproject.toml to ensure it is available during source checkouts,
+    # but we ignore it during runtime checks since it is not needed at runtime.
     if canonicalize_name(req.name) == "setuptools-rust":
         return True
     return False

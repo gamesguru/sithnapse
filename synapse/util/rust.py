@@ -47,7 +47,7 @@ def check_rust_lib_up_to_date() -> None:
     hash = _hash_rust_files_in_directory(synapse_root)
 
     if hash != get_rust_file_digest():
-        raise Exception("Rust module outdated. Please rebuild using `poetry install`")
+        raise Exception("Rust module outdated. Please rebuild using `uv sync`")
 
 
 def _hash_rust_files_in_directory(synapse_root: str) -> str:
@@ -132,7 +132,8 @@ def get_synapse_source_directory() -> str | None:
         # tree Python will pick up the synapse package from the egg-info
         # install.
         #
-        # Poetry will create an egg-info install when running `poetry install`.
+        # Editable installs (such as those created by running `uv sync`) will
+        # create package metadata inside the source tree.
         #
         # The combination of the above means that it is very common for
         # developers (e.g. running tests) to encounter egg-info installs.

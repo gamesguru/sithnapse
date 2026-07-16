@@ -47,7 +47,7 @@ trial_sqlite_tests = [
         "extras": "all",
     },
     {
-        "python-version": "3.14",
+        "python-version": "3.13",
         "database": "sqlite",
         "extras": "all",
     },
@@ -76,7 +76,7 @@ trial_postgres_tests = [
         "extras": "all",
     },
     {
-        "python-version": "3.14",
+        "python-version": "3.13",
         "database": "postgres",
         "postgres-version": "17",
         "extras": "all",

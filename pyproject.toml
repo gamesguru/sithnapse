@@ -42,7 +42,7 @@ dependencies = [
     # We could likely bump this to 22.1 without making distro packagers'
     # lives hard (as of 2025-07, distro support is Ubuntu LTS: 22.1, Debian stable: 22.4,
     # RHEL 9: 22.10)
-    "Twisted[tls]>=21.2.0",
+    "Twisted[tls]>=21.2.0,<26.0.0",
     "treq>=21.5.0",
     # Twisted has required pyopenssl 16.0 since about Twisted 16.6.
     # pyOpenSSL 16.2.0 fixes compatibility with OpenSSL 1.1.0. 
@@ -138,6 +138,12 @@ saml2 = [
 ]
 oidc = ["authlib>=0.15.1"]
 url-preview = ["lxml>=4.6.3"]
+sytest = [
+    "pyopenssl==26.0.0",
+    "cryptography==46.0.7",
+    "service-identity==24.2.0",
+]
+
 sentry = ["sentry-sdk>=0.7.2"]
 opentracing = [
     "jaeger-client>=4.2.0",
@@ -256,7 +262,7 @@ generate-setup-file = true
 
 # Dependencies used for developing Synapse itself.
 #
-# We pin development dependencies in poetry.lock so that our tests don't start
+# We pin development dependencies in uv.lock so that our tests don't start
 # failing on new releases. Keeping lower bounds loose here means that dependabot
 # can bump versions without having to update the content-hash in the lockfile.
 # This helps prevents merge conflicts when running a batch of dependabot updates.
@@ -299,11 +305,25 @@ dev = [
     # Towncrier min version comes from https://github.com/matrix-org/synapse/pull/3425. Rationale unclear.
     "towncrier>=18.6.0rc1",
 
-    # Used for checking the Poetry lockfile
+    # Used for parsing configuration files
     "tomli>=1.2.3",
 
     # Used for checking the schema delta files
     "sqlglot>=28.0.0",
+]
+core_dev = [
+    { include-group = "dev" },
+    # Core dependencies from the 'all' extra, excluding enterprise SSO (SAML/LDAP) C-bindings
+    "authlib>=0.15.1",
+    "lxml>=4.6.3",
+    "sentry-sdk>=0.7.2",
+    "jaeger-client>=4.2.0",
+    "opentracing>=2.2.0",
+    "thrift>=0.10",
+    "tornado>=6.0",
+    "txredisapi>=1.4.7",
+    "hiredis>=0.3",
+    "pympler>=1.0",
 ]
 
 [tool.towncrier]
@@ -490,3 +510,4 @@ environment= { PATH = "$PATH:$HOME/.cargo/bin" }
 before-build = "rm -rf {project}/build"
 build-frontend = "build"
 test-command = "python -c 'from synapse.synapse_rust import sum_as_string; print(sum_as_string(1, 2))'"
+

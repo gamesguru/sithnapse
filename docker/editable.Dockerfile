@@ -50,17 +50,16 @@ RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-tool
 COPY synapse /editable-src/synapse/
 COPY rust /editable-src/rust/
 # ... and what we need to `pip install`.
-COPY pyproject.toml poetry.lock README.rst build_rust.py Cargo.toml Cargo.lock /editable-src/
+COPY pyproject.toml uv.lock README.rst build_rust.py Cargo.toml Cargo.lock /editable-src/
 
-RUN pip install poetry
-RUN poetry config virtualenvs.create false
-RUN cd /editable-src && poetry install --extras all
+RUN pip install uv
+RUN cd /editable-src && UV_PROJECT_ENVIRONMENT=/usr/local uv sync --all-extras --frozen
 
 # Make copies of useful things for inspection:
 # - the Rust module (must be copied to the editable source tree before startup)
-# - poetry.lock is useful for checking if dependencies have changed.
+# - uv.lock is useful for checking if dependencies have changed.
 RUN cp /editable-src/synapse/synapse_rust.abi3.so /synapse_rust.abi3.so.bak
-RUN cp /editable-src/poetry.lock /poetry.lock.bak
+RUN cp /editable-src/uv.lock /uv.lock.bak
 
 
 ### Extra setup from original Dockerfile

@@ -119,25 +119,23 @@
                   libnotify # (the release script uses `notify-send` to tell you when CI jobs are done)
                 ];
 
-                # Install Python and manage a virtualenv with Poetry.
-                languages.python.enable = true;
-                languages.python.poetry.enable = true;
-                # Automatically activate the poetry virtualenv upon entering the shell.
-                languages.python.poetry.activate.enable = true;
-                # Install all extra Python dependencies; this is needed to run the unit
-                # tests and utilise all Synapse features.
-                languages.python.poetry.install.arguments = ["--extras all"];
-                # Install the 'matrix-synapse' package from the local checkout.
-                languages.python.poetry.install.installRootPackage = true;
+                # Install Python and manage a virtualenv with uv.
+                languages.python = {
+                  enable = true;
+                  venv = {
+                    enable = true;
+                  };
+                  uv = {
+                    enable = true;
+                    sync = {
+                      enable = true;
+                      allExtras = true;
+                    };
+                  };
+                };
 
-                # This is a work-around for NixOS systems. NixOS is special in
-                # that you can have multiple versions of packages installed at
-                # once, including your libc linker!
-                #
-                # Some binaries built for Linux expect those to be in a certain
-                # filepath, but that is not the case on NixOS. In that case, we
-                # force compiling those binaries locally instead.
-                env.POETRY_INSTALLER_NO_BINARY = "ruff";
+                # Prevent uv from downloading its own Python interpreters in Nix (forces it to use Nix's Python)
+                env.UV_PYTHON_DOWNLOADS = "never";
 
                 # Install dependencies for the additional programming languages
                 # involved with Synapse development.
@@ -195,7 +193,7 @@
                   EOF
                 '';
                 # Start synapse when `devenv up` is run.
-                processes.synapse.exec = "poetry run python -m synapse.app.homeserver -c homeserver.yaml -c homeserver-config-overrides.d";
+                processes.synapse.exec = "uv run python -m synapse.app.homeserver -c homeserver.yaml -c homeserver-config-overrides.d";
 
                 # Define the perl modules we require to run SyTest.
                 #
