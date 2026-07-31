@@ -59,6 +59,9 @@ from synapse.util.duration import Duration
 from synapse.util.metrics import Measure, measure_func
 from synapse.util.stringutils import shortstr
 
+CREATE_KEY = (EventTypes.Create, "")
+POWER_KEY = (EventTypes.PowerLevels, "")
+
 if TYPE_CHECKING:
     from synapse.server import HomeServer
     from synapse.storage.controllers import StateStorageController
@@ -81,9 +84,6 @@ EVICTION_TIMEOUT_SECONDS = 60 * 60
 
 
 _NEXT_STATE_ID = 1
-
-CREATE_KEY = (EventTypes.Create, "")
-POWER_KEY = (EventTypes.PowerLevels, "")
 
 
 def _gen_state_id() -> str:
