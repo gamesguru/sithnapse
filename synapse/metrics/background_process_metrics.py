@@ -379,6 +379,14 @@ def run_as_background_process(
 
                 with tracing_scope:
                     return await func(*args, **kwargs)
+            except defer.CancelledError:
+                # When homeserver shuts down, tasks are cancelled. Logging this as an exception
+                # stores a traceback which can leak a reference to the task/HomeServer, causing GC tests to fail.
+                logger.debug(
+                    "Background process '%s' was cancelled (likely due to shutdown).",
+                    desc,
+                )
+                return None
             except Exception:
                 logger.exception(
                     "Background process '%s' threw an exception",

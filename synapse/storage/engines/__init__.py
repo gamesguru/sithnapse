@@ -49,6 +49,17 @@ except ImportError:
             )
 
 
+try:
+    from .rocksdb import RocksdbEngine
+except ImportError:
+
+    class RocksdbEngine(BaseDatabaseEngine):  # type: ignore[no-redef]
+        def __new__(cls, *args: object, **kwargs: object) -> NoReturn:
+            raise RuntimeError(
+                f"Cannot create {cls.__name__} -- rocksdb module is not installed"
+            )
+
+
 def create_engine(database_config: Mapping[str, Any]) -> BaseDatabaseEngine:
     name = database_config["name"]
 
@@ -58,6 +69,9 @@ def create_engine(database_config: Mapping[str, Any]) -> BaseDatabaseEngine:
     if name == "psycopg2":
         return PostgresEngine(database_config)
 
+    if name == "rocksdb":
+        return RocksdbEngine(database_config)
+
     raise RuntimeError("Unsupported database engine '%s'" % (name,))
 
 
@@ -66,5 +80,6 @@ __all__ = [
     "BaseDatabaseEngine",
     "PostgresEngine",
     "Sqlite3Engine",
+    "RocksdbEngine",
     "IncorrectDatabaseSetup",
 ]

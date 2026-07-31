@@ -112,6 +112,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: sudo apt-get -qq update && sudo apt-get -qq install libclang-dev
       - uses: matrix-org/setup-python-poetry@5bbf6603c5c930615ec8a29f1b5d7d258d905aa4 # v2.0.0
         with:
           python-version: "3.x"
@@ -178,6 +179,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: sudo apt-get -qq update && sudo apt-get -qq install libclang-dev
 
       - name: Setup Poetry
         uses: matrix-org/setup-python-poetry@5bbf6603c5c930615ec8a29f1b5d7d258d905aa4 # v2.0.0
@@ -242,6 +244,7 @@ jobs:
           components: clippy
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: sudo apt-get -qq update && sudo apt-get -qq install libclang-dev
 
       - run: cargo clippy -- -D warnings
 
@@ -261,6 +264,7 @@ jobs:
           toolchain: ${{ env.RUST_NIGHTLY_VERSION }}
           components: clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: sudo apt-get -qq update && sudo apt-get -qq install libclang-dev
 
       - run: cargo clippy --all-features -- -D warnings
 
@@ -278,6 +282,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: sudo apt-get -qq update && sudo apt-get -qq install libclang-dev
 
       - name: Setup Poetry
         uses: matrix-org/setup-python-poetry@5bbf6603c5c930615ec8a29f1b5d7d258d905aa4 # v2.0.0
@@ -317,6 +322,7 @@ jobs:
           toolchain: ${{ env.RUST_NIGHTLY_VERSION }}
           components: rustfmt
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: sudo apt-get -qq update && sudo apt-get -qq install libclang-dev
 
       - run: cargo fmt --check
 
@@ -415,7 +421,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      - run: sudo apt-get -qq install xmlsec1
+      - run: sudo apt-get -qq install xmlsec1 libclang-dev
       - name: Set up PostgreSQL ${{ matrix.job.postgres-version }}
         if: ${{ matrix.job.postgres-version }}
         # 1. Mount postgres data files onto a tmpfs in-memory filesystem to reduce overhead of docker's overlayfs layer.
@@ -433,6 +439,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: sudo apt-get -qq update && sudo apt-get -qq install libclang-dev
 
       - uses: matrix-org/setup-python-poetry@5bbf6603c5c930615ec8a29f1b5d7d258d905aa4 # v2.0.0
         with:
@@ -477,6 +484,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: sudo apt-get -qq update && sudo apt-get -qq install libclang-dev
 
       # There aren't wheels for some of the older deps, so we need to install
       # their build dependencies
@@ -535,7 +543,7 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       # Install libs necessary for PyPy to build binary wheels for dependencies
-      - run: sudo apt-get -qq install xmlsec1 libxml2-dev libxslt-dev
+      - run: sudo apt-get -qq install xmlsec1 libclang-dev libxml2-dev libxslt-dev
       - uses: matrix-org/setup-python-poetry@5bbf6603c5c930615ec8a29f1b5d7d258d905aa4 # v2.0.0
         with:
           python-version: ${{ matrix.python-version }}
@@ -592,6 +600,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: sudo apt-get -qq update && sudo apt-get -qq install libclang-dev
 
       - name: Run SyTest
         run: /bootstrap.sh synapse
@@ -631,7 +640,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      - run: sudo apt-get -qq install xmlsec1 postgresql-client
+      - run: sudo apt-get -qq install xmlsec1 libclang-dev postgresql-client
       - uses: matrix-org/setup-python-poetry@5bbf6603c5c930615ec8a29f1b5d7d258d905aa4 # v2.0.0
         with:
           poetry-version: "2.4.1"
@@ -683,7 +692,7 @@ jobs:
           sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
           wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
           sudo apt-get update
-      - run: sudo apt-get -qq install xmlsec1 postgresql-client
+      - run: sudo apt-get -qq install xmlsec1 libclang-dev postgresql-client
       - uses: matrix-org/setup-python-poetry@5bbf6603c5c930615ec8a29f1b5d7d258d905aa4 # v2.0.0
         with:
           python-version: ${{ matrix.python-version }}
@@ -733,6 +742,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: sudo apt-get -qq update && sudo apt-get -qq install libclang-dev
 
       - run: cargo test
 
@@ -754,6 +764,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_NIGHTLY_VERSION }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: sudo apt-get -qq update && sudo apt-get -qq install libclang-dev
 
       - run: cargo bench --no-run
 
