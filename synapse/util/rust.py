@@ -47,7 +47,10 @@ def check_rust_lib_up_to_date() -> None:
     hash = _hash_rust_files_in_directory(synapse_root)
 
     if hash != get_rust_file_digest():
-        raise Exception("Rust module outdated. Please rebuild using `uv sync`")
+        raise Exception(
+            "Rust module outdated. Please rebuild using `uv sync` or "
+            "`uv run maturin develop`"
+        )
 
 
 def _hash_rust_files_in_directory(synapse_root: str) -> str:

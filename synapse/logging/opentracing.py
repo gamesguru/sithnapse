@@ -253,7 +253,6 @@ try:
 except ImportError:
     opentracing = None  # type: ignore[assignment]
     tags = _DummyTagNames  # type: ignore[assignment]
-
 JaegerConfig: Any = None
 LogContextScopeManager: Any = None
 try:

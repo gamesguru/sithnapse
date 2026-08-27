@@ -1,0 +1,49 @@
+
+• Yes, but the remaining gains are much smaller and more structural.
+
+  Current profile says the hot spots are:
+
+  - resolve_v2_via_lattice_fold: about 0.52s
+  - get_auth_chain_difference_from_event_graph: about 0.29s
+  - _seperate: about 0.13s
+  - the rest is mostly Python bookkeeping and dict.get overhead
+
+  So the next improvements would be:
+
+  1. Remove more Python-side graph walking
+
+  - The remaining auth-diff work is still going through Python state_sets and Python event_map.
+  - Biggest win would be a Rust API that accepts already-normalized Rust-side event structures or a packed event graph, not Python mappings.
+
+  2. Cache Rust-side event graph data across calls
+
+  - Right now each resolution rebuilds the Rust view of the event map.
+  - If the same event map is used repeatedly during a batch of merge points, caching parsed/linked event data would avoid repeated conversion and hashing.
+
+  3. Move _seperate into Rust
+
+  - It’s not the biggest cost, but it’s still pure Python work on every resolution.
+  - Cheap to move, modest win.
+
+  4. Reduce per-event hash lookups inside lattice fold
+
+  - The dict.get count is still high.
+  - If rezzy can operate on dense ids or adjacency lists instead of string-keyed maps, that should shave more time.
+
+  5. If you want a real step-change, move more of resolve_events_with_store into Rust
+
+  - The benchmark is already showing the bridge is no longer the dominant cost.
+  - The next big win is reducing Python orchestration around the resolver, not just optimizing inside rezzy.
+
+  My take:
+
+  - There is still headroom.
+  - The easy wins are mostly gone.
+  - The next meaningful gains will come from caching and from making the Rust API less Python-shaped.
+
+  If you want, I can do the next pass in priority order:
+
+  1. Cache event resolver data / auth graph across state-res calls
+  2. Move _seperate into Rust
+  3. Push more of resolve_events_with_store into a single Rust entrypoint
+

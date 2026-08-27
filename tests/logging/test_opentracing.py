@@ -51,7 +51,6 @@ except ImportError:
 else:
     jaeger_client = cast(Any, _jaeger_client)
 
-
 opentracing: Any = None
 LogContextScopeManager: Any = None
 try:
@@ -171,15 +170,8 @@ class LogContextScopeManagerTestCase(TestCase):
     def test_overlapping_spans(self) -> None:
         """Overlapping spans which are not neatly nested should work"""
         reactor = MemoryReactorClock()
-        # type-ignore: mypy-zope doesn't seem to recognise that `MemoryReactorClock`
-        # implements `ISynapseThreadlessReactor` (combination of the normal Twisted
-        # Reactor/Clock interfaces), via inheritance from
-        # `twisted.internet.testing.MemoryReactor` and `twisted.internet.testing.Clock`
-        # Ignore `multiple-internal-clocks` linter error here since we are creating a `Clock`
-        # for testing purposes.
         clock = Clock(  # type: ignore[multiple-internal-clocks]
-            reactor,  # type: ignore[arg-type]
-            server_name="test_server",
+            cast(Any, reactor), server_name="test_server"
         )
 
         scopes = []
@@ -349,7 +341,6 @@ class LogContextScopeManagerTestCase(TestCase):
                 # so that the test can complete and we see the underlying error.
                 callback_finished = True
 
-        # type-ignore: We ignore because the point is to test the bare function
         run_as_background_process(  # type: ignore[untracked-background-process]
             desc="some-bg-task",
             server_name="test_server",
@@ -416,7 +407,6 @@ class LogContextScopeManagerTestCase(TestCase):
                 "some-request",
                 tracer=self._tracer,
             ):
-                # type-ignore: We ignore because the point is to test the bare function
                 run_as_background_process(  # type: ignore[untracked-background-process]
                     desc="some-bg-task",
                     server_name="test_server",
