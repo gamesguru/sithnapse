@@ -1161,7 +1161,7 @@ wheels = [
 
 [[package]]
 name = "matrix-synapse"
-version = "1.156.0rc1"
+version = "1.159.0"
 source = { editable = "." }
 dependencies = [
     { name = "attrs" },

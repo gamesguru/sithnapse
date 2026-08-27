@@ -1,6 +1,6 @@
 [project]
 name = "matrix-synapse"
-version = "1.156.0rc1"
+version = "1.159.0"
 description = "Homeserver for the Matrix decentralised comms protocol"
 readme = "README.rst"
 authors = [
@@ -226,6 +226,7 @@ generate_signing_key = "synapse._scripts.generate_signing_key:main"
 hash_password = "synapse._scripts.hash_password:main"
 register_new_matrix_user = "synapse._scripts.register_new_matrix_user:main"
 synapse_port_db = "synapse._scripts.synapse_port_db:main"
+synapse_migrate_tikv = "synapse._scripts.migrate_state_to_tikv:main"
 synapse_review_recent_signups = "synapse._scripts.review_recent_signups:main"
 update_synapse_database = "synapse._scripts.update_synapse_database:main"
 
@@ -386,6 +387,8 @@ select = [
     "W",
     # pyflakes
     "F",
+    # flake8-logging-format
+    "G004",
     # isort
     "I001",
     # flake8-bugbear

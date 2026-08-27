@@ -20,7 +20,7 @@
 #
 #
 import tempfile
-from typing import Callable
+from typing import Any, Callable, cast
 from unittest import mock
 
 import yaml
@@ -37,10 +37,13 @@ try:
 except ImportError:
     authlib = None
 
+hiredis: Any = None
 try:
-    import hiredis
+    import hiredis as _hiredis
 except ImportError:
-    hiredis = None  # type: ignore
+    pass
+else:
+    hiredis = cast(Any, _hiredis)
 
 
 class ConfigLoadingFileTestCase(ConfigFileTestCase):
@@ -149,8 +152,6 @@ class ConfigLoadingFileTestCase(ConfigFileTestCase):
             "recaptcha_public_key_path: /does/not/exist",
             "form_secret_path: /does/not/exist",
             "worker_replication_secret_path: /does/not/exist",
-            "experimental_features:\n  msc3861:\n    client_secret_path: /does/not/exist",
-            "experimental_features:\n  msc3861:\n    admin_token_path: /does/not/exist",
             *["redis:\n  enabled: true\n  password_path: /does/not/exist"]
             * (hiredis is not None),
         ]
@@ -192,14 +193,6 @@ class ConfigLoadingFileTestCase(ConfigFileTestCase):
                 "worker_replication_secret_path: {}",
                 lambda c: c.worker.worker_replication_secret.encode("utf-8"),
             ),
-            (
-                "experimental_features:\n  msc3861:\n    client_secret_path: {}",
-                lambda c: c.experimental.msc3861.client_secret().encode("utf-8"),
-            ),
-            (
-                "experimental_features:\n  msc3861:\n    admin_token_path: {}",
-                lambda c: c.experimental.msc3861.admin_token().encode("utf-8"),
-            ),
             *[
                 (
                     "redis:\n  enabled: true\n  password_path: {}",
@@ -232,29 +225,6 @@ class ConfigLoadingFileTestCase(ConfigFileTestCase):
             "recaptcha_public_key: ¬53C237",
             "form_secret: 53C237",
             "worker_replication_secret: 53C237",
-            *[
-                "experimental_features:\n"
-                "  msc3861:\n"
-                "    enabled: true\n"
-                "    client_secret: 53C237"
-            ]
-            * (authlib is not None),
-            *[
-                "experimental_features:\n"
-                "  msc3861:\n"
-                "    enabled: true\n"
-                "    client_auth_method: private_key_jwt\n"
-                '    jwk: {{"mock": "mock"}}'
-            ]
-            * (authlib is not None),
-            *[
-                "experimental_features:\n"
-                "  msc3861:\n"
-                "    enabled: true\n"
-                "    admin_token: 53C237\n"
-                "    client_secret_path: {secret_file}"
-            ]
-            * (authlib is not None),
             *["redis:\n  enabled: true\n  password: 53C237"] * (hiredis is not None),
         ]
     )
@@ -304,15 +274,6 @@ class ConfigLoadingFileTestCase(ConfigFileTestCase):
                     f"recaptcha_public_key_path: {secret_file.name}",
                     f"form_secret_path: {secret_file.name}",
                     f"worker_replication_secret_path: {secret_file.name}",
-                    *[
-                        "experimental_features:\n"
-                        "  msc3861:\n"
-                        "    enabled: true\n"
-                        f"    admin_token_path: {secret_file.name}\n"
-                        f"    client_secret_path: {secret_file.name}\n"
-                        # f"    jwk_path: {secret_file.name}"
-                    ]
-                    * (authlib is not None),
                     *[f"redis:\n  enabled: true\n  password_path: {secret_file.name}"]
                     * (hiredis is not None),
                 ]
