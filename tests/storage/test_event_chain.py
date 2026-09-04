@@ -34,6 +34,9 @@ from synapse.rest import admin
 from synapse.rest.client import login, room
 from synapse.server import HomeServer
 from synapse.storage.database import LoggingTransaction
+from synapse.storage.databases.main.embedded_event_auth_chain_links import (
+    resolve_namespace,
+)
 from synapse.storage.databases.main.events import _LinkMap
 from synapse.storage.types import Cursor
 from synapse.types import create_requester
@@ -485,23 +488,40 @@ class EventChainStoreTestCase(HomeserverTestCase):
             for event_id, chain_id, sequence_number in rows
         }
 
-        # Fetch all the links and pass them to the _LinkMap.
-        auth_chain_rows = cast(
-            list[tuple[int, int, int, int]],
-            self.get_success(
-                self.store.db_pool.simple_select_many_batch(
-                    table="event_auth_chain_links",
-                    column="origin_chain_id",
-                    iterable=[chain_id for chain_id, _ in chain_map.values()],
-                    retcols=(
-                        "origin_chain_id",
-                        "origin_sequence_number",
-                        "target_chain_id",
-                        "target_sequence_number",
-                    ),
-                    keyvalues={},
-                )
-            ),
+        # Fetch all the links and pass them to the _LinkMap. Go via the same
+        # `_get_chain_links` the production code uses (rather than reading
+        # `event_auth_chain_links` directly) so this test exercises whichever
+        # backend -- SQL or the embedded mdbx engine -- is actually
+        # configured, instead of only ever checking the SQL table.
+        embedded_hamt_namespace = resolve_namespace(self.store)
+
+        def _fetch_links_txn(
+            txn: LoggingTransaction,
+        ) -> list[tuple[int, int, int, int]]:
+            auth_chain_rows = []
+            for links in self.store._get_chain_links(
+                txn,
+                {chain_id for chain_id, _ in chain_map.values()},
+                embedded_hamt_namespace,
+            ):
+                for origin_chain_id, values in links.items():
+                    for (
+                        origin_sequence_number,
+                        target_chain_id,
+                        target_sequence_number,
+                    ) in values:
+                        auth_chain_rows.append(
+                            (
+                                origin_chain_id,
+                                origin_sequence_number,
+                                target_chain_id,
+                                target_sequence_number,
+                            )
+                        )
+            return auth_chain_rows
+
+        auth_chain_rows = self.get_success(
+            self.store.db_pool.runInteraction("_fetch_links", _fetch_links_txn)
         )
 
         link_map = _LinkMap()

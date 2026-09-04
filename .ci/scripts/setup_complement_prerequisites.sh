@@ -6,20 +6,13 @@
 #
 set -eu
 
-alias block='{ set +x; } 2>/dev/null; func() { echo "::group::$*"; set -x; }; func'
-alias endblock='{ set +x; } 2>/dev/null; func() { echo "::endgroup::"; set -x; }; func'
+# This is presentation-only: the runner keeps the raw Go JSONL log separate
+# from its human-readable progress output, and CI filters that JSONL again
+# before handing it to gotestfmt.
+go install -v github.com/gotesttools/gotestfmt/v2/cmd/gotestfmt@latest
+mkdir -p .gotestfmt/github
+cp synapse/.ci/complement_package.gotpl .gotestfmt/github/package.gotpl
 
-block Install Complement Dependencies
-  go install -v github.com/gotesttools/gotestfmt/v2/cmd/gotestfmt@latest
-endblock
-
-block Install custom gotestfmt template
-  mkdir .gotestfmt/github -p
-  cp synapse/.ci/complement_package.gotpl .gotestfmt/github/package.gotpl
-endblock
-
-block Check out Complement
-  # Attempt to check out the same branch of Complement as the PR. If it
-  # doesn't exist, fallback to HEAD.
-  synapse/.ci/scripts/checkout_complement.sh
-endblock
+# Attempt to check out the same branch of Complement as the PR. If it
+# doesn't exist, fallback to HEAD.
+synapse/.ci/scripts/checkout_complement.sh

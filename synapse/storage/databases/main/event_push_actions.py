@@ -627,7 +627,7 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
                 ) AS receipts USING (thread_id)
                 WHERE room_id = ? AND user_id = ?
                 AND (
-                    (last_receipt_stream_ordering IS NULL AND stream_ordering > COALESCE(threaded_receipt_stream_ordering, ?))
+                    (last_receipt_stream_ordering IS NULL AND threaded_receipt_stream_ordering IS NULL AND stream_ordering > ?)
                     OR last_receipt_stream_ordering = COALESCE(threaded_receipt_stream_ordering, ?)
                 ) AND (notif_count != 0 OR COALESCE(unread_count, 0) != 0)
             """,
@@ -705,8 +705,8 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
                 continue
 
             if thread_id == MAIN_TIMELINE:
-                counts.notify_count += notif_count
-                counts.unread_count += unread_count
+                main_counts.notify_count += notif_count
+                main_counts.unread_count += unread_count
             elif thread_id in thread_counts:
                 thread_counts[thread_id].notify_count += notif_count
                 thread_counts[thread_id].unread_count += unread_count

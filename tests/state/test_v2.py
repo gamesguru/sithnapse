@@ -680,6 +680,58 @@ class SimpleParamStateTestCase(unittest.TestCase):
 
         self.assert_dict(self.expected_combined_state, state)
 
+    def test_unconflicted_events_are_prefetched_for_auth_context(self) -> None:
+        """Keep unconflicted events available to state resolution as auth context."""
+        topic_event = FakeEvent(
+            id="TOPIC",
+            sender=ALICE,
+            type=EventTypes.Topic,
+            state_key="",
+            content={"topic": "unconflicted"},
+        ).to_event(
+            [
+                self.create_event.event_id,
+                self.alice_member.event_id,
+                self.join_rules.event_id,
+            ],
+            [],
+        )
+        event_map = {**self.event_map, topic_event.event_id: topic_event}
+        state_at_bob = {
+            **self.state_at_bob,
+            (topic_event.type, topic_event.state_key): topic_event.event_id,
+        }
+        state_at_charlie = {
+            **self.state_at_charlie,
+            (topic_event.type, topic_event.state_key): topic_event.event_id,
+        }
+        store = TestStateResolutionStore(event_map)
+
+        state = self.successResultOf(
+            defer.ensureDeferred(
+                resolve_events_with_store(
+                    FakeClock(),
+                    ROOM_ID,
+                    RoomVersions.V2,
+                    [state_at_bob, state_at_charlie],
+                    event_map=None,
+                    state_res_store=store,
+                )
+            )
+        )
+
+        self.assert_dict(
+            {
+                **self.expected_combined_state,
+                (topic_event.type, topic_event.state_key): topic_event.event_id,
+            },
+            state,
+        )
+        self.assertIn(
+            topic_event.event_id,
+            {event_id for call in store.get_events_calls for event_id in call},
+        )
+
 
 class AuthChainDifferenceTestCase(unittest.TestCase):
     """We test that `_get_auth_chain_difference` correctly handles unpersisted
@@ -1024,6 +1076,7 @@ def pairwise(iterable: Iterable[T]) -> Iterable[tuple[T, T]]:
 @attr.s
 class TestStateResolutionStore:
     event_map: dict[str, EventBase] = attr.ib()
+    get_events_calls: list[Collection[str]] = attr.ib(factory=list)
 
     def get_events(
         self, event_ids: Collection[str], allow_rejected: bool = False
@@ -1038,6 +1091,7 @@ class TestStateResolutionStore:
             Dict from event_id to event.
         """
 
+        self.get_events_calls.append(event_ids)
         return defer.succeed(
             {eid: self.event_map[eid] for eid in event_ids if eid in self.event_map}
         )

@@ -1,0 +1,4 @@
+-- HAMT roots and nodes are authoritative in the embedded engine. Remove the
+-- temporary SQL publication bridge introduced by 01_state_hamt.
+DROP TABLE IF EXISTS state_hamt_pending_nodes;
+ALTER TABLE state_hamt_roots DROP COLUMN IF EXISTS published;

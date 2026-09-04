@@ -75,6 +75,8 @@ RUN apt-get update -qq -o Acquire::Languages=none \
     devscripts \
     # Required for building cffi from source.
     libffi-dev \
+    # Required for the mdbx-sys crate (a libmdbx dependency) to run bindgen.
+    libclang-dev \
     libsystemd-dev \
     lsb-release \
     pkg-config \

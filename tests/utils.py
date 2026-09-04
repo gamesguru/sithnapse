@@ -20,8 +20,13 @@
 #
 
 import atexit
+import logging
 import os
+import shutil
 import signal
+import sys
+import tempfile
+import uuid
 from types import FrameType, TracebackType
 from typing import (
     Literal,
@@ -45,6 +50,8 @@ try:
 except ImportError:
     HAS_AUTHLIB = False
 
+logger = logging.getLogger(__name__)
+
 # set this to True to run the tests against postgres instead of sqlite.
 #
 # When running under postgres, we first create a base database with the name
@@ -52,19 +59,66 @@ except ImportError:
 # create another unique database, using the base database as a template.
 USE_POSTGRES_FOR_TESTS = os.environ.get("SYNAPSE_POSTGRES", False)
 LEAVE_DB = os.environ.get("SYNAPSE_LEAVE_DB", False)
-POSTGRES_USER = os.environ.get("SYNAPSE_POSTGRES_USER", None)
-POSTGRES_HOST = os.environ.get("SYNAPSE_POSTGRES_HOST", None)
+
+# If scripts-dev/start_test_postgres.sh's RAM-disk cluster is up, connect to
+# that instead of requiring `eval "$(scripts-dev/start_test_postgres.sh)"`
+# every time -- but only as a fallback: any of SYNAPSE_POSTGRES_HOST/_USER/
+# _PORT set explicitly always wins over this, same as every other var here.
+# Announced below (not silent) specifically because a test run silently
+# talking to a different Postgres than the one you think you configured is
+# exactly the kind of thing that's maddening to debug.
+FAST_PG_SOCKET_DIR = "/tmp/synapse-pgtest"
+FAST_PG_PORT = 5433
+HAS_FAST_PG = os.path.exists(f"{FAST_PG_SOCKET_DIR}/.s.PGSQL.{FAST_PG_PORT}")
+USE_FAST_PG = HAS_FAST_PG and "SYNAPSE_POSTGRES_HOST" not in os.environ
+
+POSTGRES_USER = os.environ.get(
+    "SYNAPSE_POSTGRES_USER", "postgres" if USE_FAST_PG else None
+)
+POSTGRES_HOST = os.environ.get(
+    "SYNAPSE_POSTGRES_HOST", FAST_PG_SOCKET_DIR if USE_FAST_PG else None
+)
 POSTGRES_PASSWORD = os.environ.get("SYNAPSE_POSTGRES_PASSWORD", None)
 POSTGRES_PORT = (
     int(os.environ["SYNAPSE_POSTGRES_PORT"])
     if "SYNAPSE_POSTGRES_PORT" in os.environ
-    else None
+    else (FAST_PG_PORT if USE_FAST_PG else None)
 )
+
+if USE_POSTGRES_FOR_TESTS and USE_FAST_PG:
+    print(
+        f"tests/utils.py: using the RAM-disk test Postgres at "
+        f"{FAST_PG_SOCKET_DIR} (found its socket) -- set SYNAPSE_POSTGRES_HOST "
+        f"explicitly to use a different one.",
+        file=sys.stderr,
+    )
 POSTGRES_BASE_DB = "_synapse_unit_tests_base_%s" % (os.getpid(),)
 
 # When debugging a specific test, it's occasionally useful to write the
 # DB to disk and query it with the sqlite CLI.
 SQLITE_PERSIST_DB = os.environ.get("SYNAPSE_TEST_PERSIST_SQLITE_DB") is not None
+
+# When set, every test homeserver runs its HAMT state store through the
+# embedded engine (mdbx) instead of plain SQL -- the trial-mdbx CI job's
+# whole purpose. mdbx is just a local file, so no "is a server reachable"
+# check is needed here -- config/database.py opens it directly.
+#
+# Deliberately *not* falling back to the bare deployment switches
+# (SYNAPSE_EMBEDDED_HAMT_ENGINE / SYNAPSE_EMBEDDED_HAMT_PATH / SYNAPSE_MDBX):
+# unit tests inherit the process environment, and a shell configured for
+# running a real homeserver (e.g. SYNAPSE_EMBEDDED_HAMT_PATH pointing at a
+# production mdbx store) must not have `trial` silently open and mutate
+# that store. Only the SYNAPSE_TEST_-prefixed, test-only variables are
+# honoured here. SYNAPSE_TEST_MDBX is a shorthand alias for the common case
+# of just wanting the mdbx engine, without spelling out the engine name.
+EMBEDDED_HAMT_ENGINE = os.environ.get("SYNAPSE_TEST_EMBEDDED_HAMT_ENGINE")
+if EMBEDDED_HAMT_ENGINE is None and os.environ.get("SYNAPSE_TEST_MDBX"):
+    EMBEDDED_HAMT_ENGINE = "mdbx"
+
+EMBEDDED_HAMT_PATH = os.environ.get("SYNAPSE_TEST_EMBEDDED_HAMT_PATH")
+if EMBEDDED_HAMT_PATH is None and EMBEDDED_HAMT_ENGINE:
+    EMBEDDED_HAMT_PATH = tempfile.mkdtemp()
+    atexit.register(shutil.rmtree, EMBEDDED_HAMT_PATH, ignore_errors=True)
 
 # the dbname we will connect to in order to create the base database.
 POSTGRES_DBNAME_FOR_INITIAL_CREATE = "postgres"
@@ -129,16 +183,24 @@ def setupdb() -> None:
 
 @overload
 def default_config(
-    *, server_name: str, parse: Literal[False] = ...
+    *,
+    server_name: str,
+    parse: Literal[False] = ...,
 ) -> dict[str, object]: ...
 
 
 @overload
-def default_config(*, server_name: str, parse: Literal[True]) -> HomeServerConfig: ...
+def default_config(
+    *,
+    server_name: str,
+    parse: Literal[True],
+) -> HomeServerConfig: ...
 
 
 def default_config(
-    *, server_name: str, parse: bool = False
+    *,
+    server_name: str,
+    parse: bool = False,
 ) -> dict[str, object] | HomeServerConfig:
     """
     Create a reasonable test config.
@@ -220,6 +282,19 @@ def default_config(
         "caches": {"global_factor": 1, "sync_response_cache_duration": 0},
         "listeners": [{"port": 0, "type": "http"}],
     }
+
+    if EMBEDDED_HAMT_ENGINE and EMBEDDED_HAMT_PATH:
+        # Many test homeservers (each with their own fresh SQL database, so
+        # each restarting its state_group id sequence at 1) can share this
+        # one mdbx file across a whole trial worker process. Without a
+        # unique namespace per homeserver, two different tests' state_group
+        # 1 would collide on the same mdbx keys and silently read each
+        # other's data.
+        config_dict["embedded_hamt"] = {
+            "engine": EMBEDDED_HAMT_ENGINE,
+            "path": EMBEDDED_HAMT_PATH,
+            "namespace": f"trial-{os.getpid()}-{uuid.uuid4().hex}",
+        }
 
     if parse:
         config = HomeServerConfig()

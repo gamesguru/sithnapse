@@ -437,8 +437,6 @@ class HomeServer(metaclass=abc.ABCMeta):
         object in the garbage collector.
         """
 
-        self._is_shutdown = True
-
         logger.info(
             "Received shutdown request for %s (%s).",
             self.hostname,
@@ -510,21 +508,50 @@ class HomeServer(metaclass=abc.ABCMeta):
             except Exception:
                 pass
 
+        shutdown_handler_deferreds: list[defer.Deferred[Any | None]] = []
+
         for shutdown_handler in self._async_shutdown_handlers:
             try:
                 self.get_reactor().removeSystemEventTrigger(shutdown_handler.trigger_id)
-                defer.ensureDeferred(shutdown_handler.func(**shutdown_handler.kwargs))
-            except Exception as e:
-                logger.error("Error calling shutdown async handler: %s", e)
+            except NotImplementedError:
+                # The in-memory reactor used by unit tests does not implement
+                # trigger removal. The test cleanup clears its trigger list.
+                pass
+            except Exception:
+                logger.exception("Error removing shutdown async handler")
+
+            try:
+                d = defer.ensureDeferred(
+                    shutdown_handler.func(**shutdown_handler.kwargs)
+                )
+                shutdown_handler_deferreds.append(d)
+            except Exception:
+                logger.exception("Error starting shutdown async handler")
         self._async_shutdown_handlers.clear()
 
         for shutdown_handler in self._sync_shutdown_handlers:
             try:
                 self.get_reactor().removeSystemEventTrigger(shutdown_handler.trigger_id)
+            except NotImplementedError:
+                # See the corresponding async-handler case above.
+                pass
+            except Exception:
+                logger.exception("Error removing shutdown sync handler")
+
+            try:
                 shutdown_handler.func(**shutdown_handler.kwargs)
-            except Exception as e:
-                logger.error("Error calling shutdown sync handler: %s", e)
+            except Exception:
+                logger.exception("Error calling shutdown sync handler")
         self._sync_shutdown_handlers.clear()
+
+        # Registered shutdown handlers commonly use @wrap_as_background_process,
+        # which adds their Deferreds to _background_processes. Exclude those
+        # shutdown-handler Deferreds from the normal cancellation loop so their
+        # teardown work can complete, then prevent any new normal background work.
+        for d in shutdown_handler_deferreds:
+            self._background_processes.discard(d)
+
+        self._is_shutdown = True
 
         self.get_clock().shutdown()
 

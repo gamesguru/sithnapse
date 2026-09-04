@@ -20,7 +20,7 @@
 #
 import asyncio
 from http import HTTPStatus
-from typing import Any, TypeVar, cast
+from typing import Any, cast
 from unittest.mock import Mock
 
 import attr
@@ -591,7 +591,7 @@ class InviteAutoAccepterInternalTestCase(TestCase):
         self.mocked_update_membership.side_effect = [
             SynapseError(HTTPStatus.FORBIDDEN, "Forbidden"),
             SynapseError(HTTPStatus.FORBIDDEN, "Forbidden"),
-            make_awaitable(join_event),
+            join_event,
         ]
 
         # Stop mypy from complaining that we give on_new_event a MockEvent rather than an
@@ -781,17 +781,6 @@ class MockEvent:
         return membership
 
 
-T = TypeVar("T")
-TV = TypeVar("TV")
-
-
-async def make_awaitable(value: T) -> T:
-    """
-    Makes a fresh awaitable, suitable for mocking an `async` function.
-    """
-    return value
-
-
 def create_module(
     config_override: dict[str, Any] | None = None, worker_name: str | None = None
 ) -> InviteAutoAccepter:
@@ -800,7 +789,7 @@ def create_module(
     module_api = Mock(spec=ModuleApi)
     module_api.is_mine.side_effect = lambda a: a.split(":")[1] == "test"
     module_api.worker_name = worker_name
-    module_api.sleep.return_value = lambda *_args, **_kwargs: make_awaitable(None)
+    module_api.sleep.return_value = None
     module_api.get_userinfo_by_id.return_value = UserInfo(
         user_id=UserID.from_string("@user:test"),
         is_admin=False,

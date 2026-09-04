@@ -84,7 +84,14 @@ class DatabaseConfig(Config):
         super().__init__(*args)
 
         self.databases: list[DatabaseConnectionConfig] = []
-        self.tikv_pd_endpoints: list[str] | None = None
+        self.embedded_hamt_engine: str | None = None
+        self.embedded_hamt_path: str | None = None
+        # Optional explicit namespace for HAMT keys in the embedded engine
+        # (see StateGroupDataStore.hamt_namespace) -- defaults to the server
+        # name when unset. Only useful for isolating multiple homeservers
+        # that share one embedded-engine file (e.g. many trial test
+        # processes reusing one mdbx path), not a normal deployment concern.
+        self.embedded_hamt_namespace: str | None = None
 
     def read_config(self, config: JsonDict, **kwargs: Any) -> None:
         # We *experimentally* support specifying multiple databases via the
@@ -106,9 +113,53 @@ class DatabaseConfig(Config):
         database_config = config.get("database")
         database_path = config.get("database_path")
 
-        tikv_config = config.get("tikv")
-        if tikv_config:
-            self.tikv_pd_endpoints = tikv_config.get("pd_endpoints")
+        embedded_config = config.get("embedded_hamt")
+        if embedded_config:
+            self.embedded_hamt_engine = embedded_config.get("engine")
+            self.embedded_hamt_path = embedded_config.get("path")
+            self.embedded_hamt_namespace = embedded_config.get("namespace")
+
+        env_engine = os.environ.get("SYNAPSE_EMBEDDED_HAMT_ENGINE")
+        if env_engine:
+            self.embedded_hamt_engine = env_engine
+        env_path = os.environ.get("SYNAPSE_EMBEDDED_HAMT_PATH")
+        if env_path:
+            self.embedded_hamt_path = env_path
+
+        # A concise production switch. The path is deliberately still
+        # required: unlike tests, a production server must never silently put
+        # persistent state into a temporary directory.
+        if os.environ.get("SYNAPSE_MDBX"):
+            self.embedded_hamt_engine = "mdbx"
+            self.embedded_hamt_path = os.environ.get(
+                "SYNAPSE_MDBX_PATH", self.embedded_hamt_path
+            )
+            if not self.embedded_hamt_path:
+                raise ConfigError(
+                    "SYNAPSE_MDBX requires SYNAPSE_MDBX_PATH or embedded_hamt.path"
+                )
+
+        # Validate embedded_hamt engine/path consistency.
+        # A half-set config (engine without path) boots fine but crashes on
+        # first state write with "RuntimeError: mdbx not opened".
+        if self.embedded_hamt_engine and not self.embedded_hamt_path:
+            raise ConfigError(
+                f"embedded_hamt.engine is set to {self.embedded_hamt_engine!r} "
+                "but embedded_hamt.path is not set. "
+                "Set embedded_hamt.path (or SYNAPSE_EMBEDDED_HAMT_PATH) to "
+                "a file path, or remove the engine setting."
+            )
+        if self.embedded_hamt_path and not self.embedded_hamt_engine:
+            raise ConfigError(
+                "embedded_hamt.path is set but embedded_hamt.engine is not. "
+                "Set embedded_hamt.engine (or SYNAPSE_EMBEDDED_HAMT_ENGINE) to "
+                "'mdbx', or remove the path setting."
+            )
+        if self.embedded_hamt_engine and self.embedded_hamt_engine != "mdbx":
+            raise ConfigError(
+                f"embedded_hamt.engine is {self.embedded_hamt_engine!r}, "
+                "but only 'mdbx' is supported."
+            )
 
         if multi_database_config and database_config:
             raise ConfigError("Can't specify both 'database' and 'databases' in config")

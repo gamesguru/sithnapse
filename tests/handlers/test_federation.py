@@ -20,7 +20,6 @@
 #
 import logging
 from typing import Collection
-from unittest import TestCase
 from unittest.mock import AsyncMock, Mock, patch
 
 from twisted.internet.defer import Deferred
@@ -422,7 +421,7 @@ class FederationTestCase(unittest.FederatingHomeserverTestCase):
         return join_event
 
 
-class EventFromPduTestCase(TestCase):
+class EventFromPduTestCase(unittest.TestCase):
     def test_valid_json(self) -> None:
         """Valid JSON should be turned into an event."""
         ev = make_test_pdu_event(
@@ -656,8 +655,8 @@ class PartialJoinTestCase(unittest.FederatingHomeserverTestCase):
 
     def test_partial_state_room_sync_restart(self) -> None:
         """
-        Tests that partial state syncs are restarted when a second partial state sync
-        was deduplicated and the first partial state sync fails.
+        Tests that a failed partial state sync is retried, using parameters from a
+        deduplicated later sync if one exists.
         """
         is_partial_state = True
         end_sync: "Deferred[None]" = Deferred()
@@ -693,22 +692,13 @@ class PartialJoinTestCase(unittest.FederatingHomeserverTestCase):
             self.assertEqual(mock_sync_partial_state_room.call_count, 1)
 
             # Fail the partial state sync.
-            # The partial state sync should not be restarted.
+            # The retry is delayed to avoid a tight failure loop.
+            fed_handler._start_partial_state_room_sync("hs3", {"hs2"}, "room_id")
             end_sync.errback(Exception("Failed to request /state_ids"))
             self.assertEqual(mock_sync_partial_state_room.call_count, 1)
 
-            # Start the partial state sync again.
-            fed_handler._start_partial_state_room_sync("hs1", {"hs2"}, "room_id")
+            self.reactor.advance(1)
             self.assertEqual(mock_sync_partial_state_room.call_count, 2)
-
-            # Deduplicate another partial state sync.
-            fed_handler._start_partial_state_room_sync("hs3", {"hs2"}, "room_id")
-            self.assertEqual(mock_sync_partial_state_room.call_count, 2)
-
-            # Fail the partial state sync.
-            # It should restart with the latest parameters.
-            end_sync.errback(Exception("Failed to request /state_ids"))
-            self.assertEqual(mock_sync_partial_state_room.call_count, 3)
             mock_sync_partial_state_room.assert_called_with(
                 initial_destination="hs3",
                 other_destinations={"hs2"},

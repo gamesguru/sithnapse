@@ -19,6 +19,7 @@
 #
 import os.path
 import subprocess
+from functools import lru_cache
 
 from incremental import Version
 from zope.interface import implementer
@@ -84,6 +85,16 @@ subjectAltName = %(sanentries)s
 """
 
 
+@lru_cache(maxsize=1)
+def _openssl_x509_supports_set_serial() -> bool:
+    result = subprocess.run(
+        ["openssl", "x509", "-help"],
+        capture_output=True,
+        check=False,
+    )
+    return b"-set_serial" in result.stdout or b"-set_serial" in result.stderr
+
+
 def create_test_cert_file(sanlist: list[bytes]) -> str:
     """build an x509 certificate file
 
@@ -122,25 +133,25 @@ def create_test_cert_file(sanlist: list[bytes]) -> str:
     # finally the cert
     ca_key_filename = os.path.join(os.path.dirname(__file__), "ca.key")
     ca_cert_filename = get_test_ca_cert_file()
-    subprocess.check_call(
-        [
-            "openssl",
-            "x509",
-            "-req",
-            "-in",
-            csr_filename,
-            "-CA",
-            ca_cert_filename,
-            "-CAkey",
-            ca_key_filename,
-            "-set_serial",
-            "1",
-            "-extfile",
-            cnf_filename,
-            "-out",
-            cert_filename,
-        ]
-    )
+    cert_command = [
+        "openssl",
+        "x509",
+        "-req",
+        "-in",
+        csr_filename,
+        "-CA",
+        ca_cert_filename,
+        "-CAkey",
+        ca_key_filename,
+        "-extfile",
+        cnf_filename,
+        "-out",
+        cert_filename,
+    ]
+    if _openssl_x509_supports_set_serial():
+        cert_command[9:9] = ["-set_serial", "1"]
+
+    subprocess.check_call(cert_command)
 
     return cert_filename
 

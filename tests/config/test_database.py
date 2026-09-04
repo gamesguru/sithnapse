@@ -18,6 +18,8 @@
 #
 #
 
+import os
+
 import yaml
 
 from synapse.config._base import RootConfig
@@ -40,3 +42,72 @@ class DatabaseConfigTestCase(unittest.TestCase):
         }
 
         self.assertEqual(conf["database"], expected_database_conf)
+
+    def _read_config(
+        self, embedded_hamt: dict | None = None, env: dict[str, str] | None = None
+    ) -> DatabaseConfig:
+        """Helper: build a minimal config dict and parse it via DatabaseConfig."""
+        config: dict = {"database": {"name": "sqlite3", "args": {}}}
+        if embedded_hamt is not None:
+            config["embedded_hamt"] = embedded_hamt
+
+        old_env = os.environ.copy()
+        if env:
+            os.environ.update(env)
+        try:
+            dc = DatabaseConfig(RootConfig())
+            dc.read_config(config)
+            return dc
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+
+    def test_engine_without_path_raises(self) -> None:
+        """engine set + path missing → ConfigError."""
+        from synapse.config._base import ConfigError
+
+        with self.assertRaises(ConfigError):
+            self._read_config(
+                embedded_hamt={"engine": "mdbx"},
+            )
+
+    def test_engine_without_path_env_raises(self) -> None:
+        """SYNAPSE_EMBEDDED_HAMT_ENGINE set + path missing → ConfigError."""
+        from synapse.config._base import ConfigError
+
+        with self.assertRaises(ConfigError):
+            self._read_config(
+                env={"SYNAPSE_EMBEDDED_HAMT_ENGINE": "mdbx"},
+            )
+
+    def test_path_without_engine_raises(self) -> None:
+        """path set + engine missing → ConfigError."""
+        from synapse.config._base import ConfigError
+
+        with self.assertRaises(ConfigError):
+            self._read_config(
+                embedded_hamt={"path": "/tmp/test.mdbx"},
+            )
+
+    def test_engine_not_mdbx_raises(self) -> None:
+        """engine set to a non-mdbx value → ConfigError."""
+        from synapse.config._base import ConfigError
+
+        with self.assertRaises(ConfigError):
+            self._read_config(
+                embedded_hamt={"engine": "unknown_engine", "path": "/tmp/test"},
+            )
+
+    def test_both_set_ok(self) -> None:
+        """engine + path both set → no error."""
+        dc = self._read_config(
+            embedded_hamt={"engine": "mdbx", "path": "/tmp/test.mdbx"},
+        )
+        self.assertEqual(dc.embedded_hamt_engine, "mdbx")
+        self.assertEqual(dc.embedded_hamt_path, "/tmp/test.mdbx")
+
+    def test_neither_set_ok(self) -> None:
+        """engine + path both unset → no error."""
+        dc = self._read_config()
+        self.assertIsNone(dc.embedded_hamt_engine)
+        self.assertIsNone(dc.embedded_hamt_path)

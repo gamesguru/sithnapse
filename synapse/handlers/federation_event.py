@@ -378,6 +378,163 @@ class FederationEventHandler:
             context = await self._state_handler.compute_event_context(pdu)
             await self._process_received_pdu(origin, pdu, context)
 
+    async def try_on_receive_pdu_batch(
+        self, pdus: Sequence[tuple[str, EventBase]]
+    ) -> bool:
+        """Persist a simple contiguous run of inbound PDUs in one batch.
+
+        The inbound federation staging queue normally hands us one PDU at a time.
+        That is necessary for state events, forks, and missing prev-events, but it
+        turns a burst of ordinary timeline events into one replication request per
+        event. A run of non-state events with one predecessor each has identical
+        state before and after every event, so its contexts can safely share the
+        first event's state group and be persisted together.
+
+        Return ``False`` when the run is not exactly that shape. The caller must
+        then use ``on_receive_pdu`` for its normal conservative handling.
+        """
+
+        if len(pdus) < 2:
+            return False
+
+        origin, first_event = pdus[0]
+        room_id = first_event.room_id
+
+        # The normal path has to deal with an arbitrary federation DAG. Keep that
+        # path for all but a strict, linear, non-state run from one origin.
+        if first_event.is_state() or any(
+            event.room_id != room_id
+            or event.is_state()
+            or event_origin != origin
+            or set(event.prev_event_ids()) != {previous.event_id}
+            for (_, previous), (event_origin, event) in zip(pdus, pdus[1:])
+        ):
+            return False
+
+        if room_id in self.room_queues:
+            return False
+
+        if not await self._event_auth_handler.is_host_in_room(
+            room_id, self.server_name
+        ):
+            return False
+
+        # Do not batch de-outliering or duplicate events. Besides retaining the
+        # existing semantics, this ensures every predecessor is a new timeline event.
+        for _, event in pdus:
+            if event.internal_metadata.outlier:
+                return False
+            if await self._store.get_event(
+                event.event_id, allow_none=True, allow_rejected=True
+            ):
+                return False
+            try:
+                self._sanity_check_event(event)
+            except SynapseError:
+                return False
+
+        # The first event must have all of its real predecessors already present.
+        # Subsequent predecessors are the preceding events in this batch.
+        first_prevs = set(first_event.prev_event_ids())
+        if first_prevs - await self._store.have_events_in_timeline(first_prevs):
+            return False
+
+        async def build_contexts() -> list[EventPersistencePair]:
+            first_context = await self._state_handler.compute_event_context(first_event)
+            if first_context.rejected or first_context.state_group is None:
+                # A rejected event has no meaningful state group to share.
+                raise ValueError("cannot batch a rejected or outlier event")
+
+            return [
+                (first_event, first_context),
+                *[
+                    (
+                        event,
+                        EventContext.with_state(
+                            storage=self._storage_controllers,
+                            state_group=first_context.state_group,
+                            state_group_before_event=first_context.state_group,
+                            state_delta_due_to_event={},
+                            partial_state=first_context.partial_state,
+                            state_group_deltas={},
+                        ),
+                    )
+                    for _, event in pdus[1:]
+                ],
+            ]
+
+        async def process_batch() -> bool:
+            event_and_contexts = await build_contexts()
+
+            for event, context in event_and_contexts:
+                await self._check_event_auth(origin, event, context)
+                if context.rejected:
+                    # Rejected events are persisted with a special context which
+                    # deliberately has no state group. The synthetic contexts used
+                    # by this fast path are therefore invalid for them; fall back
+                    # before persisting anything in the run.
+                    return False
+
+                await self._check_for_soft_fail(event, context=context, origin=origin)
+
+            min_depth = await self._store.get_min_depth(room_id)
+            push_action_events = [
+                (event, context)
+                for event, context in event_and_contexts
+                if not context.rejected
+                and (min_depth is None or min_depth <= event.depth)
+            ]
+            if push_action_events:
+                await self._bulk_push_rule_evaluator.action_for_events_by_user(
+                    push_action_events
+                )
+
+            try:
+                await self.persist_events_and_notify(room_id, event_and_contexts)
+            except Exception:
+                for event, _ in event_and_contexts:
+                    await self._store.remove_push_actions_from_staging(event.event_id)
+                raise
+
+            for event, _ in event_and_contexts:
+                try:
+                    await self._handle_encrypted_event(event)
+                except Exception:
+                    # Persistence has already succeeded. Device-cache handling is
+                    # a post-persistence side effect, so it must not make the
+                    # caller fall back and remove these events from staging.
+                    logger.exception(
+                        "Failed to handle encrypted event %s after batch persistence",
+                        event.event_id,
+                    )
+
+            return True
+
+        try:
+            processed = await process_batch()
+        except (AuthError, FederationError, ValueError):
+            # Preserve the single-event path's exact error handling for unusual
+            # auth/rejection cases.
+            return False
+        except PartialStateConflictError:
+            logger.info(
+                "Room %s was un-partial stated while processing a PDU batch, trying again.",
+                room_id,
+            )
+            processed = await process_batch()
+        except Exception:
+            # A generic exception (e.g. a DB error from persist_events_and_notify,
+            # or a NotFoundError from compute_event_context) should not abort the
+            # entire room drain.  Log it and fall back to the one-at-a-time path.
+            logger.warning(
+                "Unexpected error processing PDU batch in room %s, falling back "
+                "to single-event processing",
+                room_id,
+                exc_info=True,
+            )
+            return False
+        return processed
+
     async def on_send_membership_event(
         self, origin: str, event: EventBase
     ) -> EventPersistencePair:
@@ -1506,6 +1663,10 @@ class FederationEventHandler:
 
         await self._maybe_kick_guest_users(event)
 
+        await self._handle_encrypted_event(event)
+
+    async def _handle_encrypted_event(self, event: EventBase) -> None:
+        """Validate the sending device of a newly-persisted encrypted event."""
         # For encrypted messages we check that we know about the sending device,
         # if we don't then we mark the device cache for that user as stale.
         if event.type == EventTypes.Encrypted:

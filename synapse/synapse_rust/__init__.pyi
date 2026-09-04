@@ -1,4 +1,7 @@
-from synapse.synapse_rust import tikv_engine as tikv_engine
+from synapse.synapse_rust import (
+    mdbx_engine as mdbx_engine,
+    state_hamt as state_hamt,
+)
 
 def sum_as_string(a: int, b: int) -> str: ...
 def get_rust_file_digest() -> str: ...

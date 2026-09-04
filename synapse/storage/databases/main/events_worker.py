@@ -78,6 +78,10 @@ from synapse.storage.database import (
     LoggingTransaction,
     make_tuple_in_list_sql_clause,
 )
+from synapse.storage.databases.main.embedded_event_json import (
+    get_event_json_batch,
+    open_embedded_event_json_engine,
+)
 from synapse.storage.types import Cursor
 from synapse.storage.util.id_generators import (
     AbstractStreamIdGenerator,
@@ -235,6 +239,18 @@ class EventsWorkerStore(SQLBaseStore):
         hs: "HomeServer",
     ):
         super().__init__(database, db_conn, hs)
+
+        self._embedded_event_json_enabled = open_embedded_event_json_engine(hs)
+        self._embedded_hamt_engine = hs.config.database.embedded_hamt_engine
+        # Namespaces event_to_state_group/refcount keys in the embedded
+        # engine -- see embedded_event_to_state_group.py's module docstring.
+        # Independent from (but must agree with) the state datastore's own
+        # hamt_namespace property: both default to the server name unless
+        # embedded_hamt.namespace is set in config, so they naturally agree
+        # without needing to share an instance.
+        self._embedded_hamt_namespace = (
+            hs.config.database.embedded_hamt_namespace or hs.hostname
+        )
 
         self._stream_id_gen: MultiWriterIdGenerator
         self._backfill_id_gen: MultiWriterIdGenerator
@@ -1595,6 +1611,49 @@ class EventsWorkerStore(SQLBaseStore):
 
         return row_map
 
+    def _fetch_event_json_for_ids_txn(
+        self, txn: LoggingTransaction, event_ids: list[str]
+    ) -> dict[str, tuple[str, str, int | None]]:
+        """Returns `event_id -> (internal_metadata, json, format_version)`
+        for `event_ids`, preferring the embedded engine (a local point
+        lookup, no SQL) and falling back to `event_json` in SQL for any id
+        it doesn't have.
+
+        Deliberately does NOT write the SQL-fallback result back into mdbx:
+        `event_json` is mutable (censoring, expiry -- see
+        `_censor_event_txn`), and this read runs outside of and concurrently
+        with any writer's transaction. A reader that fetched a pre-censor
+        row here could still land its mdbx write after a concurrent
+        censor/expiry has already updated mdbx to the pruned value,
+        silently resurrecting content the writer just redacted -- there's
+        no version/CAS scheme to make a read-path write safe against that
+        race. Missing ids (e.g. from before the mirror existed) simply keep
+        falling back to SQL rather than self-healing; a real backfill needs
+        an explicit background job that can't race a live censor/expiry.
+        """
+        if not event_ids:
+            return {}
+
+        found: dict[str, tuple[str, str, int | None]] = {}
+        still_missing = event_ids
+        if self._embedded_event_json_enabled:
+            found = get_event_json_batch(event_ids)
+            still_missing = [e for e in event_ids if e not in found]
+
+        if still_missing:
+            clause, args = make_in_list_sql_clause(
+                txn.database_engine, "event_id", still_missing
+            )
+            txn.execute(
+                "SELECT event_id, internal_metadata, json, format_version "
+                "FROM event_json WHERE " + clause,
+                args,
+            )
+            for event_id, internal_metadata, json_str, format_version in txn:
+                found[event_id] = (internal_metadata, json_str, format_version)
+
+        return found
+
     def _fetch_event_rows(
         self, txn: LoggingTransaction, event_ids: Iterable[str]
     ) -> dict[str, _EventRow]:
@@ -1611,19 +1670,21 @@ class EventsWorkerStore(SQLBaseStore):
         """
         event_dict = {}
         for evs in batch_iter(event_ids, 200):
+            # event_json (internal_metadata, json, format_version) is
+            # fetched separately below -- from the embedded engine when
+            # configured, falling back to SQL per id it doesn't have --
+            # rather than joined into this query, so its (often several-KB)
+            # blob payload isn't pulled through this query's result set
+            # when the embedded engine already has it.
             sql = """\
                 SELECT
                   e.event_id,
                   e.stream_ordering,
                   e.instance_name,
-                  ej.internal_metadata,
-                  ej.json,
-                  ej.format_version,
                   r.room_version,
                   rej.reason,
                   e.outlier
                 FROM events AS e
-                  JOIN event_json AS ej USING (event_id)
                   LEFT JOIN rooms r ON r.room_id = e.room_id
                   LEFT JOIN rejections as rej USING (event_id)
                 WHERE """
@@ -1634,21 +1695,33 @@ class EventsWorkerStore(SQLBaseStore):
 
             txn.execute(sql + clause, args)
 
-            for row in txn:
+            metadata_rows = txn.fetchall()
+            event_json_by_id = self._fetch_event_json_for_ids_txn(
+                txn, [row[0] for row in metadata_rows]
+            )
+
+            for row in metadata_rows:
                 event_id = row[0]
+                # An event with no event_json row (in neither the embedded
+                # engine nor SQL) is omitted, matching the old query's
+                # INNER JOIN filtering semantics.
+                event_json_row = event_json_by_id.get(event_id)
+                if event_json_row is None:
+                    continue
+                internal_metadata, json_str, format_version = event_json_row
                 event_dict[event_id] = _EventRow(
                     event_id=event_id,
                     stream_ordering=row[1],
                     # If instance_name is null we default to "master"
                     instance_name=row[2] or "master",
-                    internal_metadata=row[3],
-                    json=row[4],
-                    format_version=row[5],
-                    room_version_id=row[6],
-                    rejected_reason=row[7],
+                    internal_metadata=internal_metadata,
+                    json=json_str,
+                    format_version=format_version,
+                    room_version_id=row[3],
+                    rejected_reason=row[4],
                     unconfirmed_redactions=[],
                     confirmed_redactions=[],
-                    outlier=bool(row[8]),  # This is an int in SQLite3
+                    outlier=bool(row[5]),  # This is an int in SQLite3
                 )
 
             # check for redactions

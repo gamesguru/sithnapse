@@ -379,6 +379,10 @@ def run_as_background_process(
 
                 with tracing_scope:
                     return await func(*args, **kwargs)
+            except defer.CancelledError:
+                # Cancellation is the normal outcome when a homeserver stops a
+                # long-lived background process during shutdown.
+                return None
             except Exception:
                 logger.exception(
                     "Background process '%s' threw an exception",

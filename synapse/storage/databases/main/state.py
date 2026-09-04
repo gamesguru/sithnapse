@@ -50,6 +50,13 @@ from synapse.storage.database import (
     LoggingTransaction,
     make_in_list_sql_clause,
 )
+from synapse.storage.databases.main.embedded_event_to_state_group import (
+    decrement_state_group_refcounts_batch,
+    get_referenced_state_groups_batch,
+    get_state_group_for_events_batch,
+    increment_state_group_refcounts_batch,
+    put_event_to_state_group_batch,
+)
 from synapse.storage.databases.main.events_worker import EventsWorkerStore
 from synapse.storage.databases.main.roommember import RoomMemberWorkerStore
 from synapse.types import JsonDict, JsonMapping, StateKey, StateMap, StrCollection
@@ -593,6 +600,11 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
 
     @cached(max_entries=50000)
     async def _get_state_group_for_event(self, event_id: str) -> int | None:
+        if getattr(self, "_embedded_event_json_enabled", False):
+            found = get_state_group_for_events_batch(
+                self._embedded_hamt_namespace, [event_id]
+            )
+            return found.get(event_id)
         return await self.db_pool.simple_select_one_onecol(
             table="event_to_state_groups",
             keyvalues={"event_id": event_id},
@@ -614,19 +626,30 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
         Raises:
              RuntimeError if the state is unknown at any of the given events
         """
-        rows = cast(
-            list[tuple[str, int]],
-            await self.db_pool.simple_select_many_batch(
-                table="event_to_state_groups",
-                column="event_id",
-                iterable=event_ids,
-                keyvalues={},
-                retcols=("event_id", "state_group"),
-                desc="_get_state_group_for_events",
-            ),
-        )
+        if getattr(self, "_embedded_event_json_enabled", False):
+            # Exclusive by configured engine, not a dual-write -- see
+            # embedded_event_to_state_group.py. A miss here (unlike
+            # embedded_event_json's mirror) is not silently re-read from
+            # SQL: once this engine is configured it's the source of truth
+            # for state_group mappings, so a genuine miss surfaces as the
+            # same RuntimeError a SQL miss would.
+            res = get_state_group_for_events_batch(
+                self._embedded_hamt_namespace, list(event_ids)
+            )
+        else:
+            rows = cast(
+                list[tuple[str, int]],
+                await self.db_pool.simple_select_many_batch(
+                    table="event_to_state_groups",
+                    column="event_id",
+                    iterable=event_ids,
+                    keyvalues={},
+                    retcols=("event_id", "state_group"),
+                    desc="_get_state_group_for_events",
+                ),
+            )
+            res = dict(rows)
 
-        res = dict(rows)
         for e in event_ids:
             if e not in res:
                 raise RuntimeError("No state group for unknown or outlier event %s" % e)
@@ -643,6 +666,18 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
         Returns:
             The subset of state groups that are referenced.
         """
+
+        if getattr(self, "_embedded_event_json_enabled", False):
+            # Exclusive by configured engine: this reverse question ("is
+            # state_group X still referenced by any event") can't be
+            # answered from the forward event_id-keyed mirror without a
+            # scan, so it's backed by a separate per-state-group reference
+            # count instead -- see embedded_event_to_state_group.py's
+            # module docstring for why a count (not an event-list index)
+            # keeps this O(1) per write regardless of room activity.
+            return get_referenced_state_groups_batch(
+                self._embedded_hamt_namespace, list(state_groups)
+            )
 
         rows = cast(
             list[tuple[int]],
@@ -691,13 +726,42 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             state_group = context.state_group_before_event
         else:
             state_group = context.state_group
+        # `event_to_state_groups.state_group` is NOT NULL in SQL, so this
+        # has always implicitly relied on state_group being set by the time
+        # a (non-outlier) event reaches here; make that explicit rather
+        # than let a None silently reach either write path below.
+        assert state_group is not None
 
-        self.db_pool.simple_update_txn(
-            txn,
-            table="event_to_state_groups",
-            keyvalues={"event_id": event.event_id},
-            updatevalues={"state_group": state_group},
-        )
+        if getattr(self, "_embedded_event_json_enabled", False):
+            # Exclusive by configured engine, not a dual-write. Unlike
+            # put_event_to_state_group_batch's initial-insert callers, this
+            # is a genuine rewrite of which state_group this event
+            # references -- the old one loses a reference and the new one
+            # gains one, so the refcount must move with it, not just get
+            # incremented again (that would double-count the old group's
+            # reference forever, since a partial-state event's placeholder
+            # group is never otherwise decremented).
+            old = get_state_group_for_events_batch(
+                self._embedded_hamt_namespace, [event.event_id]
+            )
+            put_event_to_state_group_batch(
+                self._embedded_hamt_namespace, [(event.event_id, state_group)]
+            )
+            old_state_group = old.get(event.event_id)
+            if old_state_group is not None and old_state_group != state_group:
+                decrement_state_group_refcounts_batch(
+                    self._embedded_hamt_namespace, [old_state_group]
+                )
+                increment_state_group_refcounts_batch(
+                    self._embedded_hamt_namespace, [state_group]
+                )
+        else:
+            self.db_pool.simple_update_txn(
+                txn,
+                table="event_to_state_groups",
+                keyvalues={"event_id": event.event_id},
+                updatevalues={"state_group": state_group},
+            )
 
         # the event may now be rejected where it was not before, or vice versa,
         # in which case we need to update the rejected flags.

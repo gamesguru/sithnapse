@@ -1,0 +1,5 @@
+-- This migration file is intentionally a no-op on PostgreSQL.
+-- The publication bridge DDL (state_hamt_pending_nodes table and the
+-- published column on state_hamt_roots) is defined in 01_state_hamt.sql.postgres
+-- so that both SQLite and PostgreSQL share the same schema.  This file exists
+-- only to satisfy the delta-directory naming convention.

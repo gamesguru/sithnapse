@@ -48,7 +48,8 @@ def check_rust_lib_up_to_date() -> None:
 
     if hash != get_rust_file_digest():
         raise Exception(
-            "Rust module outdated. Please rebuild using `uv sync` or "
+            "Rust module outdated. Please rebuild using "
+            "`uv sync --reinstall-package matrix-synapse` or "
             "`uv run maturin develop`"
         )
 

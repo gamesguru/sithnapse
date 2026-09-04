@@ -19,7 +19,7 @@
 #
 #
 
-SCHEMA_VERSION = 94  # remember to update the list below when updating
+SCHEMA_VERSION = 95  # remember to update the list below when updating
 """Represents the expectations made by the codebase about the database schema
 
 This should be incremented whenever the codebase changes its requirements on the
@@ -176,13 +176,25 @@ Changes in SCHEMA_VERSION = 94
     - Add `recheck` column (boolean, default true) to the `redactions` table.
     - MSC4242: Add state DAG tables.
     - MSC4429: Track updates to user profile fields via a new stream.
+
+Changes in SCHEMA_VERSION = 95
+    - Add tables to store HAMT roots and shared nodes for state groups.
+    - Add `published` column and `state_hamt_pending_nodes` table for the
+      publication bridge (removed once HAMT roots/nodes became
+      authoritative in the embedded engine).
+    - Add a durable queue for HAMT roots which must be deleted after a
+      room purge commits.
+    - Change `delayed_events` primary key to be globally unique rather than
+      scoped to a user localpart (MSC4140).
+
 """
 
 
 SCHEMA_COMPAT_VERSION = (
-    # Transitive links are no longer written to `event_auth_chain_links`
-    # TODO: On the next compat bump, update the primary key of `delayed_events`
-    84
+    # HAMT state roots are authoritative in the embedded engine when one is
+    # configured, and delayed-event IDs are globally unique rather than
+    # scoped to a user localpart.
+    95
 )
 """Limit on how far the synapse codebase can be rolled back without breaking db compat
 

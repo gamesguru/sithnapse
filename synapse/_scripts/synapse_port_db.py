@@ -46,6 +46,7 @@ import yaml
 
 from twisted.internet import defer, reactor as reactor_
 
+from synapse.api.room_versions import KNOWN_ROOM_VERSIONS
 from synapse.config.database import DatabaseConnectionConfig
 from synapse.config.homeserver import HomeServerConfig
 from synapse.logging.context import (
@@ -224,6 +225,19 @@ IGNORED_TABLES = {
     "worker_read_write_locks",
 }
 
+# Columns present in the SQLite schema for a table but not in the Postgres
+# schema for the same table. `handle_table` below copies whatever columns
+# SQLite reports for a row, so these must be dropped before inserting into
+# Postgres or the insert fails with an undefined-column error.
+SQLITE_ONLY_COLUMNS: dict[str, set[str]] = {
+    # 95/03_state_hamt_pure_tikv.sql.postgres drops `published` once HAMT
+    # roots and nodes became authoritative in the embedded engine rather
+    # than SQL; the SQLite counterpart leaves it in place because older
+    # supported SQLite versions can't drop a column (see that migration's
+    # comment).
+    "state_hamt_roots": {"published"},
+}
+
 
 # These background updates will not be applied upon creation of the postgres database.
 IGNORED_BACKGROUND_UPDATES = {
@@ -231,7 +245,26 @@ IGNORED_BACKGROUND_UPDATES = {
     # already having waited for the SQLite database to complete all running background
     # updates.
     "mark_unreferenced_state_groups_for_deletion_bg_update",
+    # Same reasoning: the SQLite source has already had this backfill run against it
+    # (see the wait for `has_completed_background_updates` above). It also *can't* be
+    # rerun here -- this script's composed `Store` mixes in `StateBackgroundUpdateStore`
+    # directly rather than the full `StateGroupDataStore`, so it has no
+    # `_persist_state_hamt_txn`/`_background_backfill_state_hamt_roots` to run it with.
+    # NOTE: when the source's HAMT roots weren't all in SQL (e.g. missing
+    # for some rooms, or -- historically -- backed by a non-SQL engine),
+    # the backfill completed without writing SQL roots;
+    # `_maybe_requeue_state_hamt_backfill` re-inserts the pending update
+    # into PostgreSQL so Synapse runs it on startup.
+    "state_hamt_backfill_roots",
 }
+
+# If the SQLite source's HAMT roots weren't all in SQL, the backfill marked
+# itself complete without populating the SQL `state_hamt_roots` table for
+# every room. After copying, PostgreSQL therefore has state_groups rows but
+# no HAMT root rows -- and the completed background-update entry (copied
+# from SQLite) means Synapse will never re-run the backfill. We detect this
+# condition and reset the background update so Synapse executes it on
+# startup.
 
 
 # Error returned by the run function. Used at the top-level part of the script to
@@ -526,6 +559,23 @@ class Porter:
                     backward_chunk = min(row[0] for row in brows) - 1
 
                 rows = frows + brows
+
+                sqlite_only_columns = SQLITE_ONLY_COLUMNS.get(table)
+                if sqlite_only_columns:
+                    # headers[0] is the synthetic `rowid` column selected
+                    # above, not a real column -- always keep it. Filter
+                    # before `_convert_rows`, which strips that `rowid`
+                    # element from each row (keeping headers as-is): doing
+                    # this after would misalign the indices below against
+                    # the now rowid-less rows.
+                    keep_indices = [
+                        i
+                        for i, header in enumerate(headers)
+                        if i == 0 or header not in sqlite_only_columns
+                    ]
+                    headers = [headers[i] for i in keep_indices]
+                    rows = [tuple(row[i] for i in keep_indices) for row in rows]
+
                 rows = self._convert_rows(table, headers, rows)
 
                 def insert(txn: LoggingTransaction) -> None:
@@ -990,6 +1040,8 @@ class Porter:
 
                 tables_ported.update(tables_to_port)
 
+            await self._maybe_requeue_state_hamt_backfill()
+
             self.progress.done()
         except Exception as e:
             global end_error_exec_info
@@ -1162,6 +1214,62 @@ class Porter:
         done = int(done) if done else 0
 
         return done, remaining + done
+
+    async def _maybe_requeue_state_hamt_backfill(self) -> None:
+        """If the source SQLite database's backfill completed without every
+        room's ``state_hamt_roots`` row present (e.g. an interrupted run),
+        the completed entry was still copied from SQLite into PostgreSQL's
+        ``background_updates`` table, so Synapse would never re-run it.
+
+        Detect missing roots (including a partially completed source backfill)
+        and reset the background update so Synapse executes it on startup.
+        """
+
+        def get_missing_root_room_versions_txn(txn: LoggingTransaction) -> set[str]:
+            txn.execute(
+                """
+                SELECT DISTINCT r.room_version
+                FROM state_groups AS sg
+                LEFT JOIN state_hamt_roots AS hr ON hr.state_group = sg.id
+                INNER JOIN rooms AS r ON r.room_id = sg.room_id
+                WHERE hr.state_group IS NULL
+                """
+            )
+            return {room_version for (room_version,) in txn}
+
+        missing_root_room_versions = await self.postgres_store.db_pool.runInteraction(
+            "find_missing_state_hamt_roots", get_missing_root_room_versions_txn
+        )
+        if not missing_root_room_versions:
+            return
+
+        # The backfill can only reconstruct roots for rooms whose version is
+        # known. Missing and unsupported rooms are deliberately skipped by the
+        # handler, so they must not cause a needless full backfill scan.
+        if not any(
+            room_version in KNOWN_ROOM_VERSIONS
+            for room_version in missing_root_room_versions
+        ):
+            return
+
+        # Some source roots are absent (e.g. an interrupted source-side
+        # backfill, or -- historically -- a non-SQL HAMT engine). Delete
+        # the completed entry copied from SQLite and re-insert it as
+        # pending so Synapse backfills every missing root.
+        await self.postgres_store.db_pool.simple_delete(
+            table="background_updates",
+            keyvalues={"update_name": "state_hamt_backfill_roots"},
+            desc="requeue_state_hamt_backfill",
+        )
+        await self.postgres_store.db_pool.simple_insert(
+            table="background_updates",
+            values={
+                "update_name": "state_hamt_backfill_roots",
+                "progress_json": "{}",
+                "ordering": 100,
+            },
+            desc="requeue_state_hamt_backfill",
+        )
 
     async def _setup_state_group_id_seq(self) -> None:
         curr_id: int | None = await self.sqlite_store.db_pool.simple_select_one_onecol(

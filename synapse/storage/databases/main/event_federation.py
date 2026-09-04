@@ -311,7 +311,14 @@ class EventFederationWorkerStore(
 
         # A map from chain ID to max sequence number *reachable* from any event ID.
         chains: dict[int, int] = {}
-        for links in self._get_chain_links(txn, set(event_chains.keys())):
+        from synapse.storage.databases.main.embedded_event_auth_chain_links import (
+            resolve_namespace,
+        )
+
+        embedded_hamt_namespace = resolve_namespace(self)
+        for links in self._get_chain_links(
+            txn, set(event_chains.keys()), embedded_hamt_namespace
+        ):
             for chain_id in links:
                 if chain_id not in event_chains:
                     continue
@@ -363,7 +370,10 @@ class EventFederationWorkerStore(
 
     @classmethod
     def _get_chain_links(
-        cls, txn: LoggingTransaction, chains_to_fetch: set[int]
+        cls,
+        txn: LoggingTransaction,
+        chains_to_fetch: set[int],
+        embedded_hamt_namespace: str | None,
     ) -> Generator[dict[int, list[tuple[int, int, int]]], None, None]:
         """Fetch all auth chain links from the given set of chains, and all
         links from those chains, recursively.
@@ -373,7 +383,28 @@ class EventFederationWorkerStore(
 
         Returns a generator that produces dicts from origin chain ID to 3-tuple
         of origin sequence number, target chain ID and target sequence number.
+
+        `embedded_hamt_namespace`: the caller's resolved namespace when the
+        embedded engine is configured, `None` when it isn't -- a
+        `@classmethod` has no `self` of its own, so this can't be
+        recomputed here; see `embedded_event_auth_chain_links.py`.
         """
+        if embedded_hamt_namespace is not None:
+            # Exclusive by configured engine, not a dual-write. mdbx has no
+            # recursive-query primitive, so the walk is done here in Python
+            # instead of SQL's `WITH RECURSIVE` below -- see
+            # embedded_event_auth_chain_links.py's module docstring.
+            from synapse.storage.databases.main.embedded_event_auth_chain_links import (
+                get_chain_links_batch,
+            )
+
+            while chains_to_fetch:
+                batch = set(itertools.islice(chains_to_fetch, 1000))
+                chains_to_fetch.difference_update(batch)
+                embedded_links = get_chain_links_batch(embedded_hamt_namespace, batch)
+                chains_to_fetch.difference_update(embedded_links)
+                yield embedded_links
+            return
 
         # This query is structured to first get all chain IDs reachable, and
         # then pull out all links from those chains. This does pull out more
@@ -699,7 +730,14 @@ class EventFederationWorkerStore(
         # are reachable from any event.
 
         # (We need to take a copy of `seen_chains` as the function mutates it)
-        for links in self._get_chain_links(txn, set(seen_chains)):
+        from synapse.storage.databases.main.embedded_event_auth_chain_links import (
+            resolve_namespace,
+        )
+
+        embedded_hamt_namespace = resolve_namespace(self)
+        for links in self._get_chain_links(
+            txn, set(seen_chains), embedded_hamt_namespace
+        ):
             # `links` encodes the backwards reachable events _from a single chain_ all the way to
             # the root of the graph.
             for chains in set_to_chain:
@@ -2221,6 +2259,50 @@ class EventFederationWorkerStore(
         )
 
         return origin, event
+
+    async def get_staged_events_for_room(
+        self,
+        room_id: str,
+        room_version: RoomVersion,
+        limit: int,
+    ) -> list[tuple[str, EventBase]]:
+        """Get the oldest staged events for a room.
+
+        The caller holds the per-room inbound-PDU lock, so the rows remain owned by
+        it until they are removed from staging. This is deliberately a read rather
+        than a claim: an event must stay staged until it has been persisted.
+        """
+
+        def _get_staged_events_for_room_txn(
+            txn: LoggingTransaction,
+        ) -> list[tuple[str, str, str]]:
+            txn.execute(
+                """
+                SELECT event_json, internal_metadata, origin
+                FROM federation_inbound_events_staging
+                WHERE room_id = ?
+                ORDER BY received_ts ASC
+                LIMIT ?
+                """,
+                (room_id, limit),
+            )
+            return cast(list[tuple[str, str, str]], txn.fetchall())
+
+        rows = await self.db_pool.runInteraction(
+            "get_staged_events_for_room", _get_staged_events_for_room_txn
+        )
+
+        return [
+            (
+                row[2],
+                make_event_from_dict(
+                    event_dict=db_to_json(row[0]),
+                    room_version=room_version,
+                    internal_metadata_dict=db_to_json(row[1]),
+                ),
+            )
+            for row in rows
+        ]
 
     async def prune_staged_events_in_room(
         self,

@@ -68,16 +68,14 @@ class ApplicationServiceStoreTestCase(unittest.HomeserverTestCase):
         # must be done after inserts
         database = self.hs.get_datastores().databases[0]
         self.server_name = self.hs.hostname
-        self.store = ApplicationServiceStore(
-            database,
-            make_conn(
-                db_config=database._database_config,
-                engine=database.engine,
-                default_txn_name="test",
-                server_name=self.server_name,
-            ),
-            self.hs,
+        db_conn = make_conn(
+            db_config=database._database_config,
+            engine=database.engine,
+            default_txn_name="test",
+            server_name=self.server_name,
         )
+        self.addCleanup(db_conn.close)
+        self.store = ApplicationServiceStore(database, db_conn, self.hs)
 
     def tearDown(self) -> None:
         # TODO: suboptimal that we need to create files for tests!
@@ -150,16 +148,14 @@ class ApplicationServiceTransactionStoreTestCase(unittest.HomeserverTestCase):
 
         server_name = self.hs.hostname
         db_config = self.hs.config.database.get_single_database()
-        self.store = TestTransactionStore(
-            database,
-            make_conn(
-                db_config=db_config,
-                engine=self.engine,
-                default_txn_name="test",
-                server_name=server_name,
-            ),
-            self.hs,
+        db_conn = make_conn(
+            db_config=db_config,
+            engine=self.engine,
+            default_txn_name="test",
+            server_name=server_name,
         )
+        self.addCleanup(db_conn.close)
+        self.store = TestTransactionStore(database, db_conn, self.hs)
 
     def _add_service(self, url: str, as_token: str, id: str) -> None:
         as_yaml = {
@@ -483,6 +479,17 @@ class TestTransactionStore(ApplicationServiceTransactionStore, ApplicationServic
 
 
 class ApplicationServiceStoreConfigTestCase(unittest.HomeserverTestCase):
+    def _make_store(self) -> ApplicationServiceStore:
+        database = self.hs.get_datastores().databases[0]
+        db_conn = make_conn(
+            db_config=database._database_config,
+            engine=database.engine,
+            default_txn_name="test",
+            server_name=self.hs.hostname,
+        )
+        self.addCleanup(db_conn.close)
+        return ApplicationServiceStore(database, db_conn, self.hs)
+
     def _write_config(self, suffix: str, **kwargs: Any) -> str:
         vals: JsonDict = {
             "id": "id" + suffix,
@@ -506,18 +513,7 @@ class ApplicationServiceStoreConfigTestCase(unittest.HomeserverTestCase):
         self.hs.config.appservice.app_service_config_files = [f1, f2]
         self.hs.config.caches.event_cache_size = 1
 
-        server_name = self.hs.hostname
-        database = self.hs.get_datastores().databases[0]
-        ApplicationServiceStore(
-            database,
-            make_conn(
-                db_config=database._database_config,
-                engine=database.engine,
-                default_txn_name="test",
-                server_name=server_name,
-            ),
-            self.hs,
-        )
+        self._make_store()
 
     def test_duplicate_ids(self) -> None:
         f1 = self._write_config(id="id", suffix="1")
@@ -527,18 +523,7 @@ class ApplicationServiceStoreConfigTestCase(unittest.HomeserverTestCase):
         self.hs.config.caches.event_cache_size = 1
 
         with self.assertRaises(ConfigError) as cm:
-            server_name = self.hs.hostname
-            database = self.hs.get_datastores().databases[0]
-            ApplicationServiceStore(
-                database,
-                make_conn(
-                    db_config=database._database_config,
-                    engine=database.engine,
-                    default_txn_name="test",
-                    server_name=server_name,
-                ),
-                self.hs,
-            )
+            self._make_store()
 
         e = cm.exception
         self.assertIn(f1, str(e))
@@ -553,18 +538,7 @@ class ApplicationServiceStoreConfigTestCase(unittest.HomeserverTestCase):
         self.hs.config.caches.event_cache_size = 1
 
         with self.assertRaises(ConfigError) as cm:
-            server_name = self.hs.hostname
-            database = self.hs.get_datastores().databases[0]
-            ApplicationServiceStore(
-                database,
-                make_conn(
-                    db_config=database._database_config,
-                    engine=database.engine,
-                    default_txn_name="test",
-                    server_name=server_name,
-                ),
-                self.hs,
-            )
+            self._make_store()
 
         e = cm.exception
         self.assertIn(f1, str(e))
@@ -579,19 +553,8 @@ class ApplicationServiceStoreConfigTestCase(unittest.HomeserverTestCase):
         self.hs.config.appservice.app_service_config_files = [f]
         self.hs.config.caches.event_cache_size = 1
 
-        server_name = self.hs.hostname
-        database = self.hs.get_datastores().databases[0]
         with self.assertRaises(ValueError):
-            ApplicationServiceStore(
-                database,
-                make_conn(
-                    db_config=database._database_config,
-                    engine=database.engine,
-                    default_txn_name="test",
-                    server_name=server_name,
-                ),
-                self.hs,
-            )
+            self._make_store()
 
     def test_known_scope_works(self) -> None:
         f = self._write_config(
@@ -602,18 +565,7 @@ class ApplicationServiceStoreConfigTestCase(unittest.HomeserverTestCase):
         self.hs.config.appservice.app_service_config_files = [f]
         self.hs.config.caches.event_cache_size = 1
 
-        server_name = self.hs.hostname
-        database = self.hs.get_datastores().databases[0]
-        ApplicationServiceStore(
-            database,
-            make_conn(
-                db_config=database._database_config,
-                engine=database.engine,
-                default_txn_name="test",
-                server_name=server_name,
-            ),
-            self.hs,
-        )
+        self._make_store()
 
     def test_unknown_scope_raises(self) -> None:
         f = self._write_config(
@@ -623,16 +575,5 @@ class ApplicationServiceStoreConfigTestCase(unittest.HomeserverTestCase):
         self.hs.config.appservice.app_service_config_files = [f]
         self.hs.config.caches.event_cache_size = 1
 
-        server_name = self.hs.hostname
-        database = self.hs.get_datastores().databases[0]
         with self.assertRaises(ValueError):
-            ApplicationServiceStore(
-                database,
-                make_conn(
-                    db_config=database._database_config,
-                    engine=database.engine,
-                    default_txn_name="test",
-                    server_name=server_name,
-                ),
-                self.hs,
-            )
+            self._make_store()

@@ -56,7 +56,6 @@ jobs:
               - 'tests/**'
               - 'rust/**'
               - '.ci/scripts/calculate_jobs.py'
-              - '.ci/scripts/start_tikv.sh'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'pyproject.toml'
@@ -268,7 +267,7 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-      - run: cargo clippy -- -D warnings
+      - run: cargo clippy --locked -- -D warnings
 
   # We also lint against a nightly rustc so that we can lint the benchmark
   # suite, which requires a nightly compiler.
@@ -287,7 +286,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-      - run: cargo clippy --all-features -- -D warnings
+      - run: cargo clippy --locked --all-features -- -D warnings
 
   lint-rust:
     runs-on: ubuntu-latest
@@ -451,9 +450,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: sudo apt-get -qq install xmlsec1
-      - name: Start TiKV (PD & TiKV nodes)
-        if: ${{ matrix.job.database == 'tikv' }}
-        run: .ci/scripts/start_tikv.sh
       - name: Set up PostgreSQL ${{ matrix.job.postgres-version }}
         if: ${{ matrix.job.postgres-version }}
         # 1. Mount postgres data files onto a tmpfs in-memory filesystem to reduce overhead of docker's overlayfs layer.
@@ -505,7 +501,22 @@ jobs:
           SYNAPSE_POSTGRES_HOST: /var/run/postgresql
           SYNAPSE_POSTGRES_USER: postgres
           SYNAPSE_POSTGRES_PASSWORD: postgres
-          SYNAPSE_TEST_TIKV_PD_ENDPOINTS: ${{ matrix.job.database == 'tikv' && '172.17.0.1:2379' || '' }}
+          SYNAPSE_TEST_EMBEDDED_HAMT_ENGINE: ${{ matrix.job.database == 'mdbx' && 'mdbx' || '' }}
+          SYNAPSE_TEST_EMBEDDED_HAMT_PATH: ${{ matrix.job.database == 'mdbx' && '/tmp/synapse-embedded-hamt' || '' }}
+      - name: Dump PostgreSQL statistics
+        if: ${{ always() && matrix.job.database == 'postgres' }}
+        run: .ci/scripts/dump_postgres_stats.sh /tmp/postgres-stats.txt || true
+        env:
+          SYNAPSE_POSTGRES_HOST: /var/run/postgresql
+          SYNAPSE_POSTGRES_USER: postgres
+          SYNAPSE_POSTGRES_PASSWORD: postgres
+      - name: Upload PostgreSQL statistics
+        if: ${{ always() && matrix.job.database == 'postgres' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Trial PostgreSQL stats - (${{ join(matrix.job.*, ', ') }})
+          path: /tmp/postgres-stats.txt
+          if-no-files-found: warn
       - name: Dump logs
         # Logs are most useful when the command fails, always include them.
         if: ${{ always() }}
@@ -519,13 +530,15 @@ jobs:
           -exec echo "::endgroup::" \;
           || true
 
-  trial-tikv:
-    # Runs the trial suite with a real TiKV backend for HAMT state storage
-    # (see tikv_pd_endpoints in synapse/config/database.py), so tests that
-    # exercise it -- e.g. test_state_group_hamt_corruption_does_not_fallback_to_sql_tikv
-    # in tests/storage/test_state.py -- actually run against TiKV rather
-    # than being skipped. Sqlite only; TiKV is the variable under test here,
-    # not the SQL backend.
+  trial-mdbx:
+    # Runs the trial suite with the embedded mdbx engine for HAMT state
+    # storage (see embedded_hamt_engine in synapse/config/database.py), so
+    # tests that exercise it -- e.g.
+    # test_state_group_hamt_corruption_does_not_fallback_to_sql in
+    # tests/storage/test_state.py -- actually run against mdbx rather than
+    # the SQL fallback. Sqlite only; mdbx is the variable under test here,
+    # not the SQL backend. Replaces the old trial-tikv job now that TiKV has
+    # been removed.
     if: ${{ !cancelled() && !failure() && needs.changes.outputs.trial == 'true' }} # Allow previous steps to be skipped, but not fail
     needs:
       - linting-done
@@ -533,9 +546,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Start TiKV (PD & TiKV nodes)
-        run: .ci/scripts/start_tikv.sh
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # master
@@ -562,7 +572,8 @@ jobs:
           done
       - run: uv run trial --jobs=6 tests
         env:
-          SYNAPSE_TEST_TIKV_PD_ENDPOINTS: 172.17.0.1:2379
+          SYNAPSE_TEST_EMBEDDED_HAMT_ENGINE: mdbx
+          SYNAPSE_TEST_EMBEDDED_HAMT_PATH: /tmp/synapse-embedded-hamt
       - name: Dump logs
         # Logs are most useful when the command fails, always include them.
         if: ${{ always() }}
@@ -691,7 +702,6 @@ jobs:
       image: matrixdotorg/sytest-synapse:${{ matrix.job.sytest-tag }}
       volumes:
         - ${{ github.workspace }}:/src
-        - ${{ matrix.job.tikv && '/var/run/docker.sock:/var/run/docker.sock' || '/dev/null:/dev/null' }}
       env:
         # If this is a pull request to a release branch, use that branch as default branch for sytest, else use develop
         # This works because the release script always create a branch on the sytest repo with the same name as the release branch
@@ -702,7 +712,8 @@ jobs:
         ASYNCIO_REACTOR: ${{ (matrix.job.reactor == 'asyncio') || '' }}
         WORKERS: ${{ matrix.job.workers && 1 }}
         BLACKLIST: ${{ matrix.job.workers && 'synapse-blacklist-with-workers' }}
-        SYNAPSE_TIKV_PD_ENDPOINTS: ${{ matrix.job.tikv && 'pd:2379' }}
+        SYNAPSE_EMBEDDED_HAMT_ENGINE: ${{ matrix.job.embedded_hamt && 'mdbx' }}
+        SYNAPSE_EMBEDDED_HAMT_PATH: ${{ matrix.job.embedded_hamt && '/tmp/synapse-embedded-hamt' }}
         TOP: ${{ github.workspace }}
 
     strategy:
@@ -715,20 +726,16 @@ jobs:
       - name: Prepare test blacklist
         run: cat sytest-blacklist .ci/worker-blacklist > synapse-blacklist-with-workers
 
-      - name: Install docker CLI (for TiKV)
-        if: ${{ matrix.job.tikv }}
-        run: |
-          apt-get update
-          apt-get install -y docker.io
-      - name: Start TiKV (PD & TiKV nodes)
-        if: ${{ matrix.job.tikv }}
-        run: .ci/scripts/start_tikv.sh
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # master
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Install clang (for mdbx-sys bindgen)
+        run: |
+          apt-get update
+          apt-get install -y clang libclang-dev
 
       - name: Install dependencies using uv
         run: |
@@ -917,7 +924,7 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-      - run: cargo test
+      - run: cargo test --locked
 
   # We want to ensure that the cargo benchmarks still compile, which requires a
   # nightly compiler.
@@ -938,14 +945,14 @@ jobs:
           toolchain: ${{ env.RUST_NIGHTLY_VERSION }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-      - run: cargo bench --no-run
+      - run: cargo bench --locked --no-run
 
   # a job which marks all the other jobs as complete, thus allowing PRs to be merged.
   tests-done:
     if: ${{ always() }}
     needs:
       - trial
-      - trial-tikv
+      - trial-mdbx
       - trial-olddeps
       - sytest
       - export-data
@@ -964,7 +971,7 @@ jobs:
           # The newsfile lint may be skipped on non PR builds.
           skippable: |
             trial
-            trial-tikv
+            trial-mdbx
             trial-olddeps
             sytest
             portdb

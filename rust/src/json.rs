@@ -26,7 +26,7 @@
 ///
 /// Note, to use this type correctly, the field **MUST** be annotated with:
 ///
-/// ```rust
+/// ```rust,ignore
 /// #[serde(
 ///     default,
 ///     with = "crate::json::allow_missing",

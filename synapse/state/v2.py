@@ -21,6 +21,7 @@
 import heapq
 import itertools
 import logging
+import time
 from typing import (
     Any,
     Awaitable,
@@ -130,12 +131,35 @@ async def resolve_events_with_store(
     if room_version.state_res == StateResolutionVersions.V2_1:
         # calculate the conflicted subgraph
         conflicted_set = set(itertools.chain.from_iterable(conflicted_state.values()))
+    complete_event_graph = room_version.state_res == StateResolutionVersions.V2 and all(
+        event_id in event_map
+        for state_set in state_sets
+        for event_id in state_set.values()
+    )
+    if complete_event_graph:
+        to_check = [
+            event_id for state_set in state_sets for event_id in state_set.values()
+        ]
+        checked: set[str] = set()
+        while to_check and complete_event_graph:
+            event_id = to_check.pop()
+            if event_id in checked:
+                continue
+            checked.add(event_id)
+            event = event_map.get(event_id)
+            if event is None:
+                complete_event_graph = False
+                break
+            to_check.extend(event.auth_event_ids())
+
+    _gg_auth_diff_start = time.monotonic()
     auth_diff = await _get_auth_chain_difference(
         room_id,
         state_sets,
         event_map,
         state_res_store,
         conflicted_set,
+        complete_event_graph,
     )
     full_conflicted_set = set(
         itertools.chain(
@@ -143,13 +167,23 @@ async def resolve_events_with_store(
         )
     )
 
-    # Prefetch the conflicted set and its auth chain concurrently so later
-    # auth checks can stay on the in-memory fast path.
+    # Prefetch the conflicted set, unconflicted state, and their auth chains so
+    # the resolver has a complete in-memory event graph. Although an
+    # unconflicted binding is copied directly into the final state map, its
+    # event can still be needed as auth context while resolving a conflicting
+    # branch.
     to_fetch = {eid for eid in full_conflicted_set if eid not in event_map}
     to_fetch.update(eid for eid in unconflicted_state.values() if eid not in event_map)
+    _gg_prefetch_start = time.monotonic()
+    _gg_prefetch_rounds = 0
+    _gg_prefetch_requested = 0
+    _gg_prefetch_loaded = 0
 
     while to_fetch:
+        _gg_prefetch_rounds += 1
+        _gg_prefetch_requested += len(to_fetch)
         fetched = await state_res_store.get_events(list(to_fetch), allow_rejected=True)
+        _gg_prefetch_loaded += len(fetched)
         event_map.update(fetched)
 
         new_to_fetch = set()
@@ -160,6 +194,18 @@ async def resolve_events_with_store(
                     if aid not in event_map:
                         new_to_fetch.add(aid)
         to_fetch = new_to_fetch
+
+    logger.debug(
+        "[gg-state-timing] state_v2_auth_prefetch "
+        "conflicted=%d auth_diff_ms=%.1f rounds=%d requested=%d loaded=%d "
+        "prefetch_ms=%.1f",
+        len(full_conflicted_set),
+        (_gg_prefetch_start - _gg_auth_diff_start) * 1000,
+        _gg_prefetch_rounds,
+        _gg_prefetch_requested,
+        _gg_prefetch_loaded,
+        (time.monotonic() - _gg_prefetch_start) * 1000,
+    )
 
     # everything in the event map should be in the right room
     for event in event_map.values():
@@ -182,10 +228,18 @@ async def resolve_events_with_store(
 
             logger.debug("Resolving state v2 via Rust rezzy lattice fold")
 
+            _gg_rust_res_start = time.monotonic()
             resolved_state_rust: StateMap[str] = resolve_v2_via_lattice_fold(
                 dict(unconflicted_state),
                 list(full_conflicted_set),
                 event_map,
+            )
+            logger.debug(
+                "[gg-state-timing] state_v2_rust_resolve "
+                "conflicted=%d event_map=%d elapsed_ms=%.1f",
+                len(full_conflicted_set),
+                len(event_map),
+                (time.monotonic() - _gg_rust_res_start) * 1000,
             )
             return resolved_state_rust
         except Exception as e:
@@ -194,6 +248,7 @@ async def resolve_events_with_store(
                 exc_info=e,
             )
 
+    _gg_python_res_start = time.monotonic()
     full_conflicted_set = {eid for eid in full_conflicted_set if eid in event_map}
 
     logger.debug("%d full_conflicted_set entries", len(full_conflicted_set))
@@ -264,6 +319,14 @@ async def resolve_events_with_store(
 
     # We make sure that unconflicted state always still applies.
     resolved_state.update(unconflicted_state)
+
+    logger.debug(
+        "[gg-state-timing] state_v2_python_resolve "
+        "conflicted=%d event_map=%d elapsed_ms=%.1f",
+        len(full_conflicted_set),
+        len(event_map),
+        (time.monotonic() - _gg_python_res_start) * 1000,
+    )
 
     logger.debug("done")
 
@@ -349,6 +412,7 @@ async def _get_auth_chain_difference(
     unpersisted_events: dict[str, EventBase],
     state_res_store: StateResolutionStore,
     conflicted_state: set[str] | None,
+    complete_event_graph: bool = False,
 ) -> set[str]:
     """Compare the auth chains of each state set and return the set of events
     that only appear in some, but not all of the auth chains.
@@ -372,6 +436,8 @@ async def _get_auth_chain_difference(
 
     if not is_state_res_v21:
         try:
+            if not complete_event_graph:
+                raise ValueError("incomplete event graph")
             import synapse.synapse_rust.state_res as rust_res
 
             return cast(

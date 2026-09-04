@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import statistics
 import sys
@@ -18,8 +17,6 @@ from synapse.api.constants import EventTypes  # noqa: E402
 from synapse.synapse_rust import state_hamt  # noqa: E402
 from synmark.state_fixtures import StateFixture, make_state_fixture  # noqa: E402
 
-SERVER_SECRET = hashlib.sha256(b"state-hamt-benchmark-secret").digest()
-
 
 def entries(state: dict[tuple[str, str], str]) -> list[tuple[str, str, str]]:
     return [(typ, state_key, event_id) for (typ, state_key), event_id in state.items()]
@@ -27,7 +24,7 @@ def entries(state: dict[tuple[str, str], str]) -> list[tuple[str, str, str]]:
 
 def build(fixture: StateFixture) -> tuple[bytes, list[tuple[bytes, bytes]]]:
     root, nodes = state_hamt.build_root_handle(
-        SERVER_SECRET, fixture.room_id, entries(dict(fixture.state))
+        fixture.room_id, entries(dict(fixture.state))
     )
     return bytes(root[0]), [
         (bytes(node_hash), bytes(blob)) for node_hash, blob in nodes
@@ -52,7 +49,6 @@ def selective_lookup(
     loaded = {root_hash: all_nodes[root_hash]}
     while True:
         result, missing = state_hamt.lookup_state_entries(
-            SERVER_SECRET,
             fixture.room_id,
             loaded[root_hash],
             list(loaded.items()),
@@ -131,9 +127,7 @@ def main() -> None:
     def rebuild_one_key() -> object:
         state = dict(fixture.state)
         state[mutation_key] = mutation_event_id
-        return state_hamt.build_root_handle(
-            SERVER_SECRET, fixture.room_id, entries(state)
-        )
+        return state_hamt.build_root_handle(fixture.room_id, entries(state))
 
     results = [
         time_case("full_materialize", args.iterations, full),

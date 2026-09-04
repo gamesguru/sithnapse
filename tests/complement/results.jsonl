@@ -635,6 +635,7 @@
 {"Action":"pass","Test":"TestPushSync/Setting_actions_for_a_push_rule_wakes_up_an_incremental_/sync"}
 {"Action":"pass","Test":"TestRedact"}
 {"Action":"pass","Test":"TestRedact/Event_content_is_redacted"}
+{"Action":"pass","Test":"TestRedisRestartRecovery"}
 {"Action":"pass","Test":"TestRegistration"}
 {"Action":"pass","Test":"TestRegistration/parallel"}
 {"Action":"pass","Test":"TestRegistration/parallel/GET_/register/available_returns_M_INVALID_USERNAME_for_invalid_user_name"}
@@ -850,8 +851,8 @@
 {"Action":"pass","Test":"TestServerNotices/Alice_cannot_reject_the_invite"}
 {"Action":"pass","Test":"TestServerNotices/Alice_is_invited_to_the_server_alert_room"}
 {"Action":"pass","Test":"TestServerNotices/Sending_a_notice_with_a_transactionID_is_idempotent"}
-{"Action":"skip","Test":"TestStateIdsFallbackFetchesFullAuthChain"}
-{"Action":"skip","Test":"TestStateIdsFallbackRecoversAfterMalformedGetMissingEventsResponse"}
+{"Action":"pass","Test":"TestStateIdsFallbackFetchesFullAuthChain"}
+{"Action":"pass","Test":"TestStateIdsFallbackRecoversAfterMalformedGetMissingEventsResponse"}
 {"Action":"pass","Test":"TestSync"}
 {"Action":"pass","Test":"TestSync/parallel"}
 {"Action":"pass","Test":"TestSync/parallel/Can_sync_a_joined_room"}

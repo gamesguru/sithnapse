@@ -2381,3 +2381,87 @@ guru/refactor/rust-hamt-state-res,33288942600,2026-08-30T02:51:21Z,99197290738,"
 guru/refactor/rust-hamt-state-res,33288942600,2026-08-30T02:51:21Z,99197290756,"sytest (bookworm, postgres)",692,success
 guru/refactor/rust-hamt-state-res,33288942600,2026-08-30T02:51:21Z,99197290771,"trial (3.10, tikv, all)",444,cancelled
 guru/refactor/rust-hamt-state-res,33288942600,2026-08-30T02:51:21Z,99197290780,"sytest (bookworm, multi-postgres, workers, asyncio)",1198,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436106561,"lint-crlf",6,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436106648,"changes",3,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436106662,"check-lockfile",9,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436107885,"lint-newsfile",-1,skipped
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436131664,"Typechecking",93,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436131677,"lint-golangci",23,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436131685,"check-sampleconfig",73,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436131736,"lint-rust",72,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436131752,"lint-clippy-nightly",21,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436131756,"check-schema-delta",19,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436131780,"lint",160,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436131806,"lint-clippy",25,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436131818,"lint-rustfmt",19,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436133375,"lint-readme",-1,skipped
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436805893,"linting-done",4,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436837117,"cargo-test",44,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436837135,"trial-tikv",619,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436837147,"trial-olddeps",436,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436837164,"portdb (3.10, 14)",338,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436837186,"portdb (3.13, 17)",350,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436837193,"cargo-bench",69,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436837199,"calculate-test-jobs",5,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436837301,"complement / complement (workers, Postgres)",1980,failure
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436837341,"complement / complement (hybrid, SQLite (hybrid, tikv))",1184,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436837358,"complement / complement (monolith, Postgres)",1311,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436837370,"complement / complement (hybrid, Postgres (hybrid, tikv))",1353,failure
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436837371,"complement / complement (workers, Postgres (hybrid, tikv))",2058,failure
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436837424,"complement / complement (monolith, SQLite)",1142,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436838147,"trial-pypy",-1,skipped
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436863767,"sytest (bookworm, multi-postgres, workers, asyncio)",1029,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436863789,"trial (3.10, tikv, all)",717,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436863820,"sytest (bookworm, multi-postgres, workers)",909,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436863827,"trial (3.10, sqlite, all)",550,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436863828,"trial (3.10, postgres, 14, all)",1300,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436863850,"trial (3.13, postgres, 17, all)",1449,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436863863,"trial (3.13, sqlite, all)",483,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436863870,"sytest (bookworm, postgres)",684,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436863883,"sytest (bookworm)",702,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436863893,"trial (3.10, sqlite)",474,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99436863923,"sytest (bookworm, multi-postgres, workers, tikv)",1175,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99438305024,"export-data",283,success
+guru/refactor/rust-hamt-state-res,33375510107,2026-08-31T09:00:00Z,99445622999,"tests-done",5,failure
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99609368243,"check-lockfile",7,success
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99609368509,"changes",5,success
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99609368582,"lint-crlf",6,success
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99609369435,"lint-newsfile",-1,skipped
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99609408503,"lint",160,success
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99609408529,"check-sampleconfig",80,success
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99609408588,"check-schema-delta",23,success
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99609408601,"lint-golangci",27,success
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99609408609,"lint-rust",60,success
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99609408626,"lint-clippy-nightly",24,success
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99609408636,"Typechecking",87,success
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99609408644,"lint-clippy",28,success
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99609408679,"lint-rustfmt",20,success
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99609410205,"lint-readme",-1,skipped
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99610235828,"linting-done",4,success
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99610270664,"calculate-test-jobs",7,success
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99610270743,"trial-tikv",620,success
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99610270756,"trial-olddeps",502,success
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99610270841,"portdb (3.10, 14)",335,success
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99610270858,"portdb (3.13, 17)",332,success
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99610270881,"cargo-bench",74,success
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99610270910,"cargo-test",40,success
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99610271412,"complement / complement (monolith, SQLite)",1483,success
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99610271424,"complement / complement (workers, Postgres)",1985,failure
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99610271507,"complement / complement (hybrid, Postgres (hybrid, tikv))",1218,failure
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99610271570,"complement / complement (workers, Postgres (hybrid, tikv))",2045,failure
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99610271574,"complement / complement (hybrid, SQLite (hybrid, tikv))",1171,failure
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99610271631,"complement / complement (monolith, Postgres)",1269,failure
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99610272960,"trial-pypy",-1,skipped
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99610322250,"sytest (bookworm, postgres)",819,success
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99610322254,"sytest (bookworm, multi-postgres, workers, tikv)",1208,failure
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99610322298,"trial (3.13, postgres, 17, all)",1239,success
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99610322300,"sytest (bookworm, multi-postgres, workers)",1196,success
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99610322308,"trial (3.10, postgres, 14, all)",1206,success
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99610322316,"sytest (bookworm, multi-postgres, workers, asyncio)",1226,success
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99610322481,"trial (3.10, tikv, all)",649,success
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99610322503,"sytest (bookworm)",789,success
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99610322516,"trial (3.10, sqlite, all)",529,success
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99610322539,"trial (3.13, sqlite, all)",344,success
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99610322551,"trial (3.10, sqlite)",502,success
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99612001797,"export-data",277,success
+guru/refactor/rust-hamt-state-res,33428969771,2026-08-31T19:09:07Z,99620546623,"tests-done",2,failure

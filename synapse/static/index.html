@@ -985,12 +985,28 @@
       }
 
       measureTelemetry();
-      // Refresh only while the tab is visible, and at a low frequency.
-      setInterval(() => {
+      // Refresh telemetry at a low frequency while the tab is visible.
+      // Use a visibility change listener to avoid unnecessary background polling.
+      let telemetryInterval = null;
+      const startTelemetryPolling = () => {
+        if (telemetryInterval) return;
+        telemetryInterval = setInterval(() => {
+          if (document.visibilityState === "visible") {
+            measureTelemetry();
+          } else {
+            // Stop polling when tab is hidden, restart on visibility change
+            clearInterval(telemetryInterval);
+            telemetryInterval = null;
+          }
+        }, 120000); // 2 minutes
+      };
+      document.addEventListener("visibilitychange", () => {
         if (document.visibilityState === "visible") {
           measureTelemetry();
+          startTelemetryPolling();
         }
-      }, 60000);
+      });
+      startTelemetryPolling();
     </script>
   </body>
 </html>

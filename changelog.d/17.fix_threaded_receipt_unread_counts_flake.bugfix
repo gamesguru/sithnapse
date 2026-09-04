@@ -1,0 +1,11 @@
+Fix threaded read receipts not correctly clearing unread notification counts under load.
+
+This closes out a series of fixes to threaded-receipt notification counting on this branch:
+
+- Fix receipts silently dropped from sync after a dropped RDATA broadcast (`518b68bbc8`, refined by `649fb18b`).
+- Align `_get_linearized_receipts_for_room` with MSC4102's `ReceiptInRoom.merge_to_content` (`0cc4ff2a66`).
+- Correct main-timeline vs. per-thread count aggregation in `_get_unread_counts_by_pos_txn` (`43ae1775da`).
+
+This change adds a `threaded_receipt_stream_ordering IS NULL` guard to the summary-freshness check, so a stale `event_push_summary` row is no longer used when a threaded receipt has arrived but not yet been processed by the background rotation.
+
+This was a race that was effectively unreachable running a single test in isolation, but readily hit under full-suite load (`TestThreadedReceipts`).

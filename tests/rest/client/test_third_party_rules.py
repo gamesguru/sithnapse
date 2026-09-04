@@ -135,7 +135,7 @@ class ThirdPartyRulesTestCase(unittest.FederatingHomeserverTestCase):
         self.invitee = self.register_user("invitee", "hackme")
         self.tok = self.login("kermit", "monkey")
 
-        # Some tests might prevent room creation on purpose.
+        # Some tests might prevent room creation on purpose (e.g. LegacyDenyNewRooms).
         try:
             self.room_id = self.helper.create_room_as(self.user_id, tok=self.tok)
         except Exception:

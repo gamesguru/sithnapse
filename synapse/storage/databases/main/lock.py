@@ -478,17 +478,26 @@ class Lock:
 
     async def is_still_valid(self) -> bool:
         """Check if the lock is still held by us"""
-        last_renewed_ts = await self._store.db_pool.simple_select_one_onecol(
-            table=self._table,
-            keyvalues={
-                "lock_name": self._lock_name,
-                "lock_key": self._lock_key,
-                "token": self._token,
-            },
-            retcol="last_renewed_ts",
-            allow_none=True,
-            desc="is_lock_still_valid",
+
+        def _is_still_valid_txn(txn: LoggingTransaction) -> bool:
+            return self.is_still_valid_txn(txn)
+
+        return await self._store.db_pool.runInteraction(
+            "is_lock_still_valid", _is_still_valid_txn
         )
+
+    def is_still_valid_txn(self, txn: LoggingTransaction) -> bool:
+        """Check whether this lock is still held, within an existing transaction."""
+        txn.execute(
+            f"""
+                SELECT last_renewed_ts
+                FROM {self._table}
+                WHERE lock_name = ? AND lock_key = ? AND token = ?
+            """,
+            (self._lock_name, self._lock_key, self._token),
+        )
+        row = txn.fetchone()
+        last_renewed_ts = row[0] if row is not None else None
         return (
             last_renewed_ts is not None
             and self._clock.time_msec() - _LOCK_TIMEOUT.as_millis() < last_renewed_ts
@@ -535,7 +544,16 @@ class Lock:
                 (self._lock_name, self._lock_key, self._token), None
             )
         else:
-            self._store._live_lock_tokens.pop((self._lock_name, self._lock_key), None)
+            # Only remove if we're still the current holder. A newer lock
+            # may have been acquired (e.g. after a timeout) and replaced us
+            # in the dictionary.
+            existing = self._store._live_lock_tokens.get(
+                (self._lock_name, self._lock_key)
+            )
+            if existing is self:
+                self._store._live_lock_tokens.pop(
+                    (self._lock_name, self._lock_key), None
+                )
 
         self._dropped = True
 

@@ -1,0 +1,1 @@
+Fix a bug where a replication stream reset (e.g. after a writer restart) could be wrongly treated as a gap in updates, causing sync to fail.

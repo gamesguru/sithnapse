@@ -46,6 +46,12 @@ from synapse.storage.database import (
     make_tuple_comparison_clause,
 )
 from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
+from synapse.storage.databases.main.embedded_event_json import put_event_json_batch
+from synapse.storage.databases.main.embedded_event_to_state_group import (
+    get_state_group_for_events_batch,
+    increment_state_group_refcounts_batch,
+    put_event_to_state_group_batch,
+)
 from synapse.storage.databases.main.events import (
     SLIDING_SYNC_RELEVANT_STATE_SET,
     PersistEventsStore,
@@ -124,6 +130,13 @@ class _JoinedRoomStreamOrderingUpdate:
 class EventsBackgroundUpdatesStore(
     StreamWorkerStore, StateDeltasStore, CacheInvalidationWorkerStore, SQLBaseStore
 ):
+    EMBEDDED_EVENT_TO_STATE_GROUP_MIGRATION_UPDATE_NAME = (
+        "event_to_state_group_embedded_migration"
+    )
+    EMBEDDED_EVENT_AUTH_CHAIN_LINKS_MIGRATION_UPDATE_NAME = (
+        "event_auth_chain_links_embedded_migration"
+    )
+
     def __init__(
         self,
         database: DatabasePool,
@@ -226,6 +239,27 @@ class EventsBackgroundUpdatesStore(
             "event_arbitrary_relations",
             self._event_arbitrary_relations,
         )
+
+        if hs.config.database.embedded_hamt_engine == "mdbx":
+            self.db_pool.updates.register_background_update_handler(
+                self.EMBEDDED_EVENT_TO_STATE_GROUP_MIGRATION_UPDATE_NAME,
+                self._background_migrate_event_to_state_groups_to_embedded,
+            )
+            if hs.config.worker.run_background_tasks:
+                hs.run_as_background_process(
+                    "enqueue_event_to_state_group_embedded_migration",
+                    self._enqueue_event_to_state_group_embedded_migration_if_needed,
+                )
+
+            self.db_pool.updates.register_background_update_handler(
+                self.EMBEDDED_EVENT_AUTH_CHAIN_LINKS_MIGRATION_UPDATE_NAME,
+                self._background_migrate_event_auth_chain_links_to_embedded,
+            )
+            if hs.config.worker.run_background_tasks:
+                hs.run_as_background_process(
+                    "enqueue_event_auth_chain_links_embedded_migration",
+                    self._enqueue_event_auth_chain_links_embedded_migration_if_needed,
+                )
 
         ################################################################################
 
@@ -373,6 +407,203 @@ class EventsBackgroundUpdatesStore(
             _resolve_stale_data_in_sliding_sync_tables(
                 txn=txn,
             )
+
+    async def _enqueue_event_to_state_group_embedded_migration_if_needed(
+        self,
+    ) -> None:
+        """Turning on the embedded engine doesn't retroactively move
+        existing `event_to_state_groups` SQL rows into it -- new writes go
+        exclusively to whichever engine is configured (see
+        `_store_event_state_mappings_txn` in events.py), but old data
+        written before the switch stays SQL-only until this migration
+        copies it over (and rebuilds the reference-count companion
+        `embedded_event_to_state_group.py` needs, since that never existed
+        in SQL at all).
+
+        See `_enqueue_embedded_hamt_migration_if_needed`
+        (storage/databases/state/store.py) for why this can't just check
+        `has_completed_background_update` -- the same `_all_done` fast-path
+        problem applies here.
+        """
+        await self.db_pool.simple_upsert(
+            table="background_updates",
+            keyvalues={
+                "update_name": self.EMBEDDED_EVENT_TO_STATE_GROUP_MIGRATION_UPDATE_NAME
+            },
+            values={},
+            insertion_values={"progress_json": "{}"},
+            desc="enqueue_event_to_state_group_embedded_migration",
+        )
+        self.db_pool.updates.start_doing_background_updates()
+
+    async def _background_migrate_event_to_state_groups_to_embedded(
+        self, progress: JsonDict, batch_size: int
+    ) -> int:
+        """Copy existing SQL `event_to_state_groups` rows into the embedded
+        engine, and rebuild the per-state-group reference count
+        (`embedded_event_to_state_group.py`'s
+        `increment_state_group_refcounts_batch`) that backs
+        `get_referenced_state_groups` once this table is embedded-exclusive
+        -- for data written before `embedded_hamt_engine` was turned on.
+        New writes never need this; they already go straight to the
+        configured engine exclusively.
+
+        Existing SQL rows are left in place rather than deleted: harmless
+        once migrated, and means turning the embedded engine back off
+        doesn't lose data (see the equivalent HAMT migration's docstring
+        for the same reasoning).
+        """
+        last_event_id = progress.get("last_event_id", "")
+
+        def get_batch_txn(txn: LoggingTransaction) -> list[tuple[str, int]]:
+            txn.execute(
+                """
+                SELECT event_id, state_group FROM event_to_state_groups
+                WHERE event_id > ?
+                ORDER BY event_id
+                LIMIT ?
+                """,
+                (last_event_id, batch_size),
+            )
+            return cast(list[tuple[str, int]], txn.fetchall())
+
+        rows = await self.db_pool.runInteraction(
+            f"{self.EMBEDDED_EVENT_TO_STATE_GROUP_MIGRATION_UPDATE_NAME}_select",
+            get_batch_txn,
+        )
+
+        if not rows:
+            await self.db_pool.updates._end_background_update(
+                self.EMBEDDED_EVENT_TO_STATE_GROUP_MIGRATION_UPDATE_NAME
+            )
+            return 0
+
+        # The mdbx put below is idempotent (an overwrite), but the refcount
+        # increment is not: if this batch is reprocessed after a crash
+        # between the writes here and the progress update below, an
+        # unguarded increment would double-count every event already
+        # migrated last time. Only increment for event_ids this batch
+        # hasn't already written to mdbx.
+        already_migrated = get_state_group_for_events_batch(
+            self._embedded_hamt_namespace,
+            [event_id for event_id, _state_group in rows],
+        )
+        new_rows = [
+            (event_id, state_group)
+            for event_id, state_group in rows
+            if event_id not in already_migrated
+        ]
+        put_event_to_state_group_batch(self._embedded_hamt_namespace, rows)
+        increment_state_group_refcounts_batch(
+            self._embedded_hamt_namespace,
+            [state_group for _event_id, state_group in new_rows],
+        )
+
+        await self.db_pool.updates._background_update_progress(
+            self.EMBEDDED_EVENT_TO_STATE_GROUP_MIGRATION_UPDATE_NAME,
+            {"last_event_id": rows[-1][0]},
+        )
+
+        return len(rows)
+
+    async def _enqueue_event_auth_chain_links_embedded_migration_if_needed(
+        self,
+    ) -> None:
+        """Same reasoning as `_enqueue_event_to_state_group_embedded_migration_if_needed`,
+        for `event_auth_chain_links` -- see `embedded_event_auth_chain_links.py`.
+        """
+        await self.db_pool.simple_upsert(
+            table="background_updates",
+            keyvalues={
+                "update_name": self.EMBEDDED_EVENT_AUTH_CHAIN_LINKS_MIGRATION_UPDATE_NAME
+            },
+            values={},
+            insertion_values={"progress_json": "{}"},
+            desc="enqueue_event_auth_chain_links_embedded_migration",
+        )
+        self.db_pool.updates.start_doing_background_updates()
+
+    async def _background_migrate_event_auth_chain_links_to_embedded(
+        self, progress: JsonDict, batch_size: int
+    ) -> int:
+        """Copy existing SQL `event_auth_chain_links` rows into the embedded
+        engine, for data written before `embedded_hamt_engine` was turned
+        on. New writes never need this; they already go straight to the
+        configured engine exclusively (see `_persist_chain_cover_index` in
+        events.py).
+
+        Unlike the `event_to_state_groups` migration, this table has no
+        single monotonic key column to page on -- `(origin_chain_id,
+        origin_sequence_number, target_chain_id, target_sequence_number)`
+        together are the primary key, so progress is a 4-tuple row-value
+        cursor. There's also no already-migrated pre-check needed here: an
+        mdbx `batch_put` is a plain overwrite with no counter to
+        double-count, so reprocessing a batch after a crash is naturally
+        idempotent (see `embedded_event_auth_chain_links.py`'s
+        `put_chain_links_batch`).
+
+        Existing SQL rows are left in place rather than deleted (same
+        reasoning as the `event_to_state_groups` migration).
+        """
+        progress_cursor = (
+            progress.get("origin_chain_id", -1),
+            progress.get("origin_sequence_number", -1),
+            progress.get("target_chain_id", -1),
+            progress.get("target_sequence_number", -1),
+        )
+
+        def get_batch_txn(
+            txn: LoggingTransaction,
+        ) -> list[tuple[int, int, int, int]]:
+            txn.execute(
+                """
+                SELECT origin_chain_id, origin_sequence_number,
+                       target_chain_id, target_sequence_number
+                FROM event_auth_chain_links
+                WHERE (origin_chain_id, origin_sequence_number,
+                       target_chain_id, target_sequence_number) > (?, ?, ?, ?)
+                ORDER BY origin_chain_id, origin_sequence_number,
+                         target_chain_id, target_sequence_number
+                LIMIT ?
+                """,
+                (*progress_cursor, batch_size),
+            )
+            return cast(list[tuple[int, int, int, int]], txn.fetchall())
+
+        rows = await self.db_pool.runInteraction(
+            f"{self.EMBEDDED_EVENT_AUTH_CHAIN_LINKS_MIGRATION_UPDATE_NAME}_select",
+            get_batch_txn,
+        )
+
+        if not rows:
+            await self.db_pool.updates._end_background_update(
+                self.EMBEDDED_EVENT_AUTH_CHAIN_LINKS_MIGRATION_UPDATE_NAME
+            )
+            return 0
+
+        from synapse.storage.databases.main.embedded_event_auth_chain_links import (
+            put_chain_links_batch,
+        )
+
+        put_chain_links_batch(self._embedded_hamt_namespace, rows)
+
+        (
+            last_origin_chain_id,
+            last_origin_sequence_number,
+            last_target_chain_id,
+            last_target_sequence_number,
+        ) = rows[-1]
+        await self.db_pool.updates._background_update_progress(
+            self.EMBEDDED_EVENT_AUTH_CHAIN_LINKS_MIGRATION_UPDATE_NAME,
+            {
+                "origin_chain_id": last_origin_chain_id,
+                "origin_sequence_number": last_origin_sequence_number,
+                "target_chain_id": last_target_chain_id,
+                "target_sequence_number": last_target_sequence_number,
+            },
+        )
+
+        return len(rows)
 
     async def _background_reindex_fields_sender(
         self, progress: JsonDict, batch_size: int
@@ -1226,6 +1457,10 @@ class EventsBackgroundUpdatesStore(
         #
         # Annoyingly we need to gut wrench into the persit event store so that
         # we can reuse the function to calculate the chain cover for rooms.
+        from synapse.storage.databases.main.embedded_event_auth_chain_links import (
+            resolve_namespace,
+        )
+
         PersistEventsStore._add_chain_cover_index(
             txn,
             self.db_pool,
@@ -1233,6 +1468,7 @@ class EventsBackgroundUpdatesStore(
             event_to_room_id,
             event_to_types,
             cast(dict[str, StrCollection], event_to_auth_chain),
+            resolve_namespace(self),
         )
 
         return _CalculateChainCover(
@@ -1289,13 +1525,26 @@ class EventsBackgroundUpdatesStore(
             # target_chain_id. Hopefully any purged events are due to a room
             # being fully purged and they will be removed from the origin_*
             # searches.
-            txn.executemany(
-                """
-                DELETE FROM event_auth_chain_links WHERE
-                origin_chain_id = ? AND origin_sequence_number = ?
-                """,
-                unreferenced_chain_id_tuples,
+            from synapse.storage.databases.main.embedded_event_auth_chain_links import (
+                delete_chain_links_batch,
+                resolve_namespace,
             )
+
+            embedded_hamt_namespace = resolve_namespace(self)
+            if embedded_hamt_namespace is not None:
+                # Exclusive by configured engine, not a dual-write -- see
+                # embedded_event_auth_chain_links.py.
+                delete_chain_links_batch(
+                    embedded_hamt_namespace, unreferenced_chain_id_tuples
+                )
+            else:
+                txn.executemany(
+                    """
+                    DELETE FROM event_auth_chain_links WHERE
+                    origin_chain_id = ? AND origin_sequence_number = ?
+                    """,
+                    unreferenced_chain_id_tuples,
+                )
 
             progress = {
                 "current_event_id": event_id,
@@ -2814,8 +3063,10 @@ class EventsBackgroundUpdatesStore(
         current_verify_key = get_verify_key(self.hs.signing_key)
 
         # Re-sign any events that need it.
-        # A list of event IDs and their newly signed event dicts.
-        resigned_events: list[tuple[str, JsonDict]] = []
+        # A list of (event_id, newly signed event dict, original EventBase --
+        # kept alongside for its internal_metadata/format_version, needed to
+        # mirror the resigned JSON into the embedded engine below).
+        resigned_events: list[tuple[str, JsonDict, EventBase]] = []
         for event in next_events:
             if not event_needs_resigning(event, self.hs.hostname, current_verify_key):
                 continue
@@ -2846,14 +3097,14 @@ class EventsBackgroundUpdatesStore(
                     continue
 
             event_dict = resign_event(event, self.hs.hostname, self.hs.signing_key)
-            resigned_events.append((event.event_id, event_dict))
+            resigned_events.append((event.event_id, event_dict, event))
 
         # Atomically write the new stream pos progress with the new signatures,
         # else we may update the pos and crash before writing the new
         # signatures, thus not re-signing at all!
         def _write_events_txn(
             txn: LoggingTransaction,
-            events_to_write: list[tuple[str, JsonDict]],
+            events_to_write: list[tuple[str, JsonDict, EventBase]],
             max_stream_pos: int,
         ) -> None:
             if events_to_write:
@@ -2861,13 +3112,30 @@ class EventsBackgroundUpdatesStore(
                     txn,
                     "event_json",
                     key_names=["event_id"],
-                    key_values=[[event_id] for event_id, _ in events_to_write],
+                    key_values=[[event_id] for event_id, _, _ in events_to_write],
                     value_names=["json"],
                     value_values=[
                         [json_encoder.encode(event_dict)]
-                        for _, event_dict in events_to_write
+                        for _, event_dict, _ in events_to_write
                     ],
                 )
+                # SQL is updated in place above -- if the embedded event_json
+                # engine is enabled, it must be updated to match, the same
+                # way _censor_event_txn does for censoring/expiry. Otherwise
+                # get_event would keep serving the pre-resign (stale
+                # signature) JSON forever from the embedded engine.
+                if getattr(self, "_embedded_event_json_enabled", False):
+                    put_event_json_batch(
+                        [
+                            (
+                                event_id,
+                                json_encoder.encode(event.internal_metadata.get_dict()),
+                                json_encoder.encode(event_dict),
+                                event.format_version,
+                            )
+                            for event_id, event_dict, event in events_to_write
+                        ]
+                    )
             # Always update the progress even if we re-sign nothing.
             self.db_pool.updates._background_update_progress_txn(
                 txn,
@@ -2881,7 +3149,7 @@ class EventsBackgroundUpdatesStore(
 
             # Invalidate the event cache for re-signed events so that other
             # workers also pick up the new signatures.
-            for event_id, _ in events_to_write:
+            for event_id, _, _ in events_to_write:
                 self.invalidate_get_event_cache_after_txn(txn, event_id)
                 self._send_invalidation_to_replication(
                     txn, "_get_event_cache", (event_id,)

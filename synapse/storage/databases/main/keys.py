@@ -19,6 +19,7 @@
 #
 #
 
+import hashlib
 import itertools
 import json
 import logging
@@ -52,8 +53,9 @@ class KeyStore(CacheInvalidationWorkerStore):
         ts_added_ms: int,
         verify_keys: dict[str, FetchKeyResult],
         response_json: JsonDict,
-    ) -> None:
-        """Stores the keys for the given server that we got from `from_server`.
+    ) -> dict[str, FetchKeyResult]:
+        """Stores the keys for the given server that we got from `from_server`,
+        atomically enforcing MSC4499 First Seen Wins.
 
         Args:
             server_name: The owner of the keys
@@ -61,80 +63,188 @@ class KeyStore(CacheInvalidationWorkerStore):
             ts_added_ms: When we're adding the keys
             verify_keys: The decoded keys
             response_json: The full *signed* response JSON that contains the keys.
+
+        Returns:
+            The authoritative map of key_id -> FetchKeyResult (retaining any
+            previously-bound key bodies on collision).
         """
 
         key_json_bytes = encode_canonical_json(response_json)
 
-        def store_server_keys_response_txn(txn: LoggingTransaction) -> None:
-            self.db_pool.simple_upsert_many_txn(
-                txn,
-                table="server_signature_keys",
-                key_names=("server_name", "key_id"),
-                key_values=[(server_name, key_id) for key_id in verify_keys],
-                value_names=(
-                    "from_server",
-                    "ts_added_ms",
-                    "ts_valid_until_ms",
-                    "verify_key",
-                ),
-                value_values=[
+        def store_server_keys_response_txn(
+            txn: LoggingTransaction,
+        ) -> dict[str, FetchKeyResult]:
+            final_keys: dict[str, FetchKeyResult] = dict(verify_keys)
+            keys_to_persist: dict[str, FetchKeyResult] = dict(verify_keys)
+
+            # ----------------------------------------------------------------
+            # MSC4499 conflict resolution: insert-and-reload.
+            #
+            # Instead of a blind ON CONFLICT DO UPDATE SET (which overwrites
+            # all columns including from_server on every collision), we:
+            #
+            #   1. INSERT ... ON CONFLICT DO NOTHING  -- first committer wins
+            #   2. SELECT the actual row from the DB   -- see committed state
+            #   3. Compare stored key body vs candidate and act accordingly
+            #
+            # This addresses two bugs:
+            #
+            # Issue 1 (concurrent race): Two transactions can both read "no
+            # row" and both try to upsert. The first to commit wins via
+            # ON CONFLICT DO NOTHING; the second re-reads the committed row
+            # and applies collision logic against it, so both callers return
+            # the same authoritative key body.
+            #
+            # Issue 2 (provenance downgrade): When the key body is identical
+            # (a notary refresh), the original from_server is preserved
+            # rather than being overwritten with the notary's identity.
+            # ----------------------------------------------------------------
+
+            for key_id in list(keys_to_persist.keys()):
+                fetch_result = keys_to_persist[key_id]
+
+                # Step 1: INSERT ... ON CONFLICT DO NOTHING.
+                txn.execute(
+                    """
+                    INSERT INTO server_signature_keys
+                        (server_name, key_id, from_server, ts_added_ms,
+                         verify_key, ts_valid_until_ms)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (server_name, key_id) DO NOTHING
+                    """,
                     (
+                        server_name,
+                        key_id,
                         from_server,
                         ts_added_ms,
-                        fetch_result.valid_until_ts,
                         db_binary_type(fetch_result.verify_key.encode()),
-                    )
-                    for fetch_result in verify_keys.values()
-                ],
-            )
-
-            self.db_pool.simple_upsert_many_txn(
-                txn,
-                table="server_keys_json",
-                key_names=("server_name", "key_id", "from_server"),
-                key_values=[
-                    (server_name, key_id, from_server) for key_id in verify_keys
-                ],
-                value_names=(
-                    "ts_added_ms",
-                    "ts_valid_until_ms",
-                    "key_json",
-                ),
-                value_values=[
-                    (
-                        ts_added_ms,
                         fetch_result.valid_until_ts,
-                        db_binary_type(key_json_bytes),
-                    )
-                    for fetch_result in verify_keys.values()
-                ],
-            )
-
-            # invalidate takes a tuple corresponding to the params of
-            # _get_server_keys_json. _get_server_keys_json only takes one
-            # param, which is itself the 2-tuple (server_name, key_id).
-            #
-            # Invalidate the local cache directly, but we can only send
-            # primitive types per argument over replication, so JSON-encode the
-            # nested key and unpack it on the receiving side (see
-            # `CacheInvalidationWorkerStore.process_replication_rows`).
-            for key_id in verify_keys:
-                txn.call_after(
-                    self._get_server_keys_json.invalidate,
-                    ((server_name, key_id),),
+                    ),
                 )
-            self._send_invalidation_to_replication_bulk(
-                txn,
-                self._get_server_keys_json.__name__,
-                [(json.dumps([server_name, key_id]),) for key_id in verify_keys],
-            )
-            self._invalidate_cache_and_stream_bulk(
-                txn,
-                self.get_server_key_json_for_remote,
-                [(server_name, key_id) for key_id in verify_keys],
-            )
 
-        await self.db_pool.runInteraction(
+                # Step 2: Re-read the authoritative row.
+                txn.execute(
+                    """
+                    SELECT verify_key, ts_valid_until_ms, from_server
+                    FROM server_signature_keys
+                    WHERE server_name = ? AND key_id = ?
+                    """,
+                    (server_name, key_id),
+                )
+                row = cast(tuple[bytes | memoryview, int | None, str], txn.fetchone())
+                assert row is not None
+                stored_key_raw, stored_ts, stored_from_server = row
+                stored_key_bytes = bytes(stored_key_raw)
+
+                # Step 3: Compare stored key body against candidate.
+                if stored_key_bytes == fetch_result.verify_key.encode():
+                    # Same key body (refresh) -- preserve original from_server.
+                    stored_ts = stored_ts if stored_ts is not None else 0
+                    if stored_ts < fetch_result.valid_until_ts:
+                        txn.execute(
+                            """
+                            UPDATE server_signature_keys
+                            SET ts_valid_until_ms = ?, ts_added_ms = ?
+                            WHERE server_name = ? AND key_id = ?
+                            """,
+                            (
+                                fetch_result.valid_until_ts,
+                                ts_added_ms,
+                                server_name,
+                                key_id,
+                            ),
+                        )
+                elif stored_from_server != server_name and from_server == server_name:
+                    # Two-Tier override: direct fetch overrides provisional
+                    # notary binding (different key body).
+                    logger.warning(
+                        "MSC4499: overriding provisional notary binding for "
+                        "%s %s with direct origin fetch. "
+                        "notary_from=%s cached_sha256=%s new_sha256=%s",
+                        server_name,
+                        key_id,
+                        stored_from_server,
+                        hashlib.sha256(stored_key_bytes).hexdigest(),
+                        hashlib.sha256(fetch_result.verify_key.encode()).hexdigest(),
+                    )
+                    txn.execute(
+                        """
+                        UPDATE server_signature_keys
+                        SET from_server = ?, ts_added_ms = ?,
+                            ts_valid_until_ms = ?, verify_key = ?
+                        WHERE server_name = ? AND key_id = ?
+                        """,
+                        (
+                            from_server,
+                            ts_added_ms,
+                            fetch_result.valid_until_ts,
+                            db_binary_type(fetch_result.verify_key.encode()),
+                            server_name,
+                            key_id,
+                        ),
+                    )
+                else:
+                    # Collision: First Seen Wins -- retain original binding.
+                    logger.warning(
+                        "MSC4499: key ID collision for %s %s -- retaining "
+                        "original key body (First Seen Wins). "
+                        "cached_sha256=%s new_sha256=%s",
+                        server_name,
+                        key_id,
+                        hashlib.sha256(stored_key_bytes).hexdigest(),
+                        hashlib.sha256(fetch_result.verify_key.encode()).hexdigest(),
+                    )
+                    final_keys[key_id] = FetchKeyResult(
+                        verify_key=decode_verify_key_bytes(key_id, stored_key_bytes),
+                        valid_until_ts=stored_ts if stored_ts is not None else 0,
+                    )
+                    keys_to_persist.pop(key_id, None)
+
+            if keys_to_persist:
+                self.db_pool.simple_upsert_many_txn(
+                    txn,
+                    table="server_keys_json",
+                    key_names=("server_name", "key_id", "from_server"),
+                    key_values=[
+                        (server_name, key_id, from_server) for key_id in keys_to_persist
+                    ],
+                    value_names=(
+                        "ts_added_ms",
+                        "ts_valid_until_ms",
+                        "key_json",
+                    ),
+                    value_values=[
+                        (
+                            ts_added_ms,
+                            fetch_result.valid_until_ts,
+                            db_binary_type(key_json_bytes),
+                        )
+                        for fetch_result in keys_to_persist.values()
+                    ],
+                )
+
+                for key_id in keys_to_persist:
+                    txn.call_after(
+                        self._get_server_keys_json.invalidate,
+                        ((server_name, key_id),),
+                    )
+                self._send_invalidation_to_replication_bulk(
+                    txn,
+                    self._get_server_keys_json.__name__,
+                    [
+                        (json.dumps([server_name, key_id]),)
+                        for key_id in keys_to_persist
+                    ],
+                )
+                self._invalidate_cache_and_stream_bulk(
+                    txn,
+                    self.get_server_key_json_for_remote,
+                    [(server_name, key_id) for key_id in keys_to_persist],
+                )
+
+            return final_keys
+
+        return await self.db_pool.runInteraction(
             "store_server_keys_response", store_server_keys_response_txn
         )
 
@@ -188,9 +298,19 @@ class KeyStore(CacheInvalidationWorkerStore):
                     ts_valid_until_ms = 0
 
                 # The entire signed JSON response is stored in server_keys_json,
-                # fetch out the bits needed.
+                # fetch out the bits needed. The key may live under either
+                # `verify_keys` (current) or `old_verify_keys` (expired, per
+                # MSC4499 historical event verification) -- check both.
                 key_json = json.loads(bytes(key_json_bytes))
-                key_base64 = key_json["verify_keys"][key_id]["key"]
+                key_entry = key_json["verify_keys"].get(key_id)
+                if key_entry is None:
+                    key_entry = key_json.get("old_verify_keys", {}).get(key_id)
+                if key_entry is None:
+                    # Not present in either section of the stored response
+                    # (e.g. server_signature_keys and server_keys_json
+                    # disagree). Skip rather than raise.
+                    continue
+                key_base64 = key_entry["key"]
 
                 keys[(server_name, key_id)] = FetchKeyResult(
                     verify_key=decode_verify_key_bytes(

@@ -20,7 +20,7 @@
 #
 import logging
 from http import HTTPStatus
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from parameterized import parameterized
 
@@ -92,6 +92,82 @@ class FederationServerTests(unittest.FederatingHomeserverTestCase):
             {"edus": [{"edu_type": "FAIL_EDU_TYPE", "content": {}}]},
         )
         self.assertEqual(500, channel.code, channel.result)
+
+    def test_inbound_pdu_drain_releases_lock_between_events(self) -> None:
+        """A PDU staged while another is handled must not miss its only wake-up."""
+
+        server = self.hs.get_federation_server()
+        store = self.hs.get_datastores().main
+        room_id = "!staging-room:test"
+        origin = self.OTHER_SERVER_NAME
+        room_version = RoomVersions.V10
+        first_event = make_test_event(
+            self.add_hashes_and_signatures_from_other_server(
+                {
+                    "room_id": room_id,
+                    "sender": f"@alice:{origin}",
+                    "type": EventTypes.Message,
+                    "content": {"body": "first", "msgtype": "m.text"},
+                    "depth": 1,
+                    "origin_server_ts": 1,
+                    "auth_events": [],
+                    "prev_events": [],
+                }
+            ),
+            room_version=room_version,
+        )
+        second_event = make_test_event(
+            self.add_hashes_and_signatures_from_other_server(
+                {
+                    "room_id": room_id,
+                    "sender": f"@alice:{origin}",
+                    "type": EventTypes.Message,
+                    "content": {"body": "second", "msgtype": "m.text"},
+                    "depth": 2,
+                    "origin_server_ts": 2,
+                    "auth_events": [],
+                    "prev_events": [],
+                }
+            ),
+            room_version=room_version,
+        )
+        self.get_success(store.insert_received_event_to_staging(origin, first_event))
+        self.get_success(store.insert_received_event_to_staging(origin, second_event))
+
+        lock = self.get_success(
+            store.try_acquire_lock("federation_inbound_pdu", room_id)
+        )
+        assert lock is not None
+
+        processed: list[str] = []
+
+        async def on_receive_pdu(_origin: str, event: EventBase) -> None:
+            processed.append(event.event_id)
+            if event.event_id == second_event.event_id:
+                # The first lock must have been released before looking for the
+                # second event. Otherwise a concurrently staged event can see
+                # that live lock, decline to start a drainer, and be stranded.
+                self.assertTrue(lock._dropped)
+
+        with (
+            patch.object(
+                server._federation_event_handler,
+                "on_receive_pdu",
+                new=on_receive_pdu,
+            ),
+            patch.object(
+                server._federation_event_handler,
+                "try_on_receive_pdu_batch",
+                new=AsyncMock(return_value=False),
+            ),
+        ):
+            self.get_success(
+                server._process_incoming_pdus_in_room_inner(
+                    room_id, room_version, lock, origin, first_event
+                )
+            )
+
+        self.assertEqual(processed, [first_event.event_id, second_event.event_id])
 
 
 class GetMissingEventsRoomCheckTests(unittest.FederatingHomeserverTestCase):

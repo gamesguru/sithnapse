@@ -75,8 +75,11 @@ class EventPersisterShardTestCase(BaseMultiWorkerStreamTestCase):
             self.helper.create_room_as(user_id, tok=tok)
 
     def test_basic(self) -> None:
-        """Simple test to ensure that multiple rooms can be created and joined,
-        and that different rooms get handled by different instances.
+        """Ensure rooms assigned to each shard are persisted by that instance.
+
+        The room IDs are deliberately chosen rather than generated randomly: a
+        random sample can, however rarely, all hash to the same shard and make
+        this test flaky.
         """
 
         self.make_worker_hs(
@@ -89,40 +92,33 @@ class EventPersisterShardTestCase(BaseMultiWorkerStreamTestCase):
             {"worker_name": "worker2"},
         )
 
-        persisted_on_1 = False
-        persisted_on_2 = False
-
         store = self.hs.get_datastores().main
 
         user_id = self.register_user("user", "pass")
         access_token = self.login("user", "pass")
 
-        # Keep making new rooms until we see rooms being persisted on both
-        # workers.
-        for _ in range(10):
-            # Create a room
-            room = self.helper.create_room_as(user_id, tok=access_token)
-
-            # The other user joins
-            self.helper.join(
-                room=room, user=self.other_user_id, tok=self.other_access_token
+        rooms = (
+            ("!foo:test", "worker1"),
+            ("!baz:test", "worker2"),
+        )
+        for room_id, expected_instance in rooms:
+            self.assertEqual(
+                self.hs.config.worker.events_shard_config.get_instance(room_id),
+                expected_instance,
             )
 
-            # The other user sends some messages
-            rseponse = self.helper.send(room, body="Hi!", tok=self.other_access_token)
-            event_id = rseponse["event_id"]
+            self._create_room(room_id, user_id, access_token)
+            self.helper.join(
+                room=room_id, user=self.other_user_id, tok=self.other_access_token
+            )
 
-            # The event position includes which instance persisted the event.
+            response = self.helper.send(
+                room_id, body="Hi!", tok=self.other_access_token
+            )
+            event_id = response["event_id"]
+
             pos = self.get_success(store.get_position_for_event(event_id))
-
-            persisted_on_1 |= pos.instance_name == "worker1"
-            persisted_on_2 |= pos.instance_name == "worker2"
-
-            if persisted_on_1 and persisted_on_2:
-                break
-
-        self.assertTrue(persisted_on_1)
-        self.assertTrue(persisted_on_2)
+            self.assertEqual(pos.instance_name, expected_instance)
 
     def test_vector_clock_token(self) -> None:
         """Tests that using a stream token with a vector clock component works

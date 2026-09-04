@@ -24,7 +24,7 @@ p ?=
 .PHONY: test
 test: ##H Run tests, e.g., on tests/storage/
 	cargo +nightly test
-	uv run trial $(p)
+	uv run python scripts-dev/trial_ctrlc.py $(p)
 
 .PHONY: build
 build: ##H Build the package (requires hatch)
