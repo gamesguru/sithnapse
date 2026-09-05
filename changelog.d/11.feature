@@ -1,1 +1,1 @@
-Add preliminary support for TiKV driver and state group/heavy tables.
+Add preliminary support for an embedded storage engine for state group/heavy tables.

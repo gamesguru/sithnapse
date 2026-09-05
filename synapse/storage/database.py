@@ -618,6 +618,7 @@ class DatabasePool:
             server_name=self.server_name,
         )
 
+        self._hamt_namespace: str | None = None
         self.updates = BackgroundUpdater(hs, self)
 
         self._previous_txn_total_time = 0.0

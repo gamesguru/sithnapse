@@ -704,7 +704,37 @@ class ReplicationCommandHandler:
         # Note: We also have to check that `current_token` is at most the
         # new position, to handle the case where the stream gets "reset"
         # (e.g. for `caches` and `typing` after the writer's restart).
-        missing_updates = not (cmd.prev_token <= current_token <= cmd.new_token)
+        #
+        # Special case: if prev_token == new_token == current_token the
+        # POSITION describes a zero-width interval -- there are no rows and
+        # no caches that could be stale. Skip the catch-up fetch entirely.
+        #
+        # Otherwise the lower bound is deliberately strict (`<`, not `<=`):
+        # if `current_token == cmd.prev_token` (but `prev_token < new_token`),
+        # we have *not* seen the delta this POSITION describes -- most likely
+        # because the RDATA for it was dropped (e.g. a Redis pub/sub message
+        # missed during a brief reconnect). `on_position` below always calls
+        # `on_rdata(..., rows=[])` for the position itself, which still
+        # advances the id gen (via `process_replication_position`) but,
+        # crucially, cannot invalidate any stream-change caches that key off
+        # individual rows (e.g. `_receipts_stream_cache`), since that only
+        # happens in `process_replication_rows`'s per-row loop. Treating
+        # `current_token == cmd.prev_token` as "nothing missing" would skip
+        # the catch-up fetch below and leave those caches silently stale,
+        # even though the id gen (and hence `now_token`) has moved on.
+        #
+        # A `prev_token > new_token` POSITION is itself a reset (see above).
+        # If we're already sat at `current_token == cmd.new_token`, there is
+        # no delta left to fetch -- the reset has already been applied from
+        # our point of view -- regardless of how `prev_token` compares, so we
+        # must not fall through to the `get_updates_since` loop below (that
+        # would ask for an empty, non-advancing range and hit the "fail
+        # closed" check further down).
+        missing_updates = not (
+            cmd.prev_token == cmd.new_token == current_token
+            or cmd.prev_token < current_token <= cmd.new_token
+            or current_token == cmd.new_token
+        )
         while missing_updates:
             # Note: There may very well not be any new updates, but we check to
             # make sure. This can particularly happen for the event stream where
@@ -718,9 +748,20 @@ class ReplicationCommandHandler:
                 current_token,
                 cmd.new_token,
             )
+            previous_token = current_token
             (updates, current_token, missing_updates) = await stream.get_updates_since(
                 cmd.instance_name, current_token, cmd.new_token
             )
+
+            # A limited response must either provide rows or move the token.
+            # Retrying an empty, non-advancing response would spin forever;
+            # completing catch-up would incorrectly tell the stream handler
+            # that it has reached cmd.new_token. Fail closed instead.
+            if not updates and current_token == previous_token:
+                raise RuntimeError(
+                    f"Replication stream {stream_name!r} returned an empty, "
+                    f"non-advancing limited response at {current_token}"
+                )
 
             # TODO: add some tests for this
 

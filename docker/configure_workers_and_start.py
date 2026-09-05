@@ -1236,15 +1236,11 @@ def generate_worker_files(
                 "port": MAIN_PROCESS_REPLICATION_PORT,
             }
 
-    # Support TiKV offloading in Complement integration tests
-    tikv_endpoints = os.environ.get("SYNAPSE_TIKV_PD_ENDPOINTS")
-    if tikv_endpoints:
-        pd_endpoints = [ep.strip() for ep in tikv_endpoints.split(",") if ep.strip()]
-        if not pd_endpoints:
-            raise RuntimeError("SYNAPSE_TIKV_PD_ENDPOINTS was set but had no endpoints")
-        shared_config["tikv"] = {
-            "pd_endpoints": pd_endpoints,
-        }
+    # Support for an embedded HAMT engine (mdbx) in Complement integration
+    # tests doesn't need anything here -- SYNAPSE_EMBEDDED_HAMT_ENGINE/
+    # SYNAPSE_EMBEDDED_HAMT_PATH are read directly as environment variables
+    # in synapse/config/database.py, independent of this generated
+    # shared_config. Just set them on the container.
 
     # Shared homeserver config
     convert(

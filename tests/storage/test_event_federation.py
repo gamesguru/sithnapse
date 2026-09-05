@@ -44,6 +44,10 @@ from synapse.rest import admin
 from synapse.rest.client import login, room
 from synapse.server import HomeServer
 from synapse.storage.database import LoggingTransaction
+from synapse.storage.databases.main.embedded_event_auth_chain_links import (
+    put_chain_links_batch,
+    resolve_namespace,
+)
 from synapse.storage.types import Cursor
 from synapse.synapse_rust.events import EventInternalMetadata
 from synapse.types import JsonDict
@@ -795,19 +799,40 @@ class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
                     desc="insert",
                 )
             )
-        for link in links:
-            self.get_success(
-                self.store.db_pool.simple_insert(
-                    "event_auth_chain_links",
-                    {
-                        "origin_chain_id": link.origin_chain_and_seq[0],
-                        "origin_sequence_number": link.origin_chain_and_seq[1],
-                        "target_chain_id": link.target_chain_and_seq[0],
-                        "target_sequence_number": link.target_chain_and_seq[1],
-                    },
-                    desc="insert",
-                )
+        # Links are exclusive to whichever engine is configured (SQL or the
+        # embedded mdbx engine -- see `_persist_chain_cover_index`), so
+        # insert the fixture the same way the production write path does
+        # rather than always writing straight to the SQL table, otherwise
+        # this test would only ever check the SQL backend under the
+        # trial-mdbx CI job's `embedded_hamt_engine` config.
+        embedded_hamt_namespace = resolve_namespace(self.store)
+        if embedded_hamt_namespace is not None:
+            put_chain_links_batch(
+                embedded_hamt_namespace,
+                [
+                    (
+                        link.origin_chain_and_seq[0],
+                        link.origin_chain_and_seq[1],
+                        link.target_chain_and_seq[0],
+                        link.target_chain_and_seq[1],
+                    )
+                    for link in links
+                ],
             )
+        else:
+            for link in links:
+                self.get_success(
+                    self.store.db_pool.simple_insert(
+                        "event_auth_chain_links",
+                        {
+                            "origin_chain_id": link.origin_chain_and_seq[0],
+                            "origin_sequence_number": link.origin_chain_and_seq[1],
+                            "target_chain_id": link.target_chain_and_seq[0],
+                            "target_sequence_number": link.target_chain_and_seq[1],
+                        },
+                        desc="insert",
+                    )
+                )
 
         # Define the test cases
         class TestCase(NamedTuple):

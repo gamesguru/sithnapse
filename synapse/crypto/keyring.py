@@ -53,6 +53,7 @@ from synapse.types import JsonDict
 from synapse.util import unwrapFirstError
 from synapse.util.async_helpers import yieldable_gather_results
 from synapse.util.batching_queue import BatchingQueue
+from synapse.util.clock import Clock
 from synapse.util.retryutils import NotRetryingDestination
 
 if TYPE_CHECKING:
@@ -144,6 +145,92 @@ class VerifyJsonRequest:
 
 class KeyLookupError(ValueError):
     pass
+
+
+class KeyFetchBackoffCache:
+    """Per-remote-server negative cache and exponential backoff for failed
+    direct signing-key fetches (MSC4499's "Negative caching and backoff").
+
+    A dead or unreachable remote server would otherwise cause a fresh
+    `/_matrix/key/v2/server` request every time we need one of its keys
+    (`ServerKeyFetcher` bypasses the generic per-destination federation
+    backoff for key lookups via `ignore_backoff=True`, since key fetches are
+    often needed precisely to figure out *why* a destination is failing).
+    This cache tracks, per `server_name`, whether we're still within a
+    backoff window from a previous failure, so repeat callers fail fast
+    against the cache instead of each triggering their own outbound probe.
+
+    Concurrent callers for the same server are already coalesced onto a
+    single in-flight fetch by `BatchingQueue` (see `KeyFetcher._queue`), so a
+    failed fetch here only ever counts as one backoff increment no matter how
+    many local waiters were coalesced onto it.
+    """
+
+    def __init__(self, clock: Clock, floor_ms: int, ceiling_ms: int):
+        self._clock = clock
+        self._floor_ms = floor_ms
+        self._ceiling_ms = ceiling_ms
+        # server_name -> (retry_at_ms, current_interval_ms)
+        self._backoff: dict[str, tuple[int, int]] = {}
+        self._next_prune_ms = 0
+
+    def should_attempt(self, server_name: str) -> bool:
+        """Whether we should make an outbound fetch attempt for this server
+        right now, or fail fast against the negative cache instead."""
+        entry = self._backoff.get(server_name)
+        if entry is None:
+            return True
+        retry_at_ms, _ = entry
+        now = self._clock.time_msec()
+        if now >= retry_at_ms:
+            # Backoff window has elapsed; allow the attempt, but retain the
+            # current interval so that a subsequent record_failure() keeps
+            # doubling from where it left off rather than resetting to
+            # floor_ms. The entry is only ever cleared by record_success()
+            # (on a successful fetch) or overwritten by record_failure()
+            # (which recomputes retry_at_ms), so it doesn't linger forever.
+            return True
+        return False
+
+    def record_failure(self, server_name: str) -> None:
+        """Record a failed fetch attempt, advancing the backoff interval."""
+        entry = self._backoff.get(server_name)
+        prev_interval_ms = entry[1] if entry is not None else 0
+        interval_ms = min(self._ceiling_ms, max(self._floor_ms, prev_interval_ms * 2))
+        self._backoff[server_name] = (
+            self._clock.time_msec() + interval_ms,
+            interval_ms,
+        )
+        self._prune()
+
+    def record_success(self, server_name: str) -> None:
+        """Clear any backoff state after a successful, authenticated fetch."""
+        self._backoff.pop(server_name, None)
+
+    def _prune(self) -> None:
+        """Remove entries whose retry window has long elapsed.
+
+        Servers that have been permanently unreachable accumulate stale
+        entries.  Evict any entry whose ``retry_at_ms`` is more than
+        twice the maximum backoff interval in the past, i.e. we have
+        given up retrying long ago.
+        """
+        now = self._clock.time_msec()
+        if now < self._next_prune_ms:
+            return
+
+        # Sweeping is deliberately infrequent: this sits on the failed-fetch hot
+        # path, where rebuilding the whole cache on every failure is needlessly
+        # expensive. Entries may remain for at most one extra maximum-backoff
+        # interval, which does not affect correctness.
+        self._next_prune_ms = now + self._ceiling_ms
+        max_backoff_ms = self._ceiling_ms
+        stale_threshold_ms = now - max_backoff_ms * 2
+        self._backoff = {
+            name: entry
+            for name, entry in self._backoff.items()
+            if entry[0] >= stale_threshold_ms
+        }
 
 
 @attr.s(slots=True, frozen=True, auto_attribs=True)
@@ -701,15 +788,19 @@ class BaseV2KeyFetcher(KeyFetcher):
                     verify_key=verify_key, valid_until_ts=key_data["expired_ts"]
                 )
 
-        await self.store.store_server_keys_response(
+        # MSC4499 First Seen Wins: a key ID (algorithm:key_id) is a permanent
+        # 1:1 binding to a key body once observed. `store_server_keys_response`
+        # enforces this atomically inside the database transaction: if a colliding
+        # key ID has already been persisted (either previously or concurrently),
+        # the original binding is retained, the colliding candidate is dropped,
+        # and the authoritative keys are returned to the caller.
+        return await self.store.store_server_keys_response(
             server_name=server_name,
             from_server=from_server,
             ts_added_ms=time_added_ms,
             verify_keys=verify_keys,
             response_json=response_json,
         )
-
-        return verify_keys
 
 
 class PerspectivesKeyFetcher(BaseV2KeyFetcher):
@@ -916,6 +1007,11 @@ class ServerKeyFetcher(BaseV2KeyFetcher):
         super().__init__(hs)
         self.clock = hs.get_clock()
         self.client = hs.get_federation_http_client()
+        self._backoff = KeyFetchBackoffCache(
+            self.clock,
+            floor_ms=hs.config.key.key_fetch_backoff_floor_ms,
+            ceiling_ms=hs.config.key.key_fetch_backoff_ceiling_ms,
+        )
 
     async def get_keys(
         self, server_name: str, key_ids: list[str], minimum_valid_until_ts: int
@@ -971,8 +1067,24 @@ class ServerKeyFetcher(BaseV2KeyFetcher):
             Map from key ID to lookup result
 
         Raises:
-            KeyLookupError if there was a problem making the lookup
+            KeyLookupError if there was a problem making the lookup, including
+                if the server is currently within a MSC4499 negative-cache
+                backoff window from a previous failed fetch.
         """
+        # MSC4499 negative caching and backoff: a dead or unreachable server
+        # would otherwise get a fresh outbound probe every time one of its
+        # keys is needed. Fail fast against the cache instead. Note this is
+        # deliberately separate from the generic per-destination federation
+        # backoff (which the `ignore_backoff=True` below bypasses): key
+        # fetches are often needed precisely to figure out *why* a
+        # destination is failing, so they get their own, key-fetch-specific
+        # backoff state rather than being gated on the general one.
+        if not self._backoff.should_attempt(server_name):
+            raise KeyLookupError(
+                f"Not attempting to fetch keys for {server_name}: "
+                "still within MSC4499 negative-cache backoff window"
+            )
+
         time_now_ms = self.clock.time_msec()
         try:
             response = await self.client.get_json(
@@ -995,19 +1107,52 @@ class ServerKeyFetcher(BaseV2KeyFetcher):
         except (NotRetryingDestination, RequestSendFailed) as e:
             # these both have str() representations which we can't really improve
             # upon
+            self._backoff.record_failure(server_name)
             raise KeyLookupError(str(e))
         except HttpResponseException as e:
+            self._backoff.record_failure(server_name)
             raise KeyLookupError("Remote server returned an error: %s" % (e,))
 
-        assert isinstance(response, dict)
-        if response["server_name"] != server_name:
+        if not isinstance(response, dict):
+            # A malformed/malicious server can return any valid JSON here
+            # (a list, string, null, ...), not just an object -- `get_json`'s
+            # `JsonDict` return type is what we expect, not a runtime
+            # guarantee about what actually came off the wire, hence mypy
+            # (wrongly, for this purpose) considering this unreachable.
+            # `assert` both crashes ungracefully on that and disappears
+            # entirely under `python -O`, in which case `"server_name" not
+            # in response` below would raise a different, less useful
+            # exception (e.g. TypeError for a list). Handle it the same way
+            # as the other failure modes here: a clean KeyLookupError with
+            # the failure recorded for backoff.
+            self._backoff.record_failure(server_name)  # type: ignore[unreachable]
+            raise KeyLookupError(
+                f"Expected an object response for server {server_name!r}, "
+                f"got {type(response).__name__}"
+            )
+        if "server_name" not in response or response["server_name"] != server_name:
+            self._backoff.record_failure(server_name)
             raise KeyLookupError(
                 "Expected a response for server %r not %r"
-                % (server_name, response["server_name"])
+                % (server_name, response.get("server_name"))
             )
 
-        return await self.process_v2_response(
-            from_server=server_name,
-            response_json=response,
-            time_added_ms=time_now_ms,
-        )
+        try:
+            result = await self.process_v2_response(
+                from_server=server_name,
+                response_json=response,
+                time_added_ms=time_now_ms,
+            )
+        except KeyLookupError:
+            self._backoff.record_failure(server_name)
+            raise
+        except Exception as e:
+            self._backoff.record_failure(server_name)
+            raise KeyLookupError(
+                f"Error processing key response from {server_name}: {e}"
+            ) from e
+
+        # The fetch succeeded and the response authenticated (process_v2_response
+        # raises KeyLookupError above otherwise), so clear any backoff state.
+        self._backoff.record_success(server_name)
+        return result

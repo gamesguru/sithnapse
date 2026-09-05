@@ -3010,6 +3010,7 @@ class SyncHandler:
             user_id=user_id,
             membership_list=Membership.LIST,
             excluded_rooms=sync_result_builder.excluded_room_ids,
+            require_fresh_forgotten_rooms=True,
         )
         invite_config = await self.store.get_invite_config_for_user(user_id)
 

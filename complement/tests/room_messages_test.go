@@ -184,7 +184,7 @@ func TestMessagesOverFederation(t *testing.T) {
 }
 
 // These utilities match what we're using in the Complement repo (see
-// `matrix-org/complement` -> `tests/csapi/room_messages_test.go`)
+// `gamesguru/complement` -> `tests/csapi/room_messages_test.go`)
 
 type MessageDraft struct {
 	Sender  *client.CSAPI

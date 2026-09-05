@@ -33,6 +33,7 @@ from synapse.rest.synapse.client.new_user_consent import NewUserConsentResource
 from synapse.rest.synapse.client.pick_idp import PickIdpResource
 from synapse.rest.synapse.client.pick_username import pick_username_resource
 from synapse.rest.synapse.client.rendezvous import MSC4108RendezvousSessionResource
+from synapse.rest.synapse.client.server_stats import ServerStatsResource
 from synapse.rest.synapse.client.sso_register import SsoRegisterResource
 from synapse.rest.synapse.client.unsubscribe import UnsubscribeResource
 from synapse.rest.synapse.mas import MasResource
@@ -66,6 +67,9 @@ def build_synapse_client_resource_tree(hs: "HomeServer") -> Mapping[str, Resourc
         # `/_synapse/client`.
         MEDIA_UPLOAD_LIMIT_EXCEEDED_PATH: MediaUploadLimitExceededResource(hs),
     }
+
+    if hs.config.stats.server_stats_endpoint_enabled:
+        resources["/_synapse/client/server_stats"] = ServerStatsResource(hs)
 
     if hs.config.mas.enabled:
         resources["/_synapse/mas"] = MasResource(hs)

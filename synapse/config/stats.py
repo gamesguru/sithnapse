@@ -47,8 +47,12 @@ class StatsConfig(Config):
 
     def read_config(self, config: JsonDict, **kwargs: Any) -> None:
         self.stats_enabled = True
+        self.server_stats_endpoint_enabled = False
         stats_config = config.get("stats", None)
         if stats_config:
             self.stats_enabled = stats_config.get("enabled", self.stats_enabled)
+            self.server_stats_endpoint_enabled = stats_config.get(
+                "server_stats_endpoint_enabled", self.server_stats_endpoint_enabled
+            )
         if not self.stats_enabled:
             logger.warning(ROOM_STATS_DISABLED_WARN)

@@ -19,7 +19,6 @@
 #
 #
 
-import unittest as stdlib_unittest
 from typing import TYPE_CHECKING, Any, Mapping
 
 from synapse.api.constants import EventContentFields
@@ -40,6 +39,7 @@ from synapse.events.utils import (
 from synapse.types import JsonDict
 from synapse.util.frozenutils import freeze
 
+from tests import unittest
 from tests.test_utils.event_builders import make_test_event
 from tests.unittest import HomeserverTestCase
 
@@ -47,7 +47,7 @@ if TYPE_CHECKING:
     from synapse.server import HomeServer
 
 
-class TestMaybeUpsertEventField(stdlib_unittest.TestCase):
+class TestMaybeUpsertEventField(unittest.TestCase):
     def test_update_okay(self) -> None:
         event = make_test_event({"event_id": "$1234"})
         success = maybe_upsert_event_field(
@@ -77,7 +77,7 @@ class TestMaybeUpsertEventField(stdlib_unittest.TestCase):
         self.assertEqual(event.unsigned["replaces_state"], "value")
 
 
-class PruneEventTestCase(stdlib_unittest.TestCase):
+class PruneEventTestCase(unittest.TestCase):
     # Fields that `make_test_event` fills in by default and that `prune_event`
     # preserves as spec-required keep fields. Pruning tests only spell out the
     # fields they care about; these are merged into the expected dict so each
@@ -618,7 +618,7 @@ class PruneEventTestCase(stdlib_unittest.TestCase):
         )
 
 
-class CloneEventTestCase(stdlib_unittest.TestCase):
+class CloneEventTestCase(unittest.TestCase):
     def test_unsigned_is_copied(self) -> None:
         original = make_test_event(
             {
@@ -928,7 +928,7 @@ class SerializeEventTestCase(HomeserverTestCase):
         )
 
 
-class CopyPowerLevelsContentTestCase(stdlib_unittest.TestCase):
+class CopyPowerLevelsContentTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.test_content: PowerLevelsContent = {
             "ban": 50,
@@ -1003,7 +1003,7 @@ class CopyPowerLevelsContentTestCase(stdlib_unittest.TestCase):
             copy_and_fixup_power_levels_contents({"a": {"b": {"c": 1}}})  # type: ignore[dict-item]
 
 
-class FormatEventForClientTestCase(stdlib_unittest.TestCase):
+class FormatEventForClientTestCase(unittest.TestCase):
     """Tests for the standalone `format_event_*` transforms.
 
     These are Rust reimplementations kept purely as a backwards compatibility

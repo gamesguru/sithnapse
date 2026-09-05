@@ -99,6 +99,7 @@ use json_object::JsonObject;
 #[derive(Clone)]
 pub(crate) struct EventResolverData {
     pub(crate) event_id: String,
+    pub(crate) room_id: String,
     pub(crate) event_type: String,
     pub(crate) state_key: Option<String>,
     pub(crate) sender: String,
@@ -106,6 +107,13 @@ pub(crate) struct EventResolverData {
     pub(crate) depth: u64,
     pub(crate) prev_events: Vec<String>,
     pub(crate) auth_events: Vec<String>,
+    pub(crate) prev_state_events: Vec<String>,
+    /// Whether this event's room version is one where events carry
+    /// `prev_state_events` instead of `auth_events` (MSC4242 / room version
+    /// 2.2), i.e. `room_version.msc4242_state_dags`. Lets callers pick which
+    /// field to trust explicitly, rather than guessing from which one happens
+    /// to be non-empty.
+    pub(crate) msc4242_state_dags: bool,
     pub(crate) content: Value,
     pub(crate) rejected: bool,
     pub(crate) soft_failed: bool,
@@ -664,6 +672,7 @@ impl Event {
 
         Ok(EventResolverData {
             event_id: self.event_id.to_string(),
+            room_id: self.room_id.to_string(),
             event_type: self.r#type().to_string(),
             state_key: self.get_state_key().map(str::to_owned),
             sender: self.sender().to_string(),
@@ -671,6 +680,8 @@ impl Event {
             depth,
             prev_events: self.prev_event_ids(),
             auth_events: self.auth_event_ids()?,
+            prev_state_events: self.prev_state_events().unwrap_or_default(),
+            msc4242_state_dags: self.room_version.msc4242_state_dags,
             content,
             rejected: self.rejected_reason.is_some(),
             soft_failed: self.internal_metadata.is_soft_failed()?,

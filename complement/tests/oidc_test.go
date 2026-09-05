@@ -19,7 +19,7 @@ import (
 	"testing"
 
 	dockerClient "github.com/docker/docker/client"
-	"github.com/element-hq/synapse/tests/internal/dockerutil"
+	"github.com/gamesguru/sithnapse/tests/internal/dockerutil"
 	"github.com/matrix-org/complement"
 	"github.com/matrix-org/complement/client"
 	"github.com/matrix-org/complement/match"

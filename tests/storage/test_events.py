@@ -50,6 +50,59 @@ class EventsTestCase(HomeserverTestCase):
     ) -> None:
         self._store = self.hs.get_datastores().main
 
+    def test_get_event_via_embedded_mdbx_engine(self) -> None:
+        """`_store_event_txn` mirrors event_json into mdbx when
+        embedded_hamt_engine is configured; `_fetch_event_json_for_ids_txn`
+        reads it back on the `get_event` path. Deleting the SQL
+        `event_json` row entirely and still fetching the event correctly
+        proves the embedded-engine fast path is actually taken, not a
+        silent SQL fallback.
+
+        Note: `mdbx_engine.open_client` is backed by a process-global
+        `OnceCell` on the Rust side (one mdbx handle per process, matching
+        how Synapse itself only ever opens one), so this call is a no-op
+        if any earlier test in this process already opened a client --
+        this test then exercises whatever database is already open, not
+        necessarily `tmpdir`. That's fine here since event_ids are random
+        per test run, but don't rely on this call for real isolation.
+        """
+        import shutil
+        import tempfile
+
+        from synapse.synapse_rust import mdbx_engine
+
+        tmpdir = tempfile.mkdtemp(prefix="test-embedded-event-json-")
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        mdbx_engine.open_client(tmpdir)
+
+        persist_store = self.hs.get_datastores().persist_events
+        assert persist_store is not None
+        persist_store._embedded_event_json_enabled = True
+        self._store._embedded_event_json_enabled = True
+
+        user = self.register_user("embedded_event_json_user", "pass")
+        token = self.login("embedded_event_json_user", "pass")
+        room_id = self.helper.create_room_as(user, tok=token)
+        event_id = self.helper.send(room_id, "hello embedded mdbx", tok=token)[
+            "event_id"
+        ]
+
+        # Evict the in-process event cache so the next get_event actually
+        # hits _fetch_event_rows rather than returning a cached object.
+        self._store._get_event_cache.clear()
+
+        self.get_success(
+            self._store.db_pool.simple_delete(
+                table="event_json",
+                keyvalues={"event_id": event_id},
+                desc="test_get_event_via_embedded_mdbx_engine",
+            )
+        )
+
+        event = self.get_success(self._store.get_event(event_id))
+        self.assertEqual(event.event_id, event_id)
+        self.assertEqual(event.content.get("body"), "hello embedded mdbx")
+
     def test_get_senders_for_event_ids(self) -> None:
         """Tests the `get_senders_for_event_ids` storage function."""
 

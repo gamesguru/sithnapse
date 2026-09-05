@@ -1,0 +1,39 @@
+--
+-- This file is licensed under the Affero General Public License (AGPL) version 3.
+--
+-- Copyright (C) 2026 Element Creations Ltd
+--
+-- This program is free software: you can redistribute it and/or modify
+-- it under the terms of the GNU Affero General Public License as published by
+-- the Free Software Foundation, either version 3 of the License, or (at your
+-- option) any later version.
+--
+-- See the GNU Affero General Public License for more details:
+-- <https://www.gnu.org/licenses/agpl-3.0.html>.
+
+CREATE TABLE IF NOT EXISTS state_hamt_nodes (
+    structural_hash BYTEA PRIMARY KEY,
+    node_bytes BYTEA NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS state_hamt_roots (
+    state_group BIGINT PRIMARY KEY,
+    room_prefix BYTEA NOT NULL,
+    root_structural_hash BYTEA NOT NULL,
+    -- The retained 2048-byte LtHash lattice for this root (see
+    -- lattice_to_bytes/lattice_from_bytes in rust/src/state_hamt.rs) --
+    -- distinct from the root's collapsed state_group_id digest, which
+    -- can't be "un-collapsed" back into something apply_flat_state_updates
+    -- can incrementally update from. Both write paths (full rebuild and
+    -- incremental update) populate this going forward, so any root can
+    -- serve as the base for a later incremental update. Nullable only to
+    -- tolerate a row written before this column existed; NULL means "no
+    -- usable base for an incremental update from this root", not an error.
+    root_lattice BYTEA,
+    published BOOLEAN NOT NULL DEFAULT TRUE
+);
+
+CREATE TABLE IF NOT EXISTS state_hamt_pending_nodes (
+    structural_hash BYTEA PRIMARY KEY,
+    node_bytes BYTEA NOT NULL
+);

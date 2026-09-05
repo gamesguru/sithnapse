@@ -364,6 +364,7 @@ class StateDeletionStoreTestCase(HomeserverTestCase):
             self.state_store.store_state_group(
                 event.event_id,
                 event.room_id,
+                event.room_version,
                 prev_group=context.state_group,
                 delta_ids={},
                 current_state_ids=None,
@@ -392,6 +393,7 @@ class StateDeletionStoreTestCase(HomeserverTestCase):
             self.state_store.store_state_group(
                 event.event_id,
                 event.room_id,
+                event.room_version,
                 prev_group=new_state_group,
                 delta_ids={},
                 current_state_ids=None,

@@ -268,6 +268,45 @@ class EventCreationTestCase(unittest.HomeserverTestCase):
             )
         )
 
+    def test_rebuild_event_after_third_party_rules_preserves_outlier_context(
+        self,
+    ) -> None:
+        """If a third-party-rules module rewrites an event that is an
+        outlier, `_rebuild_event_after_third_party_rules` must still return
+        an `EventContext.for_outlier`-style context (no state group) --
+        even though `original_context` is not None here, which takes a
+        different code path than the `original_context is None` case.
+        """
+        original_event, original_context = self.get_success(
+            create_event(
+                self.hs,
+                room_id=self.room_id,
+                type=EventTypes.Message,
+                sender=self.requester.user.to_string(),
+                content={"msgtype": "m.text", "body": "original"},
+            )
+        )
+        original_event.internal_metadata.outlier = True
+
+        third_party_result = original_event.get_dict()
+        third_party_result["content"] = {
+            "msgtype": "m.text",
+            "body": "rewritten by third-party rules",
+        }
+
+        new_event, new_context = self.get_success(
+            self.handler._rebuild_event_after_third_party_rules(
+                third_party_result, original_event, original_context
+            )
+        )
+
+        self.assertTrue(new_event.internal_metadata.is_outlier())
+        # An outlier context has no state group and no state group before
+        # the event -- `calculate_context_info` would have computed both.
+        assert isinstance(new_context, EventContext)
+        self.assertIsNone(new_context.state_group)
+        self.assertIsNone(new_context.state_group_before_event)
+
 
 class ServerAclValidationTestCase(unittest.HomeserverTestCase):
     servlets = [

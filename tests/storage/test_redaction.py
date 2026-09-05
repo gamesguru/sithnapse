@@ -387,6 +387,55 @@ class RedactionTestCase(unittest.HomeserverTestCase):
 
         self.assert_dict({"content": {}}, json.loads(event_json))
 
+    def test_expire_event_updates_embedded_mirror(self) -> None:
+        """`_censor_event_txn` (shared by censoring and expiry) must update
+        the embedded mdbx mirror, not just SQL -- otherwise `get_event`
+        keeps serving the pre-expiry JSON from mdbx forever.
+
+        This must go through expiry, not an ordinary redaction: a redacted
+        event is dynamically re-pruned on every read from its `redactions`
+        row (see events_worker.py's "check for redactions" handling)
+        regardless of what's stored in event_json/mdbx, so a test built on
+        redaction+censor would pass even with a stale mirror. Expiry has no
+        such row -- the stored JSON is the only source of truth -- so it's
+        the case that actually exercises _censor_event_txn's write.
+        """
+        import shutil
+        import tempfile
+
+        from synapse.synapse_rust import mdbx_engine
+
+        tmpdir = tempfile.mkdtemp(prefix="test-expire-embedded-")
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        mdbx_engine.open_client(tmpdir)
+        self.store._embedded_event_json_enabled = True
+        persist_store = self.hs.get_datastores().persist_events
+        assert persist_store is not None
+        persist_store._embedded_event_json_enabled = True
+
+        self.inject_room_member(self.room1, self.u_alice, Membership.JOIN)
+        msg_event = self.inject_message(self.room1, self.u_alice, "t")
+
+        # Prime the mirror with the pre-expiry content.
+        self.store._get_event_cache.clear()
+        event = self.get_success(self.store.get_event(msg_event.event_id))
+        self.assertEqual(event.content.get("body"), "t")
+
+        self.get_success(self.store.expire_event(msg_event.event_id))
+
+        # Force a read via the embedded engine alone by wiping the SQL row.
+        self.store._get_event_cache.clear()
+        self.get_success(
+            self.store.db_pool.simple_delete(
+                table="event_json",
+                keyvalues={"event_id": msg_event.event_id},
+                desc="test_expire_event_updates_embedded_mirror",
+            )
+        )
+
+        event = self.get_success(self.store.get_event(msg_event.event_id))
+        self.assertEqual(event.content, {})
+
     def test_redact_redaction(self) -> None:
         """Tests that we can redact a redaction and can fetch it again."""
 

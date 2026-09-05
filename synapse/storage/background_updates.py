@@ -468,13 +468,19 @@ class BackgroundUpdater:
         # otherwise, check if there are updates to be run. This is important,
         # as we may be running on a worker which doesn't perform the bg updates
         # itself, but still wants to wait for them to happen.
-        updates = await self.db_pool.simple_select_onecol(
-            "background_updates",
-            keyvalues=None,
-            retcol="1",
-            desc="has_completed_background_updates",
+        def has_pending_background_updates_txn(txn: Cursor) -> bool:
+            # This is a hot poll path on startup. We only need to know whether
+            # one update exists: fetching every queued update made each poll
+            # grow linearly with the queue length.
+            txn.execute("SELECT 1 FROM background_updates LIMIT 1")
+            return txn.fetchone() is not None
+
+        has_pending_updates = await self.db_pool.runInteraction(
+            "has_completed_background_updates",
+            has_pending_background_updates_txn,
+            db_autocommit=True,
         )
-        if not updates:
+        if not has_pending_updates:
             self._all_done = True
             return True
 
@@ -542,40 +548,43 @@ class BackgroundUpdater:
             True if we have finished running all the background updates, otherwise False
         """
 
-        def get_background_updates_txn(txn: Cursor) -> list[tuple[str, str | None]]:
+        def get_next_background_update_txn(txn: Cursor) -> str | None:
             txn.execute(
                 """
-                SELECT update_name, depends_on FROM background_updates
-                ORDER BY ordering, update_name
+                SELECT candidate.update_name
+                FROM background_updates AS candidate
+                WHERE candidate.depends_on IS NULL
+                   OR NOT EXISTS (
+                       SELECT 1
+                       FROM background_updates AS dependency
+                       WHERE dependency.update_name = candidate.depends_on
+                   )
+                ORDER BY candidate.ordering, candidate.update_name
+                LIMIT 1
                 """
             )
-            return cast(list[tuple[str, str | None]], txn.fetchall())
+            row = txn.fetchone()
+            if row is not None:
+                return cast(str, row[0])
 
-        if not self._current_background_update:
-            all_pending_updates = await self.db_pool.runInteraction(
-                "background_updates",
-                get_background_updates_txn,
-            )
-            if not all_pending_updates:
-                # no work left to do
-                return True
-
-            # find the first update which isn't dependent on another one in the queue.
-            pending = {update_name for update_name, depends_on in all_pending_updates}
-            for update_name, depends_on in all_pending_updates:
-                if not depends_on or depends_on not in pending:
-                    break
-                logger.info(
-                    "Not starting on bg update %s until %s is done",
-                    update_name,
-                    depends_on,
-                )
-            else:
-                # if we get to the end of that for loop, there is a problem
+            # A non-empty queue with no runnable update has a dependency cycle.
+            txn.execute("SELECT 1 FROM background_updates LIMIT 1")
+            if txn.fetchone() is not None:
                 raise Exception(
                     "Unable to find a background update which doesn't depend on "
                     "another: dependency cycle?"
                 )
+
+            return None
+
+        if not self._current_background_update:
+            update_name = await self.db_pool.runInteraction(
+                "background_updates",
+                get_next_background_update_txn,
+            )
+            if update_name is None:
+                # no work left to do
+                return True
 
             self._current_background_update = update_name
 

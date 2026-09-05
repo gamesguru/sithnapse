@@ -893,20 +893,25 @@ class ThreadPool:
         *args: P.args,
         **kwargs: P.kwargs,
     ) -> "Deferred[None]":
-        def _(res: Any) -> None:
-            if isinstance(res, Failure):
-                onResult(False, res)
+        def run() -> None:
+            try:
+                result = function(*args, **kwargs)
+            except (KeyboardInterrupt, SystemExit):
+                # This test pool runs its "worker" on the main thread. Do not
+                # route process-control exceptions through a Deferred: Twisted
+                # converts them to a test failure, which makes Ctrl-C unable to
+                # stop a PostgreSQL test run.
+                raise
+            except Exception:
+                onResult(False, Failure())
             else:
-                onResult(True, res)
+                onResult(True, result)
 
-        d: "Deferred[None]" = Deferred()
-        d.addCallback(lambda x: function(*args, **kwargs))
-        d.addBoth(_)
         # mypy ignored here because:
         #   - this is part of the test infrastructure (outside of Synapse) so tracking
         #     these calls for for homeserver shutdown doesn't make sense.
-        self._reactor.callLater(0, d.callback, True)  # type: ignore[call-later-not-tracked]
-        return d
+        self._reactor.callLater(0, run)  # type: ignore[call-later-not-tracked]
+        return succeed(None)
 
 
 def get_clock() -> tuple[ThreadedMemoryReactorClock, Clock]:
@@ -1370,11 +1375,6 @@ def setup_test_homeserver(
             deferred = defer.ensureDeferred(cleanup_hs.shutdown())
         return deferred
 
-    # Register the cleanup hook for the homeserver.
-    # A full `hs.shutdown()` is necessary otherwise CI tests will fail while exhibiting
-    # strange behaviours.
-    cleanup_func(shutdown_hs_on_cleanup)
-
     # Install @cache_in_self attributes
     for key, val in extra_homeserver_attributes.items():
         setattr(hs, "_" + key, val)
@@ -1391,6 +1391,15 @@ def setup_test_homeserver(
     # throughout tests, we keep the existing behavior for now. We probably just need to
     # rename this function.
     start_test_homeserver(hs=hs, cleanup_func=cleanup_func, reactor=reactor)
+
+    # Cleanups run in reverse registration order. Register this after
+    # `start_test_homeserver`, which registers the PostgreSQL pool cleanup, so
+    # teardown is: homeserver shutdown, pool close, database drop. The pool is
+    # closed by `shutdown()` rather than by a separate cleanup registered in
+    # `start_test_homeserver`, so the ordering matters: shutting down after the
+    # pool has already been closed can leave a live PostgreSQL session behind
+    # and make DROP DATABASE fail.
+    cleanup_func(shutdown_hs_on_cleanup)
 
     return hs
 
@@ -1426,22 +1435,6 @@ def start_test_homeserver(
     # Since we've changed the databases to run DB transactions on the same
     # thread, we need to stop the event fetcher hogging that one thread.
     hs.get_datastores().main.USE_DEDICATED_DB_THREADS_FOR_EVENT_FETCHING = False
-
-    if USE_POSTGRES_FOR_TESTS:
-        # Capture the `database_pool` as a `weakref` here to ensure there is no scenario where uncalled
-        # cleanup functions result in holding the `hs` in memory.
-        database_pool = weakref.ref(hs.get_datastores().databases[0])
-
-        # We need to do cleanup on PostgreSQL
-        def cleanup() -> None:
-            # Close all the db pools
-            db_pool = database_pool()
-            if db_pool is not None:
-                db_pool._db_pool.close()
-
-        if not LEAVE_DB:
-            # Register the cleanup hook
-            cleanup_func(cleanup)
 
     # bcrypt is far too slow to be doing in unit tests
     # Need to let the HS build an auth handler and then mess with it

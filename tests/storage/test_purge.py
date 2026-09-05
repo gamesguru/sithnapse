@@ -234,6 +234,7 @@ class PurgeTests(HomeserverTestCase):
             self.state_store.store_state_group(
                 event_id=last["event_id"],
                 room_id=self.room_id,
+                room_version=RoomVersions.V1,
                 prev_group=prev_group,
                 delta_ids={("org.matrix.test", ""): state2["event_id"]},
                 current_state_ids=None,
@@ -334,6 +335,7 @@ class PurgeTests(HomeserverTestCase):
             self.state_store.store_state_group(
                 event_id=last["event_id"],
                 room_id=self.room_id,
+                room_version=RoomVersions.V1,
                 prev_group=None,
                 delta_ids={("org.matrix.test", ""): state1["event_id"]},
                 current_state_ids={("org.matrix.test", ""): ""},
@@ -349,6 +351,7 @@ class PurgeTests(HomeserverTestCase):
             self.state_store.store_state_group(
                 event_id=last["event_id"],
                 room_id=self.room_id,
+                room_version=RoomVersions.V1,
                 prev_group=prev_group,
                 delta_ids={("org.matrix.test", ""): state1["event_id"]},
                 current_state_ids=None,
@@ -358,6 +361,7 @@ class PurgeTests(HomeserverTestCase):
             self.state_store.store_state_group(
                 event_id=last["event_id"],
                 room_id=self.room_id,
+                room_version=RoomVersions.V1,
                 prev_group=unreferenced_end_state_group,
                 delta_ids={("org.matrix.test", ""): state1["event_id"]},
                 current_state_ids=None,
@@ -371,6 +375,7 @@ class PurgeTests(HomeserverTestCase):
             self.state_store.store_state_group(
                 event_id=last["event_id"],
                 room_id=self.room_id,
+                room_version=RoomVersions.V1,
                 prev_group=None,
                 delta_ids={("org.matrix.test", ""): ""},
                 current_state_ids={("org.matrix.test", ""): ""},
@@ -380,6 +385,7 @@ class PurgeTests(HomeserverTestCase):
             self.state_store.store_state_group(
                 event_id=last["event_id"],
                 room_id=self.room_id,
+                room_version=RoomVersions.V1,
                 prev_group=chain_state_group,
                 delta_ids={("org.matrix.test", ""): ""},
                 current_state_ids=None,
@@ -389,11 +395,19 @@ class PurgeTests(HomeserverTestCase):
             self.state_store.store_state_group(
                 event_id=last["event_id"],
                 room_id=self.room_id,
+                room_version=RoomVersions.V1,
                 prev_group=chain_state_group_2,
                 delta_ids={("org.matrix.test", ""): ""},
                 current_state_ids=None,
             )
         )
+        # get_referenced_state_groups() always queries the plain SQL
+        # event_to_state_groups table here, regardless of embedded_hamt_engine:
+        # it only reads the embedded mdbx refcount store when
+        # _embedded_event_json_enabled is true, which is a separate, currently
+        # hard-disabled feature (see embedded_event_json.py). A real SQL
+        # insert is required to make this state group look referenced, even
+        # when the state HAMT itself is on the embedded engine.
         self.get_success(
             self.store.db_pool.simple_insert(
                 "event_to_state_groups",
@@ -456,17 +470,24 @@ class PurgeTests(HomeserverTestCase):
         )
         self.assertIsNone(row)
 
-        # We expect there to now only be one state group for the room, which is
-        # the state group of the last event (as the only outlier).
-        state_groups = self.get_success(
-            self.state_store.db_pool.simple_select_onecol(
-                table="state_groups",
-                keyvalues={"room_id": self.room_id},
-                retcol="id",
-                desc="test_purge_unreferenced_state_group",
+        # A direct event reference to the tail protects the entire chain: none
+        # of its ancestors may be deleted merely because they are not directly
+        # referenced themselves.
+        for state_group in (
+            chain_state_group,
+            chain_state_group_2,
+            referenced_chain_state_group,
+        ):
+            row = self.get_success(
+                self.state_store.db_pool.simple_select_one_onecol(
+                    table="state_groups",
+                    keyvalues={"id": state_group},
+                    retcol="id",
+                    allow_none=True,
+                    desc="test_purge_referenced_state_group_chain",
+                )
             )
-        )
-        self.assertEqual(len(state_groups), 210)
+            self.assertEqual(row, state_group)
 
 
 class PurgeLocalEventsTests(HomeserverTestCase):

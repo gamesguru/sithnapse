@@ -25,6 +25,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import secrets
 import time
 from typing import (
@@ -668,7 +669,31 @@ class HomeserverTestCase(TestCase):
 
         async def run_bg_updates() -> None:
             with LoggingContext(name="run_bg_updates", server_name=server_name):
+                profile_background_updates = (
+                    os.environ.get("SYNAPSE_TEST_PROFILE_BACKGROUND_UPDATES") == "1"
+                )
+                pending_updates: list[str] = []
+                if profile_background_updates:
+                    pending_updates = await stor.db_pool.simple_select_onecol(
+                        "background_updates",
+                        keyvalues=None,
+                        retcol="update_name",
+                        desc="test_profile_pending_background_updates",
+                    )
+                    start = time.perf_counter()
+
                 self.get_success(stor.db_pool.updates.run_background_updates(False))
+
+                if profile_background_updates:
+                    elapsed_ms = (time.perf_counter() - start) * 1000
+                    logger.warning(
+                        "SYNAPSE_TEST_PROFILE_BACKGROUND_UPDATES "
+                        "test=%s database=%s pending=%d elapsed_ms=%.1f",
+                        self.id(),
+                        stor.db_pool.name(),
+                        len(pending_updates),
+                        elapsed_ms,
+                    )
 
         hs = setup_test_homeserver(
             cleanup_func=self.addCleanup,

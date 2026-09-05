@@ -2,6 +2,21 @@
 # configure_workers_and_start.py uses and amends to this file depending on the workers
 # that have been selected.
 
+# Named upstream for the main-process fallback location below, so it gets the same
+# max_fails=0 treatment as the generated per-worker-type upstreams (see
+# NGINX_UPSTREAM_CONFIG_BLOCK in configure_workers_and_start.py). Without this, a bare
+# `proxy_pass http://localhost:8080;` has no max_fails/fail_timeout override, so nginx's
+# default failure accounting can mark it unavailable across a backend restart (e.g.
+# Complement's StopServer/StartServer) and keep returning "no live upstreams" even after
+# Synapse is back up and serving.
+upstream synapse_main {
+{% if using_unix_sockets %}
+    server unix:/run/main_public.sock max_fails=0;
+{% else %}
+    server localhost:8080 max_fails=0;
+{% endif %}
+}
+
 {{ upstream_directives }}
 
 server {
@@ -35,14 +50,10 @@ server {
 
     # Send all other traffic to the main process
     location ~* ^(\\/_matrix|\\/_synapse) {
-{% if using_unix_sockets %}
-        proxy_pass http://unix:/run/main_public.sock;
-{% else %}
-        # note: do not add a path (even a single /) after the port in `proxy_pass`,
-        # otherwise nginx will canonicalise the URI and cause signature verification
-        # errors.
-        proxy_pass http://localhost:8080;
-{% endif %}
+        # note: do not add a path (even a single /) after the upstream name in
+        # `proxy_pass`, otherwise nginx will canonicalise the URI and cause signature
+        # verification errors.
+        proxy_pass http://synapse_main;
         proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header Host $host:$server_port;

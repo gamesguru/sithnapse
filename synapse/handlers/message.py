@@ -53,7 +53,7 @@ from synapse.api.errors import (
 from synapse.api.room_versions import KNOWN_ROOM_VERSIONS
 from synapse.api.urls import ConsentURIBuilder
 from synapse.event_auth import validate_event_for_room_version
-from synapse.events import EventBase, relation_from_event
+from synapse.events import EventBase, event_exists_in_state_dag, relation_from_event
 from synapse.events.builder import EventBuilder
 from synapse.events.py_protocol import supports_msc4242_state_dag
 from synapse.events.snapshot import (
@@ -1426,6 +1426,62 @@ class EventCreationHandler:
             else:
                 context = await self.state.calculate_context_info(event)
 
+        return await self._post_build_validate_client_event(event, context, requester)
+
+    async def create_new_client_event_for_batch(
+        self,
+        builder: EventBuilder,
+        requester: Requester,
+        prev_event_ids: list[str],
+        state_map: StateMap[str],
+        current_state_group: int,
+        auth_event_ids: list[str] | None = None,
+        state_event_ids: list[str] | None = None,
+        depth: int | None = None,
+        prev_state_events: StrCollection | None = None,
+    ) -> tuple[EventBase, UnpersistedEventContext]:
+        """Create a new event and unpersisted context for batch persistence."""
+
+        if builder.room_version.msc4242_state_dags and prev_state_events is None:
+            if builder.room_id is not None:
+                prev_state_events = list(
+                    await self.store.get_state_dag_extremities(builder.room_id)
+                )
+            else:
+                prev_state_events = []
+
+        auth_ids = self._event_auth_handler.compute_auth_events(builder, state_map)
+        event = await builder.build(
+            prev_event_ids=prev_event_ids,
+            auth_event_ids=auth_ids,
+            depth=depth,
+            prev_state_events=prev_state_events,
+        )
+
+        context = await self.state.calculate_context_info(
+            event,
+            state_ids_before_event=state_map,
+            partial_state=False,
+            state_group_before_event=current_state_group,
+        )
+
+        event, ctx = await self._post_build_validate_client_event(
+            event, context, requester
+        )
+        assert isinstance(ctx, UnpersistedEventContext), (
+            f"Expected UnpersistedEventContext for batch path, got {type(ctx).__name__}. "
+            "Third-party rules may have rewritten an outlier event; "
+            "outlier events cannot be batch-persisted."
+        )
+        return event, ctx
+
+    async def _post_build_validate_client_event(
+        self,
+        event: EventBase,
+        context: UnpersistedEventContextBase,
+        requester: Requester | None,
+    ) -> tuple[EventBase, UnpersistedEventContextBase]:
+        """Perform shared post-build validation, appservice assignment, and third-party checks."""
         if requester and requester.app_service_id:
             context.app_service = self.store.get_app_service_by_id(
                 requester.app_service_id
@@ -1443,10 +1499,8 @@ class EventCreationHandler:
                 403, "This event is not allowed in this context", Codes.FORBIDDEN
             )
         elif new_content is not None:
-            # the third-party rules want to replace the event. We'll need to build a new
-            # event.
             event, context = await self._rebuild_event_after_third_party_rules(
-                new_content, event
+                new_content, event, context
             )
 
         self.validator.validate_new(event, self.config)
@@ -1712,20 +1766,32 @@ class EventCreationHandler:
             current_state_group
         )
 
-        events_and_contexts_to_send = []
+        events_and_contexts_to_send: list[
+            tuple[EventBase, UnpersistedEventContext]
+        ] = []
         state_map = dict(state_map)
         depth = None
+        prev_state_events: list[str] | None = None
+        room_version = await self.store.get_room_version(room_id)
+        if room_version.msc4242_state_dags:
+            prev_state_events = list(
+                await self.store.get_state_dag_extremities(room_id)
+            )
 
         for event_dict in event_dicts:
-            event, context = await self.create_event(
+            builder = self.event_builder_factory.for_room_version(
+                room_version, event_dict
+            )
+            event, context = await self.create_new_client_event_for_batch(
+                builder=builder,
                 requester=requester,
-                event_dict=event_dict,
                 prev_event_ids=[prev_event_id],
                 depth=depth,
                 # Take a copy to ensure each event gets a unique copy of
                 # state_map since it is modified below.
                 state_map=dict(state_map),
-                for_batch=True,
+                current_state_group=current_state_group,
+                prev_state_events=prev_state_events,
             )
             events_and_contexts_to_send.append((event, context))
 
@@ -1735,6 +1801,8 @@ class EventCreationHandler:
                 # If this is a state event, we need to update the state map
                 # so that it can be used for the next event.
                 state_map[(event.type, event.state_key)] = event.event_id
+                if room_version.msc4242_state_dags and event_exists_in_state_dag(event):
+                    prev_state_events = [event.event_id]
 
         datastore = self.hs.get_datastores().state
         events_and_context = (
@@ -2392,19 +2460,29 @@ class EventCreationHandler:
             del self._rooms_to_exclude_from_dummy_event_insertion[room_id]
 
     async def _rebuild_event_after_third_party_rules(
-        self, third_party_result: dict, original_event: EventBase
+        self,
+        third_party_result: dict,
+        original_event: EventBase,
+        original_context: UnpersistedEventContextBase | None = None,
     ) -> tuple[EventBase, UnpersistedEventContextBase]:
         # the third_party_event_rules want to replace the event.
         # we do some basic checks, and then return the replacement event.
 
         # Construct a new EventBuilder and validate it, which helps with the
         # rest of these checks.
+        create_event_as_room_id = (
+            original_event.room_version.msc4291_room_ids_as_hashes
+            and original_event.type == EventTypes.Create
+            and hasattr(original_event, "state_key")
+            and original_event.state_key == ""
+        )
         try:
             builder = self.event_builder_factory.for_room_version(
                 original_event.room_version, third_party_result
             )
             self.validator.validate_builder(builder)
-            assert builder.room_id is not None
+            if not create_event_as_room_id:
+                assert builder.room_id is not None
         except SynapseError as e:
             raise Exception(
                 "Third party rules module created an invalid event: " + e.msg,
@@ -2439,12 +2517,54 @@ class EventCreationHandler:
         for k, v in original_event.internal_metadata.get_dict().items():
             setattr(builder.internal_metadata, k, v)
 
+        if original_context is not None:
+            prev_event_ids = list(original_event.prev_event_ids())
+            prev_state_events = None
+            if original_event.room_version.msc4242_state_dags:
+                prev_state_events = original_event.get("prev_state_events")
+            state_map = await original_context.get_prev_state_ids()
+            auth_ids = self._event_auth_handler.compute_auth_events(builder, state_map)
+            event = await builder.build(
+                prev_event_ids=prev_event_ids,
+                auth_event_ids=auth_ids,
+                depth=original_event.depth,
+                prev_state_events=prev_state_events,
+            )
+
+            if original_event.internal_metadata.is_outlier():
+                event.internal_metadata.outlier = True
+                return event, EventContext.for_outlier(self._storage_controllers)
+
+            state_group_before = getattr(
+                original_context, "state_group_before_event", None
+            )
+            # `calculate_context_info` requires `partial_state` to be `None`
+            # whenever `state_ids_before_event` is empty/falsy (e.g. the
+            # very first event in a room, where the state before it is
+            # `{}`), and non-`None` otherwise.
+            partial_state = (
+                getattr(original_context, "partial_state", False) if state_map else None
+            )
+            context = await self.state.calculate_context_info(
+                event,
+                state_ids_before_event=state_map,
+                partial_state=partial_state,
+                state_group_before_event=state_group_before,
+            )
+            return event, context
+
         # modules can send new state events, so we re-calculate the auth events just in
         # case.
-        prev_event_ids = await self.store.get_prev_events_for_room(builder.room_id)
+        if builder.room_id is not None:
+            prev_event_ids = await self.store.get_prev_events_for_room(builder.room_id)
+        else:
+            prev_event_ids = []
 
         prev_state_events = None
-        if original_event.room_version.msc4242_state_dags:
+        if (
+            original_event.room_version.msc4242_state_dags
+            and builder.room_id is not None
+        ):
             prev_state_events = list(
                 await self.store.get_state_dag_extremities(builder.room_id)
             )
@@ -2454,6 +2574,10 @@ class EventCreationHandler:
             auth_event_ids=None,
             prev_state_events=prev_state_events,
         )
+
+        if original_event.internal_metadata.is_outlier():
+            event.internal_metadata.outlier = True
+            return event, EventContext.for_outlier(self._storage_controllers)
 
         # we rebuild the event context, to be on the safe side. If nothing else,
         # delta_ids might need an update.

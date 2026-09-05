@@ -30,6 +30,7 @@ from typing import (
 )
 
 from synapse.api.constants import EventTypes, Membership
+from synapse.api.room_versions import RoomVersion
 from synapse.events import EventBase
 from synapse.logging.opentracing import tag_args, trace
 from synapse.storage.databases.main.state_deltas import StateDelta
@@ -84,25 +85,6 @@ class StateStorageController:
         Must be called after `DataStore.clear_partial_state_room`
         """
         self._partial_state_room_tracker.notify_un_partial_stated(room_id)
-
-    @trace
-    @tag_args
-    async def get_state_group_delta(
-        self, state_group: int
-    ) -> tuple[int | None, StateMap[str] | None]:
-        """Given a state group try to return a previous group and a delta between
-        the old and the new.
-
-        Args:
-            state_group: The state group used to retrieve state deltas.
-
-        Returns:
-            A tuple of the previous group and a state map of the event IDs which
-            make up the delta between the old and new state groups.
-        """
-
-        state_group_delta = await self.stores.state.get_state_group_delta(state_group)
-        return state_group_delta.prev_group, state_group_delta.delta_ids
 
     @trace
     @tag_args
@@ -544,6 +526,7 @@ class StateStorageController:
         self,
         event_id: str,
         room_id: str,
+        room_version: RoomVersion,
         prev_group: int | None,
         delta_ids: StateMap[str] | None,
         current_state_ids: StateMap[str] | None,
@@ -553,6 +536,13 @@ class StateStorageController:
         Args:
             event_id: The event ID for which the state was calculated.
             room_id: ID of the room for which the state was calculated.
+            room_version: The version of the room `room_id` is in. Passed
+                explicitly (rather than looked up by `room_id`) because the
+                caller already has it from the event being persisted, and a
+                lookup can race the `rooms` row for a brand new room not yet
+                being visible -- especially across a worker split, where
+                "not yet visible" means "not yet replicated", not just "not
+                yet committed".
             prev_group: A previous state group for the room, optional.
             delta_ids: The delta between state at `prev_group` and
                 `current_state_ids`, if `prev_group` was given. Same format as
@@ -564,7 +554,7 @@ class StateStorageController:
             The state group ID
         """
         return await self.stores.state.store_state_group(
-            event_id, room_id, prev_group, delta_ids, current_state_ids
+            event_id, room_id, room_version, prev_group, delta_ids, current_state_ids
         )
 
     @trace

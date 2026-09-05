@@ -42,7 +42,6 @@ from synapse.events.py_protocol import supports_msc4242_state_dag
 from synapse.events.snapshot import (
     EventContext,
     UnpersistedEventContext,
-    UnpersistedEventContextBase,
 )
 from synapse.logging.context import ContextResourceUsage
 from synapse.logging.opentracing import tag_args, trace
@@ -263,7 +262,7 @@ class StateHandler:
         state_ids_before_event: StateMap[str] | None = None,
         partial_state: bool | None = None,
         state_group_before_event: int | None = None,
-    ) -> UnpersistedEventContextBase:
+    ) -> UnpersistedEventContext:
         """
         Calulates the contents of an unpersisted event context, other than the current
         state group (which is either provided or calculated when the event context is persisted)
@@ -380,6 +379,7 @@ class StateHandler:
                     await self._state_storage_controller.store_state_group(
                         event.event_id,
                         event.room_id,
+                        event.room_version,
                         prev_group=state_group_before_event_prev_group,
                         delta_ids=deltas_to_state_group_before_event,
                         current_state_ids=state_ids_before_event,
@@ -515,19 +515,7 @@ class StateHandler:
         state_group_ids_set = set(state_group_ids)
         if len(state_group_ids_set) == 1:
             (state_group_id,) = state_group_ids_set
-            (
-                prev_group,
-                delta_ids,
-            ) = await self._state_storage_controller.get_state_group_delta(
-                state_group_id
-            )
-
-            return _StateCacheEntry(
-                state=None,
-                state_group=state_group_id,
-                prev_group=prev_group,
-                delta_ids=delta_ids,
-            )
+            return _StateCacheEntry(state=None, state_group=state_group_id)
         elif len(state_group_ids_set) == 0:
             return _StateCacheEntry(state={}, state_group=None)
 

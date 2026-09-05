@@ -92,10 +92,13 @@ trial_no_extra_tests = [
     }
 ]
 
-trial_tikv_tests = [
+# Run trial once against the embedded mdbx HAMT engine, the same way
+# trial_tikv_tests used to exercise the alternate node backend before TiKV
+# was removed -- see synapse/config/database.py's embedded_hamt_engine.
+trial_mdbx_tests = [
     {
         "python-version": "3.10",
-        "database": "tikv",
+        "database": "mdbx",
         "extras": "all",
     }
 ]
@@ -106,14 +109,14 @@ print(
         trial_sqlite_tests
         + trial_postgres_tests
         + trial_no_extra_tests
-        + trial_tikv_tests,
+        + trial_mdbx_tests,
         indent=4,
     )
 )
 print("::endgroup::")
 
 test_matrix = json.dumps(
-    trial_sqlite_tests + trial_postgres_tests + trial_no_extra_tests + trial_tikv_tests
+    trial_sqlite_tests + trial_postgres_tests + trial_no_extra_tests + trial_mdbx_tests
 )
 set_output("trial_test_matrix", test_matrix)
 
@@ -146,7 +149,7 @@ sytest_tests = [
         "sytest-tag": "bookworm",
         "postgres": "multi-postgres",
         "workers": "workers",
-        "tikv": "tikv",
+        "embedded_hamt": "mdbx",
     },
 ]
 

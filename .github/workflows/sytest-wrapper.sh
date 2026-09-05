@@ -100,10 +100,15 @@ with open('/sytest/scripts/synapse_sytest.sh', 'w') as f:
     f.write(content)
 PY
 
-echo "--- Patching /sytest/lib/SyTest/Homeserver/Synapse.pm to inject TiKV config"
-# When SYNAPSE_TIKV_PD_ENDPOINTS is set, add a `tikv` block to the homeserver
-# config that sytest generates, so the HAMT state backend runs against a real
-# TiKV cluster (mirrors trial-tikv / complement-tikv).
+echo "--- Patching /sytest/lib/SyTest/Homeserver/Synapse.pm to inject config"
+# When SYNAPSE_EMBEDDED_HAMT_ENGINE/SYNAPSE_EMBEDDED_HAMT_PATH are set, add an
+# `embedded_hamt` block to the homeserver config that sytest generates, so
+# the HAMT state backend runs against a real mdbx database (mirrors
+# trial-mdbx / complement-mdbx). Synapse also reads these as plain
+# environment variables directly (see synapse/config/database.py), but
+# sytest-spawned processes aren't guaranteed to inherit the host
+# environment, so this config injection is the same belt-and-braces
+# approach the old TiKV wiring used here.
 /venv/bin/python <<'PY'
 with open('/sytest/lib/SyTest/Homeserver/Synapse.pm', 'r') as f:
     content = f.read()
@@ -121,8 +126,11 @@ injection = '''        databases => \\%db_configs,
         # if a test specifically wants to exercise backoff behaviour.
         key_fetch_backoff_floor => ( length( $ENV{SYNAPSE_KEY_FETCH_BACKOFF_FLOOR} // '' ) ? $ENV{SYNAPSE_KEY_FETCH_BACKOFF_FLOOR} : "0s" ),
         ( do {
-            my @ep = grep { length } map { s/^\\s+|\\s+$//gr } split /,/, ( $ENV{SYNAPSE_TIKV_PD_ENDPOINTS} // '' );
-            @ep ? ( tikv => { pd_endpoints => \\@ep } ) : ();
+            my $engine = $ENV{SYNAPSE_EMBEDDED_HAMT_ENGINE} // '';
+            my $path = $ENV{SYNAPSE_EMBEDDED_HAMT_PATH} // '';
+            ( length($engine) && length($path) )
+                ? ( embedded_hamt => { engine => $engine, path => $path } )
+                : ();
         } ),'''
 
 assert anchor in content, 'Could not find databases anchor in Synapse.pm'

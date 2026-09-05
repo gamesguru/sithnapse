@@ -22,12 +22,14 @@ from unittest import mock
 
 from twisted.internet.testing import MemoryReactor
 
+from synapse.api.constants import EventTypes
 from synapse.api.errors import AuthError, StoreError
 from synapse.api.room_versions import RoomVersion
 from synapse.event_auth import (
     check_state_dependent_auth_rules,
     check_state_independent_auth_rules,
 )
+from synapse.events import EventBase
 from synapse.events.snapshot import EventContext
 from synapse.federation.transport.client import StateRequestResponse
 from synapse.logging.context import LoggingContext
@@ -63,6 +65,169 @@ class FederationEventHandlerTests(unittest.FederatingHomeserverTestCase):
         return super().setup_test_homeserver(
             federation_transport_client=self.mock_federation_transport_client
         )
+
+    def test_inbound_pdu_batch_falls_back_for_rejected_event(self) -> None:
+        """A rejected PDU must never be persisted with a synthetic batch context."""
+        room_id = "!room:test"
+        first_event = mock.Mock()
+        first_event.room_id = room_id
+        first_event.event_id = "$first"
+        first_event.is_state.return_value = False
+        first_event.prev_event_ids.return_value = ("$previous",)
+        first_event.internal_metadata.outlier = False
+
+        second_event = mock.Mock()
+        second_event.room_id = room_id
+        second_event.event_id = "$second"
+        second_event.is_state.return_value = False
+        second_event.prev_event_ids.return_value = ("$first",)
+        second_event.internal_metadata.outlier = False
+
+        first_context = mock.Mock(rejected=False, state_group=1, partial_state=False)
+        second_context = mock.Mock(rejected=False)
+
+        async def check_event_auth(
+            origin: str, event: EventBase, context: EventContext
+        ) -> None:
+            if event is second_event:
+                context.rejected = "auth_error"
+
+        handler = self.hs.get_federation_event_handler()
+        store = self.hs.get_datastores().main
+        persist_events_and_notify = mock.AsyncMock()
+
+        with (
+            mock.patch.object(
+                handler._event_auth_handler,
+                "is_host_in_room",
+                new=mock.AsyncMock(return_value=True),
+            ),
+            mock.patch.object(
+                store, "get_event", new=mock.AsyncMock(return_value=None)
+            ),
+            mock.patch.object(
+                store,
+                "have_events_in_timeline",
+                new=mock.AsyncMock(return_value={"$previous"}),
+            ),
+            mock.patch.object(
+                store, "get_min_depth", new=mock.AsyncMock(return_value=None)
+            ),
+            mock.patch.object(handler, "_sanity_check_event"),
+            mock.patch.object(
+                handler._state_handler,
+                "compute_event_context",
+                new=mock.AsyncMock(return_value=first_context),
+            ),
+            mock.patch.object(EventContext, "with_state", return_value=second_context),
+            mock.patch.object(
+                handler,
+                "_check_event_auth",
+                new=mock.AsyncMock(side_effect=check_event_auth),
+            ),
+            mock.patch.object(handler, "_check_for_soft_fail", new=mock.AsyncMock()),
+            mock.patch.object(
+                handler, "persist_events_and_notify", new=persist_events_and_notify
+            ),
+        ):
+            result = self.get_success(
+                handler.try_on_receive_pdu_batch(
+                    [("remote", first_event), ("remote", second_event)]
+                )
+            )
+
+        self.assertFalse(result)
+        persist_events_and_notify.assert_not_awaited()
+
+    def test_inbound_pdu_batch_handles_encrypted_events_after_persist(self) -> None:
+        room_id = "!room:test"
+        first_event = mock.Mock(
+            room_id=room_id,
+            event_id="$first",
+            type=EventTypes.Encrypted,
+        )
+        first_event.is_state.return_value = False
+        first_event.prev_event_ids.return_value = ("$previous",)
+        first_event.internal_metadata.outlier = False
+
+        second_event = mock.Mock(room_id=room_id, event_id="$second", type="m.test")
+        second_event.is_state.return_value = False
+        second_event.prev_event_ids.return_value = ("$first",)
+        second_event.internal_metadata.outlier = False
+
+        first_context = mock.Mock(rejected=False, state_group=1, partial_state=False)
+        second_context = mock.Mock(rejected=False)
+
+        handler = self.hs.get_federation_event_handler()
+        store = self.hs.get_datastores().main
+        persisted = False
+        encrypted_handlers_saw_persisted: list[bool] = []
+
+        async def persist_events(*args: object, **kwargs: object) -> None:
+            nonlocal persisted
+            persisted = True
+
+        persist_events_and_notify = mock.AsyncMock(side_effect=persist_events)
+
+        # Device-cache validation is post-persistence. A failure must not make
+        # the already-persisted batch fall back to the single-event path.
+        async def handle_encrypted(event: object) -> None:
+            encrypted_handlers_saw_persisted.append(persisted)
+            if event is first_event:
+                raise Exception()
+
+        handle_encrypted_event = mock.AsyncMock(side_effect=handle_encrypted)
+
+        with (
+            mock.patch.object(
+                handler._event_auth_handler,
+                "is_host_in_room",
+                new=mock.AsyncMock(return_value=True),
+            ),
+            mock.patch.object(
+                store, "get_event", new=mock.AsyncMock(return_value=None)
+            ),
+            mock.patch.object(
+                store,
+                "have_events_in_timeline",
+                new=mock.AsyncMock(return_value={"$previous"}),
+            ),
+            mock.patch.object(
+                store, "get_min_depth", new=mock.AsyncMock(return_value=None)
+            ),
+            mock.patch.object(handler, "_sanity_check_event"),
+            mock.patch.object(
+                handler._state_handler,
+                "compute_event_context",
+                new=mock.AsyncMock(return_value=first_context),
+            ),
+            mock.patch.object(EventContext, "with_state", return_value=second_context),
+            mock.patch.object(handler, "_check_event_auth", new=mock.AsyncMock()),
+            mock.patch.object(handler, "_check_for_soft_fail", new=mock.AsyncMock()),
+            mock.patch.object(
+                handler._bulk_push_rule_evaluator,
+                "action_for_events_by_user",
+                new=mock.AsyncMock(),
+            ),
+            mock.patch.object(
+                handler, "persist_events_and_notify", new=persist_events_and_notify
+            ),
+            mock.patch.object(
+                handler, "_handle_encrypted_event", new=handle_encrypted_event
+            ),
+        ):
+            result = self.get_success(
+                handler.try_on_receive_pdu_batch(
+                    [("remote", first_event), ("remote", second_event)]
+                )
+            )
+
+        self.assertTrue(result)
+        persist_events_and_notify.assert_awaited_once()
+        handle_encrypted_event.assert_has_awaits(
+            [mock.call(first_event), mock.call(second_event)]
+        )
+        self.assertEqual(encrypted_handlers_saw_persisted, [True, True])
 
     def test_process_pulled_event_with_missing_state(self) -> None:
         """Ensure that we correctly handle pulled events with lots of missing state

@@ -85,6 +85,25 @@ class DelayedEventsStore(SQLBaseStore):
             columns=("delay_id",),
             unique=True,
         )
+        self.db_pool.updates.register_background_index_update(
+            update_name="delayed_events_send_ts_idx",
+            index_name="delayed_events_send_ts",
+            table="delayed_events",
+            columns=("send_ts",),
+        )
+        self.db_pool.updates.register_background_index_update(
+            update_name="delayed_events_is_processed_idx",
+            index_name="delayed_events_is_processed",
+            table="delayed_events",
+            columns=("is_processed",),
+        )
+        self.db_pool.updates.register_background_index_update(
+            update_name="delayed_events_room_state_event_idx",
+            index_name="delayed_events_room_state_event_idx",
+            table="delayed_events",
+            columns=("room_id", "event_type", "state_key"),
+            where_clause="state_key IS NOT NULL",
+        )
 
     async def get_delayed_events_stream_pos(self) -> int:
         """

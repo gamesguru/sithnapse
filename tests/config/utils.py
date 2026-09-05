@@ -21,9 +21,10 @@
 import os
 import shutil
 import tempfile
-import unittest
 from contextlib import redirect_stdout
 from io import StringIO
+
+from twisted.trial import unittest
 
 from synapse.config.homeserver import HomeServerConfig
 

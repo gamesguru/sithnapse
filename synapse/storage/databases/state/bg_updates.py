@@ -19,7 +19,11 @@
 #
 #
 
+import hashlib
 import logging
+import struct
+import time
+from types import ModuleType
 from typing import (
     TYPE_CHECKING,
     Mapping,
@@ -36,6 +40,7 @@ from synapse.storage.engines import PostgresEngine
 from synapse.types import MutableStateMap, StateMap
 from synapse.types.state import StateFilter
 from synapse.util.caches import intern_string
+from synapse.util.iterutils import batch_iter
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
@@ -46,10 +51,111 @@ logger = logging.getLogger(__name__)
 MAX_STATE_DELTA_HOPS = 100
 
 
+def _state_hamt_node_key(
+    namespace: str, room_prefix: bytes, structural_hash: bytes
+) -> bytes:
+    # Must match `node_key` in `rust/src/database/core.rs`.
+    namespace_hash = hashlib.sha256(namespace.encode("utf-8")).digest()[:16]
+    return (
+        b"hamt:node:"
+        + namespace_hash.hex().encode("ascii")
+        + b":"
+        + room_prefix.hex().encode("ascii")
+        + b":"
+        + structural_hash.hex().encode("ascii")
+    )
+
+
+def _state_hamt_root_key(namespace: str, state_group: int) -> bytes:
+    """Return the per-namespace HAMT root key.
+
+    State-group ids are only unique inside one Synapse database, so the
+    namespace is part of the key. The room prefix is stored in the
+    value, allowing readers to locate a root from only its state-group id.
+    """
+    namespace_hash = hashlib.sha256(namespace.encode("utf-8")).digest()[:16]
+    return (
+        b"hamt:root:"
+        + namespace_hash.hex().encode("ascii")
+        + str(state_group).encode("ascii")
+    )
+
+
+def _encode_state_hamt_root(
+    room_prefix: bytes,
+    root_hash: bytes,
+    lattice: bytes,
+    room_id: str,
+) -> bytes:
+    room_id_bytes = room_id.encode("utf-8")
+    return (
+        b"\x01"
+        + struct.pack(">H", len(room_prefix))
+        + room_prefix
+        + struct.pack(">H", len(room_id_bytes))
+        + room_id_bytes
+        + root_hash
+        + lattice
+    )
+
+
+def _decode_state_hamt_root(
+    value: bytes,
+) -> tuple[bytes, bytes, bytes, str]:
+    if len(value) < 5 or value[0] != 1:
+        raise RuntimeError("invalid or unsupported HAMT root record version")
+    prefix_len = struct.unpack(">H", value[1:3])[0]
+    room_id_len_offset = 3 + prefix_len
+    if len(value) < room_id_len_offset + 2:
+        raise RuntimeError("truncated HAMT root record")
+    room_id_len = struct.unpack(
+        ">H", value[room_id_len_offset : room_id_len_offset + 2]
+    )[0]
+    room_id_start = room_id_len_offset + 2
+    root_start = room_id_start + room_id_len
+    if len(value) < root_start + 32:
+        raise RuntimeError("truncated HAMT root record")
+    room_prefix = value[3:room_id_len_offset]
+    room_id = value[room_id_start:root_start].decode("utf-8")
+    root_hash = value[root_start : root_start + 32]
+    lattice = value[root_start + 32 :]
+    return room_prefix, root_hash, lattice, room_id
+
+
 class StateGroupBackgroundUpdateStore(SQLBaseStore):
     """Defines functions related to state groups needed to run the state background
     updates.
     """
+
+    def __init__(
+        self,
+        database: DatabasePool,
+        db_conn: LoggingDatabaseConnection,
+        hs: "HomeServer",
+    ):
+        super().__init__(database, db_conn, hs)
+        self._hamt_namespace_override: str | None = None
+
+    @property
+    def hamt_namespace(self) -> str:
+        """Namespaces HAMT root/node keys in the embedded engine so that
+        independent deployments sharing a filesystem (e.g. multiple trial
+        workers in the same test run) can't overwrite each other's state.
+        Defaults to the server name; tests override it to a fresh value per
+        run (see `tests/utils.py`).
+        """
+        if self._hamt_namespace_override is not None:
+            return self._hamt_namespace_override
+        db_pool_ns = getattr(self.db_pool, "_hamt_namespace", None)
+        if db_pool_ns:
+            return str(db_pool_ns)
+        return self.hs.hostname
+
+    @hamt_namespace.setter
+    def hamt_namespace(self, value: str) -> None:
+        self._hamt_namespace_override = value
+        if hasattr(self, "db_pool") and self.db_pool is not None:
+            self.db_pool._hamt_namespace = value
 
     @trace
     @tag_args
@@ -118,6 +224,66 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
         if state_filter is None:
             state_filter = StateFilter.all()
 
+        groups = list(groups)
+        results: dict[int, MutableStateMap[str]] = {group: {} for group in groups}
+
+        hamt_results, missing_groups = self._get_state_groups_from_hamt_txn(
+            txn, groups, state_filter
+        )
+        results.update(hamt_results)
+
+        if not missing_groups:
+            return results
+
+        # Existing groups without a root are expected only while the v95
+        # backfill is pending. Once it has completed, a missing root is data
+        # corruption.
+        txn.execute(
+            "SELECT 1 FROM background_updates WHERE update_name = ?",
+            ("state_hamt_backfill_roots",),
+        )
+        backfill_pending = txn.fetchone() is not None
+        if not backfill_pending:
+            existing_rows = self.db_pool.simple_select_many_txn(
+                txn,
+                table="state_groups",
+                column="id",
+                iterable=missing_groups,
+                keyvalues={},
+                retcols=("id",),
+            )
+            existing_in_sql = {group for (group,) in existing_rows}
+            if existing_in_sql:
+                raise RuntimeError(
+                    f"State group(s) exist in SQL but have no HAMT root: {existing_in_sql}"
+                )
+
+        logger.debug(
+            "Falling back to legacy state-group reads for %s (state_groups_state is "
+            "not populated on this branch; expect empty results)",
+            missing_groups,
+        )
+        results.update(
+            self._get_legacy_state_for_groups_txn(txn, missing_groups, state_filter)
+        )
+        return results
+
+    def _get_legacy_state_for_groups_txn(
+        self,
+        txn: LoggingTransaction,
+        groups: list[int],
+        state_filter: StateFilter,
+    ) -> dict[int, MutableStateMap[str]]:
+        """Walk `state_group_edges`/`state_groups_state` directly to
+        reconstruct the state for `groups`, bypassing the HAMT entirely.
+
+        This is the fallback used when a group has no HAMT root (either
+        because it's genuinely missing, in which case this correctly
+        resolves to `{}`, or -- see `_get_state_groups_from_groups_txn` --
+        because it predates the HAMT schema and hasn't been backfilled yet
+        by `_background_backfill_state_hamt_roots`, which calls this
+        directly to get the state to build a root from).
+        """
         results: dict[int, MutableStateMap[str]] = {group: {} for group in groups}
 
         if isinstance(self.database_engine, PostgresEngine):
@@ -276,7 +442,567 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
                     )
 
         # The results shouldn't be considered mutable.
+        logger.debug(
+            "Legacy fallback for %s returned %s state entries "
+            "(state_groups_state is empty on this branch)",
+            groups,
+            {group: len(results[group]) for group in groups},
+        )
         return results
+
+    def _get_state_groups_from_hamt_txn(
+        self,
+        txn: LoggingTransaction,
+        groups: list[int],
+        state_filter: StateFilter,
+    ) -> tuple[dict[int, MutableStateMap[str]], list[int]]:
+        _gg_hamt_txn_start = time.monotonic()
+        results: dict[int, MutableStateMap[str]] = {}
+        missing_groups: list[int] = []
+        exact_keys = (
+            state_filter.concrete_types() if not state_filter.has_wildcards() else None
+        )
+
+        # The embedded engine (mdbx) mirrors both nodes and root records
+        # (`_store_state_hamt_root_embedded_txn`/`batch_get_state_hamt_roots`),
+        # falling back to `state_hamt_roots`/`state_groups` SQL only for a
+        # group it doesn't have. Always use the bulk path (it degrades to a
+        # single-root fetch fine for len(groups) == 1).
+        use_embedded = bool(getattr(self, "embedded_hamt_engine", None))
+
+        bulk_results: dict[int, list[tuple[str, str, str]] | None] | None = None
+        bulk_selective_results: dict[int, list[tuple[str, str, str]] | None] | None = (
+            None
+        )
+        if use_embedded:
+            if exact_keys is None:
+                bulk_results = self._materialize_state_hamts_from_embedded_txn(
+                    txn, groups
+                )
+            else:
+                bulk_selective_results = self._lookup_state_hamts_from_embedded_txn(
+                    txn, groups, exact_keys
+                )
+        elif len(groups) > 1:
+            if exact_keys is None:
+                bulk_results = self._materialize_state_hamt_from_postgres_many_txn(
+                    txn, groups
+                )
+            else:
+                bulk_selective_results = self._lookup_state_hamt_from_postgres_many_txn(
+                    txn, groups, exact_keys
+                )
+
+        for group in groups:
+            if exact_keys is not None:
+                entries = (
+                    bulk_selective_results[group]
+                    if bulk_selective_results is not None
+                    else self._lookup_state_hamt_from_postgres_txn(
+                        txn, group, exact_keys
+                    )
+                )
+            else:
+                entries = (
+                    bulk_results[group]
+                    if bulk_results is not None
+                    else self._materialize_state_hamt_from_postgres_txn(txn, group)
+                )
+            if entries is None:
+                missing_groups.append(group)
+                continue
+
+            state_map: MutableStateMap[str] = {}
+            for typ, state_key, event_id in entries:
+                key = (intern_string(typ), intern_string(state_key))
+                state_map[key] = event_id
+
+            results[group] = dict(state_filter.filter_state(state_map))
+
+        logger.debug(
+            "[gg-state-timing] _get_state_groups_from_hamt_txn groups=%d "
+            "elapsed_ms=%.1f missing=%d",
+            len(groups),
+            (time.monotonic() - _gg_hamt_txn_start) * 1000,
+            len(missing_groups),
+        )
+        return results, missing_groups
+
+    def _materialize_state_hamt_from_postgres_txn(
+        self, txn: LoggingTransaction, state_group: int
+    ) -> list[tuple[str, str, str]] | None:
+        _gg_mat_start = time.monotonic()
+        from synapse.synapse_rust import state_hamt
+
+        root = self.db_pool.simple_select_one_onecol_txn(
+            txn,
+            table="state_hamt_roots",
+            keyvalues={"state_group": state_group},
+            retcol="root_structural_hash",
+            allow_none=True,
+        )
+        if root is None:
+            logger.debug(
+                "SQL HAMT materialization: no state_hamt_roots row for "
+                "state_group %s -> falls through to empty legacy fallback",
+                state_group,
+            )
+            return None
+        root_structural_hash = bytes(root)
+
+        root_node = self.db_pool.simple_select_one_onecol_txn(
+            txn,
+            table="state_hamt_nodes",
+            keyvalues={"structural_hash": bytearray(root_structural_hash)},
+            retcol="node_bytes",
+            allow_none=True,
+        )
+        if root_node is None:
+            logger.warning(
+                "SQL HAMT materialization: state_hamt_roots row exists for "
+                "state_group %s but root node %s is missing from state_hamt_nodes",
+                state_group,
+                root_structural_hash.hex(),
+            )
+            raise RuntimeError(
+                "Missing HAMT root node for state group "
+                f"{state_group}: {root_structural_hash.hex()}"
+            )
+        root_node_bytes = bytes(root_node)
+
+        node_bytes_by_hash: dict[bytes, bytes] = {root_structural_hash: root_node_bytes}
+        seen_hashes = {root_structural_hash}
+        to_fetch = {
+            bytes(child_hash)
+            for child_hash in state_hamt.node_child_hashes(root_node_bytes)
+        }
+
+        while to_fetch:
+            current_batch = list(to_fetch)
+            to_fetch = set()
+
+            for chunk in batch_iter(current_batch, 100):
+                rows = [
+                    (bytes(structural_hash), bytes(node_bytes))
+                    for structural_hash, node_bytes in self.db_pool.simple_select_many_txn(
+                        txn,
+                        table="state_hamt_nodes",
+                        column="structural_hash",
+                        iterable=[
+                            bytearray(structural_hash) for structural_hash in chunk
+                        ],
+                        keyvalues={},
+                        retcols=("structural_hash", "node_bytes"),
+                    )
+                ]
+                found_hashes = {node_hash for node_hash, _ in rows}
+                missing_hashes = set(chunk) - found_hashes
+                if missing_hashes:
+                    raise RuntimeError(
+                        "Missing HAMT child nodes for state group "
+                        f"{state_group}: {[hash.hex() for hash in missing_hashes]}"
+                    )
+
+                for structural_hash, node_bytes in rows:
+                    node_bytes_by_hash[structural_hash] = node_bytes
+
+                    for child_hash in state_hamt.node_child_hashes(node_bytes):
+                        if child_hash not in seen_hashes:
+                            seen_hashes.add(child_hash)
+                            to_fetch.add(child_hash)
+
+        entries = state_hamt.materialize_state_entries(
+            node_bytes_by_hash[root_structural_hash],
+            list(node_bytes_by_hash.items()),
+        )
+        logger.debug(
+            "[gg-state-timing] _materialize_state_hamt_from_postgres_txn "
+            "group=%d elapsed_ms=%.1f entries=%d",
+            state_group,
+            (time.monotonic() - _gg_mat_start) * 1000,
+            len(entries),
+        )
+        return entries
+
+    def _materialize_state_hamt_from_postgres_many_txn(
+        self, txn: LoggingTransaction, groups: list[int]
+    ) -> dict[int, list[tuple[str, str, str]] | None]:
+        """Materialize multiple SQL HAMT roots while sharing node fetches."""
+        from synapse.synapse_rust import state_hamt
+
+        root_rows = self.db_pool.simple_select_many_txn(
+            txn,
+            table="state_hamt_roots",
+            column="state_group",
+            iterable=groups,
+            keyvalues={},
+            retcols=("state_group", "root_structural_hash"),
+        )
+        roots = {int(group): bytes(root_hash) for group, root_hash in root_rows}
+        results: dict[int, list[tuple[str, str, str]] | None] = dict.fromkeys(
+            groups, None
+        )
+        if not roots:
+            return results
+
+        to_fetch = set(roots.values())
+        node_bytes_by_hash: dict[bytes, bytes] = {}
+        while to_fetch:
+            current_batch = list(to_fetch)
+            to_fetch = set()
+            for chunk in batch_iter(current_batch, 100):
+                rows = [
+                    (bytes(node_hash), bytes(node_bytes))
+                    for node_hash, node_bytes in self.db_pool.simple_select_many_txn(
+                        txn,
+                        table="state_hamt_nodes",
+                        column="structural_hash",
+                        iterable=[bytearray(node_hash) for node_hash in chunk],
+                        keyvalues={},
+                        retcols=("structural_hash", "node_bytes"),
+                    )
+                ]
+                missing = set(chunk) - {node_hash for node_hash, _ in rows}
+                if missing:
+                    raise RuntimeError(
+                        "Missing HAMT nodes for state groups "
+                        f"{groups}: {[node_hash.hex() for node_hash in missing]}"
+                    )
+                for node_hash, node_bytes in rows:
+                    if node_hash in node_bytes_by_hash:
+                        continue
+                    node_bytes_by_hash[node_hash] = node_bytes
+                    for child_hash in state_hamt.node_child_hashes(node_bytes):
+                        if child_hash not in node_bytes_by_hash:
+                            to_fetch.add(child_hash)
+
+        for group, root_hash in roots.items():
+            root_bytes = node_bytes_by_hash[root_hash]
+            results[group] = state_hamt.materialize_state_entries(
+                root_bytes,
+                list(node_bytes_by_hash.items()),
+            )
+        return results
+
+    def _lookup_state_hamt_from_postgres_txn(
+        self,
+        txn: LoggingTransaction,
+        state_group: int,
+        keys: list[tuple[str, str]],
+    ) -> list[tuple[str, str, str]] | None:
+        from synapse.synapse_rust import state_hamt
+
+        _gg_single_start = time.monotonic()
+        root = self.db_pool.simple_select_one_onecol_txn(
+            txn,
+            table="state_hamt_roots",
+            keyvalues={"state_group": state_group},
+            retcol="root_structural_hash",
+            allow_none=True,
+        )
+        if root is None:
+            return None
+        root_hash = bytes(root)
+        room_id = self.db_pool.simple_select_one_onecol_txn(
+            txn,
+            table="state_groups",
+            keyvalues={"id": state_group},
+            retcol="room_id",
+            allow_none=False,
+        )
+        root_node = self.db_pool.simple_select_one_onecol_txn(
+            txn,
+            table="state_hamt_nodes",
+            keyvalues={"structural_hash": bytearray(root_hash)},
+            retcol="node_bytes",
+            allow_none=True,
+        )
+        if root_node is None:
+            raise RuntimeError(
+                f"Missing HAMT root node for state group {state_group}: {root_hash.hex()}"
+            )
+        root_bytes = bytes(root_node)
+        nodes: dict[bytes, bytes] = {root_hash: root_bytes}
+        while True:
+            entries, missing = state_hamt.lookup_state_entries(
+                room_id,
+                root_bytes,
+                list(nodes.items()),
+                keys,
+            )
+            missing = [
+                bytes(node_hash) for node_hash in missing if node_hash not in nodes
+            ]
+            if not missing:
+                logger.debug(
+                    "[gg-state-timing] _lookup_state_hamt_from_postgres_txn "
+                    "group=%d keys=%d elapsed_ms=%.1f",
+                    state_group,
+                    len(keys),
+                    (time.monotonic() - _gg_single_start) * 1000,
+                )
+                return entries
+            rows = self.db_pool.simple_select_many_txn(
+                txn,
+                table="state_hamt_nodes",
+                column="structural_hash",
+                iterable=[bytearray(node_hash) for node_hash in missing],
+                keyvalues={},
+                retcols=("structural_hash", "node_bytes"),
+            )
+            nodes.update(
+                (bytes(node_hash), bytes(node_bytes)) for node_hash, node_bytes in rows
+            )
+            unresolved = set(missing) - nodes.keys()
+            if unresolved:
+                raise RuntimeError(
+                    "Missing HAMT child nodes for state group "
+                    f"{state_group}: {[node_hash.hex() for node_hash in unresolved]}"
+                )
+
+    def _lookup_state_hamt_from_postgres_many_txn(
+        self,
+        txn: LoggingTransaction,
+        groups: list[int],
+        keys: list[tuple[str, str]],
+    ) -> dict[int, list[tuple[str, str, str]] | None]:
+        """Selective HAMT key lookup across several state groups, sharing node
+        fetches -- the SQL-mode mirror of the embedded engine's batched
+        selective lookup (`lookup_state_hamts` in `rust/src/database/`).
+
+        Each round, every group attempts to resolve `keys` against whatever
+        nodes have been fetched so far; any node hashes still missing across
+        *all* groups are merged into one shared batch fetch for the next
+        round, so groups needing a node in common only ever fetch it once.
+        """
+        _gg_many_start = time.monotonic()
+        from synapse.synapse_rust import state_hamt
+
+        root_rows = self.db_pool.simple_select_many_txn(
+            txn,
+            table="state_hamt_roots",
+            column="state_group",
+            iterable=groups,
+            keyvalues={},
+            retcols=("state_group", "root_structural_hash"),
+        )
+        roots = {int(group): bytes(root_hash) for group, root_hash in root_rows}
+        results: dict[int, list[tuple[str, str, str]] | None] = dict.fromkeys(
+            groups, None
+        )
+        if not roots:
+            return results
+
+        room_id_rows = self.db_pool.simple_select_many_txn(
+            txn,
+            table="state_groups",
+            column="id",
+            iterable=list(roots.keys()),
+            keyvalues={},
+            retcols=("id", "room_id"),
+        )
+        room_ids = {int(group): room_id for group, room_id in room_id_rows}
+
+        def try_resolve_all() -> set[bytes]:
+            """Attempt selective resolution for every group against the
+            nodes fetched so far. Returns the union of node hashes still
+            missing across all groups (deduped, and excluding anything
+            already fetched -- defensive, mirrors the single-group loop)."""
+            still_missing: set[bytes] = set()
+            for group, root_hash in roots.items():
+                entries, missing = state_hamt.lookup_state_entries(
+                    room_ids[group],
+                    node_bytes_by_hash[root_hash],
+                    list(node_bytes_by_hash.items()),
+                    keys,
+                )
+                results[group] = entries
+                still_missing.update(
+                    bytes(node_hash)
+                    for node_hash in missing
+                    if bytes(node_hash) not in node_bytes_by_hash
+                )
+            return still_missing
+
+        node_bytes_by_hash: dict[bytes, bytes] = {}
+        to_fetch = set(roots.values())
+        rounds = 0
+        while to_fetch:
+            rounds += 1
+            current_batch = list(to_fetch)
+            for chunk in batch_iter(current_batch, 100):
+                rows = [
+                    (bytes(node_hash), bytes(node_bytes))
+                    for node_hash, node_bytes in self.db_pool.simple_select_many_txn(
+                        txn,
+                        table="state_hamt_nodes",
+                        column="structural_hash",
+                        iterable=[bytearray(node_hash) for node_hash in chunk],
+                        keyvalues={},
+                        retcols=("structural_hash", "node_bytes"),
+                    )
+                ]
+                missing_from_db = set(chunk) - {node_hash for node_hash, _ in rows}
+                if missing_from_db:
+                    raise RuntimeError(
+                        "Missing HAMT nodes for state groups "
+                        f"{groups}: {[node_hash.hex() for node_hash in missing_from_db]}"
+                    )
+                node_bytes_by_hash.update(rows)
+
+            to_fetch = try_resolve_all()
+
+        logger.debug(
+            "[gg-state-timing] _lookup_state_hamt_from_postgres_many_txn "
+            "groups=%d keys=%d elapsed_ms=%.1f rounds=%d",
+            len(groups),
+            len(keys),
+            (time.monotonic() - _gg_many_start) * 1000,
+            rounds,
+        )
+        return results
+
+    def _embedded_hamt_engine_module(self) -> ModuleType:
+        """Returns the `mdbx_engine` PyO3 module configured for this
+        deployment (`embedded_hamt_engine` config). mdbx is the only
+        supported embedded engine (fjall was benchmarked and dropped, see
+        `database/mod.rs`'s doc comment). Nodes are content-addressed and
+        immutable, so `materialize_state_hamts`/`lookup_state_hamts` can
+        walk the tree itself in Rust -- unlike the SQL path above, no
+        per-node round trip back into Python is needed here.
+        """
+        engine = getattr(self, "embedded_hamt_engine", None)
+        if engine == "mdbx":
+            from synapse.synapse_rust import mdbx_engine
+
+            return mdbx_engine
+        raise RuntimeError(f"Unknown embedded_hamt_engine: {engine!r}")
+
+    def _fetch_hamt_roots_for_embedded_txn(
+        self, txn: LoggingTransaction, groups: list[int]
+    ) -> dict[int, tuple[bytes, bytes, str]]:
+        """Fetch `(room_prefix, root_structural_hash, room_id)` for each of
+        `groups` that has a published HAMT root, from the embedded engine --
+        the configured store, used exclusively. A group still missing after
+        that is NOT silently re-fetched from SQL: once the embedded engine
+        is configured it's the source of truth for new data, so a real miss
+        means either genuine corruption or (the one legitimate exception)
+        that `EMBEDDED_HAMT_MIGRATION_UPDATE_NAME` hasn't finished copying
+        this group's pre-existing SQL row over yet -- see
+        `_background_migrate_state_hamt_to_embedded`. Only in that bounded,
+        explicit window does this fall back to SQL.
+        """
+        engine = self._embedded_hamt_engine_module()
+        namespace = self.hamt_namespace
+        found: dict[int, tuple[bytes, bytes, str]] = {}
+        still_missing: list[int] = []
+        # One batched Rust call instead of an N-iteration Python for loop
+        # each paying its own FFI round trip.
+        for group, record in zip(
+            groups, engine.batch_get_state_hamt_roots(namespace, groups)
+        ):
+            if record is None:
+                still_missing.append(group)
+                continue
+            _group, room_prefix, root_hash, room_id, _lattice = record
+            found[group] = (bytes(room_prefix), bytes(root_hash), room_id)
+
+        if not still_missing:
+            return found
+
+        migration_name = getattr(
+            self, "EMBEDDED_HAMT_MIGRATION_UPDATE_NAME", "state_hamt_embedded_migration"
+        )
+        txn.execute(
+            "SELECT 1 FROM background_updates WHERE update_name = ?",
+            (migration_name,),
+        )
+        migration_pending = txn.fetchone() is not None
+        if not migration_pending:
+            # Not a migration window -- these groups are genuinely missing
+            # from the configured store. Let the caller's normal
+            # missing-group handling (raise-unless-legacy-pre-v95) decide,
+            # rather than masking it with a legacy-SQL read here.
+            return found
+
+        root_rows = self.db_pool.simple_select_many_txn(
+            txn,
+            table="state_hamt_roots",
+            column="state_group",
+            iterable=still_missing,
+            keyvalues={},
+            retcols=("state_group", "room_prefix", "root_structural_hash"),
+        )
+        if not root_rows:
+            return found
+        roots = {
+            int(group): (bytes(room_prefix), bytes(root_hash))
+            for group, room_prefix, root_hash in root_rows
+        }
+        room_id_rows = self.db_pool.simple_select_many_txn(
+            txn,
+            table="state_groups",
+            column="id",
+            iterable=list(roots.keys()),
+            keyvalues={},
+            retcols=("id", "room_id"),
+        )
+        room_ids = {int(group): room_id for group, room_id in room_id_rows}
+        found.update(
+            {
+                group: (room_prefix, root_hash, room_ids[group])
+                for group, (room_prefix, root_hash) in roots.items()
+                if group in room_ids
+            }
+        )
+        return found
+
+    def _materialize_state_hamts_from_embedded_txn(
+        self, txn: LoggingTransaction, groups: list[int]
+    ) -> dict[int, list[tuple[str, str, str]] | None]:
+        results: dict[int, list[tuple[str, str, str]] | None] = dict.fromkeys(
+            groups, None
+        )
+        roots = self._fetch_hamt_roots_for_embedded_txn(txn, groups)
+        if not roots:
+            return results
+        engine = self._embedded_hamt_engine_module()
+        ordered_groups = list(roots.keys())
+        materialized = engine.materialize_state_hamts(
+            self.hamt_namespace,
+            [roots[group] for group in ordered_groups],
+        )
+        for group, entries in zip(ordered_groups, materialized):
+            results[group] = entries
+        return results
+
+    def _lookup_state_hamts_from_embedded_txn(
+        self,
+        txn: LoggingTransaction,
+        groups: list[int],
+        keys: list[tuple[str, str]],
+    ) -> dict[int, list[tuple[str, str, str]] | None]:
+        results: dict[int, list[tuple[str, str, str]] | None] = dict.fromkeys(
+            groups, None
+        )
+        roots = self._fetch_hamt_roots_for_embedded_txn(txn, groups)
+        if not roots:
+            return results
+        engine = self._embedded_hamt_engine_module()
+        ordered_groups = list(roots.keys())
+        queries = [
+            (room_prefix, root_hash, self._room_structural_key(room_id), keys)
+            for room_prefix, root_hash, room_id in (roots[g] for g in ordered_groups)
+        ]
+        looked_up = engine.lookup_state_hamts(self.hamt_namespace, queries)
+        for group, entries in zip(ordered_groups, looked_up):
+            results[group] = entries
+        return results
+
+    def _room_structural_key(self, room_id: str) -> bytes:
+        from synapse.synapse_rust import state_hamt
+
+        return bytes(state_hamt.room_structural_key(room_id))
 
 
 class StateBackgroundUpdateStore(StateGroupBackgroundUpdateStore):
@@ -284,6 +1010,7 @@ class StateBackgroundUpdateStore(StateGroupBackgroundUpdateStore):
     STATE_GROUP_INDEX_UPDATE_NAME = "state_group_state_type_index"
     STATE_GROUPS_ROOM_INDEX_UPDATE_NAME = "state_groups_room_id_idx"
     STATE_GROUP_EDGES_UNIQUE_INDEX_UPDATE_NAME = "state_group_edges_unique_idx"
+    STATE_HAMT_BACKFILL_ROOTS_UPDATE_NAME = "state_hamt_backfill_roots"
 
     def __init__(
         self,
@@ -320,6 +1047,34 @@ class StateBackgroundUpdateStore(StateGroupBackgroundUpdateStore):
             # The old index was on (state_group) and was not unique.
             replaces_index="state_group_edges_idx",
         )
+
+        # State groups created before schema v95 (the HAMT tables) have no
+        # `state_hamt_roots` row. `_get_state_groups_from_groups_txn` treats
+        # that as corruption, so any pre-existing database needs every
+        # legacy group's root built once. The handler
+        # lives on `StateGroupDataStore` (store.py), which is where
+        # `_persist_state_hamt_txn` -- the same root-building logic used for
+        # newly-created groups -- is defined.
+        #
+        # `StateBackgroundUpdateStore` is also mixed directly into
+        # `synapse_port_db`'s composed `Store` class, which does *not*
+        # inherit `StateGroupDataStore` and so has no
+        # `_background_backfill_state_hamt_roots` (or `_persist_state_hamt_txn`)
+        # to call. `update_synapse_database` has already fully migrated the
+        # source database, including this backfill, before `synapse_port_db`
+        # runs, so the port script cannot execute it directly -- it instead
+        # re-inserts a pending entry into PostgreSQL's `background_updates`
+        # (see `_maybe_requeue_state_hamt_backfill`) when the source
+        # database is missing roots for some rooms (e.g. an interrupted
+        # source-side backfill, or -- historically -- a source that was
+        # TiKV-backed, back when that was a supported HAMT engine). Guard
+        # the registration so constructing that composed `Store` doesn't
+        # crash on the missing attribute.
+        if hasattr(self, "_background_backfill_state_hamt_roots"):
+            self.db_pool.updates.register_background_update_handler(
+                self.STATE_HAMT_BACKFILL_ROOTS_UPDATE_NAME,
+                self._background_backfill_state_hamt_roots,
+            )
 
     async def _background_deduplicate_state(
         self, progress: dict, batch_size: int

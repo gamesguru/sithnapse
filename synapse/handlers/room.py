@@ -1558,24 +1558,16 @@ class RoomCreationHandler:
         # (as this info can't be pulled from the db)
         state_map: MutableStateMap[str] = {}
 
-        async def create_event(
+        async def create_batch_event(
             etype: str,
             content: JsonMapping,
-            for_batch: bool,
             **kwargs: Any,
-        ) -> tuple[EventBase, synapse.events.snapshot.UnpersistedEventContextBase]:
+        ) -> tuple[EventBase, UnpersistedEventContext]:
             """
-            Creates an event and associated event context.
+            Creates a batch event and associated unpersisted event context.
             Args:
                 etype: the type of event to be created
                 content: content of the event
-                for_batch: whether the event is being created for batch persisting. If
-                bool for_batch is true, this will create an event using the prev_event_ids,
-                and will create an event context for the event using the parameters state_map
-                and current_state_group, thus these parameters must be provided in this
-                case if for_batch is True. The subsequently created event and context
-                are suitable for being batched up and bulk persisted to the database
-                with other similarly created events.
             """
             nonlocal depth
             nonlocal prev_event
@@ -1586,19 +1578,23 @@ class RoomCreationHandler:
             event_dict.update(event_keys)
             event_dict.update(kwargs)
 
+            builder = (
+                self.event_creation_handler.event_builder_factory.for_room_version(
+                    room_version,
+                    event_dict,
+                )
+            )
             (
                 new_event,
                 new_unpersisted_context,
-            ) = await self.event_creation_handler.create_event(
+            ) = await self.event_creation_handler.create_new_client_event_for_batch(
+                builder,
                 creator,
-                event_dict,
                 prev_event_ids=prev_event,
-                prev_state_events=prev_state_events,
-                depth=depth,
-                # Take a copy to ensure each event gets a unique copy of
-                # state_map since it is modified below.
                 state_map=dict(state_map),
-                for_batch=for_batch,
+                current_state_group=current_state_group,
+                depth=depth,
+                prev_state_events=prev_state_events,
             )
 
             depth += 1
@@ -1615,12 +1611,35 @@ class RoomCreationHandler:
             if not room_version.implicit_room_creator:
                 creation_content = dict(creation_content)
                 creation_content["creator"] = creator_id
-            creation_event, unpersisted_creation_context = await create_event(
-                EventTypes.Create, creation_content, False
+            (
+                creation_event,
+                unpersisted_creation_context,
+            ) = await self.event_creation_handler.create_event(
+                creator,
+                {
+                    "content": creation_content,
+                    "sender": creator.user.to_string(),
+                    "room_id": room_id,
+                    "type": EventTypes.Create,
+                    "state_key": "",
+                },
+                prev_event_ids=[],
+                depth=1,
+                state_map={},
+                for_batch=False,
             )
             creation_context = await unpersisted_creation_context.persist(
                 creation_event
             )
+            depth = 2
+            prev_event = [creation_event.event_id]
+            state_map[(creation_event.type, creation_event.state_key)] = (
+                creation_event.event_id
+            )
+            if room_version.msc4242_state_dags and event_exists_in_state_dag(
+                creation_event
+            ):
+                prev_state_events = [creation_event.event_id]
         else:
             (creation_event, creation_context) = creation_event_with_context
             # we had to do the above already in order to have a room ID, so just updates local vars
@@ -1671,13 +1690,13 @@ class RoomCreationHandler:
         )
         current_state_group = event_to_state[member_event_id]
 
-        events_to_send = []
+        events_to_send: list[tuple[EventBase, UnpersistedEventContext]] = []
         # We treat the power levels override specially as this needs to be one
         # of the first events that get sent into a room.
         pl_content = initial_state.pop((EventTypes.PowerLevels, ""), None)
         if pl_content is not None:
-            power_event, power_context = await create_event(
-                EventTypes.PowerLevels, pl_content, True
+            power_event, power_context = await create_batch_event(
+                EventTypes.PowerLevels, pl_content
             )
             events_to_send.append((power_event, power_context))
         else:
@@ -1734,71 +1753,65 @@ class RoomCreationHandler:
             # apply those.
             if power_level_content_override:
                 power_level_content.update(power_level_content_override)
-            pl_event, pl_context = await create_event(
+            pl_event, pl_context = await create_batch_event(
                 EventTypes.PowerLevels,
                 power_level_content,
-                True,
             )
             events_to_send.append((pl_event, pl_context))
 
         if room_alias and (EventTypes.CanonicalAlias, "") not in initial_state:
-            room_alias_event, room_alias_context = await create_event(
-                EventTypes.CanonicalAlias, {"alias": room_alias.to_string()}, True
+            room_alias_event, room_alias_context = await create_batch_event(
+                EventTypes.CanonicalAlias, {"alias": room_alias.to_string()}
             )
             events_to_send.append((room_alias_event, room_alias_context))
 
         if (EventTypes.JoinRules, "") not in initial_state:
-            join_rules_event, join_rules_context = await create_event(
+            join_rules_event, join_rules_context = await create_batch_event(
                 EventTypes.JoinRules,
                 {"join_rule": config["join_rules"]},
-                True,
             )
             events_to_send.append((join_rules_event, join_rules_context))
 
         if (EventTypes.RoomHistoryVisibility, "") not in initial_state:
-            visibility_event, visibility_context = await create_event(
+            visibility_event, visibility_context = await create_batch_event(
                 EventTypes.RoomHistoryVisibility,
                 {"history_visibility": config["history_visibility"]},
-                True,
             )
             events_to_send.append((visibility_event, visibility_context))
 
         if config["guest_can_join"]:
             if (EventTypes.GuestAccess, "") not in initial_state:
-                guest_access_event, guest_access_context = await create_event(
+                guest_access_event, guest_access_context = await create_batch_event(
                     EventTypes.GuestAccess,
                     {EventContentFields.GUEST_ACCESS: GuestAccess.CAN_JOIN},
-                    True,
                 )
                 events_to_send.append((guest_access_event, guest_access_context))
 
         for (etype, state_key), content in initial_state.items():
-            event, context = await create_event(
-                etype, content, True, state_key=state_key
+            event, context = await create_batch_event(
+                etype, content, state_key=state_key
             )
             events_to_send.append((event, context))
 
         if config["encrypted"] and not ignore_forced_encryption:
-            encryption_event, encryption_context = await create_event(
+            encryption_event, encryption_context = await create_batch_event(
                 EventTypes.RoomEncryption,
                 {"algorithm": RoomEncryptionAlgorithms.DEFAULT},
-                True,
                 state_key="",
             )
             events_to_send.append((encryption_event, encryption_context))
 
         if "name" in room_config:
             name = room_config["name"]
-            name_event, name_context = await create_event(
+            name_event, name_context = await create_batch_event(
                 EventTypes.Name,
                 {"name": name},
-                True,
             )
             events_to_send.append((name_event, name_context))
 
         if "topic" in room_config:
             topic = room_config["topic"]
-            topic_event, topic_context = await create_event(
+            topic_event, topic_context = await create_batch_event(
                 EventTypes.Topic,
                 {
                     EventContentFields.TOPIC: topic,
@@ -1807,7 +1820,6 @@ class RoomCreationHandler:
                         EventContentFields.M_TEXT: [{MTextFields.BODY: topic}]
                     },
                 },
-                True,
             )
             events_to_send.append((topic_event, topic_context))
 

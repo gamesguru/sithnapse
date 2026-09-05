@@ -1,0 +1,47 @@
+-- Delay IDs are global opaque identifiers. The store addresses delayed events
+-- by delay_id alone, so make that invariant a primary-key constraint.
+ALTER TABLE delayed_events DROP CONSTRAINT delayed_events_pkey;
+DELETE FROM delayed_events WHERE ctid IN (
+    SELECT ctid FROM (
+        SELECT ctid,
+               ROW_NUMBER() OVER (
+                   PARTITION BY delay_id
+                   ORDER BY is_processed ASC, send_ts DESC, ctid DESC
+               ) AS rn
+        FROM delayed_events
+    ) duplicates
+    WHERE rn > 1
+);
+-- Remove the background-update entry that would try to recreate this index.
+DELETE FROM background_updates WHERE update_name = 'delayed_events_idx';
+
+-- If the v93 background update has already created its unique index, promote
+-- that index to the primary key. Otherwise create the primary-key index now.
+-- This keeps the migration safe for both completed and pending v93 updates
+-- without ever maintaining two identical unique indexes.
+DO $$
+BEGIN
+    -- A cancelled CREATE INDEX CONCURRENTLY leaves an invalid index behind.
+    -- It is visible in pg_indexes but cannot be promoted with USING INDEX.
+    IF EXISTS (
+        SELECT 1
+        FROM pg_index AS i
+        JOIN pg_class AS c ON c.oid = i.indexrelid
+        JOIN pg_namespace AS n ON n.oid = c.relnamespace
+        WHERE n.nspname = current_schema()
+          AND c.relname = 'delayed_events_idx'
+          AND NOT i.indisvalid
+    ) THEN
+        DROP INDEX delayed_events_idx;
+    END IF;
+
+    IF EXISTS (
+        SELECT 1 FROM pg_indexes
+        WHERE schemaname = current_schema() AND indexname = 'delayed_events_idx'
+    ) THEN
+        ALTER TABLE delayed_events
+            ADD CONSTRAINT delayed_events_pkey PRIMARY KEY USING INDEX delayed_events_idx;
+    ELSE
+        ALTER TABLE delayed_events ADD PRIMARY KEY (delay_id);
+    END IF;
+END $$;

@@ -30,6 +30,7 @@ from synapse.storage.database import (
     LoggingTransaction,
 )
 from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
+from synapse.storage.databases.main.embedded_event_json import put_event_json_batch
 from synapse.storage.databases.main.events_worker import EventsWorkerStore
 from synapse.synapse_rust.events import redact_event
 from synapse.util.duration import Duration
@@ -162,6 +163,23 @@ class CensorEventsStore(EventsWorkerStore, CacheInvalidationWorkerStore, SQLBase
             keyvalues={"event_id": event_id},
             updatevalues={"json": pruned_json},
         )
+
+        # SQL is updated in place above, so the embedded mirror (if any) must
+        # be updated to match -- otherwise get_event would keep serving the
+        # pre-censor/pre-expiry JSON forever from mdbx. internal_metadata and
+        # format_version aren't changing here, so re-fetch them rather than
+        # thread them through every _censor_event_txn caller.
+        if getattr(self, "_embedded_event_json_enabled", False):
+            row = self.db_pool.simple_select_one_txn(
+                txn,
+                table="event_json",
+                keyvalues={"event_id": event_id},
+                retcols=("internal_metadata", "format_version"),
+            )
+            internal_metadata, format_version = row
+            put_event_json_batch(
+                [(event_id, internal_metadata, pruned_json, format_version)]
+            )
 
     async def expire_event(self, event_id: str) -> None:
         """Retrieve and expire an event that has expired, and delete its associated
