@@ -501,8 +501,8 @@ jobs:
           SYNAPSE_POSTGRES_HOST: /var/run/postgresql
           SYNAPSE_POSTGRES_USER: postgres
           SYNAPSE_POSTGRES_PASSWORD: postgres
-          SYNAPSE_TEST_EMBEDDED_HAMT_ENGINE: ${{ matrix.job.database == 'mdbx' && 'mdbx' || '' }}
-          SYNAPSE_TEST_EMBEDDED_HAMT_PATH: ${{ matrix.job.database == 'mdbx' && '/tmp/synapse-embedded-hamt' || '' }}
+          SYNAPSE_TEST_EMBEDDED_HAMT_ENGINE: ${{ matrix.job.database == 'mtxdb' && 'mtxdb' || '' }}
+          SYNAPSE_TEST_EMBEDDED_HAMT_PATH: ${{ matrix.job.database == 'mtxdb' && '/tmp/synapse-embedded-hamt' || '' }}
       - name: Dump PostgreSQL statistics
         if: ${{ always() && matrix.job.database == 'postgres' }}
         run: .ci/scripts/dump_postgres_stats.sh /tmp/postgres-stats.txt || true
@@ -530,13 +530,13 @@ jobs:
           -exec echo "::endgroup::" \;
           || true
 
-  trial-mdbx:
-    # Runs the trial suite with the embedded mdbx engine for HAMT state
+  trial-mtxdb:
+    # Runs the trial suite with the embedded mtxdb engine for HAMT state
     # storage (see embedded_hamt_engine in synapse/config/database.py), so
     # tests that exercise it -- e.g.
     # test_state_group_hamt_corruption_does_not_fallback_to_sql in
-    # tests/storage/test_state.py -- actually run against mdbx rather than
-    # the SQL fallback. Sqlite only; mdbx is the variable under test here,
+    # tests/storage/test_state.py -- actually run against mtxdb rather than
+    # the SQL fallback. Sqlite only; mtxdb is the variable under test here,
     # not the SQL backend. Replaces the old trial-tikv job now that TiKV has
     # been removed.
     if: ${{ !cancelled() && !failure() && needs.changes.outputs.trial == 'true' }} # Allow previous steps to be skipped, but not fail
@@ -572,7 +572,7 @@ jobs:
           done
       - run: uv run trial --jobs=6 tests
         env:
-          SYNAPSE_TEST_EMBEDDED_HAMT_ENGINE: mdbx
+          SYNAPSE_TEST_EMBEDDED_HAMT_ENGINE: mtxdb
           SYNAPSE_TEST_EMBEDDED_HAMT_PATH: /tmp/synapse-embedded-hamt
       - name: Dump logs
         # Logs are most useful when the command fails, always include them.
@@ -712,7 +712,7 @@ jobs:
         ASYNCIO_REACTOR: ${{ (matrix.job.reactor == 'asyncio') || '' }}
         WORKERS: ${{ matrix.job.workers && 1 }}
         BLACKLIST: ${{ matrix.job.workers && 'synapse-blacklist-with-workers' }}
-        SYNAPSE_EMBEDDED_HAMT_ENGINE: ${{ matrix.job.embedded_hamt && 'mdbx' }}
+        SYNAPSE_EMBEDDED_HAMT_ENGINE: ${{ matrix.job.embedded_hamt && 'mtxdb' }}
         SYNAPSE_EMBEDDED_HAMT_PATH: ${{ matrix.job.embedded_hamt && '/tmp/synapse-embedded-hamt' }}
         TOP: ${{ github.workspace }}
 
@@ -732,7 +732,7 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-      - name: Install clang (for mdbx-sys bindgen)
+      - name: Install clang (for mtxdb-sys bindgen)
         run: |
           apt-get update
           apt-get install -y clang libclang-dev
@@ -952,7 +952,7 @@ jobs:
     if: ${{ always() }}
     needs:
       - trial
-      - trial-mdbx
+      - trial-mtxdb
       - trial-olddeps
       - sytest
       - export-data
@@ -971,7 +971,7 @@ jobs:
           # The newsfile lint may be skipped on non PR builds.
           skippable: |
             trial
-            trial-mdbx
+            trial-mtxdb
             trial-olddeps
             sytest
             portdb

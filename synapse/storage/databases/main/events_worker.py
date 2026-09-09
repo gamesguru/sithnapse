@@ -1619,12 +1619,12 @@ class EventsWorkerStore(SQLBaseStore):
         lookup, no SQL) and falling back to `event_json` in SQL for any id
         it doesn't have.
 
-        Deliberately does NOT write the SQL-fallback result back into mdbx:
+        Deliberately does NOT write the SQL-fallback result back into mtxdb:
         `event_json` is mutable (censoring, expiry -- see
         `_censor_event_txn`), and this read runs outside of and concurrently
         with any writer's transaction. A reader that fetched a pre-censor
-        row here could still land its mdbx write after a concurrent
-        censor/expiry has already updated mdbx to the pruned value,
+        row here could still land its mtxdb write after a concurrent
+        censor/expiry has already updated mtxdb to the pruned value,
         silently resurrecting content the writer just redacted -- there's
         no version/CAS scheme to make a read-path write safe against that
         race. Missing ids (e.g. from before the mirror existed) simply keep
@@ -1637,7 +1637,9 @@ class EventsWorkerStore(SQLBaseStore):
         found: dict[str, tuple[str, str, int | None]] = {}
         still_missing = event_ids
         if self._embedded_event_json_enabled:
-            found = get_event_json_batch(event_ids)
+            found = get_event_json_batch(
+                self._embedded_hamt_engine, self._embedded_hamt_namespace, event_ids
+            )
             still_missing = [e for e in event_ids if e not in found]
 
         if still_missing:

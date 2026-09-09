@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Re-benchmark of mdbx vs. postgres for the embedded HAMT node store, run
+"""Re-benchmark of mtxdb vs. postgres for the embedded HAMT node store, run
 to refresh docs/development-gg/persistent-typed-hamt-architecture.md's
 comparison table with numbers that are actually reproducible today.
 
@@ -11,13 +11,13 @@ code for fjall was ever written, in any commit, reachable or dangling (see
 session history) -- so it is dropped rather than re-estimated.
 
 Same methodology/shape as the now-deleted benchmark_hamt_storage_engines.py
-and benchmark_hamt_mdbx.py: 32-byte content-addressed keys, 512-byte node
+and benchmark_hamt_mtxdb.py: 32-byte content-addressed keys, 512-byte node
 payloads, uniformly random, 2,000,000-row corpus, batch sizes 1/5/10 for
 reads, batch=5 for commit latency.
 
 Usage:
     eval "$(scripts-dev/start_test_postgres.sh)"
-    python3 scripts-dev/benchmark_hamt_mdbx_vs_postgres.py
+    python3 scripts-dev/benchmark_hamt_mtxdb_vs_postgres.py
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ from typing import Callable
 import psycopg2
 import psycopg2.extras
 
-from synapse.synapse_rust import mdbx_engine
+from synapse.synapse_rust import mtxdb_engine
 
 NODE_SIZE = 512
 CORPUS_SIZE = 2_000_000
@@ -91,24 +91,24 @@ def bench_commit(
     return p50, p99
 
 
-def run_mdbx() -> tuple[dict[int, tuple[float, float]], tuple[float, float]]:
-    tmpdir = tempfile.mkdtemp(prefix="hamt-mdbx-bench-")
+def run_mtxdb() -> tuple[dict[int, tuple[float, float]], tuple[float, float]]:
+    tmpdir = tempfile.mkdtemp(prefix="hamt-mtxdb-bench-")
     try:
-        mdbx_engine.open_client(tmpdir)
+        mtxdb_engine.open_client(tmpdir)
         rng = random.Random(0)
-        print(f"\n=== mdbx: corpus {CORPUS_SIZE:,} nodes x {NODE_SIZE}B ===")
+        print(f"\n=== mtxdb: corpus {CORPUS_SIZE:,} nodes x {NODE_SIZE}B ===")
 
         rows = rand_rows(rng, CORPUS_SIZE)
         start = time.perf_counter()
-        mdbx_engine.batch_put(rows)
+        mtxdb_engine.batch_put(rows)
         elapsed = time.perf_counter() - start
         print(
-            f"mdbx  bulk-load {CORPUS_SIZE:,} rows in {elapsed:6.2f}s ({CORPUS_SIZE / elapsed:,.0f} rows/s)"
+            f"mtxdb  bulk-load {CORPUS_SIZE:,} rows in {elapsed:6.2f}s ({CORPUS_SIZE / elapsed:,.0f} rows/s)"
         )
 
         keys_pool = [h for h, _ in rows[:20000]]
-        reads = bench_reads("mdbx", mdbx_engine.batch_get, keys_pool)
-        commit = bench_commit("mdbx", mdbx_engine.transactional_batch_put, rng)
+        reads = bench_reads("mtxdb", mtxdb_engine.batch_get, keys_pool)
+        commit = bench_commit("mtxdb", mtxdb_engine.batch_put, rng)
         return reads, commit
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -143,10 +143,10 @@ def run_postgres() -> tuple[dict[int, tuple[float, float]], tuple[float, float]]
         # execute_values pages internally (page_size=1000) via separate
         # cur.execute() calls; under autocommit=True each of those pages is its
         # own implicit transaction/commit -- 2,000 commits for a 2M-row corpus,
-        # vs. mdbx's batch_put doing the whole corpus in a single transaction.
+        # vs. mtxdb's batch_put doing the whole corpus in a single transaction.
         # Wrap the whole bulk-load in one explicit transaction so the comparison
         # is apples-to-apples (one commit each), not penalizing postgres with
-        # per-page commit overhead that mdbx's side doesn't pay either.
+        # per-page commit overhead that mtxdb's side doesn't pay either.
         conn.autocommit = False
         psycopg2.extras.execute_values(
             cur,
@@ -190,16 +190,16 @@ def run_postgres() -> tuple[dict[int, tuple[float, float]], tuple[float, float]]
 
 
 def main() -> None:
-    mdbx_reads, mdbx_commit = run_mdbx()
+    mtxdb_reads, mtxdb_commit = run_mtxdb()
     pg_reads, pg_commit = run_postgres()
 
     print("\n=== summary (p50, us) ===")
-    print(f"{'batch':<8}{'mdbx':<12}{'postgres':<12}{'speedup':<10}")
+    print(f"{'batch':<8}{'mtxdb':<12}{'postgres':<12}{'speedup':<10}")
     for b in BATCH_SIZES:
-        m = mdbx_reads[b][0]
+        m = mtxdb_reads[b][0]
         p = pg_reads[b][0]
         print(f"{b:<8}{m:<12.1f}{p:<12.1f}{p / m:<10.1f}")
-    m, p = mdbx_commit[0], pg_commit[0]
+    m, p = mtxdb_commit[0], pg_commit[0]
     print(f"commit  {m:<12.1f}{p:<12.1f}{p / m:<10.1f}")
 
 

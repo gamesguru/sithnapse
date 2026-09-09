@@ -103,8 +103,8 @@ PY
 echo "--- Patching /sytest/lib/SyTest/Homeserver/Synapse.pm to inject config"
 # When SYNAPSE_EMBEDDED_HAMT_ENGINE/SYNAPSE_EMBEDDED_HAMT_PATH are set, add an
 # `embedded_hamt` block to the homeserver config that sytest generates, so
-# the HAMT state backend runs against a real mdbx database (mirrors
-# trial-mdbx / complement-mdbx). Synapse also reads these as plain
+# the HAMT state backend runs against a real mtxdb database (mirrors
+# trial-mtxdb / complement-mtxdb). Synapse also reads these as plain
 # environment variables directly (see synapse/config/database.py), but
 # sytest-spawned processes aren't guaranteed to inherit the host
 # environment, so this config injection is the same belt-and-braces

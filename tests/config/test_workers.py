@@ -41,6 +41,7 @@ class WorkerDutyConfigTestCase(TestCase):
         root_config = Mock()
         root_config.worker_app = worker_app
         root_config.worker_name = worker_name
+        root_config.database.embedded_hamt_engine = None
         worker_config = WorkerConfig(root_config)
         worker_config_dict = {
             "worker_name": worker_name,

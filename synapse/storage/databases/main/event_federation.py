@@ -317,7 +317,10 @@ class EventFederationWorkerStore(
 
         embedded_hamt_namespace = resolve_namespace(self)
         for links in self._get_chain_links(
-            txn, set(event_chains.keys()), embedded_hamt_namespace
+            txn,
+            set(event_chains.keys()),
+            embedded_hamt_namespace,
+            self._embedded_hamt_engine,
         ):
             for chain_id in links:
                 if chain_id not in event_chains:
@@ -374,6 +377,7 @@ class EventFederationWorkerStore(
         txn: LoggingTransaction,
         chains_to_fetch: set[int],
         embedded_hamt_namespace: str | None,
+        embedded_hamt_engine: str | None,
     ) -> Generator[dict[int, list[tuple[int, int, int]]], None, None]:
         """Fetch all auth chain links from the given set of chains, and all
         links from those chains, recursively.
@@ -388,9 +392,12 @@ class EventFederationWorkerStore(
         embedded engine is configured, `None` when it isn't -- a
         `@classmethod` has no `self` of its own, so this can't be
         recomputed here; see `embedded_event_auth_chain_links.py`.
+
+        `embedded_hamt_engine`: the engine name threaded alongside
+        `embedded_hamt_namespace` (same `@classmethod` constraint).
         """
         if embedded_hamt_namespace is not None:
-            # Exclusive by configured engine, not a dual-write. mdbx has no
+            # Exclusive by configured engine, not a dual-write. mtxdb has no
             # recursive-query primitive, so the walk is done here in Python
             # instead of SQL's `WITH RECURSIVE` below -- see
             # embedded_event_auth_chain_links.py's module docstring.
@@ -398,12 +405,40 @@ class EventFederationWorkerStore(
                 get_chain_links_batch,
             )
 
-            while chains_to_fetch:
-                batch = set(itertools.islice(chains_to_fetch, 1000))
-                chains_to_fetch.difference_update(batch)
-                embedded_links = get_chain_links_batch(embedded_hamt_namespace, batch)
-                chains_to_fetch.difference_update(embedded_links)
-                yield embedded_links
+            # `get_chain_links_batch` is a flat batch-get, not a BFS -- it
+            # only returns edges *out of* the chain IDs it's given, not the
+            # transitive closure. So unlike the SQL `WITH RECURSIVE` below,
+            # the walk has to happen here: every `target_chain_id` we
+            # discover is a new chain that might have further edges out of
+            # it, so it goes back into the fetch set (unless already seen).
+            #
+            # Every caller of this generator relies on each yielded `links`
+            # dict being *self-contained*: `_materialize` does its own
+            # internal stack-based walk over a single `links` dict starting
+            # from one origin chain, so if the edges for a chain two hops
+            # away land in a *different* yielded dict than the edges for the
+            # chain one hop away, `_materialize` dead-ends after one hop and
+            # silently drops everything beyond it (this used to happen here:
+            # each BFS layer was yielded separately). So the whole transitive
+            # closure for `chains_to_fetch` is accumulated below and yielded
+            # once, matching what the SQL recursive query below returns in a
+            # single row set per outer (<=1000-chain) batch.
+            seen_chains = set(chains_to_fetch)
+            to_walk = set(chains_to_fetch)
+            accumulated: dict[int, list[tuple[int, int, int]]] = {}
+            while to_walk:
+                batch = set(itertools.islice(to_walk, 1000))
+                to_walk.difference_update(batch)
+                embedded_links = get_chain_links_batch(
+                    embedded_hamt_engine, embedded_hamt_namespace, batch
+                )
+                for chain_id, edges in embedded_links.items():
+                    accumulated.setdefault(chain_id, []).extend(edges)
+                    for _origin_seq, target_chain_id, _target_seq in edges:
+                        if target_chain_id not in seen_chains:
+                            seen_chains.add(target_chain_id)
+                            to_walk.add(target_chain_id)
+            yield accumulated
             return
 
         # This query is structured to first get all chain IDs reachable, and
@@ -736,7 +771,7 @@ class EventFederationWorkerStore(
 
         embedded_hamt_namespace = resolve_namespace(self)
         for links in self._get_chain_links(
-            txn, set(seen_chains), embedded_hamt_namespace
+            txn, set(seen_chains), embedded_hamt_namespace, self._embedded_hamt_engine
         ):
             # `links` encodes the backwards reachable events _from a single chain_ all the way to
             # the root of the graph.

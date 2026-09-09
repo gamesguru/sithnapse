@@ -436,6 +436,32 @@ class WorkerConfig(Config):
                 "Must specify at least one instance to handle `quarantined_media_changes` messages."
             )
 
+        # Reject embedded_hamt (mtxdb) + multi-worker deployments. The
+        # embedded engine builds its key index once at process startup by
+        # scanning shard files on disk, and only ever updates it via that
+        # same process's own put() calls — there is no fallback disk scan
+        # on an index miss. A second OS process opening the same
+        # embedded_hamt.path can therefore never see keys written by
+        # another process after its own startup, which can cause
+        # RuntimeError: "State group(s) exist in SQL but have no HAMT root"
+        # when a worker reads state that another worker wrote.
+        embedded_hamt_engine = self.root.database.embedded_hamt_engine
+        if embedded_hamt_engine and (
+            self.worker_app is not None or len(self.instance_map) > 0
+        ):
+            logger.warning(
+                f"embedded_hamt.engine is set to {embedded_hamt_engine!r}, but this "
+                "deployment is configured to run multiple worker processes "
+                "(worker_app and/or instance_map is set). The embedded HAMT "
+                "engine's key index is built once at process startup by scanning "
+                "shard files on disk, and is only ever updated by that same "
+                "process's own writes -- it has no fallback disk scan on an index "
+                "miss. A second process opening the same embedded_hamt.path can "
+                "therefore never see keys written by another process after its "
+                "own startup (this is permanent, not a transient race). "
+                "Remove embedded_hamt.engine or run as a single process."
+            )
+
         self.events_shard_config = RoutableShardedWorkerHandlingConfig(
             self.writers.events
         )

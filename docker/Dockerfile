@@ -76,6 +76,11 @@ RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -yqq --
 
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain stable --profile minimal
 
+# mtxdb uses #![feature(...)] which requires RUSTC_BOOTSTRAP on stable.
+# Scoped to the build stage only -- does not affect the runtime image.
+ARG RUSTC_BOOTSTRAP=1
+ENV RUSTC_BOOTSTRAP=${RUSTC_BOOTSTRAP}
+
 # arm64 builds consume a lot of memory if `CARGO_NET_GIT_FETCH_WITH_CLI` is not
 # set to true, so we expose it as a build-arg.
 ARG CARGO_NET_GIT_FETCH_WITH_CLI=false

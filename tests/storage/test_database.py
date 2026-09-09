@@ -29,6 +29,7 @@ from twisted.internet.defer import CancelledError, Deferred
 from twisted.internet.testing import MemoryReactor
 
 from synapse.server import HomeServer
+from synapse.storage import database as database_module
 from synapse.storage.database import (
     DatabasePool,
     LoggingDatabaseConnection,
@@ -45,6 +46,35 @@ class TupleComparisonClauseTestCase(unittest.TestCase):
         clause, args = make_tuple_comparison_clause([("a", 1), ("b", 2)])
         self.assertEqual(clause, "(a,b) > (?,?)")
         self.assertEqual(args, [1, 2])
+
+
+class TrackTableOpTestCase(unittest.TestCase):
+    """`_track_table_op` is on-by-default timing instrumentation
+    (SYNAPSE_PG_TIMINGS), fed whatever `txn.rowcount` a caller's cursor
+    happens to return -- which, for a test's Mock() transaction that
+    doesn't set `.rowcount` explicitly, is itself a Mock, not an int. It
+    must never let that crash the query it's timing.
+    """
+
+    def test_non_int_rowcount_does_not_raise(self) -> None:
+        with patch.dict("os.environ", {"SYNAPSE_PG_TIMINGS": "1"}):
+            table = "test_non_int_rowcount_table"
+            before_count = database_module._TABLE_OPS_COUNTS[table]
+            before_elapsed = database_module._TABLE_OPS[table]
+            before_rows = database_module._TABLE_OPS_ROWS[table]
+
+            # Must not raise, even though rowcount is a Mock, not an int.
+            database_module._track_table_op(
+                f"INSERT INTO {table} (a) VALUES (?)",
+                0.5,
+                rowcount=Mock(),
+            )
+
+            # The op still gets counted/timed -- only the row count (which
+            # can't be trusted from a non-int rowcount) is skipped.
+            self.assertEqual(database_module._TABLE_OPS_COUNTS[table], before_count + 1)
+            self.assertEqual(database_module._TABLE_OPS[table], before_elapsed + 0.5)
+            self.assertEqual(database_module._TABLE_OPS_ROWS[table], before_rows)
 
 
 class ExecuteScriptTestCase(unittest.HomeserverTestCase):

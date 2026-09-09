@@ -1,12 +1,10 @@
 //! Generic HAMT node-store logic backing the embedded single-process KV
-//! engine ([`crate::database::mdbx`]). The backend implements only
+//! engine ([`crate::database::mtxdb`]). The backend implements only
 //! [`NodeStore`] (a thin point-lookup/write surface over its own storage
 //! primitive) and owns its own process-global handle + node cache; the BFS
 //! materialize/selective-lookup walk, the node-cache verify-on-hit logic,
-//! and the key-encoding scheme live here. Kept separate from `mdbx.rs`
-//! (rather than folded together) mainly because it was shared with a
-//! second backend (fjall) that was benchmarked and dropped -- see
-//! `database/mod.rs`'s doc comment.
+//! and the key-encoding scheme live here. Kept separate from `mtxdb.rs`
+//! (rather than folded together) to keep the BFS logic engine-agnostic.
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
@@ -135,7 +133,7 @@ pub fn decode_root_value(value: &[u8]) -> Result<RootRecord, String> {
 /// only definition of this layout -- unlike the HAMT node/root keys,
 /// there's no separate Python-side encoder to keep in sync with, since
 /// `embedded_event_auth_chain_links.py` is a thin pass-through to the
-/// `mdbx_engine` functions built from these.
+/// `mtxdb_engine` functions built from these.
 pub fn auth_chain_prefix(namespace: &str, origin_chain_id: i64) -> Vec<u8> {
     let namespace_hash = Sha256::digest(namespace.as_bytes());
     let mut key = Vec::with_capacity(17 + 32 + 1 + 8);

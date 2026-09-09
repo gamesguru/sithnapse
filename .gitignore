@@ -84,6 +84,9 @@ tests/complement/*
 # rust
 /target/
 /synapse/*.so
+*.bin
+*.pack
+*.idx
 
 # Poetry will create a setup.py, which we don't want to include.
 /setup.py

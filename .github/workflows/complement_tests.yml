@@ -40,19 +40,19 @@ jobs:
             database: SQLite
 
           - arrangement: hybrid
-            database: SQLite (hybrid, mdbx)
+            database: SQLite (hybrid, mtxdb)
 
           - arrangement: monolith
             database: Postgres
 
           - arrangement: hybrid
-            database: Postgres (hybrid, mdbx)
+            database: Postgres (hybrid, mtxdb)
 
           - arrangement: workers
             database: Postgres
 
           - arrangement: workers
-            database: Postgres (hybrid, mdbx)
+            database: Postgres (hybrid, mtxdb)
 
     steps:
       - name: Checkout synapse codebase
@@ -115,8 +115,8 @@ jobs:
         env:
           POSTGRES: ${{ (startsWith(matrix.database, 'Postgres')) && 1 || '' }}
           WORKERS: ${{ (matrix.arrangement == 'workers') && 1 || '' }}
-          SYNAPSE_EMBEDDED_HAMT_ENGINE: ${{ (contains(matrix.database, 'mdbx')) && 'mdbx' || '' }}
-          SYNAPSE_EMBEDDED_HAMT_PATH: ${{ (contains(matrix.database, 'mdbx')) && '/data/embedded_hamt' || '' }}
+          SYNAPSE_EMBEDDED_HAMT_ENGINE: ${{ (contains(matrix.database, 'mtxdb')) && 'mtxdb' || '' }}
+          SYNAPSE_EMBEDDED_HAMT_PATH: ${{ (contains(matrix.database, 'mtxdb')) && '/data/embedded_hamt' || '' }}
           RESULTS_DIR: tests/complement/sanity
 
       - name: Formatted sanity-check Complement log
@@ -137,8 +137,8 @@ jobs:
         env:
           POSTGRES: ${{ (startsWith(matrix.database, 'Postgres')) && 1 || '' }}
           WORKERS: ${{ (matrix.arrangement == 'workers') && 1 || '' }}
-          SYNAPSE_EMBEDDED_HAMT_ENGINE: ${{ (contains(matrix.database, 'mdbx')) && 'mdbx' || '' }}
-          SYNAPSE_EMBEDDED_HAMT_PATH: ${{ (contains(matrix.database, 'mdbx')) && '/data/embedded_hamt' || '' }}
+          SYNAPSE_EMBEDDED_HAMT_ENGINE: ${{ (contains(matrix.database, 'mtxdb')) && 'mtxdb' || '' }}
+          SYNAPSE_EMBEDDED_HAMT_PATH: ${{ (contains(matrix.database, 'mtxdb')) && '/data/embedded_hamt' || '' }}
           TEST_ONLY_IGNORE_POETRY_LOCKFILE: ${{ inputs.use_latest_deps && 1 || '' }}
           TEST_ONLY_SKIP_DEP_HASH_VERIFICATION: ${{ inputs.use_twisted_trunk  && 1 || '' }}
           RESULTS_DIR: tests/complement/main
@@ -158,8 +158,8 @@ jobs:
         env:
           POSTGRES: ${{ (startsWith(matrix.database, 'Postgres')) && 1 || '' }}
           WORKERS: ${{ (matrix.arrangement == 'workers') && 1 || '' }}
-          SYNAPSE_EMBEDDED_HAMT_ENGINE: ${{ (contains(matrix.database, 'mdbx')) && 'mdbx' || '' }}
-          SYNAPSE_EMBEDDED_HAMT_PATH: ${{ (contains(matrix.database, 'mdbx')) && '/data/embedded_hamt' || '' }}
+          SYNAPSE_EMBEDDED_HAMT_ENGINE: ${{ (contains(matrix.database, 'mtxdb')) && 'mtxdb' || '' }}
+          SYNAPSE_EMBEDDED_HAMT_PATH: ${{ (contains(matrix.database, 'mtxdb')) && '/data/embedded_hamt' || '' }}
           TEST_ONLY_IGNORE_POETRY_LOCKFILE: ${{ inputs.use_latest_deps && 1 || '' }}
           TEST_ONLY_SKIP_DEP_HASH_VERIFICATION: ${{ inputs.use_twisted_trunk  && 1 || '' }}
           RESULTS_DIR: tests/complement/in-repo

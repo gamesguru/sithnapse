@@ -433,19 +433,19 @@ main() {
   # particularly tricky.
   export PASS_SYNAPSE_LOG_TESTING=1
 
-  # SYNAPSE_MDBX=1 is the concise production on-switch (see
+  # SYNAPSE_MTXDB=1 is the concise production on-switch (see
   # config/database.py) but was never actually forwarded into the
-  # container here -- treat it the same as SYNAPSE_EMBEDDED_HAMT_ENGINE=mdbx
+  # container here -- treat it the same as SYNAPSE_EMBEDDED_HAMT_ENGINE=mtxdb
   # so it does something locally too.
-  if [[ -n "${SYNAPSE_MDBX:-}" && -z "$SYNAPSE_EMBEDDED_HAMT_ENGINE" ]]; then
-    SYNAPSE_EMBEDDED_HAMT_ENGINE="mdbx"
-    SYNAPSE_EMBEDDED_HAMT_PATH="${SYNAPSE_EMBEDDED_HAMT_PATH:-${SYNAPSE_MDBX_PATH:-}}"
+  if [[ -n "${SYNAPSE_MTXDB:-}" && -z "$SYNAPSE_EMBEDDED_HAMT_ENGINE" ]]; then
+    SYNAPSE_EMBEDDED_HAMT_ENGINE="mtxdb"
+    SYNAPSE_EMBEDDED_HAMT_PATH="${SYNAPSE_EMBEDDED_HAMT_PATH:-${SYNAPSE_MTXDB_PATH:-}}"
   fi
 
   if [[ -n "$SYNAPSE_EMBEDDED_HAMT_ENGINE" ]]; then
     export PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE="$SYNAPSE_EMBEDDED_HAMT_ENGINE"
     # SYNAPSE_EMBEDDED_HAMT_PATH is read inside the Complement container, not
-    # on the host -- a caller who just wants to turn mdbx on shouldn't have
+    # on the host -- a caller who just wants to turn mtxdb on shouldn't have
     # to know or care about that. Default it to a path that's always
     # writable there (the image's WORKDIR) rather than making them supply an
     # in-container path themselves.
@@ -453,6 +453,14 @@ main() {
   fi
   if [[ -n "$SYNAPSE_EMBEDDED_HAMT_PATH" ]]; then
     export PASS_SYNAPSE_EMBEDDED_HAMT_PATH="$SYNAPSE_EMBEDDED_HAMT_PATH"
+  fi
+
+  if [[ -n "$PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE" ]]; then
+    echo "Embedded HAMT engine: ${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE} at ${PASS_SYNAPSE_EMBEDDED_HAMT_PATH:-<not set>}" >&2
+  fi
+
+  if [[ -n "${SYNAPSE_PG_TIMINGS:-}" ]]; then
+    export PASS_SYNAPSE_PG_TIMINGS=1
   fi
 
   # ── Run-filter and extra-tags from remaining args ───────────────────────────
@@ -607,7 +615,7 @@ record_result() {
     if [ "${#_display_name}" -gt 80 ]; then
       _display_name="${_display_name:0:79}…"
     fi
-    printf '%s\t%s\t%s\n' "${action^^}" "$_display_name" "$elapsed" >&2
+    printf '%-6s  %-80s  %8s\n' "${action^^}" "$_display_name" "$elapsed" >&2
   fi
 }
 
@@ -657,6 +665,37 @@ run_one_pattern() {
   local _events_fifo="${_events_dir}/events"
   mkfifo "$_events_fifo"
 
+  # ── Real-time docker log capture for PG timings ────────────────────────────
+  # Complement removes containers during test teardown, so we cannot docker-cp
+  # files after go test exits.  Instead, watch for container starts via
+  # docker-events and follow their logs; timing sections land in the captured
+  # files when the SIGTERM/exit handlers in Synapse flush them to stderr.
+  _pg_timing_dir=""
+  _pg_log_watcher_pid=""
+  if [[ -n "${SYNAPSE_PG_TIMINGS:-}" ]]; then
+    _pg_timing_dir="$(mktemp -d "${staged_results_file}.pgtimings.XXXXXX")"
+    local _container_label="COMPLEMENT_WRAPPER_TOKEN=$COMPLEMENT_WRAPPER_TOKEN"
+    # Follow logs from complement containers as they start.  Also catch any
+    # containers that are already running (race with docker-events connect).
+    (
+      # Already-running containers
+      for _cid in $(docker ps -q 2>/dev/null); do
+        if docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$_cid" 2>/dev/null \
+            | grep -Fxq "$_container_label"; then
+          docker logs -f "$_cid" >>"${_pg_timing_dir}/${_cid}.log" 2>&1 &
+        fi
+      done
+      # New containers
+      docker events --filter 'event=start' --format '{{.ID}}' 2>/dev/null | while IFS= read -r _cid; do
+        if docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$_cid" 2>/dev/null \
+            | grep -Fxq "$_container_label"; then
+          docker logs -f "$_cid" >>"${_pg_timing_dir}/${_cid}.log" 2>&1 || true
+        fi
+      done
+    ) &
+    _pg_log_watcher_pid=$!
+  fi
+
   local _go_exit=0
   set +e
   # Enable job control just for this launch so the subshell (and the
@@ -697,6 +736,16 @@ run_one_pattern() {
   _active_producer=""
   set -e
   rm -rf "$_events_dir"
+
+  # Stop the PG timing log watcher (if running) and stash its directory
+  # for the extraction block in finish().
+  if [[ -n "${_pg_log_watcher_pid:-}" ]]; then
+    kill "$_pg_log_watcher_pid" 2>/dev/null || true
+    wait "$_pg_log_watcher_pid" 2>/dev/null || true
+    _pg_log_watcher_pid=""
+  fi
+  export _PG_TIMING_DIR="${_pg_timing_dir:-}"
+
   return "$_go_exit"
 }
 
@@ -771,6 +820,52 @@ finish() {
   echo "complement results merged into $main_results_file" >&2
   echo "" >&2
 
+  # ── Stats: slowest tests + time by suite ───────────────────────────────────
+  if [ -f "$staged_log_file" ] && [ -s "$staged_log_file" ]; then
+    python3 -c "
+import json, sys
+from collections import defaultdict
+
+results = []
+for line in open(sys.argv[1]):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        r = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if r.get('Action') not in ('pass', 'fail'):
+        continue
+    if not r.get('Test'):
+        continue
+    elapsed = r.get('Elapsed', 0) or 0
+    results.append((r['Test'], r['Action'], elapsed))
+
+if not results:
+    sys.exit(0)
+
+# Slowest 10 tests
+print('--- Slowest tests ---')
+for test, action, elapsed in sorted(results, key=lambda x: -x[2])[:10]:
+    print(f'  {elapsed:7.2f}s  {action.upper():6s}  {test}')
+
+# Time by suite (first path component after Test)
+suite_times = defaultdict(float)
+suite_counts = defaultdict(int)
+for test, action, elapsed in results:
+    suite = test.split('/')[0]
+    suite_times[suite] += elapsed
+    suite_counts[suite] += 1
+
+print()
+print('--- Time by suite ---')
+for suite, total in sorted(suite_times.items(), key=lambda x: -x[1]):
+    print(f'  {total:8.2f}s  {suite_counts[suite]:4d} tests  {suite}')
+" "$staged_log_file" >&2
+    echo "" >&2
+  fi
+
   if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     {
       echo "### Complement results"
@@ -778,6 +873,38 @@ finish() {
       echo ""
       echo "Duration: \`${test_duration_seconds}s\` (in_repo=\`${use_in_repo_tests:-0}\`)"
     } >> "$GITHUB_STEP_SUMMARY"
+  fi
+
+  # ── Extract timing from captured docker logs ─────────────────────────────
+  if [[ -n "${SYNAPSE_PG_TIMINGS:-}" ]] && [[ -n "${_PG_TIMING_DIR:-}" ]]; then
+    local _found_timing=0
+    if [[ -d "$_PG_TIMING_DIR" ]]; then
+      for _f in "${_PG_TIMING_DIR}"/*.log; do
+        [ -f "$_f" ] || continue
+        # Extract the timing sections from the captured log.
+        local _sections
+        _sections=$(awk '
+          /^=== Per-table SQL timing/ { p=1 }
+          /^=== State store mtxdb-vs-SQL timings/ { p=1 }
+          /^=== Postgres test-DB lifecycle timings/ { p=1 }
+          /^=== END SYNAPSE PG TIMINGS ===/ { p=0 }
+          /^================================/ { if(p) { print; p=0; next } }
+          { if(p) print }
+        ' "$_f" 2>/dev/null)
+        if [[ -n "$_sections" ]]; then
+          if [ "$_found_timing" -eq 0 ]; then
+            echo "" >&2
+            echo "=== SYNAPSE PG TIMINGS (from containers) ===" >&2
+            _found_timing=1
+          fi
+          echo "--- ${_f##*/} ---" >&2
+          echo "$_sections" >&2
+        fi
+      done
+      if [ "$_found_timing" -eq 1 ]; then
+        echo "=== END SYNAPSE PG TIMINGS ===" >&2
+      fi
+    fi
   fi
 
   cleanup_complement_containers

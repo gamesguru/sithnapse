@@ -24,6 +24,7 @@ p ?=
 .PHONY: test
 test: ##H Run tests, e.g., on tests/storage/
 	cargo +nightly test
+	@if [ -n "$$SYNAPSE_POSTGRES" ] && [ -z "$$SYNAPSE_POSTGRES_HOST" ]; then eval "$$(scripts-dev/start_test_postgres.sh)" || exit 1; fi; \
 	uv run python scripts-dev/trial_ctrlc.py $(p)
 
 .PHONY: build

@@ -19,13 +19,18 @@
 # [This file includes modifications made by New Vector Limited]
 #
 #
+import atexit
 import inspect
 import logging
+import os
+import re
+import sys
 import time
 import types
 from collections import defaultdict
 from time import monotonic as monotonic_time
 from typing import (
+    IO,
     TYPE_CHECKING,
     Any,
     Awaitable,
@@ -101,6 +106,103 @@ sql_txn_duration = Counter(
     "sec",
     labelnames=["desc", SERVER_NAME_LABEL],
 )
+
+# ── per-table SQL ops timing (opt-in via SYNAPSE_PG_TIMINGS=1) ──────────
+_TABLE_OPS: dict[str, float] = defaultdict(float)
+_TABLE_OPS_COUNTS: dict[str, int] = defaultdict(int)
+_TABLE_OPS_ROWS: dict[str, int] = defaultdict(int)
+
+_TABLE_RE = re.compile(
+    r"(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM|FROM|JOIN)\s+(\w+)",
+    re.IGNORECASE,
+)
+
+
+def _timings_print(*args: object) -> None:
+    """Print to stderr and optionally to SYNAPSE_PG_TIMINGS_FILE."""
+    print(*args, file=sys.stderr)
+    if _timings_file is not None:
+        print(*args, file=_timings_file)
+
+
+_timings_file: IO[str] | None = None
+if os.environ.get("SYNAPSE_PG_TIMINGS"):
+    _timings_path = os.environ.get("SYNAPSE_PG_TIMINGS_FILE")
+    if _timings_path:
+        try:
+            _timings_file = open(_timings_path, "a")
+        except OSError:
+            pass
+
+
+def _track_table_op(sql: str, elapsed: float, rowcount: int = 0) -> None:
+    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+        return
+    m = _TABLE_RE.search(sql)
+    if not m:
+        return
+    table = m.group(1).lower()
+    _TABLE_OPS[table] += elapsed
+    _TABLE_OPS_COUNTS[table] += 1
+    # rowcount is instrumentation, not correctness -- a test's mock cursor
+    # (e.g. tests.storage.test_base's Mock() txn, when a test doesn't set
+    # .rowcount explicitly) can hand back a non-int Mock attribute instead
+    # of a real DB-API rowcount. This must never turn on-by-default timing
+    # instrumentation into a hard crash of the actual query it's timing.
+    if isinstance(rowcount, int):
+        _TABLE_OPS_ROWS[table] += max(rowcount, 0)
+
+
+def _print_table_ops() -> None:
+    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+        return
+    if not _TABLE_OPS:
+        return
+    # Sort by total time descending
+    ranked = sorted(_TABLE_OPS.items(), key=lambda kv: kv[1], reverse=True)
+    _timings_print("\n=== Per-table SQL timing (top 30) ===")
+    _timings_print(
+        f"  {'table':40s}  {'total':>10s}  {'calls':>6s}  {'rows':>6s}  {'avg':>13s}",
+    )
+    for table, total_s in ranked[:30]:
+        count = _TABLE_OPS_COUNTS[table]
+        rows = _TABLE_OPS_ROWS[table]
+        total_ms = total_s * 1000
+        avg_ms = (total_s / count) * 1000 if count else 0.0
+        _timings_print(
+            f"  {table:40s}  {total_ms:8.1f}ms  {count:6d}  {rows:6d}  {avg_ms:10.3f}ms",
+        )
+    total_time_s = sum(_TABLE_OPS.values())
+    total_count = sum(_TABLE_OPS_COUNTS.values())
+    total_rows = sum(_TABLE_OPS_ROWS.values())
+    total_ms = total_time_s * 1000
+    avg_ms = (total_time_s / total_count) * 1000 if total_count else 0.0
+    _timings_print("")
+    _timings_print(
+        f"  {'TOTAL':40s}  {total_ms:8.1f}ms  "
+        f"{total_count:6d}  {total_rows:6d}  {avg_ms:10.3f}ms",
+    )
+    _timings_print("=====================================")
+    _timings_print("")
+
+
+if os.environ.get("SYNAPSE_PG_TIMINGS"):
+    atexit.register(_print_table_ops)
+
+    import signal as _signal
+    from types import FrameType as _FrameType
+
+    _original_sigterm_table_ops = _signal.getsignal(_signal.SIGTERM)
+
+    def _flush_table_ops_on_sigterm(signum: int, frame: _FrameType | None) -> None:
+        _print_table_ops()
+        if callable(_original_sigterm_table_ops):
+            _original_sigterm_table_ops(signum, frame)
+        elif _original_sigterm_table_ops == _signal.SIG_DFL:
+            _signal.signal(_signal.SIGTERM, _signal.SIG_DFL)
+            _signal.raise_signal(_signal.SIGTERM)
+
+    _signal.signal(_signal.SIGTERM, _flush_table_ops_on_sigterm)
 
 
 # Unique indexes which have been added in background updates. Maps from table name
@@ -540,6 +642,11 @@ class LoggingTransaction:
             sql_query_timer.labels(
                 verb=sql.split()[0], **{SERVER_NAME_LABEL: self.server_name}
             ).observe(secs)
+            try:
+                rowcount = self.txn.rowcount
+            except Exception:
+                rowcount = 0
+            _track_table_op(sql, secs, rowcount)
 
     def close(self) -> None:
         self.txn.close()

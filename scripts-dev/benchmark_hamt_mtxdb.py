@@ -1,12 +1,12 @@
 #!/usr/bin/env python
-"""libmdbx leg of the storage-engine benchmark, using the same
+"""libmtxdb leg of the storage-engine benchmark, using the same
 methodology as benchmark_hamt_small_batches.py (batch 1/5/10 reads,
 2M-row corpus) and benchmark_hamt_storage_engines.py (batch=5 commit
 latency), so its numbers are directly comparable -- run in this
 session rather than trusting an unverified external number.
 
 Usage:
-    python3 scripts-dev/benchmark_hamt_mdbx.py
+    python3 scripts-dev/benchmark_hamt_mtxdb.py
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import statistics
 import tempfile
 import time
 
-from synapse.synapse_rust import mdbx_engine
+from synapse.synapse_rust import mtxdb_engine
 
 NODE_SIZE = 512
 CORPUS_SIZE = 2_000_000
@@ -39,18 +39,18 @@ def percentiles(samples: list[float]) -> tuple[float, float]:
 
 
 def main() -> None:
-    tmpdir = tempfile.mkdtemp(prefix="hamt-mdbx-bench-")
+    tmpdir = tempfile.mkdtemp(prefix="hamt-mtxdb-bench-")
     try:
-        mdbx_engine.open_client(tmpdir)
+        mtxdb_engine.open_client(tmpdir)
         rng = random.Random(0)
         print(f"corpus: {CORPUS_SIZE:,} nodes x {NODE_SIZE}B\n")
 
         start = time.perf_counter()
         rows = rand_rows(rng, CORPUS_SIZE)
-        mdbx_engine.batch_put(rows)
+        mtxdb_engine.batch_put(rows)
         elapsed = time.perf_counter() - start
         print(
-            f"mdbx  bulk-load {CORPUS_SIZE:,} rows in {elapsed:6.2f}s ({CORPUS_SIZE / elapsed:,.0f} rows/s)"
+            f"mtxdb  bulk-load {CORPUS_SIZE:,} rows in {elapsed:6.2f}s ({CORPUS_SIZE / elapsed:,.0f} rows/s)"
         )
 
         keys_pool = [h for h, _ in rows[:20000]]
@@ -60,22 +60,22 @@ def main() -> None:
             for _ in range(READ_ITERATIONS):
                 batch = sample_rng.sample(keys_pool, batch_size)
                 start = time.perf_counter()
-                mdbx_engine.batch_get(batch)
+                mtxdb_engine.batch_get(batch)
                 samples.append(time.perf_counter() - start)
             p50, p99 = percentiles(samples)
             print(
-                f"mdbx       batch={batch_size:<3} p50={p50:8.1f}us  p99={p99:8.1f}us"
+                f"mtxdb       batch={batch_size:<3} p50={p50:8.1f}us  p99={p99:8.1f}us"
             )
 
         commit_samples = []
         for _ in range(COMMIT_ITERATIONS):
             commit_batch = rand_rows(rng, COMMIT_BATCH_SIZE)
             start = time.perf_counter()
-            mdbx_engine.transactional_batch_put(commit_batch)
+            mtxdb_engine.batch_put(commit_batch)
             commit_samples.append(time.perf_counter() - start)
         p50, p99 = percentiles(commit_samples)
         print(
-            f"mdbx       commit(batch={COMMIT_BATCH_SIZE}) p50={p50:8.1f}us  p99={p99:8.1f}us"
+            f"mtxdb       commit(batch={COMMIT_BATCH_SIZE}) p50={p50:8.1f}us  p99={p99:8.1f}us"
         )
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

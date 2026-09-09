@@ -19,12 +19,17 @@
 #
 #
 
+import atexit
 import hashlib
 import logging
+import os
 import struct
+import sys
+import threading
 import time
-from types import ModuleType
+from collections import defaultdict
 from typing import (
+    IO,
     TYPE_CHECKING,
     Mapping,
 )
@@ -36,6 +41,7 @@ from synapse.storage.database import (
     LoggingDatabaseConnection,
     LoggingTransaction,
 )
+from synapse.storage.databases.embedded_engine import get_embedded_engine
 from synapse.storage.engines import PostgresEngine
 from synapse.types import MutableStateMap, StateMap
 from synapse.types.state import StateFilter
@@ -46,6 +52,105 @@ if TYPE_CHECKING:
     from synapse.server import HomeServer
 
 logger = logging.getLogger(__name__)
+
+# ── mtxdb-vs-SQL timing (opt-in via SYNAPSE_PG_TIMINGS=1) ───────────────
+_STATE_TIMINGS: dict[str, float] = defaultdict(float)
+_STATE_TIMING_COUNTS: dict[str, int] = defaultdict(int)
+_STATE_TIMING_LOCK: "threading.Lock | None" = (
+    threading.Lock() if os.environ.get("SYNAPSE_PG_TIMINGS") else None
+)
+
+_timings_file: IO[str] | None = None
+if os.environ.get("SYNAPSE_PG_TIMINGS"):
+    _timings_path = os.environ.get("SYNAPSE_PG_TIMINGS_FILE")
+    if _timings_path:
+        try:
+            _timings_file = open(_timings_path, "a")
+        except OSError:
+            pass
+
+
+def _timings_print(*args: object) -> None:
+    print(*args, file=sys.stderr)
+    if _timings_file is not None:
+        print(*args, file=_timings_file)
+
+
+def _state_timing(tag: str, elapsed: float) -> None:
+    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+        return
+    lock = _STATE_TIMING_LOCK
+    if lock is not None:
+        with lock:
+            _STATE_TIMINGS[tag] += elapsed
+            _STATE_TIMING_COUNTS[tag] += 1
+    else:
+        _STATE_TIMINGS[tag] += elapsed
+        _STATE_TIMING_COUNTS[tag] += 1
+
+
+def _print_state_timings() -> None:
+    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+        return
+    _timings_print("\n=== State store mtxdb-vs-SQL timings ===")
+    _timings_print(
+        f"  {'':40s}  {'total':>10s}  {'calls':>6s}  {'avg':>13s}",
+    )
+
+    embedded_tags = sorted(t for t in _STATE_TIMINGS if t.endswith("_embedded"))
+    sql_tags = sorted(t for t in _STATE_TIMINGS if t.endswith("_sql"))
+    other_tags = sorted(
+        t for t in _STATE_TIMINGS if not t.endswith(("_embedded", "_sql"))
+    )
+
+    def _print_tag_group(label: str, tags: list[str]) -> None:
+        if not tags:
+            return
+        _timings_print(f"  -- {label} --")
+        for tag in tags:
+            total_s = _STATE_TIMINGS[tag]
+            count = _STATE_TIMING_COUNTS[tag]
+            total_ms = total_s * 1000
+            avg_ms = (total_s / count) * 1000 if count else 0.0
+            _timings_print(
+                f"  {tag:40s}  {total_ms:8.1f}ms  {count:6d}  {avg_ms:10.3f}ms",
+            )
+
+    _print_tag_group("hits (embedded)", embedded_tags)
+    _timings_print("")
+    _print_tag_group("misses (sql)", sql_tags)
+    _timings_print("")
+    _print_tag_group("other", other_tags)
+
+    total_time_s = sum(_STATE_TIMINGS.values())
+    total_count = sum(_STATE_TIMING_COUNTS.values())
+    total_ms = total_time_s * 1000
+    avg_ms = (total_time_s / total_count) * 1000 if total_count else 0.0
+    _timings_print("")
+    _timings_print(
+        f"  {'TOTAL':40s}  {total_ms:8.1f}ms  {total_count:6d}  {avg_ms:10.3f}ms",
+    )
+    _timings_print("=========================================")
+    _timings_print("")
+
+
+if os.environ.get("SYNAPSE_PG_TIMINGS"):
+    atexit.register(_print_state_timings)
+
+    import signal as _signal
+    from types import FrameType as _FrameType
+
+    _original_sigterm_state_timings = _signal.getsignal(_signal.SIGTERM)
+
+    def _flush_state_timings_on_sigterm(signum: int, frame: _FrameType | None) -> None:
+        _print_state_timings()
+        if callable(_original_sigterm_state_timings):
+            _original_sigterm_state_timings(signum, frame)
+        elif _original_sigterm_state_timings == _signal.SIG_DFL:
+            _signal.signal(_signal.SIGTERM, _signal.SIG_DFL)
+            _signal.raise_signal(_signal.SIGTERM)
+
+    _signal.signal(_signal.SIGTERM, _flush_state_timings_on_sigterm)
 
 
 MAX_STATE_DELTA_HOPS = 100
@@ -463,18 +568,19 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
             state_filter.concrete_types() if not state_filter.has_wildcards() else None
         )
 
-        # The embedded engine (mdbx) mirrors both nodes and root records
+        # The embedded engine (mtxdb) mirrors both nodes and root records
         # (`_store_state_hamt_root_embedded_txn`/`batch_get_state_hamt_roots`),
         # falling back to `state_hamt_roots`/`state_groups` SQL only for a
         # group it doesn't have. Always use the bulk path (it degrades to a
         # single-root fetch fine for len(groups) == 1).
-        use_embedded = bool(getattr(self, "embedded_hamt_engine", None))
+        use_embedded = bool(getattr(self, "_embedded_hamt_engine", None))
 
         bulk_results: dict[int, list[tuple[str, str, str]] | None] | None = None
         bulk_selective_results: dict[int, list[tuple[str, str, str]] | None] | None = (
             None
         )
         if use_embedded:
+            _et = time.monotonic()
             if exact_keys is None:
                 bulk_results = self._materialize_state_hamts_from_embedded_txn(
                     txn, groups
@@ -483,7 +589,9 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
                 bulk_selective_results = self._lookup_state_hamts_from_embedded_txn(
                     txn, groups, exact_keys
                 )
+            _state_timing("state_read_embedded", time.monotonic() - _et)
         elif len(groups) > 1:
+            _st = time.monotonic()
             if exact_keys is None:
                 bulk_results = self._materialize_state_hamt_from_postgres_many_txn(
                     txn, groups
@@ -492,6 +600,7 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
                 bulk_selective_results = self._lookup_state_hamt_from_postgres_many_txn(
                     txn, groups, exact_keys
                 )
+            _state_timing("state_read_sql", time.monotonic() - _st)
 
         for group in groups:
             if exact_keys is not None:
@@ -862,22 +971,6 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
         )
         return results
 
-    def _embedded_hamt_engine_module(self) -> ModuleType:
-        """Returns the `mdbx_engine` PyO3 module configured for this
-        deployment (`embedded_hamt_engine` config). mdbx is the only
-        supported embedded engine (fjall was benchmarked and dropped, see
-        `database/mod.rs`'s doc comment). Nodes are content-addressed and
-        immutable, so `materialize_state_hamts`/`lookup_state_hamts` can
-        walk the tree itself in Rust -- unlike the SQL path above, no
-        per-node round trip back into Python is needed here.
-        """
-        engine = getattr(self, "embedded_hamt_engine", None)
-        if engine == "mdbx":
-            from synapse.synapse_rust import mdbx_engine
-
-            return mdbx_engine
-        raise RuntimeError(f"Unknown embedded_hamt_engine: {engine!r}")
-
     def _fetch_hamt_roots_for_embedded_txn(
         self, txn: LoggingTransaction, groups: list[int]
     ) -> dict[int, tuple[bytes, bytes, str]]:
@@ -892,8 +985,8 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
         `_background_migrate_state_hamt_to_embedded`. Only in that bounded,
         explicit window does this fall back to SQL.
         """
-        engine = self._embedded_hamt_engine_module()
-        namespace = self.hamt_namespace
+        engine = get_embedded_engine(getattr(self, "_embedded_hamt_engine", None))
+        namespace = getattr(self, "_embedded_hamt_namespace", None)
         found: dict[int, tuple[bytes, bytes, str]] = {}
         still_missing: list[int] = []
         # One batched Rust call instead of an N-iteration Python for loop
@@ -966,10 +1059,10 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
         roots = self._fetch_hamt_roots_for_embedded_txn(txn, groups)
         if not roots:
             return results
-        engine = self._embedded_hamt_engine_module()
+        engine = get_embedded_engine(getattr(self, "_embedded_hamt_engine", None))
         ordered_groups = list(roots.keys())
         materialized = engine.materialize_state_hamts(
-            self.hamt_namespace,
+            getattr(self, "_embedded_hamt_namespace", None),
             [roots[group] for group in ordered_groups],
         )
         for group, entries in zip(ordered_groups, materialized):
@@ -988,13 +1081,15 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
         roots = self._fetch_hamt_roots_for_embedded_txn(txn, groups)
         if not roots:
             return results
-        engine = self._embedded_hamt_engine_module()
+        engine = get_embedded_engine(getattr(self, "_embedded_hamt_engine", None))
         ordered_groups = list(roots.keys())
         queries = [
             (room_prefix, root_hash, self._room_structural_key(room_id), keys)
             for room_prefix, root_hash, room_id in (roots[g] for g in ordered_groups)
         ]
-        looked_up = engine.lookup_state_hamts(self.hamt_namespace, queries)
+        looked_up = engine.lookup_state_hamts(
+            getattr(self, "_embedded_hamt_namespace", None), queries
+        )
         for group, entries in zip(ordered_groups, looked_up):
             results[group] = entries
         return results

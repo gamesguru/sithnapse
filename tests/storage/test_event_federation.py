@@ -800,14 +800,15 @@ class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
                 )
             )
         # Links are exclusive to whichever engine is configured (SQL or the
-        # embedded mdbx engine -- see `_persist_chain_cover_index`), so
+        # embedded mtxdb engine -- see `_persist_chain_cover_index`), so
         # insert the fixture the same way the production write path does
         # rather than always writing straight to the SQL table, otherwise
         # this test would only ever check the SQL backend under the
-        # trial-mdbx CI job's `embedded_hamt_engine` config.
+        # trial-mtxdb CI job's `embedded_hamt_engine` config.
         embedded_hamt_namespace = resolve_namespace(self.store)
         if embedded_hamt_namespace is not None:
             put_chain_links_batch(
+                getattr(self.store, "_embedded_hamt_engine", None),
                 embedded_hamt_namespace,
                 [
                     (

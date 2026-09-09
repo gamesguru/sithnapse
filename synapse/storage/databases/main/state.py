@@ -50,6 +50,7 @@ from synapse.storage.database import (
     LoggingTransaction,
     make_in_list_sql_clause,
 )
+from synapse.storage.databases.main.embedded_common import SyncTier, maybe_sync
 from synapse.storage.databases.main.embedded_event_to_state_group import (
     decrement_state_group_refcounts_batch,
     get_referenced_state_groups_batch,
@@ -602,7 +603,7 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
     async def _get_state_group_for_event(self, event_id: str) -> int | None:
         if getattr(self, "_embedded_event_json_enabled", False):
             found = get_state_group_for_events_batch(
-                self._embedded_hamt_namespace, [event_id]
+                self._embedded_hamt_engine, self._embedded_hamt_namespace, [event_id]
             )
             return found.get(event_id)
         return await self.db_pool.simple_select_one_onecol(
@@ -634,7 +635,9 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             # for state_group mappings, so a genuine miss surfaces as the
             # same RuntimeError a SQL miss would.
             res = get_state_group_for_events_batch(
-                self._embedded_hamt_namespace, list(event_ids)
+                self._embedded_hamt_engine,
+                self._embedded_hamt_namespace,
+                list(event_ids),
             )
         else:
             rows = cast(
@@ -676,7 +679,9 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             # module docstring for why a count (not an event-list index)
             # keeps this O(1) per write regardless of room activity.
             return get_referenced_state_groups_batch(
-                self._embedded_hamt_namespace, list(state_groups)
+                self._embedded_hamt_engine,
+                self._embedded_hamt_namespace,
+                list(state_groups),
             )
 
         rows = cast(
@@ -742,19 +747,31 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             # reference forever, since a partial-state event's placeholder
             # group is never otherwise decremented).
             old = get_state_group_for_events_batch(
-                self._embedded_hamt_namespace, [event.event_id]
+                self._embedded_hamt_engine,
+                self._embedded_hamt_namespace,
+                [event.event_id],
             )
             put_event_to_state_group_batch(
-                self._embedded_hamt_namespace, [(event.event_id, state_group)]
+                self._embedded_hamt_engine,
+                self._embedded_hamt_namespace,
+                [(event.event_id, state_group)],
             )
             old_state_group = old.get(event.event_id)
             if old_state_group is not None and old_state_group != state_group:
                 decrement_state_group_refcounts_batch(
-                    self._embedded_hamt_namespace, [old_state_group]
+                    self._embedded_hamt_engine,
+                    self._embedded_hamt_namespace,
+                    [old_state_group],
                 )
                 increment_state_group_refcounts_batch(
-                    self._embedded_hamt_namespace, [state_group]
+                    self._embedded_hamt_engine,
+                    self._embedded_hamt_namespace,
+                    [state_group],
                 )
+            # One sync for the whole rewrite (put + decrement + increment
+            # above), not one per helper call -- see
+            # put_event_to_state_group_batch's docstring.
+            maybe_sync(SyncTier.DURABLE)
         else:
             self.db_pool.simple_update_txn(
                 txn,

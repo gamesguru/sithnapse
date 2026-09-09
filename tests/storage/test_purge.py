@@ -401,22 +401,42 @@ class PurgeTests(HomeserverTestCase):
                 current_state_ids=None,
             )
         )
-        # get_referenced_state_groups() always queries the plain SQL
-        # event_to_state_groups table here, regardless of embedded_hamt_engine:
-        # it only reads the embedded mdbx refcount store when
-        # _embedded_event_json_enabled is true, which is a separate, currently
-        # hard-disabled feature (see embedded_event_json.py). A real SQL
-        # insert is required to make this state group look referenced, even
-        # when the state HAMT itself is on the embedded engine.
-        self.get_success(
-            self.store.db_pool.simple_insert(
-                "event_to_state_groups",
-                {
-                    "event_id": "$new_event",
-                    "state_group": referenced_chain_state_group,
-                },
+        # get_referenced_state_groups() reads whichever backend is actually
+        # authoritative for event_to_state_groups: the embedded mtxdb
+        # refcount store when the embedded engine is enabled (it's
+        # exclusive, not a dual-write with SQL -- see
+        # embedded_event_to_state_group.py), plain SQL otherwise. Go
+        # through the same production functions the real persist-events
+        # path uses for whichever is active, rather than reaching into one
+        # backend directly -- a raw SQL-only insert would silently stop
+        # making this group look referenced the moment the embedded engine
+        # is on, since real writes wouldn't touch SQL at all in that case.
+        if getattr(self.store, "_embedded_event_json_enabled", False):
+            from synapse.storage.databases.main.embedded_event_to_state_group import (
+                increment_state_group_refcounts_batch,
+                put_event_to_state_group_batch,
             )
-        )
+
+            put_event_to_state_group_batch(
+                self.store._embedded_hamt_engine,
+                self.store._embedded_hamt_namespace,
+                [("$new_event", referenced_chain_state_group)],
+            )
+            increment_state_group_refcounts_batch(
+                self.store._embedded_hamt_engine,
+                self.store._embedded_hamt_namespace,
+                [referenced_chain_state_group],
+            )
+        else:
+            self.get_success(
+                self.store.db_pool.simple_insert(
+                    "event_to_state_groups",
+                    {
+                        "event_id": "$new_event",
+                        "state_group": referenced_chain_state_group,
+                    },
+                )
+            )
 
         # Insert and run the background update.
         self.get_success(

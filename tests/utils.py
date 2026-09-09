@@ -22,7 +22,6 @@
 import atexit
 import logging
 import os
-import shutil
 import signal
 import sys
 import tempfile
@@ -99,26 +98,32 @@ POSTGRES_BASE_DB = "_synapse_unit_tests_base_%s" % (os.getpid(),)
 SQLITE_PERSIST_DB = os.environ.get("SYNAPSE_TEST_PERSIST_SQLITE_DB") is not None
 
 # When set, every test homeserver runs its HAMT state store through the
-# embedded engine (mdbx) instead of plain SQL -- the trial-mdbx CI job's
-# whole purpose. mdbx is just a local file, so no "is a server reachable"
-# check is needed here -- config/database.py opens it directly.
+# embedded engine (mtxdb) instead of plain SQL -- the trial-embedded
+# CI job's whole purpose. The embedded engine is just a local file, so no
+# "is a server reachable" check is needed here -- config/database.py opens
+# it directly.
 #
 # Deliberately *not* falling back to the bare deployment switches
-# (SYNAPSE_EMBEDDED_HAMT_ENGINE / SYNAPSE_EMBEDDED_HAMT_PATH / SYNAPSE_MDBX):
+# (SYNAPSE_EMBEDDED_HAMT_ENGINE / SYNAPSE_EMBEDDED_HAMT_PATH / SYNAPSE_MTXDB):
 # unit tests inherit the process environment, and a shell configured for
 # running a real homeserver (e.g. SYNAPSE_EMBEDDED_HAMT_PATH pointing at a
-# production mdbx store) must not have `trial` silently open and mutate
-# that store. Only the SYNAPSE_TEST_-prefixed, test-only variables are
-# honoured here. SYNAPSE_TEST_MDBX is a shorthand alias for the common case
-# of just wanting the mdbx engine, without spelling out the engine name.
+# production store) must not have `trial` silently open and mutate that
+# store. Only the SYNAPSE_TEST_-prefixed, test-only variables are honoured
+# here. SYNAPSE_TEST_MTXDB is a shorthand alias for
+# the common case of just wanting the mtxdb engine, without spelling out the name.
 EMBEDDED_HAMT_ENGINE = os.environ.get("SYNAPSE_TEST_EMBEDDED_HAMT_ENGINE")
-if EMBEDDED_HAMT_ENGINE is None and os.environ.get("SYNAPSE_TEST_MDBX"):
-    EMBEDDED_HAMT_ENGINE = "mdbx"
+if EMBEDDED_HAMT_ENGINE is None and os.environ.get("SYNAPSE_TEST_MTXDB"):
+    EMBEDDED_HAMT_ENGINE = "mtxdb"
 
 EMBEDDED_HAMT_PATH = os.environ.get("SYNAPSE_TEST_EMBEDDED_HAMT_PATH")
 if EMBEDDED_HAMT_PATH is None and EMBEDDED_HAMT_ENGINE:
     EMBEDDED_HAMT_PATH = tempfile.mkdtemp()
-    atexit.register(shutil.rmtree, EMBEDDED_HAMT_PATH, ignore_errors=True)
+
+if EMBEDDED_HAMT_ENGINE:
+    print(
+        f"Embedded HAMT engine: {EMBEDDED_HAMT_ENGINE} at {EMBEDDED_HAMT_PATH}",
+        file=sys.stderr,
+    )
 
 # the dbname we will connect to in order to create the base database.
 POSTGRES_DBNAME_FOR_INITIAL_CREATE = "postgres"
@@ -286,9 +291,9 @@ def default_config(
     if EMBEDDED_HAMT_ENGINE and EMBEDDED_HAMT_PATH:
         # Many test homeservers (each with their own fresh SQL database, so
         # each restarting its state_group id sequence at 1) can share this
-        # one mdbx file across a whole trial worker process. Without a
+        # one mtxdb file across a whole trial worker process. Without a
         # unique namespace per homeserver, two different tests' state_group
-        # 1 would collide on the same mdbx keys and silently read each
+        # 1 would collide on the same mtxdb keys and silently read each
         # other's data.
         config_dict["embedded_hamt"] = {
             "engine": EMBEDDED_HAMT_ENGINE,

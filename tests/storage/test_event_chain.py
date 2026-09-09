@@ -491,7 +491,7 @@ class EventChainStoreTestCase(HomeserverTestCase):
         # Fetch all the links and pass them to the _LinkMap. Go via the same
         # `_get_chain_links` the production code uses (rather than reading
         # `event_auth_chain_links` directly) so this test exercises whichever
-        # backend -- SQL or the embedded mdbx engine -- is actually
+        # backend -- SQL or the embedded mtxdb engine -- is actually
         # configured, instead of only ever checking the SQL table.
         embedded_hamt_namespace = resolve_namespace(self.store)
 
@@ -503,6 +503,7 @@ class EventChainStoreTestCase(HomeserverTestCase):
                 txn,
                 {chain_id for chain_id, _ in chain_map.values()},
                 embedded_hamt_namespace,
+                getattr(self.store, "_embedded_hamt_engine", None),
             ):
                 for origin_chain_id, values in links.items():
                     for (

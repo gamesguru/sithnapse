@@ -1,8 +1,8 @@
 #!/usr/bin/env python
-"""Measure libmdbx point lookups after best-effort OS page-cache eviction.
+"""Measure libmtxdb point lookups after best-effort OS page-cache eviction.
 
 This complements the steady-state benchmarks. It deliberately runs every
-measured lookup in a fresh process: the Rust mdbx binding owns a process-global
+measured lookup in a fresh process: the Rust mtxdb binding owns a process-global
 environment and its mmap must be gone before asking the kernel to reclaim the
 database's file-backed pages.
 
@@ -10,12 +10,12 @@ On Linux, ``POSIX_FADV_DONTNEED`` is advisory, so label these results
 "evicted-page" rather than claiming perfectly cold storage. For a strict
 device-cold result, boot into a controlled test host (or use a data set larger
 than RAM) and run this script there. It never uses ``drop_caches`` and affects
-only its temporary MDBX files.
+only its temporary mtxdb files.
 
 Usage::
 
-    python3 scripts-dev/benchmark_mdbx_cold_reads.py
-    python3 scripts-dev/benchmark_mdbx_cold_reads.py --rows 2000000 --samples 200
+    python3 scripts-dev/benchmark_mtxdb_cold_reads.py
+    python3 scripts-dev/benchmark_mtxdb_cold_reads.py --rows 2000000 --samples 200
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ def read_key(path: Path, index: int) -> bytes:
 
 
 def evict_database_pages(database_dir: Path) -> None:
-    """Ask the kernel to reclaim clean pages from this temporary MDBX database."""
+    """Ask the kernel to reclaim clean pages from this temporary mtxdb database."""
     if not hasattr(os, "posix_fadvise"):
         raise RuntimeError("this benchmark requires os.posix_fadvise (POSIX/Linux)")
 
@@ -63,9 +63,9 @@ def evict_database_pages(database_dir: Path) -> None:
 
 
 def seed(database_dir: Path, keys_path: Path, rows: int, value_size: int) -> None:
-    # Import here so the coordinator process never owns the process-global MDBX
+    # Import here so the coordinator process never owns the process-global mtxdb
     # environment. This process exits immediately after building the corpus.
-    from synapse.synapse_rust import mdbx_engine
+    from synapse.synapse_rust import mtxdb_engine
 
     rng = random.Random(0)
     entries: list[tuple[bytes, bytes]] = []
@@ -75,21 +75,21 @@ def seed(database_dir: Path, keys_path: Path, rows: int, value_size: int) -> Non
             keys.write(key)
             entries.append((key, rng.randbytes(value_size)))
 
-    mdbx_engine.open_client(str(database_dir))
-    mdbx_engine.batch_put(entries)
+    mtxdb_engine.open_client(str(database_dir))
+    mtxdb_engine.batch_put(entries)
 
 
 def measure(database_dir: Path, key: bytes) -> None:
     # Time only the lookup. Opening the environment happens before the timer,
     # but it may itself fault metadata pages and is intentionally part of the
     # cold-cache setup, just as a restarted Synapse worker would do.
-    from synapse.synapse_rust import mdbx_engine
+    from synapse.synapse_rust import mtxdb_engine
 
-    mdbx_engine.open_client(str(database_dir))
+    mtxdb_engine.open_client(str(database_dir))
     started = time.perf_counter_ns()
-    value = mdbx_engine.get(key)
+    results = mtxdb_engine.batch_get([key])
     elapsed_us = (time.perf_counter_ns() - started) / 1_000
-    if value is None:
+    if not results:
         raise RuntimeError("seeded key was not found")
     print(json.dumps({"elapsed_us": elapsed_us}))
 
@@ -104,7 +104,7 @@ def run_parent(rows: int, value_size: int, samples: int, workdir: Path) -> None:
     # Do not default to /tmp: it is commonly tmpfs (as it is on CI and this
     # development host), which would turn an I/O-cold benchmark into RAM-only
     # timing. The caller may select a dedicated directory on the target NVMe.
-    workspace = Path(tempfile.mkdtemp(prefix="mdbx-evicted-page-bench-", dir=workdir))
+    workspace = Path(tempfile.mkdtemp(prefix="mtxdb-evicted-page-bench-", dir=workdir))
     database_dir = workspace / "database"
     keys_path = workspace / "keys.bin"
     database_dir.mkdir()
@@ -143,7 +143,7 @@ def run_parent(rows: int, value_size: int, samples: int, workdir: Path) -> None:
         p50 = statistics.median(ordered)
         p95 = ordered[int(len(ordered) * 0.95)]
         p99 = ordered[int(len(ordered) * 0.99)]
-        print("\n=== MDBX evicted-page point lookup (us) ===")
+        print("\n=== mtxdb evicted-page point lookup (us) ===")
         print(f"rows={rows:,}, value_size={value_size}, samples={samples}")
         print(f"p50={p50:.1f}  p95={p95:.1f}  p99={p99:.1f}  max={ordered[-1]:.1f}")
     finally:

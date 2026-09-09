@@ -1236,7 +1236,7 @@ def generate_worker_files(
                 "port": MAIN_PROCESS_REPLICATION_PORT,
             }
 
-    # Support for an embedded HAMT engine (mdbx) in Complement integration
+    # Support for an embedded HAMT engine (mtxdb) in Complement integration
     # tests doesn't need anything here -- SYNAPSE_EMBEDDED_HAMT_ENGINE/
     # SYNAPSE_EMBEDDED_HAMT_PATH are read directly as environment variables
     # in synapse/config/database.py, independent of this generated

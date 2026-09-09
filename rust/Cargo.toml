@@ -63,6 +63,7 @@ ulid = "1.1.2"
 # can still bump them past 2.2.0 on its own range. Pin them explicitly here
 # too so they can't drift independently of icu_segmenter.
 icu_segmenter = "=2.2.0"
+# NOTE: pinned to match icu_segmenter; transitive-only but must not drift past 2.2.0 (MSRV 1.87)
 icu_provider = "=2.2.0"
 icu_locale_core = "=2.2.0"
 reqwest = { version = "0.12.15", default-features = false, features = [
@@ -75,9 +76,8 @@ futures = "0.3.31"
 tokio = { version = "1.44.2", features = ["rt", "rt-multi-thread"] }
 once_cell = "1.18.0"
 lru = "0.12"
-itertools = "0.14.0"
 rezzy ={ git = "https://github.com/gamesguru/rezzy.git", rev = "82c9078f69297fe81cecf12516af71236e398712" }
-libmdbx = "0.6.6"
+mtxdb = { git = "https://gitlab.com/wombat-foundation/mtxdb.git", branch = "dev" }
 
 [build-dependencies]
 blake2 = "0.10.4"
@@ -89,5 +89,9 @@ name = "state_hamt"
 path = "benches/state_hamt.rs"
 harness = false
 
+[package.metadata.cargo-machete]
+ignored = ["icu_provider", "icu_locale_core"]
+
 [dev-dependencies]
+itertools = "0.14.0"
 tempfile = "3.27.0"

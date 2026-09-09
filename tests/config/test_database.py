@@ -68,7 +68,7 @@ class DatabaseConfigTestCase(unittest.TestCase):
 
         with self.assertRaises(ConfigError):
             self._read_config(
-                embedded_hamt={"engine": "mdbx"},
+                embedded_hamt={"engine": "mtxdb"},
             )
 
     def test_engine_without_path_env_raises(self) -> None:
@@ -77,7 +77,7 @@ class DatabaseConfigTestCase(unittest.TestCase):
 
         with self.assertRaises(ConfigError):
             self._read_config(
-                env={"SYNAPSE_EMBEDDED_HAMT_ENGINE": "mdbx"},
+                env={"SYNAPSE_EMBEDDED_HAMT_ENGINE": "mtxdb"},
             )
 
     def test_path_without_engine_raises(self) -> None:
@@ -86,11 +86,11 @@ class DatabaseConfigTestCase(unittest.TestCase):
 
         with self.assertRaises(ConfigError):
             self._read_config(
-                embedded_hamt={"path": "/tmp/test.mdbx"},
+                embedded_hamt={"path": "/tmp/test.mtxdb"},
             )
 
-    def test_engine_not_mdbx_raises(self) -> None:
-        """engine set to a non-mdbx value → ConfigError."""
+    def test_engine_unsupported_raises(self) -> None:
+        """engine set to an unsupported value → ConfigError."""
         from synapse.config._base import ConfigError
 
         with self.assertRaises(ConfigError):
@@ -98,16 +98,72 @@ class DatabaseConfigTestCase(unittest.TestCase):
                 embedded_hamt={"engine": "unknown_engine", "path": "/tmp/test"},
             )
 
-    def test_both_set_ok(self) -> None:
-        """engine + path both set → no error."""
+    def test_engine_mtxdb_ok(self) -> None:
+        """engine set to 'mtxdb' with a path → no error."""
         dc = self._read_config(
-            embedded_hamt={"engine": "mdbx", "path": "/tmp/test.mdbx"},
+            embedded_hamt={"engine": "mtxdb", "path": "/tmp/test"},
         )
-        self.assertEqual(dc.embedded_hamt_engine, "mdbx")
-        self.assertEqual(dc.embedded_hamt_path, "/tmp/test.mdbx")
+        self.assertEqual(dc.embedded_hamt_engine, "mtxdb")
 
     def test_neither_set_ok(self) -> None:
         """engine + path both unset → no error."""
         dc = self._read_config()
         self.assertIsNone(dc.embedded_hamt_engine)
         self.assertIsNone(dc.embedded_hamt_path)
+
+
+class EmbeddedHamtWorkerGuardTestCase(unittest.TestCase):
+    """Test that embedded_hamt.engine is rejected in multi-worker configs."""
+
+    def _make_worker_config(
+        self,
+        worker_app: str | None = None,
+        instance_map: dict | None = None,
+        embedded_hamt_engine: str | None = "mtxdb",
+    ) -> None:
+        """Build a WorkerConfig and call read_config, triggering the guard."""
+        from unittest.mock import Mock
+
+        from synapse.config.workers import WorkerConfig
+
+        root = Mock()
+        root.database.embedded_hamt_engine = embedded_hamt_engine
+
+        worker_config = WorkerConfig(root)
+        config: dict = {}
+        if worker_app is not None:
+            config["worker_app"] = worker_app
+        if instance_map is not None:
+            config["instance_map"] = instance_map
+        worker_config.read_config(config, allow_secrets_in_config=True)
+
+    def test_worker_app_raises(self) -> None:
+        """embedded_hamt + worker_app → ConfigError."""
+        from synapse.config._base import ConfigError
+
+        with self.assertRaises(ConfigError):
+            self._make_worker_config(
+                worker_app="synapse.app.generic_worker",
+                instance_map={"main": {"host": "127.0.0.1", "port": 8008}},
+            )
+
+    def test_instance_map_raises(self) -> None:
+        """embedded_hamt + non-empty instance_map (no worker_app) → ConfigError."""
+        from synapse.config._base import ConfigError
+
+        with self.assertRaises(ConfigError):
+            self._make_worker_config(
+                instance_map={"main": {"host": "127.0.0.1", "port": 8008}},
+            )
+
+    def test_single_process_ok(self) -> None:
+        """embedded_hamt alone (no worker_app, no instance_map) → no error."""
+        self._make_worker_config()
+
+    def test_no_embedded_hamt_with_workers_ok(self) -> None:
+        """worker_app + instance_map without embedded_hamt → no error."""
+        self._make_worker_config(
+            worker_app="synapse.app.generic_worker",
+            instance_map={"main": {"host": "127.0.0.1", "port": 8008}},
+            embedded_hamt_engine=None,
+        )

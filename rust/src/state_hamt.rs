@@ -216,8 +216,7 @@ pub fn room_structural_key_raw(room_id: &str) -> [u8; 32] {
 
 /// Derive a fixed-width, room-scoped prefix used to lay out this room's HAMT
 /// nodes contiguously in the embedded engine's flat sorted keyspace (see
-/// `database/core.rs`'s `node_key`). Despite the historical name this isn't
-/// TiKV-specific -- mdbx uses the exact same scheme (see `mdbx.rs`).
+/// `database/core.rs`'s `node_key`).
 ///
 /// For MSC4291-style room versions the room ID *is* `!` + base64url(hash(create
 /// event)) -- already a uniformly-distributed digest -- so we decode it directly

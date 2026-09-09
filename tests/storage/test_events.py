@@ -33,7 +33,8 @@ from synapse.types import StateMap
 from synapse.util.clock import Clock
 
 from tests.test_utils.event_builders import make_test_pdu_event
-from tests.unittest import HomeserverTestCase
+from tests.unittest import HomeserverTestCase, skip_unless
+from tests.utils import EMBEDDED_HAMT_ENGINE
 
 logger = logging.getLogger(__name__)
 
@@ -50,16 +51,17 @@ class EventsTestCase(HomeserverTestCase):
     ) -> None:
         self._store = self.hs.get_datastores().main
 
-    def test_get_event_via_embedded_mdbx_engine(self) -> None:
-        """`_store_event_txn` mirrors event_json into mdbx when
+    @skip_unless(EMBEDDED_HAMT_ENGINE is not None, "requires embedded HAMT engine")
+    def test_get_event_via_embedded_mtxdb_engine(self) -> None:
+        """`_store_event_txn` mirrors event_json into mtxdb when
         embedded_hamt_engine is configured; `_fetch_event_json_for_ids_txn`
         reads it back on the `get_event` path. Deleting the SQL
         `event_json` row entirely and still fetching the event correctly
         proves the embedded-engine fast path is actually taken, not a
         silent SQL fallback.
 
-        Note: `mdbx_engine.open_client` is backed by a process-global
-        `OnceCell` on the Rust side (one mdbx handle per process, matching
+        Note: `mtxdb_engine.open_client` is backed by a process-global
+        `OnceCell` on the Rust side (one mtxdb handle per process, matching
         how Synapse itself only ever opens one), so this call is a no-op
         if any earlier test in this process already opened a client --
         this test then exercises whatever database is already open, not
@@ -69,11 +71,11 @@ class EventsTestCase(HomeserverTestCase):
         import shutil
         import tempfile
 
-        from synapse.synapse_rust import mdbx_engine
+        from synapse.synapse_rust import mtxdb_engine
 
         tmpdir = tempfile.mkdtemp(prefix="test-embedded-event-json-")
         self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
-        mdbx_engine.open_client(tmpdir)
+        mtxdb_engine.open_client(tmpdir)
 
         persist_store = self.hs.get_datastores().persist_events
         assert persist_store is not None
@@ -83,7 +85,7 @@ class EventsTestCase(HomeserverTestCase):
         user = self.register_user("embedded_event_json_user", "pass")
         token = self.login("embedded_event_json_user", "pass")
         room_id = self.helper.create_room_as(user, tok=token)
-        event_id = self.helper.send(room_id, "hello embedded mdbx", tok=token)[
+        event_id = self.helper.send(room_id, "hello embedded mtxdb", tok=token)[
             "event_id"
         ]
 
@@ -95,13 +97,13 @@ class EventsTestCase(HomeserverTestCase):
             self._store.db_pool.simple_delete(
                 table="event_json",
                 keyvalues={"event_id": event_id},
-                desc="test_get_event_via_embedded_mdbx_engine",
+                desc="test_get_event_via_embedded_mtxdb_engine",
             )
         )
 
         event = self.get_success(self._store.get_event(event_id))
         self.assertEqual(event.event_id, event_id)
-        self.assertEqual(event.content.get("body"), "hello embedded mdbx")
+        self.assertEqual(event.content.get("body"), "hello embedded mtxdb")
 
     def test_get_senders_for_event_ids(self) -> None:
         """Tests the `get_senders_for_event_ids` storage function."""

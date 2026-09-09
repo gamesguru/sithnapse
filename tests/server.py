@@ -18,6 +18,7 @@
 # [This file includes modifications made by New Vector Limited]
 #
 #
+import atexit
 import hashlib
 import ipaddress
 import json
@@ -25,13 +26,15 @@ import logging
 import os
 import os.path
 import sqlite3
+import sys
 import time
 import uuid
 import warnings
 import weakref
-from collections import deque
+from collections import defaultdict, deque
 from io import SEEK_END, BytesIO
 from typing import (
+    IO,
     Any,
     Awaitable,
     Callable,
@@ -127,6 +130,58 @@ CustomHeaderType = tuple[str | bytes, str | bytes]
 # A pre-prepared SQLite DB that is used as a template when creating new SQLite
 # DB each test run. This dramatically speeds up test set up when using SQLite.
 PREPPED_SQLITE_DB_CONN: LoggingDatabaseConnection | None = None
+
+# ── Postgres per-test lifecycle timing (opt-in via SYNAPSE_PG_TIMINGS=1) ────
+_PG_TIMINGS: dict[str, float] = defaultdict(float)
+_PG_TIMING_COUNTS: dict[str, int] = defaultdict(int)
+
+_timings_file: IO[str] | None = None
+if os.environ.get("SYNAPSE_PG_TIMINGS"):
+    _timings_path = os.environ.get("SYNAPSE_PG_TIMINGS_FILE")
+    if _timings_path:
+        try:
+            _timings_file = open(_timings_path, "a")
+        except OSError:
+            pass
+
+
+def _timings_print(*args: object) -> None:
+    print(*args, file=sys.stderr)
+    if _timings_file is not None:
+        print(*args, file=_timings_file)
+
+
+def _pg_timing(tag: str, elapsed: float) -> None:
+    _PG_TIMINGS[tag] += elapsed
+    _PG_TIMING_COUNTS[tag] += 1
+
+
+def _print_pg_timings() -> None:
+    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+        return
+    _timings_print("\n=== Postgres test-DB lifecycle timings ===")
+    _timings_print(
+        f"  {'':40s}  {'total':>9s}  {'calls':>6s}  {'avg':>11s}",
+    )
+    for tag in sorted(_PG_TIMINGS):
+        total_s = _PG_TIMINGS[tag]
+        count = _PG_TIMING_COUNTS[tag]
+        total_ms = total_s * 1000
+        avg_ms = (total_s / count) * 1000 if count else 0.0
+        _timings_print(
+            f"  {tag:40s}  {total_ms:8.1f}ms  {count:6d}  {avg_ms:10.3f}ms",
+        )
+    total_s = sum(_PG_TIMINGS.values())
+    total_ms = total_s * 1000
+    _timings_print("")
+    _timings_print(
+        f"  {'TOTAL':40s}  {total_ms:8.1f}ms",
+    )
+    _timings_print("==========================================")
+    _timings_print("")
+
+
+atexit.register(_print_pg_timings)
 
 
 class TimedOutException(Exception):
@@ -1226,7 +1281,7 @@ def setup_test_homeserver(
                 "user": POSTGRES_USER,
                 "port": POSTGRES_PORT,
                 "cp_min": 1,
-                "cp_max": 5,
+                "cp_max": 1,
             },
         }
     else:
@@ -1295,6 +1350,7 @@ def setup_test_homeserver(
     # Create the database before we actually try and connect to it, based off
     # the template database we generate in setupdb()
     if USE_POSTGRES_FOR_TESTS:
+        _t0 = time.monotonic()
         db_conn = db_engine.module.connect(
             dbname=POSTGRES_BASE_DB,
             user=POSTGRES_USER,
@@ -1310,6 +1366,7 @@ def setup_test_homeserver(
         )
         cur.close()
         db_conn.close()
+        _pg_timing("create_database", time.monotonic() - _t0)
 
         def cleanup() -> None:
             import psycopg2
@@ -1327,6 +1384,24 @@ def setup_test_homeserver(
             db_engine.attempt_to_set_autocommit(db_conn, True)
             cur = db_conn.cursor()
 
+            # Force-close any other sessions still attached to the test DB
+            # (e.g. a connection pool that hasn't finished tearing down yet)
+            # before we try to drop it, rather than relying purely on
+            # retry-with-sleep below. This is scoped to this test's own
+            # scratch DB via datname, so it can't affect any other test.
+            try:
+                cur.execute(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                    "WHERE datname = %s AND pid <> pg_backend_pid();",
+                    (test_db,),
+                )
+            except psycopg2.Error:
+                warnings.warn(
+                    "Could not terminate backends for %s (non-superuser?)" % (test_db,),
+                    category=UserWarning,
+                    stacklevel=2,
+                )
+
             # Try a few times to drop the DB. Some things may hold on to the
             # database for a few more seconds due to flakiness, preventing
             # us from dropping it when the test is over. If we can't drop
@@ -1336,6 +1411,7 @@ def setup_test_homeserver(
                     cur.execute("DROP DATABASE IF EXISTS %s;" % (test_db,))
                     db_conn.commit()
                     dropped = True
+                    break
                 except psycopg2.OperationalError as e:
                     warnings.warn(
                         "Couldn't drop old db: " + str(e),
@@ -1384,8 +1460,10 @@ def setup_test_homeserver(
 
     # Patch `make_pool` before initialising the database, to make database transactions
     # synchronous for testing.
+    _t0 = time.monotonic()
     with patch("synapse.storage.database.make_pool", side_effect=make_fake_db_pool):
         hs.setup()
+    _pg_timing("hs_setup_total", time.monotonic() - _t0)
 
     # Ideally, setup/start would be separated but since this is historically used
     # throughout tests, we keep the existing behavior for now. We probably just need to

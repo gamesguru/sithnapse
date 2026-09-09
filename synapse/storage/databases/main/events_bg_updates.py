@@ -46,6 +46,7 @@ from synapse.storage.database import (
     make_tuple_comparison_clause,
 )
 from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
+from synapse.storage.databases.main.embedded_common import SyncTier, maybe_sync
 from synapse.storage.databases.main.embedded_event_json import put_event_json_batch
 from synapse.storage.databases.main.embedded_event_to_state_group import (
     get_state_group_for_events_batch,
@@ -240,7 +241,7 @@ class EventsBackgroundUpdatesStore(
             self._event_arbitrary_relations,
         )
 
-        if hs.config.database.embedded_hamt_engine == "mdbx":
+        if hs.config.database.embedded_hamt_engine == "mtxdb":
             self.db_pool.updates.register_background_update_handler(
                 self.EMBEDDED_EVENT_TO_STATE_GROUP_MIGRATION_UPDATE_NAME,
                 self._background_migrate_event_to_state_groups_to_embedded,
@@ -478,13 +479,14 @@ class EventsBackgroundUpdatesStore(
             )
             return 0
 
-        # The mdbx put below is idempotent (an overwrite), but the refcount
+        # The mtxdb put below is idempotent (an overwrite), but the refcount
         # increment is not: if this batch is reprocessed after a crash
         # between the writes here and the progress update below, an
         # unguarded increment would double-count every event already
         # migrated last time. Only increment for event_ids this batch
-        # hasn't already written to mdbx.
+        # hasn't already written to mtxdb.
         already_migrated = get_state_group_for_events_batch(
+            self._embedded_hamt_engine,
             self._embedded_hamt_namespace,
             [event_id for event_id, _state_group in rows],
         )
@@ -493,11 +495,17 @@ class EventsBackgroundUpdatesStore(
             for event_id, state_group in rows
             if event_id not in already_migrated
         ]
-        put_event_to_state_group_batch(self._embedded_hamt_namespace, rows)
+        put_event_to_state_group_batch(
+            self._embedded_hamt_engine, self._embedded_hamt_namespace, rows
+        )
         increment_state_group_refcounts_batch(
+            self._embedded_hamt_engine,
             self._embedded_hamt_namespace,
             [state_group for _event_id, state_group in new_rows],
         )
+        # One sync for the whole batch (put + increment above), not one per
+        # helper call -- see put_event_to_state_group_batch's docstring.
+        maybe_sync(SyncTier.DURABLE)
 
         await self.db_pool.updates._background_update_progress(
             self.EMBEDDED_EVENT_TO_STATE_GROUP_MIGRATION_UPDATE_NAME,
@@ -537,7 +545,7 @@ class EventsBackgroundUpdatesStore(
         origin_sequence_number, target_chain_id, target_sequence_number)`
         together are the primary key, so progress is a 4-tuple row-value
         cursor. There's also no already-migrated pre-check needed here: an
-        mdbx `batch_put` is a plain overwrite with no counter to
+        mtxdb `batch_put` is a plain overwrite with no counter to
         double-count, so reprocessing a batch after a crash is naturally
         idempotent (see `embedded_event_auth_chain_links.py`'s
         `put_chain_links_batch`).
@@ -585,7 +593,12 @@ class EventsBackgroundUpdatesStore(
             put_chain_links_batch,
         )
 
-        put_chain_links_batch(self._embedded_hamt_namespace, rows)
+        put_chain_links_batch(
+            self._embedded_hamt_engine,
+            self._embedded_hamt_namespace,
+            rows,
+            sync=True,
+        )
 
         (
             last_origin_chain_id,
@@ -1469,6 +1482,7 @@ class EventsBackgroundUpdatesStore(
             event_to_types,
             cast(dict[str, StrCollection], event_to_auth_chain),
             resolve_namespace(self),
+            self._embedded_hamt_engine,
         )
 
         return _CalculateChainCover(
@@ -1535,7 +1549,10 @@ class EventsBackgroundUpdatesStore(
                 # Exclusive by configured engine, not a dual-write -- see
                 # embedded_event_auth_chain_links.py.
                 delete_chain_links_batch(
-                    embedded_hamt_namespace, unreferenced_chain_id_tuples
+                    self._embedded_hamt_engine,
+                    embedded_hamt_namespace,
+                    unreferenced_chain_id_tuples,
+                    sync=True,
                 )
             else:
                 txn.executemany(
@@ -3126,6 +3143,8 @@ class EventsBackgroundUpdatesStore(
                 # signature) JSON forever from the embedded engine.
                 if getattr(self, "_embedded_event_json_enabled", False):
                     put_event_json_batch(
+                        self._embedded_hamt_engine,
+                        self._embedded_hamt_namespace,
                         [
                             (
                                 event_id,
@@ -3134,7 +3153,7 @@ class EventsBackgroundUpdatesStore(
                                 event.format_version,
                             )
                             for event_id, event_dict, event in events_to_write
-                        ]
+                        ],
                     )
             # Always update the progress even if we re-sign nothing.
             self.db_pool.updates._background_update_progress_txn(
