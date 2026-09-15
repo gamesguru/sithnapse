@@ -194,8 +194,14 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             # state_group -> root_structural_hash for groups created on
             # this (non-writer) instance whose mtxdb mirror write was
             # skipped -- see `store_state_group`'s skip_mirror_write and
-            # `pop_pending_embedded_hamt_root`. Only ever populated when
-            # `_embedded_hamt_is_writer` is False; harmless if unused.
+            # `pop_pending_embedded_hamt_root`. Entries live only between
+            # `store_state_group` returning and the immediate
+            # `pop_pending_embedded_hamt_root` call in
+            # `UnpersistedEventContext.persist` a few lines later in the
+            # same coroutine -- not held across a request lifetime, so
+            # there's nothing here for `EventContext.serialize` retries to
+            # lose. Only ever populated when `_embedded_hamt_is_writer` is
+            # False; harmless if unused.
             self._pending_embedded_hamt_mirrors: dict[int, bytes] = {}
             try:
                 engine = get_embedded_engine(self._embedded_hamt_engine)
