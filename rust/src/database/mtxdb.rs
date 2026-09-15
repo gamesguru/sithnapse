@@ -14,7 +14,7 @@ struct MtxdbPools {
     auth_chain: Arc<PackfileStorage>,
 }
 
-/// Base directory for the state_group -> room_prefix room-index files (see
+/// Base directory for the state_group -> room_prefix room-index file (see
 /// `room_index` module below), set once by `open_client`.
 static ROOM_INDEX_DIR: OnceCell<std::path::PathBuf> = OnceCell::new();
 
