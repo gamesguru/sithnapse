@@ -216,8 +216,7 @@ pub fn room_structural_key_raw(room_id: &str) -> [u8; 32] {
 
 /// Derive a fixed-width, room-scoped prefix used to lay out this room's HAMT
 /// nodes contiguously in the embedded engine's flat sorted keyspace (see
-/// `database/core.rs`'s `node_key`). Despite the historical name this isn't
-/// TiKV-specific -- mdbx uses the exact same scheme (see `mdbx.rs`).
+/// `database/core.rs`'s `node_key`).
 ///
 /// For MSC4291-style room versions the room ID *is* `!` + base64url(hash(create
 /// event)) -- already a uniformly-distributed digest -- so we decode it directly
@@ -856,6 +855,26 @@ pub(crate) fn lookup_from_node_map(
     keys: &[(String, String)],
     node_map: &HashMap<StructuralHash, Arc<HamtNode<String, String>>>,
 ) -> Result<(Vec<PyStateEntry>, HashSet<StructuralHash>), String> {
+    let encoded_keys = keys
+        .iter()
+        .map(|(event_type, state_key)| {
+            serde_json::to_string(&(event_type, state_key))
+                .map_err(|e| format!("Failed to encode HAMT state key: {e}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    lookup_from_node_map_preencoded(root_hash, structural_key, keys, &encoded_keys, node_map)
+}
+
+/// Equivalent to [`lookup_from_node_map`], except callers retrying a lookup
+/// while fetching missing nodes can serialize the query keys only once.
+pub(crate) fn lookup_from_node_map_preencoded(
+    root_hash: &StructuralHash,
+    structural_key: &[u8],
+    keys: &[(String, String)],
+    encoded_keys: &[String],
+    node_map: &HashMap<StructuralHash, Arc<HamtNode<String, String>>>,
+) -> Result<(Vec<PyStateEntry>, HashSet<StructuralHash>), String> {
+    debug_assert_eq!(keys.len(), encoded_keys.len());
     let root_node = node_map
         .get(root_hash)
         .cloned()
@@ -863,15 +882,13 @@ pub(crate) fn lookup_from_node_map(
     let mut entries = Vec::new();
     let mut missing = HashSet::new();
 
-    for (event_type, state_key) in keys {
-        let key = serde_json::to_string(&(event_type, state_key))
-            .map_err(|e| format!("Failed to encode HAMT state key: {e}"))?;
+    for ((event_type, state_key), key) in keys.iter().zip(encoded_keys) {
         let mut resolver = |hash: &StructuralHash| {
             node_map.get(hash).cloned().ok_or_else(|| {
                 missing.insert(*hash);
             })
         };
-        if let Ok(Some(event_id)) = root_node.search(structural_key, &key, &mut resolver) {
+        if let Ok(Some(event_id)) = root_node.search(structural_key, key, &mut resolver) {
             entries.push((event_type.clone(), state_key.clone(), event_id));
         }
     }

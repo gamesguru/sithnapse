@@ -92,16 +92,33 @@ trial_no_extra_tests = [
     }
 ]
 
-# Run trial once against the embedded mdbx HAMT engine, the same way
-# trial_tikv_tests used to exercise the alternate node backend before TiKV
-# was removed -- see synapse/config/database.py's embedded_hamt_engine.
-trial_mdbx_tests = [
+# trial_mtxdb_tests: test mtxdb on oldest and newest Python versions
+# in PRs, and all versions on non-PR runs. The dedicated trial-mtxdb job
+# in tests.yml runs on Python 3.12; this matrix ensures coverage on the
+# oldest (3.10) and newest (3.13) supported versions too.
+trial_mtxdb_tests = [
     {
         "python-version": "3.10",
-        "database": "mdbx",
+        "database": "mtxdb",
         "extras": "all",
-    }
+    },
+    {
+        "python-version": "3.13",
+        "database": "mtxdb",
+        "extras": "all",
+    },
 ]
+
+if not IS_PR:
+    # Check all supported Python versions.
+    trial_mtxdb_tests.extend(
+        {
+            "python-version": version,
+            "database": "mtxdb",
+            "extras": "all",
+        }
+        for version in ("3.11", "3.12", "3.13")
+    )
 
 print("::group::Calculated trial jobs")
 print(
@@ -109,14 +126,14 @@ print(
         trial_sqlite_tests
         + trial_postgres_tests
         + trial_no_extra_tests
-        + trial_mdbx_tests,
+        + trial_mtxdb_tests,
         indent=4,
     )
 )
 print("::endgroup::")
 
 test_matrix = json.dumps(
-    trial_sqlite_tests + trial_postgres_tests + trial_no_extra_tests + trial_mdbx_tests
+    trial_sqlite_tests + trial_postgres_tests + trial_no_extra_tests + trial_mtxdb_tests
 )
 set_output("trial_test_matrix", test_matrix)
 
@@ -144,12 +161,6 @@ sytest_tests = [
         "postgres": "multi-postgres",
         "workers": "workers",
         "reactor": "asyncio",
-    },
-    {
-        "sytest-tag": "bookworm",
-        "postgres": "multi-postgres",
-        "workers": "workers",
-        "embedded_hamt": "mdbx",
     },
 ]
 

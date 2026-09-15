@@ -1,12 +1,10 @@
 //! Generic HAMT node-store logic backing the embedded single-process KV
-//! engine ([`crate::database::mdbx`]). The backend implements only
+//! engine ([`crate::database::mtxdb`]). The backend implements only
 //! [`NodeStore`] (a thin point-lookup/write surface over its own storage
 //! primitive) and owns its own process-global handle + node cache; the BFS
 //! materialize/selective-lookup walk, the node-cache verify-on-hit logic,
-//! and the key-encoding scheme live here. Kept separate from `mdbx.rs`
-//! (rather than folded together) mainly because it was shared with a
-//! second backend (fjall) that was benchmarked and dropped -- see
-//! `database/mod.rs`'s doc comment.
+//! and the key-encoding scheme live here. Kept separate from `mtxdb.rs`
+//! (rather than folded together) to keep the BFS logic engine-agnostic.
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
@@ -18,7 +16,7 @@ use rezzy::hamt::{HamtNode, StructuralHash};
 use sha2::{Digest, Sha256};
 
 use crate::state_hamt::{
-    decode_persisted_node_verified, lookup_from_node_map, materialize_from_node_map,
+    decode_persisted_node_verified, lookup_from_node_map_preencoded, materialize_from_node_map,
 };
 
 /// Minimal point-lookup/write surface every embedded HAMT KV backend must
@@ -135,7 +133,7 @@ pub fn decode_root_value(value: &[u8]) -> Result<RootRecord, String> {
 /// only definition of this layout -- unlike the HAMT node/root keys,
 /// there's no separate Python-side encoder to keep in sync with, since
 /// `embedded_event_auth_chain_links.py` is a thin pass-through to the
-/// `mdbx_engine` functions built from these.
+/// `mtxdb_engine` functions built from these.
 pub fn auth_chain_prefix(namespace: &str, origin_chain_id: i64) -> Vec<u8> {
     let namespace_hash = Sha256::digest(namespace.as_bytes());
     let mut key = Vec::with_capacity(17 + 32 + 1 + 8);
@@ -193,24 +191,6 @@ pub fn decode_auth_chain_link_suffix(key: &[u8], prefix: &[u8]) -> Result<(i64, 
         target_chain_id,
         target_sequence_number,
     ))
-}
-
-/// Batched root lookup: one call in from Python instead of an N-iteration
-/// `for` loop each doing its own FFI round trip. Returns `None` per group
-/// that has no root record in this engine (the caller falls back to SQL
-/// for those, same self-healing shape as node reads).
-pub fn batch_get_state_hamt_roots(
-    store: &dyn NodeStore,
-    namespace: &str,
-    groups: &[i64],
-) -> Result<Vec<Option<RootRecord>>, String> {
-    groups
-        .iter()
-        .map(|&group| match store.get_raw(&root_key(namespace, group))? {
-            Some(value) => Ok(Some(decode_root_value(&value)?)),
-            None => Ok(None),
-        })
-        .collect()
 }
 
 /// Encodes a batch of `(structural_hash, node_bytes)` pairs (the shape
@@ -338,7 +318,9 @@ pub fn materialize_state_hamts(
                                 node_map.insert((*room_prefix, *structural_key, *hash), node);
                             }
                         }
-                        None => still_missing.push((key, *room_prefix, *structural_key, *hash)),
+                        None => {
+                            still_missing.push((key, *room_prefix, *structural_key, *hash));
+                        }
                     }
                 }
             }
@@ -395,6 +377,21 @@ pub fn lookup_state_hamts(
     let mut node_map: HashMap<NodeLocation, Arc<HamtNode<String, String>>> = HashMap::new();
     let mut seen: HashSet<NodeLocation> = queries.iter().map(|(p, h, k, _)| (*p, *k, *h)).collect();
     let mut to_fetch: HashSet<NodeLocation> = seen.clone();
+    let encoded_query_keys = queries
+        .iter()
+        .map(|(_, _, _, keys)| {
+            keys.iter()
+                .map(|(event_type, state_key)| {
+                    serde_json::to_string(&(event_type, state_key))
+                        .map_err(|e| format!("Failed to encode HAMT state key: {e}"))
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    // Each loop's lookup results are valid iff it enqueued no further nodes.
+    // Keep the latest result so that successful final round is returned
+    // directly instead of traversing every query a second time below.
+    let mut latest_entries = vec![None; queries.len()];
 
     while !to_fetch.is_empty() {
         let current_batch: Vec<NodeLocation> = to_fetch.drain().collect();
@@ -415,7 +412,9 @@ pub fn lookup_state_hamts(
                                     .insert((*room_prefix, *structural_key, *hash), node.clone());
                             }
                         }
-                        None => still_missing.push((key, *room_prefix, *structural_key, *hash)),
+                        None => {
+                            still_missing.push((key, *room_prefix, *structural_key, *hash));
+                        }
                     }
                 }
             }
@@ -441,11 +440,17 @@ pub fn lookup_state_hamts(
                 .insert(*hash, Arc::clone(node));
         }
 
-        for (room_prefix, root_hash, structural_key, keys) in &queries {
+        for (index, (room_prefix, root_hash, structural_key, keys)) in queries.iter().enumerate() {
             if let Some(prefix_nodes) = nodes_by_prefix.get(room_prefix) {
                 if prefix_nodes.contains_key(root_hash) {
-                    let (_entries, missing) =
-                        lookup_from_node_map(root_hash, structural_key, keys, prefix_nodes)?;
+                    let (entries, missing) = lookup_from_node_map_preencoded(
+                        root_hash,
+                        structural_key,
+                        keys,
+                        &encoded_query_keys[index],
+                        prefix_nodes,
+                    )?;
+                    latest_entries[index] = Some(entries);
                     for missing_hash in missing {
                         let child_loc = (*room_prefix, *structural_key, missing_hash);
                         if seen.insert(child_loc) {
@@ -457,33 +462,85 @@ pub fn lookup_state_hamts(
         }
     }
 
-    type PrefixNodeMap = HashMap<StructuralHash, Arc<HamtNode<String, String>>>;
-    let mut nodes_by_prefix: HashMap<[u8; ROOM_PREFIX_LEN], PrefixNodeMap> = HashMap::new();
-    for ((room_prefix, _, hash), node) in node_map {
-        nodes_by_prefix
-            .entry(room_prefix)
-            .or_default()
-            .insert(hash, node);
-    }
-
-    queries
+    latest_entries
         .into_iter()
-        .map(|(room_prefix, root_hash, structural_key, keys)| {
-            let prefix_nodes = nodes_by_prefix.get(&room_prefix).ok_or_else(|| {
+        .enumerate()
+        .map(|(index, entries)| {
+            entries.ok_or_else(|| {
+                let (room_prefix, _, _, _) = &queries[index];
                 format!(
                     "Missing nodes for room prefix: {}",
                     hex::encode(room_prefix)
                 )
-            })?;
-            let (entries, missing) =
-                lookup_from_node_map(&root_hash, &structural_key, &keys, prefix_nodes)?;
-            if !missing.is_empty() {
-                return Err(format!(
-                    "Unresolved missing nodes after fetch loop for root {:02x?}",
-                    root_hash
-                ));
-            }
-            Ok(entries)
+            })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::{lookup_state_hamts, new_node_cache, node_key, NodeStore};
+    use crate::state_hamt::{
+        build_root_handle_and_nodes, room_hamt_prefix_raw, room_structural_key_raw,
+    };
+
+    struct MemoryStore(HashMap<Vec<u8>, Vec<u8>>);
+
+    impl NodeStore for MemoryStore {
+        fn get_raw(&self, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
+            Ok(self.0.get(key).cloned())
+        }
+    }
+
+    #[test]
+    fn lookup_returns_entry_resolved_by_the_last_fetch_round() {
+        let room_id = "!lookup:test.example";
+        let namespace = "test";
+        let entries = (0..1_000)
+            .map(|index| {
+                (
+                    "m.room.member".to_owned(),
+                    format!("@user-{index}:test.example"),
+                    format!("${index}"),
+                )
+            })
+            .collect();
+        let ((root_hash, _), nodes) =
+            build_root_handle_and_nodes(room_id, entries).expect("HAMT root should build");
+        let room_prefix = room_hamt_prefix_raw(room_id, false).expect("valid room prefix");
+        let structural_key = room_structural_key_raw(room_id);
+        let store = MemoryStore(
+            nodes
+                .into_iter()
+                .map(|(hash, bytes)| (node_key(namespace, &room_prefix, &hash), bytes))
+                .collect(),
+        );
+
+        let result = lookup_state_hamts(
+            &store,
+            &new_node_cache(),
+            namespace,
+            vec![(
+                room_prefix,
+                root_hash,
+                structural_key,
+                vec![(
+                    "m.room.member".to_owned(),
+                    "@user-42:test.example".to_owned(),
+                )],
+            )],
+        )
+        .expect("lookup should resolve nodes fetched by the final round");
+
+        assert_eq!(
+            result,
+            vec![vec![(
+                "m.room.member".to_owned(),
+                "@user-42:test.example".to_owned(),
+                "$42".to_owned(),
+            )]]
+        );
+    }
 }

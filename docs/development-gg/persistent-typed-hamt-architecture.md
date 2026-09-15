@@ -226,12 +226,12 @@ mapping is permanent/immutable, all readers can resolve it from the same TiKV
 namespace, measured SQL round trips actually dominate the workload, and
 ownership/repair semantics are specified.
 
-## Storage Engine Selection & libmdbx Embedded Architecture
+## Storage Engine Selection & mtxdb Embedded Architecture
 
-`libmdbx` was selected as Synapse's embedded storage engine alongside
+`mtxdb` was selected as Synapse's embedded storage engine alongside
 PostgreSQL. `fjall` was evaluated first and dropped -- see `git log` for
-`ab59dd8ba6` ("storage(embedded): drop fjall, commit to mdbx as the embedded
-engine") -- both on measured latency and architecturally: mdbx supports native
+`ab59dd8ba6` ("storage(embedded): drop fjall, commit to mtxdb as the embedded
+engine") -- both on measured latency and architecturally: mtxdb supports native
 multi-process `mmap` access on a shared filesystem, while fjall's LSM tree can
 only be opened by one OS process, which would require a separate RPC/socket
 bridge for every non-owning worker. **No such bridge was ever built or
@@ -242,14 +242,14 @@ rather than re-estimated.
 
 ### Warm-cache benchmark summary (2,000,000 nodes, 512 bytes/node)
 
-Re-run from scratch on `scripts-dev/benchmark_hamt_mdbx_vs_postgres.py` (mdbx
+Re-run from scratch on `scripts-dev/benchmark_hamt_mtxdb_vs_postgres.py` (mtxdb
 and postgres are both still live in the tree and directly reproducible; fjall's
 crate/bindings were fully removed in `ab59dd8ba6`, so its figures below are
 unverified historical data rather than newly measured results):
 
 ```text
 =====================================================================================
-Batch Size    fjall (in-process)*   libmdbx (direct mmap)    postgres    speedup**
+Batch Size    fjall (in-process)*   mtxdb (content-addressed packfile)    postgres    speedup**
 -------------------------------------------------------------------------------------
 batch = 1          14.2 us               6.5 us                64.7 us      9.9x
 batch = 5          79.0 us              18.5 us               116.2 us      6.3x
@@ -262,16 +262,16 @@ bulk-load rows/s      n/a              192,129                 58,531       3.3x
   contained the fabricated "fjall + UDS Bridge" row above, and the script
   that could have produced them is deleted, so there's no raw log left to
   check them against and no way to rerun them (fjall's crate is gone too).
-  Treat as unconfirmed, not as measured fact -- fjall lost to mdbx clearly
+  Treat as unconfirmed, not as measured fact -- fjall lost to mtxdb clearly
   enough on every other axis that nothing here hinges on these two numbers.
-** mdbx vs postgres, the two columns re-run together (see below).
+** mtxdb vs postgres, the two columns re-run together (see below).
 ```
 
-(p50 latencies; see the script for p99 and full methodology. mdbx and postgres
+(p50 latencies; see the script for p99 and full methodology. mtxdb and postgres
 are reproducible:
-`eval "$(scripts-dev/start_test_postgres.sh)"; python3 scripts-dev/benchmark_hamt_mdbx_vs_postgres.py`.
+`eval "$(scripts-dev/start_test_postgres.sh)"; python3 scripts-dev/benchmark_hamt_mtxdb_vs_postgres.py`.
 Includes both fixes below: sorted `batch_put` and a single explicit transaction
-for the postgres bulk-load, so mdbx and postgres each pay exactly one commit for
+for the postgres bulk-load, so mtxdb and postgres each pay exactly one commit for
 the whole corpus -- the postgres bulk-load number barely moved from the earlier,
 per-page-autocommit measurement (58,202 -> 58,531 rows/s) because
 `start_test_postgres.sh` already disables fsync/synchronous_commit on this
@@ -281,7 +281,7 @@ methodology bug was real, its effect on these particular numbers wasn't.)
 fjall's read numbers are unverified (see note above) -- they come from the
 now-deleted `benchmark_hamt_storage_engines.py`, allegedly run before
 `ab59dd8ba6` removed the crate/bindings, but no raw output survives to confirm
-it. If true, they'd already put fjall slower than mdbx in-process, before
+it. If true, they'd already put fjall slower than mtxdb in-process, before
 accounting for the bridge a multi-process deployment would have additionally
 required (never built, see above) -- but don't cite these two figures as solid.
 Its bulk-load throughput and commit latency were never recorded anywhere in this
@@ -291,14 +291,14 @@ guessed.
 
 ### Two methodology fixes behind these numbers
 
-**Bulk-load throughput (`73283299ed`)**: the one leg mdbx originally _lost_.
+**Bulk-load throughput (`73283299ed`)**: the one leg mtxdb originally _lost_.
 `batch_put` inserted content-addressed keys (structural hashes / event ids) in
 whatever random order they arrived, costing a B-tree search/possible page-split
 per row with no locality. Sorting each batch by key before insertion (the
-standard mdbx/LMDB bulk-load pattern, safe against a non-empty table -- unlike
+standard mtxdb bulk-load pattern, safe against a non-empty table -- unlike
 `WriteFlags::APPEND`, not used here since it additionally requires every key to
 sort above the table's current max, a guarantee a reused database doesn't give
-us) took mdbx from 43,612 to ~185,000-192,000 rows/s across repeated runs, at
+us) took mtxdb from 43,612 to ~185,000-192,000 rows/s across repeated runs, at
 the cost of a small, reproducible rise in point-read p50 at batch=1 (2.1us ->
 ~6.5-6.6us; still comfortably faster than postgres either way). That
 read-latency shift isn't fully root-caused -- current best guess is a
@@ -309,7 +309,7 @@ tree), not a real regression, but it hasn't been isolated further.
 **Postgres bulk-load commit granularity**: `execute_values(..., page_size=1000)`
 issues a separate `cur.execute()` per 1000-row page; under
 `conn.autocommit = True` each page was its own implicit transaction/commit --
-2,000 commits for the 2M-row corpus, vs. mdbx's `batch_put` doing the whole
+2,000 commits for the 2M-row corpus, vs. mtxdb's `batch_put` doing the whole
 corpus in one transaction. Fixed by wrapping the postgres bulk-load in one
 explicit transaction (`conn.autocommit = False` around the load, single
 `conn.commit()` after) so both sides pay one commit for one corpus. As noted
@@ -327,7 +327,7 @@ carries both fixes above (sorted `batch_put`, single-transaction postgres
 bulk-load) -- re-run at n=2,000,000 (steady state, after the 200k warm-up leg):
 
 ```text
-n=2,000,000                mdbx        postgres     speedup
+n=2,000,000                mtxdb        postgres     speedup
 ------------------------------------------------------------
 bulk-load (rows/s, +1.8M)  99,100      54,684        1.8x
 read(batch=1)                2.3us      65.6us      28.5x
@@ -338,22 +338,22 @@ commit(batch=5)              63.1us    168.6us       2.7x
 
 (p50 latencies. Reproduce with:
 `eval "$(scripts-dev/start_test_postgres.sh)"; python3 scripts-dev/benchmark_event_json_storage.py`.
-mdbx's bulk-load jumped from 24,158 to 99,100 rows/s on this workload from the
+mtxdb's bulk-load jumped from 24,158 to 99,100 rows/s on this workload from the
 same sort-before-insert fix as the HAMT-node bench, going from postgres's
-biggest lead to another mdbx win; postgres's own bulk-load number moved
+biggest lead to another mtxdb win; postgres's own bulk-load number moved
 negligibly, 54,316 -> 54,684, for the same reason noted above.)
 
 ### Cold-read status
 
 The tables above are **warm-cache / steady-state** measurements. They must not
-be used to claim that MDBX delivers microsecond reads when the required pages
-are absent from memory. MDBX reads through the kernel's file-backed page cache;
+be used to claim that mtxdb delivers microsecond reads when the required pages
+are absent from memory. mtxdb reads through the kernel's file-backed page cache;
 an absent B-tree page causes storage I/O just as it does for other disk-backed
 engines.
 
-`scripts-dev/benchmark_mdbx_cold_reads.py` measures independent MDBX point
+`scripts-dev/benchmark_mtxdb_cold_reads.py` measures independent mtxdb point
 lookups after a fresh process opens the environment and `POSIX_FADV_DONTNEED`
-has been issued for only the temporary MDBX files. Its temporary database
+has been issued for only the temporary mtxdb files. Its temporary database
 defaults to the current working directory rather than `/tmp`, since `/tmp` is
 often tmpfs and would invalidate an I/O-cold test.
 
@@ -362,7 +362,7 @@ A small, illustrative run on this development host's on-disk ext4 filesystem
 
 | Engine     | Corpus / value size |     p50 |     p95 |     p99 | Status                                                |
 | ---------- | ------------------- | ------: | ------: | ------: | ----------------------------------------------------- |
-| MDBX       | 10,000 / 512 bytes  | 22.7 ms | 40.8 ms | 40.8 ms | Evicted-page sample; not a strict device-cold result. |
+| mtxdb       | 10,000 / 512 bytes  | 22.7 ms | 40.8 ms | 40.8 ms | Evicted-page sample; not a strict device-cold result. |
 | PostgreSQL | 10,000 / 512 bytes  | 14.1 ms | 61.1 ms | 61.1 ms | Dedicated disk cluster restarted between samples.     |
 
 This is an **evicted-page** result, not a perfectly device-cold guarantee:
@@ -372,14 +372,14 @@ a stricter device-cold run, use a controlled host or a corpus larger than RAM. A
 representative command is:
 
 ```sh
-python3 scripts-dev/benchmark_mdbx_cold_reads.py \
+python3 scripts-dev/benchmark_mtxdb_cold_reads.py \
   --rows 2000000 --samples 200 --value-size 512 --workdir /path/on/target-disk
 ```
 
 The two rows above are the first apples-to-apples cold sample, not a general
 winner declaration: the sample is too small to resolve tail latency and cold I/O
 varies sharply by storage device, filesystem, data size, and B-tree locality. On
-this host PostgreSQL had the lower p50, while MDBX had the lower p95. Re-run
+this host PostgreSQL had the lower p50, while mtxdb had the lower p95. Re-run
 both harnesses with a larger corpus and sample count before making a product
 decision.
 
@@ -412,14 +412,14 @@ python3 scripts-dev/benchmark_postgres_cold_reads.py \
   --rows 2000000 --samples 200 --value-size 512
 ```
 
-### Key Architectural Advantages of `libmdbx`:
+### Key Architectural Advantages of `mtxdb`:
 
 1. **Direct Zero-Copy `mmap` Read Latency (~6.5us at batch=1)**:
    - Values are returned directly as borrowed `&[u8]` pointers in OS page cache
      without memory allocations, deserialization wrappers, or IPC overhead.
 2. **Zero RPC Daemon / Zero Bridge Complexity**:
    - All Synapse worker processes (`sync`, `federation`, `state_res`, `api`)
-     open the `libmdbx` environment files directly via kernel `mmap`. This
+     open the mtxdb environment files directly via kernel `mmap`. This
      avoids the operational overhead a single-process engine like fjall would
      have required (a daemon or socket bridge for non-owning workers) -- but
      note that overhead was never built, so it's an architectural argument, not
@@ -436,7 +436,7 @@ python3 scripts-dev/benchmark_postgres_cold_reads.py \
                    | (Step 1: Write HAMT Nodes)      | (Step 2: Commit Transaction)
                    v                                 v
       +--------------------------+       +--------------------------+
-      |  libmdbx Embedded Engine |       |   PostgreSQL Database    |
+      |  mtxdb Embedded Engine |       |   PostgreSQL Database    |
       |   (Shared Kernel mmap)   |       |   (`state_groups` table) |
       +--------------------------+       +--------------------------+
                    |                                 |
@@ -449,14 +449,14 @@ python3 scripts-dev/benchmark_postgres_cold_reads.py \
                   +------------------------------------+
 ```
 
-1. **Write HAMT Nodes First**: Structural HAMT nodes are persisted to `libmdbx`
+1. **Write HAMT Nodes First**: Structural HAMT nodes are persisted to mtxdb
    before committing the `state_groups` transaction in PostgreSQL.
 2. **PostgreSQL Commit is Truth**: A state group exists if and only if its row
    in PostgreSQL `state_groups` is committed. If a crash occurs after writing
-   `libmdbx` but before PostgreSQL commits, unreferenced HAMT nodes in `libmdbx`
+   mtxdb but before PostgreSQL commits, unreferenced HAMT nodes in mtxdb
    are inert content-addressed blobs that harm nothing.
 3. **Startup Self-Healing**: On startup, Synapse validates that the highest
-   `state_group_id` in PostgreSQL has a matching HAMT root in `libmdbx`,
+   `state_group_id` in PostgreSQL has a matching HAMT root in mtxdb,
    automatically re-materializing missing roots if a crash occurred during
    commit.
 

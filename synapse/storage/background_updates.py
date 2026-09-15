@@ -19,6 +19,7 @@
 #
 #
 import abc
+import asyncio
 import logging
 from enum import Enum, IntEnum
 from types import TracebackType
@@ -35,6 +36,8 @@ from typing import (
 
 import attr
 from pydantic import BaseModel
+
+from twisted.internet import defer
 
 from synapse.storage.engines import PostgresEngine
 from synapse.storage.types import Connection, Cursor
@@ -431,6 +434,8 @@ class BackgroundUpdater:
                 try:
                     result = await self.do_next_background_update(sleep)
                     back_to_back_failures = 0
+                except (defer.CancelledError, asyncio.CancelledError):
+                    raise
                 except Exception as e:
                     logger.exception("Error doing update: %s", e)
                     back_to_back_failures += 1

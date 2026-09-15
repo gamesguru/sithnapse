@@ -20,6 +20,7 @@
 #
 
 import logging
+import os
 import time
 from typing import (
     TYPE_CHECKING,
@@ -43,11 +44,23 @@ from synapse.storage.database import (
     LoggingDatabaseConnection,
     LoggingTransaction,
 )
+from synapse.storage.databases.embedded_engine import get_embedded_engine
+from synapse.storage.databases.main.embedded_common import (
+    Pool,
+    _clear_coalescer,
+    _FlushCoalescer,
+    _set_coalescer,
+    _set_engine_configured,
+    configure_sync,
+    ffi_timing,
+    mark_dirty,
+    mirror_timing,
+)
 from synapse.storage.databases.state.bg_updates import (
     StateBackgroundUpdateStore,
+    _decode_state_hamt_root,
     _encode_state_hamt_root,
-    _state_hamt_node_key,
-    _state_hamt_root_key,
+    _state_timing,
 )
 from synapse.storage.engines import PostgresEngine
 from synapse.storage.types import Cursor
@@ -139,45 +152,100 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             id_column="id",
         )
 
-        self.embedded_hamt_engine = hs.config.database.embedded_hamt_engine
-        self.embedded_hamt_path = hs.config.database.embedded_hamt_path
-        if self.embedded_hamt_engine and self.embedded_hamt_path:
-            # mdbx is the only embedded engine: it beat fjall on every real
+        self._embedded_hamt_engine = hs.config.database.embedded_hamt_engine
+        self._embedded_hamt_path = hs.config.database.embedded_hamt_path
+        configure_sync(no_sync=hs.config.database.embedded_hamt_no_sync)
+
+        # Defaults to the server name when unset (see the comment on
+        # DatabaseConfig.embedded_hamt_namespace) -- must always be
+        # assigned here, since every call site below reads
+        # self._embedded_hamt_namespace unconditionally.
+        self._embedded_hamt_namespace = (
+            hs.config.database.embedded_hamt_namespace or self.server_name
+        )
+
+        if self._embedded_hamt_engine and self._embedded_hamt_path:
+            # mtxdb is the embedded engine for HAMT state offload.
             # benchmark (point reads, batch reads) and needs no worker-
             # process bridge (native multi-process mmap access), so fjall
             # was dropped rather than kept as a second maintained option.
-            if self.embedded_hamt_engine != "mdbx":
+            _set_engine_configured()
+            if self._embedded_hamt_engine != "mtxdb":
                 raise RuntimeError(
-                    f"Unknown embedded_hamt_engine: {self.embedded_hamt_engine!r} "
-                    "(only 'mdbx' is supported)"
+                    f"Unknown embedded_hamt_engine: {self._embedded_hamt_engine!r} "
+                    "(only 'mtxdb' is supported)"
                 )
+            # mtxdb's writable open takes an exclusive lock (see
+            # PackfileStorage::open vs open_read_only) -- only one process
+            # may hold it. State groups are only ever created on an events
+            # stream writer (PersistEventsStore itself asserts this -- see
+            # events.py), so that's the natural, already-unique-by-config
+            # choice of which single process should be that writer; every
+            # other instance (including a monolith, where it's trivially
+            # the only instance and so always the writer) opens read-only
+            # instead of dying at the lock. A read-only instance's index is
+            # a point-in-time snapshot -- see
+            # `refresh_state_hamt_collections_for_groups`'s call site for
+            # how a stale read there catches up.
+            self._embedded_hamt_is_writer = (
+                hs.get_instance_name() in hs.config.worker.writers.events
+            )
             try:
-                from synapse.synapse_rust import mdbx_engine
-
-                mdbx_engine.open_client(self.embedded_hamt_path)
+                engine = get_embedded_engine(self._embedded_hamt_engine)
+                _oet = time.monotonic()
+                if self._embedded_hamt_is_writer:
+                    engine.open_client(self._embedded_hamt_path)
+                else:
+                    engine.open_client_read_only(self._embedded_hamt_path)
+                ffi_timing("embedded_engine_open", time.monotonic() - _oet)
+                # `stats()` only counts logical reads when explicitly enabled,
+                # avoiding atomic increments on the hot read path in normal
+                # deployments. Enable them for the opt-in end-of-run report.
+                if os.environ.get("SYNAPSE_MTXDB_STATS"):
+                    engine.set_stats_enabled(True)
                 logger.info(
-                    "Opened embedded mdbx engine at %s for state HAMT offload",
-                    self.embedded_hamt_path,
+                    "Opened embedded %s engine (%s) at %s for state HAMT offload",
+                    self._embedded_hamt_engine,
+                    "writer" if self._embedded_hamt_is_writer else "read-only",
+                    self._embedded_hamt_path,
                 )
             except Exception as e:
                 raise RuntimeError(
-                    f"Failed to open embedded mdbx engine at {self.embedded_hamt_path}"
+                    f"Failed to open embedded {self._embedded_hamt_engine} engine at {self._embedded_hamt_path}"
                 ) from e
 
-            if hs.config.database.embedded_hamt_namespace:
-                self.hamt_namespace = hs.config.database.embedded_hamt_namespace
-
-            if hs.config.worker.run_background_tasks:
+            # Gated on being the mtxdb *writer* (the events-writer
+            # instance), not on the generic `run_background_tasks`
+            # designation: these all write (delete, fsync, migrate), and a
+            # read-only-opened handle fails at the OS level on any write.
+            # `run_background_tasks` and "is the events writer" are two
+            # independent designations that can land on different
+            # instances in some worker topologies -- this must follow the
+            # latter regardless of the former, or it silently fails (sync)
+            # or never runs anywhere (drain/migrate) on such a topology.
+            if self._embedded_hamt_is_writer:
                 hs.get_clock().looping_call(
                     self._drain_embedded_state_hamt_root_deletion_queue,
                     Duration(minutes=5),
+                )
+                # Every write path into the embedded engine above was
+                # changed to *not* fsync per write/per batch -- an fsync
+                # Commit-aware flush coalescer: dirty marking happens via
+                # txn.call_after (after SQL commit), debounced 250-500ms.
+                # Replaces the former 1-second periodic sync timer.
+                self._flush_coalescer = _FlushCoalescer(hs.get_clock())
+                _set_coalescer(self._flush_coalescer)
+                hs.register_sync_shutdown_handler(
+                    phase="during",
+                    eventType="shutdown",
+                    shutdown_func=self._flush_coalescer.close,
                 )
 
             self.db_pool.updates.register_background_update_handler(
                 self.EMBEDDED_HAMT_MIGRATION_UPDATE_NAME,
                 self._background_migrate_state_hamt_to_embedded,
             )
-            if hs.config.worker.run_background_tasks:
+            if self._embedded_hamt_is_writer:
                 hs.run_as_background_process(
                     "enqueue_state_hamt_embedded_migration",
                     self._enqueue_embedded_hamt_migration_if_needed,
@@ -268,7 +336,11 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             )
             return 0
 
-        from synapse.synapse_rust import mdbx_engine, state_hamt
+        from synapse.synapse_rust import state_hamt
+
+        engine_name = self._embedded_hamt_engine
+        assert engine_name is not None
+        engine = get_embedded_engine(engine_name)
 
         def migrate_one_txn(
             txn: LoggingTransaction,
@@ -300,8 +372,8 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                         bytes(child)
                         for child in state_hamt.node_child_hashes(node_bytes)
                     )
-            mdbx_engine.put_state_hamt_nodes(
-                self.hamt_namespace, room_prefix, list(nodes.items())
+            engine.put_state_hamt_nodes(
+                self._embedded_hamt_namespace, room_prefix, list(nodes.items())
             )
             if lattice:
                 self._store_state_hamt_root_embedded_txn(
@@ -313,6 +385,9 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 migrate_one_txn(
                     txn, state_group, room_prefix, root_hash, lattice, room_id
                 )
+            # Mark dirty after SQL commit.  Migration is idempotent, so a
+            # crash mid-batch just re-does work on restart.
+            txn.call_after(mark_dirty, Pool.STATE)
             self.db_pool.updates._background_update_progress_txn(
                 txn,
                 self.EMBEDDED_HAMT_MIGRATION_UPDATE_NAME,
@@ -612,8 +687,13 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         updates: list[tuple[str, str, str]] | None = None,
         local_nodes: dict[bytes, bytes] | None = None,
         local_roots: dict[int, tuple[bytes, bytes]] | None = None,
+        pending_room_roots: list[tuple[int, bytes]] | None = None,
     ) -> tuple[bytes, bytes, list[tuple[bytes, bytes]]]:
         """Persist a new state_group's HAMT root and nodes.
+
+        Marks the STATE pool dirty via txn.call_after after SQL commit --
+        the coalescer flushes asynchronously (250-500ms debounce). See
+        _store_state_hamt_root_embedded_txn's docstring.
 
         If `prev_state_group` has a usable stored root+lattice and
         `updates` names the `(event_type, state_key, event_id)` changes
@@ -651,8 +731,13 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 updates,
                 local_nodes=local_nodes,
                 local_roots=local_roots,
+                pending_room_roots=pending_room_roots,
             )
         if incremental is not None:
+            # Only the embedded path has a coalescer to notify; skip the
+            # registration entirely when the engine isn't configured.
+            if self._embedded_hamt_engine:
+                txn.call_after(mark_dirty, Pool.STATE)
             return incremental
 
         _gg_reb_start = time.monotonic()
@@ -686,11 +771,26 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         # owns it instead. _store_state_hamt_nodes_txn already makes this
         # same choice for nodes.
         self._store_state_hamt_nodes_txn(txn, room_prefix, nodes)
-        if self.embedded_hamt_engine == "mdbx":
+        if self._embedded_hamt_engine == "mtxdb":
+            _et = time.monotonic()
             self._store_state_hamt_root_embedded_txn(
-                state_group, room_prefix, root_structural_hash, root_lattice, room_id
+                state_group,
+                room_prefix,
+                root_structural_hash,
+                root_lattice,
+                room_id,
+                pending_room_roots=pending_room_roots,
             )
+            # _store_state_hamt_root_embedded_txn is write-only (no internal
+            # sync).  Callers manage durability: batched loops sync once
+            # after the loop; single-group callers sync immediately after
+            # the call.  See _store_state_hamt_root_embedded_txn's
+            # docstring. When pending_room_roots is given this measures the
+            # room-index write plus the (near-free) list append -- the
+            # caller times its own deferred root-flush call separately.
+            _state_timing("state_write_root_embedded", time.monotonic() - _et)
         else:
+            _st = time.monotonic()
             self.db_pool.simple_insert_txn(
                 txn,
                 table="state_hamt_roots",
@@ -701,6 +801,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                     "root_lattice": bytearray(root_lattice),
                 },
             )
+            _state_timing("state_write_root_sql", time.monotonic() - _st)
 
         logger.debug(
             "[gg-state-timing] _persist_state_hamt_txn mode=rebuild "
@@ -709,6 +810,10 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             len(current_state_ids),
             (time.monotonic() - _gg_reb_start) * 1000,
         )
+        # Only the embedded path has a coalescer to notify; skip the
+        # registration entirely when the engine isn't configured.
+        if self._embedded_hamt_engine:
+            txn.call_after(mark_dirty, Pool.STATE)
         return root_structural_hash, root_lattice, nodes
 
     def _persist_state_hamt_incremental_txn(
@@ -721,6 +826,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         updates: list[tuple[str, str, str]],
         local_nodes: dict[bytes, bytes] | None = None,
         local_roots: dict[int, tuple[bytes, bytes]] | None = None,
+        pending_room_roots: list[tuple[int, bytes]] | None = None,
     ) -> tuple[bytes, bytes, list[tuple[bytes, bytes]]] | None:
         """Apply `updates` -- a delta of any size, from a single state event
         to a whole state-resolution/merge result the caller already computed
@@ -745,14 +851,19 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         else:
             prev_root_hash = None
             prev_lattice = None
-            mdbx_active = self.embedded_hamt_engine == "mdbx"
-            if mdbx_active:
-                embedded_root = self._get_embedded_hamt_root(prev_state_group)
+            mtxdb_active = self._embedded_hamt_engine == "mtxdb"
+            if mtxdb_active:
+                _et = time.monotonic()
+                embedded_root = self._get_embedded_hamt_root(
+                    room_prefix, prev_state_group
+                )
+                _state_timing("state_read_root_embedded", time.monotonic() - _et)
                 if embedded_root is not None:
                     prev_root_hash, prev_lattice = embedded_root
             if prev_root_hash is None and (
-                not mdbx_active or self._embedded_hamt_migration_pending_txn(txn)
+                not mtxdb_active or self._embedded_hamt_migration_pending_txn(txn)
             ):
+                _st = time.monotonic()
                 prev_root = self.db_pool.simple_select_one_txn(
                     txn,
                     table="state_hamt_roots",
@@ -760,6 +871,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                     retcols=("root_structural_hash", "root_lattice"),
                     allow_none=True,
                 )
+                _state_timing("state_read_root_sql", time.monotonic() - _st)
                 if prev_root is not None and prev_root[1] is not None:
                     prev_root_hash, prev_lattice = (
                         bytes(prev_root[0]),
@@ -773,11 +885,14 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         local_nodes = local_nodes or {}
         root_node_bytes = local_nodes.get(prev_root_hash)
         if root_node_bytes is None:
+            _et = time.monotonic()
             root_node_bytes = self._get_embedded_hamt_node(room_prefix, prev_root_hash)
+            _state_timing("state_read_node_embedded", time.monotonic() - _et)
         if root_node_bytes is None and (
-            self.embedded_hamt_engine != "mdbx"
+            self._embedded_hamt_engine != "mtxdb"
             or self._embedded_hamt_migration_pending_txn(txn)
         ):
+            _st = time.monotonic()
             root_node_bytes = self.db_pool.simple_select_one_onecol_txn(
                 txn,
                 table="state_hamt_nodes",
@@ -785,6 +900,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 retcol="node_bytes",
                 allow_none=True,
             )
+            _state_timing("state_read_node_sql", time.monotonic() - _st)
         if root_node_bytes is None:
             raise RuntimeError(
                 "Missing HAMT root node for state group "
@@ -792,7 +908,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             )
         root_bytes = bytes(root_node_bytes)
         # Start with only the root node from the local cache (not all accumulated nodes).
-        # The retry loop below will fetch any missing child nodes via SQL/mdbx.
+        # The retry loop below will fetch any missing child nodes via SQL/mtxdb.
         nodes: dict[bytes, bytes] = {prev_root_hash: root_bytes}
         # Add any root nodes from the local cache (needed for the retry loop)
         for node_hash, node_bytes in local_nodes.items():
@@ -852,11 +968,20 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         new_root_hash, _new_state_group_id, new_lattice, new_nodes = applied
 
         self._store_state_hamt_nodes_txn(txn, room_prefix, new_nodes)
-        if self.embedded_hamt_engine == "mdbx":
+        if self._embedded_hamt_engine == "mtxdb":
+            _et = time.monotonic()
             self._store_state_hamt_root_embedded_txn(
-                state_group, room_prefix, new_root_hash, new_lattice, room_id
+                state_group,
+                room_prefix,
+                new_root_hash,
+                new_lattice,
+                room_id,
+                pending_room_roots=pending_room_roots,
             )
+            # Sync deferred to caller -- see comment in _persist_state_hamt_txn.
+            _state_timing("state_write_root_embedded", time.monotonic() - _et)
         else:
+            _st = time.monotonic()
             self.db_pool.simple_insert_txn(
                 txn,
                 table="state_hamt_roots",
@@ -867,6 +992,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                     "root_lattice": bytearray(new_lattice),
                 },
             )
+            _state_timing("state_write_root_sql", time.monotonic() - _st)
         logger.debug(
             "[gg-state-timing] _persist_state_hamt_incremental_txn "
             "group=%d prev=%d updates=%d nodes=%d elapsed_ms=%.1f",
@@ -889,12 +1015,23 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         # embedded engine's materialize/lookup BFS walk actually looks up --
         # a plain `batch_put` keyed by the raw structural_hash would be
         # invisible to it.
-        if self.embedded_hamt_engine == "mdbx":
-            from synapse.synapse_rust import mdbx_engine
+        if self._embedded_hamt_engine == "mtxdb":
+            engine = get_embedded_engine(self._embedded_hamt_engine)
+            _et = time.monotonic()
+            engine.put_state_hamt_nodes(
+                self._embedded_hamt_namespace, room_prefix, nodes
+            )
+            ffi_timing("ffi_put_hamt_nodes", time.monotonic() - _et)
+            _state_timing("state_write_nodes_embedded", time.monotonic() - _et)
+            # Record batch-size/byte-count stats for diagnostics.
+            from synapse.storage.databases.state.bg_updates import (
+                _record_node_write_stats,
+            )
 
-            mdbx_engine.put_state_hamt_nodes(self.hamt_namespace, room_prefix, nodes)
+            _record_node_write_stats(nodes, time.monotonic() - _et)
             return
 
+        _st = time.monotonic()
         txn.executemany(
             """
             INSERT INTO state_hamt_nodes (structural_hash, node_bytes)
@@ -906,6 +1043,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 for structural_hash, node_bytes in nodes
             ],
         )
+        _state_timing("state_write_nodes_sql", time.monotonic() - _st)
 
     def _embedded_hamt_migration_pending_txn(self, txn: LoggingTransaction) -> bool:
         """Whether `EMBEDDED_HAMT_MIGRATION_UPDATE_NAME` is still queued or
@@ -919,25 +1057,35 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         )
         return txn.fetchone() is not None
 
-    def _get_embedded_hamt_root(self, state_group: int) -> tuple[bytes, bytes] | None:
+    def _get_embedded_hamt_root(
+        self, room_prefix: bytes, state_group: int
+    ) -> tuple[bytes, bytes] | None:
         """Point lookup of a single HAMT root's `(root_hash, lattice)` in
         the embedded engine, if configured. Returns `None` on a miss.
-        """
-        if self.embedded_hamt_engine != "mdbx":
-            return None
-        from synapse.synapse_rust import mdbx_engine
 
-        (record,) = mdbx_engine.batch_get_state_hamt_roots(
-            self.hamt_namespace, [state_group]
-        )
-        if record is None:
+        Reads from `room_prefix`'s own State collection
+        (`get_state_hamt_roots_for_room`) -- the room-scoped counterpart of
+        `put_state_hamt_roots`, which is now the only place a root is
+        written. This is the hot persist/incremental-update path, which
+        always already knows its room.
+        """
+        if self._embedded_hamt_engine != "mtxdb":
             return None
-        _group, _room_prefix, root_hash, _room_id, lattice = record
+        engine = get_embedded_engine(self._embedded_hamt_engine)
+
+        _et = time.monotonic()
+        (raw,) = engine.get_state_hamt_roots_for_room(
+            self._embedded_hamt_namespace, room_prefix, [state_group]
+        )
+        ffi_timing("ffi_get_hamt_root", time.monotonic() - _et)
+        if raw is None:
+            return None
+        _room_prefix, root_hash, lattice, _room_id = _decode_state_hamt_root(bytes(raw))
         if not lattice:
             # A root written before the lattice column existed -- no usable
             # base for an incremental update, same as SQL's NULL root_lattice.
             return None
-        return bytes(root_hash), bytes(lattice)
+        return root_hash, lattice
 
     def _get_embedded_hamt_node(
         self, room_prefix: bytes, node_hash: bytes
@@ -947,13 +1095,16 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         SQL. Returns `None` on a miss (caller falls back), never raises for
         a missing key.
         """
-        if self.embedded_hamt_engine != "mdbx":
+        if self._embedded_hamt_engine != "mtxdb":
             return None
-        from synapse.synapse_rust import mdbx_engine
+        engine = get_embedded_engine(self._embedded_hamt_engine)
 
-        key = _state_hamt_node_key(self.hamt_namespace, room_prefix, node_hash)
-        value = mdbx_engine.get(key)
-        return bytes(value) if value is not None else None
+        _et = time.monotonic()
+        results = engine.get_state_hamt_nodes_batch(
+            self._embedded_hamt_namespace, room_prefix, [node_hash]
+        )
+        ffi_timing("ffi_get_hamt_node", time.monotonic() - _et)
+        return bytes(results[0]) if results and results[0] is not None else None
 
     def _get_embedded_hamt_nodes_batch(
         self, room_prefix: bytes, node_hashes: list[bytes]
@@ -963,16 +1114,20 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         result, same self-healing shape as `embedded_event_json`'s
         `get_event_json_batch`.
         """
-        if self.embedded_hamt_engine != "mdbx" or not node_hashes:
+        if self._embedded_hamt_engine != "mtxdb" or not node_hashes:
             return {}
-        from synapse.synapse_rust import mdbx_engine
+        engine = get_embedded_engine(self._embedded_hamt_engine)
 
-        key_to_hash = {
-            _state_hamt_node_key(self.hamt_namespace, room_prefix, node_hash): node_hash
-            for node_hash in node_hashes
+        _et = time.monotonic()
+        results = engine.get_state_hamt_nodes_batch(
+            self._embedded_hamt_namespace, room_prefix, node_hashes
+        )
+        ffi_timing("ffi_get_hamt_nodes_batch", time.monotonic() - _et)
+        return {
+            node_hash: bytes(data)
+            for node_hash, data in zip(node_hashes, results)
+            if data is not None
         }
-        found = mdbx_engine.batch_get(list(key_to_hash))
-        return {key_to_hash[bytes(key)]: bytes(value) for key, value in found}
 
     def _store_state_hamt_root_embedded_txn(
         self,
@@ -981,28 +1136,87 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         root_hash: bytes,
         lattice: bytes,
         room_id: str,
+        pending_room_roots: list[tuple[int, bytes]] | None = None,
     ) -> None:
-        """Mirror a HAMT root record into the configured embedded engine,
-        under the `hamt:root:<namespace_hash><state_group>` key
-        (`_state_hamt_root_key`). Called synchronously in the persisting
-        transaction: an embedded engine is a local call with no network
-        round-trip to defer past commit, so there's no reason to route it
-        through an async post-commit publish path.
-        `_fetch_hamt_roots_for_embedded_txn` (bg_updates.py) reads this and
-        falls back to `state_hamt_roots` SQL only inside the bounded
-        `EMBEDDED_HAMT_MIGRATION_UPDATE_NAME` window -- see that function's
-        docstring.
-        """
-        if not self.embedded_hamt_engine:
-            return
-        root_key = _state_hamt_root_key(self.hamt_namespace, state_group)
-        root_value = _encode_state_hamt_root(
-            room_prefix, root_hash, lattice, room_id=room_id
-        )
-        if self.embedded_hamt_engine == "mdbx":
-            from synapse.synapse_rust import mdbx_engine
+        """Mirror a HAMT root record into the configured embedded engine.
 
-            mdbx_engine.put(root_key, root_value)
+        Written to the root's own room's State collection
+        (`put_state_hamt_roots`) -- not the single global flat-KV
+        collection every root used to share (`kv_room_id()`). mtxdb clones
+        a collection's entire index on every write; parking every root in
+        one shared collection meant that clone cost scaled with the
+        server's *total* root count instead of one room's, growing without
+        bound as more rooms/state groups are persisted. This is now the
+        only place a root is written -- also updates the
+        `state_group -> room_prefix` flat-file index (`put_room_index`) in
+        the same call, which is what lets `_fetch_hamt_roots_for_embedded_txn`
+        (bg_updates.py) -- which only ever has a bare `state_group` int, by
+        design -- find the right room's collection to look in, without SQL
+        or a second shared mtxdb collection. See `put_room_index`'s module
+        doc comment (`rust/src/database/mtxdb.rs`) for that index's
+        durability/concurrency invariants.
+
+        Called synchronously in the persisting transaction: an embedded
+        engine is a local call with no network round-trip to defer past
+        commit, so there's no reason to route it through an async
+        post-commit publish path.
+
+        `pending_room_roots`: when given, this appends the
+        `(state_group, root_value)` pair instead of writing it immediately
+        -- the caller (`insert_deltas_group_txn`) is accumulating roots for
+        every state group in one linear batch to flush via a single
+        `put_state_hamt_roots([...])` call after its loop, amortizing
+        mtxdb's per-call `LossyIndex` clone across the whole batch the same
+        way `_store_state_hamt_nodes_txn`'s `put_many` already does for
+        nodes, instead of paying that clone once per one-pair call. The
+        room-index write is not deferred alongside it: it's a single
+        direct-offset syscall with no clone cost to amortize, so there's
+        nothing to gain by batching it, and eagerly writing it keeps
+        `_fetch_hamt_roots_for_embedded_txn` able to resolve a state
+        group's room immediately after this call returns rather than only
+        after the batch's deferred root flush. The caller is responsible
+        for the deferred root write and for keeping `local_roots` (already
+        used for mid-transaction visibility -- see
+        `_persist_state_hamt_txn`'s docstring) in sync in the meantime.
+
+        Deliberately does NOT call sync() itself: it's shared by callers
+        that persist one state group at a time (which must follow this
+        with their own `maybe_sync(SyncTier.DURABLE)`) and by a batched
+        loop in `_persist_state_group_snapshot_txn` that syncs once after
+        many calls. Do not add an unconditional sync() here -- it silently
+        defeats that batching by fsyncing on every loop iteration again.
+        """
+        if not self._embedded_hamt_engine:
+            return
+        with mirror_timing("state_hamt_root"):
+            root_value = _encode_state_hamt_root(
+                room_prefix, root_hash, lattice, room_id=room_id
+            )
+            if self._embedded_hamt_engine == "mtxdb":
+                engine = get_embedded_engine(self._embedded_hamt_engine)
+                # Written eagerly, ahead of root_value itself when
+                # pending_room_roots defers the latter: if the enclosing SQL
+                # transaction then rolls back before the deferred root flush
+                # runs, this index entry outlives a root that was never
+                # written. Harmless -- state_group ids come from a
+                # non-transactional sequence generator (_state_group_seq_gen),
+                # so a rolled-back transaction's id is never reissued, and
+                # nothing will ever look this state_group up again.
+                _et = time.monotonic()
+                engine.put_room_index(
+                    self._embedded_hamt_namespace, [(state_group, room_prefix)]
+                )
+                ffi_timing("ffi_put_room_index", time.monotonic() - _et)
+                if pending_room_roots is not None:
+                    pending_room_roots.append((state_group, root_value))
+                    return
+                _et = time.monotonic()
+                engine.put_state_hamt_roots(
+                    self._embedded_hamt_namespace,
+                    room_prefix,
+                    [(state_group, root_value)],
+                )
+                ffi_timing("ffi_put_state_hamt_roots", time.monotonic() - _et)
 
     async def _background_backfill_state_hamt_roots(
         self, progress: dict, batch_size: int
@@ -1082,20 +1296,31 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         # a good root with an empty one. Skip anything the embedded engine
         # already has.
         already_embedded: set[int] = set()
-        if self.embedded_hamt_engine == "mdbx":
-            from synapse.synapse_rust import mdbx_engine
-
-            state_groups = [state_group for state_group, _ in rows]
-            already_embedded = {
-                state_group
+        if self._embedded_hamt_engine == "mtxdb":
+            engine = get_embedded_engine(self._embedded_hamt_engine)
+            # Roots live in their room's own collection now (see
+            # put_state_hamt_roots), not the old global one
+            # batch_get_state_hamt_roots still reads -- that call always
+            # returns "not found" post-migration, which used to make this
+            # set permanently empty and re-persist every already-migrated
+            # group on every pass of this backfill forever (wasted work,
+            # not data loss, since _persist_state_hamt_txn is idempotent).
+            # Group by room and use the per-room read instead.
+            by_room: dict[str, list[int]] = {}
+            for state_group, room_id in rows:
+                by_room.setdefault(room_id, []).append(state_group)
+            for room_id, state_groups in by_room.items():
+                room_prefix = room_prefixes.get(room_id)
+                if room_prefix is None:
+                    continue
                 for state_group, record in zip(
                     state_groups,
-                    mdbx_engine.batch_get_state_hamt_roots(
-                        self.hamt_namespace, state_groups
+                    engine.get_state_hamt_roots_for_room(
+                        self._embedded_hamt_namespace, room_prefix, state_groups
                     ),
-                )
-                if record is not None
-            }
+                ):
+                    if record is not None:
+                        already_embedded.add(state_group)
 
         def backfill_txn(txn: LoggingTransaction) -> None:
             for state_group, room_id in rows:
@@ -1112,6 +1337,11 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 self._persist_state_hamt_txn(
                     txn, state_group, room_id, room_prefix, current_state_ids
                 )
+
+            # Dirty marking handled by _persist_state_hamt_txn via
+            # txn.call_after(mark_dirty, Pool.STATE).  This backfill is
+            # idempotent (already_embedded above skips groups it finds on
+            # retry), so a crash mid-batch just re-does work on restart.
 
             self.db_pool.updates._background_update_progress_txn(
                 txn,
@@ -1137,6 +1367,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         updates: list[tuple[str, str, str]] | None = None,
         local_nodes: dict[bytes, bytes] | None = None,
         local_roots: dict[int, tuple[bytes, bytes]] | None = None,
+        pending_room_roots: list[tuple[int, bytes]] | None = None,
     ) -> tuple[bytes, bytes, list[tuple[bytes, bytes]]]:
         self.db_pool.simple_insert_txn(
             txn,
@@ -1193,6 +1424,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             updates=updates,
             local_nodes=local_nodes,
             local_roots=local_roots,
+            pending_room_roots=pending_room_roots,
         )
 
     @trace
@@ -1231,7 +1463,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         )
 
         # Each group's incremental update looks up its predecessor via
-        # _get_embedded_hamt_node (mdbx, if configured) then SQL -- no
+        # _get_embedded_hamt_node (mtxdb, if configured) then SQL -- no
         # prefetch needed before the transaction starts; both are local
         # reads, unlike a real network round-trip would require.
         initial_nodes: dict[bytes, bytes] = {}
@@ -1278,14 +1510,27 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             state_group_iter = iter(state_groups)
             hamt_writes: list[tuple[int, bytes, bytes, list[tuple[bytes, bytes]]]] = []
             # Nodes for state groups persisted earlier *in this same batch*
-            # aren't visible to a fresh SQL/mdbx lookup mid-transaction (SQL
+            # aren't visible to a fresh SQL/mtxdb lookup mid-transaction (SQL
             # rows aren't visible to other reads in the same txn until
-            # commit, and mdbx isn't written until _store_state_hamt_nodes_txn
+            # commit, and mtxdb isn't written until _store_state_hamt_nodes_txn
             # runs for that row either) -- so a later group's incremental
             # update needs this in-memory cache to find its predecessor's
             # root.
             local_nodes = dict(initial_nodes)
             local_roots = dict(initial_roots)
+            # Accumulated across every state group in this linear batch and
+            # flushed via one batch_put() call below, instead of one
+            # one-pair batch_put() per state group -- amortizes mtxdb's
+            # per-call LossyIndex clone across the whole batch, the same
+            # way _store_state_hamt_nodes_txn's put_many already does for
+            # nodes. Safe because mid-batch visibility of an earlier
+            # iteration's root already goes through local_roots above, not
+            # a re-read of mtxdb -- see _persist_state_hamt_txn's
+            # docstring. Always a single room/collection here (this whole
+            # function persists one room's events_and_context), so a
+            # single flat put_state_hamt_roots() of every pending root,
+            # against this one room_prefix, is correct.
+            pending_room_roots: list[tuple[int, bytes]] = []
 
             for event, context in events_and_context:
                 if not event.is_state():
@@ -1315,10 +1560,11 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                     updates=[(event.type, event.state_key, event.event_id)],
                     local_nodes=local_nodes,
                     local_roots=local_roots,
+                    pending_room_roots=pending_room_roots,
                 )
                 hamt_writes.append((sg_after, root_hash, lattice, nodes))
                 # Only keep the root node in the local cache for the next iteration.
-                # Child nodes are fetched via SQL/mdbx in the retry loop if needed.
+                # Child nodes are fetched via SQL/mtxdb in the retry loop if needed.
                 local_nodes.clear()
                 # nodes is a list of (hash, bytes) tuples; find the root node entry
                 for node_hash, node_bytes in nodes:
@@ -1327,6 +1573,17 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                         break
                 local_roots[sg_after] = (root_hash, lattice)
                 sg_before = sg_after
+
+            if pending_room_roots and self._embedded_hamt_engine == "mtxdb":
+                _et = time.monotonic()
+                engine = get_embedded_engine(self._embedded_hamt_engine)
+                engine.put_state_hamt_roots(
+                    self._embedded_hamt_namespace, room_prefix, pending_room_roots
+                )
+                _state_timing("state_write_root_embedded", time.monotonic() - _et)
+
+            # Dirty marking handled by _persist_state_hamt_txn via
+            # txn.call_after(mark_dirty, Pool.STATE).
 
             return events_and_context, hamt_writes
 
@@ -1448,12 +1705,14 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                     local_roots=initial_roots,
                 )
             )
+            # Dirty marking handled by _persist_state_hamt_txn via
+            # txn.call_after(mark_dirty, Pool.STATE).
 
             return state_group, root_structural_hash, lattice, nodes
 
         # Both SQL and (if configured) the embedded engine were already
-        # written synchronously in insert_full_state_txn -- nothing left to
-        # publish post-commit.
+        # written (dirty marking via txn.call_after) in
+        # insert_full_state_txn -- nothing left to publish post-commit.
         state_group, _root_hash, _lattice, _nodes = await self.db_pool.runInteraction(
             "store_state_group.insert_full_state",
             insert_full_state_txn,
@@ -1490,17 +1749,39 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             room_id,
             state_groups_to_sequence_numbers,
         )
-        if self.embedded_hamt_engine == "mdbx" and state_groups:
-            from synapse.synapse_rust import mdbx_engine
-
-            await defer_to_thread(
+        if self._embedded_hamt_engine == "mtxdb" and state_groups:
+            engine = get_embedded_engine(self._embedded_hamt_engine)
+            room_prefixes = await defer_to_thread(
                 self.hs.get_reactor(),
-                mdbx_engine.batch_delete,
-                [
-                    _state_hamt_root_key(self.hamt_namespace, int(state_group))
-                    for state_group in state_groups
-                ],
+                engine.get_room_index,
+                self._embedded_hamt_namespace,
+                [int(state_group) for state_group in state_groups],
             )
+            by_room: dict[bytes, list[int]] = {}
+            resolved_groups: list[int] = []
+            for state_group, room_prefix in zip(state_groups, room_prefixes):
+                if room_prefix is not None:
+                    by_room.setdefault(bytes(room_prefix), []).append(state_group)
+                    resolved_groups.append(state_group)
+            for room_prefix, room_state_groups in by_room.items():
+                await defer_to_thread(
+                    self.hs.get_reactor(),
+                    engine.delete_state_hamt_roots_for_room,
+                    self._embedded_hamt_namespace,
+                    room_prefix,
+                    room_state_groups,
+                )
+            # Only remove from the deletion queue the groups we successfully
+            # resolved a room prefix for. Groups without a mapping are left
+            # in the queue for retry on the next run.
+            if resolved_groups:
+                await self.db_pool.simple_delete_many(
+                    table="state_hamt_root_deletion_queue",
+                    column="state_group",
+                    iterable=resolved_groups,
+                    keyvalues={},
+                    desc="remove_purged_embedded_state_hamt_roots",
+                )
         return deleted
 
     def _purge_unreferenced_state_groups(
@@ -1586,6 +1867,18 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             [(sg,) for sg in state_groups_to_delete],
         )
 
+        if self._embedded_hamt_engine == "mtxdb":
+            # Preserve enough information to retry an embedded deletion if
+            # the room version is no longer available after this transaction.
+            # The room index records the prefix alongside each root.
+            txn.execute_batch(
+                """
+                INSERT INTO state_hamt_root_deletion_queue (state_group)
+                VALUES (?) ON CONFLICT (state_group) DO NOTHING
+                """,
+                [(state_group,) for state_group in state_groups_to_delete],
+            )
+
         # Delete the SQL root pointer -- a no-op when the embedded engine is
         # exclusively configured (state_hamt_roots was never written for
         # this group; see _persist_state_hamt_txn), harmless either way.
@@ -1664,18 +1957,24 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             self._purge_room_state_txn,
             room_id,
         )
-        if self.embedded_hamt_engine == "mdbx":
+        if self._embedded_hamt_engine == "mtxdb":
             await self._drain_embedded_state_hamt_root_deletion_queue()
+
+    async def stop(self) -> None:
+        """Flush outstanding coalescer dirty pools on shutdown."""
+        if hasattr(self, "_flush_coalescer"):
+            self._flush_coalescer.close()
+            _clear_coalescer(self._flush_coalescer)
 
     @wrap_as_background_process("drain_embedded_state_hamt_root_deletion_queue")
     async def _drain_embedded_state_hamt_root_deletion_queue(self) -> None:
         """Delete queued embedded-engine roots after their SQL state groups
         are purged."""
 
-        if self.embedded_hamt_engine != "mdbx":
+        if self._embedded_hamt_engine != "mtxdb":
             return
 
-        from synapse.synapse_rust import mdbx_engine
+        engine = get_embedded_engine(self._embedded_hamt_engine)
 
         while True:
 
@@ -1695,22 +1994,44 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             if not state_groups:
                 return
 
+            resolved_groups: list[int] = []
             try:
-                await defer_to_thread(
+                # Same fix as purge_unreferenced_state_groups: roots live
+                # in their room's own collection now, not the old global
+                # one _state_hamt_root_key/batch_delete targeted (a silent
+                # no-op post-migration). This queue only has bare
+                # state_group ints, so resolve each to a room via the
+                # room_index before deleting. An index miss does not prove
+                # there is no root: an interrupted write can leave a root
+                # without its index entry. Keep such groups queued rather
+                # than losing the retry record.
+                room_prefixes = await defer_to_thread(
                     self.hs.get_reactor(),
-                    mdbx_engine.batch_delete,
-                    [
-                        _state_hamt_root_key(self.hamt_namespace, state_group)
-                        for state_group in state_groups
-                    ],
+                    engine.get_room_index,
+                    self._embedded_hamt_namespace,
+                    state_groups,
                 )
-                await self.db_pool.simple_delete_many(
-                    table="state_hamt_root_deletion_queue",
-                    column="state_group",
-                    iterable=state_groups,
-                    keyvalues={},
-                    desc="remove_embedded_state_hamt_root_deletion_queue_batch",
-                )
+                by_room: dict[bytes, list[int]] = {}
+                for state_group, room_prefix in zip(state_groups, room_prefixes):
+                    if room_prefix is not None:
+                        by_room.setdefault(bytes(room_prefix), []).append(state_group)
+                        resolved_groups.append(state_group)
+                for room_prefix, room_state_groups in by_room.items():
+                    await defer_to_thread(
+                        self.hs.get_reactor(),
+                        engine.delete_state_hamt_roots_for_room,
+                        self._embedded_hamt_namespace,
+                        room_prefix,
+                        room_state_groups,
+                    )
+                if resolved_groups:
+                    await self.db_pool.simple_delete_many(
+                        table="state_hamt_root_deletion_queue",
+                        column="state_group",
+                        iterable=resolved_groups,
+                        keyvalues={},
+                        desc="remove_embedded_state_hamt_root_deletion_queue_batch",
+                    )
             except Exception:
                 # The IDs remain durably queued for the periodic retry, so a
                 # transient embedded-engine failure cannot leave
@@ -1720,6 +2041,8 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                     len(state_groups),
                     exc_info=True,
                 )
+
+            if len(resolved_groups) < len(state_groups):
                 return
 
     def _purge_room_state_txn(
@@ -1747,7 +2070,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         if not deleted_state_groups:
             return []
 
-        if self.embedded_hamt_engine == "mdbx":
+        if self._embedded_hamt_engine == "mtxdb":
             # Persist a retry record in the same transaction as the SQL purge.
             # If the embedded engine write fails after commit, its root keys
             # can still be removed on a later retry instead of being lost

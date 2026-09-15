@@ -1,5 +1,5 @@
 from synapse.synapse_rust import (
-    mdbx_engine as mdbx_engine,
+    mtxdb_engine as mtxdb_engine,
     state_hamt as state_hamt,
 )
 

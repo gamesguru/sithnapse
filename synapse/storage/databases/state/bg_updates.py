@@ -19,12 +19,16 @@
 #
 #
 
-import hashlib
+import atexit
 import logging
+import os
 import struct
+import sys
+import threading
 import time
-from types import ModuleType
+from collections import defaultdict
 from typing import (
+    IO,
     TYPE_CHECKING,
     Mapping,
 )
@@ -36,6 +40,8 @@ from synapse.storage.database import (
     LoggingDatabaseConnection,
     LoggingTransaction,
 )
+from synapse.storage.databases.embedded_engine import get_embedded_engine
+from synapse.storage.databases.main.embedded_common import ffi_timing, namespace_hash
 from synapse.storage.engines import PostgresEngine
 from synapse.types import MutableStateMap, StateMap
 from synapse.types.state import StateFilter
@@ -47,6 +53,233 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# ── mtxdb-vs-SQL timing (opt-in via SYNAPSE_PG_TIMINGS=1) ───────────────
+_STATE_TIMINGS: dict[str, float] = defaultdict(float)
+_STATE_TIMING_COUNTS: dict[str, int] = defaultdict(int)
+_STATE_TIMING_LOCK: "threading.Lock | None" = (
+    threading.Lock() if os.environ.get("SYNAPSE_PG_TIMINGS") else None
+)
+
+# ── Node-write bucketed stats (opt-in via SYNAPSE_PG_TIMINGS=1) ────────
+# Tracks batch size, total bytes, and per-call latency for put_state_hamt_nodes
+# to diagnose the 0.27ms/call fixed-cost amplification.
+_NODE_WRITE_CALLS = 0
+_NODE_WRITE_TOTAL_NODES = 0
+_NODE_WRITE_TOTAL_BYTES = 0
+_NODE_WRITE_TOTAL_TIME = 0.0
+_NODE_WRITE_LATENCY_BUCKETS: dict[str, int] = defaultdict(
+    int
+)  # latency bucket -> count
+_NODE_WRITE_SIZE_BUCKETS: dict[str, int] = defaultdict(
+    int
+)  # batch-size bucket -> count
+
+_timings_file: IO[str] | None = None
+if os.environ.get("SYNAPSE_PG_TIMINGS"):
+    _timings_path = os.environ.get("SYNAPSE_PG_TIMINGS_FILE")
+    if _timings_path:
+        try:
+            _timings_file = open(_timings_path, "a")
+        except OSError:
+            pass
+
+
+def _timings_print(*args: object) -> None:
+    print(*args, file=sys.stderr)
+    if _timings_file is not None:
+        print(*args, file=_timings_file)
+
+
+def _state_timing(tag: str, elapsed: float) -> None:
+    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+        return
+    lock = _STATE_TIMING_LOCK
+    if lock is not None:
+        with lock:
+            _STATE_TIMINGS[tag] += elapsed
+            _STATE_TIMING_COUNTS[tag] += 1
+    else:
+        _STATE_TIMINGS[tag] += elapsed
+        _STATE_TIMING_COUNTS[tag] += 1
+
+
+def _record_node_write_stats(nodes: list[tuple[bytes, bytes]], elapsed: float) -> None:
+    """Record batch-size/byte-count stats for put_state_hamt_nodes diagnostics."""
+    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+        return
+    global \
+        _NODE_WRITE_CALLS, \
+        _NODE_WRITE_TOTAL_NODES, \
+        _NODE_WRITE_TOTAL_BYTES, \
+        _NODE_WRITE_TOTAL_TIME
+    batch_size = len(nodes)
+    total_bytes = sum(len(h) + len(b) for h, b in nodes)
+    # Latency buckets: <0.1ms, <0.25ms, <0.5ms, <1ms, >=1ms
+    if elapsed < 0.0001:
+        lat_bucket = "<0.1ms"
+    elif elapsed < 0.00025:
+        lat_bucket = "<0.25ms"
+    elif elapsed < 0.0005:
+        lat_bucket = "<0.5ms"
+    elif elapsed < 0.001:
+        lat_bucket = "<1ms"
+    else:
+        lat_bucket = ">=1ms"
+    # Size buckets: 1, 2-5, 6-20, 21-100, >100
+    if batch_size == 1:
+        size_bucket = "1"
+    elif batch_size <= 5:
+        size_bucket = "2-5"
+    elif batch_size <= 20:
+        size_bucket = "6-20"
+    elif batch_size <= 100:
+        size_bucket = "21-100"
+    else:
+        size_bucket = ">100"
+    lock = _STATE_TIMING_LOCK
+    if lock is not None:
+        with lock:
+            _NODE_WRITE_CALLS += 1
+            _NODE_WRITE_TOTAL_NODES += batch_size
+            _NODE_WRITE_TOTAL_BYTES += total_bytes
+            _NODE_WRITE_TOTAL_TIME += elapsed
+            _NODE_WRITE_LATENCY_BUCKETS[lat_bucket] += 1
+            _NODE_WRITE_SIZE_BUCKETS[size_bucket] += 1
+    else:
+        _NODE_WRITE_CALLS += 1
+        _NODE_WRITE_TOTAL_NODES += batch_size
+        _NODE_WRITE_TOTAL_BYTES += total_bytes
+        _NODE_WRITE_TOTAL_TIME += elapsed
+        _NODE_WRITE_LATENCY_BUCKETS[lat_bucket] += 1
+        _NODE_WRITE_SIZE_BUCKETS[size_bucket] += 1
+
+
+def _print_state_timings() -> None:
+    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+        return
+    lock = _STATE_TIMING_LOCK
+    assert lock is not None
+    with lock:
+        if not _STATE_TIMINGS:
+            return
+        # Snapshot under the lock so the SIGTERM/atexit flusher never races a
+        # concurrent `_state_timing` on these dicts.
+        timings = dict(_STATE_TIMINGS)
+        counts = dict(_STATE_TIMING_COUNTS)
+    _timings_print("\n=== State store mtxdb-vs-SQL timings ===")
+    _timings_print(
+        f"  {'':40s}  {'total':>10s}  {'calls':>6s}  {'avg':>13s}",
+    )
+
+    embedded_tags = sorted(t for t in timings if t.endswith("_embedded"))
+    sql_tags = sorted(t for t in timings if t.endswith("_sql"))
+    other_tags = sorted(t for t in timings if not t.endswith(("_embedded", "_sql")))
+
+    def _print_tag_group(label: str, tags: list[str]) -> None:
+        if not tags:
+            return
+        _timings_print(f"  -- {label} --")
+        for tag in tags:
+            total_s = timings[tag]
+            count = counts[tag]
+            total_ms = total_s * 1000
+            avg_ms = (total_s / count) * 1000 if count else 0.0
+            _timings_print(
+                f"  {tag:40s}  {total_ms:8.1f}ms  {count:6d}  {avg_ms:10.3f}ms",
+            )
+
+    def _print_subtotal(label: str, tags: list[str]) -> None:
+        total_s = sum(timings[tag] for tag in tags)
+        count = sum(counts[tag] for tag in tags)
+        total_ms = total_s * 1000
+        avg_ms = (total_s / count) * 1000 if count else 0.0
+        _timings_print(
+            f"  {label:40s}  {total_ms:8.1f}ms  {count:6d}  {avg_ms:10.3f}ms",
+        )
+
+    _print_tag_group("hits (embedded)", embedded_tags)
+    _timings_print("")
+    _print_subtotal("SUB-TOTAL (hits embedded)", embedded_tags)
+    _timings_print("")
+    _print_tag_group("misses (sql)", sql_tags)
+    _timings_print("")
+    _print_tag_group("other", other_tags)
+
+    total_time_s = sum(timings.values())
+    total_count = sum(counts.values())
+    total_ms = total_time_s * 1000
+    avg_ms = (total_time_s / total_count) * 1000 if total_count else 0.0
+    _timings_print("")
+    _timings_print(
+        f"  {'TOTAL':40s}  {total_ms:8.1f}ms  {total_count:6d}  {avg_ms:10.3f}ms",
+    )
+    _timings_print("=========================================")
+    _timings_print("")
+
+
+def _print_node_write_stats() -> None:
+    """Print node-write bucketed stats for put_state_hamt_nodes diagnostics."""
+    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+        return
+    lock = _STATE_TIMING_LOCK
+    assert lock is not None
+    with lock:
+        calls = _NODE_WRITE_CALLS
+        total_nodes = _NODE_WRITE_TOTAL_NODES
+        total_bytes = _NODE_WRITE_TOTAL_BYTES
+        total_time = _NODE_WRITE_TOTAL_TIME
+        lat_buckets = dict(_NODE_WRITE_LATENCY_BUCKETS)
+        size_buckets = dict(_NODE_WRITE_SIZE_BUCKETS)
+    if calls == 0:
+        return
+    _timings_print("\n=== put_state_hamt_nodes batch diagnostics ===")
+    _timings_print(f"  calls:                    {calls}")
+    _timings_print(f"  total nodes:              {total_nodes}")
+    _timings_print(f"  total bytes:              {total_bytes:,}")
+    _timings_print(f"  total time:               {total_time * 1000:.1f}ms")
+    _timings_print(f"  avg nodes/call:           {total_nodes / calls:.1f}")
+    _timings_print(f"  avg bytes/call:           {total_bytes / calls:.0f}")
+    _timings_print(f"  avg time/call:            {(total_time / calls) * 1000:.3f}ms")
+    _timings_print(
+        f"  avg bytes/node:           {total_bytes / total_nodes:.0f}"
+        if total_nodes
+        else ""
+    )
+    _timings_print("")
+    _timings_print("  Latency distribution:")
+    for bucket in ("<0.1ms", "<0.25ms", "<0.5ms", "<1ms", ">=1ms"):
+        count = lat_buckets.get(bucket, 0)
+        pct = (count / calls) * 100 if calls else 0
+        _timings_print(f"    {bucket:12s}  {count:6d}  ({pct:5.1f}%)")
+    _timings_print("")
+    _timings_print("  Batch-size distribution:")
+    for bucket in ("1", "2-5", "6-20", "21-100", ">100"):
+        count = size_buckets.get(bucket, 0)
+        pct = (count / calls) * 100 if calls else 0
+        _timings_print(f"    {bucket:12s}  {count:6d}  ({pct:5.1f}%)")
+    _timings_print("=============================================")
+    _timings_print("")
+
+
+if os.environ.get("SYNAPSE_PG_TIMINGS"):
+    atexit.register(_print_state_timings)
+    atexit.register(_print_node_write_stats)
+
+    import signal as _signal
+    from types import FrameType as _FrameType
+
+    _original_sigterm_state_timings = _signal.getsignal(_signal.SIGTERM)
+
+    def _flush_state_timings_on_sigterm(signum: int, frame: _FrameType | None) -> None:
+        _print_state_timings()
+        if callable(_original_sigterm_state_timings):
+            _original_sigterm_state_timings(signum, frame)
+        elif _original_sigterm_state_timings == _signal.SIG_DFL:
+            _signal.signal(_signal.SIGTERM, _signal.SIG_DFL)
+            _signal.raise_signal(_signal.SIGTERM)
+
+    _signal.signal(_signal.SIGTERM, _flush_state_timings_on_sigterm)
+
 
 MAX_STATE_DELTA_HOPS = 100
 
@@ -55,10 +288,10 @@ def _state_hamt_node_key(
     namespace: str, room_prefix: bytes, structural_hash: bytes
 ) -> bytes:
     # Must match `node_key` in `rust/src/database/core.rs`.
-    namespace_hash = hashlib.sha256(namespace.encode("utf-8")).digest()[:16]
+    ns_hash = namespace_hash(namespace)
     return (
         b"hamt:node:"
-        + namespace_hash.hex().encode("ascii")
+        + ns_hash.hex().encode("ascii")
         + b":"
         + room_prefix.hex().encode("ascii")
         + b":"
@@ -73,11 +306,9 @@ def _state_hamt_root_key(namespace: str, state_group: int) -> bytes:
     namespace is part of the key. The room prefix is stored in the
     value, allowing readers to locate a root from only its state-group id.
     """
-    namespace_hash = hashlib.sha256(namespace.encode("utf-8")).digest()[:16]
+    ns_hash = namespace_hash(namespace)
     return (
-        b"hamt:root:"
-        + namespace_hash.hex().encode("ascii")
-        + str(state_group).encode("ascii")
+        b"hamt:root:" + ns_hash.hex().encode("ascii") + str(state_group).encode("ascii")
     )
 
 
@@ -253,6 +484,45 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
                 retcols=("id",),
             )
             existing_in_sql = {group for (group,) in existing_rows}
+            if (
+                existing_in_sql
+                and getattr(self, "_embedded_hamt_engine", None) == "mtxdb"
+            ):
+                # In a multi-worker deployment, this worker's in-process
+                # mtxdb index may simply be stale rather than the group
+                # being genuinely corrupt: another worker can have written
+                # the root/nodes after this worker last loaded (or never
+                # loaded) that room's collection, and nothing invalidates
+                # this worker's copy automatically -- see
+                # `StorageEngine::refresh_collection`'s doc comment.
+                # `room_index` itself needs no such retry (it's always
+                # current -- a plain `pread`), so this resolves the
+                # affected groups to their rooms via that index and forces
+                # a one-time re-scan of each room's collection before
+                # concluding the data is actually missing.
+                from synapse.synapse_rust.mtxdb_engine import (
+                    refresh_state_hamt_collections_for_groups,
+                )
+
+                namespace = getattr(self, "_embedded_hamt_namespace", None)
+                # __init__ always sets this alongside `_embedded_hamt_engine`
+                # in the same branch (see store.py) -- reaching here with
+                # the engine set but not the namespace would be an init bug,
+                # not a normal runtime state.
+                assert namespace is not None
+                refresh_state_hamt_collections_for_groups(
+                    namespace, list(existing_in_sql)
+                )
+                retry_results, _ = self._get_state_groups_from_hamt_txn(
+                    txn, list(existing_in_sql), state_filter
+                )
+                results.update(retry_results)
+                existing_in_sql -= set(retry_results)
+                # Recovered groups must not also go through the legacy
+                # fallback below -- it would overwrite the correct,
+                # just-refreshed state with an empty/wrong reconstruction.
+                missing_groups = [g for g in missing_groups if g not in retry_results]
+
             if existing_in_sql:
                 raise RuntimeError(
                     f"State group(s) exist in SQL but have no HAMT root: {existing_in_sql}"
@@ -463,18 +733,19 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
             state_filter.concrete_types() if not state_filter.has_wildcards() else None
         )
 
-        # The embedded engine (mdbx) mirrors both nodes and root records
+        # The embedded engine (mtxdb) mirrors both nodes and root records
         # (`_store_state_hamt_root_embedded_txn`/`batch_get_state_hamt_roots`),
         # falling back to `state_hamt_roots`/`state_groups` SQL only for a
         # group it doesn't have. Always use the bulk path (it degrades to a
         # single-root fetch fine for len(groups) == 1).
-        use_embedded = bool(getattr(self, "embedded_hamt_engine", None))
+        use_embedded = bool(getattr(self, "_embedded_hamt_engine", None))
 
         bulk_results: dict[int, list[tuple[str, str, str]] | None] | None = None
         bulk_selective_results: dict[int, list[tuple[str, str, str]] | None] | None = (
             None
         )
         if use_embedded:
+            _et = time.monotonic()
             if exact_keys is None:
                 bulk_results = self._materialize_state_hamts_from_embedded_txn(
                     txn, groups
@@ -483,7 +754,9 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
                 bulk_selective_results = self._lookup_state_hamts_from_embedded_txn(
                     txn, groups, exact_keys
                 )
+            _state_timing("state_read_embedded", time.monotonic() - _et)
         elif len(groups) > 1:
+            _st = time.monotonic()
             if exact_keys is None:
                 bulk_results = self._materialize_state_hamt_from_postgres_many_txn(
                     txn, groups
@@ -492,6 +765,7 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
                 bulk_selective_results = self._lookup_state_hamt_from_postgres_many_txn(
                     txn, groups, exact_keys
                 )
+            _state_timing("state_read_sql", time.monotonic() - _st)
 
         for group in groups:
             if exact_keys is not None:
@@ -862,22 +1136,6 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
         )
         return results
 
-    def _embedded_hamt_engine_module(self) -> ModuleType:
-        """Returns the `mdbx_engine` PyO3 module configured for this
-        deployment (`embedded_hamt_engine` config). mdbx is the only
-        supported embedded engine (fjall was benchmarked and dropped, see
-        `database/mod.rs`'s doc comment). Nodes are content-addressed and
-        immutable, so `materialize_state_hamts`/`lookup_state_hamts` can
-        walk the tree itself in Rust -- unlike the SQL path above, no
-        per-node round trip back into Python is needed here.
-        """
-        engine = getattr(self, "embedded_hamt_engine", None)
-        if engine == "mdbx":
-            from synapse.synapse_rust import mdbx_engine
-
-            return mdbx_engine
-        raise RuntimeError(f"Unknown embedded_hamt_engine: {engine!r}")
-
     def _fetch_hamt_roots_for_embedded_txn(
         self, txn: LoggingTransaction, groups: list[int]
     ) -> dict[int, tuple[bytes, bytes, str]]:
@@ -891,22 +1149,26 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
         this group's pre-existing SQL row over yet -- see
         `_background_migrate_state_hamt_to_embedded`. Only in that bounded,
         explicit window does this fall back to SQL.
+
+        `groups` is a bare list of `state_group` ints spanning arbitrary,
+        unknown rooms by design (this is the generic materialize/lookup-by
+        -groups path). Roots live in per-room mtxdb collections, so the Rust
+        bulk API resolves each group's room via the flat-file room index,
+        groups the reads by room, and decodes their records before returning
+        to Python. This keeps the whole operation to one FFI crossing.
         """
-        engine = self._embedded_hamt_engine_module()
-        namespace = self.hamt_namespace
+        engine = get_embedded_engine(getattr(self, "_embedded_hamt_engine", None))
+        namespace = getattr(self, "_embedded_hamt_namespace", None)
         found: dict[int, tuple[bytes, bytes, str]] = {}
         still_missing: list[int] = []
-        # One batched Rust call instead of an N-iteration Python for loop
-        # each paying its own FFI round trip.
-        for group, record in zip(
-            groups, engine.batch_get_state_hamt_roots(namespace, groups)
-        ):
-            if record is None:
+
+        roots = engine.get_state_hamt_roots_bulk(namespace, groups)
+        for group, root in zip(groups, roots):
+            if root is None:
                 still_missing.append(group)
                 continue
-            _group, room_prefix, root_hash, room_id, _lattice = record
+            room_prefix, root_hash, room_id = root
             found[group] = (bytes(room_prefix), bytes(root_hash), room_id)
-
         if not still_missing:
             return found
 
@@ -966,12 +1228,14 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
         roots = self._fetch_hamt_roots_for_embedded_txn(txn, groups)
         if not roots:
             return results
-        engine = self._embedded_hamt_engine_module()
+        engine = get_embedded_engine(getattr(self, "_embedded_hamt_engine", None))
         ordered_groups = list(roots.keys())
+        _et = time.monotonic()
         materialized = engine.materialize_state_hamts(
-            self.hamt_namespace,
+            getattr(self, "_embedded_hamt_namespace", None),
             [roots[group] for group in ordered_groups],
         )
+        ffi_timing("ffi_materialize_hamts", time.monotonic() - _et)
         for group, entries in zip(ordered_groups, materialized):
             results[group] = entries
         return results
@@ -988,13 +1252,17 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
         roots = self._fetch_hamt_roots_for_embedded_txn(txn, groups)
         if not roots:
             return results
-        engine = self._embedded_hamt_engine_module()
+        engine = get_embedded_engine(getattr(self, "_embedded_hamt_engine", None))
         ordered_groups = list(roots.keys())
         queries = [
             (room_prefix, root_hash, self._room_structural_key(room_id), keys)
             for room_prefix, root_hash, room_id in (roots[g] for g in ordered_groups)
         ]
-        looked_up = engine.lookup_state_hamts(self.hamt_namespace, queries)
+        _et = time.monotonic()
+        looked_up = engine.lookup_state_hamts(
+            getattr(self, "_embedded_hamt_namespace", None), queries
+        )
+        ffi_timing("ffi_lookup_hamts", time.monotonic() - _et)
         for group, entries in zip(ordered_groups, looked_up):
             results[group] = entries
         return results

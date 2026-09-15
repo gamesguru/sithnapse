@@ -19,6 +19,7 @@
 #
 
 import datetime
+import unittest
 from typing import (
     Collection,
     Iterable,
@@ -56,6 +57,7 @@ from synapse.util.json import json_encoder
 
 import tests.unittest
 import tests.utils
+from tests.utils import EMBEDDED_HAMT_ENGINE
 
 # The silly auth graph we use to test the auth difference algorithm,
 # where the top are the most recent events.
@@ -800,14 +802,15 @@ class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
                 )
             )
         # Links are exclusive to whichever engine is configured (SQL or the
-        # embedded mdbx engine -- see `_persist_chain_cover_index`), so
+        # embedded mtxdb engine -- see `_persist_chain_cover_index`), so
         # insert the fixture the same way the production write path does
         # rather than always writing straight to the SQL table, otherwise
         # this test would only ever check the SQL backend under the
-        # trial-mdbx CI job's `embedded_hamt_engine` config.
+        # trial-mtxdb CI job's `embedded_hamt_engine` config.
         embedded_hamt_namespace = resolve_namespace(self.store)
         if embedded_hamt_namespace is not None:
             put_chain_links_batch(
+                getattr(self.store, "_embedded_hamt_engine", None),
                 embedded_hamt_namespace,
                 [
                     (
@@ -944,6 +947,168 @@ class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
             self.get_success(
                 self.store.db_pool.runInteraction(
                     f"test_case_{test_case.name}", run_test, test_case
+                )
+            )
+
+    @unittest.skipUnless(EMBEDDED_HAMT_ENGINE, "requires embedded HAMT engine")
+    def test_conflicted_subgraph_embedded_closures(self) -> None:
+        """Embedded-closures counterpart to `test_conflicted_subgraph`.
+
+        The fixture above is a chain-cover **(chain id, seq num, link)**
+        description; the embedded closures path instead navigates a plain
+        auth DAG (short ids + direct auth edges), so this test expresses the
+        same ancestry as *direct edges* and asserts
+        `_get_auth_chain_difference_using_embedded_closures_txn` returns the
+        very same `want_conflicted_subgraph` sets the chain-cover code is held
+        to. Both implementations must agree; if one drifts, this is the guard.
+
+        The edge set is derived from the links: an event that "links into" a
+        chain at position `n` auths every position `<= n` of that chain, plus
+        its own chain's predecessors -- the chain-cover semantics that the
+        want sets above were computed under.
+        """
+        from synapse.storage.databases.main.embedded_event_auth_chains import (
+            embed_auth_edges_batch,
+            get_or_create_short_ids,
+        )
+
+        embedded_hamt_namespace = resolve_namespace(self.store)
+        if embedded_hamt_namespace is None:
+            self.skipTest("embedded closures namespace not configured")
+
+        engine_name = getattr(self.store, "_embedded_hamt_engine", None)
+        room_id = "!conflicted_subgraph_embedded_closures"
+
+        # Direct auth edges reproducing the same ancestry as the chain
+        # fixture (see the ASCII diagram in `test_conflicted_subgraph`).
+        auth_edges = {
+            "A1": [],
+            "A2": ["A1"],
+            "A3": ["A2"],
+            "B1": ["A1", "A2"],
+            "B2": ["B1"],
+            "B3": ["B2"],
+            "C1": ["B1", "B2"],
+            "C2": ["C1"],
+            "C3": ["C2"],
+            "D1": ["C1"],
+            "D2": ["D1"],
+            "D3": ["D2"],
+            "E1": ["D1", "D2"],
+            "F1": ["E1"],
+            "F2": ["F1"],
+            "G1": ["D1", "D2", "D3"],
+            "G2": ["G1"],
+        }
+        event_ids = list(auth_edges)
+        short_ids = get_or_create_short_ids(
+            engine_name, embedded_hamt_namespace, room_id, event_ids
+        )
+        short_id_of = dict(zip(event_ids, short_ids))
+        embed_auth_edges_batch(
+            engine_name,
+            embedded_hamt_namespace,
+            room_id,
+            [
+                (short_id_of[event_id], [short_id_of[auth_id] for auth_id in auths])
+                for event_id, auths in auth_edges.items()
+            ],
+        )
+
+        class TestCase(NamedTuple):
+            name: str
+            conflicted: set[str]
+            additional_backwards_reachable: set[str]
+            want_conflicted_subgraph: set[str]
+
+        test_cases = [
+            TestCase(
+                name="basic_single_chain",
+                conflicted={"B1", "B3"},
+                additional_backwards_reachable=set(),
+                want_conflicted_subgraph={"B1", "B2", "B3"},
+            ),
+            TestCase(
+                name="basic_single_link",
+                conflicted={"A1", "B2"},
+                additional_backwards_reachable=set(),
+                want_conflicted_subgraph={"A1", "A2", "B1", "B2"},
+            ),
+            TestCase(
+                name="basic_multi_link",
+                conflicted={"B1", "F1"},
+                additional_backwards_reachable=set(),
+                want_conflicted_subgraph={"B1", "B2", "C1", "D1", "D2", "E1", "F1"},
+            ),
+            TestCase(
+                name="basic_single_chain_as_additional",
+                conflicted={"B1"},
+                additional_backwards_reachable={"B3"},
+                want_conflicted_subgraph={"B1", "B2", "B3"},
+            ),
+            TestCase(
+                name="basic_single_link_as_additional",
+                conflicted={"A1"},
+                additional_backwards_reachable={"B2"},
+                want_conflicted_subgraph={"A1", "A2", "B1", "B2"},
+            ),
+            TestCase(
+                name="basic_multi_link_as_additional",
+                conflicted={"B1"},
+                additional_backwards_reachable={"F1"},
+                want_conflicted_subgraph={"B1", "B2", "C1", "D1", "D2", "E1", "F1"},
+            ),
+            TestCase(
+                name="mixed_multi_link",
+                conflicted={"D1", "F1"},
+                additional_backwards_reachable={"G1"},
+                want_conflicted_subgraph={"D1", "D2", "D3", "E1", "F1", "G1"},
+            ),
+            TestCase(
+                name="additional_backwards_doesnt_add_forwards_info",
+                conflicted={"C1", "C3"},
+                additional_backwards_reachable={"B1"},
+                want_conflicted_subgraph={"C1", "C2", "C3"},
+            ),
+            TestCase(
+                name="empty_subgraph",
+                conflicted={"B3", "C3"},
+                additional_backwards_reachable=set(),
+                want_conflicted_subgraph={"B3", "C3"},
+            ),
+            TestCase(
+                name="empty_subgraph_with_additional",
+                conflicted={"C1"},
+                additional_backwards_reachable={"B1"},
+                want_conflicted_subgraph={"C1"},
+            ),
+            TestCase(
+                name="empty_subgraph_single_conflict",
+                conflicted={"C1"},
+                additional_backwards_reachable=set(),
+                want_conflicted_subgraph={"C1"},
+            ),
+        ]
+
+        def run_test(txn: LoggingTransaction, test_case: TestCase) -> None:
+            result = self.store._get_auth_chain_difference_using_embedded_closures_txn(
+                txn,
+                embedded_hamt_namespace,
+                room_id,
+                [test_case.conflicted.union(test_case.additional_backwards_reachable)],
+                test_case.conflicted,
+                test_case.additional_backwards_reachable,
+            )
+            self.assertEqual(
+                result.conflicted_subgraph,
+                test_case.want_conflicted_subgraph,
+                f"{test_case.name} : conflicted subgraph mismatch",
+            )
+
+        for test_case in test_cases:
+            self.get_success(
+                self.store.db_pool.runInteraction(
+                    f"embedded_test_case_{test_case.name}", run_test, test_case
                 )
             )
 
