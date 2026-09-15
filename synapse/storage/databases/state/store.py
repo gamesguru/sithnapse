@@ -190,6 +190,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             self._embedded_hamt_is_writer = (
                 hs.get_instance_name() in hs.config.worker.writers.events
             )
+            self._instance_name = hs.get_instance_name()
             try:
                 engine = get_embedded_engine(self._embedded_hamt_engine)
                 _oet = time.monotonic()
@@ -250,6 +251,27 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                     "enqueue_state_hamt_embedded_migration",
                     self._enqueue_embedded_hamt_migration_if_needed,
                 )
+
+    def _assert_embedded_hamt_writer(self) -> None:
+        """Raise before attempting an mtxdb write on an instance that
+        opened the engine read-only.
+
+        A read-only-opened handle fails a write at the OS level (see the
+        comment on `_embedded_hamt_is_writer` above), but not until the
+        coalesced flush runs -- by then the failed write has already been
+        buffered, and the flush failure plus a subsequent failed rollback
+        permanently poisons the mtxdb shard for every process sharing it.
+        Every foreground write entry point must call this first so a
+        misrouted write fails immediately and locally instead of taking
+        the whole store down later.
+        """
+        if not self._embedded_hamt_is_writer:
+            raise RuntimeError(
+                f"Instance {self._instance_name!r} attempted an mtxdb write "
+                "but opened the embedded HAMT engine read-only (it is not "
+                "the events writer). This is a routing bug: state-group "
+                "mirror writes must only happen on the events writer."
+            )
 
     async def _enqueue_embedded_hamt_migration_if_needed(self) -> None:
         """Turning on the embedded engine doesn't retroactively move
@@ -1016,6 +1038,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         # a plain `batch_put` keyed by the raw structural_hash would be
         # invisible to it.
         if self._embedded_hamt_engine == "mtxdb":
+            self._assert_embedded_hamt_writer()
             engine = get_embedded_engine(self._embedded_hamt_engine)
             _et = time.monotonic()
             engine.put_state_hamt_nodes(
@@ -1193,6 +1216,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 room_prefix, root_hash, lattice, room_id=room_id
             )
             if self._embedded_hamt_engine == "mtxdb":
+                self._assert_embedded_hamt_writer()
                 engine = get_embedded_engine(self._embedded_hamt_engine)
                 # Written eagerly, ahead of root_value itself when
                 # pending_room_roots defers the latter: if the enclosing SQL
