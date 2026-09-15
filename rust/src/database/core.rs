@@ -98,11 +98,11 @@ pub struct RootRecord {
 }
 
 pub fn decode_root_value(value: &[u8]) -> Result<RootRecord, String> {
-    if value.len() < 5 || value[0] != 1 {
+    if value.len() < 9 || value.get(..4) != Some(b"MTHR") || value[4] != 1 {
         return Err("invalid or unsupported HAMT root record version".to_owned());
     }
-    let prefix_len = u16::from_be_bytes([value[1], value[2]]) as usize;
-    let room_id_len_offset = 3 + prefix_len;
+    let prefix_len = u16::from_be_bytes([value[5], value[6]]) as usize;
+    let room_id_len_offset = 7 + prefix_len;
     if value.len() < room_id_len_offset + 2 {
         return Err("truncated HAMT root record".to_owned());
     }
@@ -113,7 +113,7 @@ pub fn decode_root_value(value: &[u8]) -> Result<RootRecord, String> {
     if value.len() < root_start + 32 {
         return Err("truncated HAMT root record".to_owned());
     }
-    let room_prefix = value[3..room_id_len_offset].to_vec();
+    let room_prefix = value[7..room_id_len_offset].to_vec();
     let room_id =
         String::from_utf8(value[room_id_start..root_start].to_vec()).map_err(|e| e.to_string())?;
     let root_hash: StructuralHash = value[root_start..root_start + 32]

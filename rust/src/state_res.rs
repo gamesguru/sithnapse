@@ -18,8 +18,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PySet, PyTuple};
 use pythonize::depythonize;
 use rezzy::{
-    auth::roaring::AuthGraph, basespec::event_types::EventType, resolve_lattice_fold, LeanEvent,
-    RoomId, SharedState, StateResVersion,
+    auth::roaring::AuthGraph, basespec::event_types::EventType, resolve_semilattice_fold,
+    LeanEvent, RoomId, SharedState, StateResVersion,
 };
 use serde_json::Value;
 
@@ -236,9 +236,9 @@ fn resolve_v2_from_parsed_events<'py>(
         }
     }
 
-    let resolved = resolve_lattice_fold(
-        unconf_state,
-        conflicted_events,
+    let resolved = resolve_semilattice_fold(
+        &unconf_state,
+        &conflicted_events,
         parsed_events,
         StateResVersion::V2,
     );

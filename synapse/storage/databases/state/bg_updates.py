@@ -320,7 +320,7 @@ def _encode_state_hamt_root(
 ) -> bytes:
     room_id_bytes = room_id.encode("utf-8")
     return (
-        b"\x01"
+        b"MTHR\x01"
         + struct.pack(">H", len(room_prefix))
         + room_prefix
         + struct.pack(">H", len(room_id_bytes))
@@ -333,10 +333,10 @@ def _encode_state_hamt_root(
 def _decode_state_hamt_root(
     value: bytes,
 ) -> tuple[bytes, bytes, bytes, str]:
-    if len(value) < 5 or value[0] != 1:
+    if len(value) < 9 or value[:4] != b"MTHR" or value[4] != 1:
         raise RuntimeError("invalid or unsupported HAMT root record version")
-    prefix_len = struct.unpack(">H", value[1:3])[0]
-    room_id_len_offset = 3 + prefix_len
+    prefix_len = struct.unpack(">H", value[5:7])[0]
+    room_id_len_offset = 7 + prefix_len
     if len(value) < room_id_len_offset + 2:
         raise RuntimeError("truncated HAMT root record")
     room_id_len = struct.unpack(
@@ -346,7 +346,7 @@ def _decode_state_hamt_root(
     root_start = room_id_start + room_id_len
     if len(value) < root_start + 32:
         raise RuntimeError("truncated HAMT root record")
-    room_prefix = value[3:room_id_len_offset]
+    room_prefix = value[7:room_id_len_offset]
     room_id = value[room_id_start:root_start].decode("utf-8")
     root_hash = value[root_start : root_start + 32]
     lattice = value[root_start + 32 :]

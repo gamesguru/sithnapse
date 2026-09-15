@@ -296,14 +296,14 @@ pub fn get_state_hamt_roots_for_room(
 /// boundary only once: it returns just the fields its caller needs rather than
 /// raw records for Python to unpack one at a time.
 fn decode_state_hamt_root(value: &[u8]) -> PyResult<(Vec<u8>, Vec<u8>, String)> {
-    if value.len() < 5 || value[0] != 1 {
+    if value.len() < 9 || value.get(..4) != Some(b"MTHR") || value[4] != 1 {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
             "invalid or unsupported HAMT root record version",
         ));
     }
 
-    let prefix_len = u16::from_be_bytes([value[1], value[2]]) as usize;
-    let room_id_len_offset = 3 + prefix_len;
+    let prefix_len = u16::from_be_bytes([value[5], value[6]]) as usize;
+    let room_id_len_offset = 7 + prefix_len;
     if value.len() < room_id_len_offset + 2 {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
             "truncated HAMT root record",
@@ -328,7 +328,7 @@ fn decode_state_hamt_root(value: &[u8]) -> PyResult<(Vec<u8>, Vec<u8>, String)> 
         })?
         .to_owned();
     Ok((
-        value[3..room_id_len_offset].to_vec(),
+        value[7..room_id_len_offset].to_vec(),
         value[root_start..root_start + 32].to_vec(),
         room_id,
     ))
