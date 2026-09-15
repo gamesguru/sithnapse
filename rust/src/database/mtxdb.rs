@@ -19,6 +19,68 @@ struct MtxdbPools {
 static ROOM_INDEX_DIR: OnceCell<std::path::PathBuf> = OnceCell::new();
 
 static DBS: OnceCell<MtxdbPools> = OnceCell::new();
+/// Whether this process opened mtxdb writable (`open_client`) or
+/// read-only (`open_client_read_only`). Checked by every mutating
+/// pyfunction via `assert_writable()` before touching any fd -- a
+/// read-only-opened handle fails a write at the OS level, but not until
+/// flush time, by which point the failed write is already buffered and a
+/// subsequent failed rollback can permanently poison the shard for every
+/// process sharing it. Gating once here, at the single choke point every
+/// mutating call passes through, means no future write door can reopen
+/// that hole the way a per-Python-callsite guard could.
+static WRITE_MODE: OnceCell<bool> = OnceCell::new();
+/// The pid that actually opened `DBS`, recorded alongside it. `DBS` is a
+/// process-global `OnceCell`; under a fork()-based worker launcher a
+/// child that inherits an already-`Some` `DBS` from its parent's address
+/// space must not silently reuse those fds as if it had opened them
+/// itself -- see `check_pid_guard`.
+static OPENER_PID: OnceCell<u32> = OnceCell::new();
+
+/// Raises if this process opened mtxdb read-only (or never opened it),
+/// before any mutating pyfunction touches a fd. See `WRITE_MODE`'s doc
+/// comment for why this must be the single choke point, not a per-caller
+/// guard.
+fn assert_writable() -> PyResult<()> {
+    match WRITE_MODE.get() {
+        Some(true) => Ok(()),
+        Some(false) => Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "mtxdb opened read-only in this process; refusing to write \
+             (this is a routing bug -- writes must only be attempted on \
+             the process that opened mtxdb via open_client)",
+        )),
+        None => Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "mtxdb not opened in this process",
+        )),
+    }
+}
+
+/// Returns `Ok(true)` if `DBS` is already open *in this process* and the
+/// caller (`open_client`/`open_client_read_only`) should short-circuit
+/// as a no-op, exactly as the old `DBS.get().is_some()` check did.
+///
+/// Returns `Err` instead of `Ok(true)` when `DBS` is `Some` but was
+/// opened by a *different* pid -- i.e. this process inherited it via
+/// `fork()` rather than opening it itself. Silently reusing inherited
+/// fds here is exactly the fork-inheritance hazard: two processes
+/// sharing one fd with independently-diverging in-memory bookkeeping
+/// (buffered writes, file_len tracking) is how a flush lands on invalid
+/// file state. There is no live incident this closes (the launcher in
+/// use opens mtxdb strictly post-fork, per the topology audit), but a
+/// future pre-fork opener would otherwise reintroduce it silently.
+fn check_pid_guard() -> PyResult<bool> {
+    if DBS.get().is_none() {
+        return Ok(false);
+    }
+    let current = std::process::id();
+    match OPENER_PID.get() {
+        Some(&opener) if opener == current => Ok(true),
+        opener => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "mtxdb DBS state was inherited from another process (opener \
+             pid {opener:?}, current pid {current}); refusing to reuse \
+             fds across a fork boundary"
+        ))),
+    }
+}
 /// Serialize all read-modify-write cycles through the embedded engine.
 /// The mtxdb `StorageEngine` trait has no atomic increment or transaction API,
 /// so we hold this across get→put_many for counters and auth-chain manifests.
@@ -132,6 +194,7 @@ pub fn put_state_hamt_roots(
     room_prefix: Vec<u8>,
     roots: Vec<(i64, Vec<u8>)>,
 ) -> PyResult<()> {
+    assert_writable()?;
     let room_id = room_id_from_prefix(&room_prefix);
     let pairs: Vec<(NodeId, NodeData)> = roots
         .into_iter()
@@ -171,6 +234,7 @@ pub fn delete_state_hamt_roots_for_room(
     room_prefix: Vec<u8>,
     state_groups: Vec<i64>,
 ) -> PyResult<()> {
+    assert_writable()?;
     let room_id = room_id_from_prefix(&room_prefix);
     let pairs: Vec<(NodeId, NodeData)> = state_groups
         .into_iter()
@@ -778,6 +842,7 @@ pub fn put_room_index(
     namespace: String,
     entries: Vec<(i64, Vec<u8>)>,
 ) -> PyResult<()> {
+    assert_writable()?;
     // `room_index::put` does blocking local I/O and takes its own handle
     // cache mutex. Release the GIL while it runs so concurrent Python threads
     // (including test-harness Postgres dispatchers) are not serialized behind
@@ -1029,7 +1094,7 @@ fn decode_auth_edges(bytes: &[u8]) -> PyResult<Vec<u32>> {
 #[pyfunction]
 pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
     py.detach(|| {
-        if DBS.get().is_some() {
+        if check_pid_guard()? {
             return Ok(());
         }
         let layout = DatabaseLayout::open(std::path::PathBuf::from(&path)).map_err(|e| {
@@ -1072,6 +1137,8 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
             event_dag,
             auth_chain,
         });
+        let _ = OPENER_PID.set(std::process::id());
+        let _ = WRITE_MODE.set(true);
         let _ = ROOM_INDEX_DIR.set(std::path::PathBuf::from(&path).join("room_index"));
         Ok(())
     })
@@ -1098,7 +1165,7 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
 #[pyfunction]
 pub fn open_client_read_only(py: Python<'_>, path: String) -> PyResult<()> {
     py.detach(|| {
-        if DBS.get().is_some() {
+        if check_pid_guard()? {
             return Ok(());
         }
         let layout = DatabaseLayout::open(std::path::PathBuf::from(&path)).map_err(|e| {
@@ -1131,6 +1198,8 @@ pub fn open_client_read_only(py: Python<'_>, path: String) -> PyResult<()> {
             event_dag,
             auth_chain,
         });
+        let _ = OPENER_PID.set(std::process::id());
+        let _ = WRITE_MODE.set(false);
         let _ = ROOM_INDEX_DIR.set(std::path::PathBuf::from(&path).join("room_index"));
         Ok(())
     })
@@ -1143,6 +1212,7 @@ pub fn put_state_hamt_nodes(
     room_prefix: Vec<u8>,
     nodes: Vec<(Vec<u8>, Vec<u8>)>,
 ) -> PyResult<()> {
+    assert_writable()?;
     let room_id = room_id_from_prefix(&room_prefix);
 
     let t0 = std::time::Instant::now();
@@ -1225,6 +1295,7 @@ pub fn put_auth_chain_links_batch(
     namespace: String,
     links: Vec<(i64, i64, i64, i64)>,
 ) -> PyResult<()> {
+    assert_writable()?;
     Python::attach(|py| {
         py.detach(|| {
             // Acquire the RMW lock after releasing the GIL. The lock remains held for
@@ -1287,6 +1358,7 @@ pub fn put_auth_chain_links_batch(
 
 #[pyfunction]
 pub fn delete_auth_chain_links_batch(namespace: String, pairs: Vec<(i64, i64)>) -> PyResult<()> {
+    assert_writable()?;
     Python::attach(|py| {
         py.detach(|| {
             let _guard = RMW_LOCK.lock().map_err(|e| {
@@ -1350,6 +1422,7 @@ pub fn get_or_create_short_ids(
     room_id: String,
     event_ids: Vec<String>,
 ) -> PyResult<Vec<u32>> {
+    assert_writable()?;
     Python::attach(|py| {
         py.detach(|| {
             let _guard = RMW_LOCK.lock().map_err(|e| {
@@ -1561,6 +1634,7 @@ pub fn auth_chain_edges_put(
     room_id: String,
     rows: Vec<(u32, Vec<u32>)>,
 ) -> PyResult<()> {
+    assert_writable()?;
     py.detach(|| {
         let engine = db_for_shard_type(ShardType::AuthChain)?;
         let collection = auth_chain_closure_room_id(&namespace, &room_id);
@@ -1626,6 +1700,7 @@ pub fn auth_chain_children_append(
     room_id: String,
     rows: Vec<(u32, Vec<u32>)>,
 ) -> PyResult<()> {
+    assert_writable()?;
     Python::attach(|py| {
         py.detach(|| {
             let _guard = RMW_LOCK.lock().map_err(|e| {
@@ -1694,6 +1769,7 @@ pub fn auth_chain_children_append(
 /// bump that generation *before* calling this, not after.
 #[pyfunction]
 pub fn auth_chain_purge_room(py: Python<'_>, namespace: String, room_id: String) -> PyResult<()> {
+    assert_writable()?;
     py.detach(|| {
         let engine = db_for_shard_type(ShardType::AuthChain)?;
         let collection = auth_chain_closure_room_id(&namespace, &room_id);
@@ -1804,6 +1880,7 @@ fn batch_put_impl(pairs: Vec<(Vec<u8>, Vec<u8>)>) -> PyResult<()> {
 /// used by `batch_delete` (which writes empty bytes as a deletion marker).
 #[pyfunction]
 pub fn batch_put(py: Python<'_>, pairs: Vec<(Vec<u8>, Vec<u8>)>) -> PyResult<()> {
+    assert_writable()?;
     py.detach(|| {
         for (_, value) in &pairs {
             if value.is_empty() {
@@ -1819,6 +1896,7 @@ pub fn batch_put(py: Python<'_>, pairs: Vec<(Vec<u8>, Vec<u8>)>) -> PyResult<()>
 /// Tombstone flat-KV records in the shard type selected from each key.
 #[pyfunction]
 pub fn batch_delete(py: Python<'_>, keys: Vec<Vec<u8>>) -> PyResult<()> {
+    assert_writable()?;
     py.detach(|| {
         let pairs = keys.into_iter().map(|key| (key, Vec::new())).collect();
         batch_put_impl(pairs)
@@ -1946,6 +2024,7 @@ pub fn event_json_put(
     namespace: String,
     rows: Vec<(String, String, Vec<u8>, Vec<u8>)>,
 ) -> PyResult<()> {
+    assert_writable()?;
     for (_, _, metadata, body) in &rows {
         if metadata.is_empty() || body.is_empty() {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -2097,6 +2176,7 @@ pub fn event_json_delete(
     namespace: String,
     event_ids: Vec<String>,
 ) -> PyResult<()> {
+    assert_writable()?;
     py.detach(|| {
         let engine = event_dag_db()?;
         let node_ids: Vec<NodeId> = event_ids
@@ -2173,6 +2253,7 @@ pub fn event_json_delete(
 /// so it is never served stale data.
 #[pyfunction]
 pub fn event_json_purge_room(py: Python<'_>, namespace: String, room_id: String) -> PyResult<()> {
+    assert_writable()?;
     py.detach(|| {
         let engine = event_dag_db()?;
         let collection = event_dag_room_id(&namespace, &room_id);
@@ -2314,6 +2395,7 @@ pub type PyRootRecord = (i64, Vec<u8>, Vec<u8>, String, Vec<u8>);
 
 #[pyfunction]
 pub fn increment_counters_batch(pairs: Vec<(Vec<u8>, i64)>) -> PyResult<Vec<i64>> {
+    assert_writable()?;
     Python::attach(|py| {
         py.detach(|| {
             let _guard = RMW_LOCK.lock().map_err(|e| {
@@ -2399,6 +2481,7 @@ pub fn get_state_hamt_nodes_batch(
 
 #[pyfunction]
 pub fn sync(py: Python<'_>) -> PyResult<()> {
+    assert_writable()?;
     py.detach(|| {
         // Sync mtxdb pools before publishing the room index. A durable
         // index entry must never point at a root that was not yet synced.
@@ -2422,6 +2505,7 @@ pub fn sync(py: Python<'_>) -> PyResult<()> {
 /// durable, not every other pool's currently-dirty shards along with it.
 #[pyfunction]
 pub fn sync_state(py: Python<'_>) -> PyResult<()> {
+    assert_writable()?;
     py.detach(|| {
         sync_one("state", state_db()?)?;
         room_index::sync()
@@ -2432,6 +2516,7 @@ pub fn sync_state(py: Python<'_>) -> PyResult<()> {
 /// prev_event_edges).
 #[pyfunction]
 pub fn sync_event_dag(py: Python<'_>) -> PyResult<()> {
+    assert_writable()?;
     py.detach(|| sync_one("event-dag", event_dag_db()?))
 }
 
@@ -2439,6 +2524,7 @@ pub fn sync_event_dag(py: Python<'_>) -> PyResult<()> {
 /// index).
 #[pyfunction]
 pub fn sync_auth_chain(py: Python<'_>) -> PyResult<()> {
+    assert_writable()?;
     py.detach(|| sync_one("auth-chain", auth_chain_db()?))
 }
 
