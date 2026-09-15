@@ -191,6 +191,12 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 hs.get_instance_name() in hs.config.worker.writers.events
             )
             self._instance_name = hs.get_instance_name()
+            # state_group -> root_structural_hash for groups created on
+            # this (non-writer) instance whose mtxdb mirror write was
+            # skipped -- see `store_state_group`'s skip_mirror_write and
+            # `pop_pending_embedded_hamt_root`. Only ever populated when
+            # `_embedded_hamt_is_writer` is False; harmless if unused.
+            self._pending_embedded_hamt_mirrors: dict[int, bytes] = {}
             try:
                 engine = get_embedded_engine(self._embedded_hamt_engine)
                 _oet = time.monotonic()
@@ -272,6 +278,89 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 "the events writer). This is a routing bug: state-group "
                 "mirror writes must only happen on the events writer."
             )
+
+    def pop_pending_embedded_hamt_root(self, state_group: int) -> bytes | None:
+        """Returns and clears the expected root_structural_hash for a state
+        group created on this (non-writer) instance whose mtxdb mirror
+        write was skipped, or None if `state_group` has no pending mirror
+        (either it was created on the writer directly, or it's not new).
+
+        Called once, when building the `send_events` payload for an event
+        referencing this state group, so the writer can include an
+        expected-root check alongside the delta it will recompute from --
+        see the item-2 determinism requirement: the writer's recomputed
+        root must be verified against this before it's trusted, since nothing
+        else catches a silent divergence between what the creator computed
+        and what the writer redid.
+        """
+        return self._pending_embedded_hamt_mirrors.pop(state_group, None)
+
+    async def redo_embedded_hamt_mirror_write(
+        self,
+        state_group: int,
+        prev_state_group: int | None,
+        room_id: str,
+        room_version: RoomVersion,
+        updates: list[tuple[str, str, str]],
+        expected_root_hash: bytes,
+    ) -> None:
+        """Redo, on the events writer, the mtxdb mirror write a non-writer
+        instance skipped when it created `state_group` -- see
+        `store_state_group`'s `skip_mirror_write` and
+        `pop_pending_embedded_hamt_root`. Called from the `send_events`
+        replication handler once per event whose deserialized context
+        carries a `pending_embedded_hamt_mirror_root`.
+
+        Recomputes via the same `_persist_state_hamt_txn` path the creator
+        used (incremental against `prev_state_group` when possible, falling
+        back to a full rebuild), but does not persist anything until the
+        recomputed root is checked against `expected_root_hash`. This is
+        the determinism guarantee the design depends on: the writer's
+        recompute is only trusted -- and only written -- if it exactly
+        reproduces what the creator computed. A mismatch means the writer
+        and creator disagree about the pre-update state (most likely a
+        `prev_state_group` the writer doesn't yet have a root for), and
+        raises loudly rather than silently diverging from the SQL truth.
+
+        Raises RuntimeError if called on a non-writer instance (defensive;
+        should be unreachable, since only the writer processes send_events)
+        or if the determinism check fails.
+        """
+        self._assert_embedded_hamt_writer()
+
+        from synapse.synapse_rust import state_hamt
+
+        room_prefix = state_hamt.room_hamt_prefix(
+            room_id, room_version.msc4291_room_ids_as_hashes
+        )
+
+        def redo_txn(txn: LoggingTransaction) -> None:
+            root_hash, lattice, nodes = self._persist_state_hamt_txn(
+                txn,
+                state_group,
+                room_id,
+                room_prefix,
+                current_state_ids=None,
+                prev_state_group=prev_state_group,
+                updates=updates,
+                # Compute only -- verify before persisting, see docstring.
+                skip_mirror_write=True,
+            )
+            if root_hash != expected_root_hash:
+                raise RuntimeError(
+                    "mtxdb mirror-write determinism check failed for state "
+                    f"group {state_group}: writer recomputed root "
+                    f"{root_hash.hex()} but the creator expected "
+                    f"{expected_root_hash.hex()}"
+                )
+
+            self._store_state_hamt_nodes_txn(txn, room_prefix, nodes)
+            self._store_state_hamt_root_embedded_txn(
+                state_group, room_prefix, root_hash, lattice, room_id
+            )
+            txn.call_after(mark_dirty, Pool.STATE)
+
+        await self.db_pool.runInteraction("redo_embedded_hamt_mirror_write", redo_txn)
 
     async def _enqueue_embedded_hamt_migration_if_needed(self) -> None:
         """Turning on the embedded engine doesn't retroactively move
@@ -710,8 +799,20 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         local_nodes: dict[bytes, bytes] | None = None,
         local_roots: dict[int, tuple[bytes, bytes]] | None = None,
         pending_room_roots: list[tuple[int, bytes]] | None = None,
+        skip_mirror_write: bool = False,
     ) -> tuple[bytes, bytes, list[tuple[bytes, bytes]]]:
         """Persist a new state_group's HAMT root and nodes.
+
+        `skip_mirror_write`: this instance opened the embedded engine
+        read-only (it is not the events writer, see
+        `_embedded_hamt_is_writer`) -- compute the root/lattice/nodes as
+        normal (the caller and later state-resolution steps in this same
+        request need them), but do not attempt to persist them here. The
+        events writer will redo this write from the `updates` delta it
+        receives over `send_events` replication instead -- see
+        `pop_pending_embedded_hamt_root`. SQL row creation for the state
+        group itself (`_persist_state_group_snapshot_txn`'s own inserts)
+        is unaffected by this flag and always happens locally.
 
         Marks the STATE pool dirty via txn.call_after after SQL commit --
         the coalescer flushes asynchronously (250-500ms debounce). See
@@ -754,11 +855,13 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 local_nodes=local_nodes,
                 local_roots=local_roots,
                 pending_room_roots=pending_room_roots,
+                skip_mirror_write=skip_mirror_write,
             )
         if incremental is not None:
             # Only the embedded path has a coalescer to notify; skip the
-            # registration entirely when the engine isn't configured.
-            if self._embedded_hamt_engine:
+            # registration entirely when the engine isn't configured, or
+            # when nothing was actually written locally (skip_mirror_write).
+            if self._embedded_hamt_engine and not skip_mirror_write:
                 txn.call_after(mark_dirty, Pool.STATE)
             return incremental
 
@@ -788,42 +891,51 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             )
         )
 
-        # Exclusive by configured engine, not a dual-write: SQL owns this
-        # data unless the embedded engine is configured, in which case it
-        # owns it instead. _store_state_hamt_nodes_txn already makes this
-        # same choice for nodes.
-        self._store_state_hamt_nodes_txn(txn, room_prefix, nodes)
-        if self._embedded_hamt_engine == "mtxdb":
-            _et = time.monotonic()
-            self._store_state_hamt_root_embedded_txn(
-                state_group,
-                room_prefix,
-                root_structural_hash,
-                root_lattice,
-                room_id,
-                pending_room_roots=pending_room_roots,
-            )
-            # _store_state_hamt_root_embedded_txn is write-only (no internal
-            # sync).  Callers manage durability: batched loops sync once
-            # after the loop; single-group callers sync immediately after
-            # the call.  See _store_state_hamt_root_embedded_txn's
-            # docstring. When pending_room_roots is given this measures the
-            # room-index write plus the (near-free) list append -- the
-            # caller times its own deferred root-flush call separately.
-            _state_timing("state_write_root_embedded", time.monotonic() - _et)
+        if skip_mirror_write:
+            # This instance opened mtxdb read-only -- it cannot write here
+            # (see `_assert_embedded_hamt_writer`). The events writer will
+            # redo this write from the `updates` delta shipped over
+            # `send_events`; nothing to persist locally. root/lattice/nodes
+            # are still returned below so the caller (and any further
+            # incremental step in the same batch/chain) has them.
+            pass
         else:
-            _st = time.monotonic()
-            self.db_pool.simple_insert_txn(
-                txn,
-                table="state_hamt_roots",
-                values={
-                    "state_group": state_group,
-                    "room_prefix": bytearray(room_prefix),
-                    "root_structural_hash": bytearray(root_structural_hash),
-                    "root_lattice": bytearray(root_lattice),
-                },
-            )
-            _state_timing("state_write_root_sql", time.monotonic() - _st)
+            # Exclusive by configured engine, not a dual-write: SQL owns this
+            # data unless the embedded engine is configured, in which case it
+            # owns it instead. _store_state_hamt_nodes_txn already makes this
+            # same choice for nodes.
+            self._store_state_hamt_nodes_txn(txn, room_prefix, nodes)
+            if self._embedded_hamt_engine == "mtxdb":
+                _et = time.monotonic()
+                self._store_state_hamt_root_embedded_txn(
+                    state_group,
+                    room_prefix,
+                    root_structural_hash,
+                    root_lattice,
+                    room_id,
+                    pending_room_roots=pending_room_roots,
+                )
+                # _store_state_hamt_root_embedded_txn is write-only (no internal
+                # sync).  Callers manage durability: batched loops sync once
+                # after the loop; single-group callers sync immediately after
+                # the call.  See _store_state_hamt_root_embedded_txn's
+                # docstring. When pending_room_roots is given this measures the
+                # room-index write plus the (near-free) list append -- the
+                # caller times its own deferred root-flush call separately.
+                _state_timing("state_write_root_embedded", time.monotonic() - _et)
+            else:
+                _st = time.monotonic()
+                self.db_pool.simple_insert_txn(
+                    txn,
+                    table="state_hamt_roots",
+                    values={
+                        "state_group": state_group,
+                        "room_prefix": bytearray(room_prefix),
+                        "root_structural_hash": bytearray(root_structural_hash),
+                        "root_lattice": bytearray(root_lattice),
+                    },
+                )
+                _state_timing("state_write_root_sql", time.monotonic() - _st)
 
         logger.debug(
             "[gg-state-timing] _persist_state_hamt_txn mode=rebuild "
@@ -833,8 +945,9 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             (time.monotonic() - _gg_reb_start) * 1000,
         )
         # Only the embedded path has a coalescer to notify; skip the
-        # registration entirely when the engine isn't configured.
-        if self._embedded_hamt_engine:
+        # registration entirely when the engine isn't configured, or when
+        # nothing was actually written locally (skip_mirror_write).
+        if self._embedded_hamt_engine and not skip_mirror_write:
             txn.call_after(mark_dirty, Pool.STATE)
         return root_structural_hash, root_lattice, nodes
 
@@ -849,6 +962,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         local_nodes: dict[bytes, bytes] | None = None,
         local_roots: dict[int, tuple[bytes, bytes]] | None = None,
         pending_room_roots: list[tuple[int, bytes]] | None = None,
+        skip_mirror_write: bool = False,
     ) -> tuple[bytes, bytes, list[tuple[bytes, bytes]]] | None:
         """Apply `updates` -- a delta of any size, from a single state event
         to a whole state-resolution/merge result the caller already computed
@@ -989,32 +1103,37 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
 
         new_root_hash, _new_state_group_id, new_lattice, new_nodes = applied
 
-        self._store_state_hamt_nodes_txn(txn, room_prefix, new_nodes)
-        if self._embedded_hamt_engine == "mtxdb":
-            _et = time.monotonic()
-            self._store_state_hamt_root_embedded_txn(
-                state_group,
-                room_prefix,
-                new_root_hash,
-                new_lattice,
-                room_id,
-                pending_room_roots=pending_room_roots,
-            )
-            # Sync deferred to caller -- see comment in _persist_state_hamt_txn.
-            _state_timing("state_write_root_embedded", time.monotonic() - _et)
+        if skip_mirror_write:
+            # See the matching comment in _persist_state_hamt_txn's rebuild
+            # branch -- the events writer redoes this from `updates`.
+            pass
         else:
-            _st = time.monotonic()
-            self.db_pool.simple_insert_txn(
-                txn,
-                table="state_hamt_roots",
-                values={
-                    "state_group": state_group,
-                    "room_prefix": bytearray(room_prefix),
-                    "root_structural_hash": bytearray(new_root_hash),
-                    "root_lattice": bytearray(new_lattice),
-                },
-            )
-            _state_timing("state_write_root_sql", time.monotonic() - _st)
+            self._store_state_hamt_nodes_txn(txn, room_prefix, new_nodes)
+            if self._embedded_hamt_engine == "mtxdb":
+                _et = time.monotonic()
+                self._store_state_hamt_root_embedded_txn(
+                    state_group,
+                    room_prefix,
+                    new_root_hash,
+                    new_lattice,
+                    room_id,
+                    pending_room_roots=pending_room_roots,
+                )
+                # Sync deferred to caller -- see comment in _persist_state_hamt_txn.
+                _state_timing("state_write_root_embedded", time.monotonic() - _et)
+            else:
+                _st = time.monotonic()
+                self.db_pool.simple_insert_txn(
+                    txn,
+                    table="state_hamt_roots",
+                    values={
+                        "state_group": state_group,
+                        "room_prefix": bytearray(room_prefix),
+                        "root_structural_hash": bytearray(new_root_hash),
+                        "root_lattice": bytearray(new_lattice),
+                    },
+                )
+                _state_timing("state_write_root_sql", time.monotonic() - _st)
         logger.debug(
             "[gg-state-timing] _persist_state_hamt_incremental_txn "
             "group=%d prev=%d updates=%d nodes=%d elapsed_ms=%.1f",
@@ -1392,6 +1511,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         local_nodes: dict[bytes, bytes] | None = None,
         local_roots: dict[int, tuple[bytes, bytes]] | None = None,
         pending_room_roots: list[tuple[int, bytes]] | None = None,
+        skip_mirror_write: bool = False,
     ) -> tuple[bytes, bytes, list[tuple[bytes, bytes]]]:
         self.db_pool.simple_insert_txn(
             txn,
@@ -1449,6 +1569,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             local_nodes=local_nodes,
             local_roots=local_roots,
             pending_room_roots=pending_room_roots,
+            skip_mirror_write=skip_mirror_write,
         )
 
     @trace
@@ -1556,6 +1677,11 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             # against this one room_prefix, is correct.
             pending_room_roots: list[tuple[int, bytes]] = []
 
+            # See store_state_group's matching comment/flag.
+            skip_mirror_write = bool(self._embedded_hamt_engine) and not getattr(
+                self, "_embedded_hamt_is_writer", True
+            )
+
             for event, context in events_and_context:
                 if not event.is_state():
                     context.state_group_after_event = sg_before
@@ -1585,7 +1711,10 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                     local_nodes=local_nodes,
                     local_roots=local_roots,
                     pending_room_roots=pending_room_roots,
+                    skip_mirror_write=skip_mirror_write,
                 )
+                if skip_mirror_write:
+                    self._pending_embedded_hamt_mirrors[sg_after] = root_hash
                 hamt_writes.append((sg_after, root_hash, lattice, nodes))
                 # Only keep the root node in the local cache for the next iteration.
                 # Child nodes are fetched via SQL/mtxdb in the retry loop if needed.
@@ -1700,6 +1829,15 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         initial_nodes: dict[bytes, bytes] = {}
         initial_roots: dict[int, tuple[bytes, bytes]] = {}
 
+        # This instance opened mtxdb read-only (it is not the events
+        # writer) -- the mirror write must be skipped here and redone by
+        # the writer from `updates`/`delta_ids` once this state group's
+        # event reaches it over `send_events` replication. See
+        # `_assert_embedded_hamt_writer` and `pop_pending_embedded_hamt_root`.
+        skip_mirror_write = bool(self._embedded_hamt_engine) and not getattr(
+            self, "_embedded_hamt_is_writer", True
+        )
+
         def insert_full_state_txn(
             txn: LoggingTransaction, current_state_ids: StateMap[str]
         ) -> tuple[int, bytes, bytes, list[tuple[bytes, bytes]]]:
@@ -1727,6 +1865,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                     updates=updates,
                     local_nodes=initial_nodes,
                     local_roots=initial_roots,
+                    skip_mirror_write=skip_mirror_write,
                 )
             )
             # Dirty marking handled by _persist_state_hamt_txn via
@@ -1734,14 +1873,17 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
 
             return state_group, root_structural_hash, lattice, nodes
 
-        # Both SQL and (if configured) the embedded engine were already
-        # written (dirty marking via txn.call_after) in
+        # Both SQL and (if configured and this is the writer) the embedded
+        # engine were already written (dirty marking via txn.call_after) in
         # insert_full_state_txn -- nothing left to publish post-commit.
-        state_group, _root_hash, _lattice, _nodes = await self.db_pool.runInteraction(
+        state_group, root_hash, _lattice, _nodes = await self.db_pool.runInteraction(
             "store_state_group.insert_full_state",
             insert_full_state_txn,
             current_state_ids,
         )
+
+        if skip_mirror_write:
+            self._pending_embedded_hamt_mirrors[state_group] = root_hash
 
         logger.debug(
             "[gg-state-timing] store_state_group group=%d elapsed_ms=%.1f",

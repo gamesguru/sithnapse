@@ -142,6 +142,14 @@ class EventContext(UnpersistedEventContextBase):
 
     partial_state: bool = False
 
+    # Set only by `deserialize`, on the receiving (events writer) side: the
+    # expected root_structural_hash for `_state_group`, when the instance
+    # that created it skipped the mtxdb mirror write and needs this one
+    # redone here -- see `serialize`'s `pending_embedded_hamt_mirror_root`
+    # and `pop_pending_embedded_hamt_root`. None on the creating side, and
+    # None here too once no mirror write is pending.
+    pending_embedded_hamt_mirror_root: bytes | None = None
+
     @staticmethod
     def with_state(
         storage: "StorageControllers",
@@ -181,6 +189,20 @@ class EventContext(UnpersistedEventContextBase):
             The serialized event.
         """
 
+        # If this state group was created on this instance and its mtxdb
+        # mirror write was skipped (see StateGroupDataStore.store_state_group's
+        # skip_mirror_write), the events writer needs to know it must redo
+        # that write from state_delta_due_to_event -- and what root hash to
+        # verify the result against, since a silent divergence here would
+        # otherwise never surface as an error. See pop_pending_embedded_hamt_root.
+        pending_mirror_root = None
+        if self._state_group is not None:
+            pending_mirror_root = (
+                self._storage.state.stores.state.pop_pending_embedded_hamt_root(
+                    self._state_group
+                )
+            )
+
         return {
             "state_group": self._state_group,
             "state_group_before_event": self.state_group_before_event,
@@ -191,6 +213,9 @@ class EventContext(UnpersistedEventContextBase):
             ),
             "app_service_id": self.app_service.id if self.app_service else None,
             "partial_state": self.partial_state,
+            "pending_embedded_hamt_mirror_root": (
+                pending_mirror_root.hex() if pending_mirror_root is not None else None
+            ),
         }
 
     @staticmethod
@@ -223,6 +248,11 @@ class EventContext(UnpersistedEventContextBase):
         app_service_id = input["app_service_id"]
         if app_service_id:
             context.app_service = storage.main.get_app_service_by_id(app_service_id)
+
+        pending_root_hex = input.get("pending_embedded_hamt_mirror_root")
+        context.pending_embedded_hamt_mirror_root = (
+            bytes.fromhex(pending_root_hex) if pending_root_hex is not None else None
+        )
 
         return context
 

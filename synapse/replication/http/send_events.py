@@ -80,6 +80,7 @@ class ReplicationSendEventsRestServlet(ReplicationEndpoint):
         self.server_name = hs.hostname
         self.event_creation_handler = hs.get_event_creation_handler()
         self.store = hs.get_datastores().main
+        self._state_store = hs.get_datastores().state
         self._storage_controllers = hs.get_storage_controllers()
         self.clock = hs.get_clock()
 
@@ -145,6 +146,31 @@ class ReplicationSendEventsRestServlet(ReplicationEndpoint):
                 context = EventContext.deserialize(
                     self._storage_controllers, event_payload["context"]
                 )
+
+                if context.pending_embedded_hamt_mirror_root is not None:
+                    # The instance that created this event's state group
+                    # opened mtxdb read-only and could not mirror-write it
+                    # (see StateGroupDataStore.store_state_group's
+                    # skip_mirror_write) -- redo that write here, now that
+                    # we're on the events writer. Must happen before
+                    # persist_and_notify_client_events below, since that
+                    # (and anything racing it, e.g. a synchrotron already
+                    # polling replication) may read this state group's
+                    # HAMT nodes as soon as the event is persisted.
+                    assert context._state_group is not None
+                    state_delta = context._state_delta_due_to_event or {}
+                    updates = [
+                        (event_type, state_key, ev_id)
+                        for (event_type, state_key), ev_id in state_delta.items()
+                    ]
+                    await self._state_store.redo_embedded_hamt_mirror_write(
+                        context._state_group,
+                        context.state_group_before_event,
+                        event.room_id,
+                        event.room_version,
+                        updates,
+                        context.pending_embedded_hamt_mirror_root,
+                    )
 
                 ratelimit = event_payload["ratelimit"]
                 events_and_context.append((event, context))
