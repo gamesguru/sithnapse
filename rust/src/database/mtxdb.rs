@@ -493,8 +493,9 @@ pub fn refresh_state_hamt_collections_for_groups(
 /// against files written under the old layout) hits this same failure
 /// mode for every group it doesn't happen to already cover.
 mod room_index {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::fs::{File, OpenOptions};
+    use std::io::{Read, Write};
     use std::num::NonZeroUsize;
     use std::os::unix::fs::FileExt;
     use std::sync::{Arc, Mutex};
@@ -505,6 +506,10 @@ mod room_index {
 
     use super::{ROOM_INDEX_DIR, ROOM_PREFIX_LEN};
 
+    const INDEX_MAGIC: [u8; 4] = *b"MTRI";
+    const NAMESPACE_DIGEST_LEN: usize = 16;
+    const RECORD_LEN: usize = 4 + NAMESPACE_DIGEST_LEN + 8 + ROOM_PREFIX_LEN;
+
     // A real `room_prefix` is always exactly `ROOM_PREFIX_LEN` (8) bytes --
     // `room_hamt_prefix_raw` truncates to that length unconditionally in
     // both its branches (MSC4291 hash-derived and legacy). This used to be
@@ -512,8 +517,6 @@ mod room_index {
     // returned that padding along with the real prefix, and every reader
     // (`lookup_state_hamts` et al.) enforces the true 8-byte length, so a
     // padded value failed downstream with "room_prefix must be 8 bytes".
-    const RECORD_LEN: u64 = ROOM_PREFIX_LEN as u64;
-
     // Keep recent mappings in-process after a successful write or read. This
     // is an optimization only: the direct-offset file remains authoritative,
     // so a worker that has not seen another worker's write simply falls back
@@ -525,34 +528,10 @@ mod room_index {
     static PREFIX_CACHE: Mutex<Option<LruCache<(String, i64), [u8; ROOM_PREFIX_LEN]>>> =
         Mutex::new(None);
 
-    /// Cached file handles, one per namespace, so a batch of N `put`/`get`
-    /// calls (e.g. one per state group in a persist loop) pays one `open()`
-    /// for the whole batch rather than one per call -- the same overhead
-    /// this index otherwise avoids by skipping mtxdb's clone-on-write
-    /// entirely. `FileExt::write_at`/`read_at` (pread/pwrite) take an
-    /// explicit offset per call, so a shared handle needs no seek and no
-    /// per-call mutable state -- safe to hand out from behind a `Mutex`
-    /// that's only ever held for the duration of a lookup/insert, never
-    /// across the actual I/O (callers clone the `Arc<File>` and do the
-    /// pread/pwrite on their own clone, outside the lock).
-    ///
-    /// Retention is bounded: a *per-namespace* cache would leak one fd per
-    /// namespace for the process lifetime, and the test harness alone
-    /// creates a fresh namespace for every homeserver, so a full trial
-    /// suite's thousands of namespaces blew straight through `ulimit -n`
-    /// (`[Errno 24] Too many open files`). An LRU caps open fds at
-    /// `HANDLE_CACHE_CAPACITY` no matter how many namespaces a process has
-    /// ever seen. Evicting a handle only closes the file: dirty pages
-    /// already `pwrite`n survive `close()` in the kernel's writeback, so
-    /// the only thing lost is the same periodic (not per-write) durability
-    /// window the rest of the engine already accepts -- see `sync()` -- and
-    /// the next access for that namespace re-opens it deterministically
-    /// from `index_path` on the cold path the per-call `open()` this cache
-    /// exists to avoid is only re-paid once.
-    const HANDLE_CACHE_CAPACITY: usize = 64;
-
-    #[allow(clippy::type_complexity)]
-    static HANDLES: Mutex<Option<LruCache<String, std::sync::Arc<File>>>> = Mutex::new(None);
+    /// There is one shared handle and one shared file, regardless of how many
+    /// namespaces the process serves. The old per-namespace LRU fixed open-FD
+    /// pressure but still created one inode per namespace.
+    static HANDLE: Mutex<Option<std::sync::Arc<File>>> = Mutex::new(None);
 
     /// Namespaces `put` has written to since the last `sync()`. `sync()`
     /// used to unconditionally `sync_data()` every cached handle -- with
@@ -566,9 +545,9 @@ mod room_index {
     /// occupancy, not with actual write volume. Mirrors the dirty-only
     /// fsync `PackfileStorage::sync()` (mtxdb-core) already does for the
     /// three pools proper.
-    static DIRTY_NAMESPACES: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    static DIRTY: Mutex<bool> = Mutex::new(false);
 
-    fn index_path(namespace: &str, create: bool) -> PyResult<std::path::PathBuf> {
+    fn index_path(create: bool) -> PyResult<std::path::PathBuf> {
         let dir = ROOM_INDEX_DIR
             .get()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("mtxdb not opened"))?;
@@ -579,34 +558,37 @@ mod room_index {
                 ))
             })?;
         }
+        Ok(dir.join("index.bin"))
+    }
+
+    fn legacy_index_path(namespace: &str) -> PyResult<std::path::PathBuf> {
+        let dir = ROOM_INDEX_DIR
+            .get()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("mtxdb not opened"))?;
         let namespace_hash = Sha256::digest(namespace.as_bytes());
         Ok(dir.join(format!("{}.bin", hex::encode(&namespace_hash[..16]))))
     }
 
-    fn cached_handle(namespace: &str, create: bool) -> PyResult<Option<std::sync::Arc<File>>> {
-        let mut guard = HANDLES
+    fn namespace_digest(namespace: &str) -> [u8; NAMESPACE_DIGEST_LEN] {
+        let digest = Sha256::digest(namespace.as_bytes());
+        let mut out = [0u8; NAMESPACE_DIGEST_LEN];
+        out.copy_from_slice(&digest[..NAMESPACE_DIGEST_LEN]);
+        out
+    }
+
+    fn cached_handle(create: bool) -> PyResult<Option<std::sync::Arc<File>>> {
+        let mut guard = HANDLE
             .lock()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}")))?;
-        let map = guard.get_or_insert_with(|| {
-            LruCache::new(NonZeroUsize::new(HANDLE_CACHE_CAPACITY).expect("nonzero capacity"))
-        });
-        // A read-only lookup may have populated the cache. OpenOptions'
-        // access mode is fixed at open time, so never reuse that handle for
-        // a later writer.
-        if create {
-            map.pop(namespace);
-        } else if let Some(file) = map.get(namespace) {
+        if let Some(file) = guard.as_ref() {
             return Ok(Some(Arc::clone(file)));
         }
-        let path = index_path(namespace, create)?;
-        // Writers and readers use separate cache lifetimes: a writer
-        // replaces any cached read-only handle above, while a read-only
-        // lookup never creates or modifies the index file.
+        let path = index_path(create)?;
         let opened = OpenOptions::new()
             .create(create)
-            .truncate(false)
             .read(true)
             .write(create)
+            .append(create)
             .open(&path);
         let file = match opened {
             Ok(f) => f,
@@ -618,16 +600,7 @@ mod room_index {
             }
         };
         let file = Arc::new(file);
-        if let Some(evicted_file) = map.put(namespace.to_string(), Arc::clone(&file)) {
-            // An evicted namespace may still have dirty index pages.  Flush
-            // before dropping its last handle so the room index cannot lag
-            // behind the HAMT root after the next sync.
-            evicted_file.sync_data().map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "failed to sync evicted room index: {e}"
-                ))
-            })?;
-        }
+        *guard = Some(Arc::clone(&file));
         Ok(Some(file))
     }
 
@@ -1799,6 +1772,59 @@ fn kv_node_id(key: &[u8]) -> [u8; 16] {
     id
 }
 
+/// Generic KV records retain the full logical-key digest in their value. The
+/// mtxdb NodeId remains 16 bytes, so this envelope makes the truncation
+/// explicit and lets readers detect a 128-bit NodeId collision.
+const KV_VALUE_VERSION: &[u8; 4] = b"KV01";
+
+fn kv_key_digest(key: &[u8]) -> [u8; 32] {
+    Sha256::digest(key).into()
+}
+
+fn encode_kv_value(key: &[u8], value: &[u8]) -> Vec<u8> {
+    let digest = kv_key_digest(key);
+    let mut encoded = Vec::with_capacity(4 + digest.len() + value.len());
+    encoded.extend_from_slice(KV_VALUE_VERSION);
+    encoded.extend_from_slice(&digest);
+    encoded.extend_from_slice(value);
+    encoded
+}
+
+fn decode_kv_value(key: &[u8], encoded: &[u8]) -> PyResult<Vec<u8>> {
+    if !encoded.starts_with(KV_VALUE_VERSION) {
+        // Keep pre-envelope records readable during migration.
+        return Ok(encoded.to_vec());
+    }
+
+    let digest_start = KV_VALUE_VERSION.len();
+    let value_start = digest_start + 32;
+    if encoded.len() < value_start {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "truncated generic KV value envelope",
+        ));
+    }
+    if encoded[digest_start..value_start] != kv_key_digest(key) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "generic KV truncated-hash collision detected",
+        ));
+    }
+    Ok(encoded[value_start..].to_vec())
+}
+
+fn validate_kv_collision(engine: &PackfileStorage, key: &[u8], node_id: &NodeId) -> PyResult<()> {
+    let Some(existing) = engine.get(&kv_room_id(), node_id).map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get error reading KV: {e}"))
+    })?
+    else {
+        return Ok(());
+    };
+    if !existing.bytes.is_empty() && existing.bytes.starts_with(KV_VALUE_VERSION) {
+        // Reuse the normal verifier; a mismatch is a hard collision error.
+        let _ = decode_kv_value(key, &existing.bytes)?;
+    }
+    Ok(())
+}
+
 /// Fetch flat-KV records, routing each key to its shard type internally.
 #[pyfunction]
 pub fn batch_get(py: Python<'_>, keys: Vec<Vec<u8>>) -> PyResult<Vec<(Vec<u8>, Vec<u8>)>> {
@@ -1831,15 +1857,14 @@ pub fn batch_get(py: Python<'_>, keys: Vec<Vec<u8>>) -> PyResult<Vec<(Vec<u8>, V
                 values[position] = value;
             }
         }
-        Ok(keys
-            .into_iter()
+        keys.into_iter()
             .zip(values)
             .filter_map(|(key, value)| {
                 value
                     .filter(|data| !data.bytes.is_empty())
-                    .map(|data| (key, data.bytes.to_vec()))
+                    .map(|data| Ok((key.clone(), decode_kv_value(&key, &data.bytes)?)))
             })
-            .collect())
+            .collect::<PyResult<Vec<_>>>()
     })
 }
 
@@ -1852,8 +1877,25 @@ pub fn batch_get(py: Python<'_>, keys: Vec<Vec<u8>>) -> PyResult<Vec<(Vec<u8>, V
 fn batch_put_impl(pairs: Vec<(Vec<u8>, Vec<u8>)>) -> PyResult<()> {
     let mut state_puts = Vec::new();
     let mut event_puts = Vec::new();
+    let mut seen: HashMap<NodeId, [u8; 32]> = HashMap::new();
     for (key, value) in pairs {
-        let entry = (kv_node_id(&key), NodeData::new(bytes::Bytes::from(value)));
+        let encoded = if value.is_empty() {
+            value
+        } else {
+            let node_id = kv_node_id(&key);
+            let digest = kv_key_digest(&key);
+            if let Some(previous) = seen.insert(node_id, digest) {
+                if previous != digest {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        "generic KV truncated-hash collision detected in batch",
+                    ));
+                }
+            }
+            let shard_type = shard_type_for_key(&key);
+            validate_kv_collision(db_for_shard_type(shard_type)?, &key, &node_id)?;
+            encode_kv_value(&key, &value)
+        };
+        let entry = (kv_node_id(&key), NodeData::new(bytes::Bytes::from(encoded)));
         match shard_type_for_key(&key) {
             ShardType::State => state_puts.push(entry),
             ShardType::EventDag => event_puts.push(entry),
@@ -2410,8 +2452,9 @@ pub fn increment_counters_batch(pairs: Vec<(Vec<u8>, i64)>) -> PyResult<Vec<i64>
                 let node_id = kv_node_id(&key);
                 let current = match engine.get(&room_id, &node_id) {
                     Ok(Some(data)) => {
-                        if data.bytes.len() == 8 {
-                            i64::from_be_bytes(data.bytes.as_ref().try_into().unwrap())
+                        let value = decode_kv_value(&key, &data.bytes)?;
+                        if value.len() == 8 {
+                            i64::from_be_bytes(value.as_slice().try_into().unwrap())
                         } else {
                             0
                         }
@@ -2428,7 +2471,10 @@ pub fn increment_counters_batch(pairs: Vec<(Vec<u8>, i64)>) -> PyResult<Vec<i64>
                 results.push(new_value);
                 puts.push((
                     node_id,
-                    NodeData::new(bytes::Bytes::copy_from_slice(&new_value.to_be_bytes())),
+                    NodeData::new(bytes::Bytes::from(encode_kv_value(
+                        &key,
+                        &new_value.to_be_bytes(),
+                    ))),
                 ));
             }
 
