@@ -64,6 +64,7 @@ class StateStorageController:
 
     def __init__(self, hs: "HomeServer", stores: "Databases"):
         self.server_name = hs.hostname  # nb must be called this for @cached
+        self._instance_name = hs.get_instance_name()
         self.clock = hs.get_clock()
         self._is_mine_id = hs.is_mine_id
         self.stores = stores

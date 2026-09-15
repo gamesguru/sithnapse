@@ -436,6 +436,108 @@ class WorkerConfig(Config):
                 "Must specify at least one instance to handle `quarantined_media_changes` messages."
             )
 
+        # Reject embedded_hamt (mtxdb) + *sharded-events* multi-worker
+        # deployments specifically, not multi-worker deployments in
+        # general. A worker process's mtxdb index is built once at open
+        # time by scanning shard files on disk, and only ever updated by
+        # that same process's own writes -- there is no ambient
+        # cross-process invalidation. A single-writer deployment handles
+        # this safely: exactly one process (the events writer -- see
+        # StateGroupDataStore.__init__) opens the store writable, every
+        # other process opens read-only and self-heals a stale read via
+        # `refresh_state_hamt_collections_for_groups`. That safety
+        # argument depends entirely on there being exactly one events
+        # writer: if `writers.events` names more than one instance (event
+        # persistence sharded across multiple writers), each of those
+        # instances would independently decide it's *the* mtxdb writer and
+        # all try to open writable, immediately hitting mtxdb's own
+        # exclusive-lock rejection (WouldBlock, "already locked by another
+        # writer process") -- a real failure this guard exists to turn
+        # into a clear config-time error instead of a confusing runtime
+        # one. Supporting sharded-events + mtxdb together needs one of:
+        # forwarding each writer's HAMT deltas to a single designated
+        # mtxdb-writer instance over replication, or partitioning mtxdb
+        # itself per writer -- neither exists yet.
+        embedded_hamt_engine = self.root.database.embedded_hamt_engine
+        if embedded_hamt_engine and len(self.writers.events) > 1:
+            raise ConfigError(
+                f"embedded_hamt.engine is set to {embedded_hamt_engine!r}, but "
+                f"writers.events names {len(self.writers.events)} instances "
+                f"({self.writers.events!r}). The embedded HAMT engine supports "
+                "exactly one writer process at a time (see "
+                "StateGroupDataStore.__init__'s writer/read-only split): with "
+                "more than one events writer, each would independently open "
+                "the store writable and immediately hit mtxdb's own exclusive-"
+                "lock rejection. Configure a single events writer, or remove "
+                "embedded_hamt.engine."
+            )
+
+        # A second, independent constraint on the same feature: the
+        # embedded-HAMT-to-SQL backfill migration (state/store.py's
+        # EMBEDDED_HAMT_MIGRATION_UPDATE_NAME) runs through Synapse's
+        # generic background-updates framework, whose poll loop is always
+        # started unconditionally by the *main* process
+        # (synapse/app/homeserver.py's start() -- generic_worker.py never
+        # calls it); but see the additional run_background_tasks_on
+        # constraint below, which closes the *other* way a second such
+        # loop can exist.
+        # So the migration always executes on "master", regardless of
+        # which instance StateGroupDataStore.__init__ decided is the mtxdb
+        # writer. If master itself is not the sole events writer (the
+        # common case when event persistence is delegated to a dedicated
+        # worker), master opens mtxdb read-only and the migration crashes
+        # the first time it tries to write. Require master to be that sole
+        # writer whenever mtxdb is in play in a worker deployment, closing
+        # that gap loudly instead of leaving it to crash a background
+        # update on a deployment that already passes the check above.
+        #
+        # That's not the whole story, though: `run_background_tasks_on` can
+        # independently name a *different* instance to also run its own
+        # background-updates poll loop (see events_bg_updates.py's
+        # `run_background_tasks`-gated enqueue calls) -- and main's own
+        # loop above runs unconditionally regardless of that setting, so
+        # the two can run concurrently. Stock Synapse gets away with that
+        # because its background-update handlers are plain SQL, safe under
+        # concurrent execution by the database's own transaction
+        # isolation; mtxdb writes have no such safety net (no
+        # cross-instance coordination exists in this fork at all -- see
+        # BackgroundUpdater/do_next_background_update). So this deployment
+        # shape needs *no* background-updates-capable instance other than
+        # main to exist: require `run_background_tasks_on` to be unset or
+        # explicitly "main" too, whenever embedded_hamt is in play in a
+        # worker deployment.
+        background_tasks_instance = (
+            config.get("run_background_tasks_on") or MAIN_PROCESS_INSTANCE_NAME
+        )
+        if embedded_hamt_engine and (
+            self.worker_app is not None or len(self.instance_map) > 0
+        ):
+            if self.writers.events != [MAIN_PROCESS_INSTANCE_NAME]:
+                raise ConfigError(
+                    f"embedded_hamt.engine is set to {embedded_hamt_engine!r} in a "
+                    "worker deployment, but writers.events is "
+                    f"{self.writers.events!r}, not just the main process. The "
+                    "embedded-HAMT background migration always runs on the main "
+                    "process (Synapse's background-updates poll loop is only "
+                    "ever started there), so main must also be the sole mtxdb "
+                    "writer or that migration crashes trying to write through a "
+                    "read-only-opened store. Make the main process the sole "
+                    "events writer, or remove embedded_hamt.engine."
+                )
+            if background_tasks_instance != MAIN_PROCESS_INSTANCE_NAME:
+                raise ConfigError(
+                    f"embedded_hamt.engine is set to {embedded_hamt_engine!r} in a "
+                    f"worker deployment, but run_background_tasks_on is "
+                    f"{background_tasks_instance!r}, not the main process. That "
+                    "instance would run its own independent background-updates "
+                    "poll loop (see events_bg_updates.py's run_background_tasks-"
+                    "gated enqueue calls), concurrently with main's own "
+                    "unconditional one, racing on the same embedded-HAMT-writing "
+                    "rows with no cross-instance coordination. Leave "
+                    "run_background_tasks_on unset (or set it to the main "
+                    "process), or remove embedded_hamt.engine."
+                )
+
         self.events_shard_config = RoutableShardedWorkerHandlingConfig(
             self.writers.events
         )

@@ -128,6 +128,16 @@ EOF
 fsync = off
 synchronous_commit = off
 full_page_writes = off
+# This cluster is used only for disposable test databases. There are no
+# replicas or crash-recovery guarantees to preserve, so avoid WAL work when
+# cloning the per-test database template.
+wal_level = minimal
+max_wal_senders = 0
+# Short-lived test databases do not benefit from background vacuuming, and
+# starting autovacuum workers adds avoidable contention during parallel runs.
+autovacuum = off
+# Avoid per-query JIT setup in a suite dominated by small test queries.
+jit = off
 EOF
 	fi
 

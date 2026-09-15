@@ -1,0 +1,566 @@
+from __future__ import annotations
+
+import atexit
+import hashlib
+import logging
+import os
+import threading
+import time
+from collections import defaultdict, deque
+from contextlib import contextmanager
+from enum import Enum, auto
+from typing import IO, TYPE_CHECKING, Iterable, Iterator
+
+if TYPE_CHECKING:
+    from synapse.util.clock import Clock, DelayedCallWrapper
+
+logger = logging.getLogger(__name__)
+
+# Module-level flag: when True, all DURABLE-tier sync() calls are suppressed.
+# Set once during HomeServer init via configure_sync(); never mutated after.
+_sync_disabled: bool = False
+
+# Whether any store in this process configured an embedded engine. Set once
+# during HomeServer init (see StateGroupDataStore.__init__); monotonic
+# (only ever False -> True), so multi-homeserver processes sharing this
+# module (e.g. Complement trial) can't unset it for each other. Lets
+# maybe_sync/sync_now no-op when the engine was never configured instead of
+# importing the native module and issuing FFI syncs against a never-opened
+# engine.
+_engine_configured: bool = False
+
+# ── FFI boundary timing (opt-in via SYNAPSE_PG_TIMINGS=1) ────────────────
+_FFI_TIMINGS: dict[str, float] = defaultdict(float)
+_FFI_TIMING_COUNTS: dict[str, int] = defaultdict(int)
+_FFI_LATENCY_LIMIT = 4096
+_FFI_LATENCIES: dict[str, deque[float]] = defaultdict(
+    lambda: deque(maxlen=_FFI_LATENCY_LIMIT)
+)
+_FFI_TIMING_LOCK: "threading.Lock | None" = (
+    threading.Lock() if os.environ.get("SYNAPSE_PG_TIMINGS") else None
+)
+
+_ffi_timings_file: IO[str] | None = None
+if os.environ.get("SYNAPSE_PG_TIMINGS"):
+    _ffi_timings_path = os.environ.get("SYNAPSE_PG_TIMINGS_FILE")
+    if _ffi_timings_path:
+        try:
+            _ffi_timings_file = open(_ffi_timings_path, "a")
+        except OSError:
+            pass
+
+
+def _ffi_timings_print(*args: object) -> None:
+    import sys
+
+    print(*args, file=sys.stderr)
+    if _ffi_timings_file is not None:
+        print(*args, file=_ffi_timings_file)
+
+
+def ffi_timing(tag: str, elapsed: float) -> None:
+    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+        return
+    lock = _FFI_TIMING_LOCK
+    if lock is not None:
+        with lock:
+            _FFI_TIMINGS[tag] += elapsed
+            _FFI_TIMING_COUNTS[tag] += 1
+            _FFI_LATENCIES[tag].append(elapsed)
+    else:
+        _FFI_TIMINGS[tag] += elapsed
+        _FFI_TIMING_COUNTS[tag] += 1
+        _FFI_LATENCIES[tag].append(elapsed)
+
+
+def _print_ffi_timings() -> None:
+    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+        return
+    lock = _FFI_TIMING_LOCK
+    if lock is None:
+        return
+    with lock:
+        if not _FFI_TIMINGS:
+            return
+        timings = dict(_FFI_TIMINGS)
+        counts = dict(_FFI_TIMING_COUNTS)
+        latencies = {k: sorted(v) for k, v in _FFI_LATENCIES.items() if v}
+    _ffi_timings_print("\n=== FFI boundary timings ===")
+    has_hist = bool(latencies)
+    if has_hist:
+        _ffi_timings_print(
+            f"  {'':50s}  {'total':>9s}  {'calls':>6s}  {'avg':>11s}  {'p50':>10s}  {'p95':>10s}  {'p99':>10s}",
+        )
+    else:
+        _ffi_timings_print(
+            f"  {'':50s}  {'total':>9s}  {'calls':>6s}  {'avg':>11s}",
+        )
+
+    def _percentile(sorted_vals: list[float], p: float) -> float:
+        if not sorted_vals:
+            return 0.0
+        idx = int(len(sorted_vals) * p)
+        idx = min(idx, len(sorted_vals) - 1)
+        return sorted_vals[idx]
+
+    for tag in sorted(timings):
+        total_s = timings[tag]
+        count = counts[tag]
+        total_ms = total_s * 1000
+        avg_ms = (total_s / count) * 1000 if count else 0.0
+        if tag in latencies:
+            s = latencies[tag]
+            p50_ms = _percentile(s, 0.50) * 1000
+            p95_ms = _percentile(s, 0.95) * 1000
+            p99_ms = _percentile(s, 0.99) * 1000
+            _ffi_timings_print(
+                f"  {tag:50s}  {total_ms:8.1f}ms  {count:6d}  {avg_ms:10.3f}ms  {p50_ms:9.3f}ms  {p95_ms:9.3f}ms  {p99_ms:9.3f}ms",
+            )
+        else:
+            _ffi_timings_print(
+                f"  {tag:50s}  {total_ms:8.1f}ms  {count:6d}  {avg_ms:10.3f}ms",
+            )
+    total_s = sum(timings.values())
+    total_count = sum(counts.values())
+    total_ms = total_s * 1000
+    _ffi_timings_print("")
+    _ffi_timings_print(
+        f"  {'TOTAL':50s}  {total_ms:8.1f}ms  {total_count:6d}",
+    )
+    _ffi_timings_print("==============================")
+    _ffi_timings_print("")
+
+
+if os.environ.get("SYNAPSE_PG_TIMINGS"):
+    atexit.register(_print_ffi_timings)
+
+
+# ── mtxdb runtime stats (opt-in via SYNAPSE_MTXDB_STATS=1) ──────────────
+
+
+def _print_mtxdb_stats() -> None:
+    """Print an end-of-run mtxdb runtime stats report for all three pools."""
+    if not os.environ.get("SYNAPSE_MTXDB_STATS"):
+        return
+    try:
+        from synapse.storage.databases.embedded_engine import get_embedded_engine
+
+        engine = get_embedded_engine("mtxdb")
+        s = engine.stats()
+    except Exception:
+        return
+
+    import sys
+
+    out = sys.stderr
+
+    def _fmt_us(us: int) -> str:
+        if us < 1000:
+            return f"{us}us"
+        if us < 1_000_000:
+            return f"{us / 1000:.1f}ms"
+        return f"{us / 1_000_000:.2f}s"
+
+    print("\n=== mtxdb runtime stats ===", file=out)
+    for pool_name in ("state", "event_dag", "auth_chain"):
+        ps = s.get(pool_name, {})
+        if not ps:
+            continue
+        print(f"\n  [{pool_name}]", file=out)
+        print(
+            f"    collections: {ps.get('collection_count', 0)}  shards: {ps.get('shard_count', 0)}  index: {ps.get('index_bytes', 0):,}B",
+            file=out,
+        )
+
+        # Read counters (only meaningful when stats_enabled was true).
+        gc = ps.get("get_calls", 0)
+        gm = ps.get("get_misses", 0)
+        gmc = ps.get("get_many_calls", 0)
+        gmr = ps.get("get_many_records", 0)
+        gmm = ps.get("get_many_misses", 0)
+        if gc or gmc:
+            hit_rate = ps.get("cache_hit_rate", 0.0)
+            print(
+                f"    get: {gc} calls, {gm} misses | get_many: {gmc} calls, {gmr} records, {gmm} misses",
+                file=out,
+            )
+            print(
+                f"    cache: hits={ps.get('cache_hits', 0)}  misses={ps.get('cache_misses', 0)}  rate={hit_rate:.3f}",
+                file=out,
+            )
+
+        # Write / batch counters.
+        pc = ps.get("put_calls", 0)
+        pmc = ps.get("put_many_calls", 0)
+        pmr = ps.get("put_many_records", 0)
+        pmb = ps.get("put_many_bytes", 0)
+        if pc or pmc:
+            avg_r = pmr / pmc if pmc else 0
+            avg_b = pmb / pmc if pmc else 0
+            fast = ps.get("put_many_fast_path_calls", 0)
+            clone = ps.get("put_many_clone_path_calls", 0)
+            print(
+                f"    put: {pc} calls, {ps.get('put_bytes', 0):,}B | put_many: {pmc} calls, {pmr:,} records, {pmb:,}B (avg {avg_r:.1f}r/{avg_b:.0f}B)",
+                file=out,
+            )
+            if fast or clone:
+                print(
+                    f"    put_many path: fast={fast}  clone={clone}  index_clone={_fmt_us(ps.get('index_clone_time_us', 0))}",
+                    file=out,
+                )
+
+        # Sync / persistence.
+        sc = ps.get("sync_calls", 0)
+        if sc:
+            print(
+                f"    sync: {sc} calls  checkpoint_writes={ps.get('checkpoint_writes', 0)}  delta_appends={ps.get('delta_appends', 0)}  invalidations={ps.get('delta_invalidations', 0)}",
+                file=out,
+            )
+
+        # Shard write stats (persisted across opens).
+        sw = ps.get("shard_write_count", 0)
+        sb = ps.get("shard_bytes_written", 0)
+        ss = ps.get("shard_sync_count", 0)
+        if sw:
+            print(f"    shard writes: {sw:,} records, {sb:,}B, {ss} syncs", file=out)
+
+        # Index ops.
+        ig = ps.get("index_grow_count", 0)
+        ir = ps.get("index_rebuild_count", 0)
+        if ig or ir:
+            print(f"    index: grows={ig}  rebuilds={ir}", file=out)
+
+        # Repack.
+        rc = ps.get("repack_count", 0)
+        if rc:
+            print(
+                f"    repack: {rc} calls, kept={ps.get('repack_kept', 0):,}, dropped={ps.get('repack_dropped', 0):,}",
+                file=out,
+            )
+
+        # Open timings.
+        ot = ps.get("last_open_timings")
+        if ot:
+            print(
+                f"    last open: {_fmt_us(ot.get('total_us', 0))} (shard={_fmt_us(ot.get('shard_open_us', 0))} metadata={_fmt_us(ot.get('metadata_load_us', 0))} checkpoint={_fmt_us(ot.get('checkpoint_decode_us', 0))} index={_fmt_us(ot.get('index_materialization_us', 0))} delta={_fmt_us(ot.get('delta_replay_us', 0))} scan={_fmt_us(ot.get('full_scan_us', 0))})",
+                file=out,
+            )
+
+        # Sync timings.
+        st = ps.get("last_sync_timings")
+        if st:
+            print(
+                f"    last sync: {_fmt_us(st.get('total_us', 0))} (flush={_fmt_us(st.get('pack_flush_us', 0))} fsync={_fmt_us(st.get('pack_fsync_us', 0))} sidecar={_fmt_us(st.get('sidecar_us', 0))} delta={_fmt_us(st.get('delta_log_us', 0))} checkpoint={_fmt_us(st.get('checkpoint_us', 0))})",
+                file=out,
+            )
+
+    print("=============================\n", file=out)
+
+
+if os.environ.get("SYNAPSE_MTXDB_STATS"):
+    atexit.register(_print_mtxdb_stats)
+
+
+@contextmanager
+def mirror_timing(tag: str) -> Iterator[None]:
+    """Bracket an entire mirror-helper call (Python row/metadata construction
+    *and* the native call it eventually makes) under one `mirror_<tag>`
+    entry in the same aggregate report `ffi_timing` feeds -- distinct from
+    the narrower `ffi_<tag>` entries individual call sites record around
+    just the native call itself. Diffing `mirror_<tag>` against the matching
+    `ffi_<tag>` isolates the Python-side share (encoding, list/dict
+    construction, `get_embedded_engine` lookup) of a given helper's cost.
+
+    Deliberately brackets the whole containing helper rather than timing
+    every sub-step (e.g. every `get_embedded_engine()` lookup) individually
+    -- more, finer-grained timers add their own overhead and risk
+    perturbing the very measurement they're trying to take.
+
+    No-op (near-zero overhead: one dict lookup, no timer read) when
+    `SYNAPSE_PG_TIMINGS` isn't set, same as `ffi_timing`.
+    """
+    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+        yield
+        return
+    start = time.monotonic()
+    try:
+        yield
+    finally:
+        ffi_timing(f"mirror_{tag}", time.monotonic() - start)
+
+
+def configure_sync(*, no_sync: bool) -> None:
+    """Set the module-level sync-disable flag.  Call once during init."""
+    global _sync_disabled
+    _sync_disabled = no_sync
+
+
+def _set_engine_configured() -> None:
+    """Record that an embedded engine was configured. Called once per store
+    init when `embedded_hamt.engine` + `embedded_hamt.path` are set."""
+    global _engine_configured
+    _engine_configured = True
+
+
+def namespace_hash(namespace: str) -> bytes:
+    """16-byte digest of a namespace, used to key every embedded mirror.
+
+    Namespaced keys keep multiple homeservers sharing one mtxdb file from
+    colliding on event ids / state-group ids. Kept here so every
+    embedded_* module derives keys identically (see `_state_hamt_node_key`
+    in `rust/src/database/core.rs` for the matching Rust-side derivation).
+    """
+    return hashlib.sha256(namespace.encode("utf-8")).digest()[:16]
+
+
+class SyncTier(Enum):
+    """Classification for embedded-sidecar write durability.
+
+    DURABLE: No SQL fallback exists, or the write uses accumulating/delta
+    semantics (counters, auth-chain links, HAMT roots).  A lost unflushed
+    write here means silent data loss or incorrect state, so sync() is
+    called after every batch.
+
+    CACHE: A SQL fallback exists on the read path.  A lost unflushed write
+    just means a slower read via that fallback, not data loss.  sync() is
+    skipped to avoid per-event fsync cost on the hottest write path.
+    """
+
+    DURABLE = auto()
+    CACHE = auto()
+
+
+class Pool(Enum):
+    """Which of mtxdb's three storage pools a DURABLE write touched.
+
+    `sync()` on the Rust side used to always fsync `state`, `event_dag`,
+    and `auth_chain` together, regardless of which one a given caller
+    actually wrote to -- e.g. an `event_json_put` (event_dag, sharded
+    across 256 locator-bucket collections) forced a flush of every
+    dirty event_dag shard on the next unrelated `state.py` DURABLE sync,
+    and vice versa. Passing the pool(s) a call site actually dirtied to
+    `maybe_sync` lets it call the matching Rust-side `sync_state` /
+    `sync_event_dag` / `sync_auth_chain` instead of the blanket `sync`,
+    so unrelated modules stop forcing each other's flushes.
+    """
+
+    STATE = auto()
+    EVENT_DAG = auto()
+    AUTH_CHAIN = auto()
+
+
+def maybe_sync(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
+    """Sync mtxdb for DURABLE writes; no-op for CACHE writes.
+
+    A DURABLE write has no SQL fallback, or uses accumulating/delta
+    semantics (counters, auth-chain links, HAMT roots). A lost unflushed
+    write here means silent data loss or incorrect state, so sync() is
+    called after every batch.
+
+    A CACHE write has a SQL fallback on the read path. A lost unflushed
+    write just means a slower read via that fallback, not data loss.
+
+    `pools`: which pool(s) this call site's batch actually wrote to (see
+    `Pool`'s doc comment). Omit only for a generic backstop that isn't
+    tied to a specific write (e.g. a periodic timer flush) -- that syncs
+    all three pools, same as before this parameter existed. A call site
+    that knows what it wrote should always pass `pools` explicitly, so a
+    write to one pool doesn't force a flush of another pool's unrelated
+    dirty shards.
+    """
+    if not _engine_configured:
+        return
+
+    if tier is not SyncTier.DURABLE:
+        return
+
+    if _sync_disabled:
+        return
+
+    from synapse.storage.databases.embedded_engine import get_embedded_engine
+
+    engine = get_embedded_engine("mtxdb")
+    if pools is None:
+        _st = time.monotonic()
+        engine.sync()
+        ffi_timing("ffi_sync_all", time.monotonic() - _st)
+        return
+    pool_set = set(pools)
+    if Pool.STATE in pool_set:
+        _st = time.monotonic()
+        engine.sync_state()
+        ffi_timing("ffi_sync_state", time.monotonic() - _st)
+    if Pool.EVENT_DAG in pool_set:
+        _st = time.monotonic()
+        engine.sync_event_dag()
+        ffi_timing("ffi_sync_event_dag", time.monotonic() - _st)
+    if Pool.AUTH_CHAIN in pool_set:
+        _st = time.monotonic()
+        engine.sync_auth_chain()
+        ffi_timing("ffi_sync_auth_chain", time.monotonic() - _st)
+
+
+# ── Commit-aware flush coalescer ──────────────────────────────────────
+#
+# Replaces the 1-second periodic timer with event-driven debounced
+# flushing.  Dirty marking happens via txn.call_after, which only fires
+# after successful SQL commit.  The coalescer debounces from the first
+# committed dirty write, flushes only dirty pools, clears a pool only
+# after its sync succeeds, and retries on failure with backoff.
+#
+# Immediate barriers (maybe_sync) are retained for destructive ops
+# (purge, redaction) and shutdown.
+
+
+class _FlushCoalescer:
+    """Commit-aware coalescing flush for mtxdb pools.
+
+    Owned by the writer StateGroupDataStore and initialized with its
+    clock.  Dirty marking happens via txn.call_after (after SQL commit),
+    so only committed writes trigger an fsync.
+
+    Debounces from the first committed dirty write (250-500ms) without
+    resetting the timer on subsequent writes.  Flushes only dirty pools.
+    Clears a pool only after its sync succeeds.  Retries on failure
+    with backoff.
+    """
+
+    def __init__(self, clock: Clock) -> None:
+        from synapse.util.duration import Duration
+
+        self._clock = clock
+        self._dirty: set[Pool] = set()
+        self._delayed_call: DelayedCallWrapper | None = None
+        self._closed: bool = False
+        self._FLUSH_DELAY = Duration(seconds=0.5)
+        self._RETRY_DELAY = Duration(seconds=1.0)
+
+    def mark_dirty(self, pool: Pool) -> None:
+        """Mark a pool as dirty.  Called via txn.call_after after SQL commit."""
+        if self._closed or _sync_disabled:
+            return
+        was_clean = not self._dirty
+        self._dirty.add(pool)
+        if was_clean and self._delayed_call is None:
+            self._delayed_call = self._clock.call_later(self._FLUSH_DELAY, self._flush)
+
+    def _flush(self) -> None:
+        """Flush dirty pools.  Called by the delayed callback."""
+        self._delayed_call = None
+        if self._closed:
+            return
+        to_flush = set(self._dirty)  # snapshot
+        if not to_flush:
+            return
+        try:
+            _do_sync_pools(to_flush)
+            self._dirty.difference_update(to_flush)
+        except Exception:
+            logger.warning(
+                "Flush coalescer sync failed for %s, will retry",
+                to_flush,
+                exc_info=True,
+            )
+        # Schedule retry if still dirty
+        if self._dirty and self._delayed_call is None:
+            self._delayed_call = self._clock.call_later(self._RETRY_DELAY, self._flush)
+
+    def sync_now(self, pools: Iterable[Pool] | None = None) -> None:
+        """Immediate barrier for destructive ops and shutdown.
+
+        Cancels any pending delayed flush, syncs the requested pools
+        (or all dirty pools if None), and reschedules if still dirty.
+        """
+        if self._closed:
+            return
+        if self._delayed_call is not None:
+            self._delayed_call.cancel()
+            self._delayed_call = None
+        to_flush = set(pools) if pools is not None else set(self._dirty)
+        if to_flush:
+            _do_sync_pools(to_flush)
+            self._dirty.difference_update(to_flush)
+        if self._dirty and self._delayed_call is None:
+            self._delayed_call = self._clock.call_later(self._FLUSH_DELAY, self._flush)
+
+    def close(self) -> None:
+        """Flush outstanding dirty pools and shut down."""
+        if self._delayed_call is not None:
+            self._delayed_call.cancel()
+            self._delayed_call = None
+        self._closed = True
+        if self._dirty:
+            for attempt in range(3):
+                try:
+                    _do_sync_pools(self._dirty)
+                except Exception:
+                    logger.warning(
+                        "Flush coalescer close sync failed (attempt %d/3)",
+                        attempt + 1,
+                        exc_info=True,
+                    )
+                else:
+                    self._dirty.clear()
+                    break
+            if self._dirty:
+                logger.error(
+                    "Unable to durably flush embedded pools during shutdown; "
+                    "writes remain pending: %s",
+                    self._dirty,
+                )
+
+
+_coalescer: _FlushCoalescer | None = None
+
+
+def _do_sync_pools(pools: set[Pool]) -> None:
+    """Sync specific pools.  Internal helper for the coalescer."""
+    maybe_sync(SyncTier.DURABLE, pools=pools)
+
+
+def _set_coalescer(c: _FlushCoalescer) -> None:
+    """Set the module-level coalescer reference.  Called by StateGroupDataStore.__init__."""
+    global _coalescer
+    _coalescer = c
+
+
+def _clear_coalescer(c: _FlushCoalescer) -> None:
+    """Clear the module-level coalescer reference only if it is still ``c``.
+
+    Identity-safe: stopping one homeserver's coalescer will not close
+    another's if they share a process (e.g. Complement trial).
+    """
+    global _coalescer
+    if _coalescer is c:
+        _coalescer = None
+
+
+def mark_dirty(pool: Pool) -> None:
+    """Mark a pool dirty.  Called via txn.call_after after SQL commit."""
+    if _coalescer is not None:
+        _coalescer.mark_dirty(pool)
+
+
+def sync_now(pools: Iterable[Pool] | None = None) -> None:
+    """Immediate barrier for destructive ops (purge, redaction, shutdown).
+
+    Syncs the requested pools and clears their dirty flags so a pending
+    delayed flush does not redundantly re-sync them.  Falls back to
+    maybe_sync if the coalescer hasn't been initialized.
+    """
+    if not _engine_configured:
+        return
+
+    if _coalescer is not None:
+        _coalescer.sync_now(pools)
+    elif pools is not None:
+        maybe_sync(SyncTier.DURABLE, pools=pools)
+
+
+def close_coalescer() -> None:
+    """Flush outstanding dirty pools and shut down the coalescer."""
+    if _coalescer is not None:
+        _coalescer.close()
+        # Don't clear _coalescer here — _clear_coalescer is the
+        # identity-safe path called by the owning store's stop().
+        # This is a fallback for process-level teardown.
