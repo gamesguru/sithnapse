@@ -311,7 +311,11 @@ def _print_mtxdb_stats() -> None:
         ot = ps.get("last_open_timings")
         if ot:
             print(
-                f"    last open: {_fmt_us(ot.get('total_us', 0))} (shard={_fmt_us(ot.get('shard_open_us', 0))} metadata={_fmt_us(ot.get('metadata_load_us', 0))} checkpoint={_fmt_us(ot.get('checkpoint_decode_us', 0))} index={_fmt_us(ot.get('index_materialization_us', 0))} delta={_fmt_us(ot.get('delta_replay_us', 0))} scan={_fmt_us(ot.get('full_scan_us', 0))})",
+                f"    last open: {_fmt_us(ot.get('total_us', 0))} (shard={_fmt_us(ot.get('shard_open_us', 0))} discovery={_fmt_us(ot.get('shard_discovery_us', 0))} lock={_fmt_us(ot.get('writer_lock_us', 0))} recovery={_fmt_us(ot.get('packfile_recovery_us', 0))}/{ot.get('packfile_recovery_calls', 0)} packs open={_fmt_us(ot.get('packfile_open_us', 0))}/{ot.get('packfile_open_calls', 0)} packs metadata={_fmt_us(ot.get('metadata_restore_us', 0))} unattributed={_fmt_us(ot.get('shard_open_unattributed_us', 0))})",
+                file=out,
+            )
+            print(
+                f"      index: checkpoint={_fmt_us(ot.get('checkpoint_decode_us', 0))} fingerprint={_fmt_us(ot.get('fingerprint_us', 0))} materialization={_fmt_us(ot.get('index_materialization_us', 0))} delta={_fmt_us(ot.get('delta_replay_us', 0))} scan={_fmt_us(ot.get('full_scan_us', 0))}",
                 file=out,
             )
 

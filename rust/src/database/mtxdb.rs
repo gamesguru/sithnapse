@@ -2652,6 +2652,23 @@ fn stats_to_dict(
     if let Some(ref ot) = s.last_open_timings {
         let od = PyDict::new(py);
         od.set_item("shard_open_us", ot.shard_open.as_micros() as u64)?;
+        od.set_item("shard_discovery_us", ot.shard_discovery.as_micros() as u64)?;
+        od.set_item("writer_lock_us", ot.writer_lock.as_micros() as u64)?;
+        od.set_item(
+            "packfile_recovery_us",
+            ot.packfile_recovery.as_micros() as u64,
+        )?;
+        od.set_item("packfile_recovery_calls", ot.packfile_recovery_calls)?;
+        od.set_item("packfile_open_us", ot.packfile_open.as_micros() as u64)?;
+        od.set_item("packfile_open_calls", ot.packfile_open_calls)?;
+        od.set_item(
+            "metadata_restore_us",
+            ot.metadata_restore.as_micros() as u64,
+        )?;
+        od.set_item(
+            "shard_open_unattributed_us",
+            ot.shard_open_unattributed.as_micros() as u64,
+        )?;
         od.set_item("metadata_load_us", ot.metadata_load.as_micros() as u64)?;
         od.set_item(
             "checkpoint_decode_us",
