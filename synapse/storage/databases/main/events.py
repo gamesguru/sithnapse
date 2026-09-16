@@ -505,6 +505,9 @@ class PersistEventsStore:
                             "redact_end_ordering": None,
                         },
                     )
+                    # `simple_upsert` has committed by the time it returns, so it
+                    # is safe to invalidate the emptiness cache here.
+                    self.db_pool.note_table_write("room_ban_redactions")
 
                     # normally the cache entry for a redacted event would be invalidated
                     # by an arriving redaction event, but since we are not creating redaction

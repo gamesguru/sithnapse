@@ -1727,19 +1727,31 @@ class EventsWorkerStore(SQLBaseStore):
                 )
 
             # check for redactions
-            redactions_sql = "SELECT event_id, redacts, recheck FROM redactions WHERE "
+            #
+            # The `redactions` table is empty in the vast majority of rooms, so
+            # skip the query outright until something has actually been written
+            # to it (see `TableEmptyCache`).
+            redactions_empty = self.db_pool.table_empty_cache("redactions")
+            if redactions_empty is None or redactions_empty.should_query(
+                txn, "redactions"
+            ):
+                redactions_sql = (
+                    "SELECT event_id, redacts, recheck FROM redactions WHERE "
+                )
 
-            clause, args = make_in_list_sql_clause(txn.database_engine, "redacts", evs)
+                clause, args = make_in_list_sql_clause(
+                    txn.database_engine, "redacts", evs
+                )
 
-            txn.execute(redactions_sql + clause, args)
+                txn.execute(redactions_sql + clause, args)
 
-            for redacter, redacted, recheck in txn:
-                d = event_dict.get(redacted)
-                if d:
-                    if recheck:
-                        d.unconfirmed_redactions.append(redacter)
-                    else:
-                        d.confirmed_redactions.append(redacter)
+                for redacter, redacted, recheck in txn:
+                    d = event_dict.get(redacted)
+                    if d:
+                        if recheck:
+                            d.unconfirmed_redactions.append(redacter)
+                        else:
+                            d.confirmed_redactions.append(redacter)
 
             # check for MSC4293 redactions
             to_check = []
@@ -1760,35 +1772,45 @@ class EventsWorkerStore(SQLBaseStore):
             # likely that some of these events may be for the same room/user combo, in
             # which case we don't need to do redundant queries
             to_check_set = set(to_check)
-            room_redaction_sql = "SELECT room_id, user_id, redacting_event_id, redact_end_ordering FROM room_ban_redactions WHERE "
-            (
-                in_list_clause,
-                room_redaction_args,
-            ) = make_tuple_in_list_sql_clause(
-                self.database_engine, ("room_id", "user_id"), to_check_set
+            # As with `redactions` above, `room_ban_redactions` is almost always
+            # empty; skip the query until a membership event actually writes to
+            # it (see `TableEmptyCache`).
+            room_ban_redactions_empty = self.db_pool.table_empty_cache(
+                "room_ban_redactions"
             )
-            txn.execute(room_redaction_sql + in_list_clause, room_redaction_args)
-            for (
-                returned_room_id,
-                returned_user_id,
-                redacting_event_id,
-                redact_end_ordering,
-            ) in txn:
-                for e_row in events:
-                    e_json = json.loads(e_row.json)
-                    room_id = e_json.get("room_id")
-                    user_id = e_json.get("sender")
-                    room_and_user = (returned_room_id, returned_user_id)
-                    # check if we have a redaction match for this room, user combination
-                    if room_and_user != (room_id, user_id):
-                        continue
-                    if redact_end_ordering:
-                        # Avoid redacting any events arriving *after* the membership event which
-                        # ends an active redaction - note that this will always redact
-                        # backfilled events, as they have a negative stream ordering
-                        if e_row.stream_ordering >= redact_end_ordering:
+            if (
+                room_ban_redactions_empty is None
+                or room_ban_redactions_empty.should_query(txn, "room_ban_redactions")
+            ):
+                room_redaction_sql = "SELECT room_id, user_id, redacting_event_id, redact_end_ordering FROM room_ban_redactions WHERE "
+                (
+                    in_list_clause,
+                    room_redaction_args,
+                ) = make_tuple_in_list_sql_clause(
+                    self.database_engine, ("room_id", "user_id"), to_check_set
+                )
+                txn.execute(room_redaction_sql + in_list_clause, room_redaction_args)
+                for (
+                    returned_room_id,
+                    returned_user_id,
+                    redacting_event_id,
+                    redact_end_ordering,
+                ) in txn:
+                    for e_row in events:
+                        e_json = json.loads(e_row.json)
+                        room_id = e_json.get("room_id")
+                        user_id = e_json.get("sender")
+                        room_and_user = (returned_room_id, returned_user_id)
+                        # check if we have a redaction match for this room, user combination
+                        if room_and_user != (room_id, user_id):
                             continue
-                    e_row.unconfirmed_redactions.append(redacting_event_id)
+                        if redact_end_ordering:
+                            # Avoid redacting any events arriving *after* the membership event which
+                            # ends an active redaction - note that this will always redact
+                            # backfilled events, as they have a negative stream ordering
+                            if e_row.stream_ordering >= redact_end_ordering:
+                                continue
+                        e_row.unconfirmed_redactions.append(redacting_event_id)
         return event_dict
 
     def _maybe_redact_event_row(
