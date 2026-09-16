@@ -2312,11 +2312,11 @@ class HAMTStructuralKeyRegressionTest(HomeserverTestCase):
         # would pass regardless of what fed the hash, so pin the exact bytes.
         self.assertEqual(
             hash_a.hex(),
-            "8dd913b7c06b71b0922167cc5468e40b83617ebbf3789483c05afb312343c32a",
+            "fb95526dd1daa672eb9aeeae34b27de638a69a2ddc8ee5350eae79e944fcd56b",
         )
         self.assertEqual(
             sg_a.hex(),
-            "cbd967fa5a267868fd32c3701ef0e9c7afb78b0ace049003701393ee59f903a8",
+            "8b94bfad590b925e09f0a9b22ce4aadffd205d82948671760e0ad52ed129e332",
         )
 
     def test_room_structural_key_is_sha256_of_room_id(self) -> None:

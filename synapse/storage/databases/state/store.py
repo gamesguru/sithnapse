@@ -79,12 +79,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+MAX_MIRROR_STATE_ENTRIES = 100_000
+
 
 class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
     """A data store for fetching/storing state groups."""
 
     EMBEDDED_HAMT_MIGRATION_UPDATE_NAME = "state_hamt_embedded_migration"
-    MAX_MIRROR_STATE_ENTRIES = 100_000
+    MAX_MIRROR_STATE_ENTRIES = MAX_MIRROR_STATE_ENTRIES
 
     def __init__(
         self,
@@ -344,6 +346,15 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 expected_prefix: bytes | None = item.get("expected_room_prefix")
                 state_map: Mapping[tuple[str, str], str] | None = item.get("state_map")
 
+                if len(expected_root_hash) != 32:
+                    raise RuntimeError(
+                        f"Invalid expected_root_hash length {len(expected_root_hash)} for state group {state_group}"
+                    )
+                if expected_lattice is not None and len(expected_lattice) != 2048:
+                    raise RuntimeError(
+                        f"Invalid expected_lattice length {len(expected_lattice)} for state group {state_group}"
+                    )
+
                 if expected_prefix is not None and expected_prefix != room_prefix:
                     raise RuntimeError(
                         f"Room prefix mismatch in mirror payload for state group {state_group}: "
@@ -351,11 +362,16 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                     )
 
                 if state_map is not None:
-                    if "state_count" in item and len(state_map) != item["state_count"]:
-                        raise RuntimeError(
-                            f"State count mismatch in mirror payload for state group {state_group}: "
-                            f"payload specified {item['state_count']} entries, found {len(state_map)}"
-                        )
+                    if "state_count" in item and item["state_count"] is not None:
+                        if item["state_count"] > self.MAX_MIRROR_STATE_ENTRIES:
+                            raise RuntimeError(
+                                f"State count {item['state_count']} exceeds maximum limit {self.MAX_MIRROR_STATE_ENTRIES} for state group {state_group}"
+                            )
+                        if len(state_map) != item["state_count"]:
+                            raise RuntimeError(
+                                f"State count mismatch in mirror payload for state group {state_group}: "
+                                f"payload specified {item['state_count']} entries, found {len(state_map)}"
+                            )
 
                     root_hash, lattice, nodes = self._persist_state_hamt_txn(
                         txn,
