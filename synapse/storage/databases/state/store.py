@@ -341,17 +341,61 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         )
 
         def redo_txn(txn: LoggingTransaction) -> None:
-            root_hash, lattice, nodes = self._persist_state_hamt_txn(
-                txn,
-                state_group,
-                room_id,
-                room_prefix,
-                current_state_ids=None,
-                prev_state_group=prev_state_group,
-                updates=updates,
-                # Compute only -- verify before persisting, see docstring.
-                skip_mirror_write=True,
-            )
+            # A reader may have created the predecessor state group in SQL
+            # while its mtxdb handle was read-only. In that case the normal
+            # incremental path cannot find a predecessor root and its full
+            # rebuild would deliberately hit the strict HAMT reader. Repair
+            # this replication-only case from the legacy SQL state instead.
+            predecessor_state: StateMap[str] | None = None
+            if (
+                prev_state_group is not None
+                and self._get_embedded_hamt_root(room_prefix, prev_state_group) is None
+            ):
+                predecessor_exists = self.db_pool.simple_select_one_onecol_txn(
+                    txn,
+                    table="state_groups",
+                    keyvalues={"id": prev_state_group},
+                    retcol="id",
+                    allow_none=True,
+                )
+                if predecessor_exists is not None:
+                    predecessor_state = self._get_legacy_state_for_groups_txn(
+                        txn, [prev_state_group], StateFilter.all()
+                    )[prev_state_group]
+
+            if predecessor_state is None:
+                root_hash, lattice, nodes = self._persist_state_hamt_txn(
+                    txn,
+                    state_group,
+                    room_id,
+                    room_prefix,
+                    current_state_ids=None,
+                    prev_state_group=prev_state_group,
+                    updates=updates,
+                    # Compute only -- verify before persisting, see docstring.
+                    skip_mirror_write=True,
+                )
+            else:
+                current_state_ids = dict(predecessor_state)
+                current_state_ids.update(
+                    {
+                        (event_type, state_key): event_id
+                        for event_type, state_key, event_id in updates
+                    }
+                )
+                root_hash, lattice, nodes = self._persist_state_hamt_txn(
+                    txn,
+                    state_group,
+                    room_id,
+                    room_prefix,
+                    current_state_ids=current_state_ids,
+                    # The predecessor is represented by the reconstructed
+                    # state, so do not ask the strict HAMT reader for it.
+                    prev_state_group=None,
+                    updates=None,
+                    # Compute only -- verify before persisting, see docstring.
+                    skip_mirror_write=True,
+                )
             if root_hash != expected_root_hash:
                 raise RuntimeError(
                     "mtxdb mirror-write determinism check failed for state "

@@ -137,6 +137,13 @@ class _NoChainCoverIndex(Exception):
         super().__init__("Unexpectedly no chain cover for events in %s" % (room_id,))
 
 
+# Rooms for which the embedded auth-graph incomplete warning has already been
+# logged.  Populated lazily; lives at module level so every store instance
+# shares the dedup set for the process lifetime.  Prevents a per-request
+# flood when cold-import is lagging behind federation.
+_warned_incomplete_auth_graph: set[str] = set()
+
+
 class EventFederationWorkerStore(
     SignatureWorkerStore, EventsWorkerStore, CacheInvalidationWorkerStore
 ):
@@ -278,11 +285,13 @@ class EventFederationWorkerStore(
                         # chain-cover path entirely and fall through to the
                         # legacy recursive BFS walk, which is authoritative
                         # against raw event_auth rows.
-                        logger.warning(
-                            "Embedded auth graph incomplete for room %s; "
-                            "falling back to legacy SQL auth-chain traversal",
-                            room_id,
-                        )
+                        if room_id not in _warned_incomplete_auth_graph:
+                            _warned_incomplete_auth_graph.add(room_id)
+                            logger.warning(
+                                "Embedded auth graph incomplete for room %s; "
+                                "falling back to legacy SQL auth-chain traversal",
+                                room_id,
+                            )
                         return await self.db_pool.runInteraction(
                             "get_auth_chain_ids_legacy_fallback",
                             self._get_auth_chain_ids_txn,
@@ -761,11 +770,13 @@ class EventFederationWorkerStore(
                         # cover-index may have the same gap for imported
                         # outliers, so go directly to the authoritative
                         # legacy BFS walk against raw event_auth rows.
-                        logger.warning(
-                            "Embedded auth graph incomplete for room %s; "
-                            "falling back to legacy SQL auth-chain traversal",
-                            room_id,
-                        )
+                        if room_id not in _warned_incomplete_auth_graph:
+                            _warned_incomplete_auth_graph.add(room_id)
+                            logger.warning(
+                                "Embedded auth graph incomplete for room %s; "
+                                "falling back to legacy SQL auth-chain traversal",
+                                room_id,
+                            )
                         if conflicted_set is not None:
                             # The legacy BFS cannot compute the v2.1
                             # conflicted subgraph; surface the error.
