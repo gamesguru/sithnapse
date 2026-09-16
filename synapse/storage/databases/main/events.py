@@ -3752,6 +3752,14 @@ class PersistEventsStore:
             # state dag rooms allow outliers to have state, as `/get_missing_events` state dag events are nominally
             # outliers (not present in the timeline) but do need state persisted so we can calculate
             # what the auth_events are for the event.
+            # if the event was rejected, just give it the same state as its
+            # predecessor. This must come first: `context.state_group` raises
+            # for rejected events, so the outlier check below must never
+            # dereference it for one.
+            if context.rejected:
+                state_groups[event.event_id] = context.state_group_before_event
+                continue
+
             if (
                 not event.room_version.msc4242_state_dags
                 and event.internal_metadata.is_outlier()
@@ -3769,12 +3777,6 @@ class PersistEventsStore:
                 # later local join/leave state resolution can find it.
                 if context.state_group is None:
                     continue
-
-            # if the event was rejected, just give it the same state as its
-            # predecessor.
-            if context.rejected:
-                state_groups[event.event_id] = context.state_group_before_event
-                continue
 
             state_groups[event.event_id] = context.state_group
 

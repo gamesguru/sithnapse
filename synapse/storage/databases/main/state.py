@@ -681,6 +681,24 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
 
         missing = set(event_ids).difference(res)
         if missing:
+            # The batch reads above can transiently miss an event whose
+            # mapping was already prefilled into the scalar cache at persist
+            # commit: the embedded engine's mapping publication is coalesced,
+            # and a worker may observe the event before the fallback SQL row
+            # is visible to it. Peek the scalar cache for *completed* values
+            # (never call it, so no negative results are planted) before
+            # giving up.
+            for event_id in list(missing):
+                cached = self._get_state_group_for_event_sql.cache.get_immediate(
+                    # A cached `None` (e.g. a rejected event's mapping) is the
+                    # same as a miss here: it carries no usable state group.
+                    (event_id,),
+                    None,
+                )
+                if cached is not None:
+                    res[event_id] = cached
+            missing = set(event_ids).difference(res)
+        if missing:
             raise RuntimeError(
                 "State mapping disappeared before _get_state_group_for_events "
                 f"returned: {missing}"
