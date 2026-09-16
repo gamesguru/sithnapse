@@ -520,8 +520,10 @@ class StateHandler:
         logger.debug("resolve_state_groups event_ids %s", event_ids)
 
         try:
-            state_groups = await self._state_storage_controller.get_state_group_for_events(
-                event_ids, await_full_state=await_full_state
+            state_groups = (
+                await self._state_storage_controller.get_state_group_for_events(
+                    event_ids, await_full_state=await_full_state
+                )
             )
         except RuntimeError:
             # Tolerate unresolvable events when the caller explicitly opted out

@@ -126,6 +126,8 @@ _TABLE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_SQL_COMMENT_RE = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
+
 
 def _timings_print(*args: object) -> None:
     """Print to stderr and optionally to SYNAPSE_PG_TIMINGS_FILE."""
@@ -148,6 +150,8 @@ if os.environ.get("SYNAPSE_PG_TIMINGS"):
 def _track_table_op(sql: str, elapsed: float, rowcount: int = 0) -> None:
     if not os.environ.get("SYNAPSE_PG_TIMINGS"):
         return
+    if "--" in sql or "/*" in sql:
+        sql = _SQL_COMMENT_RE.sub(" ", sql)
     m = _TABLE_RE.search(sql)
     if not m:
         return
