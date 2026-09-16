@@ -1315,14 +1315,9 @@ pub fn get_auth_chain_links_batch(
         let room_id = namespace_room_id(&namespace);
         let node_ids: Vec<NodeId> = chain_ids.iter().map(|&c| chain_node_id(c)).collect();
 
-        let results = engine
-            .get_many_with_refresh(&room_id, &node_ids)
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "mtxdb get_many_with_refresh error: {}",
-                    e
-                ))
-            })?;
+        let results = engine.get_many(&room_id, &node_ids).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {}", e))
+        })?;
 
         let mut out = Vec::with_capacity(node_ids.len());
         for (chain_id, res) in chain_ids.into_iter().zip(results) {
