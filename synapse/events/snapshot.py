@@ -148,7 +148,7 @@ class EventContext(UnpersistedEventContextBase):
     # redone here -- see `serialize`'s `pending_embedded_hamt_mirror_root`
     # and `pop_pending_embedded_hamt_root`. None on the creating side, and
     # None here too once no mirror write is pending.
-    pending_embedded_hamt_mirror_roots: dict[int, dict[str, Any]] | None = None
+    pending_embedded_hamt_mirror_roots: dict[int, dict[str, Any] | bytes] | None = None
 
     @staticmethod
     def with_state(
@@ -158,7 +158,8 @@ class EventContext(UnpersistedEventContextBase):
         state_delta_due_to_event: StateMap[str] | None,
         partial_state: bool,
         state_group_deltas: dict[tuple[int, int], StateMap[str]],
-        pending_embedded_hamt_mirror_roots: dict[int, dict[str, Any]] | None = None,
+        pending_embedded_hamt_mirror_roots: dict[int, dict[str, Any] | bytes]
+        | None = None,
     ) -> "EventContext":
         return EventContext(
             storage=storage,
@@ -210,7 +211,10 @@ class EventContext(UnpersistedEventContextBase):
             "app_service_id": self.app_service.id if self.app_service else None,
             "partial_state": self.partial_state,
             "pending_embedded_hamt_mirror_roots": (
-                {str(sg): payload for sg, payload in pending_mirror_roots.items()}
+                {
+                    str(sg): payload.hex() if isinstance(payload, bytes) else payload
+                    for sg, payload in pending_mirror_roots.items()
+                }
                 if pending_mirror_roots
                 else None
             ),
@@ -262,8 +266,8 @@ class EventContext(UnpersistedEventContextBase):
         context.pending_embedded_hamt_mirror_roots = (
             {
                 int(sg): payload
-                if isinstance(payload, dict)
-                else {"expected_root": payload}
+                if isinstance(payload, (dict, bytes))
+                else bytes.fromhex(payload)
                 for sg, payload in pending_roots_dict.items()
             }
             if pending_roots_dict
@@ -437,7 +441,7 @@ class UnpersistedEventContext(UnpersistedEventContextBase):
 
             # Pop any deferred mtxdb mirror roots that the batch created
             # on this non-writer instance, so the events writer can replay them.
-            _pending_roots: dict[int, dict[str, Any]] = {}
+            _pending_roots: dict[int, dict[str, Any] | bytes] = {}
             state_stores = getattr(unpersisted_context._storage.state, "stores", None)
             if state_stores is not None:
                 for sg in (
@@ -530,7 +534,7 @@ class UnpersistedEventContext(UnpersistedEventContextBase):
         # rides on the EventContext itself rather than a side table that
         # `serialize` would have to pop from (and could pop from twice, on
         # a replication retry, losing the mirror write the second time).
-        _pending_roots: dict[int, dict[str, Any]] = {}
+        _pending_roots: dict[int, dict[str, Any] | bytes] = {}
         state_stores = getattr(self._storage.state, "stores", None)
         if state_stores is not None:
             if self.state_group_before_event is not None:
@@ -546,7 +550,7 @@ class UnpersistedEventContext(UnpersistedEventContextBase):
                 if root:
                     _pending_roots[self.state_group_after_event] = root
 
-        pending_embedded_hamt_mirror_roots: dict[int, dict[str, Any]] | None = (
+        pending_embedded_hamt_mirror_roots: dict[int, dict[str, Any] | bytes] | None = (
             _pending_roots if _pending_roots else None
         )
 

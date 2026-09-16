@@ -158,24 +158,53 @@ class ReplicationSendEventsRestServlet(ReplicationEndpoint):
                     # writer. Sort by state group so that the predecessor is always
                     # mirror-written before the child group that depends on it.
                     replays: list[dict[str, Any]] = []
-                    for sg, payload in sorted(
+                    for sg, pending_payload in sorted(
                         context.pending_embedded_hamt_mirror_roots.items()
                     ):
                         prev_sg = None
                         delta = None
 
-                        expected_root = bytes.fromhex(payload["expected_root"])
-                        full_state_map = _decode_state_dict(payload.get("state"))
-                        expected_lattice = (
-                            bytes.fromhex(payload["lattice"])
-                            if "lattice" in payload
-                            else None
-                        )
-                        expected_prefix = (
-                            bytes.fromhex(payload["room_prefix"])
-                            if "room_prefix" in payload
-                            else None
-                        )
+                        if isinstance(pending_payload, bytes):
+                            expected_root = pending_payload
+                            full_state_map = None
+                            expected_lattice = None
+                            expected_prefix = None
+                            version = 0
+                            state_count = None
+                        else:
+                            payload = pending_payload
+                            version = payload.get("version", 0)
+                            if version != 1:
+                                expected_root = bytes.fromhex(payload["expected_root"])
+                                full_state_map = None
+                                expected_lattice = None
+                                expected_prefix = None
+                                state_count = None
+                            else:
+                                if payload.get("state_group") != sg:
+                                    raise RuntimeError(
+                                        "Pending HAMT payload state-group mismatch"
+                                    )
+                                if (
+                                    "state" not in payload
+                                    or "state_count" not in payload
+                                ):
+                                    raise RuntimeError(
+                                        "Incomplete version-1 pending HAMT payload"
+                                    )
+                                state_count = payload["state_count"]
+                                if state_count > 100_000:
+                                    raise RuntimeError(
+                                        "Pending HAMT payload exceeds state limit"
+                                    )
+                                expected_root = bytes.fromhex(payload["expected_root"])
+                                full_state_map = _decode_state_dict(payload["state"])
+                                if full_state_map is None:
+                                    raise RuntimeError(
+                                        "Version-1 pending HAMT payload has no state"
+                                    )
+                                expected_lattice = bytes.fromhex(payload["lattice"])
+                                expected_prefix = bytes.fromhex(payload["room_prefix"])
 
                         if sg == context._state_group:
                             prev_sg = context.state_group_before_event
@@ -207,8 +236,8 @@ class ReplicationSendEventsRestServlet(ReplicationEndpoint):
                                 "expected_lattice": expected_lattice,
                                 "expected_room_prefix": expected_prefix,
                                 "state_map": full_state_map,
-                                "state_count": payload.get("state_count"),
-                                "version": payload.get("version", 0),
+                                "state_count": state_count,
+                                "version": version,
                             }
                         )
 
