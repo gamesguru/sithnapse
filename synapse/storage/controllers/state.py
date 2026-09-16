@@ -114,6 +114,13 @@ class StateStorageController:
             event_ids, await_full_state=await_full_state
         )
 
+        missing = set(event_ids).difference(event_to_groups)
+        if missing:
+            raise RuntimeError(
+                "State mapping disappeared in get_state_for_events: "
+                f"{missing}"
+            )
+
         groups = set(event_to_groups.values())
         group_to_state = await self.stores.state._get_state_for_groups(groups)
 

@@ -631,15 +631,16 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             desc="_get_state_group_for_event",
         )
 
-    @cachedList(
-        cached_method_name="_get_state_group_for_event",
-        list_name="event_ids",
-        num_args=1,
-    )
     async def _get_state_group_for_events(
         self, event_ids: Collection[str]
     ) -> Mapping[str, int]:
         """Returns mapping event_id -> state_group.
+
+        This deliberately does not use ``@cachedList``. That decorator uses
+        the scalar cache and treats ``None`` as a cacheable negative result.
+        For the embedded backend, a worker can observe a temporary miss while
+        another worker is persisting the mapping; reusing that negative would
+        prevent the refresh-aware mtxdb lookup and SQL fallback from running.
 
         Raises:
              RuntimeError if the state is unknown at any of the given events
@@ -692,9 +693,12 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             )
             res = dict(rows)
 
-        for e in event_ids:
-            if e not in res:
-                raise RuntimeError("No state group for unknown or outlier event %s" % e)
+        missing = set(event_ids).difference(res)
+        if missing:
+            raise RuntimeError(
+                "State mapping disappeared before _get_state_group_for_events "
+                f"returned: {missing}"
+            )
         return res
 
     async def get_referenced_state_groups(
