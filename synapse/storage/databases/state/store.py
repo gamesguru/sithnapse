@@ -1857,7 +1857,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                     skip_mirror_write=skip_mirror_write,
                 )
                 if skip_mirror_write:
-                    if context.partial_state or not context.state_map_before_event:
+                    if context.partial_state or context.state_map_before_event is None:
                         raise RuntimeError(
                             f"Cannot emit version-1 mirror payload for batched state group {sg_after}: "
                             f"in-memory state map is unavailable or incomplete (partial_state={context.partial_state})"
@@ -2047,7 +2047,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         )
 
         if skip_mirror_write:
-            if not current_state_ids:
+            if current_state_ids is None:
                 raise RuntimeError(
                     f"Cannot emit version-1 mirror payload for state group {state_group}: "
                     "complete in-memory state map is required"

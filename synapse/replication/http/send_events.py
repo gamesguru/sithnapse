@@ -34,7 +34,7 @@ from synapse.events.snapshot import (
 from synapse.http.server import HttpServer
 from synapse.replication.http._base import ReplicationEndpoint
 from synapse.storage.databases.state.store import MAX_MIRROR_STATE_ENTRIES
-from synapse.types import JsonDict, Requester, UserID
+from synapse.types import JsonDict, Requester, StateMap, UserID
 from synapse.util.metrics import Measure
 
 if TYPE_CHECKING:
@@ -163,7 +163,7 @@ class ReplicationSendEventsRestServlet(ReplicationEndpoint):
                         context.pending_embedded_hamt_mirror_roots.items()
                     ):
                         prev_sg = None
-                        delta = None
+                        delta: StateMap[str] | None = None
 
                         if isinstance(pending_payload, bytes):
                             if len(pending_payload) != 32:
@@ -260,7 +260,15 @@ class ReplicationSendEventsRestServlet(ReplicationEndpoint):
                                         f"payload specified {state_count} entries, found {len(full_state_map)}"
                                     )
 
-                        if sg == context._state_group:
+                        if version == 1:
+                            # v1 carries the complete state map, so the
+                            # predecessor is metadata and is not needed for
+                            # reconstruction. Batched contexts do not always
+                            # carry every pending group's delta.
+                            assert isinstance(payload, dict)
+                            prev_sg = payload["predecessor_state_group"]
+                            delta = {}
+                        elif sg == context._state_group:
                             prev_sg = context.state_group_before_event
                             delta = context._state_delta_due_to_event or {}
                         else:
@@ -276,14 +284,6 @@ class ReplicationSendEventsRestServlet(ReplicationEndpoint):
                                 raise RuntimeError(
                                     f"Could not find predecessor for state group {sg} in deltas"
                                 )
-                        if (
-                            version == 1
-                            and payload["predecessor_state_group"] != prev_sg
-                        ):
-                            raise RuntimeError(
-                                f"Pending HAMT payload predecessor mismatch for state group {sg}"
-                            )
-
                         updates = [
                             (event_type, state_key, ev_id)
                             for (event_type, state_key), ev_id in delta.items()
