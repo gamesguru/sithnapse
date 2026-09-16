@@ -1315,11 +1315,29 @@ pub fn get_auth_chain_links_batch(
         let room_id = namespace_room_id(&namespace);
         let node_ids: Vec<NodeId> = chain_ids.iter().map(|&c| chain_node_id(c)).collect();
 
-        let results = engine.get_many(&room_id, &node_ids).map_err(|e| {
+        let mut results = engine.get_many(&room_id, &node_ids).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {}", e))
         })?;
 
-        let mut out = Vec::with_capacity(chain_ids.len());
+        // Read-only workers keep an in-process collection index. If the
+        // writer published chain-link records after this worker loaded the
+        // collection (or if the worker has never seen this namespace's
+        // auth-chain collection at all), retry once after refreshing the
+        // index -- mirroring the identical pattern in `batch_get`.
+        if results.iter().any(Option::is_none) {
+            engine.refresh_collection(&room_id).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "mtxdb refresh_collection error: {e}"
+                ))
+            })?;
+            results = engine.get_many(&room_id, &node_ids).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "mtxdb get_many error after refresh: {e}"
+                ))
+            })?;
+        }
+
+        let mut out = Vec::with_capacity(node_ids.len());
         for (chain_id, res) in chain_ids.into_iter().zip(results) {
             if let Some(data) = res {
                 let edges = deserialize_manifest(&data.bytes);
@@ -1652,9 +1670,26 @@ pub fn auth_chain_edges_get(
             .iter()
             .map(|&s| auth_chain_edge_node_id(s))
             .collect();
-        let results = engine.get_many(&collection, &node_ids).map_err(|e| {
+        let mut results = engine.get_many(&collection, &node_ids).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {}", e))
         })?;
+
+        // Read-only workers: refresh the collection and retry once if any
+        // record is missing from the in-process index snapshot, mirroring
+        // `batch_get` and `get_auth_chain_links_batch`.
+        if results.iter().any(Option::is_none) {
+            engine.refresh_collection(&collection).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "mtxdb refresh_collection error: {e}"
+                ))
+            })?;
+            results = engine.get_many(&collection, &node_ids).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "mtxdb get_many error after refresh: {e}"
+                ))
+            })?;
+        }
+
         results
             .into_iter()
             .map(|opt| match opt {
