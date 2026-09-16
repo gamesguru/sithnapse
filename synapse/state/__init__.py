@@ -519,9 +519,21 @@ class StateHandler:
         """
         logger.debug("resolve_state_groups event_ids %s", event_ids)
 
-        state_groups = await self._state_storage_controller.get_state_group_for_events(
-            event_ids, await_full_state=await_full_state
-        )
+        try:
+            state_groups = await self._state_storage_controller.get_state_group_for_events(
+                event_ids, await_full_state=await_full_state
+            )
+        except RuntimeError:
+            # Tolerate unresolvable events when the caller explicitly opted out
+            # of waiting for full state (`await_full_state=False`): event
+            # creation passes this and falls back to caller-supplied auth
+            # events when the prev events are not (yet) resolvable -- a
+            # mid-flight event whose state-group mapping is only published at
+            # event persist, or a stateless outlier. Return the same empty
+            # state entry as the all-unknown branch below rather than raising.
+            if not await_full_state:
+                return _StateCacheEntry(state={}, state_group=None)
+            raise
 
         state_group_ids = state_groups.values()
 
