@@ -364,11 +364,10 @@ main() {
   # This significantly speeds up tests, but increases the possibility of test pollution.
   export COMPLEMENT_ENABLE_DIRTY_RUNS=1
 
-  # A failed deployment can leave its network behind before Complement gets to
-  # its normal teardown. Reclaim orphaned Complement resources before the
-  # next deployment, otherwise Docker eventually exhausts its predefined
-  # address pools.
-  cleanup_complement_resources
+  # Reclaim networks left by older failed runs. The grace period prevents a
+  # concurrent run's freshly-created, not-yet-attached network from being
+  # mistaken for stale state.
+  cleanup_stale_complement_networks
 
   # All environment variables starting with PASS_ will be shared.
   # (The prefix is stripped off before reaching the container.)
@@ -632,55 +631,78 @@ main() {
 cleanup_complement_containers() {
   local runtime="${CONTAINER_RUNTIME:-docker}"
   local container_label="COMPLEMENT_WRAPPER_TOKEN=$COMPLEMENT_WRAPPER_TOKEN"
-  local containers container ours=()
+  local containers container network
+  local -a ours=() networks=()
   if command -v "$runtime" &>/dev/null; then
     mapfile -t containers < <("$runtime" ps -aq --filter "name=complement" 2>/dev/null || true)
     for container in "${containers[@]:-}"; do
       if "$runtime" inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$container" 2>/dev/null \
           | grep -Fxq "$container_label"; then
         ours+=("$container")
+        while IFS= read -r network; do
+          [ -n "$network" ] || continue
+          if [[ ! " ${networks[*]} " == *" $network "* ]]; then
+            networks+=("$network")
+          fi
+        done < <(
+          "$runtime" inspect --format '{{range $name, $config := .NetworkSettings.Networks}}{{println $name}}{{end}}' \
+            "$container" 2>/dev/null || true
+        )
       fi
     done
     if [ "${#ours[@]}" -gt 0 ]; then
       echo "Cleaning up Complement containers spawned by this run..." >&2
       printf '%s\n' "${ours[@]}" | xargs -r "$runtime" rm -f
     fi
+
+    # Only remove networks which were attached to containers carrying this
+    # run's token. An unscoped name-based sweep can delete a network another
+    # Complement invocation has just created but not attached yet.
+    for network in "${networks[@]:-}"; do
+      echo "Cleaning up Complement network $network..." >&2
+      "$runtime" network rm "$network" >/dev/null 2>&1 || true
+    done
   fi
 }
 
-# Remove only Complement-owned resources which no longer have containers.
-# Keeping active resources intact matters when multiple Complement runs share
-# the same Docker/Podman daemon.
-cleanup_complement_resources() {
+# Remove only old, empty Complement networks. This handles deployments which
+# died after creating a network but before creating a token-labelled container.
+# The age check is intentional: network creation and container attachment are
+# separate daemon operations, so an unscoped zero-container check alone has a
+# startup race with another Complement invocation.
+cleanup_stale_complement_networks() {
   local runtime="${CONTAINER_RUNTIME:-docker}"
-  local network attached pod pod_containers
-  local -a networks=() pods=()
+  local network created created_epoch now age attached
+  local stale_after="${COMPLEMENT_STALE_NETWORK_AGE_SECS:-600}"
+  local -a networks=()
 
   if ! command -v "$runtime" &>/dev/null; then
     return 0
   fi
 
+  now=$(date +%s)
   mapfile -t networks < <("$runtime" network ls -q --filter "name=complement" 2>/dev/null || true)
   for network in "${networks[@]:-}"; do
     [ -n "$network" ] || continue
-    attached=$("$runtime" network inspect --format '{{len .Containers}}' "$network" 2>/dev/null || echo 1)
-    if [ "$attached" = "0" ]; then
-      echo "Cleaning up orphaned Complement network $network..." >&2
-      "$runtime" network rm "$network" >/dev/null 2>&1 || true
-    fi
-  done
 
-  if [ "$runtime" = "podman" ]; then
-    mapfile -t pods < <("$runtime" pod ls -q --filter "name=complement" 2>/dev/null || true)
-    for pod in "${pods[@]:-}"; do
-      [ -n "$pod" ] || continue
-      pod_containers=$("$runtime" pod inspect --format '{{len .Containers}}' "$pod" 2>/dev/null || echo 1)
-      if [ "$pod_containers" = "0" ]; then
-        echo "Cleaning up orphaned Complement pod $pod..." >&2
-        "$runtime" pod rm -f "$pod" >/dev/null 2>&1 || true
-      fi
-    done
-  fi
+    # Do not remove a network if the runtime cannot describe its age.
+    created=$("$runtime" network inspect --format '{{.Created}}' "$network" 2>/dev/null || true)
+    created_epoch=$(date -d "$created" +%s 2>/dev/null || true)
+    [[ "$created_epoch" =~ ^[0-9]+$ ]] || continue
+    age=$((now - created_epoch))
+    [ "$age" -ge "$stale_after" ] || continue
+
+    # Docker exposes Containers as a map; Podman exposes equivalent network
+    # membership in its inspect JSON. jq handles either shape and a failure
+    # deliberately keeps the network rather than risking deletion.
+    attached=$("$runtime" network inspect "$network" 2>/dev/null \
+      | jq -r '.[0].Containers // {} | length' 2>/dev/null || echo 1)
+    [[ "$attached" =~ ^[0-9]+$ ]] || continue
+    [ "$attached" -eq 0 ] || continue
+
+    echo "Cleaning up stale Complement network $network (${age}s old)..." >&2
+    "$runtime" network rm "$network" >/dev/null 2>&1 || true
+  done
 }
 
 # ── record_result: one summary line + append to staged results ───────────────
@@ -1036,7 +1058,6 @@ for suite, total in sorted(suite_times.items(), key=lambda x: -x[1]):
   fi
 
   cleanup_complement_containers
-  cleanup_complement_resources
 }
 trap finish EXIT
 
