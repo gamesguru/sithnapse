@@ -349,9 +349,14 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             predecessor_state: StateMap[str] | None = None
             predecessor_root_found = False
             used_fallback = False
-            if prev_state_group is not None:
+            predecessor_root = (
+                self._get_embedded_hamt_root(room_prefix, prev_state_group)
+                if prev_state_group is not None
+                else None
+            )
+            if predecessor_root is not None:
                 predecessor_root_found = (
-                    self._get_embedded_hamt_root(room_prefix, prev_state_group)
+                    self._get_embedded_hamt_node(room_prefix, predecessor_root[0])
                     is not None
                 )
 
