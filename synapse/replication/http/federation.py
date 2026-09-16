@@ -78,6 +78,7 @@ class ReplicationFederationSendEventsRestServlet(ReplicationEndpoint):
 
         self.server_name = hs.hostname
         self.store = hs.get_datastores().main
+        self._state_store = hs.get_datastores().state
         self._storage_controllers = hs.get_storage_controllers()
         self.clock = hs.get_clock()
         self.federation_event_handler = hs.get_federation_event_handler()
@@ -146,6 +147,27 @@ class ReplicationFederationSendEventsRestServlet(ReplicationEndpoint):
                 context = EventContext.deserialize(
                     self._storage_controllers, event_payload["context"]
                 )
+
+                if context.pending_embedded_hamt_mirror_root is not None:
+                    # Federation workers may have created this state group
+                    # while holding a read-only mtxdb handle. Replay the
+                    # deferred mirror on the events writer before the event
+                    # becomes visible to readers, just as the normal
+                    # send_events endpoint does.
+                    assert context._state_group is not None
+                    state_delta = context._state_delta_due_to_event or {}
+                    updates = [
+                        (event_type, state_key, event_id)
+                        for (event_type, state_key), event_id in state_delta.items()
+                    ]
+                    await self._state_store.redo_embedded_hamt_mirror_write(
+                        context._state_group,
+                        context.state_group_before_event,
+                        event.room_id,
+                        event.room_version,
+                        updates,
+                        context.pending_embedded_hamt_mirror_root,
+                    )
 
                 event_and_contexts.append((event, context))
 
