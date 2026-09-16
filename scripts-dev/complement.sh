@@ -368,16 +368,17 @@ main() {
 
   # Enable dirty runs, so tests will reuse the same container where possible.
   # This significantly speeds up tests, but increases the possibility of test pollution.
-  export COMPLEMENT_ENABLE_DIRTY_RUNS=1
+  export COMPLEMENT_ENABLE_DIRTY_RUNS="${COMPLEMENT_ENABLE_DIRTY_RUNS:-1}"
 
-  # Reclaim resources left by older failed runs. The run lock above prevents
-  # this sweep from racing another complement.sh invocation.
-  cleanup_stale_complement_containers
-
-  # Reclaim networks left by older failed runs. The grace period prevents a
-  # concurrent run's freshly-created, not-yet-attached network from being
-  # mistaken for stale state.
-  cleanup_stale_complement_networks
+  # Reclaim resources left by older failed runs. The sweep can be disabled
+  # when this daemon is shared with Complement runners outside this script;
+  # current-run, token-scoped cleanup remains enabled in either case.
+  if [ "${COMPLEMENT_CLEANUP_STALE_RESOURCES:-1}" != "0" ]; then
+    cleanup_stale_complement_containers
+    # The grace period prevents a freshly-created, not-yet-attached network
+    # from being mistaken for stale state.
+    cleanup_stale_complement_networks
+  fi
 
   # All environment variables starting with PASS_ will be shared.
   # (The prefix is stripped off before reaching the container.)
@@ -1124,8 +1125,10 @@ for suite, total in sorted(suite_times.items(), key=lambda x: -x[1]):
   # Also sweep resources left by an older interrupted invocation. Keep this
   # on the EXIT path as well as startup so an invocation which is interrupted
   # before Complement's normal teardown still gets cleaned up immediately.
-  cleanup_stale_complement_containers
-  cleanup_stale_complement_networks
+  if [ "${COMPLEMENT_CLEANUP_STALE_RESOURCES:-1}" != "0" ]; then
+    cleanup_stale_complement_containers
+    cleanup_stale_complement_networks
+  fi
 }
 trap finish EXIT
 

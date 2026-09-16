@@ -273,7 +273,22 @@ class EventFederationWorkerStore(
                             include_given,
                         )
                     except IncompleteAuthGraph:
-                        raise _NoChainCoverIndex(room_id) from None
+                        # The embedded ramp is missing genuine data (e.g.
+                        # cold-import hasn't caught up yet).  Bypass the
+                        # chain-cover path entirely and fall through to the
+                        # legacy recursive BFS walk, which is authoritative
+                        # against raw event_auth rows.
+                        logger.warning(
+                            "Embedded auth graph incomplete for room %s; "
+                            "falling back to legacy SQL auth-chain traversal",
+                            room_id,
+                        )
+                        return await self.db_pool.runInteraction(
+                            "get_auth_chain_ids_legacy_fallback",
+                            self._get_auth_chain_ids_txn,
+                            event_ids,
+                            include_given,
+                        )
 
                 return await self.db_pool.runInteraction(
                     "get_auth_chain_ids_chains",
@@ -718,27 +733,51 @@ class EventFederationWorkerStore(
         room = await self.get_room(room_id)  # type: ignore[attr-defined]
         # If the room has an auth chain index.
         if room[1]:
-            try:
-                from synapse.storage.databases.main.embedded_event_auth_chains import (
-                    IncompleteAuthGraph,
-                    resolve_namespace,
-                )
+            from synapse.storage.databases.main.embedded_event_auth_chains import (
+                IncompleteAuthGraph,
+                resolve_namespace,
+            )
 
+            try:
                 embedded_hamt_namespace = resolve_namespace(self)
                 if (
                     embedded_hamt_namespace is not None
                     and self.hs.get_instance_name()
                     in self.hs.config.worker.writers.events
                 ):
-                    return await self.db_pool.runInteraction(
-                        "get_auth_chain_difference_embedded",
-                        self._get_auth_chain_difference_using_embedded_closures_txn,
-                        embedded_hamt_namespace,
-                        room_id,
-                        state_sets,
-                        conflicted_set,
-                        additional_backwards_reachable_conflicted_events,
-                    )
+                    try:
+                        return await self.db_pool.runInteraction(
+                            "get_auth_chain_difference_embedded",
+                            self._get_auth_chain_difference_using_embedded_closures_txn,
+                            embedded_hamt_namespace,
+                            room_id,
+                            state_sets,
+                            conflicted_set,
+                            additional_backwards_reachable_conflicted_events,
+                        )
+                    except IncompleteAuthGraph:
+                        # The embedded ramp is missing genuine data (e.g.
+                        # cold-import hasn't caught up yet).  The SQL
+                        # cover-index may have the same gap for imported
+                        # outliers, so go directly to the authoritative
+                        # legacy BFS walk against raw event_auth rows.
+                        logger.warning(
+                            "Embedded auth graph incomplete for room %s; "
+                            "falling back to legacy SQL auth-chain traversal",
+                            room_id,
+                        )
+                        if conflicted_set is not None:
+                            # The legacy BFS cannot compute the v2.1
+                            # conflicted subgraph; surface the error.
+                            raise _NoChainCoverIndex(room_id)
+                        auth_diff = await self.db_pool.runInteraction(
+                            "get_auth_chain_difference_legacy_fallback",
+                            self._get_auth_chain_difference_txn,
+                            state_sets,
+                        )
+                        return StateDifference(
+                            auth_difference=auth_diff, conflicted_subgraph=None
+                        )
                 return await self.db_pool.runInteraction(
                     "get_auth_chain_difference_chains",
                     self._get_auth_chain_difference_using_cover_index_txn,
@@ -747,10 +786,6 @@ class EventFederationWorkerStore(
                     conflicted_set,
                     additional_backwards_reachable_conflicted_events,
                 )
-            except IncompleteAuthGraph:
-                # The ramp is missing genuine data -- as harmless as a chain
-                # cover index that doesn't cover the events in question.
-                raise _NoChainCoverIndex(room_id) from None
             except _NoChainCoverIndex:
                 # For whatever reason we don't actually have a chain cover index
                 # for the events in question, so we fall back to the old method
