@@ -453,6 +453,28 @@ class UnpersistedEventContext(UnpersistedEventContextBase):
                         if root:
                             _pending_roots[sg] = root
 
+            # Prefill the in-memory state mapping so that subsequent events built
+            # on top of this unpersisted event in tests or batching can resolve
+            # state without failing on missing database rows.
+            if unpersisted_context.state_group_after_event is not None:
+                state_stores_for_prefill = getattr(
+                    unpersisted_context._storage.state, "stores", None
+                )
+                main_store_for_prefill = (
+                    getattr(state_stores_for_prefill, "main", None)
+                    if state_stores_for_prefill is not None
+                    else getattr(unpersisted_context._storage, "main", None)
+                )
+                if main_store_for_prefill is not None:
+                    prefill_fn = getattr(
+                        main_store_for_prefill, "_get_state_group_for_event_sql", None
+                    )
+                    if prefill_fn is not None:
+                        prefill_fn.prefill(
+                            (event.event_id,),
+                            unpersisted_context.state_group_after_event,
+                        )
+
             context = EventContext(
                 storage=unpersisted_context._storage,
                 state_group=unpersisted_context.state_group_after_event,
@@ -555,6 +577,23 @@ class UnpersistedEventContext(UnpersistedEventContextBase):
         )
 
         state_group_deltas = self._build_state_group_deltas()
+
+        # Prefill the in-memory state mapping so that subsequent events built
+        # on top of this unpersisted event in tests or batching can resolve
+        # state without failing on missing database rows.
+        if self.state_group_after_event is not None:
+            state_stores_for_prefill = getattr(self._storage.state, "stores", None)
+            main_store_for_prefill = (
+                getattr(state_stores_for_prefill, "main", None)
+                if state_stores_for_prefill is not None
+                else getattr(self._storage, "main", None)
+            )
+            if main_store_for_prefill is not None:
+                prefill_fn = getattr(
+                    main_store_for_prefill, "_get_state_group_for_event_sql", None
+                )
+                if prefill_fn is not None:
+                    prefill_fn.prefill((event.event_id,), self.state_group_after_event)
 
         return EventContext.with_state(
             storage=self._storage,

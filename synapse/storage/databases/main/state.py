@@ -609,12 +609,18 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             )
             if event_id in found:
                 return found[event_id]
-            return await self.db_pool.simple_select_one_onecol(
+            row = await self.db_pool.simple_select_one_onecol(
                 table="event_to_state_groups",
                 keyvalues={"event_id": event_id},
                 retcol="state_group",
                 allow_none=True,
                 desc="_get_state_group_for_event_sql_fallback",
+            )
+            if row is not None:
+                return row
+            return self._get_state_group_for_event_sql.cache.get_immediate(
+                event_id,
+                None,
             )
         return await self._get_state_group_for_event_sql(event_id)
 
