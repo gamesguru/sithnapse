@@ -117,8 +117,7 @@ class StateStorageController:
         missing = set(event_ids).difference(event_to_groups)
         if missing:
             raise RuntimeError(
-                "State mapping disappeared in get_state_for_events: "
-                f"{missing}"
+                f"State mapping disappeared in get_state_for_events: {missing}"
             )
 
         groups = set(event_to_groups.values())

@@ -3863,7 +3863,7 @@ class PersistEventsStore:
 
         for event_id, state_group_id in state_groups.items():
             txn.call_after(
-                self.store._get_state_group_for_event.prefill,
+                self.store._get_state_group_for_event_sql.prefill,
                 (event_id,),
                 state_group_id,
             )

@@ -52,7 +52,6 @@ from synapse.storage.database import (
 )
 from synapse.storage.databases.main.embedded_common import (
     Pool,
-    ffi_count,
     mark_dirty,
 )
 from synapse.storage.databases.main.embedded_event_to_state_group import (
@@ -123,7 +122,7 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
         if stream_name == UnPartialStatedEventStream.NAME:
             for row in rows:
                 assert isinstance(row, UnPartialStatedEventStreamRow)
-                self._get_state_group_for_event.invalidate((row.event_id,))
+                self._get_state_group_for_event_sql.invalidate((row.event_id,))
                 self.is_partial_state_event.invalidate((row.event_id,))
 
         super().process_replication_rows(stream_name, instance_name, token, rows)
@@ -603,26 +602,24 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             "get_filtered_current_state_ids", _get_filtered_current_state_ids_txn
         )
 
-    @cached(max_entries=50000)
     async def _get_state_group_for_event(self, event_id: str) -> int | None:
         if getattr(self, "_embedded_event_json_enabled", False):
             found = get_state_group_for_events_batch(
                 self._embedded_hamt_engine, self._embedded_hamt_namespace, [event_id]
             )
-            ffi_count("event_to_state_group_mtxdb_hits", len(found))
-            ffi_count("event_to_state_group_mtxdb_misses", 1 - len(found))
             if event_id in found:
                 return found[event_id]
-            row = await self.db_pool.simple_select_one_onecol(
+            return await self.db_pool.simple_select_one_onecol(
                 table="event_to_state_groups",
                 keyvalues={"event_id": event_id},
                 retcol="state_group",
                 allow_none=True,
                 desc="_get_state_group_for_event_sql_fallback",
             )
-            ffi_count("event_to_state_group_sql_fallback_hits", row is not None)
-            ffi_count("event_to_state_group_sql_fallback_misses", row is None)
-            return row
+        return await self._get_state_group_for_event_sql(event_id)
+
+    @cached(max_entries=50000)
+    async def _get_state_group_for_event_sql(self, event_id: str) -> int | None:
         return await self.db_pool.simple_select_one_onecol(
             table="event_to_state_groups",
             keyvalues={"event_id": event_id},
@@ -640,7 +637,7 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
         the scalar cache and treats ``None`` as a cacheable negative result.
         For the embedded backend, a worker can observe a temporary miss while
         another worker is persisting the mapping; reusing that negative would
-        prevent the refresh-aware mtxdb lookup and SQL fallback from running.
+        prevent the refresh-aware mtxdb lookup from running.
 
         Raises:
              RuntimeError if the state is unknown at any of the given events
@@ -655,11 +652,6 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             missing_event_ids = [
                 event_id for event_id in requested_event_ids if event_id not in res
             ]
-            ffi_count(
-                "event_to_state_group_mtxdb_hits",
-                len(requested_event_ids) - len(missing_event_ids),
-            )
-            ffi_count("event_to_state_group_mtxdb_misses", len(missing_event_ids))
             if missing_event_ids:
                 rows = cast(
                     list[tuple[str, int]],
@@ -672,13 +664,7 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
                         desc="_get_state_group_for_events_sql_fallback",
                     ),
                 )
-                sql_res = dict(rows)
-                res.update(sql_res)
-                ffi_count("event_to_state_group_sql_fallback_hits", len(sql_res))
-                ffi_count(
-                    "event_to_state_group_sql_fallback_misses",
-                    len(missing_event_ids) - len(sql_res),
-                )
+                res.update(dict(rows))
         else:
             rows = cast(
                 list[tuple[str, int]],
@@ -837,7 +823,7 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
 
         txn.call_after(self.is_partial_state_event.invalidate, (event.event_id,))
         txn.call_after(
-            self._get_state_group_for_event.prefill,
+            self._get_state_group_for_event_sql.prefill,
             (event.event_id,),
             state_group,
         )
