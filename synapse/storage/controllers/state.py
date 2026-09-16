@@ -529,6 +529,10 @@ class StateStorageController:
 
         return await self.stores.main._get_state_group_for_events(event_ids)
 
+    async def get_state_group_for_event(self, event_id: str) -> int | None:
+        """Return the state group for an event, if one is persisted."""
+        return await self.stores.main._get_state_group_for_event(event_id)
+
     async def store_state_group(
         self,
         event_id: str,

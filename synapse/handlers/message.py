@@ -1379,18 +1379,31 @@ class EventCreationHandler:
         # joining or rejecting the invite; it must not also be a prev_event of
         # the new state event, since that would make state resolution ask for
         # state at the stateless invite.
-        if prev_event_ids and not builder.internal_metadata.outlier:
+        #
+        # A normal remote invite with a state group must remain a prev_event.
+        # The outlier metadata is not reliably retained when older events are
+        # reloaded, so use the persisted absence of a state group as the
+        # stateless signal for a known remote membership invite.
+        if prev_event_ids:
             prev_events = await self.store.get_events(prev_event_ids)
+            stateless_remote_invites = set()
+            for event_id, event in prev_events.items():
+                if (
+                    event.type == EventTypes.Member
+                    and event.membership == Membership.INVITE
+                    and event.state_key is not None
+                    and not self.hs.is_mine_id(event.sender)
+                    and await self._storage_controllers.state.get_state_group_for_event(
+                        event_id
+                    )
+                    is None
+                ):
+                    stateless_remote_invites.add(event_id)
+
             prev_event_ids = [
                 event_id
                 for event_id in prev_event_ids
-                if event_id not in prev_events
-                or not (
-                    prev_events[event_id].type == EventTypes.Member
-                    and prev_events[event_id].membership == Membership.INVITE
-                    and prev_events[event_id].state_key is not None
-                    and not self.hs.is_mine_id(prev_events[event_id].sender)
-                )
+                if event_id not in stateless_remote_invites
             ]
 
         if builder.type == EventTypes.Create and builder.is_state():
