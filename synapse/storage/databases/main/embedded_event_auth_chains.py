@@ -467,7 +467,32 @@ class ClosureCache:
         embedded = get_embedded_auth_edges_batch(
             engine_name, namespace, room_id, [event_short_id]
         )[event_short_id]
-        if embedded is not None:
+        if embedded:
+            return embedded
+
+        if embedded == []:
+            # An empty edge list is normally a leaf, but it can also have
+            # been recorded during the short window between the events row
+            # becoming visible and its event_auth rows being committed.  In
+            # that case treating it as final permanently loses the event's
+            # auth chain.  Recheck SQL for empty records; non-empty records
+            # remain the cheap embedded fast path.
+            event_id = resolve_short_ids_to_event_ids(
+                engine_name, namespace, room_id, [event_short_id]
+            )[0]
+            if event_id is not None:
+                auth_event_ids = _fetch_auth_event_ids_from_sql(txn, event_id)
+                if auth_event_ids:
+                    auth_short_ids = get_or_create_short_ids(
+                        engine_name, namespace, room_id, auth_event_ids
+                    )
+                    embed_auth_edges_batch(
+                        engine_name,
+                        namespace,
+                        room_id,
+                        [(event_short_id, auth_short_ids)],
+                    )
+                    return auth_short_ids
             return embedded
 
         event_id = resolve_short_ids_to_event_ids(

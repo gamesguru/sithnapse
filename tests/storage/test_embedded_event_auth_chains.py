@@ -227,6 +227,24 @@ class ClosureWalkTests(TestCase):
             [create_id],
         )
 
+    def test_empty_embedded_edges_are_repaired_from_sql(self) -> None:
+        """An early empty write must not permanently turn an event into a leaf."""
+        graph = {"$create": [], "$a": ["$create"]}
+        txn = FakeTxn(graph)
+        create_id = self._short_id("$create")
+        a_id = self._short_id("$a")
+
+        # Model the race where the events row was visible before its SQL
+        # event_auth rows, causing the first writer to record an empty list.
+        embed_auth_edges_batch(None, NAMESPACE, ROOM_ID, [(a_id, [])])
+
+        closure = self.cache.get_closure(txn, None, NAMESPACE, ROOM_ID, a_id)
+        self.assertEqual(set(closure), {create_id})
+        self.assertEqual(
+            get_embedded_auth_edges_batch(None, NAMESPACE, ROOM_ID, [a_id])[a_id],
+            [create_id],
+        )
+
     def test_incomplete_graph_raises_and_is_not_cached(self) -> None:
         # "$a" claims "$missing" as an auth event, but SQL has no
         # event_auth rows *and* no events row for "$missing" -- a genuine
