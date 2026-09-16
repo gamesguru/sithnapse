@@ -1621,3 +1621,23 @@ class FakeEvent:
 
     def is_state(self) -> bool:
         return True
+
+
+class WarnedIncompleteAuthGraphCacheTestCase(unittest.TestCase):
+    def test_dedup_and_ttl_and_eviction(self) -> None:
+        from synapse.storage.databases.main.event_federation import (
+            _WarnedIncompleteAuthGraphCache,
+        )
+
+        cache = _WarnedIncompleteAuthGraphCache(max_size=2, ttl_seconds=10.0)
+        self.assertTrue(cache.should_warn("!r1:test"))
+        self.assertFalse(cache.should_warn("!r1:test"))
+        self.assertIn("!r1:test", cache)
+
+        self.assertTrue(cache.should_warn("!r2:test"))
+        self.assertTrue(
+            cache.should_warn("!r3:test")
+        )  # evicts !r1:test due to max_size=2
+
+        self.assertNotIn("!r1:test", cache)
+        self.assertTrue(cache.should_warn("!r1:test"))

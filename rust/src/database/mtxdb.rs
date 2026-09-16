@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use mtxdb::{DatabaseLayout, NodeData, NodeId, PackfileStorage, ShardType, StorageEngine};
+use mtxdb_core::{DatabaseLayout, NodeData, NodeId, PackfileStorage, ShardType, StorageEngine};
 use once_cell::sync::OnceCell;
 use pyo3::prelude::*;
 use sha2::{Digest, Sha256};
@@ -2600,7 +2600,7 @@ use pyo3::types::PyDict;
 fn stats_to_dict(
     py: Python<'_>,
     name: &str,
-    s: &mtxdb::packfile::storage::RuntimeStats,
+    s: &mtxdb_core::packfile::storage::RuntimeStats,
 ) -> PyResult<Py<PyDict>> {
     let d = PyDict::new(py);
     d.set_item("pool", name)?;
@@ -2682,7 +2682,7 @@ fn stats_to_dict(
 #[pyfunction]
 pub fn stats(py: Python<'_>) -> PyResult<Py<PyDict>> {
     let snapshots = py.detach(
-        || -> Result<Vec<(&str, mtxdb::packfile::storage::RuntimeStats)>, pyo3::PyErr> {
+        || -> Result<Vec<(&str, mtxdb_core::packfile::storage::RuntimeStats)>, pyo3::PyErr> {
             let pools = pools()?;
             Ok(vec![
                 ("state", pools.state.stats()),

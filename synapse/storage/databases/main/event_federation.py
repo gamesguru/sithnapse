@@ -21,6 +21,8 @@
 import datetime
 import itertools
 import logging
+import time
+from collections import OrderedDict
 from queue import Empty, PriorityQueue
 from typing import (
     TYPE_CHECKING,
@@ -139,9 +141,41 @@ class _NoChainCoverIndex(Exception):
 
 # Rooms for which the embedded auth-graph incomplete warning has already been
 # logged.  Populated lazily; lives at module level so every store instance
-# shares the dedup set for the process lifetime.  Prevents a per-request
-# flood when cold-import is lagging behind federation.
-_warned_incomplete_auth_graph: set[str] = set()
+# shares the dedup cache for the process lifetime.  Prevents unbounded memory
+# growth while rate-limiting repeated warnings for the same room (10m TTL, max 10k rooms).
+class _WarnedIncompleteAuthGraphCache:
+    def __init__(self, max_size: int = 10_000, ttl_seconds: float = 600.0) -> None:
+        self._max_size = max_size
+        self._ttl_seconds = ttl_seconds
+        self._entries: OrderedDict[str, float] = OrderedDict()
+
+    def should_warn(self, room_id: str) -> bool:
+        now = time.monotonic()
+        last_warned = self._entries.get(room_id)
+        if last_warned is not None and (now - last_warned) < self._ttl_seconds:
+            return False
+        self._entries[room_id] = now
+        self._entries.move_to_end(room_id)
+        while len(self._entries) > self._max_size:
+            self._entries.popitem(last=False)
+        return True
+
+    def __contains__(self, room_id: object) -> bool:
+        if not isinstance(room_id, str):
+            return False
+        last_warned = self._entries.get(room_id)
+        if last_warned is None:
+            return False
+        return (time.monotonic() - last_warned) < self._ttl_seconds
+
+    def add(self, room_id: str) -> None:
+        self._entries[room_id] = time.monotonic()
+        self._entries.move_to_end(room_id)
+        while len(self._entries) > self._max_size:
+            self._entries.popitem(last=False)
+
+
+_warned_incomplete_auth_graph = _WarnedIncompleteAuthGraphCache()
 
 
 class EventFederationWorkerStore(
@@ -285,8 +319,7 @@ class EventFederationWorkerStore(
                         # chain-cover path entirely and fall through to the
                         # legacy recursive BFS walk, which is authoritative
                         # against raw event_auth rows.
-                        if room_id not in _warned_incomplete_auth_graph:
-                            _warned_incomplete_auth_graph.add(room_id)
+                        if _warned_incomplete_auth_graph.should_warn(room_id):
                             logger.warning(
                                 "Embedded auth graph incomplete for room %s; "
                                 "falling back to legacy SQL auth-chain traversal",
@@ -770,8 +803,7 @@ class EventFederationWorkerStore(
                         # cover-index may have the same gap for imported
                         # outliers, so go directly to the authoritative
                         # legacy BFS walk against raw event_auth rows.
-                        if room_id not in _warned_incomplete_auth_graph:
-                            _warned_incomplete_auth_graph.add(room_id)
+                        if _warned_incomplete_auth_graph.should_warn(room_id):
                             logger.warning(
                                 "Embedded auth graph incomplete for room %s; "
                                 "falling back to legacy SQL auth-chain traversal",

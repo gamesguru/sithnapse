@@ -920,17 +920,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "mtxdb"
-version = "0.1.0-beta.1"
-source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=dev#7567f4e8a891d94a77281c20b22137754ae74a12"
-dependencies = [
- "mtxdb-core",
-]
-
-[[package]]
 name = "mtxdb-core"
 version = "0.1.0"
-source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=dev#7567f4e8a891d94a77281c20b22137754ae74a12"
+source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=dev#8ab1f9601bd4be77f32fc0946e001bbaf8561bad"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -940,6 +932,15 @@ dependencies = [
  "sha2",
  "zstd",
  "zstd-sys",
+]
+
+[[package]]
+name = "mtxdb-ffi"
+version = "0.1.0"
+source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=dev#8ab1f9601bd4be77f32fc0946e001bbaf8561bad"
+dependencies = [
+ "bytes",
+ "mtxdb-core",
 ]
 
 [[package]]
@@ -1677,7 +1678,8 @@ dependencies = [
  "log",
  "lru",
  "mime",
- "mtxdb",
+ "mtxdb-core",
+ "mtxdb-ffi",
  "once_cell",
  "pyo3",
  "pyo3-log",
