@@ -292,18 +292,13 @@ class EventFederationWorkerStore(
             )
 
             embedded_hamt_namespace = resolve_namespace(self)
+            is_embedded_writer = (
+                embedded_hamt_namespace is not None
+                and self.hs.get_instance_name() in self.hs.config.worker.writers.events
+            )
             try:
-                # The embedded closure walk has a cold-import path which
-                # allocates short IDs and embeds SQL auth edges.  That is a
-                # write, so it is only safe on the events writer.  Readers
-                # must use the SQL implementation and let the writer's
-                # replication catch them up instead of attempting to mutate
-                # their read-only mtxdb handle.
-                if (
-                    embedded_hamt_namespace is not None
-                    and self.hs.get_instance_name()
-                    in self.hs.config.worker.writers.events
-                ):
+                if is_embedded_writer:
+                    assert embedded_hamt_namespace is not None
                     try:
                         return await self.db_pool.runInteraction(
                             "get_auth_chain_ids_embedded",
@@ -332,6 +327,10 @@ class EventFederationWorkerStore(
                             include_given,
                         )
 
+                # Non-writers (or instances without embedded HAMT): prefer the cover
+                # index when complete. Non-writers hold a read-only mtxdb handle and
+                # cannot safely repair missing links; if the cover index is incomplete or
+                # missing, fall back to the authoritative legacy SQL BFS walk.
                 return await self.db_pool.runInteraction(
                     "get_auth_chain_ids_chains",
                     self._get_auth_chain_ids_using_cover_index_txn,
@@ -339,12 +338,24 @@ class EventFederationWorkerStore(
                     event_ids,
                     include_given,
                 )
-            except _NoChainCoverIndex:
-                # For whatever reason we don't actually have a chain cover index
+            except (IncompleteAuthGraph, _NoChainCoverIndex):
+                # For whatever reason we don't actually have a complete chain cover index
                 # for the events in question, so we fall back to the old method
                 # (except in tests)
                 if not self.tests_allow_no_chain_cover_index:
                     raise
+                if _warned_incomplete_auth_graph.should_warn(room_id):
+                    logger.warning(
+                        "Cover index incomplete for room %s; "
+                        "falling back to legacy SQL auth-chain traversal",
+                        room_id,
+                    )
+                return await self.db_pool.runInteraction(
+                    "get_auth_chain_ids_legacy_fallback",
+                    self._get_auth_chain_ids_txn,
+                    event_ids,
+                    include_given,
+                )
 
         return await self.db_pool.runInteraction(
             "get_auth_chain_ids",
@@ -535,6 +546,52 @@ class EventFederationWorkerStore(
             for chain_id, max_no in chains.items():
                 txn.execute(sql, (chain_id, max_no))
                 results.update(r for (r,) in txn)
+
+        # Check that all direct auth events for the initial events are present in the
+        # computed auth chain. If any direct auth event is missing from the cover index,
+        # the chain cover is incomplete and we must fall back to legacy traversal.
+        clause, args = make_in_list_sql_clause(
+            txn.database_engine, "event_id", initial_events
+        )
+        txn.execute(
+            f"SELECT DISTINCT auth_id FROM event_auth WHERE {clause}",
+            args,
+        )
+        direct_auth_ids = {auth_id for (auth_id,) in txn}
+        missing_direct_auth = direct_auth_ids.difference(results)
+        if missing_direct_auth:
+            from synapse.storage.databases.main.embedded_event_auth_chains import (
+                IncompleteAuthGraph,
+            )
+
+            logger.warning(
+                "Cover index auth chain incomplete for room %s: missing direct auth events %s",
+                room_id,
+                missing_direct_auth,
+            )
+            raise IncompleteAuthGraph(
+                f"Missing direct auth events in cover index: {missing_direct_auth}"
+            )
+
+        if direct_auth_ids:
+            txn.execute(
+                "SELECT event_id FROM events WHERE room_id = ? AND type = 'm.room.create' LIMIT 1",
+                (room_id,),
+            )
+            create_row = txn.fetchone()
+            if create_row and create_row[0] not in results:
+                from synapse.storage.databases.main.embedded_event_auth_chains import (
+                    IncompleteAuthGraph,
+                )
+
+                logger.warning(
+                    "Cover index auth chain incomplete for room %s: room create event %s missing",
+                    room_id,
+                    create_row[0],
+                )
+                raise IncompleteAuthGraph(
+                    f"Room create event {create_row[0]} missing from cover index results"
+                )
 
         return results
 
@@ -782,11 +839,13 @@ class EventFederationWorkerStore(
 
             try:
                 embedded_hamt_namespace = resolve_namespace(self)
-                if (
+                is_embedded_writer = (
                     embedded_hamt_namespace is not None
                     and self.hs.get_instance_name()
                     in self.hs.config.worker.writers.events
-                ):
+                )
+                if is_embedded_writer:
+                    assert embedded_hamt_namespace is not None
                     try:
                         return await self.db_pool.runInteraction(
                             "get_auth_chain_difference_embedded",
@@ -821,6 +880,16 @@ class EventFederationWorkerStore(
                         return StateDifference(
                             auth_difference=auth_diff, conflicted_subgraph=None
                         )
+                elif embedded_hamt_namespace is not None and conflicted_set is not None:
+                    # Non-writer instances hold a read-only mtxdb handle and cannot
+                    # safely repair missing embedded links, and legacy BFS cannot
+                    # compute the v2.1 conflicted subgraph. Fail loud with _NoChainCoverIndex.
+                    raise _NoChainCoverIndex(room_id)
+
+                # Non-writers (or instances without embedded HAMT): prefer the cover
+                # index when complete. Non-writers hold a read-only mtxdb handle and
+                # cannot safely repair missing links; if the cover index is incomplete
+                # or missing, fall back to the authoritative legacy SQL traversal.
                 return await self.db_pool.runInteraction(
                     "get_auth_chain_difference_chains",
                     self._get_auth_chain_difference_using_cover_index_txn,
@@ -829,12 +898,22 @@ class EventFederationWorkerStore(
                     conflicted_set,
                     additional_backwards_reachable_conflicted_events,
                 )
-            except _NoChainCoverIndex:
+            except (IncompleteAuthGraph, _NoChainCoverIndex):
                 # For whatever reason we don't actually have a chain cover index
                 # for the events in question, so we fall back to the old method
                 # (except in tests)
                 if not self.tests_allow_no_chain_cover_index:
                     raise
+                if conflicted_set is not None:
+                    raise _NoChainCoverIndex(room_id)
+                auth_diff = await self.db_pool.runInteraction(
+                    "get_auth_chain_difference_legacy_fallback",
+                    self._get_auth_chain_difference_txn,
+                    state_sets,
+                )
+                return StateDifference(
+                    auth_difference=auth_diff, conflicted_subgraph=None
+                )
 
         # It's been 4 years since we added chain cover, so we expect all rooms to have it.
         # If they don't, we will error out when trying to do state res v2.1

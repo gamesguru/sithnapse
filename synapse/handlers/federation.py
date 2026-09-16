@@ -601,10 +601,21 @@ class FederationHandler:
 
     async def on_event_auth(self, event_id: str, room_id: str) -> list[EventBase]:
         event = await self.store.get_event(event_id, check_room_id=room_id)
+        requested_auth_event_ids = set(event.auth_event_ids())
         auth = await self.store.get_auth_chain(
-            event.room_id, list(event.auth_event_ids()), include_given=True
+            event.room_id, list(requested_auth_event_ids), include_given=True
         )
-        return list(auth)
+        auth_events = list(auth)
+        returned_event_ids = {auth_event.event_id for auth_event in auth_events}
+        logger.info(
+            "Serving /event_auth for %s: requested_auth_event_ids=%s "
+            "returned_event_ids=%s missing_requested_event_ids=%s",
+            event_id,
+            sorted(requested_auth_event_ids),
+            sorted(returned_event_ids),
+            sorted(requested_auth_event_ids - returned_event_ids),
+        )
+        return auth_events
 
     async def do_invite_join(
         self, target_hosts: Iterable[str], room_id: str, joinee: str, content: JsonDict

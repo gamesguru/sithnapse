@@ -1641,3 +1641,121 @@ class WarnedIncompleteAuthGraphCacheTestCase(unittest.TestCase):
 
         self.assertNotIn("!r1:test", cache)
         self.assertTrue(cache.should_warn("!r1:test"))
+
+
+class AuthChainReaderWorkerTestCase(tests.unittest.HomeserverTestCase):
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
+        self.store = hs.get_datastores().main
+
+    def test_non_writer_v21_fails_loud(self) -> None:
+        """Non-writer instances must deliberately fail loud with _NoChainCoverIndex
+        on state res v2.1 requests (conflicted_set is not None), since non-writers
+        cannot safely mutate/repair short IDs or embedded closures and legacy BFS
+        cannot compute the conflicted subgraph."""
+        from synapse.storage.databases.main.event_federation import _NoChainCoverIndex
+
+        room_id = "!v21_fail_loud:test"
+
+        def setup_room(txn: LoggingTransaction) -> None:
+            self.store.db_pool.simple_insert_txn(
+                txn,
+                "rooms",
+                {
+                    "room_id": room_id,
+                    "creator": "@user:test",
+                    "is_public": True,
+                    "room_version": "org.matrix.msc4297",
+                    "has_auth_chain_index": True,
+                },
+            )
+
+        self.get_success(self.store.db_pool.runInteraction("setup_room", setup_room))
+
+        # Simulate running on a reader worker (not in writers.events)
+        self.hs.get_instance_name = lambda: "federation_reader1"  # type: ignore[method-assign]
+
+        self.get_failure(
+            self.store.get_auth_chain_difference_extended(
+                room_id,
+                state_sets=[{"$e1"}, {"$e2"}],
+                conflicted_set={"$e1", "$e2"},
+                additional_backwards_reachable_conflicted_events=set(),
+            ),
+            _NoChainCoverIndex,
+        )
+
+    def test_non_writer_auth_chain_fallback_on_incomplete_cover(self) -> None:
+        """When the cover index is incomplete (e.g. missing direct auth events
+        or create event in cover index), a non-writer reader worker must detect
+        the gap and fall back to the authoritative SQL event_auth traversal."""
+        self.store.tests_allow_no_chain_cover_index = True
+        room_id = "!incomplete_cover:test"
+
+        def insert_test_events(txn: LoggingTransaction) -> None:
+            self.store.db_pool.simple_insert_txn(
+                txn,
+                "rooms",
+                {
+                    "room_id": room_id,
+                    "creator": "@user:test",
+                    "is_public": True,
+                    "room_version": "6",
+                    "has_auth_chain_index": True,
+                },
+            )
+            # Insert create event ($create), power levels ($pl), and message/state ($s1)
+            for eid, etype, depth in [
+                ("$create", "m.room.create", 1),
+                ("$pl", "m.room.power_levels", 2),
+                ("$s1", "m.room.member", 3),
+            ]:
+                self.store.db_pool.simple_insert_txn(
+                    txn,
+                    "events",
+                    {
+                        "event_id": eid,
+                        "room_id": room_id,
+                        "depth": depth,
+                        "topological_ordering": depth,
+                        "type": etype,
+                        "processed": True,
+                        "outlier": False,
+                        "stream_ordering": depth,
+                    },
+                )
+            # Direct event_auth edges
+            self.store.db_pool.simple_insert_txn(
+                txn,
+                "event_auth",
+                {"event_id": "$pl", "room_id": room_id, "auth_id": "$create"},
+            )
+            self.store.db_pool.simple_insert_txn(
+                txn,
+                "event_auth",
+                {"event_id": "$s1", "room_id": room_id, "auth_id": "$pl"},
+            )
+            self.store.db_pool.simple_insert_txn(
+                txn,
+                "event_auth",
+                {"event_id": "$s1", "room_id": room_id, "auth_id": "$create"},
+            )
+            # Intentionally insert an event_auth_chains row for $s1 with a fictitious chain
+            # that has NO links in mtxdb/SQL, so cover index alone would return only {$s1}.
+            self.store.db_pool.simple_insert_txn(
+                txn,
+                "event_auth_chains",
+                {"event_id": "$s1", "chain_id": 99999, "sequence_number": 1},
+            )
+
+        self.get_success(
+            self.store.db_pool.runInteraction("insert_test_events", insert_test_events)
+        )
+
+        # Simulate reader worker
+        self.hs.get_instance_name = lambda: "federation_reader1"  # type: ignore[method-assign]
+
+        # Calling get_auth_chain_ids for $s1 must fall back to SQL and return the full auth chain
+        chain = self.get_success(
+            self.store.get_auth_chain_ids(room_id, ["$s1"], include_given=True)
+        )
+        self.assertEqual(chain, {"$s1", "$pl", "$create"})
