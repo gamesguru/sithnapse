@@ -1374,6 +1374,25 @@ class EventCreationHandler:
             else:
                 prev_event_ids = []  # can only happen for the create event in MSC4291 rooms
 
+        # A remote OOB invite is an auth event, but has no state group. It can
+        # be present in the room's extremities while the invited user is
+        # joining or rejecting the invite; it must not also be a prev_event of
+        # the new state event, since that would make state resolution ask for
+        # state at the stateless invite.
+        if prev_event_ids and not builder.internal_metadata.outlier:
+            prev_events = await self.store.get_events(prev_event_ids)
+            prev_event_ids = [
+                event_id
+                for event_id in prev_event_ids
+                if event_id not in prev_events
+                or not (
+                    prev_events[event_id].type == EventTypes.Member
+                    and prev_events[event_id].membership == Membership.INVITE
+                    and prev_events[event_id].state_key is not None
+                    and not self.hs.is_mine_id(prev_events[event_id].sender)
+                )
+            ]
+
         if builder.type == EventTypes.Create and builder.is_state():
             if len(prev_event_ids) != 0:
                 raise SynapseError(

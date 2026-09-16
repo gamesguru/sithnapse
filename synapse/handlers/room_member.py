@@ -206,6 +206,20 @@ class RoomMemberHandler(metaclass=abc.ABCMeta):
         self._push_writer = hs.config.worker.writers.push_rules[0]
         self._copy_push_client = ReplicationCopyPusherRestServlet.make_client(hs)
 
+    def _is_remote_invite_for_user(self, event: EventBase, target_user_id: str) -> bool:
+        """Whether ``event`` is the remote invite being acted on.
+
+        Remote OOB invites are stored as outliers and therefore have no state
+        group. The outlier flag is not sufficient here: an event loaded while
+        the invite is being de-outliered may not retain that metadata.
+        """
+        return (
+            event.type == EventTypes.Member
+            and event.state_key == target_user_id
+            and event.membership == Membership.INVITE
+            and not self.hs.is_mine_id(event.sender)
+        )
+
     def _on_user_joined_room(self, event_id: str, room_id: str) -> None:
         """Notify the rate limiter that a room join has occurred.
 
@@ -453,15 +467,6 @@ class RoomMemberHandler(metaclass=abc.ABCMeta):
 
         if content is None:
             content = {}
-
-        if prev_event_ids:
-            prev_events = await self.store.get_events(prev_event_ids)
-            prev_event_ids = [
-                event_id
-                for event_id in prev_event_ids
-                if event_id not in prev_events
-                or not prev_events[event_id].internal_metadata.is_outlier()
-            ]
 
         content["membership"] = membership
         if requester.is_guest:
@@ -982,18 +987,6 @@ class RoomMemberHandler(metaclass=abc.ABCMeta):
             latest_event_ids = list(await self.store.get_state_dag_extremities(room_id))
         else:
             latest_event_ids = await self.store.get_prev_events_for_room(room_id)
-
-        # Out-of-band membership events are intentionally persisted without a
-        # state group. They can appear in the event extremities, but must not
-        # be used as parents when constructing an ordinary local membership
-        # event: state resolution cannot be performed at such an event.
-        latest_events = await self.store.get_events(latest_event_ids)
-        latest_event_ids = [
-            event_id
-            for event_id in latest_event_ids
-            if event_id in latest_events
-            and not latest_events[event_id].internal_metadata.is_outlier()
-        ]
 
         is_partial_state_room = await self.store.is_partial_state_room(room_id)
         partial_state_before_join = await self.state_handler.compute_state_after_events(
