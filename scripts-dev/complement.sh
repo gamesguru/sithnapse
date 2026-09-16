@@ -96,6 +96,21 @@ Run the complement test suite on Synapse.
         This is occasionally useful if the built-in rebuild detection with
         --editable fails, e.g. when changing configure_workers_and_start.py.
 
+Environment variables:
+  COMPLEMENT_ENABLE_DIRTY_RUNS=0
+        Disable reuse of containers between runs (recommended when debugging).
+
+  COMPLEMENT_CLEANUP_STALE_RESOURCES=0
+        Disable the startup sweep when sharing a container daemon with other
+        Complement runners. Current-run cleanup remains enabled.
+
+Only one complement.sh run may execute at a time. If the lock message appears,
+inspect the holder on the host with:
+  lslocks -o PID,COMMAND,PATH | grep synapse-complement
+or:
+  fuser -v "${TMPDIR:-/tmp}/synapse-complement.lock"
+The lock is descriptor-based; deleting the lock file does not release it.
+
 For help on arguments to 'go test', run 'go help testflag'.
 EOF
 }
