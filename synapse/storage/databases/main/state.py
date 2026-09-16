@@ -52,6 +52,7 @@ from synapse.storage.database import (
 )
 from synapse.storage.databases.main.embedded_common import (
     Pool,
+    ffi_count,
     mark_dirty,
 )
 from synapse.storage.databases.main.embedded_event_to_state_group import (
@@ -608,7 +609,20 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             found = get_state_group_for_events_batch(
                 self._embedded_hamt_engine, self._embedded_hamt_namespace, [event_id]
             )
-            return found.get(event_id)
+            ffi_count("event_to_state_group_mtxdb_hits", len(found))
+            ffi_count("event_to_state_group_mtxdb_misses", 1 - len(found))
+            if event_id in found:
+                return found[event_id]
+            row = await self.db_pool.simple_select_one_onecol(
+                table="event_to_state_groups",
+                keyvalues={"event_id": event_id},
+                retcol="state_group",
+                allow_none=True,
+                desc="_get_state_group_for_event_sql_fallback",
+            )
+            ffi_count("event_to_state_group_sql_fallback_hits", row is not None)
+            ffi_count("event_to_state_group_sql_fallback_misses", row is None)
+            return row
         return await self.db_pool.simple_select_one_onecol(
             table="event_to_state_groups",
             keyvalues={"event_id": event_id},
@@ -631,17 +645,39 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
              RuntimeError if the state is unknown at any of the given events
         """
         if getattr(self, "_embedded_event_json_enabled", False):
-            # Exclusive by configured engine, not a dual-write -- see
-            # embedded_event_to_state_group.py. A miss here (unlike
-            # embedded_event_json's mirror) is not silently re-read from
-            # SQL: once this engine is configured it's the source of truth
-            # for state_group mappings, so a genuine miss surfaces as the
-            # same RuntimeError a SQL miss would.
+            requested_event_ids = list(event_ids)
             res = get_state_group_for_events_batch(
                 self._embedded_hamt_engine,
                 self._embedded_hamt_namespace,
-                list(event_ids),
+                requested_event_ids,
             )
+            missing_event_ids = [
+                event_id for event_id in requested_event_ids if event_id not in res
+            ]
+            ffi_count(
+                "event_to_state_group_mtxdb_hits",
+                len(requested_event_ids) - len(missing_event_ids),
+            )
+            ffi_count("event_to_state_group_mtxdb_misses", len(missing_event_ids))
+            if missing_event_ids:
+                rows = cast(
+                    list[tuple[str, int]],
+                    await self.db_pool.simple_select_many_batch(
+                        table="event_to_state_groups",
+                        column="event_id",
+                        iterable=missing_event_ids,
+                        keyvalues={},
+                        retcols=("event_id", "state_group"),
+                        desc="_get_state_group_for_events_sql_fallback",
+                    ),
+                )
+                sql_res = dict(rows)
+                res.update(sql_res)
+                ffi_count("event_to_state_group_sql_fallback_hits", len(sql_res))
+                ffi_count(
+                    "event_to_state_group_sql_fallback_misses",
+                    len(missing_event_ids) - len(sql_res),
+                )
         else:
             rows = cast(
                 list[tuple[str, int]],
