@@ -24,7 +24,13 @@ from typing import TYPE_CHECKING, Any
 import attr
 from signedjson.types import SigningKey
 
-from synapse.api.constants import MAX_DEPTH, EventTypes, StickyEvent, StickyEventField
+from synapse.api.constants import (
+    MAX_DEPTH,
+    EventTypes,
+    Membership,
+    StickyEvent,
+    StickyEventField,
+)
 from synapse.api.room_versions import (
     KNOWN_EVENT_FORMAT_VERSIONS,
     EventFormatVersions,
@@ -255,6 +261,37 @@ class EventBuilder:
                         await self._store._get_state_group_for_event(member_event_id)
                     ) is not None:
                         prev_event_ids.append(member_event_id)
+
+        # Callers may also supply the current membership event in
+        # ``prev_event_ids``. Remove stateless remote invites from that list at
+        # the final point before building the event, while retaining them as
+        # auth events. A state-bearing remote invite remains a predecessor.
+        if (
+            prev_event_ids
+            and not self.room_version.msc4242_state_dags
+            and self.type == EventTypes.Member
+            and self.is_mine_id(self.state_key)
+        ):
+            loaded_prev_events = await self._store.get_events(prev_event_ids)
+            stateless_oob_invites = set()
+            for event_id, event in loaded_prev_events.items():
+                if (
+                    event.type == EventTypes.Member
+                    and event.membership == Membership.INVITE
+                    and event.state_key is not None
+                    and not self.is_mine_id(event.sender)
+                    and await self._store._get_state_group_for_event(event_id) is None
+                ):
+                    stateless_oob_invites.add(event_id)
+
+            for event_id in stateless_oob_invites:
+                if event_id not in auth_event_ids:
+                    auth_event_ids.append(event_id)
+            prev_event_ids = [
+                event_id
+                for event_id in prev_event_ids
+                if event_id not in stateless_oob_invites
+            ]
 
         format_version = self.room_version.event_format
         # The types of auth/prev events changes between event versions.
