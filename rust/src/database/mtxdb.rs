@@ -1842,11 +1842,26 @@ pub fn batch_get(py: Python<'_>, keys: Vec<Vec<u8>>) -> PyResult<Vec<(Vec<u8>, V
                 continue;
             }
             let node_ids: Vec<NodeId> = ids.iter().map(|(_, id)| *id).collect();
-            let found = db_for_shard_type(shard_type)?
-                .get_many(&kv_room_id(), &node_ids)
-                .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {e}"))
+            let engine = db_for_shard_type(shard_type)?;
+            let room_id = kv_room_id();
+            let mut found = engine.get_many(&room_id, &node_ids).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {e}"))
+            })?;
+            // Read-only workers keep an in-process collection index. If the
+            // writer published a mapping after this worker opened the store,
+            // retry once after refreshing the generic-KV collection.
+            if found.iter().any(Option::is_none) {
+                engine.refresh_collection(&room_id).map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "mtxdb refresh_collection error: {e}"
+                    ))
                 })?;
+                found = engine.get_many(&room_id, &node_ids).map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "mtxdb get_many error after refresh: {e}"
+                    ))
+                })?;
+            }
             for ((position, _), value) in ids.into_iter().zip(found) {
                 values[position] = value;
             }
