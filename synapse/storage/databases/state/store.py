@@ -168,6 +168,11 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         self._embedded_hamt_namespace = (
             hs.config.database.embedded_hamt_namespace or self.server_name
         )
+        # state_group -> root_structural_hash for groups created on a
+        # non-writer instance whose mtxdb mirror write was skipped. Keep this
+        # available even when embedded HAMT is disabled: the replication
+        # handoff helper is shared by both configurations.
+        self._pending_embedded_hamt_mirrors: dict[int, dict[str, Any]] = {}
 
         if self._embedded_hamt_engine and self._embedded_hamt_path:
             # mtxdb is the embedded engine for HAMT state offload.
@@ -207,7 +212,6 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             # there's nothing here for `EventContext.serialize` retries to
             # lose. Only ever populated when `_embedded_hamt_is_writer` is
             # False; harmless if unused.
-            self._pending_embedded_hamt_mirrors: dict[int, dict[str, Any]] = {}
             try:
                 engine = get_embedded_engine(self._embedded_hamt_engine)
                 _oet = time.monotonic()
