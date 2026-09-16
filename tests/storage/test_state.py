@@ -32,8 +32,9 @@ from twisted.internet.testing import MemoryReactor
 from synapse.api.constants import EventTypes, Membership
 from synapse.api.room_versions import RoomVersions
 from synapse.events import EventBase
-from synapse.events.snapshot import UnpersistedEventContext
+from synapse.events.snapshot import EventContext, UnpersistedEventContext
 from synapse.server import HomeServer
+from synapse.storage.database import LoggingTransaction
 from synapse.types import JsonDict, RoomID, StateMap, UserID, create_requester
 from synapse.types.state import StateFilter
 from synapse.util.clock import Clock
@@ -2346,3 +2347,140 @@ class HAMTStructuralKeyRegressionTest(HomeserverTestCase):
             "!room2:example.com", entries
         )
         self.assertNotEqual(hash_a, hash_b)
+
+
+class RejectedEventStateGroupTestCase(HomeserverTestCase):
+    """Regression tests for `_store_event_state_mappings_txn` ordering: a
+    rejected event's `EventContext.state_group` property raises, so the
+    rejected-event check must run before anything that would touch it.
+    """
+
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
+        self.store = hs.get_datastores().main
+        self.storage = hs.get_storage_controllers()
+        persist_events_store = hs.get_datastores().persist_events
+        assert persist_events_store is not None
+        self.persist_events_store = persist_events_store
+
+        self.room_id = "!rejected-state-group:test"
+        self.get_success(
+            self.store.store_room(
+                room_id=self.room_id,
+                room_creator_user_id="",
+                is_public=True,
+                room_version=RoomVersions.V6,
+            )
+        )
+
+    def test_rejected_event_uses_state_group_before_event(self) -> None:
+        """A rejected event must be recorded against
+        `state_group_before_event` without the code ever evaluating the
+        `state_group` property, which raises for a rejected event's
+        context.
+        """
+        event_factory = self.hs.get_event_builder_factory()
+        bob = "@bob:test"
+
+        create = self.get_success(
+            event_factory.for_room_version(
+                RoomVersions.V6,
+                {
+                    "type": EventTypes.Create,
+                    "state_key": "",
+                    "sender": bob,
+                    "room_id": self.room_id,
+                    "content": {"tag": "create"},
+                },
+            ).build(prev_event_ids=[], auth_event_ids=[])
+        )
+
+        rejected = self.get_success(
+            event_factory.for_room_version(
+                RoomVersions.V6,
+                {
+                    "type": EventTypes.Message,
+                    "sender": bob,
+                    "room_id": self.room_id,
+                    "content": {"tag": "rejected"},
+                },
+            ).build(prev_event_ids=[create.event_id], auth_event_ids=[create.event_id])
+        )
+
+        # A real EventContext for a rejected event: `_state_group` is left
+        # unset (None), matching production, where a rejected event's
+        # `state_group` is genuinely not something the caller may read.
+        # Touching `.state_group` here raises `RuntimeError` -- that's the
+        # bug this test exists to catch.
+        context = EventContext(
+            storage=self.storage,
+            state_group_deltas={},
+            rejected="test rejection reason",
+            state_group_before_event=42,
+        )
+
+        def _persist_txn(txn: LoggingTransaction) -> None:
+            self.persist_events_store._store_event_state_mappings_txn(
+                txn, [(rejected, context)]
+            )
+
+        self.get_success(
+            self.store.db_pool.runInteraction("test_rejected_state_group", _persist_txn)
+        )
+
+        state_group = self.get_success(
+            self.store.db_pool.simple_select_one_onecol(
+                table="event_to_state_groups",
+                keyvalues={"event_id": rejected.event_id},
+                retcol="state_group",
+                allow_none=True,
+            )
+        )
+        self.assertEqual(
+            state_group,
+            42,
+            "rejected event must be recorded against state_group_before_event",
+        )
+
+
+class GetStateGroupForEventsCacheFallbackTestCase(HomeserverTestCase):
+    """Regression test for the race where `_get_state_group_for_events`'s
+    batch read misses an event whose mapping was already published into the
+    `_get_state_group_for_event_sql` scalar cache.
+    """
+
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
+        self.store = hs.get_datastores().main
+
+    def test_missing_from_batch_read_is_recovered_from_cache(self) -> None:
+        cached_event_id = "$only-in-cache:test"
+
+        # Seed the scalar cache directly, simulating a mapping that was
+        # already published there but whose row the batch SQL read below
+        # doesn't (yet) see. `prefill` is synchronous.
+        self.store._get_state_group_for_event_sql.prefill((cached_event_id,), 99)
+
+        with patch.object(
+            self.store.db_pool,
+            "simple_select_many_batch",
+            return_value=[],
+        ):
+            result = self.get_success(
+                self.store._get_state_group_for_events([cached_event_id])
+            )
+
+        self.assertEqual(
+            result[cached_event_id],
+            99,
+            "a mapping already in the scalar cache must be used instead of raising",
+        )
+
+    def test_missing_everywhere_still_raises(self) -> None:
+        with patch.object(
+            self.store.db_pool,
+            "simple_select_many_batch",
+            return_value=[],
+        ):
+            self.get_failure(
+                self.store._get_state_group_for_events(["$ghost-event:test"]),
+                RuntimeError,
+            )

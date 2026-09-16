@@ -689,10 +689,13 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             # (never call it, so no negative results are planted) before
             # giving up.
             for event_id in list(missing):
+                # `_get_state_group_for_event_sql` takes a single arg, so its
+                # cache key is the bare event_id, not a 1-tuple -- the
+                # key-builder special-cases num_args == 1 to skip wrapping.
                 cached = self._get_state_group_for_event_sql.cache.get_immediate(
                     # A cached `None` (e.g. a rejected event's mapping) is the
                     # same as a miss here: it carries no usable state group.
-                    (event_id,),
+                    event_id,
                     None,
                 )
                 if cached is not None:
