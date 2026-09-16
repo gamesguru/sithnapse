@@ -906,8 +906,208 @@ class StateStoreTestCase(HomeserverTestCase):
         # The row(s) are still reported as processed (progress advances, so
         # the background update doesn't loop forever on them) even though
         # nothing was re-persisted -- the AssertionError patched above would
-        # have propagated and failed this test otherwise.
         self.assertGreaterEqual(num_processed, 1)
+
+    def test_redo_mirror_write_v1_success(self) -> None:
+        """Replaying a version-1 payload with full state map succeeds and publishes root."""
+        self._setup_embedded_engine_for_room("test-redo-v1-")
+        room_id = self.room.to_string()
+        room_version = self.get_success(self.store.get_room_version(room_id))
+
+        from synapse.synapse_rust import state_hamt
+
+        state_map = {
+            ("m.room.create", ""): "$create",
+            ("m.room.member", "@alice:example.com"): "$member",
+        }
+        root_hash, lattice, _, _ = state_hamt.build_root_handle_with_lattice(
+            room_id,
+            [(k[0], k[1], v) for k, v in state_map.items()],
+        )
+        room_prefix = state_hamt.room_hamt_prefix(
+            room_id, room_version.msc4291_room_ids_as_hashes
+        )
+        sg = 80001
+        self.get_success(
+            self.state_datastore.redo_embedded_hamt_mirror_writes_batch(
+                room_id,
+                room_version,
+                [
+                    {
+                        "state_group": sg,
+                        "prev_state_group": None,
+                        "expected_root_hash": root_hash,
+                        "expected_lattice": lattice,
+                        "expected_room_prefix": room_prefix,
+                        "state_map": state_map,
+                        "state_count": len(state_map),
+                        "version": 1,
+                    }
+                ],
+            )
+        )
+        stored_root = self.state_datastore._get_embedded_hamt_root(room_prefix, sg)
+        self.assertIsNotNone(stored_root)
+        assert stored_root is not None
+        self.assertEqual(stored_root[0], root_hash)
+
+    def test_redo_mirror_write_batch_atomic_success(self) -> None:
+        """Batch replay of parent and child groups succeeds and publishes both."""
+        self._setup_embedded_engine_for_room("test-redo-batch-")
+        room_id = self.room.to_string()
+        room_version = self.get_success(self.store.get_room_version(room_id))
+
+        from synapse.synapse_rust import state_hamt
+
+        state_map_1 = {("m.room.create", ""): "$create"}
+        state_map_2 = {
+            ("m.room.create", ""): "$create",
+            ("m.room.name", ""): "$name",
+        }
+        root_1, lat_1, _, _ = state_hamt.build_root_handle_with_lattice(
+            room_id,
+            [(k[0], k[1], v) for k, v in state_map_1.items()],
+        )
+        root_2, lat_2, _, _ = state_hamt.build_root_handle_with_lattice(
+            room_id,
+            [(k[0], k[1], v) for k, v in state_map_2.items()],
+        )
+        room_prefix = state_hamt.room_hamt_prefix(
+            room_id, room_version.msc4291_room_ids_as_hashes
+        )
+        sg1, sg2 = 80002, 80003
+        self.get_success(
+            self.state_datastore.redo_embedded_hamt_mirror_writes_batch(
+                room_id,
+                room_version,
+                [
+                    {
+                        "state_group": sg1,
+                        "prev_state_group": None,
+                        "expected_root_hash": root_1,
+                        "expected_lattice": lat_1,
+                        "state_map": state_map_1,
+                        "state_count": len(state_map_1),
+                        "version": 1,
+                    },
+                    {
+                        "state_group": sg2,
+                        "prev_state_group": sg1,
+                        "expected_root_hash": root_2,
+                        "expected_lattice": lat_2,
+                        "state_map": state_map_2,
+                        "state_count": len(state_map_2),
+                        "version": 1,
+                    },
+                ],
+            )
+        )
+        self.assertIsNotNone(
+            self.state_datastore._get_embedded_hamt_root(room_prefix, sg1)
+        )
+        self.assertIsNotNone(
+            self.state_datastore._get_embedded_hamt_root(room_prefix, sg2)
+        )
+
+    def test_redo_mirror_write_batch_atomic_rollback_on_mismatch(self) -> None:
+        """If any group in a batch has a mismatch, all writes in the batch are aborted."""
+        self._setup_embedded_engine_for_room("test-redo-abort-")
+        room_id = self.room.to_string()
+        room_version = self.get_success(self.store.get_room_version(room_id))
+
+        from synapse.synapse_rust import state_hamt
+
+        state_map_1 = {("m.room.create", ""): "$create"}
+        state_map_2 = {("m.room.create", ""): "$create", ("m.room.name", ""): "$name"}
+        root_1, lat_1, _, _ = state_hamt.build_root_handle_with_lattice(
+            room_id,
+            [(k[0], k[1], v) for k, v in state_map_1.items()],
+        )
+        room_prefix = state_hamt.room_hamt_prefix(
+            room_id, room_version.msc4291_room_ids_as_hashes
+        )
+        sg1, sg2 = 80004, 80005
+        self.get_failure(
+            self.state_datastore.redo_embedded_hamt_mirror_writes_batch(
+                room_id,
+                room_version,
+                [
+                    {
+                        "state_group": sg1,
+                        "prev_state_group": None,
+                        "expected_root_hash": root_1,
+                        "expected_lattice": lat_1,
+                        "state_map": state_map_1,
+                        "state_count": len(state_map_1),
+                        "version": 1,
+                    },
+                    {
+                        "state_group": sg2,
+                        "prev_state_group": sg1,
+                        "expected_root_hash": b"\x00" * 32,  # deliberately wrong!
+                        "expected_lattice": lat_1,
+                        "state_map": state_map_2,
+                        "state_count": len(state_map_2),
+                        "version": 1,
+                    },
+                ],
+            ),
+            RuntimeError,
+        )
+        # Neither group was published
+        self.assertIsNone(
+            self.state_datastore._get_embedded_hamt_root(room_prefix, sg1)
+        )
+        self.assertIsNone(
+            self.state_datastore._get_embedded_hamt_root(room_prefix, sg2)
+        )
+
+    def test_redo_mirror_write_v0_missing_predecessor_fails_closed(self) -> None:
+        """Version-0 replay without state map fails closed when predecessor is missing."""
+        self._setup_embedded_engine_for_room("test-redo-v0-fail-")
+        room_id = self.room.to_string()
+        room_version = self.get_success(self.store.get_room_version(room_id))
+
+        self.get_failure(
+            self.state_datastore.redo_embedded_hamt_mirror_writes_batch(
+                room_id,
+                room_version,
+                [
+                    {
+                        "state_group": 80006,
+                        "prev_state_group": 77777,  # nonexistent in mtxdb
+                        "expected_root_hash": b"\x11" * 32,
+                        "updates": [("m.room.name", "", "$name")],
+                        "version": 0,
+                    }
+                ],
+            ),
+            RuntimeError,
+        )
+
+    def test_redo_mirror_write_state_count_mismatch(self) -> None:
+        """Mismatch between state_count and state_map length raises RuntimeError."""
+        self._setup_embedded_engine_for_room("test-redo-count-mismatch-")
+        room_id = self.room.to_string()
+        room_version = self.get_success(self.store.get_room_version(room_id))
+
+        self.get_failure(
+            self.state_datastore.redo_embedded_hamt_mirror_writes_batch(
+                room_id,
+                room_version,
+                [
+                    {
+                        "state_group": 80007,
+                        "prev_state_group": None,
+                        "expected_root_hash": b"\x22" * 32,
+                        "state_map": {("m.room.create", ""): "$create"},
+                        "state_count": 99,  # mismatch!
+                        "version": 1,
+                    }
+                ],
+            ),
+            RuntimeError,
+        )
 
     def test_nonexistent_group_returns_empty_dict(self) -> None:
         """Verify that a nonexistent state group (not in SQL) returns {} without raising."""

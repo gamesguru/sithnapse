@@ -24,6 +24,7 @@ import os
 import time
 from typing import (
     TYPE_CHECKING,
+    Any,
     Iterable,
     Mapping,
     cast,
@@ -34,6 +35,7 @@ from synapse.api.room_versions import RoomVersion
 from synapse.events import EventBase
 from synapse.events.snapshot import (
     UnpersistedEventContext,
+    _encode_state_dict,
 )
 from synapse.logging.context import defer_to_thread
 from synapse.logging.opentracing import tag_args, trace
@@ -82,6 +84,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
     """A data store for fetching/storing state groups."""
 
     EMBEDDED_HAMT_MIGRATION_UPDATE_NAME = "state_hamt_embedded_migration"
+    MAX_MIRROR_STATE_ENTRIES = 100_000
 
     def __init__(
         self,
@@ -202,9 +205,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             # there's nothing here for `EventContext.serialize` retries to
             # lose. Only ever populated when `_embedded_hamt_is_writer` is
             # False; harmless if unused.
-            self._pending_embedded_hamt_mirrors: dict[
-                int, tuple[bytes, StateMap[str] | None]
-            ] = {}
+            self._pending_embedded_hamt_mirrors: dict[int, dict[str, Any]] = {}
             try:
                 engine = get_embedded_engine(self._embedded_hamt_engine)
                 _oet = time.monotonic()
@@ -287,9 +288,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 "mirror writes must only happen on the events writer."
             )
 
-    def pop_pending_embedded_hamt_root(
-        self, state_group: int
-    ) -> tuple[bytes, StateMap[str] | None] | None:
+    def pop_pending_embedded_hamt_root(self, state_group: int) -> dict[str, Any] | None:
         """Returns and clears the expected root_structural_hash for a state
         group created on this (non-writer) instance whose mtxdb mirror
         write was skipped, or None if `state_group` has no pending mirror
@@ -305,6 +304,152 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         """
         return self._pending_embedded_hamt_mirrors.pop(state_group, None)
 
+    async def redo_embedded_hamt_mirror_writes_batch(
+        self,
+        room_id: str,
+        room_version: RoomVersion,
+        replays: list[dict[str, Any]],
+    ) -> None:
+        """Redo, on the events writer, mtxdb mirror writes that non-writer
+        instances skipped when creating state groups.
+
+        Executes atomically in a single interaction: recomputes and verifies
+        expected roots for ALL groups in the batch before publishing any nodes
+        or roots to mtxdb. If any determinism check or validation fails, no
+        writes occur.
+        """
+        if not replays:
+            return
+
+        self._assert_embedded_hamt_writer()
+
+        from synapse.synapse_rust import state_hamt
+
+        room_prefix = state_hamt.room_hamt_prefix(
+            room_id, room_version.msc4291_room_ids_as_hashes
+        )
+
+        def redo_all_txn(txn: LoggingTransaction) -> None:
+            hamt_writes: list[tuple[int, bytes, bytes, list[tuple[bytes, bytes]]]] = []
+            local_nodes: dict[bytes, bytes] = {}
+            local_roots: dict[int, tuple[bytes, bytes]] = {}
+
+            # Phase 1: Recompute and verify all groups in dependency order
+            for item in replays:
+                state_group: int = item["state_group"]
+                prev_state_group: int | None = item.get("prev_state_group")
+                updates: list[tuple[str, str, str]] = item.get("updates", [])
+                expected_root_hash: bytes = item["expected_root_hash"]
+                expected_lattice: bytes | None = item.get("expected_lattice")
+                expected_prefix: bytes | None = item.get("expected_room_prefix")
+                state_map: Mapping[tuple[str, str], str] | None = item.get("state_map")
+
+                if expected_prefix is not None and expected_prefix != room_prefix:
+                    raise RuntimeError(
+                        f"Room prefix mismatch in mirror payload for state group {state_group}: "
+                        f"expected {expected_prefix.hex()} but room computed {room_prefix.hex()}"
+                    )
+
+                if state_map is not None:
+                    if "state_count" in item and len(state_map) != item["state_count"]:
+                        raise RuntimeError(
+                            f"State count mismatch in mirror payload for state group {state_group}: "
+                            f"payload specified {item['state_count']} entries, found {len(state_map)}"
+                        )
+
+                    root_hash, lattice, nodes = self._persist_state_hamt_txn(
+                        txn,
+                        state_group,
+                        room_id,
+                        room_prefix,
+                        current_state_ids=state_map,
+                        prev_state_group=None,
+                        updates=None,
+                        skip_mirror_write=True,
+                    )
+                else:
+                    # Version-0 / legacy fallback path
+                    predecessor_root_found = False
+                    if prev_state_group is not None:
+                        if prev_state_group in local_roots:
+                            predecessor_root_found = True
+                        else:
+                            pred_root = self._get_embedded_hamt_root(
+                                room_prefix, prev_state_group
+                            )
+                            if pred_root is not None:
+                                predecessor_root_found = (
+                                    self._get_embedded_hamt_node(
+                                        room_prefix, pred_root[0]
+                                    )
+                                    is not None
+                                )
+
+                    if prev_state_group is not None and not predecessor_root_found:
+                        raise RuntimeError(
+                            f"Cannot redo mirror write for state group {state_group}: "
+                            f"predecessor {prev_state_group} HAMT data is missing and no state map was provided"
+                        )
+
+                    root_hash, lattice, nodes = self._persist_state_hamt_txn(
+                        txn,
+                        state_group,
+                        room_id,
+                        room_prefix,
+                        current_state_ids=None
+                        if prev_state_group is not None
+                        else {
+                            (event_type, state_key): event_id
+                            for event_type, state_key, event_id in updates
+                        },
+                        prev_state_group=prev_state_group,
+                        updates=updates if prev_state_group is not None else None,
+                        local_nodes=local_nodes,
+                        local_roots=local_roots,
+                        skip_mirror_write=True,
+                    )
+
+                if root_hash != expected_root_hash:
+                    logger.error(
+                        "mtxdb mirror replay mismatch: state_group=%d prev_state_group=%s "
+                        "updates=%d state_size=%s expected=%s actual=%s",
+                        state_group,
+                        prev_state_group,
+                        len(updates),
+                        len(state_map) if state_map is not None else None,
+                        expected_root_hash.hex(),
+                        root_hash.hex(),
+                    )
+                    raise RuntimeError(
+                        "mtxdb mirror-write determinism check failed for state "
+                        f"group {state_group}: writer recomputed root "
+                        f"{root_hash.hex()} but the creator expected "
+                        f"{expected_root_hash.hex()}"
+                    )
+
+                if expected_lattice is not None and lattice != expected_lattice:
+                    raise RuntimeError(
+                        f"mtxdb mirror-write lattice mismatch for state group {state_group}: "
+                        f"writer recomputed lattice {lattice.hex()} but creator expected {expected_lattice.hex()}"
+                    )
+
+                hamt_writes.append((state_group, root_hash, lattice, nodes))
+                for node_hash, node_bytes in nodes:
+                    local_nodes[node_hash] = node_bytes
+                local_roots[state_group] = (root_hash, lattice)
+
+            # Phase 2: All groups verified! Publish nodes and roots atomically
+            for sg, root_hash, lattice, nodes in hamt_writes:
+                self._store_state_hamt_nodes_txn(txn, room_prefix, nodes)
+                self._store_state_hamt_root_embedded_txn(
+                    sg, room_prefix, root_hash, lattice, room_id
+                )
+            txn.call_after(mark_dirty, Pool.STATE)
+
+        await self.db_pool.runInteraction(
+            "redo_embedded_hamt_mirror_writes_batch", redo_all_txn
+        )
+
     async def redo_embedded_hamt_mirror_write(
         self,
         state_group: int,
@@ -315,132 +460,20 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         expected_root_hash: bytes,
         state_map: Mapping[tuple[str, str], str] | None = None,
     ) -> None:
-        """Redo, on the events writer, the mtxdb mirror write a non-writer
-        instance skipped when it created `state_group` -- see
-        `store_state_group`'s `skip_mirror_write` and
-        `pop_pending_embedded_hamt_root`. Called from the `send_events`
-        replication handler once per event whose deserialized context
-        carries a `pending_embedded_hamt_mirror_root`.
-
-        Recomputes via the same `_persist_state_hamt_txn` path the creator
-        used (incremental against `prev_state_group` when possible, falling
-        back to a full rebuild), but does not persist anything until the
-        recomputed root is checked against `expected_root_hash`. This is
-        the determinism guarantee the design depends on: the writer's
-        recompute is only trusted -- and only written -- if it exactly
-        reproduces what the creator computed. A mismatch means the writer
-        and creator disagree about the pre-update state (most likely a
-        `prev_state_group` the writer doesn't yet have a root for), and
-        raises loudly rather than silently diverging from the SQL truth.
-
-        Raises RuntimeError if called on a non-writer instance (defensive;
-        should be unreachable, since only the writer processes send_events)
-        or if the determinism check fails.
-        """
-        self._assert_embedded_hamt_writer()
-
-        from synapse.synapse_rust import state_hamt
-
-        room_prefix = state_hamt.room_hamt_prefix(
-            room_id, room_version.msc4291_room_ids_as_hashes
+        """Redo, on the events writer, a single mtxdb mirror write."""
+        await self.redo_embedded_hamt_mirror_writes_batch(
+            room_id,
+            room_version,
+            [
+                {
+                    "state_group": state_group,
+                    "prev_state_group": prev_state_group,
+                    "updates": updates,
+                    "expected_root_hash": expected_root_hash,
+                    "state_map": state_map,
+                }
+            ],
         )
-
-        def redo_txn(txn: LoggingTransaction) -> None:
-            # A reader may have created the predecessor state group in SQL
-            # while its mtxdb handle was read-only. In that case the normal
-            # incremental path cannot find a predecessor root and its full
-            # rebuild would deliberately hit the strict HAMT reader. Repair
-            # this replication-only case from the legacy SQL state instead.
-            predecessor_state: StateMap[str] | None = None
-            predecessor_root_found = False
-            used_fallback = False
-            predecessor_root = (
-                self._get_embedded_hamt_root(room_prefix, prev_state_group)
-                if prev_state_group is not None
-                else None
-            )
-            if predecessor_root is not None:
-                predecessor_root_found = (
-                    self._get_embedded_hamt_node(room_prefix, predecessor_root[0])
-                    is not None
-                )
-
-            if prev_state_group is not None and not predecessor_root_found:
-                predecessor_exists = self.db_pool.simple_select_one_onecol_txn(
-                    txn,
-                    table="state_groups",
-                    keyvalues={"id": prev_state_group},
-                    retcol="id",
-                    allow_none=True,
-                )
-                if predecessor_exists is not None:
-                    used_fallback = True
-                    predecessor_state = self._get_legacy_state_for_groups_txn(
-                        txn, [prev_state_group], StateFilter.all()
-                    )[prev_state_group]
-
-            if predecessor_state is None:
-                root_hash, lattice, nodes = self._persist_state_hamt_txn(
-                    txn,
-                    state_group,
-                    room_id,
-                    room_prefix,
-                    current_state_ids=None,
-                    prev_state_group=prev_state_group,
-                    updates=updates,
-                    # Compute only -- verify before persisting, see docstring.
-                    skip_mirror_write=True,
-                )
-            else:
-                current_state_ids = dict(predecessor_state)
-                current_state_ids.update(
-                    {
-                        (event_type, state_key): event_id
-                        for event_type, state_key, event_id in updates
-                    }
-                )
-                root_hash, lattice, nodes = self._persist_state_hamt_txn(
-                    txn,
-                    state_group,
-                    room_id,
-                    room_prefix,
-                    current_state_ids=current_state_ids,
-                    # The predecessor is represented by the reconstructed
-                    # state, so do not ask the strict HAMT reader for it.
-                    prev_state_group=None,
-                    updates=None,
-                    # Compute only -- verify before persisting, see docstring.
-                    skip_mirror_write=True,
-                )
-
-            if root_hash != expected_root_hash:
-                logger.error(
-                    "mtxdb mirror replay mismatch: state_group=%d prev_state_group=%s "
-                    "updates=%d predecessor_root_found=%s used_fallback=%s "
-                    "predecessor_state_size=%s expected=%s actual=%s",
-                    state_group,
-                    prev_state_group,
-                    len(updates),
-                    predecessor_root_found,
-                    used_fallback,
-                    len(predecessor_state) if predecessor_state is not None else None,
-                    expected_root_hash.hex(),
-                    root_hash.hex(),
-                )
-                raise RuntimeError(
-                    "mtxdb mirror-write determinism check failed for state "
-                    f"group {state_group}: writer recomputed root "
-                    f"{root_hash.hex()} but the creator expected "
-                    f"{expected_root_hash.hex()}"
-                )
-
-            self._store_state_hamt_nodes_txn(txn, room_prefix, nodes)
-            self._store_state_hamt_root_embedded_txn(
-                state_group, room_prefix, root_hash, lattice, room_id
-            )
-            txn.call_after(mark_dirty, Pool.STATE)
-
-        await self.db_pool.runInteraction("redo_embedded_hamt_mirror_write", redo_txn)
 
     async def _enqueue_embedded_hamt_migration_if_needed(self) -> None:
         """Turning on the embedded engine doesn't retroactively move
@@ -1794,7 +1827,28 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                     skip_mirror_write=skip_mirror_write,
                 )
                 if skip_mirror_write:
-                    self._pending_embedded_hamt_mirrors[sg_after] = (root_hash, None)
+                    if context.partial_state or not context.state_map_before_event:
+                        raise RuntimeError(
+                            f"Cannot emit version-1 mirror payload for batched state group {sg_after}: "
+                            f"in-memory state map is unavailable or incomplete (partial_state={context.partial_state})"
+                        )
+                    state_map = dict(context.state_map_before_event)
+                    state_map.update(context.state_delta_due_to_event or {})
+                    if len(state_map) > self.MAX_MIRROR_STATE_ENTRIES:
+                        raise RuntimeError(
+                            f"State map for state group {sg_after} exceeds maximum replication payload size "
+                            f"({len(state_map)} > {self.MAX_MIRROR_STATE_ENTRIES})"
+                        )
+                    self._pending_embedded_hamt_mirrors[sg_after] = {
+                        "version": 1,
+                        "state_group": sg_after,
+                        "predecessor_state_group": sg_before,
+                        "room_prefix": room_prefix.hex(),
+                        "expected_root": root_hash.hex(),
+                        "lattice": lattice.hex(),
+                        "state_count": len(state_map),
+                        "state": _encode_state_dict(state_map),
+                    }
                 hamt_writes.append((sg_after, root_hash, lattice, nodes))
                 # Only keep the root node in the local cache for the next iteration.
                 # Child nodes are fetched via SQL/mtxdb in the retry loop if needed.
@@ -1956,14 +2010,33 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         # Both SQL and (if configured and this is the writer) the embedded
         # engine were already written (dirty marking via txn.call_after) in
         # insert_full_state_txn -- nothing left to publish post-commit.
-        state_group, root_hash, _lattice, _nodes = await self.db_pool.runInteraction(
+        state_group, root_hash, lattice, _nodes = await self.db_pool.runInteraction(
             "store_state_group.insert_full_state",
             insert_full_state_txn,
             current_state_ids,
         )
 
         if skip_mirror_write:
-            self._pending_embedded_hamt_mirrors[state_group] = (root_hash, None)
+            if not current_state_ids:
+                raise RuntimeError(
+                    f"Cannot emit version-1 mirror payload for state group {state_group}: "
+                    "complete in-memory state map is required"
+                )
+            if len(current_state_ids) > self.MAX_MIRROR_STATE_ENTRIES:
+                raise RuntimeError(
+                    f"State map for state group {state_group} exceeds maximum replication payload size "
+                    f"({len(current_state_ids)} > {self.MAX_MIRROR_STATE_ENTRIES})"
+                )
+            self._pending_embedded_hamt_mirrors[state_group] = {
+                "version": 1,
+                "state_group": state_group,
+                "predecessor_state_group": prev_group,
+                "room_prefix": room_prefix.hex(),
+                "expected_root": root_hash.hex(),
+                "lattice": lattice.hex(),
+                "state_count": len(current_state_ids),
+                "state": _encode_state_dict(current_state_ids),
+            }
 
         logger.debug(
             "[gg-state-timing] store_state_group group=%d elapsed_ms=%.1f",

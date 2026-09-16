@@ -19,13 +19,17 @@
 #
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from twisted.web.server import Request
 
 from synapse.api.room_versions import KNOWN_ROOM_VERSIONS, RoomVersion
 from synapse.events import make_event_from_dict
-from synapse.events.snapshot import EventContext, EventPersistencePair
+from synapse.events.snapshot import (
+    EventContext,
+    EventPersistencePair,
+    _decode_state_dict,
+)
 from synapse.http.server import HttpServer
 from synapse.replication.http._base import ReplicationEndpoint
 from synapse.types import JsonDict
@@ -155,11 +159,25 @@ class ReplicationFederationSendEventsRestServlet(ReplicationEndpoint):
                     # visible to readers, just as the normal send_events endpoint does.
                     # Sort by state group so that the predecessor is always
                     # mirror-written before the child group that depends on it.
-                    for sg, expected_root in sorted(
+                    replays: list[dict[str, Any]] = []
+                    for sg, payload in sorted(
                         context.pending_embedded_hamt_mirror_roots.items()
                     ):
                         prev_sg = None
                         delta = None
+
+                        expected_root = bytes.fromhex(payload["expected_root"])
+                        full_state_map = _decode_state_dict(payload.get("state"))
+                        expected_lattice = (
+                            bytes.fromhex(payload["lattice"])
+                            if "lattice" in payload
+                            else None
+                        )
+                        expected_prefix = (
+                            bytes.fromhex(payload["room_prefix"])
+                            if "room_prefix" in payload
+                            else None
+                        )
 
                         if sg == context._state_group:
                             prev_sg = context.state_group_before_event
@@ -182,13 +200,25 @@ class ReplicationFederationSendEventsRestServlet(ReplicationEndpoint):
                             (event_type, state_key, ev_id)
                             for (event_type, state_key), ev_id in delta.items()
                         ]
-                        await self._state_store.redo_embedded_hamt_mirror_write(
-                            sg,
-                            prev_sg,
+                        replays.append(
+                            {
+                                "state_group": sg,
+                                "prev_state_group": prev_sg,
+                                "updates": updates,
+                                "expected_root_hash": expected_root,
+                                "expected_lattice": expected_lattice,
+                                "expected_room_prefix": expected_prefix,
+                                "state_map": full_state_map,
+                                "state_count": payload.get("state_count"),
+                                "version": payload.get("version", 0),
+                            }
+                        )
+
+                    if replays:
+                        await self._state_store.redo_embedded_hamt_mirror_writes_batch(
                             event.room_id,
                             event.room_version,
-                            updates,
-                            expected_root,
+                            replays,
                         )
 
                 event_and_contexts.append((event, context))
