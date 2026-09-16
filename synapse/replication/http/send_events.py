@@ -232,9 +232,9 @@ class ReplicationSendEventsRestServlet(ReplicationEndpoint):
                                         f"Invalid expected_lattice length {len(expected_lattice)} for state group {sg}"
                                     )
                                 expected_prefix = bytes.fromhex(payload["room_prefix"])
-                                if len(expected_prefix) != 32:
+                                if len(expected_prefix) != 8:
                                     raise RuntimeError(
-                                        f"Invalid room_prefix length {len(expected_prefix)} for state group {sg}"
+                                        f"Invalid room_prefix length {len(expected_prefix)} for state group {sg}; expected 8"
                                     )
 
                                 from synapse.synapse_rust import state_hamt
