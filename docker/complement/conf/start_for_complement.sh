@@ -78,15 +78,12 @@ if [[ -n "$SYNAPSE_COMPLEMENT_USE_WORKERS" ]]; then
       ${event_persister_entry}\
       ${background_worker_entry}\
       event_creator, \
-      user_dir, \
+      client_reader=client_reader+user_dir, \
       media_repository, \
-      federation_inbound, \
-      federation_reader, \
+      federation_receiver=federation_reader+federation_inbound, \
       federation_sender, \
       synchrotron, \
-      client_reader, \
-      appservice, \
-      pusher, \
+      notifiers=pusher+appservice, \
       device_lists:2, \
       stream_writers=account_data+presence+receipts+to_device+typing"
 
