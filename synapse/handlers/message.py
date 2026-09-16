@@ -1920,6 +1920,12 @@ class EventCreationHandler:
         assert self._external_cache_joined_hosts_updates is not None
 
         for event, event_context in events_and_context:
+            # OOB membership events are never sent to federation. They may
+            # intentionally have no state group, so there is no useful
+            # joined-hosts cache entry to calculate for them.
+            if event.internal_metadata.is_out_of_band_membership():
+                continue
+
             if event_context.partial_state:
                 # To populate the cache for a partial-state event, we either have to
                 # block until full state, which the code below does, or change the
