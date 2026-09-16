@@ -926,6 +926,12 @@ run_one_pattern() {
     # `kill -- -PGID` below (same technique as the go-test launch further
     # down this function).
     (
+      # Do not let the watcher keep the process-wide flock alive if the
+      # parent is interrupted. In particular, `tail -f` can outlive this
+      # subshell and would otherwise retain the inherited lock FD.
+      if [ -n "${COMPLEMENT_RUN_LOCK_FD:-}" ]; then
+        eval "exec ${COMPLEMENT_RUN_LOCK_FD}>&-"
+      fi
       set -m
       "$_rt" events --filter 'event=start' --format '{{.ID}}' 2>/dev/null >"${_pg_timing_dir}/.events_stream" &
       declare -A _seen
@@ -951,6 +957,11 @@ run_one_pattern() {
   # go test/tee/jq running as orphans past container cleanup.
   set -m
   (
+    # Background test processes must not inherit the run lock either. The
+    # parent shell remains responsible for holding and releasing it.
+    if [ -n "${COMPLEMENT_RUN_LOCK_FD:-}" ]; then
+      eval "exec ${COMPLEMENT_RUN_LOCK_FD}>&-"
+    fi
     set -o pipefail
     if [ -n "$use_in_repo_tests" ]; then
       cd "${repo_root}/complement"
