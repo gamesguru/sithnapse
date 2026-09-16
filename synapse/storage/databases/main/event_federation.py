@@ -252,7 +252,17 @@ class EventFederationWorkerStore(
 
             embedded_hamt_namespace = resolve_namespace(self)
             try:
-                if embedded_hamt_namespace is not None:
+                # The embedded closure walk has a cold-import path which
+                # allocates short IDs and embeds SQL auth edges.  That is a
+                # write, so it is only safe on the events writer.  Readers
+                # must use the SQL implementation and let the writer's
+                # replication catch them up instead of attempting to mutate
+                # their read-only mtxdb handle.
+                if (
+                    embedded_hamt_namespace is not None
+                    and self.hs.get_instance_name()
+                    in self.hs.config.worker.writers.events
+                ):
                     try:
                         return await self.db_pool.runInteraction(
                             "get_auth_chain_ids_embedded",
@@ -715,7 +725,11 @@ class EventFederationWorkerStore(
                 )
 
                 embedded_hamt_namespace = resolve_namespace(self)
-                if embedded_hamt_namespace is not None:
+                if (
+                    embedded_hamt_namespace is not None
+                    and self.hs.get_instance_name()
+                    in self.hs.config.worker.writers.events
+                ):
                     return await self.db_pool.runInteraction(
                         "get_auth_chain_difference_embedded",
                         self._get_auth_chain_difference_using_embedded_closures_txn,
