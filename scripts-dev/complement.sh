@@ -505,7 +505,7 @@ main() {
   # that can save anything from a failing run for later inspection, and
   # it also dumps Postgres stats test-to-test along the way. Don't clobber
   # a caller who has already set their own COMPLEMENT_POST_TEST_SCRIPT.
-  export COMPLEMENT_POST_TEST_SCRIPT="${COMPLEMENT_POST_TEST_SCRIPT:-${repo_root}/scripts-dev/complement_post_test.sh}"
+  export COMPLEMENT_POST_TEST_SCRIPT="${COMPLEMENT_POST_TEST_SCRIPT:-${repo_root}/scripts-dev/_complement_post_test.sh}"
 
   if [[ -n "${SYNAPSE_PG_TIMINGS:-}" ]]; then
     export PASS_SYNAPSE_PG_TIMINGS=1
