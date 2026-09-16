@@ -489,10 +489,15 @@ class HomeserverTestCase(TestCase):
     def wait_for_background_updates(self) -> None:
         """Block until all background database updates have completed."""
         store = self.hs.get_datastores().main
+        if self.get_success(store.db_pool.updates.has_completed_background_updates()):
+            return
+
         while not self.get_success(
-            store.db_pool.updates.has_completed_background_updates()
+            store.db_pool.updates.do_next_background_update(False)
         ):
-            self.get_success(store.db_pool.updates.do_next_background_update(False))
+            pass
+
+        self.get_success(store.db_pool.updates.has_completed_background_updates())
 
     def make_homeserver(
         self, reactor: ThreadedMemoryReactorClock, clock: Clock
