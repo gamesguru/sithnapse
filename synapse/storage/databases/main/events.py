@@ -3237,6 +3237,9 @@ class PersistEventsStore:
                 "recheck": event.internal_metadata.need_to_check_redaction(),
             },
         )
+        # The `redactions` emptiness cache is only ever invalidated by writes,
+        # so make sure this one is reported once the transaction commits.
+        self.db_pool.note_table_write_after(txn, "redactions")
 
     def insert_labels_for_event_txn(
         self,

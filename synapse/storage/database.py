@@ -737,6 +737,50 @@ class PerformanceCounters:
         return top_n_counters
 
 
+class TableEmptyCache:
+    """A conservative "is this table empty?" cache.
+
+    Some reads only care about matches against a set of keys (e.g. "are any of
+    these events redacted?"). If we have positively observed that the table is
+    empty, and no write to it has happened since, the read cannot match
+    anything and can be skipped entirely.
+
+    The cache is only consulted on the process that performs *every* write to
+    the table, so "no write happened since" is a reliable, local statement (see
+    `DatabasePool.table_empty_cache`). Deletes deliberately do not invalidate
+    the cache: wrongly believing a table is non-empty only costs a redundant
+    query, whereas wrongly believing it is empty would return stale results.
+    """
+
+    __slots__ = ("_generation", "_probed_generation", "_empty")
+
+    def __init__(self) -> None:
+        self._generation = 0
+        self._probed_generation = -1
+        self._empty = False
+
+    def note_write(self) -> None:
+        """Record that the table has been written to.
+
+        Must be called *after* the write has committed (e.g. via
+        `LoggingTransaction.call_after`): bumping before commit would let a
+        concurrent reader observe the table as still empty and then cache that
+        stale observation.
+        """
+        self._generation += 1
+
+    def should_query(self, txn: LoggingTransaction, table: str) -> bool:
+        """Whether a read of `table` must actually hit the database.
+
+        `table` is always a hard-coded literal at the call site.
+        """
+        if self._probed_generation != self._generation:
+            txn.execute(f"SELECT 1 FROM {table} LIMIT 1")
+            self._empty = txn.fetchone() is None
+            self._probed_generation = self._generation
+        return not self._empty
+
+
 class DatabasePool:
     """Wraps a single physical database and connection pool.
 
@@ -781,6 +825,15 @@ class DatabasePool:
 
         self.engine = engine
 
+        # Lazily-created per-table emptiness caches (see `TableEmptyCache`).
+        self._table_empty_caches: dict[str, TableEmptyCache] = {}
+        # The cache assumes that *every* write to a cached table happens on
+        # this process and is reported via `note_table_write`. That is only
+        # true for the process that persists events, so only enable it there.
+        self._table_empty_caching_enabled = (
+            hs.get_instance_name() in hs.config.worker.writers.events
+        )
+
         # A set of tables that are not safe to use native upserts in.
         self._unsafe_to_upsert_tables = set(UNIQUE_INDEX_BACKGROUND_UPDATES.keys())
 
@@ -797,6 +850,43 @@ class DatabasePool:
             "upsert_safety_check",
             self._check_safe_to_upsert,
         )
+
+    def table_empty_cache(self, table: str) -> TableEmptyCache | None:
+        """Return the emptiness cache for `table`, if it is safe to use one.
+
+        Returns `None` on instances that don't perform every write to the
+        table, where the cache's invalidation guarantee doesn't hold.
+        """
+        if not self._table_empty_caching_enabled:
+            return None
+        cache = self._table_empty_caches.get(table)
+        if cache is None:
+            cache = TableEmptyCache()
+            self._table_empty_caches[table] = cache
+        return cache
+
+    def note_table_write(self, table: str) -> None:
+        """Invalidate the emptiness cache for `table`.
+
+        Must be called *after* the write commits, never from inside the
+        transaction: a concurrent reader must not be able to observe the
+        pre-write (empty) state and cache it.
+        """
+        cache = self._table_empty_caches.get(table)
+        if cache is not None:
+            cache.note_write()
+
+    def note_table_write_after(self, txn: LoggingTransaction, table: str) -> None:
+        """Schedule `note_table_write` for `table` once `txn` commits.
+
+        Safe to call even when caching is disabled or the transaction doesn't
+        accept after-callbacks.
+        """
+        if not self._table_empty_caching_enabled:
+            return
+        if txn.after_callbacks is None:
+            return
+        txn.call_after(self.note_table_write, table)
 
     def stop_background_updates(self) -> None:
         """
