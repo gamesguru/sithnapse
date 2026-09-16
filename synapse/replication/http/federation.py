@@ -155,11 +155,23 @@ class ReplicationFederationSendEventsRestServlet(ReplicationEndpoint):
                     # visible to readers, just as the normal send_events endpoint does.
                     # Sort by state group so that the predecessor is always
                     # mirror-written before the child group that depends on it.
-                    for sg, expected_root in sorted(
+                    for sg, payload in sorted(
                         context.pending_embedded_hamt_mirror_roots.items()
                     ):
                         prev_sg = None
                         delta = None
+
+                        expected_root = payload["expected_root"]
+                        full_state_map = None
+                        if payload.get("version") == 1:
+                            expected_root = bytes.fromhex(payload["expected_root"])
+                            full_state_map = {
+                                (t, k): ev for t, k, ev in payload.get("state", [])
+                            }
+                        else:
+                            # Legacy format
+                            expected_root = bytes.fromhex(payload["expected_root"])
+
                         if sg == context._state_group:
                             prev_sg = context.state_group_before_event
                             delta = context._state_delta_due_to_event or {}
@@ -167,10 +179,10 @@ class ReplicationFederationSendEventsRestServlet(ReplicationEndpoint):
                             for (
                                 p_sg,
                                 c_sg,
-                            ), state_map in context.state_group_deltas.items():
+                            ), d_map in context.state_group_deltas.items():
                                 if c_sg == sg:
                                     prev_sg = p_sg
-                                    delta = state_map
+                                    delta = d_map
                                     break
                             if delta is None:
                                 raise RuntimeError(
@@ -178,8 +190,8 @@ class ReplicationFederationSendEventsRestServlet(ReplicationEndpoint):
                                 )
 
                         updates = [
-                            (event_type, state_key, event_id)
-                            for (event_type, state_key), event_id in delta.items()
+                            (event_type, state_key, ev_id)
+                            for (event_type, state_key), ev_id in delta.items()
                         ]
                         await self._state_store.redo_embedded_hamt_mirror_write(
                             sg,
@@ -188,6 +200,7 @@ class ReplicationFederationSendEventsRestServlet(ReplicationEndpoint):
                             event.room_version,
                             updates,
                             expected_root,
+                            state_map=full_state_map,
                         )
 
                 event_and_contexts.append((event, context))

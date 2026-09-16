@@ -202,7 +202,9 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             # there's nothing here for `EventContext.serialize` retries to
             # lose. Only ever populated when `_embedded_hamt_is_writer` is
             # False; harmless if unused.
-            self._pending_embedded_hamt_mirrors: dict[int, bytes] = {}
+            self._pending_embedded_hamt_mirrors: dict[
+                int, tuple[bytes, StateMap[str] | None]
+            ] = {}
             try:
                 engine = get_embedded_engine(self._embedded_hamt_engine)
                 _oet = time.monotonic()
@@ -285,7 +287,9 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 "mirror writes must only happen on the events writer."
             )
 
-    def pop_pending_embedded_hamt_root(self, state_group: int) -> bytes | None:
+    def pop_pending_embedded_hamt_root(
+        self, state_group: int
+    ) -> tuple[bytes, StateMap[str] | None] | None:
         """Returns and clears the expected root_structural_hash for a state
         group created on this (non-writer) instance whose mtxdb mirror
         write was skipped, or None if `state_group` has no pending mirror
@@ -309,6 +313,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         room_version: RoomVersion,
         updates: list[tuple[str, str, str]],
         expected_root_hash: bytes,
+        state_map: Mapping[tuple[str, str], str] | None = None,
     ) -> None:
         """Redo, on the events writer, the mtxdb mirror write a non-writer
         instance skipped when it created `state_group` -- see
@@ -1789,7 +1794,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                     skip_mirror_write=skip_mirror_write,
                 )
                 if skip_mirror_write:
-                    self._pending_embedded_hamt_mirrors[sg_after] = root_hash
+                    self._pending_embedded_hamt_mirrors[sg_after] = (root_hash, None)
                 hamt_writes.append((sg_after, root_hash, lattice, nodes))
                 # Only keep the root node in the local cache for the next iteration.
                 # Child nodes are fetched via SQL/mtxdb in the retry loop if needed.
@@ -1958,7 +1963,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         )
 
         if skip_mirror_write:
-            self._pending_embedded_hamt_mirrors[state_group] = root_hash
+            self._pending_embedded_hamt_mirrors[state_group] = (root_hash, None)
 
         logger.debug(
             "[gg-state-timing] store_state_group group=%d elapsed_ms=%.1f",
