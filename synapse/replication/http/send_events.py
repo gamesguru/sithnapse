@@ -33,6 +33,7 @@ from synapse.events.snapshot import (
 )
 from synapse.http.server import HttpServer
 from synapse.replication.http._base import ReplicationEndpoint
+from synapse.storage.databases.state.store import MAX_MIRROR_STATE_ENTRIES
 from synapse.types import JsonDict, Requester, UserID
 from synapse.util.metrics import Measure
 
