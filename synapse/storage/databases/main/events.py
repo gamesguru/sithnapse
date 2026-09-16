@@ -3764,7 +3764,11 @@ class PersistEventsStore:
                         "Outlier event %s claims to have partial state", event.event_id
                     )
 
-                continue
+                # Out-of-band invites can be persisted as outliers while
+                # still carrying a usable state group. Keep their mapping so
+                # later local join/leave state resolution can find it.
+                if context.state_group is None:
+                    continue
 
             # if the event was rejected, just give it the same state as its
             # predecessor.
