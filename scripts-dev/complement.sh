@@ -645,6 +645,7 @@ cleanup_complement_containers() {
             networks+=("$network")
           fi
         done < <(
+          # shellcheck disable=SC2016 # Docker/Podman expands this Go template.
           "$runtime" inspect --format '{{range $name, $config := .NetworkSettings.Networks}}{{println $name}}{{end}}' \
             "$container" 2>/dev/null || true
         )
@@ -680,6 +681,13 @@ cleanup_stale_complement_networks() {
     return 0
   fi
 
+  # Docker exposes network membership in `network inspect`. Podman does not,
+  # so do not run this stale-resource sweep there until its membership query
+  # is implemented using `podman ps --filter network=...` and verified.
+  if [ "$runtime" != "docker" ]; then
+    return 0
+  fi
+
   now=$(date +%s)
   mapfile -t networks < <("$runtime" network ls -q --filter "name=complement" 2>/dev/null || true)
   for network in "${networks[@]:-}"; do
@@ -692,9 +700,8 @@ cleanup_stale_complement_networks() {
     age=$((now - created_epoch))
     [ "$age" -ge "$stale_after" ] || continue
 
-    # Docker exposes Containers as a map; Podman exposes equivalent network
-    # membership in its inspect JSON. jq handles either shape and a failure
-    # deliberately keeps the network rather than risking deletion.
+    # Docker exposes Containers as a map. A failure deliberately keeps the
+    # network rather than risking deletion.
     attached=$("$runtime" network inspect "$network" 2>/dev/null \
       | jq -r '.[0].Containers // {} | length' 2>/dev/null || echo 1)
     [[ "$attached" =~ ^[0-9]+$ ]] || continue
@@ -1069,6 +1076,7 @@ trap finish EXIT
 # Terminate any active go-test pipeline so it does not outlive container
 # cleanup. Clear _active_producer after a successful wait to avoid
 # signaling a recycled PID later.
+# shellcheck disable=SC2329 # invoked indirectly by the signal traps below.
 _kill_active_producer() {
   if [ -n "$_active_producer" ]; then
     # Negative PID targets the whole process group (see `set -m` above),
