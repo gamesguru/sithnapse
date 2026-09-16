@@ -32,6 +32,10 @@ _engine_configured: bool = False
 # ── FFI boundary timing (opt-in via SYNAPSE_PG_TIMINGS=1) ────────────────
 _FFI_TIMINGS: dict[str, float] = defaultdict(float)
 _FFI_TIMING_COUNTS: dict[str, int] = defaultdict(int)
+_FFI_COUNTERS: dict[str, int] = defaultdict(int)
+_FFI_BATCH_SIZES: dict[str, deque[int]] = defaultdict(
+    lambda: deque(maxlen=_FFI_LATENCY_LIMIT)
+)
 _FFI_LATENCY_LIMIT = 4096
 _FFI_LATENCIES: dict[str, deque[float]] = defaultdict(
     lambda: deque(maxlen=_FFI_LATENCY_LIMIT)
@@ -73,6 +77,30 @@ def ffi_timing(tag: str, elapsed: float) -> None:
         _FFI_LATENCIES[tag].append(elapsed)
 
 
+def ffi_count(tag: str, count: int) -> None:
+    """Record an opt-in count alongside FFI timing diagnostics."""
+    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+        return
+    lock = _FFI_TIMING_LOCK
+    if lock is not None:
+        with lock:
+            _FFI_COUNTERS[tag] += count
+    else:
+        _FFI_COUNTERS[tag] += count
+
+
+def ffi_batch_size(tag: str, size: int) -> None:
+    """Record an opt-in batch-size sample for FFI diagnostics."""
+    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+        return
+    lock = _FFI_TIMING_LOCK
+    if lock is not None:
+        with lock:
+            _FFI_BATCH_SIZES[tag].append(size)
+    else:
+        _FFI_BATCH_SIZES[tag].append(size)
+
+
 def _print_ffi_timings() -> None:
     if not os.environ.get("SYNAPSE_PG_TIMINGS"):
         return
@@ -84,6 +112,8 @@ def _print_ffi_timings() -> None:
             return
         timings = dict(_FFI_TIMINGS)
         counts = dict(_FFI_TIMING_COUNTS)
+        counters = dict(_FFI_COUNTERS)
+        batch_sizes = {k: sorted(v) for k, v in _FFI_BATCH_SIZES.items() if v}
         latencies = {k: sorted(v) for k, v in _FFI_LATENCIES.items() if v}
     _ffi_timings_print("\n=== FFI boundary timings ===")
     has_hist = bool(latencies)
@@ -129,6 +159,22 @@ def _print_ffi_timings() -> None:
     )
     _ffi_timings_print("==============================")
     _ffi_timings_print("")
+    if counters:
+        _ffi_timings_print("=== FFI batch counters ===")
+        for tag in sorted(counters):
+            _ffi_timings_print(f"  {tag:50s}  {counters[tag]:>12,d}")
+        _ffi_timings_print("===========================")
+        _ffi_timings_print("")
+    if batch_sizes:
+        _ffi_timings_print("=== FFI batch sizes ===")
+        for tag, values in sorted(batch_sizes.items()):
+            p50 = values[len(values) // 2]
+            p95 = values[min(len(values) - 1, int(len(values) * 0.95))]
+            _ffi_timings_print(
+                f"  {tag:50s}  calls={len(values):,}  avg={sum(values) / len(values):.1f}  p50={p50}  p95={p95}"
+            )
+        _ffi_timings_print("=======================")
+        _ffi_timings_print("")
 
 
 if os.environ.get("SYNAPSE_PG_TIMINGS"):

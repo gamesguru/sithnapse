@@ -180,7 +180,11 @@ class ReplicationFederationSendEventsRestServlet(ReplicationEndpoint):
                             state_count = None
                         else:
                             version = payload.get("version", 0)
-                            if version != 1:
+                            if version not in (0, 1):
+                                raise RuntimeError(
+                                    f"Unsupported pending HAMT payload version {version}"
+                                )
+                            if version == 0:
                                 if "expected_root" not in payload:
                                     raise RuntimeError(
                                         f"Missing expected_root in mirror payload for state group {sg}"
@@ -210,7 +214,11 @@ class ReplicationFederationSendEventsRestServlet(ReplicationEndpoint):
                                         "Incomplete version-1 pending HAMT payload"
                                     )
                                 state_count = payload["state_count"]
-                                if state_count > MAX_MIRROR_STATE_ENTRIES:
+                                if (
+                                    not isinstance(state_count, int)
+                                    or state_count < 0
+                                    or state_count > MAX_MIRROR_STATE_ENTRIES
+                                ):
                                     raise RuntimeError(
                                         "Pending HAMT payload exceeds state limit"
                                     )
@@ -269,6 +277,14 @@ class ReplicationFederationSendEventsRestServlet(ReplicationEndpoint):
                                 raise RuntimeError(
                                     f"Could not find predecessor for state group {sg} in deltas"
                                 )
+                        if (
+                            version == 1
+                            and isinstance(payload, dict)
+                            and payload["predecessor_state_group"] != prev_sg
+                        ):
+                            raise RuntimeError(
+                                f"Pending HAMT payload predecessor mismatch for state group {sg}"
+                            )
 
                         updates = [
                             (event_type, state_key, ev_id)
@@ -289,6 +305,12 @@ class ReplicationFederationSendEventsRestServlet(ReplicationEndpoint):
                         )
 
                     if replays:
+                        if len(replays) > 1 and any(
+                            replay["version"] == 0 for replay in replays
+                        ):
+                            raise RuntimeError(
+                                "Cannot replay multiple legacy HAMT payloads"
+                            )
                         await self._state_store.redo_embedded_hamt_mirror_writes_batch(
                             event.room_id,
                             event.room_version,

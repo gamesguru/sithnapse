@@ -361,16 +361,26 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                         f"expected {expected_prefix.hex()} but room computed {room_prefix.hex()}"
                     )
 
-                if state_map is not None:
+                version: int = item.get("version", 0)
+                if version == 1:
+                    if state_map is None:
+                        raise RuntimeError(
+                            f"Version-1 mirror payload for state group {state_group} has no state map"
+                        )
                     if "state_count" in item and item["state_count"] is not None:
-                        if item["state_count"] > self.MAX_MIRROR_STATE_ENTRIES:
+                        state_count = item["state_count"]
+                        if (
+                            not isinstance(state_count, int)
+                            or state_count < 0
+                            or state_count > self.MAX_MIRROR_STATE_ENTRIES
+                        ):
                             raise RuntimeError(
-                                f"State count {item['state_count']} exceeds maximum limit {self.MAX_MIRROR_STATE_ENTRIES} for state group {state_group}"
+                                f"State count {state_count} is invalid or exceeds maximum limit {self.MAX_MIRROR_STATE_ENTRIES} for state group {state_group}"
                             )
-                        if len(state_map) != item["state_count"]:
+                        if len(state_map) != state_count:
                             raise RuntimeError(
                                 f"State count mismatch in mirror payload for state group {state_group}: "
-                                f"payload specified {item['state_count']} entries, found {len(state_map)}"
+                                f"payload specified {state_count} entries, found {len(state_map)}"
                             )
 
                     root_hash, lattice, nodes = self._persist_state_hamt_txn(
@@ -383,7 +393,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                         updates=None,
                         skip_mirror_write=True,
                     )
-                else:
+                elif version == 0:
                     # Version-0 / legacy fallback path
                     predecessor_root_found = False
                     if prev_state_group is not None:
@@ -423,6 +433,10 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                         local_nodes=local_nodes,
                         local_roots=local_roots,
                         skip_mirror_write=True,
+                    )
+                else:
+                    raise RuntimeError(
+                        f"Unsupported mirror payload version {version} for state group {state_group}"
                     )
 
                 if root_hash != expected_root_hash:

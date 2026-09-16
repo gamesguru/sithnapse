@@ -59,6 +59,8 @@ import time
 
 from synapse.storage.databases.embedded_engine import get_embedded_engine
 from synapse.storage.databases.main.embedded_common import (
+    ffi_batch_size,
+    ffi_count,
     ffi_timing,
     mirror_timing,
     namespace_hash,
@@ -133,6 +135,8 @@ def get_state_group_for_events_batch(
     engine; a missing id is simply absent from the result.
     """
     with mirror_timing("get_event_to_state_group"):
+        ffi_count("event_to_state_group_event_ids_requested", len(event_ids))
+        ffi_batch_size("event_to_state_group", len(event_ids))
         engine = get_embedded_engine(engine_name)
         batch_get = engine.batch_get
 
@@ -142,6 +146,7 @@ def get_state_group_for_events_batch(
         key_to_event_id = dict(zip(keys, event_ids))
         _et = time.monotonic()
         found = batch_get(keys)
+        ffi_count("event_to_state_group_keys_sent", len(keys))
         ffi_timing("ffi_batch_get", time.monotonic() - _et)
         out = {}
         for key, value in found:
@@ -150,6 +155,8 @@ def get_state_group_for_events_batch(
                 raise RuntimeError("invalid event_to_state_group record")
             (state_group,) = struct.unpack(">q", value)
             out[key_to_event_id[bytes(key)]] = state_group
+        ffi_count("event_to_state_group_records_returned", len(out))
+        ffi_count("event_to_state_group_misses", len(event_ids) - len(out))
     return out
 
 
