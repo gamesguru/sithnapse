@@ -709,6 +709,32 @@ cleanup_complement_containers() {
   fi
 }
 
+# Stop the PostgreSQL timing watcher and every process it spawned. The watcher
+# contains `docker events`, a tail pipeline, and one `docker logs -f` process
+# per container; process-group membership is not reliable when this script is
+# launched from an interactive shell, so walk the actual child tree instead.
+cleanup_pg_log_watcher() {
+  local pid="${_pg_log_watcher_pid:-}"
+  local child
+  [ -n "$pid" ] || return 0
+
+  for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+    _kill_process_tree "$child"
+  done
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  _pg_log_watcher_pid=""
+}
+
+_kill_process_tree() {
+  local pid="$1"
+  local child
+  for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+    _kill_process_tree "$child"
+  done
+  kill "$pid" 2>/dev/null || true
+}
+
 # A crashed Complement process can leave running containers or pods behind.
 # They have no reliable token we can recover after the shell dies, so this
 # startup sweep is protected by the run lock and removes only Complement-named
@@ -941,17 +967,7 @@ run_one_pattern() {
   set -e
   rm -rf "$_events_dir"
 
-  # Stop the PG timing log watcher (if running). Its `docker events`
-  # reader, merge/dedupe pipeline, and every `docker logs -f` follower it
-  # forked all share its process group (see `set -m` above), so a single
-  # negative-PID kill tears down the whole tree at once -- a plain `kill`
-  # of just $_pg_log_watcher_pid would leave the followers, which are its
-  # grandchildren, running past this function.
-  if [[ -n "${_pg_log_watcher_pid:-}" ]]; then
-    kill -- "-$_pg_log_watcher_pid" 2>/dev/null || kill "$_pg_log_watcher_pid" 2>/dev/null || true
-    wait "$_pg_log_watcher_pid" 2>/dev/null || true
-    _pg_log_watcher_pid=""
-  fi
+  cleanup_pg_log_watcher
   # Accumulate every pattern invocation's timing dir instead of overwriting,
   # so `finish` extracts timings from *all* -run patterns, not just the last.
   if [[ -n "${_pg_timing_dir:-}" ]]; then
@@ -979,6 +995,8 @@ _reported=""
 finish() {
   [ -n "$_reported" ] && return 0
   _reported=1
+
+  cleanup_pg_log_watcher
 
   merge_script="${repo_root}/scripts-dev/merge_complement_results.py"
   if [ -f "$staged_results_file" ] && [ -s "$staged_results_file" ]; then
