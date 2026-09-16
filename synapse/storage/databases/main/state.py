@@ -797,6 +797,12 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
                     self._embedded_hamt_namespace,
                     [state_group],
                 )
+            self.db_pool.simple_update_txn(
+                txn,
+                table="event_to_state_groups",
+                keyvalues={"event_id": event.event_id},
+                updatevalues={"state_group": state_group},
+            )
             # Mark STATE pool dirty after SQL commit via txn.call_after.
             txn.call_after(mark_dirty, Pool.STATE)
         else:
