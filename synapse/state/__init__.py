@@ -333,9 +333,23 @@ class StateHandler:
             # we've already taken into account partial state, so no need to wait for
             # complete state here.
 
+            state_prev_event_ids = prev_event_ids
+            if len(prev_event_ids) > 1:
+                # If there are multiple prev_events, some may be stateless
+                # outliers (e.g. an out-of-band remote invite in a room the
+                # server is already participating in). Filter them out for state
+                # resolution so long as at least one state-bearing event remains.
+                non_outlier_prev_events = set()
+                for prev_id in prev_event_ids:
+                    sg = await self.store._get_state_group_for_event(prev_id)
+                    if sg is not None:
+                        non_outlier_prev_events.add(prev_id)
+                if non_outlier_prev_events:
+                    state_prev_event_ids = frozenset(non_outlier_prev_events)
+
             entry = await self.resolve_state_groups_for_events(
                 event.room_id,
-                prev_event_ids,
+                state_prev_event_ids,
                 await_full_state=False,
             )
 
