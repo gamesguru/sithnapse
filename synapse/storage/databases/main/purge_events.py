@@ -494,7 +494,7 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
 
         self._invalidate_cache_and_stream_bulk(
             txn,
-            self._get_state_group_for_event,
+            self._get_state_group_for_event_sql,
             [(event_id,) for event_id, _ in event_rows],
         )
 
