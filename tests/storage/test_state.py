@@ -920,7 +920,7 @@ class StateStoreTestCase(HomeserverTestCase):
             ("m.room.create", ""): "$create",
             ("m.room.member", "@alice:example.com"): "$member",
         }
-        root_hash, lattice, _, _ = state_hamt.build_root_handle_with_lattice(
+        root_hash, _sg, lattice, _ = state_hamt.build_root_handle_with_lattice(
             room_id,
             [(k[0], k[1], v) for k, v in state_map.items()],
         )
@@ -964,11 +964,11 @@ class StateStoreTestCase(HomeserverTestCase):
             ("m.room.create", ""): "$create",
             ("m.room.name", ""): "$name",
         }
-        root_1, lat_1, _, _ = state_hamt.build_root_handle_with_lattice(
+        root_1, _sg1, lat_1, _ = state_hamt.build_root_handle_with_lattice(
             room_id,
             [(k[0], k[1], v) for k, v in state_map_1.items()],
         )
-        root_2, lat_2, _, _ = state_hamt.build_root_handle_with_lattice(
+        root_2, _sg2, lat_2, _ = state_hamt.build_root_handle_with_lattice(
             room_id,
             [(k[0], k[1], v) for k, v in state_map_2.items()],
         )
@@ -1019,7 +1019,7 @@ class StateStoreTestCase(HomeserverTestCase):
 
         state_map_1 = {("m.room.create", ""): "$create"}
         state_map_2 = {("m.room.create", ""): "$create", ("m.room.name", ""): "$name"}
-        root_1, lat_1, _, _ = state_hamt.build_root_handle_with_lattice(
+        root_1, _sg1, lat_1, _ = state_hamt.build_root_handle_with_lattice(
             room_id,
             [(k[0], k[1], v) for k, v in state_map_1.items()],
         )
