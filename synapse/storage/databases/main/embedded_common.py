@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import hashlib
+import json
 import logging
 import os
 import threading
@@ -115,6 +116,28 @@ def _print_ffi_timings() -> None:
         counters = dict(_FFI_COUNTERS)
         batch_sizes = {k: sorted(v) for k, v in _FFI_BATCH_SIZES.items() if v}
         latencies = {k: sorted(v) for k, v in _FFI_LATENCIES.items() if v}
+
+    run_dir = os.environ.get("SYNAPSE_TIMINGS_RUN_DIR")
+    if run_dir:
+        tmp_path = os.path.join(run_dir, f"ffi_{os.getpid()}.tmp")
+        final_path = os.path.join(run_dir, f"ffi_{os.getpid()}.json")
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "timings": timings,
+                        "counts": counts,
+                        "counters": counters,
+                        "batch_sizes": batch_sizes,
+                        "latencies": latencies,
+                    },
+                    f,
+                )
+            os.replace(tmp_path, final_path)
+        except OSError:
+            pass
+        return
+
     _ffi_timings_print("\n=== FFI boundary timings ===")
     has_hist = bool(latencies)
     if has_hist:

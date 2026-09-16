@@ -173,6 +173,19 @@ def _print_pg_timings() -> None:
         # concurrent `_pg_timing` on these dicts.
         timings = dict(_PG_TIMINGS)
         counts = dict(_PG_TIMING_COUNTS)
+
+    run_dir = os.environ.get("SYNAPSE_TIMINGS_RUN_DIR")
+    if run_dir:
+        tmp_path = os.path.join(run_dir, f"lifecycle_{os.getpid()}.tmp")
+        final_path = os.path.join(run_dir, f"lifecycle_{os.getpid()}.json")
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump({"timings": timings, "counts": counts}, f)
+            os.replace(tmp_path, final_path)
+        except OSError:
+            pass
+        return
+
     _timings_print("\n=== Postgres test-DB lifecycle timings ===")
     _timings_print(
         f"  {'':40s}  {'total':>9s}  {'calls':>6s}  {'avg':>11s}",

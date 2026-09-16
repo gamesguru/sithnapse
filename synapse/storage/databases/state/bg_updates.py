@@ -20,6 +20,7 @@
 #
 
 import atexit
+import json
 import logging
 import os
 import struct
@@ -166,6 +167,19 @@ def _print_state_timings() -> None:
         # concurrent `_state_timing` on these dicts.
         timings = dict(_STATE_TIMINGS)
         counts = dict(_STATE_TIMING_COUNTS)
+
+    run_dir = os.environ.get("SYNAPSE_TIMINGS_RUN_DIR")
+    if run_dir:
+        tmp_path = os.path.join(run_dir, f"state_{os.getpid()}.tmp")
+        final_path = os.path.join(run_dir, f"state_{os.getpid()}.json")
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump({"timings": timings, "counts": counts}, f)
+            os.replace(tmp_path, final_path)
+        except OSError:
+            pass
+        return
+
     _timings_print("\n=== State store mtxdb-vs-SQL timings ===")
     _timings_print(
         f"  {'':40s}  {'total':>10s}  {'calls':>6s}  {'avg':>13s}",
@@ -232,6 +246,29 @@ def _print_node_write_stats() -> None:
         size_buckets = dict(_NODE_WRITE_SIZE_BUCKETS)
     if calls == 0:
         return
+
+    run_dir = os.environ.get("SYNAPSE_TIMINGS_RUN_DIR")
+    if run_dir:
+        tmp_path = os.path.join(run_dir, f"node_writes_{os.getpid()}.tmp")
+        final_path = os.path.join(run_dir, f"node_writes_{os.getpid()}.json")
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "calls": calls,
+                        "total_nodes": total_nodes,
+                        "total_bytes": total_bytes,
+                        "total_time": total_time,
+                        "lat_buckets": lat_buckets,
+                        "size_buckets": size_buckets,
+                    },
+                    f,
+                )
+            os.replace(tmp_path, final_path)
+        except OSError:
+            pass
+        return
+
     _timings_print("\n=== put_state_hamt_nodes batch diagnostics ===")
     _timings_print(f"  calls:                    {calls}")
     _timings_print(f"  total nodes:              {total_nodes}")

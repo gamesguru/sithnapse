@@ -21,6 +21,7 @@
 #
 import atexit
 import inspect
+import json
 import logging
 import os
 import re
@@ -179,6 +180,22 @@ def _print_table_ops() -> None:
         table_ops = dict(_TABLE_OPS)
         table_counts = dict(_TABLE_OPS_COUNTS)
         table_rows = dict(_TABLE_OPS_ROWS)
+
+    run_dir = os.environ.get("SYNAPSE_TIMINGS_RUN_DIR")
+    if run_dir:
+        tmp_path = os.path.join(run_dir, f"sql_{os.getpid()}.tmp")
+        final_path = os.path.join(run_dir, f"sql_{os.getpid()}.json")
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"ops": table_ops, "counts": table_counts, "rows": table_rows},
+                    f,
+                )
+            os.replace(tmp_path, final_path)
+        except OSError:
+            pass
+        return
+
     # Sort by total time descending
     ranked = sorted(table_ops.items(), key=lambda kv: kv[1], reverse=True)
     _timings_print("\n=== Per-table SQL timing (top 30) ===")
