@@ -715,15 +715,31 @@ cleanup_complement_containers() {
 # launched from an interactive shell, so walk the actual child tree instead.
 cleanup_pg_log_watcher() {
   local pid="${_pg_log_watcher_pid:-}"
+  local timing_dir="${_pg_timing_dir:-}"
   local child
-  [ -n "$pid" ] || return 0
 
-  for child in $(pgrep -P "$pid" 2>/dev/null || true); do
-    _kill_process_tree "$child"
-  done
-  kill "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
+  if [ -n "$pid" ]; then
+    for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+      _kill_process_tree "$child"
+    done
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  fi
+
+  # The watcher contains a pipeline.  Its tail and log followers can become
+  # reparented when the pipeline is torn down, so they are no longer visible
+  # below _pg_log_watcher_pid.  The timing directory is unique to this run;
+  # use it to reap those otherwise-detached processes without matching another
+  # Complement invocation.
+  if [ -n "$timing_dir" ]; then
+    while IFS= read -r child; do
+      [ -n "$child" ] || continue
+      _kill_process_tree "$child"
+    done < <(pgrep -f -- "$timing_dir" 2>/dev/null || true)
+  fi
+
   _pg_log_watcher_pid=""
+  _pg_timing_dir=""
 }
 
 _kill_process_tree() {
@@ -1183,9 +1199,9 @@ _kill_active_producer() {
     _active_producer=""
   fi
 }
-trap '_kill_active_producer; exit 130' INT
-trap '_kill_active_producer; exit 143' TERM
-trap '_kill_active_producer; exit 129' HUP
+trap '_kill_active_producer; cleanup_pg_log_watcher; exit 130' INT
+trap '_kill_active_producer; cleanup_pg_log_watcher; exit 143' TERM
+trap '_kill_active_producer; cleanup_pg_log_watcher; exit 129' HUP
 
 # ── Run all patterns ──────────────────────────────────────────────────────────
 for _pattern in "${ALT_PATTERNS[@]}"; do
