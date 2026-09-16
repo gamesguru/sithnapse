@@ -2666,6 +2666,30 @@ fn stats_to_dict(
             ot.metadata_restore.as_micros() as u64,
         )?;
         od.set_item(
+            "pool_meta_restore_us",
+            ot.pool_meta_restore.as_micros() as u64,
+        )?;
+        od.set_item(
+            "persisted_stats_restore_us",
+            ot.persisted_stats_restore.as_micros() as u64,
+        )?;
+        od.set_item(
+            "store_meta_write_us",
+            ot.store_meta_write.as_micros() as u64,
+        )?;
+        od.set_item(
+            "pool_meta_persist_us",
+            ot.pool_meta_persist.as_micros() as u64,
+        )?;
+        od.set_item(
+            "initial_pack_create_us",
+            ot.initial_pack_create.as_micros() as u64,
+        )?;
+        od.set_item(
+            "metadata_unattributed_us",
+            ot.metadata_unattributed.as_micros() as u64,
+        )?;
+        od.set_item(
             "shard_open_unattributed_us",
             ot.shard_open_unattributed.as_micros() as u64,
         )?;

@@ -314,8 +314,37 @@ def _print_mtxdb_stats() -> None:
         # Open timings.
         ot = ps.get("last_open_timings")
         if ot:
+            is_fresh = any(
+                ot.get(k, 0) > 0
+                for k in (
+                    "store_meta_write_us",
+                    "pool_meta_persist_us",
+                    "initial_pack_create_us",
+                )
+            )
+            init_str = ""
+            if is_fresh:
+                init_str = (
+                    f" init(store_meta={_fmt_us(ot.get('store_meta_write_us', 0))} "
+                    f"pool_persist={_fmt_us(ot.get('pool_meta_persist_us', 0))} "
+                    f"pack_create={_fmt_us(ot.get('initial_pack_create_us', 0))})"
+                )
+            meta_unatt = ot.get("metadata_unattributed_us", 0)
+            meta_unatt_str = f" unatt={_fmt_us(meta_unatt)}" if meta_unatt > 0 else ""
             print(
-                f"    last open: {_fmt_us(ot.get('total_us', 0))} (shard={_fmt_us(ot.get('shard_open_us', 0))} discovery={_fmt_us(ot.get('shard_discovery_us', 0))} lock={_fmt_us(ot.get('writer_lock_us', 0))} recovery={_fmt_us(ot.get('packfile_recovery_us', 0))}/{ot.get('packfile_recovery_calls', 0)} packs open={_fmt_us(ot.get('packfile_open_us', 0))}/{ot.get('packfile_open_calls', 0)} packs metadata={_fmt_us(ot.get('metadata_restore_us', 0))} unattributed={_fmt_us(ot.get('shard_open_unattributed_us', 0))})",
+                f"    last open: {_fmt_us(ot.get('total_us', 0))} ("
+                f"shard={_fmt_us(ot.get('shard_open_us', 0))} "
+                f"discovery={_fmt_us(ot.get('shard_discovery_us', 0))} "
+                f"lock={_fmt_us(ot.get('writer_lock_us', 0))} "
+                f"recovery={_fmt_us(ot.get('packfile_recovery_us', 0))}/{ot.get('packfile_recovery_calls', 0)} packs "
+                f"open={_fmt_us(ot.get('packfile_open_us', 0))}/{ot.get('packfile_open_calls', 0)} packs "
+                f"metadata={_fmt_us(ot.get('metadata_restore_us', 0))}["
+                f"pool_meta={_fmt_us(ot.get('pool_meta_restore_us', 0))} "
+                f"stats={_fmt_us(ot.get('persisted_stats_restore_us', 0))}"
+                f"{init_str}"
+                f"{meta_unatt_str}"
+                f"] "
+                f"unattributed={_fmt_us(ot.get('shard_open_unattributed_us', 0))})",
                 file=out,
             )
             print(
