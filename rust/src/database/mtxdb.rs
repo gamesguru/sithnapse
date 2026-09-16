@@ -530,15 +530,16 @@ mod room_index {
     static PREFIX_CACHE: Mutex<Option<LruCache<(String, i64), [u8; ROOM_PREFIX_LEN]>>> =
         Mutex::new(None);
 
-    /// Handles are cached by fixed shard, never by namespace. This bounds the
-    /// directory to `SHARD_COUNT` files and the process to the same number of
-    /// possible room-index descriptors.
-    static HANDLES: Mutex<Option<LruCache<u8, std::sync::Arc<File>>>> = Mutex::new(None);
+    /// Handles are cached by fixed shard and access mode, never by namespace.
+    /// A read-only lookup must never poison the writable handle used by `put`.
+    /// This bounds the process to at most two descriptors per shard.
+    #[allow(clippy::type_complexity)]
+    static HANDLES: Mutex<Option<LruCache<(u8, bool), std::sync::Arc<File>>>> = Mutex::new(None);
 
     /// Namespaces `put` has written to since the last `sync()`. `sync()`
     /// used to unconditionally `sync_data()` every cached handle -- with
-    /// `HANDLE_CACHE_CAPACITY` at 64 and one namespace per homeserver (see
-    /// `HANDLES`'s doc comment), a workload that opens many short-lived
+    /// `HANDLE_CACHE_CAPACITY` at 64 and one namespace per homeserver, a
+    /// workload that opens many short-lived
     /// namespaces (e.g. the test suite, one per HS) fills the cache with
     /// mostly-idle handles from *other* namespaces, so every write-path
     /// sync (`sync_state`, called on essentially every event persist) paid
@@ -584,13 +585,14 @@ mod room_index {
 
     fn cached_handle(namespace: &str, create: bool) -> PyResult<Option<std::sync::Arc<File>>> {
         let shard = shard_for(namespace);
+        let key = (shard, create);
         let mut guard = HANDLES
             .lock()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}")))?;
         let map = guard.get_or_insert_with(|| {
             LruCache::new(NonZeroUsize::new(HANDLE_CACHE_CAPACITY).expect("nonzero capacity"))
         });
-        if let Some(file) = map.get(&shard) {
+        if let Some(file) = map.get(&key) {
             return Ok(Some(Arc::clone(file)));
         }
         let path = index_path(shard, create)?;
@@ -610,7 +612,7 @@ mod room_index {
             }
         };
         let file = Arc::new(file);
-        map.put(shard, Arc::clone(&file));
+        map.put(key, Arc::clone(&file));
         Ok(Some(file))
     }
 
@@ -784,7 +786,7 @@ mod room_index {
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}")))?;
         if let Some(map) = guard.as_ref() {
             for shard in dirty {
-                if let Some(file) = map.peek(&shard) {
+                if let Some(file) = map.peek(&(shard, true)) {
                     file.sync_data().map_err(|e| {
                         pyo3::exceptions::PyRuntimeError::new_err(format!(
                             "room_index sync failed: {e}"
@@ -826,6 +828,26 @@ mod room_index {
 
             let got = get_many(ns_kept, &[1]).expect("get kept");
             assert_eq!(got, vec![Some(prefix)]);
+        }
+
+        #[test]
+        fn read_handle_does_not_poison_later_write() {
+            super::super::auth_chain_closure_tests::ensure_open();
+            let namespace = "ns-read-before-write";
+
+            put(namespace, &[(10_001, b"ROOM4GHI".to_vec())]).expect("initial put");
+            *HANDLES.lock().expect("no poison") = None;
+            *PREFIX_CACHE.lock().expect("no poison") = None;
+
+            // This opens the shard read-only because the file already exists.
+            assert_eq!(
+                get_many(namespace, &[10_001]).expect("read"),
+                vec![Some(b"ROOM4GHI".to_vec())]
+            );
+
+            // A later write must open a separate writable handle, rather than
+            // reusing the read-only handle cached above.
+            put(namespace, &[(10_002, b"ROOM5JKL".to_vec())]).expect("write after read");
         }
 
         #[test]

@@ -153,6 +153,12 @@ main() {
     export CONTAINER_RUNTIME=docker
   fi
 
+  # Complement deployments use a shared container daemon. Serialize this
+  # script so one invocation cannot clean up resources belonging to another
+  # invocation between deployment and container attachment. `flock` releases
+  # the lock automatically if the shell is killed.
+  acquire_complement_run_lock
+
   # Change to the repository root. Resolve it once, here, to an absolute
   # path and reuse that below -- $0 is never re-anchored after this cd, so
   # re-deriving "$(dirname "$0")/.." again later (once CWD has already
@@ -363,6 +369,10 @@ main() {
   # Enable dirty runs, so tests will reuse the same container where possible.
   # This significantly speeds up tests, but increases the possibility of test pollution.
   export COMPLEMENT_ENABLE_DIRTY_RUNS=1
+
+  # Reclaim resources left by older failed runs. The run lock above prevents
+  # this sweep from racing another complement.sh invocation.
+  cleanup_stale_complement_containers
 
   # Reclaim networks left by older failed runs. The grace period prevents a
   # concurrent run's freshly-created, not-yet-attached network from being
@@ -626,6 +636,23 @@ main() {
   return 0
 }
 
+# Keep only one local complement.sh deployment active at a time. This is
+# deliberately process-scoped rather than runtime-scoped: Docker/Podman do
+# not provide a transaction covering resource discovery and deployment.
+acquire_complement_run_lock() {
+  local lock_file="${TMPDIR:-/tmp}/synapse-complement.lock"
+  if ! command -v flock &>/dev/null; then
+    echo "ERROR: flock is required to safely clean up stale Complement resources" >&2
+    return 1
+  fi
+
+  exec {COMPLEMENT_RUN_LOCK_FD}>"$lock_file"
+  if ! flock -n "$COMPLEMENT_RUN_LOCK_FD"; then
+    echo "Another complement.sh run is active; refusing to clean up shared resources" >&2
+    return 1
+  fi
+}
+
 # Invoked by the EXIT trap installed in main.
 # shellcheck disable=SC2329
 cleanup_complement_containers() {
@@ -666,6 +693,35 @@ cleanup_complement_containers() {
   fi
 }
 
+# A crashed Complement process can leave running containers or pods behind.
+# They have no reliable token we can recover after the shell dies, so this
+# startup sweep is protected by the run lock and removes only Complement-named
+# resources carrying Complement's ownership labels from this runtime.
+cleanup_stale_complement_containers() {
+  local runtime="${CONTAINER_RUNTIME:-docker}"
+  local container pod
+  local -a containers=() pods=()
+
+  if ! command -v "$runtime" &>/dev/null; then
+    return 0
+  fi
+
+  mapfile -t containers < <("$runtime" ps -aq --filter "label=complement_pkg" 2>/dev/null || true)
+  if [ "${#containers[@]}" -gt 0 ]; then
+    echo "Cleaning up stale Complement containers..." >&2
+    printf '%s\n' "${containers[@]}" | xargs -r "$runtime" rm -f
+  fi
+
+  if [ "$runtime" = "podman" ]; then
+    mapfile -t pods < <("$runtime" pod ps -aq --filter "label=complement_pkg" 2>/dev/null || true)
+    for pod in "${pods[@]:-}"; do
+      [ -n "$pod" ] || continue
+      echo "Cleaning up stale Complement pod $pod..." >&2
+      "$runtime" pod rm -f "$pod" >/dev/null 2>&1 || true
+    done
+  fi
+}
+
 # Remove only old, empty Complement networks. This handles deployments which
 # died after creating a network but before creating a token-labelled container.
 # The age check is intentional: network creation and container attachment are
@@ -689,7 +745,7 @@ cleanup_stale_complement_networks() {
   fi
 
   now=$(date +%s)
-  mapfile -t networks < <("$runtime" network ls -q --filter "name=complement" 2>/dev/null || true)
+  mapfile -t networks < <("$runtime" network ls -q --filter "label=complement_pkg" 2>/dev/null || true)
   for network in "${networks[@]:-}"; do
     [ -n "$network" ] || continue
 
@@ -1065,6 +1121,11 @@ for suite, total in sorted(suite_times.items(), key=lambda x: -x[1]):
   fi
 
   cleanup_complement_containers
+  # Also sweep resources left by an older interrupted invocation. Keep this
+  # on the EXIT path as well as startup so an invocation which is interrupted
+  # before Complement's normal teardown still gets cleaned up immediately.
+  cleanup_stale_complement_containers
+  cleanup_stale_complement_networks
 }
 trap finish EXIT
 
