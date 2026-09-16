@@ -299,8 +299,15 @@ def _print_node_write_stats() -> None:
 
 
 if os.environ.get("SYNAPSE_PG_TIMINGS"):
-    atexit.register(_print_state_timings)
-    atexit.register(_print_node_write_stats)
+
+    def flush_state_timings() -> None:
+        _print_state_timings()
+
+    def flush_node_write_stats() -> None:
+        _print_node_write_stats()
+
+    atexit.register(flush_state_timings)
+    atexit.register(flush_node_write_stats)
 
     import signal as _signal
     from types import FrameType as _FrameType

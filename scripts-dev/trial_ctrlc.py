@@ -23,6 +23,23 @@ from twisted.trial import itrial, unittest
 from twisted.trial.runner import TrialRunner, _logFile, _testDirectory
 
 
+def _flush_process_timings() -> None:
+    """Flush diagnostics owned by this process before aggregating them."""
+    flushers = (
+        ("tests.server", "flush_pg_timings"),
+        ("synapse.storage.database", "flush_table_ops"),
+        ("synapse.storage.databases.state.bg_updates", "flush_state_timings"),
+        ("synapse.storage.databases.state.bg_updates", "flush_node_write_stats"),
+        ("synapse.storage.databases.main.embedded_common", "flush_ffi_timings"),
+    )
+    for module_name, function_name in flushers:
+        module = sys.modules.get(module_name)
+        if module is not None:
+            flusher = getattr(module, function_name, None)
+            if flusher is not None:
+                flusher()
+
+
 def _aggregate_and_print_timings(timings_dir: str) -> None:
     timings_path = os.environ.get("SYNAPSE_PG_TIMINGS_FILE")
     out_file = None
@@ -328,7 +345,7 @@ def run() -> None:
         raise SystemExit(f"{sys.argv[0]}: --profile is not supported by this wrapper")
 
     timings_dir: str | None = None
-    if os.environ.get("SYNAPSE_PG_TIMINGS"):
+    if os.environ.get("SYNAPSE_PG_TIMINGS") and config["jobs"] is not None:
         timings_dir = tempfile.mkdtemp(prefix="synapse_timings_")
         os.environ["SYNAPSE_TIMINGS_RUN_DIR"] = timings_dir
 
@@ -375,6 +392,7 @@ def run() -> None:
     finally:
         if timings_dir:
             try:
+                _flush_process_timings()
                 _aggregate_and_print_timings(timings_dir)
             finally:
                 shutil.rmtree(timings_dir, ignore_errors=True)

@@ -208,7 +208,11 @@ def _print_pg_timings() -> None:
     _timings_print("")
 
 
-atexit.register(_print_pg_timings)
+def flush_pg_timings() -> None:
+    _print_pg_timings()
+
+
+atexit.register(flush_pg_timings)
 
 if os.environ.get("SYNAPSE_PG_TIMINGS"):
     import signal as _signal

@@ -225,7 +225,11 @@ def _print_table_ops() -> None:
 
 
 if os.environ.get("SYNAPSE_PG_TIMINGS"):
-    atexit.register(_print_table_ops)
+
+    def flush_table_ops() -> None:
+        _print_table_ops()
+
+    atexit.register(flush_table_ops)
 
     import signal as _signal
     from types import FrameType as _FrameType

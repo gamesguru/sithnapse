@@ -201,7 +201,11 @@ def _print_ffi_timings() -> None:
 
 
 if os.environ.get("SYNAPSE_PG_TIMINGS"):
-    atexit.register(_print_ffi_timings)
+
+    def flush_ffi_timings() -> None:
+        _print_ffi_timings()
+
+    atexit.register(flush_ffi_timings)
 
 
 # ── mtxdb runtime stats (opt-in via SYNAPSE_MTXDB_STATS=1) ──────────────
