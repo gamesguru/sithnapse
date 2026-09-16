@@ -347,10 +347,15 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             # rebuild would deliberately hit the strict HAMT reader. Repair
             # this replication-only case from the legacy SQL state instead.
             predecessor_state: StateMap[str] | None = None
-            if (
-                prev_state_group is not None
-                and self._get_embedded_hamt_root(room_prefix, prev_state_group) is None
-            ):
+            predecessor_root_found = False
+            used_fallback = False
+            if prev_state_group is not None:
+                predecessor_root_found = (
+                    self._get_embedded_hamt_root(room_prefix, prev_state_group)
+                    is not None
+                )
+
+            if prev_state_group is not None and not predecessor_root_found:
                 predecessor_exists = self.db_pool.simple_select_one_onecol_txn(
                     txn,
                     table="state_groups",
@@ -359,6 +364,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                     allow_none=True,
                 )
                 if predecessor_exists is not None:
+                    used_fallback = True
                     predecessor_state = self._get_legacy_state_for_groups_txn(
                         txn, [prev_state_group], StateFilter.all()
                     )[prev_state_group]
@@ -396,7 +402,21 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                     # Compute only -- verify before persisting, see docstring.
                     skip_mirror_write=True,
                 )
+
             if root_hash != expected_root_hash:
+                logger.error(
+                    "mtxdb mirror replay mismatch: state_group=%d prev_state_group=%s "
+                    "updates=%d predecessor_root_found=%s used_fallback=%s "
+                    "predecessor_state_size=%s expected=%s actual=%s",
+                    state_group,
+                    prev_state_group,
+                    len(updates),
+                    predecessor_root_found,
+                    used_fallback,
+                    len(predecessor_state) if predecessor_state is not None else None,
+                    expected_root_hash.hex(),
+                    root_hash.hex(),
+                )
                 raise RuntimeError(
                     "mtxdb mirror-write determinism check failed for state "
                     f"group {state_group}: writer recomputed root "

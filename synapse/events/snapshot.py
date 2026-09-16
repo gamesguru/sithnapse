@@ -248,6 +248,15 @@ class EventContext(UnpersistedEventContextBase):
             context.app_service = storage.main.get_app_service_by_id(app_service_id)
 
         pending_roots_dict = input.get("pending_embedded_hamt_mirror_roots")
+        if pending_roots_dict is None:
+            # Backwards compat: old workers send singular hex string
+            old_root_hex = input.get("pending_embedded_hamt_mirror_root")
+            if (
+                old_root_hex is not None
+                and getattr(context, "_state_group", None) is not None
+            ):
+                pending_roots_dict = {str(context._state_group): old_root_hex}
+
         context.pending_embedded_hamt_mirror_roots = (
             {int(sg): bytes.fromhex(h) for sg, h in pending_roots_dict.items()}
             if pending_roots_dict
@@ -419,6 +428,20 @@ class UnpersistedEventContext(UnpersistedEventContextBase):
         for event, unpersisted_context in amended_events_and_context:
             state_group_deltas = unpersisted_context._build_state_group_deltas()
 
+            # Pop any deferred mtxdb mirror roots that the batch created
+            # on this non-writer instance, so the events writer can replay them.
+            _pending_roots: dict[int, bytes] = {}
+            state_stores = getattr(unpersisted_context._storage.state, "stores", None)
+            if state_stores is not None:
+                for sg in (
+                    unpersisted_context.state_group_before_event,
+                    unpersisted_context.state_group_after_event,
+                ):
+                    if sg is not None:
+                        root = state_stores.state.pop_pending_embedded_hamt_root(sg)
+                        if root:
+                            _pending_roots[sg] = root
+
             context = EventContext(
                 storage=unpersisted_context._storage,
                 state_group=unpersisted_context.state_group_after_event,
@@ -426,6 +449,7 @@ class UnpersistedEventContext(UnpersistedEventContextBase):
                 state_delta_due_to_event=unpersisted_context.state_delta_due_to_event,
                 partial_state=unpersisted_context.partial_state,
                 state_group_deltas=state_group_deltas,
+                pending_embedded_hamt_mirror_roots=_pending_roots or None,
             )
             events_and_persisted_context.append((event, context))
         return events_and_persisted_context
