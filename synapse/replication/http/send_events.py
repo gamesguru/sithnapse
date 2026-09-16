@@ -166,6 +166,10 @@ class ReplicationSendEventsRestServlet(ReplicationEndpoint):
                         delta = None
 
                         if isinstance(pending_payload, bytes):
+                            if len(pending_payload) != 32:
+                                raise RuntimeError(
+                                    f"Invalid legacy root length {len(pending_payload)} for state group {sg}"
+                                )
                             expected_root = pending_payload
                             full_state_map = None
                             expected_lattice = None
@@ -176,7 +180,15 @@ class ReplicationSendEventsRestServlet(ReplicationEndpoint):
                             payload = pending_payload
                             version = payload.get("version", 0)
                             if version != 1:
+                                if "expected_root" not in payload:
+                                    raise RuntimeError(
+                                        f"Missing expected_root in mirror payload for state group {sg}"
+                                    )
                                 expected_root = bytes.fromhex(payload["expected_root"])
+                                if len(expected_root) != 32:
+                                    raise RuntimeError(
+                                        f"Invalid expected_root length {len(expected_root)} for state group {sg}"
+                                    )
                                 full_state_map = None
                                 expected_lattice = None
                                 expected_prefix = None
@@ -189,23 +201,56 @@ class ReplicationSendEventsRestServlet(ReplicationEndpoint):
                                 if (
                                     "state" not in payload
                                     or "state_count" not in payload
+                                    or "expected_root" not in payload
+                                    or "lattice" not in payload
+                                    or "room_prefix" not in payload
                                 ):
                                     raise RuntimeError(
                                         "Incomplete version-1 pending HAMT payload"
                                     )
                                 state_count = payload["state_count"]
-                                if state_count > 100_000:
+                                if state_count > MAX_MIRROR_STATE_ENTRIES:
                                     raise RuntimeError(
                                         "Pending HAMT payload exceeds state limit"
                                     )
                                 expected_root = bytes.fromhex(payload["expected_root"])
+                                if len(expected_root) != 32:
+                                    raise RuntimeError(
+                                        f"Invalid expected_root length {len(expected_root)} for state group {sg}"
+                                    )
+                                expected_lattice = bytes.fromhex(payload["lattice"])
+                                if len(expected_lattice) != 2048:
+                                    raise RuntimeError(
+                                        f"Invalid expected_lattice length {len(expected_lattice)} for state group {sg}"
+                                    )
+                                expected_prefix = bytes.fromhex(payload["room_prefix"])
+                                if len(expected_prefix) != 32:
+                                    raise RuntimeError(
+                                        f"Invalid room_prefix length {len(expected_prefix)} for state group {sg}"
+                                    )
+
+                                from synapse.synapse_rust import state_hamt
+
+                                event_room_prefix = state_hamt.room_hamt_prefix(
+                                    event.room_id,
+                                    event.room_version.msc4291_room_ids_as_hashes,
+                                )
+                                if expected_prefix != event_room_prefix:
+                                    raise RuntimeError(
+                                        f"Room prefix mismatch in mirror payload for state group {sg}: "
+                                        f"expected {expected_prefix.hex()} but room computed {event_room_prefix.hex()}"
+                                    )
+
                                 full_state_map = _decode_state_dict(payload["state"])
                                 if full_state_map is None:
                                     raise RuntimeError(
                                         "Version-1 pending HAMT payload has no state"
                                     )
-                                expected_lattice = bytes.fromhex(payload["lattice"])
-                                expected_prefix = bytes.fromhex(payload["room_prefix"])
+                                if len(full_state_map) != state_count:
+                                    raise RuntimeError(
+                                        f"State count mismatch in mirror payload for state group {sg}: "
+                                        f"payload specified {state_count} entries, found {len(full_state_map)}"
+                                    )
 
                         if sg == context._state_group:
                             prev_sg = context.state_group_before_event
