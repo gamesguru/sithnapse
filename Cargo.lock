@@ -922,7 +922,7 @@ dependencies = [
 [[package]]
 name = "mtxdb-core"
 version = "0.1.0-beta.1"
-source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=dev#043ccf6b4fe718d660bca6bb5cd7f78983164c8b"
+source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=dev#1b923006edc753beb74ad95f7c0268889b75ab5a"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -937,7 +937,7 @@ dependencies = [
 [[package]]
 name = "mtxdb-ffi"
 version = "0.1.0-beta.1"
-source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=dev#043ccf6b4fe718d660bca6bb5cd7f78983164c8b"
+source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=dev#1b923006edc753beb74ad95f7c0268889b75ab5a"
 dependencies = [
  "bytes",
  "mtxdb-core",
@@ -1342,7 +1342,7 @@ dependencies = [
 [[package]]
 name = "rezzy"
 version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=dev#14a5b698b01c7dc495b7f73a7a0770499089aa14"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=dev#b22a83ff3c7818ba49e2ea08629d64338c76e602"
 dependencies = [
  "base64",
  "blake2",
