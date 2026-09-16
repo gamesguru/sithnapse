@@ -147,30 +147,46 @@ class ReplicationSendEventsRestServlet(ReplicationEndpoint):
                     self._storage_controllers, event_payload["context"]
                 )
 
-                if context.pending_embedded_hamt_mirror_root is not None:
-                    # The instance that created this event's state group
-                    # opened mtxdb read-only and could not mirror-write it
-                    # (see StateGroupDataStore.store_state_group's
-                    # skip_mirror_write) -- redo that write here, now that
-                    # we're on the events writer. Must happen before
-                    # persist_and_notify_client_events below, since that
-                    # (and anything racing it, e.g. a synchrotron already
-                    # polling replication) may read this state group's
-                    # HAMT nodes as soon as the event is persisted.
-                    assert context._state_group is not None
-                    state_delta = context._state_delta_due_to_event or {}
-                    updates = [
-                        (event_type, state_key, ev_id)
-                        for (event_type, state_key), ev_id in state_delta.items()
-                    ]
-                    await self._state_store.redo_embedded_hamt_mirror_write(
-                        context._state_group,
-                        context.state_group_before_event,
-                        event.room_id,
-                        event.room_version,
-                        updates,
-                        context.pending_embedded_hamt_mirror_root,
-                    )
+                if context.pending_embedded_hamt_mirror_roots is not None:
+                    # The instance that created this event's state group (or its
+                    # predecessors) opened mtxdb read-only and could not mirror-write
+                    # it -- redo those writes here, now that we're on the events
+                    # writer. Sort by state group so that the predecessor is always
+                    # mirror-written before the child group that depends on it.
+                    for sg, expected_root in sorted(
+                        context.pending_embedded_hamt_mirror_roots.items()
+                    ):
+                        prev_sg = None
+                        delta = None
+                        if sg == context._state_group:
+                            prev_sg = context.state_group_before_event
+                            delta = context._state_delta_due_to_event or {}
+                        else:
+                            for (
+                                p_sg,
+                                c_sg,
+                            ), state_map in context.state_group_deltas.items():
+                                if c_sg == sg:
+                                    prev_sg = p_sg
+                                    delta = state_map
+                                    break
+                            if delta is None:
+                                raise RuntimeError(
+                                    f"Could not find predecessor for state group {sg} in deltas"
+                                )
+
+                        updates = [
+                            (event_type, state_key, ev_id)
+                            for (event_type, state_key), ev_id in delta.items()
+                        ]
+                        await self._state_store.redo_embedded_hamt_mirror_write(
+                            sg,
+                            prev_sg,
+                            event.room_id,
+                            event.room_version,
+                            updates,
+                            expected_root,
+                        )
 
                 ratelimit = event_payload["ratelimit"]
                 events_and_context.append((event, context))
