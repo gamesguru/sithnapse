@@ -495,7 +495,7 @@ pub fn refresh_state_hamt_collections_for_groups(
 mod room_index {
     use std::collections::{HashMap, HashSet};
     use std::fs::{File, OpenOptions};
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::num::NonZeroUsize;
     use std::os::unix::fs::FileExt;
     use std::sync::{Arc, Mutex};
@@ -507,6 +507,8 @@ mod room_index {
     use super::{ROOM_INDEX_DIR, ROOM_PREFIX_LEN};
 
     const INDEX_MAGIC: [u8; 4] = *b"MTRI";
+    const SHARD_COUNT: u8 = 64;
+    const HANDLE_CACHE_CAPACITY: usize = SHARD_COUNT as usize;
     const NAMESPACE_DIGEST_LEN: usize = 16;
     const RECORD_LEN: usize = 4 + NAMESPACE_DIGEST_LEN + 8 + ROOM_PREFIX_LEN;
 
@@ -528,10 +530,10 @@ mod room_index {
     static PREFIX_CACHE: Mutex<Option<LruCache<(String, i64), [u8; ROOM_PREFIX_LEN]>>> =
         Mutex::new(None);
 
-    /// There is one shared handle and one shared file, regardless of how many
-    /// namespaces the process serves. The old per-namespace LRU fixed open-FD
-    /// pressure but still created one inode per namespace.
-    static HANDLE: Mutex<Option<std::sync::Arc<File>>> = Mutex::new(None);
+    /// Handles are cached by fixed shard, never by namespace. This bounds the
+    /// directory to `SHARD_COUNT` files and the process to the same number of
+    /// possible room-index descriptors.
+    static HANDLES: Mutex<Option<LruCache<u8, std::sync::Arc<File>>>> = Mutex::new(None);
 
     /// Namespaces `put` has written to since the last `sync()`. `sync()`
     /// used to unconditionally `sync_data()` every cached handle -- with
@@ -545,9 +547,13 @@ mod room_index {
     /// occupancy, not with actual write volume. Mirrors the dirty-only
     /// fsync `PackfileStorage::sync()` (mtxdb-core) already does for the
     /// three pools proper.
-    static DIRTY: Mutex<bool> = Mutex::new(false);
+    static DIRTY: Mutex<Option<HashSet<u8>>> = Mutex::new(None);
 
-    fn index_path(create: bool) -> PyResult<std::path::PathBuf> {
+    fn shard_for(namespace: &str) -> u8 {
+        namespace_digest(namespace)[0] % SHARD_COUNT
+    }
+
+    fn index_path(shard: u8, create: bool) -> PyResult<std::path::PathBuf> {
         let dir = ROOM_INDEX_DIR
             .get()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("mtxdb not opened"))?;
@@ -558,7 +564,7 @@ mod room_index {
                 ))
             })?;
         }
-        Ok(dir.join("index.bin"))
+        Ok(dir.join(format!("index-{shard:02x}.bin")))
     }
 
     fn legacy_index_path(namespace: &str) -> PyResult<std::path::PathBuf> {
@@ -576,14 +582,18 @@ mod room_index {
         out
     }
 
-    fn cached_handle(create: bool) -> PyResult<Option<std::sync::Arc<File>>> {
-        let mut guard = HANDLE
+    fn cached_handle(namespace: &str, create: bool) -> PyResult<Option<std::sync::Arc<File>>> {
+        let shard = shard_for(namespace);
+        let mut guard = HANDLES
             .lock()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}")))?;
-        if let Some(file) = guard.as_ref() {
+        let map = guard.get_or_insert_with(|| {
+            LruCache::new(NonZeroUsize::new(HANDLE_CACHE_CAPACITY).expect("nonzero capacity"))
+        });
+        if let Some(file) = map.get(&shard) {
             return Ok(Some(Arc::clone(file)));
         }
-        let path = index_path(create)?;
+        let path = index_path(shard, create)?;
         let opened = OpenOptions::new()
             .create(create)
             .read(true)
@@ -600,7 +610,7 @@ mod room_index {
             }
         };
         let file = Arc::new(file);
-        *guard = Some(Arc::clone(&file));
+        map.put(shard, Arc::clone(&file));
         Ok(Some(file))
     }
 
@@ -608,24 +618,27 @@ mod room_index {
         if entries.is_empty() {
             return Ok(());
         }
-        let file = cached_handle(namespace, true)?.expect("create=true never returns None");
+        let mut file = cached_handle(namespace, true)?.expect("create=true never returns None");
+        let namespace_digest = namespace_digest(namespace);
         for (state_group, room_prefix) in entries {
-            let mut record = [0u8; RECORD_LEN as usize];
-            let n = std::cmp::min(room_prefix.len(), RECORD_LEN as usize);
-            record[..n].copy_from_slice(&room_prefix[..n]);
-            let offset = (*state_group as u64).saturating_mul(RECORD_LEN);
-            file.write_all_at(&record, offset).map_err(|e| {
+            let mut record = [0u8; RECORD_LEN];
+            record[..INDEX_MAGIC.len()].copy_from_slice(&INDEX_MAGIC);
+            record[INDEX_MAGIC.len()..INDEX_MAGIC.len() + NAMESPACE_DIGEST_LEN]
+                .copy_from_slice(&namespace_digest);
+            let group_start = INDEX_MAGIC.len() + NAMESPACE_DIGEST_LEN;
+            record[group_start..group_start + 8].copy_from_slice(&state_group.to_be_bytes());
+            let prefix_start = group_start + 8;
+            let n = std::cmp::min(room_prefix.len(), ROOM_PREFIX_LEN);
+            record[prefix_start..prefix_start + n].copy_from_slice(&room_prefix[..n]);
+            file.write_all(&record).map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("room_index write failed: {e}"))
             })?;
         }
-        {
-            let mut dirty = DIRTY_NAMESPACES.lock().map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}"))
-            })?;
-            dirty
-                .get_or_insert_with(HashSet::new)
-                .insert(namespace.to_string());
-        }
+        DIRTY
+            .lock()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}")))?
+            .get_or_insert_with(HashSet::new)
+            .insert(shard_for(namespace));
         let mut cache = PREFIX_CACHE
             .lock()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}")))?;
@@ -667,37 +680,87 @@ mod room_index {
         if missing.is_empty() {
             return Ok(out);
         }
-        let Some(file) = cached_handle(namespace, false)? else {
-            return Ok(out);
-        };
-        let mut read_records = Vec::new();
-        for (index, state_group) in missing {
-            let offset = (state_group as u64).saturating_mul(RECORD_LEN);
-            let mut record = [0u8; RECORD_LEN as usize];
-            let value = match file.read_exact_at(&mut record, offset) {
-                Ok(()) if record.iter().any(|&b| b != 0) => {
-                    read_records.push((state_group, record));
-                    Some(record.to_vec())
+        let wanted: HashSet<i64> = missing.iter().map(|&(_, group)| group).collect();
+        let shared_records = cached_handle(namespace, false)?.and_then(|file| {
+            let length = file.metadata().ok()?.len();
+            let length = usize::try_from(length).ok()?;
+            let mut bytes = vec![0u8; length];
+            let mut offset = 0usize;
+            while offset < bytes.len() {
+                let count = file.read_at(&mut bytes[offset..], offset as u64).ok()?;
+                if count == 0 {
+                    bytes.truncate(offset);
+                    break;
                 }
-                _ => None, // all-zero (sentinel) or short read past EOF: miss.
-            };
-            out[index] = value;
+                offset += count;
+            }
+            Some(bytes)
+        });
+        let namespace_digest = namespace_digest(namespace);
+        let mut found = HashMap::new();
+        if let Some(bytes) = shared_records {
+            for record in bytes.chunks_exact(RECORD_LEN) {
+                if record[..INDEX_MAGIC.len()] != INDEX_MAGIC
+                    || record[INDEX_MAGIC.len()..INDEX_MAGIC.len() + NAMESPACE_DIGEST_LEN]
+                        != namespace_digest
+                {
+                    continue;
+                }
+                let group_start = INDEX_MAGIC.len() + NAMESPACE_DIGEST_LEN;
+                let group =
+                    i64::from_be_bytes(record[group_start..group_start + 8].try_into().unwrap());
+                if wanted.contains(&group) {
+                    let prefix_start = group_start + 8;
+                    let mut prefix = [0u8; ROOM_PREFIX_LEN];
+                    prefix.copy_from_slice(&record[prefix_start..prefix_start + ROOM_PREFIX_LEN]);
+                    if prefix.iter().any(|&b| b != 0) {
+                        found.insert(group, prefix);
+                    }
+                }
+            }
         }
-        if !read_records.is_empty() {
+        for (index, state_group) in missing {
+            if let Some(prefix) = found.get(&state_group) {
+                out[index] = Some(prefix.to_vec());
+            }
+        }
+        // Read compatibility for databases written before the shared file
+        // format. New writes never create another per-namespace file.
+        let legacy = legacy_index_path(namespace)
+            .ok()
+            .and_then(|path| File::open(path).ok());
+        if let Some(file) = legacy {
+            for (index, state_group) in state_groups.iter().enumerate() {
+                if out[index].is_some() {
+                    continue;
+                }
+                let mut record = [0u8; ROOM_PREFIX_LEN];
+                let offset = (*state_group as u64).saturating_mul(ROOM_PREFIX_LEN as u64);
+                if file.read_exact_at(&mut record, offset).is_ok() && record.iter().any(|&b| b != 0)
+                {
+                    out[index] = Some(record.to_vec());
+                }
+            }
+        }
+        if out.iter().any(Option::is_some) {
             let mut cache = PREFIX_CACHE.lock().map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}"))
             })?;
             let cache = cache.get_or_insert_with(|| {
                 LruCache::new(NonZeroUsize::new(PREFIX_CACHE_CAPACITY).expect("nonzero capacity"))
             });
-            for (state_group, record) in read_records {
-                cache.put((namespace.to_owned(), state_group), record);
+            for (state_group, value) in state_groups.iter().zip(out.iter()) {
+                if let Some(value) = value {
+                    let mut record = [0u8; ROOM_PREFIX_LEN];
+                    record.copy_from_slice(value);
+                    cache.put((namespace.to_owned(), *state_group), record);
+                }
             }
         }
         Ok(out)
     }
 
-    /// Flush all cached room-index handles to disk. Mirrors the bounded,
+    /// Flush the shared room-index handle to disk. Mirrors the bounded,
     /// periodic (not per-write) durability window the rest of the embedded
     /// engine uses -- see `_periodic_embedded_sync` on the Python side,
     /// which calls this via the top-level `sync()` pyfunction. Without
@@ -708,39 +771,26 @@ mod room_index {
     /// gap rather than being the only thing standing between a crash and
     /// data loss.
     pub fn sync() -> PyResult<()> {
-        // Only fsync namespaces `put` actually touched since the last
-        // sync -- see `DIRTY_NAMESPACES`'s doc comment. A namespace can be
-        // dirty-marked but no longer cached (LRU-evicted since the write):
-        // that's fine to skip, same as a normal eviction -- the comment on
-        // `HANDLES` already establishes that an evicted handle's dirty
-        // pages survive `close()` via kernel writeback, so this call's job
-        // was already effectively done for it by the eviction itself.
-        let dirty: HashSet<String> = {
-            let mut guard = DIRTY_NAMESPACES.lock().map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}"))
-            })?;
-            match guard.as_mut() {
-                Some(set) => std::mem::take(set),
-                None => return Ok(()),
-            }
-        };
+        let dirty: HashSet<u8> = DIRTY
+            .lock()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}")))?
+            .take()
+            .unwrap_or_default();
         if dirty.is_empty() {
             return Ok(());
         }
         let guard = HANDLES
             .lock()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}")))?;
-        let Some(map) = guard.as_ref() else {
-            return Ok(());
-        };
-        for namespace in &dirty {
-            // `peek`, not `get`: syncing must not perturb LRU recency.
-            if let Some(file) = map.peek(namespace) {
-                file.sync_data().map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "room_index sync failed: {e}"
-                    ))
-                })?;
+        if let Some(map) = guard.as_ref() {
+            for shard in dirty {
+                if let Some(file) = map.peek(&shard) {
+                    file.sync_data().map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "room_index sync failed: {e}"
+                        ))
+                    })?;
+                }
             }
         }
         Ok(())
@@ -751,30 +801,27 @@ mod room_index {
         use super::*;
 
         #[test]
-        fn handle_cache_is_bounded_and_evicted_namespaces_reopen() {
+        fn shared_handle_is_reused_across_namespaces() {
             super::super::auth_chain_closure_tests::ensure_open();
             let ns_kept = "ns-lru-kept";
             let prefix: Vec<u8> = b"ROOM1ABC".to_vec();
             put(ns_kept, &[(1, prefix.clone())]).expect("put kept");
 
-            // Rotate well past the cache capacity so `ns_kept`'s handle (the
-            // least recently used, inserted first) is guaranteed LRU-evicted
-            // and its file closed.
-            for i in 0..(HANDLE_CACHE_CAPACITY + 32) {
+            // Many namespaces share the same physical index file and handle.
+            for i in 0..256 {
                 put(&format!("ns-lru-rot-{}", i), &[(1, b"ROOM2XYZ".to_vec())]).expect("put rot");
             }
 
             {
                 let guard = HANDLES.lock().expect("no poison");
                 assert!(
-                    guard.as_ref().map(|m| m.len()).unwrap_or(0) <= HANDLE_CACHE_CAPACITY,
-                    "handle count must never exceed the cache capacity"
+                    guard.as_ref().map_or(0, LruCache::len) <= HANDLE_CACHE_CAPACITY,
+                    "room-index handles must remain bounded by the shard count"
                 );
             }
 
-            // Clear the in-memory prefix cache so the read below cannot be
-            // served from it: `ns_kept`'s handle is closed, so this walks the
-            // `cached_handle(namespace, create=false)` reopen path.
+            // Clear the in-memory prefix cache so the read below exercises
+            // the shared index file.
             *PREFIX_CACHE.lock().expect("no poison") = None;
 
             let got = get_many(ns_kept, &[1]).expect("get kept");
@@ -1772,59 +1819,6 @@ fn kv_node_id(key: &[u8]) -> [u8; 16] {
     id
 }
 
-/// Generic KV records retain the full logical-key digest in their value. The
-/// mtxdb NodeId remains 16 bytes, so this envelope makes the truncation
-/// explicit and lets readers detect a 128-bit NodeId collision.
-const KV_VALUE_VERSION: &[u8; 4] = b"KV01";
-
-fn kv_key_digest(key: &[u8]) -> [u8; 32] {
-    Sha256::digest(key).into()
-}
-
-fn encode_kv_value(key: &[u8], value: &[u8]) -> Vec<u8> {
-    let digest = kv_key_digest(key);
-    let mut encoded = Vec::with_capacity(4 + digest.len() + value.len());
-    encoded.extend_from_slice(KV_VALUE_VERSION);
-    encoded.extend_from_slice(&digest);
-    encoded.extend_from_slice(value);
-    encoded
-}
-
-fn decode_kv_value(key: &[u8], encoded: &[u8]) -> PyResult<Vec<u8>> {
-    if !encoded.starts_with(KV_VALUE_VERSION) {
-        // Keep pre-envelope records readable during migration.
-        return Ok(encoded.to_vec());
-    }
-
-    let digest_start = KV_VALUE_VERSION.len();
-    let value_start = digest_start + 32;
-    if encoded.len() < value_start {
-        return Err(pyo3::exceptions::PyRuntimeError::new_err(
-            "truncated generic KV value envelope",
-        ));
-    }
-    if encoded[digest_start..value_start] != kv_key_digest(key) {
-        return Err(pyo3::exceptions::PyRuntimeError::new_err(
-            "generic KV truncated-hash collision detected",
-        ));
-    }
-    Ok(encoded[value_start..].to_vec())
-}
-
-fn validate_kv_collision(engine: &PackfileStorage, key: &[u8], node_id: &NodeId) -> PyResult<()> {
-    let Some(existing) = engine.get(&kv_room_id(), node_id).map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get error reading KV: {e}"))
-    })?
-    else {
-        return Ok(());
-    };
-    if !existing.bytes.is_empty() && existing.bytes.starts_with(KV_VALUE_VERSION) {
-        // Reuse the normal verifier; a mismatch is a hard collision error.
-        let _ = decode_kv_value(key, &existing.bytes)?;
-    }
-    Ok(())
-}
-
 /// Fetch flat-KV records, routing each key to its shard type internally.
 #[pyfunction]
 pub fn batch_get(py: Python<'_>, keys: Vec<Vec<u8>>) -> PyResult<Vec<(Vec<u8>, Vec<u8>)>> {
@@ -1857,14 +1851,15 @@ pub fn batch_get(py: Python<'_>, keys: Vec<Vec<u8>>) -> PyResult<Vec<(Vec<u8>, V
                 values[position] = value;
             }
         }
-        keys.into_iter()
+        Ok(keys
+            .into_iter()
             .zip(values)
             .filter_map(|(key, value)| {
                 value
                     .filter(|data| !data.bytes.is_empty())
-                    .map(|data| Ok((key.clone(), decode_kv_value(&key, &data.bytes)?)))
+                    .map(|data| (key, data.bytes.to_vec()))
             })
-            .collect::<PyResult<Vec<_>>>()
+            .collect())
     })
 }
 
@@ -1877,25 +1872,8 @@ pub fn batch_get(py: Python<'_>, keys: Vec<Vec<u8>>) -> PyResult<Vec<(Vec<u8>, V
 fn batch_put_impl(pairs: Vec<(Vec<u8>, Vec<u8>)>) -> PyResult<()> {
     let mut state_puts = Vec::new();
     let mut event_puts = Vec::new();
-    let mut seen: HashMap<NodeId, [u8; 32]> = HashMap::new();
     for (key, value) in pairs {
-        let encoded = if value.is_empty() {
-            value
-        } else {
-            let node_id = kv_node_id(&key);
-            let digest = kv_key_digest(&key);
-            if let Some(previous) = seen.insert(node_id, digest) {
-                if previous != digest {
-                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                        "generic KV truncated-hash collision detected in batch",
-                    ));
-                }
-            }
-            let shard_type = shard_type_for_key(&key);
-            validate_kv_collision(db_for_shard_type(shard_type)?, &key, &node_id)?;
-            encode_kv_value(&key, &value)
-        };
-        let entry = (kv_node_id(&key), NodeData::new(bytes::Bytes::from(encoded)));
+        let entry = (kv_node_id(&key), NodeData::new(bytes::Bytes::from(value)));
         match shard_type_for_key(&key) {
             ShardType::State => state_puts.push(entry),
             ShardType::EventDag => event_puts.push(entry),
@@ -2452,9 +2430,8 @@ pub fn increment_counters_batch(pairs: Vec<(Vec<u8>, i64)>) -> PyResult<Vec<i64>
                 let node_id = kv_node_id(&key);
                 let current = match engine.get(&room_id, &node_id) {
                     Ok(Some(data)) => {
-                        let value = decode_kv_value(&key, &data.bytes)?;
-                        if value.len() == 8 {
-                            i64::from_be_bytes(value.as_slice().try_into().unwrap())
+                        if data.bytes.len() == 8 {
+                            i64::from_be_bytes(data.bytes.as_ref().try_into().unwrap())
                         } else {
                             0
                         }
@@ -2471,10 +2448,7 @@ pub fn increment_counters_batch(pairs: Vec<(Vec<u8>, i64)>) -> PyResult<Vec<i64>
                 results.push(new_value);
                 puts.push((
                     node_id,
-                    NodeData::new(bytes::Bytes::from(encode_kv_value(
-                        &key,
-                        &new_value.to_be_bytes(),
-                    ))),
+                    NodeData::new(bytes::Bytes::copy_from_slice(&new_value.to_be_bytes())),
                 ));
             }
 
