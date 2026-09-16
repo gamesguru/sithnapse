@@ -364,6 +364,12 @@ main() {
   # This significantly speeds up tests, but increases the possibility of test pollution.
   export COMPLEMENT_ENABLE_DIRTY_RUNS=1
 
+  # A failed deployment can leave its network behind before Complement gets to
+  # its normal teardown. Reclaim orphaned Complement resources before the
+  # next deployment, otherwise Docker eventually exhausts its predefined
+  # address pools.
+  cleanup_complement_resources
+
   # All environment variables starting with PASS_ will be shared.
   # (The prefix is stripped off before reaching the container.)
   export COMPLEMENT_SHARE_ENV_PREFIX=PASS_
@@ -624,20 +630,56 @@ main() {
 # Invoked by the EXIT trap installed in main.
 # shellcheck disable=SC2329
 cleanup_complement_containers() {
+  local runtime="${CONTAINER_RUNTIME:-docker}"
   local container_label="COMPLEMENT_WRAPPER_TOKEN=$COMPLEMENT_WRAPPER_TOKEN"
   local containers container ours=()
-  if command -v docker &>/dev/null; then
-    mapfile -t containers < <(docker ps -aq --filter "name=complement" 2>/dev/null || true)
+  if command -v "$runtime" &>/dev/null; then
+    mapfile -t containers < <("$runtime" ps -aq --filter "name=complement" 2>/dev/null || true)
     for container in "${containers[@]:-}"; do
-      if docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$container" 2>/dev/null \
+      if "$runtime" inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$container" 2>/dev/null \
           | grep -Fxq "$container_label"; then
         ours+=("$container")
       fi
     done
     if [ "${#ours[@]}" -gt 0 ]; then
       echo "Cleaning up Complement containers spawned by this run..." >&2
-      printf '%s\n' "${ours[@]}" | xargs -r docker rm -f
+      printf '%s\n' "${ours[@]}" | xargs -r "$runtime" rm -f
     fi
+  fi
+}
+
+# Remove only Complement-owned resources which no longer have containers.
+# Keeping active resources intact matters when multiple Complement runs share
+# the same Docker/Podman daemon.
+cleanup_complement_resources() {
+  local runtime="${CONTAINER_RUNTIME:-docker}"
+  local network attached pod pod_containers
+  local -a networks=() pods=()
+
+  if ! command -v "$runtime" &>/dev/null; then
+    return 0
+  fi
+
+  mapfile -t networks < <("$runtime" network ls -q --filter "name=complement" 2>/dev/null || true)
+  for network in "${networks[@]:-}"; do
+    [ -n "$network" ] || continue
+    attached=$("$runtime" network inspect --format '{{len .Containers}}' "$network" 2>/dev/null || echo 1)
+    if [ "$attached" = "0" ]; then
+      echo "Cleaning up orphaned Complement network $network..." >&2
+      "$runtime" network rm "$network" >/dev/null 2>&1 || true
+    fi
+  done
+
+  if [ "$runtime" = "podman" ]; then
+    mapfile -t pods < <("$runtime" pod ls -q --filter "name=complement" 2>/dev/null || true)
+    for pod in "${pods[@]:-}"; do
+      [ -n "$pod" ] || continue
+      pod_containers=$("$runtime" pod inspect --format '{{len .Containers}}' "$pod" 2>/dev/null || echo 1)
+      if [ "$pod_containers" = "0" ]; then
+        echo "Cleaning up orphaned Complement pod $pod..." >&2
+        "$runtime" pod rm -f "$pod" >/dev/null 2>&1 || true
+      fi
+    done
   fi
 }
 
@@ -994,6 +1036,7 @@ for suite, total in sorted(suite_times.items(), key=lambda x: -x[1]):
   fi
 
   cleanup_complement_containers
+  cleanup_complement_resources
 }
 trap finish EXIT
 
