@@ -1315,27 +1315,14 @@ pub fn get_auth_chain_links_batch(
         let room_id = namespace_room_id(&namespace);
         let node_ids: Vec<NodeId> = chain_ids.iter().map(|&c| chain_node_id(c)).collect();
 
-        let mut results = engine.get_many(&room_id, &node_ids).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {}", e))
-        })?;
-
-        // Read-only workers keep an in-process collection index. If the
-        // writer published chain-link records after this worker loaded the
-        // collection (or if the worker has never seen this namespace's
-        // auth-chain collection at all), retry once after refreshing the
-        // index -- mirroring the identical pattern in `batch_get`.
-        if results.iter().any(Option::is_none) {
-            engine.refresh_collection(&room_id).map_err(|e| {
+        let results = engine
+            .get_many_with_refresh(&room_id, &node_ids)
+            .map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "mtxdb refresh_collection error: {e}"
+                    "mtxdb get_many_with_refresh error: {}",
+                    e
                 ))
             })?;
-            results = engine.get_many(&room_id, &node_ids).map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "mtxdb get_many error after refresh: {e}"
-                ))
-            })?;
-        }
 
         let mut out = Vec::with_capacity(node_ids.len());
         for (chain_id, res) in chain_ids.into_iter().zip(results) {
@@ -1670,25 +1657,14 @@ pub fn auth_chain_edges_get(
             .iter()
             .map(|&s| auth_chain_edge_node_id(s))
             .collect();
-        let mut results = engine.get_many(&collection, &node_ids).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {}", e))
-        })?;
-
-        // Read-only workers: refresh the collection and retry once if any
-        // record is missing from the in-process index snapshot, mirroring
-        // `batch_get` and `get_auth_chain_links_batch`.
-        if results.iter().any(Option::is_none) {
-            engine.refresh_collection(&collection).map_err(|e| {
+        let results = engine
+            .get_many_with_refresh(&collection, &node_ids)
+            .map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "mtxdb refresh_collection error: {e}"
+                    "mtxdb get_many_with_refresh error: {}",
+                    e
                 ))
             })?;
-            results = engine.get_many(&collection, &node_ids).map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "mtxdb get_many error after refresh: {e}"
-                ))
-            })?;
-        }
 
         results
             .into_iter()
@@ -1901,24 +1877,19 @@ pub fn batch_get(py: Python<'_>, keys: Vec<Vec<u8>>) -> PyResult<Vec<(Vec<u8>, V
             let node_ids: Vec<NodeId> = ids.iter().map(|(_, id)| *id).collect();
             let engine = db_for_shard_type(shard_type)?;
             let room_id = kv_room_id();
-            let mut found = engine.get_many(&room_id, &node_ids).map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {e}"))
-            })?;
             // Read-only workers keep an in-process collection index. If the
             // writer published a mapping after this worker opened the store,
-            // retry once after refreshing the generic-KV collection.
-            if found.iter().any(Option::is_none) {
-                engine.refresh_collection(&room_id).map_err(|e| {
+            // `get_many_with_refresh` retries the *missing* keys once after
+            // refreshing the generic-KV collection, and suppresses repeat
+            // refreshes for confirmed negatives against an unchanged
+            // collection (see mtxdb-core's `get_many_with_refresh`).
+            let found = engine
+                .get_many_with_refresh(&room_id, &node_ids)
+                .map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "mtxdb refresh_collection error: {e}"
+                        "mtxdb get_many_with_refresh error: {e}"
                     ))
                 })?;
-                found = engine.get_many(&room_id, &node_ids).map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "mtxdb get_many error after refresh: {e}"
-                    ))
-                })?;
-            }
             for ((position, _), value) in ids.into_iter().zip(found) {
                 values[position] = value;
             }
@@ -2645,6 +2616,10 @@ fn stats_to_dict(
     d.set_item("get_many_calls", s.get_many_calls)?;
     d.set_item("get_many_records", s.get_many_records)?;
     d.set_item("get_many_misses", s.get_many_misses)?;
+    d.set_item("miss_refreshes", s.miss_refreshes)?;
+    d.set_item("miss_refresh_skips", s.miss_refresh_skips)?;
+    d.set_item("miss_refresh_recovered", s.miss_refresh_recovered)?;
+    d.set_item("miss_refresh_retry_ids", s.miss_refresh_retry_ids)?;
     d.set_item("put_calls", s.put_calls)?;
     d.set_item("put_bytes", s.put_bytes)?;
     d.set_item("put_many_calls", s.put_many_calls)?;
