@@ -23,7 +23,16 @@ lint: ##H Lint the code with mypy
 
 .PHONY: sync
 sync:	##H Runs: uv run maturin develop
-	uv run maturin develop --release
+	@rm -f target/maturin/libsynapse.so target/release/libsynapse.so
+	@RUSTC_WRAPPER= uv run maturin develop --release
+	@test -s target/maturin/libsynapse.so || { \
+		echo "maturin produced an empty libsynapse.so" >&2; \
+		exit 1; \
+	}
+	@file target/maturin/libsynapse.so | grep -q 'ELF .*shared object' || { \
+		echo "maturin produced a non-ELF libsynapse.so" >&2; \
+		exit 1; \
+	}
 
 p ?=
 
