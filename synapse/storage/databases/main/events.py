@@ -66,7 +66,7 @@ from synapse.storage.database import (
     LoggingTransaction,
     make_tuple_in_list_sql_clause,
 )
-from synapse.storage.databases.main.embedded_common import Pool, mark_dirty
+from synapse.storage.databases.main.embedded_common import Pool, mark_dirty, sync_now
 from synapse.storage.databases.main.embedded_event_json import (
     open_embedded_event_json_engine,
     put_event_json_batch,
@@ -1109,6 +1109,13 @@ class PersistEventsStore:
             PartialStateConflictError: if attempting to persist a partial state event in
                 a room that has been un-partial stated.
         """
+        # Register this first so it runs before stream-position replication
+        # callbacks registered later in the transaction. Event-to-state-group
+        # mappings have no SQL fallback in embedded mode; workers must not be
+        # notified about an event until the state pool is durable.
+        if self._embedded_hamt_engine:
+            txn.call_after(sync_now, [Pool.STATE])
+
         all_events_and_contexts = events_and_contexts
 
         min_stream_order = events_and_contexts[0][0].internal_metadata.stream_ordering
@@ -1243,7 +1250,6 @@ class PersistEventsStore:
         # coalescer flushes only committed writes.  Gated on the embedded
         # engine being configured (same guard as the writes above).
         if self._embedded_hamt_engine:
-            txn.call_after(mark_dirty, Pool.STATE)
             txn.call_after(mark_dirty, Pool.AUTH_CHAIN)
 
     def _persist_event_auth_chain_txn(
