@@ -155,22 +155,11 @@ class ReplicationFederationSendEventsRestServlet(ReplicationEndpoint):
                     # visible to readers, just as the normal send_events endpoint does.
                     # Sort by state group so that the predecessor is always
                     # mirror-written before the child group that depends on it.
-                    for sg, payload in sorted(
+                    for sg, expected_root in sorted(
                         context.pending_embedded_hamt_mirror_roots.items()
                     ):
                         prev_sg = None
                         delta = None
-
-                        expected_root = payload["expected_root"]
-                        full_state_map = None
-                        if payload.get("version") == 1:
-                            expected_root = bytes.fromhex(payload["expected_root"])
-                            full_state_map = {
-                                (t, k): ev for t, k, ev in payload.get("state", [])
-                            }
-                        else:
-                            # Legacy format
-                            expected_root = bytes.fromhex(payload["expected_root"])
 
                         if sg == context._state_group:
                             prev_sg = context.state_group_before_event
@@ -200,7 +189,6 @@ class ReplicationFederationSendEventsRestServlet(ReplicationEndpoint):
                             event.room_version,
                             updates,
                             expected_root,
-                            state_map=full_state_map,
                         )
 
                 event_and_contexts.append((event, context))
