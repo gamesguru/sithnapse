@@ -252,8 +252,15 @@ class EventBuilder:
                     and member_event_id not in auth_event_ids
                 ):
                     auth_event_ids.append(member_event_id)
-                    if member_event_id not in prev_event_ids:
-                        prev_event_ids.append(member_event_id)
+                    # Also make sure to point to the previous membership event that will
+                    # allow this one to happen so the computed state works out. An
+                    # out-of-band invite is intentionally stateless, so it must remain
+                    # an auth event without becoming a state-resolution predecessor.
+                    if (
+                        await self._store._get_state_group_for_event(member_event_id)
+                    ) is not None:
+                        if member_event_id not in prev_event_ids:
+                            prev_event_ids.append(member_event_id)
 
         format_version = self.room_version.event_format
         # The types of auth/prev events changes between event versions.

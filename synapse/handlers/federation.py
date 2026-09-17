@@ -1043,6 +1043,21 @@ class FederationHandler:
                 errcode=Codes.NOT_FOUND,
             )
 
+        # If there are incoming PDUs currently staged for this room (e.g. a recent
+        # leave or state change from federation), wait briefly for them to be persisted
+        # so make_join builds against up-to-date room state.
+        for _ in range(40):
+            staged_count = await self.store.db_pool.simple_select_one_onecol(
+                table="federation_inbound_events_staging",
+                keyvalues={"room_id": room_id},
+                retcol="COUNT(*)",
+                allow_none=True,
+                desc="make_join_wait_staged_events",
+            )
+            if not staged_count:
+                break
+            await self.clock.sleep(Duration(milliseconds=50))
+
         # now check that we are *still* in the room
         is_in_room = await self._event_auth_handler.is_host_in_room(
             room_id, self.server_name

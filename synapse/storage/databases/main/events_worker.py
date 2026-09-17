@@ -481,7 +481,6 @@ class EventsWorkerStore(SQLBaseStore):
                 assert isinstance(row, UnPartialStatedEventStreamRow)
 
                 self.is_partial_state_event.invalidate((row.event_id,))
-                self._get_state_group_for_event_sql.invalidate((row.event_id,))
 
                 if row.rejection_status_changed:
                     # If the partial-stated event became rejected or unrejected
