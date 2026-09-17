@@ -368,9 +368,7 @@ class EventFederationWorkerStore(
                 )
                 _auth_coverage(
                     "get_auth_chain_ids",
-                    "embedded_complete"
-                    if embedded_hamt_namespace is not None
-                    else "sql_only",
+                    "sql_chain_cover_complete",
                     len(event_ids),
                     len(result),
                 )
@@ -963,9 +961,7 @@ class EventFederationWorkerStore(
                 )
                 _auth_coverage(
                     "get_auth_chain_difference",
-                    "embedded_complete"
-                    if embedded_hamt_namespace is not None
-                    else "sql_only",
+                    "sql_chain_cover_complete",
                     sum(len(state_set) for state_set in state_sets),
                     len(result.auth_difference),
                 )

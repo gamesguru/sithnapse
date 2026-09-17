@@ -505,16 +505,25 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                     if tag.startswith("auth_chain_")
                 }
                 if auth_counters:
+                    tag_width = max(50, *(len(tag) for tag in auth_counters))
                     out("=== Auth chain coverage ===")
                     for tag in sorted(auth_counters):
-                        out(f"  {tag:70s}  {auth_counters[tag]:>12,d}")
+                        out(f"  {tag:{tag_width}s}  {auth_counters[tag]:>12,d}")
                     out("===========================")
                     out("")
                 out("=== FFI batch counters ===")
+                tag_width = max(
+                    50,
+                    *(
+                        len(tag)
+                        for tag in ffi_counters
+                        if not tag.startswith("auth_chain_")
+                    ),
+                )
                 for tag in sorted(ffi_counters):
                     if tag.startswith("auth_chain_"):
                         continue
-                    out(f"  {tag:50s}  {ffi_counters[tag]:>12,d}")
+                    out(f"  {tag:{tag_width}s}  {ffi_counters[tag]:>12,d}")
                 out("===========================")
                 out("")
             if ffi_batch_sizes:

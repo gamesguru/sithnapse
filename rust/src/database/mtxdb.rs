@@ -1,5 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
 
 use mtxdb_core::{DatabaseLayout, NodeData, NodeId, PackfileStorage, ShardType, StorageEngine};
 use once_cell::sync::OnceCell;
@@ -87,6 +90,12 @@ fn check_pid_guard() -> PyResult<bool> {
 /// Only one SQL transaction runs at a time via the DB pool, so contention is
 /// negligible.
 static RMW_LOCK: Mutex<()> = Mutex::new(());
+
+/// Semantic counters for state-group refcount RMWs. These deliberately live
+/// beside the Synapse wrapper rather than in generic mtxdb runtime stats:
+/// only this layer knows that a missing counter means initialization.
+static REFCOUNT_INITS: AtomicU64 = AtomicU64::new(0);
+static REFCOUNT_EXISTING: AtomicU64 = AtomicU64::new(0);
 
 fn pools() -> PyResult<&'static MtxdbPools> {
     DBS.get()
@@ -2468,13 +2477,21 @@ pub fn increment_counters_batch(pairs: Vec<(Vec<u8>, i64)>) -> PyResult<Vec<i64>
                 let node_id = kv_node_id(&key);
                 let current = match engine.get(&room_id, &node_id) {
                     Ok(Some(data)) => {
+                        if key.starts_with(b"state_group_refcount:") {
+                            REFCOUNT_EXISTING.fetch_add(1, Ordering::Relaxed);
+                        }
                         if data.bytes.len() == 8 {
                             i64::from_be_bytes(data.bytes.as_ref().try_into().unwrap())
                         } else {
                             0
                         }
                     }
-                    Ok(None) => 0,
+                    Ok(None) => {
+                        if key.starts_with(b"state_group_refcount:") {
+                            REFCOUNT_INITS.fetch_add(1, Ordering::Relaxed);
+                        }
+                        0
+                    }
                     Err(e) => {
                         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
                             "mtxdb get error reading counter: {}",
@@ -2638,6 +2655,13 @@ fn stats_to_dict(
     d.set_item("index_bytes", s.index_bytes)?;
     d.set_item("collection_count", s.collection_count)?;
     d.set_item("shard_count", s.shards.len())?;
+    if name == "state" {
+        d.set_item("refcount_inits", REFCOUNT_INITS.load(Ordering::Relaxed))?;
+        d.set_item(
+            "refcount_existing",
+            REFCOUNT_EXISTING.load(Ordering::Relaxed),
+        )?;
+    }
     let mut shard_writes: u64 = 0;
     let mut shard_bytes: u64 = 0;
     let mut shard_syncs: u64 = 0;
@@ -2752,6 +2776,8 @@ pub fn reset_stats(py: Python<'_>) -> PyResult<()> {
         pools.state.reset_stats();
         pools.event_dag.reset_stats();
         pools.auth_chain.reset_stats();
+        REFCOUNT_INITS.store(0, Ordering::Relaxed);
+        REFCOUNT_EXISTING.store(0, Ordering::Relaxed);
         Ok(())
     })
 }

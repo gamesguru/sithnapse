@@ -228,16 +228,20 @@ def _print_ffi_timings() -> None:
             if tag.startswith("auth_chain_")
         }
         if auth_counters:
+            tag_width = max(50, *(len(tag) for tag in auth_counters))
             _ffi_timings_print("=== Auth chain coverage ===")
             for tag in sorted(auth_counters):
-                _ffi_timings_print(f"  {tag:70s}  {auth_counters[tag]:>12,d}")
+                _ffi_timings_print(f"  {tag:{tag_width}s}  {auth_counters[tag]:>12,d}")
             _ffi_timings_print("===========================")
             _ffi_timings_print("")
         _ffi_timings_print("=== FFI batch counters ===")
+        tag_width = max(
+            50, *(len(tag) for tag in counters if not tag.startswith("auth_chain_"))
+        )
         for tag in sorted(counters):
             if tag.startswith("auth_chain_"):
                 continue
-            _ffi_timings_print(f"  {tag:50s}  {counters[tag]:>12,d}")
+            _ffi_timings_print(f"  {tag:{tag_width}s}  {counters[tag]:>12,d}")
         _ffi_timings_print("===========================")
         _ffi_timings_print("")
     if batch_sizes:
@@ -313,6 +317,13 @@ def _print_mtxdb_stats() -> None:
                 f"    cache: hits={ps.get('cache_hits', 0)}  misses={ps.get('cache_misses', 0)}  rate={hit_rate:.3f}",
                 file=out,
             )
+            refcount_inits = ps.get("refcount_inits", 0)
+            refcount_existing = ps.get("refcount_existing", 0)
+            if refcount_inits or refcount_existing:
+                print(
+                    f"    refcounts: inits={refcount_inits:,}  updates={refcount_existing:,}",
+                    file=out,
+                )
 
         # Write / batch counters.
         pc = ps.get("put_calls", 0)
