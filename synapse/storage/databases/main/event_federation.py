@@ -2686,6 +2686,51 @@ class EventFederationWorkerStore(
         Args:
             event_id: The event to search for as a prev_event.
         """
+        if getattr(self, "_embedded_event_edges_enabled", False):
+            from synapse.storage.databases.main.embedded_event_edges import (
+                get_event_edges_forward_batch,
+                put_event_edges_batch,
+            )
+
+            forward_map = get_event_edges_forward_batch(
+                self._embedded_hamt_namespace, [event_id]
+            )
+            successors = forward_map.get(event_id)
+            if successors is not None:
+                ffi_count("event_edges_successor_hits", 1)
+                return successors
+
+            ffi_count("event_edges_successor_fallbacks", 1)
+            sql_res = await self.db_pool.simple_select_onecol(
+                table="event_edges",
+                keyvalues={"prev_event_id": event_id},
+                retcol="event_id",
+                desc="get_successor_events",
+            )
+            if sql_res:
+                try:
+                    room_id = await self.db_pool.simple_select_one_onecol(
+                        table="events",
+                        keyvalues={"event_id": event_id},
+                        retcol="room_id",
+                        allow_none=True,
+                        desc="get_successor_events_room_id",
+                    )
+                    if room_id:
+                        put_event_edges_batch(
+                            self._embedded_hamt_namespace,
+                            [
+                                (room_id, succ_id, event_id, False)
+                                for succ_id in sql_res
+                            ],
+                        )
+                        ffi_count("event_edges_successor_repairs", len(sql_res))
+                except Exception:
+                    logger.debug(
+                        "Failed to repair forward edge for %s", event_id, exc_info=True
+                    )
+            return sql_res
+
         return await self.db_pool.simple_select_onecol(
             table="event_edges",
             keyvalues={"prev_event_id": event_id},

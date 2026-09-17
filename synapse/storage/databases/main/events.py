@@ -67,6 +67,10 @@ from synapse.storage.database import (
     make_tuple_in_list_sql_clause,
 )
 from synapse.storage.databases.main.embedded_common import Pool, mark_dirty
+from synapse.storage.databases.main.embedded_event_edges import (
+    open_embedded_event_edges_engine,
+    put_event_edges_batch,
+)
 from synapse.storage.databases.main.embedded_event_json import (
     open_embedded_event_json_engine,
     put_event_json_batch,
@@ -285,6 +289,7 @@ class PersistEventsStore:
         self.is_mine_id = hs.is_mine_id
 
         self._embedded_event_json_enabled = open_embedded_event_json_engine(hs)
+        self._embedded_event_edges_enabled = open_embedded_event_edges_engine(hs)
         self._embedded_hamt_engine = hs.config.database.embedded_hamt_engine
         self._embedded_hamt_namespace = (
             hs.config.database.embedded_hamt_namespace or hs.hostname
@@ -3928,6 +3933,15 @@ class PersistEventsStore:
                 (ev.event_id, e_id) for ev in events for e_id in ev.prev_event_ids()
             ],
         )
+
+        if self._embedded_event_edges_enabled:
+            edge_rows = [
+                (ev.room_id, ev.event_id, e_id, False)
+                for ev in events
+                for e_id in ev.prev_event_ids()
+            ]
+            if edge_rows:
+                put_event_edges_batch(self._embedded_hamt_namespace, edge_rows)
 
         self._update_backward_extremeties(txn, events)
 

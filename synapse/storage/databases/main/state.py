@@ -853,7 +853,7 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             )
 
         self._has_un_partial_stated_events = True
-        self.is_un_partial_stated_event.invalidate((event.event_id,))
+        txn.call_after(self.is_un_partial_stated_event.invalidate, (event.event_id,))
 
         # the event may now be rejected where it was not before, or vice versa,
         # in which case we need to update the rejected flags.

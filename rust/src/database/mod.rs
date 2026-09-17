@@ -4,11 +4,13 @@
 //! append-only content-addressed packfiles.
 
 pub mod core;
+pub mod embedded_edges;
 pub mod mtxdb;
 
 use pyo3::prelude::*;
 
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     mtxdb::register_module(py, m)?;
+    embedded_edges::register_module(m)?;
     Ok(())
 }

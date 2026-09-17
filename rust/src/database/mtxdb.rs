@@ -43,7 +43,7 @@ static OPENER_PID: OnceCell<u32> = OnceCell::new();
 /// before any mutating pyfunction touches a fd. See `WRITE_MODE`'s doc
 /// comment for why this must be the single choke point, not a per-caller
 /// guard.
-fn assert_writable() -> PyResult<()> {
+pub(crate) fn assert_writable() -> PyResult<()> {
     match WRITE_MODE.get() {
         Some(true) => Ok(()),
         Some(false) => Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -89,7 +89,7 @@ fn check_pid_guard() -> PyResult<bool> {
 /// so we hold this across get→put_many for counters and auth-chain manifests.
 /// Only one SQL transaction runs at a time via the DB pool, so contention is
 /// negligible.
-static RMW_LOCK: Mutex<()> = Mutex::new(());
+pub(crate) static RMW_LOCK: Mutex<()> = Mutex::new(());
 
 /// Semantic counters for state-group refcount RMWs. These deliberately live
 /// beside the Synapse wrapper rather than in generic mtxdb runtime stats:
@@ -106,7 +106,7 @@ fn state_db() -> PyResult<&'static Arc<PackfileStorage>> {
     Ok(&pools()?.state)
 }
 
-fn event_dag_db() -> PyResult<&'static Arc<PackfileStorage>> {
+pub(crate) fn event_dag_db() -> PyResult<&'static Arc<PackfileStorage>> {
     Ok(&pools()?.event_dag)
 }
 
@@ -1993,7 +1993,7 @@ type EventJsonGetRow = (String, Option<Vec<u8>>, Option<Vec<u8>>);
 /// every other `NodeId` in this adapter is (first 16 bytes of SHA-256 over a
 /// domain-separated key -- see `kv_node_id`/`chain_node_id`/`root_node_id`).
 /// No u64 truncation of the event id anywhere; the id is hashed in full.
-fn event_node_id(namespace: &str, event_id: &str) -> NodeId {
+pub(crate) fn event_node_id(namespace: &str, event_id: &str) -> NodeId {
     let mut hasher = Sha256::new();
     hasher.update(b"event_json:event:");
     hasher.update(namespace.as_bytes());
@@ -2028,7 +2028,7 @@ fn event_meta_node_id(namespace: &str, event_id: &str) -> NodeId {
 /// every other collection derivation -- deliberately NOT State's 8-byte
 /// room-prefix scheme, whose fixed-width zero-extension semantics are tuned
 /// for 8-byte prefixes, not arbitrary room_ids.
-fn event_locator_collection_id(namespace: &str, node_id: &NodeId) -> [u8; 16] {
+pub(crate) fn event_locator_collection_id(namespace: &str, node_id: &NodeId) -> [u8; 16] {
     let bucket = u32::from_le_bytes([node_id[0], node_id[1], node_id[2], node_id[3]])
         % EVENT_LOCATOR_BUCKETS;
     let mut hasher = Sha256::new();
@@ -2045,7 +2045,7 @@ fn event_locator_collection_id(namespace: &str, node_id: &NodeId) -> [u8; 16] {
 /// Room-scoped EventDag collection id: a domain-separated 128-bit derivation
 /// from `(namespace, room_id)`, the same shape `auth_chain_closure_room_id`
 /// uses. Not a copy of State's room-prefix scheme.
-fn event_dag_room_id(namespace: &str, room_id: &str) -> [u8; 16] {
+pub(crate) fn event_dag_room_id(namespace: &str, room_id: &str) -> [u8; 16] {
     let mut hasher = Sha256::new();
     hasher.update(b"event_json:dag:");
     hasher.update(namespace.as_bytes());
@@ -2847,7 +2847,7 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
 }
 
 #[cfg(test)]
-mod auth_chain_closure_tests {
+pub(crate) mod auth_chain_closure_tests {
     //! `DBS` is a process-global `OnceCell` (see `open_client`): only the
     //! first call in this test binary actually opens a store, and every
     //! test after that silently reuses it. Isolation between tests

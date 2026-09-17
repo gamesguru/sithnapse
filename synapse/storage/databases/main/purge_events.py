@@ -26,6 +26,7 @@ from synapse.api.errors import SynapseError
 from synapse.storage.database import LoggingTransaction
 from synapse.storage.databases.main import CacheInvalidationWorkerStore
 from synapse.storage.databases.main.embedded_common import Pool, sync_now
+from synapse.storage.databases.main.embedded_event_edges import delete_event_edges_batch
 from synapse.storage.databases.main.embedded_event_json import delete_event_json_batch
 from synapse.storage.databases.main.embedded_event_to_state_group import (
     decrement_state_group_refcounts_batch,
@@ -377,6 +378,11 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
                 self._embedded_hamt_namespace,
                 [event_id for event_id, should_delete in event_rows if should_delete],
             )
+        if getattr(self, "_embedded_event_edges_enabled", False):
+            delete_event_edges_batch(
+                self._embedded_hamt_namespace,
+                [event_id for event_id, should_delete in event_rows if should_delete],
+            )
 
         # Some of the `event_push_actions` we're about to delete may have already
         # been rotated into the aggregate `event_push_summary` counts. Deleting
@@ -642,6 +648,10 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
         if room_event_ids:
             delete_event_json_batch(
                 self._embedded_hamt_engine,
+                self._embedded_hamt_namespace,
+                room_event_ids,
+            )
+            delete_event_edges_batch(
                 self._embedded_hamt_namespace,
                 room_event_ids,
             )

@@ -1,0 +1,531 @@
+//! Embedded Event Edges storage in the `event_dag` mtxdb packfile storage pool.
+//!
+//! Stores the DAG edges connecting Matrix events:
+//! - Backward edges: `event_id -> [(prev_event_id, is_state)]` (immutable, write-once).
+//! - Forward edges: `prev_event_id -> [child_event_id]` (appended & deduplicated under RMW_LOCK).
+//! - Locators: maps event_id and prev_event_id to their respective room's EventDag collection.
+
+use std::collections::{HashMap, HashSet};
+
+use mtxdb_core::{NodeData, NodeId, StorageEngine};
+use pyo3::prelude::*;
+use sha2::{Digest, Sha256};
+
+use super::mtxdb::{
+    assert_writable, event_dag_db, event_dag_room_id, event_locator_collection_id, event_node_id,
+    RMW_LOCK,
+};
+
+fn event_edges_backward_node_id(namespace: &str, event_id: &str) -> NodeId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"event_edges:backward:");
+    hasher.update(namespace.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(event_id.as_bytes());
+    let hash = hasher.finalize();
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&hash[..16]);
+    id
+}
+
+fn event_edges_forward_node_id(namespace: &str, prev_event_id: &str) -> NodeId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"event_edges:forward:");
+    hasher.update(namespace.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(prev_event_id.as_bytes());
+    let hash = hasher.finalize();
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&hash[..16]);
+    id
+}
+
+fn encode_backward_edges(edges: &[(String, bool)]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(edges.len() as u16).to_be_bytes());
+    for (prev_id, is_state) in edges {
+        buf.push(if *is_state { 1 } else { 0 });
+        let bytes = prev_id.as_bytes();
+        buf.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+        buf.extend_from_slice(bytes);
+    }
+    buf
+}
+
+fn decode_backward_edges(bytes: &[u8]) -> PyResult<Vec<(String, bool)>> {
+    if bytes.len() < 2 {
+        return Ok(Vec::new());
+    }
+    let count = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
+    let mut offset = 2;
+    let mut edges = Vec::with_capacity(count);
+    for _ in 0..count {
+        if offset >= bytes.len() {
+            break;
+        }
+        let is_state = bytes[offset] != 0;
+        offset += 1;
+        if offset + 2 > bytes.len() {
+            break;
+        }
+        let len = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]) as usize;
+        offset += 2;
+        if offset + len > bytes.len() {
+            break;
+        }
+        let id_str = std::str::from_utf8(&bytes[offset..offset + len])
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("utf8 error: {e}")))?;
+        edges.push((id_str.to_string(), is_state));
+        offset += len;
+    }
+    Ok(edges)
+}
+
+fn encode_forward_edges(children: &[String]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(children.len() as u32).to_be_bytes());
+    for child in children {
+        let bytes = child.as_bytes();
+        buf.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+        buf.extend_from_slice(bytes);
+    }
+    buf
+}
+
+fn decode_forward_edges(bytes: &[u8]) -> PyResult<Vec<String>> {
+    if bytes.len() < 4 {
+        return Ok(Vec::new());
+    }
+    let count = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    let mut offset = 4;
+    let mut children = Vec::with_capacity(count);
+    for _ in 0..count {
+        if offset + 2 > bytes.len() {
+            break;
+        }
+        let len = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]) as usize;
+        offset += 2;
+        if offset + len > bytes.len() {
+            break;
+        }
+        let id_str = std::str::from_utf8(&bytes[offset..offset + len])
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("utf8 error: {e}")))?;
+        children.push(id_str.to_string());
+        offset += len;
+    }
+    Ok(children)
+}
+
+/// Batch put event edges into the room-aware event_dag pool:
+/// 1. Backward edges: `event_id -> [(prev_event_id, is_state)]`
+/// 2. Forward edges: `prev_event_id -> [child_event_id]` (appended and deduplicated)
+/// 3. Locators: `event_id` and `prev_event_id` -> room collection
+#[pyfunction]
+pub fn event_edges_put(
+    py: Python<'_>,
+    namespace: String,
+    rows: Vec<(String, String, String, bool)>, // (room_id, event_id, prev_event_id, is_state)
+) -> PyResult<()> {
+    assert_writable()?;
+    py.detach(|| {
+        let _guard = RMW_LOCK
+            .lock()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}")))?;
+        let engine = event_dag_db()?;
+
+        let mut backward_map: HashMap<(String, String), Vec<(String, bool)>> = HashMap::new();
+        let mut forward_map: HashMap<(String, String), Vec<String>> = HashMap::new();
+
+        for (room_id, event_id, prev_event_id, is_state) in rows {
+            backward_map
+                .entry((room_id.clone(), event_id.clone()))
+                .or_default()
+                .push((prev_event_id.clone(), is_state));
+            forward_map
+                .entry((room_id, prev_event_id))
+                .or_default()
+                .push(event_id);
+        }
+
+        let mut locator_puts: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
+        let mut dag_puts: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
+
+        for ((room_id, event_id), edges) in backward_map {
+            let room_collection = event_dag_room_id(&namespace, &room_id);
+            let identity = event_node_id(&namespace, &event_id);
+            let edge_node = event_edges_backward_node_id(&namespace, &event_id);
+            let locator_collection = event_locator_collection_id(&namespace, &identity);
+
+            let encoded = encode_backward_edges(&edges);
+            dag_puts
+                .entry(room_collection)
+                .or_default()
+                .push((edge_node, NodeData::new(bytes::Bytes::from(encoded))));
+
+            locator_puts.entry(locator_collection).or_default().push((
+                identity,
+                NodeData::new(bytes::Bytes::copy_from_slice(&room_collection)),
+            ));
+        }
+
+        for ((room_id, prev_event_id), new_children) in forward_map {
+            let room_collection = event_dag_room_id(&namespace, &room_id);
+            let prev_identity = event_node_id(&namespace, &prev_event_id);
+            let forward_node = event_edges_forward_node_id(&namespace, &prev_event_id);
+            let parent_locator = event_locator_collection_id(&namespace, &prev_identity);
+
+            // Read existing children if any
+            let mut existing_children = match engine.get(&room_collection, &forward_node) {
+                Ok(Some(data)) if !data.bytes.is_empty() => decode_forward_edges(&data.bytes)?,
+                _ => Vec::new(),
+            };
+
+            let mut seen: HashSet<String> = existing_children.iter().cloned().collect();
+            let mut changed = false;
+            for child in new_children {
+                if seen.insert(child.clone()) {
+                    existing_children.push(child);
+                    changed = true;
+                }
+            }
+
+            if changed {
+                let encoded = encode_forward_edges(&existing_children);
+                dag_puts
+                    .entry(room_collection)
+                    .or_default()
+                    .push((forward_node, NodeData::new(bytes::Bytes::from(encoded))));
+            }
+
+            locator_puts.entry(parent_locator).or_default().push((
+                prev_identity,
+                NodeData::new(bytes::Bytes::copy_from_slice(&room_collection)),
+            ));
+        }
+
+        for (collection, pairs) in dag_puts {
+            engine.put_many(&collection, &pairs).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {e}"))
+            })?;
+        }
+        for (collection, pairs) in locator_puts {
+            engine.put_many(&collection, &pairs).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {e}"))
+            })?;
+        }
+
+        Ok(())
+    })
+}
+
+/// Read backward edges: given event_ids, returns `(event_id, Option<[(prev_event_id, is_state)]>)`
+#[pyfunction]
+#[allow(clippy::type_complexity)]
+pub fn event_edges_get_backward(
+    py: Python<'_>,
+    namespace: String,
+    event_ids: Vec<String>,
+) -> PyResult<Vec<(String, Option<Vec<(String, bool)>>)>> {
+    py.detach(|| {
+        let engine = event_dag_db()?;
+        let node_ids: Vec<NodeId> = event_ids
+            .iter()
+            .map(|id| event_node_id(&namespace, id))
+            .collect();
+
+        // Phase 1: resolve room collections via locator
+        let mut locator_ids: HashMap<[u8; 16], Vec<(usize, NodeId)>> = HashMap::new();
+        for (position, node_id) in node_ids.iter().enumerate() {
+            locator_ids
+                .entry(event_locator_collection_id(&namespace, node_id))
+                .or_default()
+                .push((position, *node_id));
+        }
+
+        let mut room_collections: Vec<Option<[u8; 16]>> = vec![None; event_ids.len()];
+        for (collection, ids) in locator_ids {
+            let node_ids_only: Vec<NodeId> = ids.iter().map(|(_, id)| *id).collect();
+            let found = engine.get_many(&collection, &node_ids_only).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {e}"))
+            })?;
+            for ((position, _), value) in ids.into_iter().zip(found) {
+                if let Some(data) = value {
+                    if !data.bytes.is_empty() {
+                        if let Ok(room) = <[u8; 16]>::try_from(data.bytes.as_ref()) {
+                            room_collections[position] = Some(room);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Phase 2: fetch edge records from resolved room collections
+        let mut dag_ids: HashMap<[u8; 16], Vec<(usize, NodeId)>> = HashMap::new();
+        for (position, room_collection) in room_collections.iter().enumerate() {
+            if let Some(room_collection) = room_collection {
+                let edge_node = event_edges_backward_node_id(&namespace, &event_ids[position]);
+                dag_ids
+                    .entry(*room_collection)
+                    .or_default()
+                    .push((position, edge_node));
+            }
+        }
+
+        let mut results: Vec<Option<Vec<(String, bool)>>> = vec![None; event_ids.len()];
+        for (collection, ids) in dag_ids {
+            let node_ids_only: Vec<NodeId> = ids.iter().map(|(_, id)| *id).collect();
+            let found = engine.get_many(&collection, &node_ids_only).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {e}"))
+            })?;
+            for ((position, _), value) in ids.into_iter().zip(found) {
+                if let Some(data) = value {
+                    if !data.bytes.is_empty() {
+                        results[position] = Some(decode_backward_edges(&data.bytes)?);
+                    }
+                }
+            }
+        }
+
+        Ok(event_ids.into_iter().zip(results).collect())
+    })
+}
+
+/// Read forward edges: given prev_event_ids, returns `(prev_event_id, Option<[child_event_id]>)`
+#[pyfunction]
+pub fn event_edges_get_forward(
+    py: Python<'_>,
+    namespace: String,
+    prev_event_ids: Vec<String>,
+) -> PyResult<Vec<(String, Option<Vec<String>>)>> {
+    py.detach(|| {
+        let engine = event_dag_db()?;
+        let node_ids: Vec<NodeId> = prev_event_ids
+            .iter()
+            .map(|id| event_node_id(&namespace, id))
+            .collect();
+
+        // Phase 1: resolve room collections via locator
+        let mut locator_ids: HashMap<[u8; 16], Vec<(usize, NodeId)>> = HashMap::new();
+        for (position, node_id) in node_ids.iter().enumerate() {
+            locator_ids
+                .entry(event_locator_collection_id(&namespace, node_id))
+                .or_default()
+                .push((position, *node_id));
+        }
+
+        let mut room_collections: Vec<Option<[u8; 16]>> = vec![None; prev_event_ids.len()];
+        for (collection, ids) in locator_ids {
+            let node_ids_only: Vec<NodeId> = ids.iter().map(|(_, id)| *id).collect();
+            let found = engine.get_many(&collection, &node_ids_only).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {e}"))
+            })?;
+            for ((position, _), value) in ids.into_iter().zip(found) {
+                if let Some(data) = value {
+                    if !data.bytes.is_empty() {
+                        if let Ok(room) = <[u8; 16]>::try_from(data.bytes.as_ref()) {
+                            room_collections[position] = Some(room);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Phase 2: fetch forward edge records from resolved room collections
+        let mut dag_ids: HashMap<[u8; 16], Vec<(usize, NodeId)>> = HashMap::new();
+        for (position, room_collection) in room_collections.iter().enumerate() {
+            if let Some(room_collection) = room_collection {
+                let forward_node =
+                    event_edges_forward_node_id(&namespace, &prev_event_ids[position]);
+                dag_ids
+                    .entry(*room_collection)
+                    .or_default()
+                    .push((position, forward_node));
+            }
+        }
+
+        let mut results: Vec<Option<Vec<String>>> = vec![None; prev_event_ids.len()];
+        for (collection, ids) in dag_ids {
+            let node_ids_only: Vec<NodeId> = ids.iter().map(|(_, id)| *id).collect();
+            let found = engine.get_many(&collection, &node_ids_only).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {e}"))
+            })?;
+            for ((position, _), value) in ids.into_iter().zip(found) {
+                if let Some(data) = value {
+                    if !data.bytes.is_empty() {
+                        results[position] = Some(decode_forward_edges(&data.bytes)?);
+                    }
+                }
+            }
+        }
+
+        Ok(prev_event_ids.into_iter().zip(results).collect())
+    })
+}
+
+/// Tombstone backward edges for purged events
+#[pyfunction]
+pub fn event_edges_delete(
+    py: Python<'_>,
+    namespace: String,
+    event_ids: Vec<String>,
+) -> PyResult<()> {
+    assert_writable()?;
+    py.detach(|| {
+        let engine = event_dag_db()?;
+        let node_ids: Vec<NodeId> = event_ids
+            .iter()
+            .map(|id| event_node_id(&namespace, id))
+            .collect();
+
+        let mut locator_ids: HashMap<[u8; 16], Vec<(usize, NodeId)>> = HashMap::new();
+        for (position, node_id) in node_ids.iter().enumerate() {
+            locator_ids
+                .entry(event_locator_collection_id(&namespace, node_id))
+                .or_default()
+                .push((position, *node_id));
+        }
+
+        let mut room_collections: Vec<Option<[u8; 16]>> = vec![None; event_ids.len()];
+        for (collection, ids) in locator_ids {
+            let node_ids_only: Vec<NodeId> = ids.iter().map(|(_, id)| *id).collect();
+            let found = engine.get_many(&collection, &node_ids_only).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {e}"))
+            })?;
+            for ((position, _), value) in ids.into_iter().zip(found) {
+                if let Some(data) = value {
+                    if !data.bytes.is_empty() {
+                        if let Ok(room) = <[u8; 16]>::try_from(data.bytes.as_ref()) {
+                            room_collections[position] = Some(room);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut dag_tombs: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
+        for (position, room_collection) in room_collections.iter().enumerate() {
+            if let Some(room_collection) = room_collection {
+                let tombs = dag_tombs.entry(*room_collection).or_default();
+                tombs.push((
+                    event_edges_backward_node_id(&namespace, &event_ids[position]),
+                    NodeData::new(bytes::Bytes::new()),
+                ));
+            }
+        }
+
+        for (collection, pairs) in dag_tombs {
+            engine.put_many(&collection, &pairs).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {e}"))
+            })?;
+        }
+
+        Ok(())
+    })
+}
+
+pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(event_edges_put, m)?)?;
+    m.add_function(wrap_pyfunction!(event_edges_get_backward, m)?)?;
+    m.add_function(wrap_pyfunction!(event_edges_get_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(event_edges_delete, m)?)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn put_get_backward_and_forward_round_trip() {
+        crate::database::mtxdb::auth_chain_closure_tests::ensure_open();
+        let ns = "ns-edges-roundtrip";
+        let room = "!room-edges:example.org";
+
+        // $child has prev_events: ($p1, true) and ($p2, false)
+        pyo3::Python::attach(|py| {
+            event_edges_put(
+                py,
+                ns.to_string(),
+                vec![
+                    (
+                        room.to_string(),
+                        "$child".to_string(),
+                        "$p1".to_string(),
+                        true,
+                    ),
+                    (
+                        room.to_string(),
+                        "$child".to_string(),
+                        "$p2".to_string(),
+                        false,
+                    ),
+                ],
+            )
+            .expect("put edges");
+
+            // Check backward edges for $child
+            let got_backward = event_edges_get_backward(
+                py,
+                ns.to_string(),
+                vec!["$child".to_string(), "$nonexistent".to_string()],
+            )
+            .expect("get backward");
+            assert_eq!(got_backward.len(), 2);
+            assert_eq!(got_backward[0].0, "$child");
+            let child_preds = got_backward[0].1.as_ref().expect("child preds found");
+            assert_eq!(child_preds.len(), 2);
+            assert_eq!(child_preds[0], ("$p1".to_string(), true));
+            assert_eq!(child_preds[1], ("$p2".to_string(), false));
+            assert_eq!(got_backward[1].1, None);
+
+            // Check forward edges for $p1 and $p2
+            let got_forward = event_edges_get_forward(
+                py,
+                ns.to_string(),
+                vec![
+                    "$p1".to_string(),
+                    "$p2".to_string(),
+                    "$nonexistent".to_string(),
+                ],
+            )
+            .expect("get forward");
+            assert_eq!(got_forward.len(), 3);
+            assert_eq!(
+                got_forward[0].1.as_deref(),
+                Some(&["$child".to_string()][..])
+            );
+            assert_eq!(
+                got_forward[1].1.as_deref(),
+                Some(&["$child".to_string()][..])
+            );
+            assert_eq!(got_forward[2].1, None);
+
+            // Add another child ($child2) pointing to $p1
+            event_edges_put(
+                py,
+                ns.to_string(),
+                vec![(
+                    room.to_string(),
+                    "$child2".to_string(),
+                    "$p1".to_string(),
+                    false,
+                )],
+            )
+            .expect("put second child");
+
+            let p1_forward = event_edges_get_forward(py, ns.to_string(), vec!["$p1".to_string()])
+                .expect("get p1 forward");
+            let p1_children = p1_forward[0].1.as_ref().expect("p1 children");
+            assert_eq!(p1_children.len(), 2);
+            assert!(p1_children.contains(&"$child".to_string()));
+            assert!(p1_children.contains(&"$child2".to_string()));
+
+            // Deletion tombstones $child
+            event_edges_delete(py, ns.to_string(), vec!["$child".to_string()]).expect("delete");
+            let after_delete =
+                event_edges_get_backward(py, ns.to_string(), vec!["$child".to_string()])
+                    .expect("get after delete");
+            assert_eq!(after_delete[0].1, None);
+        });
+    }
+}

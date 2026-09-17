@@ -78,6 +78,10 @@ from synapse.storage.database import (
     LoggingTransaction,
     make_tuple_in_list_sql_clause,
 )
+from synapse.storage.databases.main.embedded_common import ffi_count
+from synapse.storage.databases.main.embedded_event_edges import (
+    open_embedded_event_edges_engine,
+)
 from synapse.storage.databases.main.embedded_event_json import (
     get_event_json_batch,
     open_embedded_event_json_engine,
@@ -241,6 +245,7 @@ class EventsWorkerStore(SQLBaseStore):
         super().__init__(database, db_conn, hs)
 
         self._embedded_event_json_enabled = open_embedded_event_json_engine(hs)
+        self._embedded_event_edges_enabled = open_embedded_event_edges_engine(hs)
         self._embedded_hamt_engine = hs.config.database.embedded_hamt_engine
         # Namespaces event_to_state_group/refcount keys in the embedded
         # engine -- see embedded_event_to_state_group.py's module docstring.
@@ -2573,6 +2578,29 @@ class EventsWorkerStore(SQLBaseStore):
             if txn.fetchone():
                 return False
 
+            if self._embedded_event_edges_enabled:
+                from synapse.storage.databases.main.embedded_event_edges import (
+                    get_event_edges_forward_batch,
+                )
+
+                forward_map = get_event_edges_forward_batch(
+                    self._embedded_hamt_namespace, [event.event_id]
+                )
+                children = forward_map.get(event.event_id)
+                if children is not None:
+                    ffi_count("event_edges_gap_hits", 1)
+                    if not children:
+                        return True
+                    clause, args = make_in_list_sql_clause(
+                        self.database_engine, "event_id", children
+                    )
+                    txn.execute(f"SELECT event_id FROM rejections WHERE {clause}", args)
+                    rejected_children = {r[0] for r in txn}
+                    if any(c not in rejected_children for c in children):
+                        return False
+                    return True
+                ffi_count("event_edges_gap_fallbacks", 1)
+
             # Check to see whether the event in question is already referenced
             # by another event. If we don't see any edges, we're next to a
             # forward gap.
@@ -2721,7 +2749,7 @@ class EventsWorkerStore(SQLBaseStore):
     ) -> Mapping[str, bool]:
         """Checks which of the given events have been un-partial-stated."""
         if not self._has_un_partial_stated_events:
-            return {e_id: False for e_id in event_ids}
+            return dict.fromkeys(event_ids, False)
 
         result = cast(
             list[tuple[str]],
