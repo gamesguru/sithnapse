@@ -2020,8 +2020,8 @@ class PersistEventsStore:
 
                 args: list[Any] = [
                     room_id,
-                    room_id,
                     sliding_sync_table_changes.joined_room_bump_stamp_to_fully_insert,
+                    room_id,
                 ]
                 args.extend(iter(sliding_sync_updates_values))
 
@@ -2047,20 +2047,20 @@ class PersistEventsStore:
                     f"""
                     INSERT INTO sliding_sync_joined_rooms
                         (room_id, event_stream_ordering, bump_stamp, {", ".join(sliding_sync_updates_keys)})
-                    VALUES (
+                    SELECT
                         ?,
-                        COALESCE(
-                            (SELECT stream_ordering FROM events WHERE room_id = ? AND stream_ordering IS NOT NULL ORDER BY stream_ordering DESC LIMIT 1),
-                            ?
-                        ),
+                        e.stream_ordering,
                         ?,
                         {", ".join("?" for _ in sliding_sync_updates_values)}
-                    )
+                    FROM events AS e
+                    WHERE e.room_id = ? AND e.stream_ordering IS NOT NULL
+                    ORDER BY e.stream_ordering DESC
+                    LIMIT 1
                     ON CONFLICT (room_id)
                     DO UPDATE SET
                         {", ".join(f"{key} = EXCLUDED.{key}" for key in sliding_sync_updates_keys)}
                     """,
-                    [args[0], args[1], stream_id, *args[2:]],
+                    args,
                 )
 
         # We now update `local_current_membership`. We do this regardless
