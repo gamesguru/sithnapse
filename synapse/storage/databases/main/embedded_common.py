@@ -235,9 +235,10 @@ def _print_ffi_timings() -> None:
             _ffi_timings_print("===========================")
             _ffi_timings_print("")
         _ffi_timings_print("=== FFI batch counters ===")
-        tag_width = max(
-            50, *(len(tag) for tag in counters if not tag.startswith("auth_chain_"))
-        )
+        non_auth_tags = [
+            len(tag) for tag in counters if not tag.startswith("auth_chain_")
+        ]
+        tag_width = max(50, *non_auth_tags)
         for tag in sorted(counters):
             if tag.startswith("auth_chain_"):
                 continue

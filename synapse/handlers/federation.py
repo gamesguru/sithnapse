@@ -1082,6 +1082,9 @@ class FederationHandler:
             if await self._event_auth_handler.has_restricted_join_rules(
                 state_ids, room_version
             ):
+                allowed_rooms = (
+                    await self._event_auth_handler.get_rooms_that_allow_join(state_ids)
+                )
                 prev_member_event_id = state_ids.get((EventTypes.Member, user_id), None)
                 # If the user is invited or joined to the room already, then
                 # no additional info is needed.
@@ -1093,7 +1096,7 @@ class FederationHandler:
                         Membership.INVITE,
                     )
 
-                if include_auth_user_id:
+                if include_auth_user_id and allowed_rooms:
                     event_content[
                         EventContentFields.AUTHORISING_USER
                     ] = await self._event_auth_handler.get_user_which_could_invite(

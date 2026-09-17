@@ -52,7 +52,7 @@ from synapse.storage.database import (
 )
 from synapse.storage.databases.main.embedded_common import (
     Pool,
-    mark_dirty,
+    sync_now,
 )
 from synapse.storage.databases.main.embedded_event_to_state_group import (
     decrement_state_group_refcounts_batch,
@@ -835,8 +835,9 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
                 keyvalues={"event_id": event.event_id},
                 updatevalues={"state_group": state_group},
             )
-            # Mark STATE pool dirty after SQL commit via txn.call_after.
-            txn.call_after(mark_dirty, Pool.STATE)
+            # Immediately sync STATE pool to mtxdb after SQL commit so reader workers
+            # see the updated state group without waiting for debounce.
+            txn.call_after(sync_now, [Pool.STATE])
         else:
             self.db_pool.simple_update_txn(
                 txn,

@@ -593,6 +593,9 @@ class EventFederationWorkerStore(
         # Check that all direct auth events for the initial events are present in the
         # computed auth chain. If any direct auth event is missing from the cover index,
         # the chain cover is incomplete and we must fall back to legacy traversal.
+        # Note: when include_given is False, results does not contain initial_events,
+        # so direct auth events (and the room create event) that are already in
+        # initial_events must be accounted for via all_covered = results | initial_events.
         clause, args = make_in_list_sql_clause(
             txn.database_engine, "event_id", initial_events
         )
@@ -601,7 +604,8 @@ class EventFederationWorkerStore(
             args,
         )
         direct_auth_ids = {auth_id for (auth_id,) in txn}
-        missing_direct_auth = direct_auth_ids.difference(results)
+        all_covered = results | initial_events
+        missing_direct_auth = direct_auth_ids.difference(all_covered)
         if missing_direct_auth:
             from synapse.storage.databases.main.embedded_event_auth_chains import (
                 IncompleteAuthGraph,
@@ -622,7 +626,7 @@ class EventFederationWorkerStore(
                 (room_id,),
             )
             create_row = txn.fetchone()
-            if create_row and create_row[0] not in results:
+            if create_row and create_row[0] not in all_covered:
                 from synapse.storage.databases.main.embedded_event_auth_chains import (
                     IncompleteAuthGraph,
                 )
@@ -941,16 +945,8 @@ class EventFederationWorkerStore(
                         return StateDifference(
                             auth_difference=auth_diff, conflicted_subgraph=None
                         )
-                elif embedded_hamt_namespace is not None and conflicted_set is not None:
-                    # Non-writer instances hold a read-only mtxdb handle and cannot
-                    # safely repair missing embedded links, and legacy BFS cannot
-                    # compute the v2.1 conflicted subgraph. Fail loud with _NoChainCoverIndex.
-                    raise _NoChainCoverIndex(room_id)
-
-                # Non-writers (or instances without embedded HAMT): prefer the cover
-                # index when complete. Non-writers hold a read-only mtxdb handle and
-                # cannot safely repair missing links; if the cover index is incomplete
-                # or missing, fall back to the authoritative legacy SQL traversal.
+                # Non-writers cannot repair the embedded graph. If the embedded lookup is
+                # incomplete, fall back to the SQL chain-cover implementation.
                 result = await self.db_pool.runInteraction(
                     "get_auth_chain_difference_chains",
                     self._get_auth_chain_difference_using_cover_index_txn,

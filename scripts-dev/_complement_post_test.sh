@@ -48,7 +48,7 @@ mkdir -p "$stats_dir"
 # place the closure-cache's diagnostic logger.warning() calls end up.
 # Not captured anywhere else: Complement's own logs.jsonl is the *test*
 # framework's output, and COMPLEMENT_ALWAYS_PRINT_SERVER_LOGS isn't set.
-"$runtime" logs "$container_id" >"${stats_dir}/container.${test_name//[^A-Za-z0-9_.-]/_}.log" 2>&1 || true
+"$runtime" logs "$container_id" >"${stats_dir}/container.${container_id:0:12}.${test_name//[^A-Za-z0-9_.-]/_}.log" 2>&1 || true
 
 {
 	echo "=== $(date -u +%FT%TZ) test=${test_name} failed=${failed} container=${container_id} ==="

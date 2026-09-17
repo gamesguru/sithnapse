@@ -2969,7 +2969,7 @@ class SyncHandler:
                     events=[],
                     newly_joined=newly_joined,
                     full_state=False,
-                    since_token=since_token,
+                    since_token=None if newly_joined else since_token,
                     upto_token=since_token,
                     end_token=now_token,
                 )
