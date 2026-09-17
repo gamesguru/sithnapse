@@ -306,6 +306,7 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
                 self._embedded_hamt_engine,
                 self._embedded_hamt_namespace,
                 all_purge_event_ids,
+                purpose="purge_traversal",
             )
             referenced_state_groups = set(event_id_to_state_group.values())
             logger.info(
@@ -650,6 +651,7 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
                 self._embedded_hamt_engine,
                 self._embedded_hamt_namespace,
                 room_event_ids,
+                purpose="purge_traversal",
             )
             delete_event_to_state_group_batch(
                 self._embedded_hamt_engine,

@@ -144,7 +144,10 @@ class EventForwardExtremitiesStore(
         event_ids = [event_id for event_id, _depth, _received_ts in rows]
         if getattr(self, "_embedded_event_json_enabled", False):
             state_groups = get_state_group_for_events_batch(
-                self._embedded_hamt_engine, self._embedded_hamt_namespace, event_ids
+                self._embedded_hamt_engine,
+                self._embedded_hamt_namespace,
+                event_ids,
+                purpose="forward_extremities",
             )
             # During the event-to-state-group migration, some events may not
             # have been copied to mtxdb yet. Fall back to SQL for any missing

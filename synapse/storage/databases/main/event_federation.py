@@ -323,7 +323,10 @@ class EventFederationWorkerStore(
                             include_given,
                         )
                         _auth_coverage(
-                            "get_auth_chain_ids", "embedded_complete", len(event_ids), len(result)
+                            "get_auth_chain_ids",
+                            "embedded_complete",
+                            len(event_ids),
+                            len(result),
                         )
                         return result
                     except IncompleteAuthGraph:
