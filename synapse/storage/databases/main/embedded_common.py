@@ -582,6 +582,11 @@ def maybe_sync(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
 # (purge, redaction) and shutdown.
 
 
+# Exported so tests can advance the reactor by slightly more than the flush
+# window without coupling to a magic literal.
+FLUSH_DELAY_SECS: float = 0.5
+
+
 class _FlushCoalescer:
     """Commit-aware coalescing flush for mtxdb pools.
 
@@ -602,7 +607,7 @@ class _FlushCoalescer:
         self._dirty: set[Pool] = set()
         self._delayed_call: DelayedCallWrapper | None = None
         self._closed: bool = False
-        self._FLUSH_DELAY = Duration(seconds=0.5)
+        self._FLUSH_DELAY = Duration(seconds=FLUSH_DELAY_SECS)
         self._RETRY_DELAY = Duration(seconds=1.0)
 
     def mark_dirty(self, pool: Pool) -> None:

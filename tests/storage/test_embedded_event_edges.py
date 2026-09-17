@@ -20,6 +20,7 @@ from twisted.test.proto_helpers import MemoryReactor
 from synapse.rest import admin
 from synapse.rest.client import login, room
 from synapse.server import HomeServer
+from synapse.storage.databases.main.embedded_common import FLUSH_DELAY_SECS
 from synapse.storage.databases.main.embedded_event_edges import (
     delete_event_edges_batch,
     get_event_edges_backward_batch,
@@ -235,7 +236,14 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         self.assertIn(e2_id, successors)
 
     def test_sql_fallback_and_repair_on_missing_mtxdb_edges(self) -> None:
-        """If mtxdb is missing edges (e.g. write failure after SQL commit), SQL fallback returns them and repairs mtxdb."""
+        """SQL fallback returns edges missing from mtxdb and repairs the local store.
+
+        This is a same-process test: it verifies that after the coalesced flush
+        fires, the same in-process mtxdb handle reflects the repaired edge when
+        read through the read-only (non-writable) code path.  It does NOT verify
+        cross-worker or cross-process visibility; that requires a separate
+        read-only engine handle or a genuine multi-process integration test.
+        """
         res1 = self.helper.send(self.room_id, "parent", tok=self.tok)
         p_id = res1["event_id"]
         res2 = self.helper.send(self.room_id, "child", tok=self.tok)
@@ -260,10 +268,13 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         )
         self.assertIn(c_id, fwd_repaired.get(p_id) or [])
 
-        # Advance reactor clock to trigger the coalesced flush
-        self.reactor.advance(1.0)
+        # Advance the reactor clock past the flush window so the coalesced flush fires.
+        # Use FLUSH_DELAY_SECS + a small margin so the test is not fragile to
+        # floating-point boundaries or minor changes to the delay value.
+        self.reactor.advance(FLUSH_DELAY_SECS + 0.1)
 
-        # A separate read-only worker now observes the repaired edge directly from mtxdb
+        # The same-process read-only code path (writable=False) can still read
+        # the repaired edge from the in-process mtxdb handle after the flush.
         self.store._embedded_event_edges_writable = False
         reader_successors = self.get_success(self.store.get_successor_events(p_id))
         self.assertIn(c_id, reader_successors)
