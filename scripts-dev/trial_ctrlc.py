@@ -16,11 +16,16 @@ import signal
 import sys
 import tempfile
 from collections import defaultdict
+from typing import Protocol, cast
 
 from twisted.python import usage
 from twisted.scripts.trial import Options, _getSuite, _initialDebugSetup, _makeRunner
 from twisted.trial import itrial, unittest
 from twisted.trial.runner import TrialRunner, _logFile, _testDirectory
+
+
+class _DistributedRunner(Protocol):
+    _workingDirectory: str
 
 
 def _flush_process_timings() -> None:
@@ -564,13 +569,13 @@ def run() -> None:
     # cascading FileNotFoundErrors.  Resolve the runner-owned path once before
     # any worker is spawned.
     if config["jobs"] is not None:
-        trialRunner._workingDirectory = os.path.abspath(  # type: ignore[attr-defined]
-            trialRunner._workingDirectory  # type: ignore[attr-defined]
+        distributed_runner = cast(_DistributedRunner, trialRunner)
+        distributed_runner._workingDirectory = os.path.abspath(
+            distributed_runner._workingDirectory
         )
     else:
-        trialRunner.workingDirectory = os.path.abspath(  # type: ignore[attr-defined]
-            trialRunner.workingDirectory  # type: ignore[attr-defined]
-        )
+        assert isinstance(trialRunner, TrialRunner)
+        trialRunner.workingDirectory = os.path.abspath(trialRunner.workingDirectory)
     suite = _getSuite(config)
 
     interrupted = False
