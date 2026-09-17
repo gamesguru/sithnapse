@@ -665,6 +665,22 @@ class _FlushCoalescer:
         self._delayed_call = None
         if self._closed:
             return
+        # Drain the coalesced edge-write queues first: the rows land in the
+        # EVENT_DAG pool, and the fsync below must cover them.  On failure the
+        # rows were restored to their queues and EVENT_DAG re-marked dirty, so
+        # retry on the backoff delay.  Imported lazily (embedded_event_edges
+        # imports this module).
+        try:
+            if _drain_edge_writes():
+                self._dirty.add(Pool.EVENT_DAG)
+        except Exception:
+            logger.warning("Edge-write drain failed, will retry", exc_info=True)
+            self._dirty.add(Pool.EVENT_DAG)
+            if self._delayed_call is None:
+                self._delayed_call = self._clock.call_later(
+                    self._RETRY_DELAY, self._flush
+                )
+            return
         to_flush = set(self._dirty)  # snapshot
         if not to_flush:
             return
@@ -704,20 +720,28 @@ class _FlushCoalescer:
         if self._delayed_call is not None:
             self._delayed_call.cancel()
             self._delayed_call = None
-        # Drain the coalesced edge-write queue before the final fsync so a
+        # Drain the coalesced edge-write queues before the final fsync so a
         # shutdown racing still-queued forward-edge appends does not drop
         # committed rows.  Imported lazily (embedded_event_edges imports this
         # module) and done before marking closed so flush_edge_writes's
         # mark_dirty(EVENT_DAG) lands in `_dirty` for the final sync below.
-        try:
-            from synapse.storage.databases.main.embedded_event_edges import (
-                flush_edge_writes,
-            )
-
-            flush_edge_writes()
-        except Exception:
-            logger.warning(
-                "Unable to flush queued edge writes at shutdown", exc_info=True
+        drained = False
+        for attempt in range(3):
+            try:
+                if _drain_edge_writes():
+                    self._dirty.add(Pool.EVENT_DAG)
+                drained = True
+                break
+            except Exception:
+                logger.warning(
+                    "Flush coalescer edge-write drain failed (attempt %d/3)",
+                    attempt + 1,
+                    exc_info=True,
+                )
+        if not drained:
+            logger.error(
+                "Unable to drain queued edge writes during shutdown; "
+                "writes remain pending (SQL fallback will cover reads)"
             )
         self._closed = True
         if self._dirty:
@@ -764,6 +788,19 @@ def _clear_coalescer(c: _FlushCoalescer) -> None:
     global _coalescer
     if _coalescer is c:
         _coalescer = None
+
+
+def _drain_edge_writes() -> bool:
+    """Flush every coalesced edge-write queue into mtxdb.
+
+    Returns ``True`` if any rows were written.  Imported lazily because
+    ``embedded_event_edges`` imports this module.  Called by the flush
+    coalescer's timer and by shutdown so queued edge rows land in the
+    EVENT_DAG pool before it is synced.
+    """
+    from synapse.storage.databases.main.embedded_event_edges import flush_edge_writes
+
+    return flush_edge_writes()
 
 
 def mark_dirty(pool: Pool) -> None:

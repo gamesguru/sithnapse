@@ -2688,7 +2688,6 @@ class EventFederationWorkerStore(
         """
         if getattr(self, "_embedded_event_edges_enabled", False):
             from synapse.storage.databases.main.embedded_event_edges import (
-                flush_edge_writes,
                 get_event_edges_forward_batch,
                 queue_edge_write,
             )
@@ -2725,11 +2724,11 @@ class EventFederationWorkerStore(
                                 for succ_id in sql_res
                             ],
                         )
-                        # Writes are appended to the coalescing queue; flush
-                        # immediately so a following read of the same event
-                        # sees the repaired edge (SQL fallback covers the
-                        # window).
-                        flush_edge_writes(self._embedded_hamt_namespace)
+                        # The row joins the per-namespace coalescing queue; the
+                        # flush coalescer drains it within its debounce window.
+                        # Reads before then fall back to SQL, which already
+                        # covered this miss, so a following read of the same
+                        # event stays correct.
                         ffi_count("event_edges_successor_repairs", len(sql_res))
                 except Exception:
                     logger.debug(
