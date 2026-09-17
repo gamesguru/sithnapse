@@ -173,14 +173,18 @@ def _print_ffi_timings() -> None:
             _ffi_timings_print(
                 f"  {tag:50s}  {total_ms:8.1f}ms  {count:6d}  {avg_ms:10.3f}ms",
             )
-    total_s = sum(timings.values())
-    total_count = sum(counts.values())
-    total_ms = total_s * 1000
-    total_avg_ms = (total_s / total_count) * 1000 if total_count else 0.0
     _ffi_timings_print("")
-    _ffi_timings_print(
-        f"  {'TOTAL':50s}  {total_ms:8.1f}ms  {total_count:6d}  {total_avg_ms:10.3f}ms",
-    )
+    for label, excluded in (
+        ("TOTAL (all measured spans)", None),
+        ("TOTAL (excluding engine open)", "embedded_engine_open"),
+    ):
+        total_s = sum(elapsed for tag, elapsed in timings.items() if tag != excluded)
+        total_count = sum(count for tag, count in counts.items() if tag != excluded)
+        total_ms = total_s * 1000
+        total_avg_ms = (total_s / total_count) * 1000 if total_count else 0.0
+        _ffi_timings_print(
+            f"  {label:50s}  {total_ms:8.1f}ms  {total_count:6d}  {total_avg_ms:10.3f}ms",
+        )
     _ffi_timings_print("==============================")
     _ffi_timings_print("")
     batch_timings = {
