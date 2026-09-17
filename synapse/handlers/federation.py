@@ -1044,7 +1044,6 @@ class FederationHandler:
                 errcode=Codes.NOT_FOUND,
             )
 
-
         # now check that we are *still* in the room
         is_in_room = await self._event_auth_handler.is_host_in_room(
             room_id, self.server_name

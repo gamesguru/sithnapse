@@ -837,4 +837,3 @@ class TestOutOfBandInviteWhenAlreadyParticipating(FederatingHomeserverTestCase):
         self.assertIn(persisted_invite.event_id, leave_event.prev_event_ids())
         self.assertIn(persisted_invite.event_id, leave_event.auth_event_ids())
         self.assertEqual(leave_event.membership, Membership.LEAVE)
-
