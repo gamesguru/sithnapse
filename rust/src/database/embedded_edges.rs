@@ -120,9 +120,11 @@ fn decode_forward_edges(bytes: &[u8]) -> PyResult<Vec<String>> {
 /// Batch put event edges into the room-aware event_dag pool:
 /// 1. Backward edges: `event_id -> [(prev_event_id, is_state)]`
 /// 2. Forward edges: `prev_event_id -> [child_event_id]` (appended and deduplicated)
-/// 3. Locators for event_id and prev_event_id -> room collection (idempotent;
-///    `event_json_put` already writes the same mapping, but the edge module
-///    may run first in tests or during repair).
+///
+/// Locators are NOT written here: `event_json_put` publishes every event's
+/// `event_id -> room collection` locator when the event is persisted, and the
+/// read paths resolve room collections through those. Edge records therefore
+/// only ever land in a room collection whose locator already exists.
 #[pyfunction]
 pub fn event_edges_put(
     py: Python<'_>,
@@ -150,32 +152,22 @@ pub fn event_edges_put(
                 .push(event_id);
         }
 
-        let mut locator_puts: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
         let mut dag_puts: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
 
         for ((room_id, event_id), edges) in backward_map {
             let room_collection = event_dag_room_id(&namespace, &room_id);
-            let identity = event_node_id(&namespace, &event_id);
             let edge_node = event_edges_backward_node_id(&namespace, &event_id);
-            let locator_collection = event_locator_collection_id(&namespace, &identity);
 
             let encoded = encode_backward_edges(&edges);
             dag_puts
                 .entry(room_collection)
                 .or_default()
                 .push((edge_node, NodeData::new(bytes::Bytes::from(encoded))));
-
-            locator_puts.entry(locator_collection).or_default().push((
-                identity,
-                NodeData::new(bytes::Bytes::copy_from_slice(&room_collection)),
-            ));
         }
 
         for ((room_id, prev_event_id), new_children) in forward_map {
             let room_collection = event_dag_room_id(&namespace, &room_id);
-            let prev_identity = event_node_id(&namespace, &prev_event_id);
             let forward_node = event_edges_forward_node_id(&namespace, &prev_event_id);
-            let parent_locator = event_locator_collection_id(&namespace, &prev_identity);
 
             // Read existing children if any
             let mut existing_children = match engine.get(&room_collection, &forward_node) {
@@ -199,19 +191,9 @@ pub fn event_edges_put(
                     .or_default()
                     .push((forward_node, NodeData::new(bytes::Bytes::from(encoded))));
             }
-
-            locator_puts.entry(parent_locator).or_default().push((
-                prev_identity,
-                NodeData::new(bytes::Bytes::copy_from_slice(&room_collection)),
-            ));
         }
 
         for (collection, pairs) in dag_puts {
-            engine.put_many(&collection, &pairs).map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {e}"))
-            })?;
-        }
-        for (collection, pairs) in locator_puts {
             engine.put_many(&collection, &pairs).map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {e}"))
             })?;
@@ -489,6 +471,28 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::*;
 
+    /// Seed `event_id -> room collection` locators exactly as the persistence
+    /// path does via `event_json_put`. Edge records rely on those locators to
+    /// resolve room collections; `event_edges_put` no longer writes them.
+    fn seed_locators(py: Python<'_>, ns: &str, room: &str, event_ids: &[&str]) {
+        crate::database::mtxdb::event_json_put(
+            py,
+            ns.to_string(),
+            event_ids
+                .iter()
+                .map(|id| {
+                    (
+                        room.to_string(),
+                        id.to_string(),
+                        b"seed-meta".to_vec(),
+                        b"seed-body".to_vec(),
+                    )
+                })
+                .collect(),
+        )
+        .expect("seed event locators");
+    }
+
     #[test]
     fn put_get_backward_and_forward_round_trip() {
         crate::database::mtxdb::auth_chain_closure_tests::ensure_open();
@@ -497,6 +501,7 @@ mod tests {
 
         // $child has prev_events: ($p1, true) and ($p2, false)
         pyo3::Python::attach(|py| {
+            seed_locators(py, ns, room, &["$p1", "$p2", "$child", "$child2"]);
             event_edges_put(
                 py,
                 ns.to_string(),

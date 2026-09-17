@@ -26,11 +26,16 @@ Reads are mtxdb-first with SQL fallback:
   mtxdb lookup
     ├─ complete -> return mtxdb result
     └─ missing/incomplete -> query SQL, repair mtxdb, return SQL result
+
+Writes are coalesced: ``queue_edge_write`` accumulates rows across
+post-commit callbacks and ``flush_edge_writes`` drains them in a single
+FFI call when the queue exceeds ``_EDGE_WRITE_THRESHOLD``.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import TYPE_CHECKING, Iterable
 
@@ -39,6 +44,7 @@ from synapse.storage.databases.main.embedded_common import (
     ffi_batch_size,
     ffi_count,
     ffi_timing,
+    mark_dirty,
     mirror_timing,
     sync_now,
 )
@@ -47,6 +53,63 @@ if TYPE_CHECKING:
     from synapse.server import HomeServer
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Edge write coalescer
+# ---------------------------------------------------------------------------
+# txn.call_after callbacks run one-by-one after each SQL commit.  Without
+# coalescing every commit triggers a separate FFI call + RMW_LOCK acquire
+# for as few as 1-2 rows.  The queue accumulates rows across commits and
+# flushes them in bulk when the threshold is reached or flush_edge_writes()
+# is called explicitly (e.g. at shutdown or before a sync_now).
+_EDGE_WRITE_THRESHOLD: int = 64
+_edge_write_queue: list[tuple[str, str, str, bool]] = []
+# The last namespace queued rows were staged under.  Tracked so the shutdown
+# hook (`flush_edge_writes` with no namespace) can drain committed rows without
+# a caller-supplied namespace -- production runs one namespace per process.
+_edge_write_namespace: str | None = None
+_edge_write_lock = threading.Lock()
+
+
+def queue_edge_write(
+    namespace: str,
+    rows: Iterable[tuple[str, str, str, bool]],
+    *,
+    sync: bool = False,
+) -> None:
+    """Append edge rows to the coalescing queue; flush if threshold reached."""
+    row_list = list(rows)
+    if not row_list:
+        return
+    global _edge_write_namespace
+    with _edge_write_lock:
+        _edge_write_namespace = namespace
+        _edge_write_queue.extend(row_list)
+        should_flush = len(_edge_write_queue) >= _EDGE_WRITE_THRESHOLD
+    if should_flush:
+        flush_edge_writes(namespace, sync=sync)
+
+
+def flush_edge_writes(namespace: str | None = None, *, sync: bool = False) -> bool:
+    """Drain the coalescing queue into a single FFI call.
+
+    ``namespace`` may be omitted (e.g. from the shutdown hook) and defaults
+    to the last namespace rows were queued under.
+
+    Returns ``True`` if any rows were flushed.
+    """
+    with _edge_write_lock:
+        if not _edge_write_queue:
+            return False
+        if namespace is None:
+            if _edge_write_namespace is None:
+                return False
+            namespace = _edge_write_namespace
+        rows = _edge_write_queue[:]
+        _edge_write_queue.clear()
+    put_event_edges_batch(namespace, rows, sync=sync)
+    mark_dirty(Pool.EVENT_DAG)
+    return True
 
 
 def open_embedded_event_edges_engine(hs: HomeServer) -> bool:
@@ -99,6 +162,10 @@ def delete_event_edges_batch(
     """Tombstones backward edges for purged events in mtxdb."""
     if not event_ids:
         return
+
+    # Destructive, immediate barrier: drain any coalesced edge writes so a
+    # purge cannot race a still-queued forward-edge append.
+    flush_edge_writes(namespace)
 
     with mirror_timing("event_edges_delete"):
         from synapse.synapse_rust.mtxdb_engine import event_edges_delete

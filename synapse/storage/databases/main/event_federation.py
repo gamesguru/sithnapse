@@ -51,11 +51,7 @@ from synapse.storage.database import (
     LoggingTransaction,
 )
 from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
-from synapse.storage.databases.main.embedded_common import (
-    Pool,
-    ffi_count,
-    mark_dirty,
-)
+from synapse.storage.databases.main.embedded_common import ffi_count
 from synapse.storage.databases.main.events_worker import EventsWorkerStore
 from synapse.storage.databases.main.signatures import SignatureWorkerStore
 from synapse.storage.engines import PostgresEngine, Sqlite3Engine
@@ -2692,8 +2688,9 @@ class EventFederationWorkerStore(
         """
         if getattr(self, "_embedded_event_edges_enabled", False):
             from synapse.storage.databases.main.embedded_event_edges import (
+                flush_edge_writes,
                 get_event_edges_forward_batch,
-                put_event_edges_batch,
+                queue_edge_write,
             )
 
             forward_map = get_event_edges_forward_batch(
@@ -2721,14 +2718,18 @@ class EventFederationWorkerStore(
                         desc="get_successor_events_room_id",
                     )
                     if room_id:
-                        put_event_edges_batch(
+                        queue_edge_write(
                             self._embedded_hamt_namespace,
                             [
                                 (room_id, succ_id, event_id, False)
                                 for succ_id in sql_res
                             ],
                         )
-                        mark_dirty(Pool.EVENT_DAG)
+                        # Writes are appended to the coalescing queue; flush
+                        # immediately so a following read of the same event
+                        # sees the repaired edge (SQL fallback covers the
+                        # window).
+                        flush_edge_writes(self._embedded_hamt_namespace)
                         ffi_count("event_edges_successor_repairs", len(sql_res))
                 except Exception:
                     logger.debug(

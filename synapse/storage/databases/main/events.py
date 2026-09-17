@@ -70,7 +70,7 @@ from synapse.storage.databases.main.embedded_common import Pool, mark_dirty
 from synapse.storage.databases.main.embedded_event_edges import (
     embedded_event_edges_is_writable,
     open_embedded_event_edges_engine,
-    put_event_edges_batch,
+    queue_edge_write,
 )
 from synapse.storage.databases.main.embedded_event_json import (
     open_embedded_event_json_engine,
@@ -3831,6 +3831,15 @@ class PersistEventsStore:
             )
             raise PartialStateConflictError()
 
+        # Partial and outlier events can legitimately have no state group.
+        # `event_to_state_groups.state_group` is NOT NULL, so exclude those
+        # mappings from the SQL safety copy as well as from the embedded map.
+        non_null_state_groups: dict[str, int] = {
+            event_id: state_group_id
+            for event_id, state_group_id in state_groups.items()
+            if state_group_id is not None
+        }
+
         if getattr(self, "_embedded_event_json_enabled", False):
             # Exclusive by configured engine, not a dual-write -- see
             # embedded_event_to_state_group.py. This is an upsert (a retried
@@ -3848,11 +3857,6 @@ class PersistEventsStore:
             new_event_ids = [
                 event_id for event_id in state_groups if event_id not in existing
             ]
-            non_null_state_groups: dict[str, int] = {
-                event_id: state_group_id
-                for event_id, state_group_id in state_groups.items()
-                if state_group_id is not None
-            }
             put_event_to_state_group_batch(
                 self._embedded_hamt_engine,
                 self._embedded_hamt_namespace,
@@ -3891,10 +3895,11 @@ class PersistEventsStore:
                 txn,
                 table="event_to_state_groups",
                 key_names=["event_id"],
-                key_values=[[event_id] for event_id, _ in state_groups.items()],
+                key_values=[[event_id] for event_id in non_null_state_groups],
                 value_names=["state_group"],
                 value_values=[
-                    [state_group_id] for _, state_group_id in state_groups.items()
+                    [state_group_id]
+                    for state_group_id in non_null_state_groups.values()
                 ],
             )
 
@@ -3944,7 +3949,7 @@ class PersistEventsStore:
             ]
             if edge_rows:
                 txn.call_after(
-                    put_event_edges_batch,
+                    queue_edge_write,
                     self._embedded_hamt_namespace,
                     edge_rows,
                 )

@@ -704,6 +704,21 @@ class _FlushCoalescer:
         if self._delayed_call is not None:
             self._delayed_call.cancel()
             self._delayed_call = None
+        # Drain the coalesced edge-write queue before the final fsync so a
+        # shutdown racing still-queued forward-edge appends does not drop
+        # committed rows.  Imported lazily (embedded_event_edges imports this
+        # module) and done before marking closed so flush_edge_writes's
+        # mark_dirty(EVENT_DAG) lands in `_dirty` for the final sync below.
+        try:
+            from synapse.storage.databases.main.embedded_event_edges import (
+                flush_edge_writes,
+            )
+
+            flush_edge_writes()
+        except Exception:
+            logger.warning(
+                "Unable to flush queued edge writes at shutdown", exc_info=True
+            )
         self._closed = True
         if self._dirty:
             for attempt in range(3):

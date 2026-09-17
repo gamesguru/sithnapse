@@ -28,6 +28,7 @@ from synapse.storage.databases.main.embedded_common import (
 )
 from synapse.storage.databases.main.embedded_event_edges import (
     delete_event_edges_batch,
+    flush_edge_writes,
     get_event_edges_backward_batch,
     get_event_edges_forward_batch,
     put_event_edges_batch,
@@ -67,7 +68,22 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
         self.namespace = "test-edges-ns"
         self.room_id = "!room:example.org"
 
+    def seed_event_locators(self, event_ids: list[str]) -> None:
+        """Seed `event_id -> room collection` locators the way the persistence
+        path does via `event_json_put`.  Edge records only ever land in a room
+        collection whose locator already exists (`event_edges_put` does not
+        write locators), so tests that call `put_event_edges_batch` directly
+        must seed them first."""
+        mtxdb_engine.event_json_put(
+            self.namespace,
+            [
+                (self.room_id, event_id, b"seed-meta", b"seed-body")
+                for event_id in event_ids
+            ],
+        )
+
     def test_put_get_backward_and_forward(self) -> None:
+        self.seed_event_locators(["$e1", "$e2", "$p1", "$p2"])
         # e1 has prev_events p1 and p2
         rows = [
             (self.room_id, "$e1", "$p1", False),
@@ -142,6 +158,11 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         res2 = self.helper.send(self.room_id, "second", tok=self.tok)
         e2_id = res2["event_id"]
 
+        # Edge writes are coalesced in-process; drain the queue so the mirror
+        # reflects them (in production the next flush / threshold / shutdown
+        # would do this, but the test asserts immediately).
+        flush_edge_writes(self.store._embedded_hamt_namespace)
+
         # e2 should have e1 in its backward edges in mtxdb
         backward = get_event_edges_backward_batch(
             self.store._embedded_hamt_namespace, [e2_id]
@@ -160,6 +181,9 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         e1_id = res1["event_id"]
         res2 = self.helper.send(self.room_id, "second", tok=self.tok)
         e2_id = res2["event_id"]
+
+        # Drain the coalesced edge writes so the mirror reflects both sends.
+        flush_edge_writes(self.store._embedded_hamt_namespace)
 
         # Before deletion: e1 has e2 as forward successor
         fwd_before = get_event_edges_forward_batch(
