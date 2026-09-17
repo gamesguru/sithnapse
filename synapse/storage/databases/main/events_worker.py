@@ -252,6 +252,11 @@ class EventsWorkerStore(SQLBaseStore):
             hs.config.database.embedded_hamt_namespace or hs.hostname
         )
 
+        txn = db_conn.cursor()
+        txn.execute("SELECT event_id FROM un_partial_stated_event_stream")
+        self._un_partial_stated_event_ids: set[str] = {row[0] for row in txn.fetchall()}
+        txn.close()
+
         self._stream_id_gen: MultiWriterIdGenerator
         self._backfill_id_gen: MultiWriterIdGenerator
 
@@ -479,7 +484,7 @@ class EventsWorkerStore(SQLBaseStore):
         if stream_name == UnPartialStatedEventStream.NAME:
             for row in rows:
                 assert isinstance(row, UnPartialStatedEventStreamRow)
-
+                self._un_partial_stated_event_ids.add(row.event_id)
                 self.is_partial_state_event.invalidate((row.event_id,))
 
                 if row.rejection_status_changed:

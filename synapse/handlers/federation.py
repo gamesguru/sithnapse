@@ -95,6 +95,13 @@ _PARTIAL_STATE_SYNC_INITIAL_BACKOFF = Duration(seconds=1)
 _PARTIAL_STATE_SYNC_MAX_BACKOFF = Duration(hours=1)
 _PARTIAL_STATE_SYNC_MAX_CONSECUTIVE_FAILURES = 10
 
+_MAKE_JOIN_STAGED_EVENTS_DRAIN_TIMEOUT = Duration(seconds=2)
+_MAKE_JOIN_STAGED_EVENTS_DRAIN_POLL_INTERVAL = Duration(milliseconds=50)
+_MAKE_JOIN_STAGED_EVENTS_DRAIN_MAX_ATTEMPTS = int(
+    _MAKE_JOIN_STAGED_EVENTS_DRAIN_TIMEOUT.as_millis()
+    // _MAKE_JOIN_STAGED_EVENTS_DRAIN_POLL_INTERVAL.as_millis()
+)
+
 # Added to debug performance and track progress on optimizations
 backfill_processing_before_timer = Histogram(
     "synapse_federation_backfill_processing_before_time_seconds",
@@ -1043,10 +1050,12 @@ class FederationHandler:
                 errcode=Codes.NOT_FOUND,
             )
 
-        # If there are incoming PDUs currently staged for this room (e.g. a recent
+        # Best-effort bounded consistency wait: if there are incoming PDUs currently
+        # staged for this room in federation_inbound_events_staging (e.g. a recent
         # leave or state change from federation), wait briefly for them to be persisted
-        # so make_join builds against up-to-date room state.
-        for _ in range(40):
+        # so make_join builds against up-to-date room state. This mitigates races where
+        # a user leaves and immediately re-joins before their leave PDU has drained.
+        for _ in range(_MAKE_JOIN_STAGED_EVENTS_DRAIN_MAX_ATTEMPTS):
             staged_count = await self.store.db_pool.simple_select_one_onecol(
                 table="federation_inbound_events_staging",
                 keyvalues={"room_id": room_id},
@@ -1056,7 +1065,7 @@ class FederationHandler:
             )
             if not staged_count:
                 break
-            await self.clock.sleep(Duration(milliseconds=50))
+            await self.clock.sleep(_MAKE_JOIN_STAGED_EVENTS_DRAIN_POLL_INTERVAL)
 
         # now check that we are *still* in the room
         is_in_room = await self._event_auth_handler.is_host_in_room(

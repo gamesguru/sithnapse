@@ -143,16 +143,21 @@ class EventForwardExtremitiesStore(
         # replaces silently dropped non-matching rows instead.
         event_ids = [event_id for event_id, _depth, _received_ts in rows]
         if getattr(self, "_embedded_event_json_enabled", False):
+            un_partial_stated = self._un_partial_stated_event_ids.intersection(
+                event_ids
+            )
+            embedded_event_ids = [e for e in event_ids if e not in un_partial_stated]
             state_groups = get_state_group_for_events_batch(
                 self._embedded_hamt_engine,
                 self._embedded_hamt_namespace,
-                event_ids,
+                embedded_event_ids,
                 purpose="forward_extremities",
             )
             # During the event-to-state-group migration, some events may not
             # have been copied to mtxdb yet. Fall back to SQL for any missing
             # entries to avoid silently dropping extremities.
-            missing = [eid for eid in event_ids if eid not in state_groups]
+            missing = [eid for eid in embedded_event_ids if eid not in state_groups]
+            missing.extend(un_partial_stated)
             if missing:
                 sql_rows = cast(
                     list[tuple[str, int]],

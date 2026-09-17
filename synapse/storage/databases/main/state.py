@@ -604,14 +604,15 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
 
     async def _get_state_group_for_event(self, event_id: str) -> int | None:
         if getattr(self, "_embedded_event_json_enabled", False):
-            found = get_state_group_for_events_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
-                [event_id],
-                purpose="read_point",
-            )
-            if event_id in found:
-                return found[event_id]
+            if event_id not in self._un_partial_stated_event_ids:
+                found = get_state_group_for_events_batch(
+                    self._embedded_hamt_engine,
+                    self._embedded_hamt_namespace,
+                    [event_id],
+                    purpose="read_point",
+                )
+                if event_id in found:
+                    return found[event_id]
             row = await self.db_pool.simple_select_one_onecol(
                 table="event_to_state_groups",
                 keyvalues={"event_id": event_id},
@@ -652,16 +653,20 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
              RuntimeError if the state is unknown at any of the given events
         """
         if getattr(self, "_embedded_event_json_enabled", False):
-            requested_event_ids = list(event_ids)
+            un_partial_stated = self._un_partial_stated_event_ids.intersection(
+                event_ids
+            )
+            embedded_event_ids = [e for e in event_ids if e not in un_partial_stated]
             res = get_state_group_for_events_batch(
                 self._embedded_hamt_engine,
                 self._embedded_hamt_namespace,
-                requested_event_ids,
+                embedded_event_ids,
                 purpose="read_batch",
             )
             missing_event_ids = [
-                event_id for event_id in requested_event_ids if event_id not in res
+                event_id for event_id in embedded_event_ids if event_id not in res
             ]
+            missing_event_ids.extend(un_partial_stated)
             if missing_event_ids:
                 rows = cast(
                     list[tuple[str, int]],
@@ -845,6 +850,8 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
                 keyvalues={"event_id": event.event_id},
                 updatevalues={"state_group": state_group},
             )
+
+        self._un_partial_stated_event_ids.add(event.event_id)
 
         # the event may now be rejected where it was not before, or vice versa,
         # in which case we need to update the rejected flags.
