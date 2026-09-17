@@ -3948,6 +3948,7 @@ class PersistEventsStore:
                     self._embedded_hamt_namespace,
                     edge_rows,
                 )
+                txn.call_after(mark_dirty, Pool.EVENT_DAG)
 
         self._update_backward_extremeties(txn, events)
 

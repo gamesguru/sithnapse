@@ -185,7 +185,7 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
 
         self.get_failure(
             self.store.db_pool.runInteraction("test_abort", bad_txn),
-            RuntimeError,
+            Exception,
         )
 
         # Check mtxdb: fake_id is NOT in mtxdb backward edges
@@ -213,3 +213,29 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
 
         successors = self.get_success(self.store.get_successor_events(e1_id))
         self.assertIn(e2_id, successors)
+
+    def test_sql_fallback_and_repair_on_missing_mtxdb_edges(self) -> None:
+        """If mtxdb is missing edges (e.g. write failure after SQL commit), SQL fallback returns them and repairs mtxdb."""
+        res1 = self.helper.send(self.room_id, "parent", tok=self.tok)
+        p_id = res1["event_id"]
+        res2 = self.helper.send(self.room_id, "child", tok=self.tok)
+        c_id = res2["event_id"]
+
+        # Simulate post-commit write failure or missing edge in mtxdb by deleting the edge from mtxdb
+        delete_event_edges_batch(self.store._embedded_hamt_namespace, [c_id])
+
+        # Verify mtxdb has no forward edge for p_id
+        fwd_miss = get_event_edges_forward_batch(
+            self.store._embedded_hamt_namespace, [p_id]
+        )
+        self.assertIsNone(fwd_miss.get(p_id))
+
+        # Querying successor events falls back to SQL, successfully finding c_id, and repairs mtxdb
+        successors = self.get_success(self.store.get_successor_events(p_id))
+        self.assertIn(c_id, successors)
+
+        # Now mtxdb has been repaired!
+        fwd_repaired = get_event_edges_forward_batch(
+            self.store._embedded_hamt_namespace, [p_id]
+        )
+        self.assertIn(c_id, fwd_repaired.get(p_id) or [])

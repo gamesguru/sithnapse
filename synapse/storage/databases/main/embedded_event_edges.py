@@ -68,7 +68,7 @@ def put_event_edges_batch(
     namespace: str,
     rows: Iterable[tuple[str, str, str, bool]],
     *,
-    sync: bool = True,
+    sync: bool = False,
 ) -> None:
     """Batch put event edges into mtxdb.
 

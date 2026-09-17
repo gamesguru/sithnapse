@@ -656,10 +656,12 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
                 self._embedded_hamt_namespace,
                 room_event_ids,
             )
-            delete_event_edges_batch(
-                self._embedded_hamt_namespace,
-                room_event_ids,
-            )
+            if getattr(self, "_embedded_event_edges_writable", False):
+                txn.call_after(
+                    delete_event_edges_batch,
+                    self._embedded_hamt_namespace,
+                    room_event_ids,
+                )
             # Same for event_to_state_groups: fetch state_groups before
             # deleting so the refcount can be rebalanced.
             event_id_to_state_group = get_state_group_for_events_batch(
