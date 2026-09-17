@@ -251,6 +251,15 @@ class StateHandler:
         Returns:
             The hosts in the room at the given events
         """
+        if len(event_ids) > 1:
+            non_outlier_event_ids = set()
+            for event_id in event_ids:
+                sg = await self.store._get_state_group_for_event(event_id)
+                if sg is not None:
+                    non_outlier_event_ids.add(event_id)
+            if non_outlier_event_ids:
+                event_ids = non_outlier_event_ids
+
         entry = await self.resolve_state_groups_for_events(room_id, event_ids)
         return await self._state_storage_controller.get_joined_hosts(room_id, entry)
 

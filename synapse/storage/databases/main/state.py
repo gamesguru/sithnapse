@@ -852,6 +852,7 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
                 updatevalues={"state_group": state_group},
             )
 
+        self._has_un_partial_stated_events = True
         self.is_un_partial_stated_event.invalidate((event.event_id,))
 
         # the event may now be rejected where it was not before, or vice versa,

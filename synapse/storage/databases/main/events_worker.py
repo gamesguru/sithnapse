@@ -252,6 +252,11 @@ class EventsWorkerStore(SQLBaseStore):
             hs.config.database.embedded_hamt_namespace or hs.hostname
         )
 
+        txn = db_conn.cursor()
+        txn.execute("SELECT 1 FROM un_partial_stated_event_stream LIMIT 1")
+        self._has_un_partial_stated_events = txn.fetchone() is not None
+        txn.close()
+
         self._stream_id_gen: MultiWriterIdGenerator
         self._backfill_id_gen: MultiWriterIdGenerator
 
@@ -477,6 +482,7 @@ class EventsWorkerStore(SQLBaseStore):
         rows: Iterable[Any],
     ) -> None:
         if stream_name == UnPartialStatedEventStream.NAME:
+            self._has_un_partial_stated_events = True
             for row in rows:
                 assert isinstance(row, UnPartialStatedEventStreamRow)
                 self.is_un_partial_stated_event.invalidate((row.event_id,))
@@ -2714,6 +2720,9 @@ class EventsWorkerStore(SQLBaseStore):
         self, event_ids: Collection[str]
     ) -> Mapping[str, bool]:
         """Checks which of the given events have been un-partial-stated."""
+        if not self._has_un_partial_stated_events:
+            return {e_id: False for e_id in event_ids}
+
         result = cast(
             list[tuple[str]],
             await self.db_pool.simple_select_many_batch(
@@ -2730,6 +2739,9 @@ class EventsWorkerStore(SQLBaseStore):
     @cached()
     async def is_un_partial_stated_event(self, event_id: str) -> bool:
         """Checks if the given event has been un-partial-stated."""
+        if not self._has_un_partial_stated_events:
+            return False
+
         result = await self.db_pool.simple_select_one_onecol(
             table="un_partial_stated_event_stream",
             keyvalues={"event_id": event_id},
