@@ -378,11 +378,16 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
                 self._embedded_hamt_namespace,
                 [event_id for event_id, should_delete in event_rows if should_delete],
             )
-        if getattr(self, "_embedded_event_edges_enabled", False):
-            delete_event_edges_batch(
-                self._embedded_hamt_namespace,
-                [event_id for event_id, should_delete in event_rows if should_delete],
-            )
+        if getattr(self, "_embedded_event_edges_writable", False):
+            deleted_edge_ids = [
+                event_id for event_id, should_delete in event_rows if should_delete
+            ]
+            if deleted_edge_ids:
+                txn.call_after(
+                    delete_event_edges_batch,
+                    self._embedded_hamt_namespace,
+                    deleted_edge_ids,
+                )
 
         # Some of the `event_push_actions` we're about to delete may have already
         # been rotated into the aggregate `event_push_summary` counts. Deleting

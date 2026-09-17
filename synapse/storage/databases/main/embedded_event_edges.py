@@ -50,11 +50,17 @@ logger = logging.getLogger(__name__)
 
 
 def open_embedded_event_edges_engine(hs: HomeServer) -> bool:
-    """Return whether the optional embedded event-edges backend is enabled."""
+    """Return whether the embedded event-edges backend is available for readers and writers."""
     return bool(
         hs.config.database.embedded_hamt_engine == "mtxdb"
         and hs.config.database.embedded_hamt_path
-        and not getattr(hs.config.database, "read_only", False)
+    )
+
+
+def embedded_event_edges_is_writable(hs: HomeServer) -> bool:
+    """Return whether this process is permitted to write to embedded event-edges."""
+    return open_embedded_event_edges_engine(hs) and not getattr(
+        hs.config.database, "read_only", False
     )
 
 
@@ -62,7 +68,7 @@ def put_event_edges_batch(
     namespace: str,
     rows: Iterable[tuple[str, str, str, bool]],
     *,
-    sync: bool = False,
+    sync: bool = True,
 ) -> None:
     """Batch put event edges into mtxdb.
 

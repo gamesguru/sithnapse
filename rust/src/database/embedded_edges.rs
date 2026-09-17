@@ -362,7 +362,7 @@ pub fn event_edges_get_forward(
     })
 }
 
-/// Tombstone backward edges for purged events
+/// Tombstone backward edges for purged events and remove them from parent forward lists
 #[pyfunction]
 pub fn event_edges_delete(
     py: Python<'_>,
@@ -370,6 +370,7 @@ pub fn event_edges_delete(
     event_ids: Vec<String>,
 ) -> PyResult<()> {
     assert_writable()?;
+    let _guard = RMW_LOCK.lock().unwrap();
     py.detach(|| {
         let engine = event_dag_db()?;
         let node_ids: Vec<NodeId> = event_ids
@@ -402,18 +403,82 @@ pub fn event_edges_delete(
             }
         }
 
-        let mut dag_tombs: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
+        let mut dag_updates: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
+        let mut locator_updates: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
+        let mut forward_cache: HashMap<([u8; 16], NodeId), Vec<String>> = HashMap::new();
+
         for (position, room_collection) in room_collections.iter().enumerate() {
             if let Some(room_collection) = room_collection {
-                let tombs = dag_tombs.entry(*room_collection).or_default();
-                tombs.push((
-                    event_edges_backward_node_id(&namespace, &event_ids[position]),
-                    NodeData::new(bytes::Bytes::new()),
-                ));
+                let event_id = &event_ids[position];
+                let backward_node = event_edges_backward_node_id(&namespace, event_id);
+
+                // 1. Read backward edges to find parents
+                let backward_data = engine.get(room_collection, &backward_node).map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get error: {e}"))
+                })?;
+
+                if let Some(data) = backward_data {
+                    if !data.bytes.is_empty() {
+                        let preds = decode_backward_edges(&data.bytes)?;
+                        for (parent_id, _) in preds {
+                            let forward_node = event_edges_forward_node_id(&namespace, &parent_id);
+                            let key = (*room_collection, forward_node);
+
+                            if let std::collections::hash_map::Entry::Vacant(e) =
+                                forward_cache.entry(key)
+                            {
+                                let existing = match engine.get(room_collection, &forward_node) {
+                                    Ok(Some(d)) if !d.bytes.is_empty() => {
+                                        decode_forward_edges(&d.bytes)?
+                                    }
+                                    _ => Vec::new(),
+                                };
+                                e.insert(existing);
+                            }
+
+                            if let Some(children) = forward_cache.get_mut(&key) {
+                                children.retain(|c| c != event_id);
+                            }
+                        }
+                    }
+                }
+
+                // 2. Tombstone backward edge
+                dag_updates
+                    .entry(*room_collection)
+                    .or_default()
+                    .push((backward_node, NodeData::new(bytes::Bytes::new())));
+
+                // 3. Tombstone event locator
+                let identity = node_ids[position];
+                let locator_col = event_locator_collection_id(&namespace, &identity);
+                locator_updates
+                    .entry(locator_col)
+                    .or_default()
+                    .push((identity, NodeData::new(bytes::Bytes::new())));
             }
         }
 
-        for (collection, pairs) in dag_tombs {
+        // 4. Write updated or tombstoned forward edges
+        for ((room_col, forward_node), children) in forward_cache {
+            let data = if children.is_empty() {
+                NodeData::new(bytes::Bytes::new())
+            } else {
+                NodeData::new(bytes::Bytes::from(encode_forward_edges(&children)))
+            };
+            dag_updates
+                .entry(room_col)
+                .or_default()
+                .push((forward_node, data));
+        }
+
+        for (collection, pairs) in dag_updates {
+            engine.put_many(&collection, &pairs).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {e}"))
+            })?;
+        }
+
+        for (collection, pairs) in locator_updates {
             engine.put_many(&collection, &pairs).map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {e}"))
             })?;
@@ -520,12 +585,26 @@ mod tests {
             assert!(p1_children.contains(&"$child".to_string()));
             assert!(p1_children.contains(&"$child2".to_string()));
 
-            // Deletion tombstones $child
+            // Deletion tombstones $child and removes $child from parent forward lists
             event_edges_delete(py, ns.to_string(), vec!["$child".to_string()]).expect("delete");
             let after_delete =
                 event_edges_get_backward(py, ns.to_string(), vec!["$child".to_string()])
                     .expect("get after delete");
             assert_eq!(after_delete[0].1, None);
+
+            let forward_after_delete = event_edges_get_forward(
+                py,
+                ns.to_string(),
+                vec!["$p1".to_string(), "$p2".to_string()],
+            )
+            .expect("get forward after delete");
+            // $p1 only has $child2 now
+            assert_eq!(
+                forward_after_delete[0].1.as_deref(),
+                Some(&["$child2".to_string()][..])
+            );
+            // $p2 has no remaining children, so it was tombstoned
+            assert_eq!(forward_after_delete[1].1, None);
         });
     }
 }

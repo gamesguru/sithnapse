@@ -80,6 +80,7 @@ from synapse.storage.database import (
 )
 from synapse.storage.databases.main.embedded_common import ffi_count
 from synapse.storage.databases.main.embedded_event_edges import (
+    embedded_event_edges_is_writable,
     open_embedded_event_edges_engine,
 )
 from synapse.storage.databases.main.embedded_event_json import (
@@ -246,6 +247,7 @@ class EventsWorkerStore(SQLBaseStore):
 
         self._embedded_event_json_enabled = open_embedded_event_json_engine(hs)
         self._embedded_event_edges_enabled = open_embedded_event_edges_engine(hs)
+        self._embedded_event_edges_writable = embedded_event_edges_is_writable(hs)
         self._embedded_hamt_engine = hs.config.database.embedded_hamt_engine
         # Namespaces event_to_state_group/refcount keys in the embedded
         # engine -- see embedded_event_to_state_group.py's module docstring.

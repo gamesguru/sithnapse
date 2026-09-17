@@ -72,10 +72,14 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
         forward2 = get_event_edges_forward_batch(self.namespace, ["$p1"])
         self.assertCountEqual(forward2["$p1"] or [], ["$e1", "$e2"])
 
-        # Delete $e1 tombstones backward edge
+        # Delete $e1 tombstones backward edge and removes $e1 from parents' forward edges
         delete_event_edges_batch(self.namespace, ["$e1"])
         backward_after = get_event_edges_backward_batch(self.namespace, ["$e1"])
         self.assertIsNone(backward_after["$e1"])
+
+        forward_after = get_event_edges_forward_batch(self.namespace, ["$p1", "$p2"])
+        self.assertEqual(forward_after["$p1"], ["$e2"])
+        self.assertIsNone(forward_after["$p2"])
 
 
 class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
@@ -93,11 +97,26 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
             room_creator=self.user_id, tok=self.tok
         )
 
+        tmpdir = tempfile.mkdtemp(prefix="test-embedded-event-edges-")
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        mtxdb_engine.open_client(tmpdir)
+
+        self.store._embedded_event_edges_enabled = True
+        self.store._embedded_event_edges_writable = True
+        self.store._embedded_hamt_engine = "mtxdb"
+        if not getattr(self.store, "_embedded_hamt_namespace", None):
+            self.store._embedded_hamt_namespace = hs.hostname
+
+        self.persist_store = hs.get_datastores().persist_events
+        if self.persist_store is not None:
+            self.persist_store._embedded_event_edges_enabled = True
+            self.persist_store._embedded_event_edges_writable = True
+            self.persist_store._embedded_hamt_engine = "mtxdb"
+            if not getattr(self.persist_store, "_embedded_hamt_namespace", None):
+                self.persist_store._embedded_hamt_namespace = hs.hostname
+
     def test_event_edges_mirrored_on_persistence(self) -> None:
         """When events are persisted, event_edges are dual-written to mtxdb."""
-        if not getattr(self.store, "_embedded_event_edges_enabled", False):
-            return
-
         res1 = self.helper.send(self.room_id, "first", tok=self.tok)
         e1_id = res1["event_id"]
         res2 = self.helper.send(self.room_id, "second", tok=self.tok)
@@ -112,5 +131,85 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         self.assertIn(e1_id, prev_ids)
 
         # e1 should have e2 in its forward successors in mtxdb
+        successors = self.get_success(self.store.get_successor_events(e1_id))
+        self.assertIn(e2_id, successors)
+
+    def test_event_edges_purge_cleans_forward_edges(self) -> None:
+        """Purging an event removes it from its parents' forward lists in mtxdb."""
+        res1 = self.helper.send(self.room_id, "first", tok=self.tok)
+        e1_id = res1["event_id"]
+        res2 = self.helper.send(self.room_id, "second", tok=self.tok)
+        e2_id = res2["event_id"]
+
+        # Before deletion: e1 has e2 as forward successor
+        fwd_before = get_event_edges_forward_batch(
+            self.store._embedded_hamt_namespace, [e1_id]
+        )
+        self.assertIn(e2_id, fwd_before.get(e1_id) or [])
+
+        # Purge e2
+        delete_event_edges_batch(self.store._embedded_hamt_namespace, [e2_id])
+
+        # After deletion: e2 is tombstoned in backward edges
+        back_after = get_event_edges_backward_batch(
+            self.store._embedded_hamt_namespace, [e2_id]
+        )
+        self.assertIsNone(back_after[e2_id])
+
+        # And e1's forward edges no longer contain e2
+        fwd_after = get_event_edges_forward_batch(
+            self.store._embedded_hamt_namespace, [e1_id]
+        )
+        self.assertNotIn(e2_id, fwd_after.get(e1_id) or [])
+
+    def test_rollback_leaves_mtxdb_unmodified(self) -> None:
+        """A rolled back SQL transaction does not write orphaned edges to mtxdb."""
+        from unittest.mock import Mock
+
+        from synapse.storage.database import LoggingTransaction
+
+        res1 = self.helper.send(self.room_id, "base_event", tok=self.tok)
+        e1_id = res1["event_id"]
+
+        fake_id = f"$aborted_{self.clock.time()}:test"
+        mock_ev = Mock(
+            room_id=self.room_id, event_id=fake_id, prev_event_ids=lambda: [e1_id]
+        )
+
+        persist_store = self.persist_store
+        assert persist_store is not None
+
+        def bad_txn(txn: LoggingTransaction) -> None:
+            persist_store._handle_mult_prev_events(txn, [mock_ev])
+            raise RuntimeError("simulated transaction failure")
+
+        self.get_failure(
+            self.store.db_pool.runInteraction("test_abort", bad_txn),
+            RuntimeError,
+        )
+
+        # Check mtxdb: fake_id is NOT in mtxdb backward edges
+        back = get_event_edges_backward_batch(
+            self.store._embedded_hamt_namespace, [fake_id]
+        )
+        self.assertIsNone(back[fake_id])
+
+        # And e1_id's forward edges do NOT contain fake_id
+        fwd = get_event_edges_forward_batch(
+            self.store._embedded_hamt_namespace, [e1_id]
+        )
+        self.assertNotIn(fake_id, fwd.get(e1_id) or [])
+
+    def test_read_only_worker_reads_edges(self) -> None:
+        """A read-only worker can read edges from mtxdb without failing assert_writable."""
+        res1 = self.helper.send(self.room_id, "msg1", tok=self.tok)
+        e1_id = res1["event_id"]
+        res2 = self.helper.send(self.room_id, "msg2", tok=self.tok)
+        e2_id = res2["event_id"]
+
+        # Simulate read-only worker
+        self.store._embedded_event_edges_writable = False
+        self.store._embedded_event_edges_enabled = True
+
         successors = self.get_success(self.store.get_successor_events(e1_id))
         self.assertIn(e2_id, successors)

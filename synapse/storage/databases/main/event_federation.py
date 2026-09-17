@@ -2707,7 +2707,7 @@ class EventFederationWorkerStore(
                 retcol="event_id",
                 desc="get_successor_events",
             )
-            if sql_res:
+            if sql_res and getattr(self, "_embedded_event_edges_writable", False):
                 try:
                     room_id = await self.db_pool.simple_select_one_onecol(
                         table="events",
