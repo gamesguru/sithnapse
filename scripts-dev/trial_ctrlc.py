@@ -106,7 +106,7 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                 f" (strategy: {', '.join(sorted(strategies))})" if strategies else ""
             )
             out(f"\n=== Postgres test-DB lifecycle timings{strat_str} ===")
-            out(f"  {'':44s}  {'total':>9s}  {'calls':>6s}  {'avg':>11s}")
+            out(f"  {'':44s}  {'total':>10s}  {'calls':>6s}  {'avg':>12s}")
             if "hs_setup_wall" in lc_timings:
                 wall_s = lc_timings["hs_setup_wall"]
                 wall_cnt = lc_counts["hs_setup_wall"]
@@ -214,7 +214,7 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
             ranked = sorted(sql_ops.items(), key=lambda kv: kv[1], reverse=True)
             out("\n=== Per-table SQL timing (top 30) ===")
             out(
-                f"  {'table':40s}  {'total':>10s}  {'calls':>6s}  {'rows':>6s}  {'avg':>13s}"
+                f"  {'table':40s}  {'total':>10s}  {'calls':>6s}  {'rows':>6s}  {'avg':>12s}"
             )
             for table, total_s in ranked[:30]:
                 count = sql_counts.get(table, 0)
@@ -255,7 +255,7 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
 
         if st_timings:
             out("\n=== State store mtxdb-vs-SQL timings ===")
-            out(f"  {'':40s}  {'total':>10s}  {'calls':>6s}  {'avg':>13s}")
+            out(f"  {'':40s}  {'total':>10s}  {'calls':>6s}  {'avg':>12s}")
             embedded_tags = sorted(t for t in st_timings if t.endswith("_embedded"))
             sql_tags = sorted(t for t in st_timings if t.endswith("_sql"))
             other_tags = sorted(
@@ -373,10 +373,10 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
             has_hist = bool(ffi_latencies)
             if has_hist:
                 out(
-                    f"  {'':50s}  {'total':>9s}  {'calls':>6s}  {'avg':>11s}  {'p50':>10s}  {'p95':>10s}  {'p99':>10s}"
+                    f"  {'':50s}  {'total':>10s}  {'calls':>6s}  {'avg':>12s}  {'p50':>11s}  {'p95':>11s}  {'p99':>11s}"
                 )
             else:
-                out(f"  {'':50s}  {'total':>9s}  {'calls':>6s}  {'avg':>11s}")
+                out(f"  {'':50s}  {'total':>10s}  {'calls':>6s}  {'avg':>12s}")
 
             def _pct(s: list[float], p: float) -> float:
                 if not s:

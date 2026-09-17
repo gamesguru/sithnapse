@@ -142,11 +142,11 @@ def _print_ffi_timings() -> None:
     has_hist = bool(latencies)
     if has_hist:
         _ffi_timings_print(
-            f"  {'':50s}  {'total':>9s}  {'calls':>6s}  {'avg':>11s}  {'p50':>10s}  {'p95':>10s}  {'p99':>10s}",
+            f"  {'':50s}  {'total':>10s}  {'calls':>6s}  {'avg':>12s}  {'p50':>11s}  {'p95':>11s}  {'p99':>11s}",
         )
     else:
         _ffi_timings_print(
-            f"  {'':50s}  {'total':>9s}  {'calls':>6s}  {'avg':>11s}",
+            f"  {'':50s}  {'total':>10s}  {'calls':>6s}  {'avg':>12s}",
         )
 
     def _percentile(sorted_vals: list[float], p: float) -> float:

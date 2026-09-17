@@ -200,7 +200,7 @@ def _print_table_ops() -> None:
     ranked = sorted(table_ops.items(), key=lambda kv: kv[1], reverse=True)
     _timings_print("\n=== Per-table SQL timing (top 30) ===")
     _timings_print(
-        f"  {'table':40s}  {'total':>10s}  {'calls':>6s}  {'rows':>6s}  {'avg':>13s}",
+        f"  {'table':40s}  {'total':>10s}  {'calls':>6s}  {'rows':>6s}  {'avg':>12s}",
     )
     for table, total_s in ranked[:30]:
         count = table_counts.get(table, 0)
