@@ -51,7 +51,11 @@ from synapse.storage.database import (
     LoggingTransaction,
 )
 from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
-from synapse.storage.databases.main.embedded_common import ffi_count
+from synapse.storage.databases.main.embedded_common import (
+    Pool,
+    ffi_count,
+    mark_dirty,
+)
 from synapse.storage.databases.main.events_worker import EventsWorkerStore
 from synapse.storage.databases.main.signatures import SignatureWorkerStore
 from synapse.storage.engines import PostgresEngine, Sqlite3Engine
@@ -2724,6 +2728,7 @@ class EventFederationWorkerStore(
                                 for succ_id in sql_res
                             ],
                         )
+                        mark_dirty(Pool.EVENT_DAG)
                         ffi_count("event_edges_successor_repairs", len(sql_res))
                 except Exception:
                     logger.debug(

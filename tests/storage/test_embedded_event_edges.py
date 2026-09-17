@@ -180,13 +180,33 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         assert persist_store is not None
 
         def bad_txn(txn: LoggingTransaction) -> None:
+            self.store.db_pool.simple_insert_txn(
+                txn,
+                table="events",
+                values={
+                    "instance_name": "master",
+                    "stream_ordering": 999999,
+                    "topological_ordering": 1,
+                    "depth": 1,
+                    "event_id": fake_id,
+                    "room_id": self.room_id,
+                    "type": "m.room.message",
+                    "processed": True,
+                    "outlier": False,
+                    "origin_server_ts": int(self.clock.time_msec()),
+                    "received_ts": int(self.clock.time_msec()),
+                    "sender": self.user_id,
+                    "contains_url": False,
+                },
+            )
             persist_store._handle_mult_prev_events(txn, [mock_ev])
             raise RuntimeError("simulated transaction failure")
 
-        self.get_failure(
+        failure = self.get_failure(
             self.store.db_pool.runInteraction("test_abort", bad_txn),
-            Exception,
+            RuntimeError,
         )
+        self.assertEqual(str(failure.value), "simulated transaction failure")
 
         # Check mtxdb: fake_id is NOT in mtxdb backward edges
         back = get_event_edges_backward_batch(
