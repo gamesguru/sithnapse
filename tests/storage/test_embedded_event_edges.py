@@ -259,3 +259,11 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
             self.store._embedded_hamt_namespace, [p_id]
         )
         self.assertIn(c_id, fwd_repaired.get(p_id) or [])
+
+        # Advance reactor clock to trigger the coalesced flush
+        self.reactor.advance(1.0)
+
+        # A separate read-only worker now observes the repaired edge directly from mtxdb
+        self.store._embedded_event_edges_writable = False
+        reader_successors = self.get_success(self.store.get_successor_events(p_id))
+        self.assertIn(c_id, reader_successors)
