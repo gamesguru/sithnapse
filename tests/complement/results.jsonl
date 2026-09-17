@@ -163,7 +163,7 @@
 {"Action":"pass","Test":"TestFederationRoomsInvite/Parallel/Invited_user_has_'is_direct'_flag_in_prev_content_after_joining"}
 {"Action":"pass","Test":"TestFederationRoomsInvite/Parallel/Inviter_user_can_rescind_invite_over_federation"}
 {"Action":"pass","Test":"TestFederationRoomsInvite/Parallel/Non-invitee_user_cannot_rescind_invite_over_federation"}
-{"Action":"pass","Test":"TestFederationRoomsInvite/Parallel/Remote_invited_user_can_join_the_room_when_homeserver_is_already_participating_in_the_room"}
+{"Action":"fail","Test":"TestFederationRoomsInvite/Parallel/Remote_invited_user_can_join_the_room_when_homeserver_is_already_participating_in_the_room"}
 {"Action":"fail","Test":"TestFederationRoomsInvite/Parallel/Remote_invited_user_can_reject_invite_when_homeserver_is_already_participating_in_the_room"}
 {"Action":"pass","Test":"TestFederationRoomsInvite/Parallel/Remote_invited_user_can_see_room_metadata"}
 {"Action":"pass","Test":"TestFederationThumbnail"}
@@ -551,7 +551,7 @@
 {"Action":"pass","Test":"TestPartialStateJoin/Device_list_tracking/Device_list_tracking_for_user_incorrectly_believed_to_be_in_room_when_they_rejoin_after_partial_state_join_completes"}
 {"Action":"skip","Test":"TestPartialStateJoin/Device_list_tracking/Device_list_tracking_for_user_incorrectly_believed_to_be_in_room_when_they_rejoin_before_partial_state_join_completes"}
 {"Action":"pass","Test":"TestPartialStateJoin/Device_list_tracking/Device_list_tracking_when_pre-existing_members_in_partial_state_room_join_another_shared_room"}
-{"Action":"pass","Test":"TestPartialStateJoin/EagerIncrementalSyncDuringPartialStateJoin"}
+{"Action":"fail","Test":"TestPartialStateJoin/EagerIncrementalSyncDuringPartialStateJoin"}
 {"Action":"pass","Test":"TestPartialStateJoin/EagerInitialSyncDuringPartialStateJoin"}
 {"Action":"pass","Test":"TestPartialStateJoin/EagerLongPollingSyncWokenWhenResyncCompletes"}
 {"Action":"pass","Test":"TestPartialStateJoin/GappySyncAfterPartialStateSynced"}
@@ -701,10 +701,10 @@
 {"Action":"pass","Test":"TestRestrictedRoomsRemoteJoin/Join_should_succeed_when_joined_to_allowed_room"}
 {"Action":"pass","Test":"TestRestrictedRoomsRemoteJoinFailOver"}
 {"Action":"pass","Test":"TestRestrictedRoomsRemoteJoinFailOverInMSC3787Room"}
-{"Action":"pass","Test":"TestRestrictedRoomsRemoteJoinInMSC3787Room"}
+{"Action":"fail","Test":"TestRestrictedRoomsRemoteJoinInMSC3787Room"}
 {"Action":"pass","Test":"TestRestrictedRoomsRemoteJoinInMSC3787Room/Join_should_fail_initially"}
 {"Action":"pass","Test":"TestRestrictedRoomsRemoteJoinInMSC3787Room/Join_should_fail_when_left_allowed_room"}
-{"Action":"pass","Test":"TestRestrictedRoomsRemoteJoinInMSC3787Room/Join_should_fail_with_mangled_join_rules"}
+{"Action":"fail","Test":"TestRestrictedRoomsRemoteJoinInMSC3787Room/Join_should_fail_with_mangled_join_rules"}
 {"Action":"pass","Test":"TestRestrictedRoomsRemoteJoinInMSC3787Room/Join_should_succeed_when_invited"}
 {"Action":"pass","Test":"TestRestrictedRoomsRemoteJoinInMSC3787Room/Join_should_succeed_when_joined_to_allowed_room"}
 {"Action":"pass","Test":"TestRestrictedRoomsRemoteJoinLocalUser"}
