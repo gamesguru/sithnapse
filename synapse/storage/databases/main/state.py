@@ -604,7 +604,7 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
 
     async def _get_state_group_for_event(self, event_id: str) -> int | None:
         if getattr(self, "_embedded_event_json_enabled", False):
-            if not await self.is_un_partial_stated_event(event_id):
+            if event_id not in self._un_partial_stated_event_ids:
                 found = get_state_group_for_events_batch(
                     self._embedded_hamt_engine,
                     self._embedded_hamt_namespace,
@@ -653,9 +653,8 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
              RuntimeError if the state is unknown at any of the given events
         """
         if getattr(self, "_embedded_event_json_enabled", False):
-            un_partial_stated_map = await self.get_un_partial_stated_events(event_ids)
             un_partial_stated = {
-                eid for eid, is_un in un_partial_stated_map.items() if is_un
+                eid for eid in event_ids if eid in self._un_partial_stated_event_ids
             }
             embedded_event_ids = [e for e in event_ids if e not in un_partial_stated]
             res = get_state_group_for_events_batch(
@@ -852,7 +851,7 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
                 updatevalues={"state_group": state_group},
             )
 
-        self._has_un_partial_stated_events = True
+        self._un_partial_stated_event_ids.add(event.event_id)
         txn.call_after(self.is_un_partial_stated_event.invalidate, (event.event_id,))
 
         # the event may now be rejected where it was not before, or vice versa,

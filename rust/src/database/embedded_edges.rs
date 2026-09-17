@@ -3,7 +3,8 @@
 //! Stores the DAG edges connecting Matrix events:
 //! - Backward edges: `event_id -> [(prev_event_id, is_state)]` (immutable, write-once).
 //! - Forward edges: `prev_event_id -> [child_event_id]` (appended & deduplicated under RMW_LOCK).
-//! - Locators: maps event_id and prev_event_id to their respective room's EventDag collection.
+//!
+//! Locators are owned by `event_json_put`; edge reads rely on those.
 
 use std::collections::{HashMap, HashSet};
 
@@ -119,7 +120,9 @@ fn decode_forward_edges(bytes: &[u8]) -> PyResult<Vec<String>> {
 /// Batch put event edges into the room-aware event_dag pool:
 /// 1. Backward edges: `event_id -> [(prev_event_id, is_state)]`
 /// 2. Forward edges: `prev_event_id -> [child_event_id]` (appended and deduplicated)
-/// 3. Locators: `event_id` and `prev_event_id` -> room collection
+/// 3. Locators for event_id and prev_event_id -> room collection (idempotent;
+///    `event_json_put` already writes the same mapping, but the edge module
+///    may run first in tests or during repair).
 #[pyfunction]
 pub fn event_edges_put(
     py: Python<'_>,
@@ -404,7 +407,6 @@ pub fn event_edges_delete(
         }
 
         let mut dag_updates: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
-        let mut locator_updates: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
         let mut forward_cache: HashMap<([u8; 16], NodeId), Vec<String>> = HashMap::new();
 
         for (position, room_collection) in room_collections.iter().enumerate() {
@@ -448,18 +450,11 @@ pub fn event_edges_delete(
                     .entry(*room_collection)
                     .or_default()
                     .push((backward_node, NodeData::new(bytes::Bytes::new())));
-
-                // 3. Tombstone event locator
-                let identity = node_ids[position];
-                let locator_col = event_locator_collection_id(&namespace, &identity);
-                locator_updates
-                    .entry(locator_col)
-                    .or_default()
-                    .push((identity, NodeData::new(bytes::Bytes::new())));
+                // NOTE: locators are owned by event_json_put; do not tombstone here.
             }
         }
 
-        // 4. Write updated or tombstoned forward edges
+        // 3. Write updated or tombstoned forward edges
         for ((room_col, forward_node), children) in forward_cache {
             let data = if children.is_empty() {
                 NodeData::new(bytes::Bytes::new())
@@ -473,12 +468,6 @@ pub fn event_edges_delete(
         }
 
         for (collection, pairs) in dag_updates {
-            engine.put_many(&collection, &pairs).map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {e}"))
-            })?;
-        }
-
-        for (collection, pairs) in locator_updates {
             engine.put_many(&collection, &pairs).map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {e}"))
             })?;

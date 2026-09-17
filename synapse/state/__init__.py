@@ -252,11 +252,14 @@ class StateHandler:
             The hosts in the room at the given events
         """
         if len(event_ids) > 1:
-            non_outlier_event_ids = set()
-            for event_id in event_ids:
-                sg = await self.store._get_state_group_for_event(event_id)
-                if sg is not None:
-                    non_outlier_event_ids.add(event_id)
+            rows = await self.store.db_pool.simple_select_many_batch(
+                table="event_to_state_groups",
+                column="event_id",
+                iterable=event_ids,
+                retcols=("event_id",),
+                desc="get_hosts_in_room_at_events_filter_outliers",
+            )
+            non_outlier_event_ids = {r[0] for r in rows}
             if non_outlier_event_ids:
                 event_ids = non_outlier_event_ids
 

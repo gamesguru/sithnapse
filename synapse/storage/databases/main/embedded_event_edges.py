@@ -20,7 +20,7 @@ Design:
   immutable once an event is created.
 - Forward edges: `prev_event_id -> [child_event_id]`. Deduplicated and appended
   as new children arrive under RMW_LOCK.
-- Locator: 256 deterministic buckets mapping `event_id` -> room collection.
+- Locators are owned by `embedded_event_json`; edge writes rely on those.
 
 Reads are mtxdb-first with SQL fallback:
   mtxdb lookup

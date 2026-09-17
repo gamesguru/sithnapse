@@ -568,7 +568,9 @@ def run() -> None:
             trialRunner._workingDirectory  # type: ignore[attr-defined]
         )
     else:
-        trialRunner.workingDirectory = os.path.abspath(trialRunner.workingDirectory)
+        trialRunner.workingDirectory = os.path.abspath(  # type: ignore[attr-defined]
+            trialRunner.workingDirectory  # type: ignore[attr-defined]
+        )
     suite = _getSuite(config)
 
     interrupted = False
