@@ -835,8 +835,13 @@ class DatabasePool:
         # The cache assumes that *every* write to a cached table happens on
         # this process and is reported via `note_table_write`. That is only
         # true for the process that persists events, so only enable it there.
+        writers = getattr(
+            getattr(getattr(hs, "config", None), "worker", None), "writers", None
+        )
+        events_writers = getattr(writers, "events", ()) if writers is not None else ()
         self._table_empty_caching_enabled = (
-            hs.get_instance_name() in hs.config.worker.writers.events
+            isinstance(events_writers, (list, tuple, set, frozenset))
+            and hs.get_instance_name() in events_writers
         )
 
         # A set of tables that are not safe to use native upserts in.

@@ -2021,9 +2021,9 @@ class PersistEventsStore:
                 args: list[Any] = [
                     room_id,
                     sliding_sync_table_changes.joined_room_bump_stamp_to_fully_insert,
-                    room_id,
                 ]
                 args.extend(iter(sliding_sync_updates_values))
+                args.append(room_id)
 
                 # XXX: We use a sub-query for `stream_ordering` because it's unreliable to
                 # pre-calculate from `events_and_contexts` at the time when
