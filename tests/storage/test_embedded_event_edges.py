@@ -22,6 +22,7 @@ from synapse.rest.client import login, room
 from synapse.server import HomeServer
 from synapse.storage.databases.main.embedded_common import (
     FLUSH_DELAY_SECS,
+    enable_ffi_counting,
     get_ffi_count,
 )
 from synapse.storage.databases.main.embedded_event_edges import (
@@ -38,14 +39,30 @@ from tests.unittest import HomeserverTestCase
 
 
 class EmbeddedEventEdgesTestCase(unittest.TestCase):
+    """Pure unit tests for the embedded event-edges FFI layer.
+
+    mtxdb_engine.open_client() is backed by a Rust OnceCell: the engine is
+    opened exactly once per process and subsequent calls are no-ops.  The
+    engine's data directory must therefore survive for the life of the
+    process; setUp/tearDown must NOT delete it.  Use setUpClass/tearDownClass
+    so the directory is created once and cleaned up after all tests in the
+    class finish.
+    """
+
+    _engine_tmpdir: str  # set by setUpClass
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._engine_tmpdir = tempfile.mkdtemp(prefix="test-embedded-event-edges-")
+        mtxdb_engine.open_client(cls._engine_tmpdir)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        shutil.rmtree(cls._engine_tmpdir, ignore_errors=True)
+
     def setUp(self) -> None:
-        self.tmpdir = tempfile.mkdtemp(prefix="test-embedded-event-edges-")
-        mtxdb_engine.open_client(self.tmpdir)
         self.namespace = "test-edges-ns"
         self.room_id = "!room:example.org"
-
-    def tearDown(self) -> None:
-        shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_put_get_backward_and_forward(self) -> None:
         # e1 has prev_events p1 and p2
@@ -281,25 +298,24 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         # floating-point boundaries or minor changes to the delay value.
         self.reactor.advance(FLUSH_DELAY_SECS + 0.1)
 
-        # Snapshot counters before the read-only query so we can assert the
-        # query was served from the embedded store, not the SQL fallback path.
-        hits_before = get_ffi_count("event_edges_successor_hits")
-        fallbacks_before = get_ffi_count("event_edges_successor_fallbacks")
-
         # Exercise the read-only code path after the coalesced flush.
         # writable=False routes through the embedded read path (no SQL write).
+        # enable_ffi_counting() activates counters only for this block so the
+        # assertion is isolated from any other test activity and does not add
+        # overhead to production deployments where diagnostics are disabled.
         self.store._embedded_event_edges_writable = False
-        reader_successors = self.get_success(self.store.get_successor_events(p_id))
-        self.assertIn(c_id, reader_successors)
+        with enable_ffi_counting():
+            reader_successors = self.get_success(self.store.get_successor_events(p_id))
+            self.assertIn(c_id, reader_successors)
 
-        # The query must have been an embedded hit, not a SQL fallback.
-        self.assertEqual(
-            get_ffi_count("event_edges_successor_hits"),
-            hits_before + 1,
-            "expected exactly one embedded hit for the read-only query",
-        )
-        self.assertEqual(
-            get_ffi_count("event_edges_successor_fallbacks"),
-            fallbacks_before,
-            "expected no SQL fallback for the read-only query after repair",
-        )
+            # The query must have been an embedded hit, not a SQL fallback.
+            self.assertEqual(
+                get_ffi_count("event_edges_successor_hits"),
+                1,
+                "expected exactly one embedded hit for the read-only query",
+            )
+            self.assertEqual(
+                get_ffi_count("event_edges_successor_fallbacks"),
+                0,
+                "expected no SQL fallback for the read-only query after repair",
+            )

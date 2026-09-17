@@ -78,13 +78,19 @@ def ffi_timing(tag: str, elapsed: float) -> None:
         _FFI_LATENCIES[tag].append(elapsed)
 
 
+# When True, ffi_count() writes to _FFI_COUNTERS even without SYNAPSE_PG_TIMINGS.
+# Only set by enable_ffi_counting() in tests; never set in production.
+_ffi_counting_enabled: bool = False
+
+
 def ffi_count(tag: str, count: int) -> None:
     """Record an opt-in count alongside FFI timing diagnostics.
 
-    Always increments _FFI_COUNTERS so that test code can assert on values
-    without requiring SYNAPSE_PG_TIMINGS.  The counter dict is allocated
-    unconditionally; only the lock and summary-print path are env-gated.
+    In production, this is a no-op unless SYNAPSE_PG_TIMINGS is set.
+    Tests may activate counting via the enable_ffi_counting() context manager.
     """
+    if not _ffi_counting_enabled and not os.environ.get("SYNAPSE_PG_TIMINGS"):
+        return
     lock = _FFI_TIMING_LOCK
     if lock is not None:
         with lock:
@@ -96,14 +102,33 @@ def ffi_count(tag: str, count: int) -> None:
 def get_ffi_count(tag: str) -> int:
     """Return the current accumulated value of a named ffi_count counter.
 
-    Intended for use in tests and diagnostics.  Returns 0 if the tag has
-    never been incremented.
+    Only meaningful when SYNAPSE_PG_TIMINGS is set or inside an
+    enable_ffi_counting() block.  Returns 0 for unseen or uncounted tags.
     """
     lock = _FFI_TIMING_LOCK
     if lock is not None:
         with lock:
             return _FFI_COUNTERS[tag]
     return _FFI_COUNTERS[tag]
+
+
+@contextmanager
+def enable_ffi_counting() -> Iterator[None]:
+    """Context manager that activates ffi_count() for the duration of the block.
+
+    Intended for tests that need to assert on hit/fallback counters without
+    requiring SYNAPSE_PG_TIMINGS.  Resets the affected counter dict on entry
+    so that before/after snapshots are clean.
+
+    Not thread-safe; use only in single-threaded test code.
+    """
+    global _ffi_counting_enabled
+    _ffi_counting_enabled = True
+    _FFI_COUNTERS.clear()
+    try:
+        yield
+    finally:
+        _ffi_counting_enabled = False
 
 
 def ffi_batch_size(tag: str, size: int) -> None:
