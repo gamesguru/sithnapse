@@ -313,10 +313,6 @@ def _print_mtxdb_stats() -> None:
                 f"    get: {gc} calls, {gm} misses | get_many: {gmc} calls, {gmr} records, {gmm} misses",
                 file=out,
             )
-            print(
-                f"    cache: hits={ps.get('cache_hits', 0)}  misses={ps.get('cache_misses', 0)}  rate={hit_rate:.3f}",
-                file=out,
-            )
             refcount_inits = ps.get("refcount_inits", 0)
             refcount_existing = ps.get("refcount_existing", 0)
             if refcount_inits or refcount_existing:
@@ -324,6 +320,10 @@ def _print_mtxdb_stats() -> None:
                     f"    refcounts: inits={refcount_inits:,}  updates={refcount_existing:,}",
                     file=out,
                 )
+            print(
+                f"    cache: hits={ps.get('cache_hits', 0)}  misses={ps.get('cache_misses', 0)}  rate={hit_rate:.3f}",
+                file=out,
+            )
 
         # Write / batch counters.
         pc = ps.get("put_calls", 0)
