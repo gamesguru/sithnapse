@@ -252,11 +252,6 @@ class EventsWorkerStore(SQLBaseStore):
             hs.config.database.embedded_hamt_namespace or hs.hostname
         )
 
-        txn = db_conn.cursor()
-        txn.execute("SELECT event_id FROM un_partial_stated_event_stream")
-        self._un_partial_stated_event_ids: set[str] = {row[0] for row in txn.fetchall()}
-        txn.close()
-
         self._stream_id_gen: MultiWriterIdGenerator
         self._backfill_id_gen: MultiWriterIdGenerator
 
@@ -484,7 +479,7 @@ class EventsWorkerStore(SQLBaseStore):
         if stream_name == UnPartialStatedEventStream.NAME:
             for row in rows:
                 assert isinstance(row, UnPartialStatedEventStreamRow)
-                self._un_partial_stated_event_ids.add(row.event_id)
+                self.is_un_partial_stated_event.invalidate((row.event_id,))
                 self.is_partial_state_event.invalidate((row.event_id,))
 
                 if row.rejection_status_changed:
@@ -2711,6 +2706,36 @@ class EventsWorkerStore(SQLBaseStore):
             retcol="1",
             allow_none=True,
             desc="is_partial_state_event",
+        )
+        return result is not None
+
+    @cachedList(cached_method_name="is_un_partial_stated_event", list_name="event_ids")
+    async def get_un_partial_stated_events(
+        self, event_ids: Collection[str]
+    ) -> Mapping[str, bool]:
+        """Checks which of the given events have been un-partial-stated."""
+        result = cast(
+            list[tuple[str]],
+            await self.db_pool.simple_select_many_batch(
+                table="un_partial_stated_event_stream",
+                column="event_id",
+                iterable=event_ids,
+                retcols=["event_id"],
+                desc="get_un_partial_stated_events",
+            ),
+        )
+        un_partial_stated = {r[0] for r in result}
+        return {e_id: e_id in un_partial_stated for e_id in event_ids}
+
+    @cached()
+    async def is_un_partial_stated_event(self, event_id: str) -> bool:
+        """Checks if the given event has been un-partial-stated."""
+        result = await self.db_pool.simple_select_one_onecol(
+            table="un_partial_stated_event_stream",
+            keyvalues={"event_id": event_id},
+            retcol="1",
+            allow_none=True,
+            desc="is_un_partial_stated_event",
         )
         return result is not None
 

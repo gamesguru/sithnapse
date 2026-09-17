@@ -143,9 +143,10 @@ class EventForwardExtremitiesStore(
         # replaces silently dropped non-matching rows instead.
         event_ids = [event_id for event_id, _depth, _received_ts in rows]
         if getattr(self, "_embedded_event_json_enabled", False):
-            un_partial_stated = self._un_partial_stated_event_ids.intersection(
-                event_ids
-            )
+            un_partial_stated_map = await self.get_un_partial_stated_events(event_ids)
+            un_partial_stated = {
+                eid for eid, is_un in un_partial_stated_map.items() if is_un
+            }
             embedded_event_ids = [e for e in event_ids if e not in un_partial_stated]
             state_groups = get_state_group_for_events_batch(
                 self._embedded_hamt_engine,
