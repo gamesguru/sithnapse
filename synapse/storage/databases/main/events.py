@@ -2050,7 +2050,7 @@ class PersistEventsStore:
                     VALUES (
                         ?,
                         COALESCE(
-                            (SELECT stream_ordering FROM events WHERE room_id = ? ORDER BY stream_ordering DESC LIMIT 1),
+                            (SELECT stream_ordering FROM events WHERE room_id = ? AND stream_ordering IS NOT NULL ORDER BY stream_ordering DESC LIMIT 1),
                             ?
                         ),
                         ?,
