@@ -2049,7 +2049,10 @@ class PersistEventsStore:
                         (room_id, event_stream_ordering, bump_stamp, {", ".join(sliding_sync_updates_keys)})
                     VALUES (
                         ?,
-                        (SELECT stream_ordering FROM events WHERE room_id = ? ORDER BY stream_ordering DESC LIMIT 1),
+                        COALESCE(
+                            (SELECT stream_ordering FROM events WHERE room_id = ? ORDER BY stream_ordering DESC LIMIT 1),
+                            ?
+                        ),
                         ?,
                         {", ".join("?" for _ in sliding_sync_updates_values)}
                     )
@@ -2057,7 +2060,7 @@ class PersistEventsStore:
                     DO UPDATE SET
                         {", ".join(f"{key} = EXCLUDED.{key}" for key in sliding_sync_updates_keys)}
                     """,
-                    args,
+                    [args[0], args[1], stream_id, *args[2:]],
                 )
 
         # We now update `local_current_membership`. We do this regardless

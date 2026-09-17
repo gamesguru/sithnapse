@@ -174,6 +174,9 @@ class _DummyStore:
             res[event] = self._event_to_state_group[event]
         return res
 
+    async def _get_state_group_for_event(self, event_id: str) -> int | None:
+        return self._event_to_state_group.get(event_id)
+
     async def get_state_for_groups(
         self, groups: Collection[int]
     ) -> dict[int, MutableStateMap[str]]:

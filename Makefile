@@ -36,11 +36,16 @@ sync:	##H Runs: uv run maturin develop
 
 p ?=
 
+# When the test target is invoked as `make -jN test`, pass the same worker
+# count through to Trial. GNU Make normalizes both `-j N` and `-jN` to `-jN`
+# in MAKEFLAGS. An unbounded `make -j` has no numeric value to propagate.
+TRIAL_JOBS := $(shell printf '%s\n' "$(MAKEFLAGS)" | sed -n 's/.*-j\([0-9][0-9]*\).*/\1/p')
+
 .PHONY: test
 test: ##H Run tests, e.g., on tests/storage/
 	cargo +nightly test
 	if [ -n "$$SYNAPSE_POSTGRES" ] && [ -z "$$SYNAPSE_POSTGRES_HOST" ]; then eval "$$(scripts-dev/start_test_postgres.sh)" || exit 1; fi; \
-	uv run python scripts-dev/trial_ctrlc.py $(p)
+	uv run python scripts-dev/trial_ctrlc.py $(if $(TRIAL_JOBS),-j $(TRIAL_JOBS),) $(p)
 
 
 .PHONY: build
