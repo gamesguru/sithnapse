@@ -20,7 +20,10 @@ from twisted.test.proto_helpers import MemoryReactor
 from synapse.rest import admin
 from synapse.rest.client import login, room
 from synapse.server import HomeServer
-from synapse.storage.databases.main.embedded_common import FLUSH_DELAY_SECS
+from synapse.storage.databases.main.embedded_common import (
+    FLUSH_DELAY_SECS,
+    get_ffi_count,
+)
 from synapse.storage.databases.main.embedded_event_edges import (
     delete_event_edges_batch,
     get_event_edges_backward_batch,
@@ -243,6 +246,10 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         read through the read-only (non-writable) code path.  It does NOT verify
         cross-worker or cross-process visibility; that requires a separate
         read-only engine handle or a genuine multi-process integration test.
+
+        The metric assertions confirm that the final read-only query was served
+        from the embedded store (hit counter up, fallback counter flat) rather
+        than silently succeeding through the SQL fallback path.
         """
         res1 = self.helper.send(self.room_id, "parent", tok=self.tok)
         p_id = res1["event_id"]
@@ -258,11 +265,12 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         )
         self.assertIsNone(fwd_miss.get(p_id))
 
-        # Querying successor events falls back to SQL, successfully finding c_id, and repairs mtxdb
+        # Querying successor events falls back to SQL, successfully finding c_id,
+        # and repairs mtxdb.
         successors = self.get_success(self.store.get_successor_events(p_id))
         self.assertIn(c_id, successors)
 
-        # Now mtxdb has been repaired!
+        # Now mtxdb has been repaired in-process.
         fwd_repaired = get_event_edges_forward_batch(
             self.store._embedded_hamt_namespace, [p_id]
         )
@@ -273,8 +281,25 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         # floating-point boundaries or minor changes to the delay value.
         self.reactor.advance(FLUSH_DELAY_SECS + 0.1)
 
-        # The same-process read-only code path (writable=False) can still read
-        # the repaired edge from the in-process mtxdb handle after the flush.
+        # Snapshot counters before the read-only query so we can assert the
+        # query was served from the embedded store, not the SQL fallback path.
+        hits_before = get_ffi_count("event_edges_successor_hits")
+        fallbacks_before = get_ffi_count("event_edges_successor_fallbacks")
+
+        # Exercise the read-only code path after the coalesced flush.
+        # writable=False routes through the embedded read path (no SQL write).
         self.store._embedded_event_edges_writable = False
         reader_successors = self.get_success(self.store.get_successor_events(p_id))
         self.assertIn(c_id, reader_successors)
+
+        # The query must have been an embedded hit, not a SQL fallback.
+        self.assertEqual(
+            get_ffi_count("event_edges_successor_hits"),
+            hits_before + 1,
+            "expected exactly one embedded hit for the read-only query",
+        )
+        self.assertEqual(
+            get_ffi_count("event_edges_successor_fallbacks"),
+            fallbacks_before,
+            "expected no SQL fallback for the read-only query after repair",
+        )

@@ -79,15 +79,31 @@ def ffi_timing(tag: str, elapsed: float) -> None:
 
 
 def ffi_count(tag: str, count: int) -> None:
-    """Record an opt-in count alongside FFI timing diagnostics."""
-    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
-        return
+    """Record an opt-in count alongside FFI timing diagnostics.
+
+    Always increments _FFI_COUNTERS so that test code can assert on values
+    without requiring SYNAPSE_PG_TIMINGS.  The counter dict is allocated
+    unconditionally; only the lock and summary-print path are env-gated.
+    """
     lock = _FFI_TIMING_LOCK
     if lock is not None:
         with lock:
             _FFI_COUNTERS[tag] += count
     else:
         _FFI_COUNTERS[tag] += count
+
+
+def get_ffi_count(tag: str) -> int:
+    """Return the current accumulated value of a named ffi_count counter.
+
+    Intended for use in tests and diagnostics.  Returns 0 if the tag has
+    never been incremented.
+    """
+    lock = _FFI_TIMING_LOCK
+    if lock is not None:
+        with lock:
+            return _FFI_COUNTERS[tag]
+    return _FFI_COUNTERS[tag]
 
 
 def ffi_batch_size(tag: str, size: int) -> None:
