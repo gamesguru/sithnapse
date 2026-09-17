@@ -112,9 +112,6 @@ class SQLBaseStoreTestCase(unittest.TestCase):
 
         self.datastore = SQLBaseStore(db, None, hs)  # type: ignore[arg-type]
 
-    def tearDown(self) -> None:
-        pass
-
     @defer.inlineCallbacks
     def test_insert_1col(self) -> Generator["defer.Deferred[object]", object, None]:
         self.mock_txn.rowcount = 1
