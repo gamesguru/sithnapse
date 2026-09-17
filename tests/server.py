@@ -198,6 +198,7 @@ def _print_pg_timings() -> None:
     _timings_print(
         f"\n=== Postgres test-DB lifecycle timings (strategy: {strategy_name}) ==="
     )
+    _timings_print("")
     _timings_print(
         f"  {'':44s}  {'total':>10s}  {'calls':>6s}  {'avg':>12s}",
     )

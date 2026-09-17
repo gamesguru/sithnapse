@@ -106,6 +106,7 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                 f" (strategy: {', '.join(sorted(strategies))})" if strategies else ""
             )
             out(f"\n=== Postgres test-DB lifecycle timings{strat_str} ===")
+            out("")
             out(f"  {'':44s}  {'total':>10s}  {'calls':>6s}  {'avg':>12s}")
             if "hs_setup_wall" in lc_timings:
                 wall_s = lc_timings["hs_setup_wall"]
@@ -212,9 +213,12 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
 
         if sql_ops:
             ranked = sorted(sql_ops.items(), key=lambda kv: kv[1], reverse=True)
+            table_width = max(
+                40, *(len(table) for table, _ in ranked[:30]), len("TOTAL")
+            )
             out("\n=== Per-table SQL timing (top 30) ===")
             out(
-                f"  {'table':40s}  {'total':>10s}  {'calls':>6s}  {'rows':>6s}  {'avg':>12s}"
+                f"  {'table':{table_width}s}  {'total':>10s}  {'calls':>6s}  {'rows':>6s}  {'avg':>12s}"
             )
             for table, total_s in ranked[:30]:
                 count = sql_counts.get(table, 0)
@@ -222,7 +226,7 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                 total_ms = total_s * 1000
                 avg_ms = (total_s / count) * 1000 if count else 0.0
                 out(
-                    f"  {table:40s}  {total_ms:8.1f}ms  {count:6d}  {rows:6d}  {avg_ms:10.3f}ms"
+                    f"  {table:{table_width}s}  {total_ms:8.1f}ms  {count:6d}  {rows:6d}  {avg_ms:10.3f}ms"
                 )
             total_time_s = sum(sql_ops.values())
             total_count = sum(sql_counts.values())
@@ -231,7 +235,7 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
             avg_ms = (total_time_s / total_count) * 1000 if total_count else 0.0
             out("")
             out(
-                f"  {'TOTAL':40s}  {total_ms:8.1f}ms  {total_count:6d}  {total_rows:6d}  {avg_ms:10.3f}ms"
+                f"  {'TOTAL':{table_width}s}  {total_ms:8.1f}ms  {total_count:6d}  {total_rows:6d}  {avg_ms:10.3f}ms"
             )
             out("=====================================")
             out("")
@@ -354,6 +358,7 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
     if ffi_files:
         ffi_timings: dict[str, float] = defaultdict(float)
         ffi_counts: dict[str, int] = defaultdict(int)
+        ffi_counters: dict[str, int] = defaultdict(int)
         ffi_latencies: dict[str, list[float]] = defaultdict(list)
         for fname in ffi_files:
             try:
@@ -363,6 +368,8 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                     ffi_timings[k] += v
                 for k, v in data.get("counts", {}).items():
                     ffi_counts[k] += v
+                for k, v in data.get("counters", {}).items():
+                    ffi_counters[k] += v
                 for k, v in data.get("latencies", {}).items():
                     ffi_latencies[k].extend(v)
             except Exception as e:
@@ -403,10 +410,39 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
             total_s = sum(ffi_timings.values())
             total_count = sum(ffi_counts.values())
             total_ms = total_s * 1000
+            total_avg_ms = (total_s / total_count) * 1000 if total_count else 0.0
             out("")
-            out(f"  {'TOTAL':50s}  {total_ms:8.1f}ms  {total_count:6d}")
+            out(
+                f"  {'TOTAL':50s}  {total_ms:8.1f}ms  {total_count:6d}  {total_avg_ms:10.3f}ms"
+            )
             out("==============================")
             out("")
+            batch_timings = {
+                tag: (total_s, ffi_counts.get(tag, 0), ffi_latencies.get(tag, []))
+                for tag, total_s in ffi_timings.items()
+                if tag.endswith("_batch")
+            }
+            if batch_timings:
+                out("=== FFI batch timings ===")
+                out(
+                    f"  {'operation':40s}  {'total':>10s}  {'event IDs':>9s}  {'batches':>8s}  {'avg/batch':>12s}  {'p50':>9s}  {'p95':>9s}  {'p99':>9s}"
+                )
+                for tag, (total_s, batch_count, samples) in sorted(
+                    batch_timings.items()
+                ):
+                    request_count = ffi_counters.get(
+                        f"{tag[:-6]}_event_ids_requested", 0
+                    )
+                    samples = sorted(samples)
+                    p50 = _pct(samples, 0.50) * 1000
+                    p95 = _pct(samples, 0.95) * 1000
+                    p99 = _pct(samples, 0.99) * 1000
+                    avg_ms = (total_s / batch_count) * 1000 if batch_count else 0.0
+                    out(
+                        f"  {tag[:-6]:40s}  {total_s * 1000:8.1f}ms  {request_count:9,d}  {batch_count:8,d}  {avg_ms:10.3f}ms  {p50:7.3f}ms  {p95:7.3f}ms  {p99:7.3f}ms"
+                    )
+                out("========================")
+                out("")
 
 
 def run() -> None:

@@ -198,9 +198,10 @@ def _print_table_ops() -> None:
 
     # Sort by total time descending
     ranked = sorted(table_ops.items(), key=lambda kv: kv[1], reverse=True)
+    table_width = max(40, *(len(table) for table, _ in ranked[:30]), len("TOTAL"))
     _timings_print("\n=== Per-table SQL timing (top 30) ===")
     _timings_print(
-        f"  {'table':40s}  {'total':>10s}  {'calls':>6s}  {'rows':>6s}  {'avg':>12s}",
+        f"  {'table':{table_width}s}  {'total':>10s}  {'calls':>6s}  {'rows':>6s}  {'avg':>12s}",
     )
     for table, total_s in ranked[:30]:
         count = table_counts.get(table, 0)
@@ -208,7 +209,7 @@ def _print_table_ops() -> None:
         total_ms = total_s * 1000
         avg_ms = (total_s / count) * 1000 if count else 0.0
         _timings_print(
-            f"  {table:40s}  {total_ms:8.1f}ms  {count:6d}  {rows:6d}  {avg_ms:10.3f}ms",
+            f"  {table:{table_width}s}  {total_ms:8.1f}ms  {count:6d}  {rows:6d}  {avg_ms:10.3f}ms",
         )
     total_time_s = sum(table_ops.values())
     total_count = sum(table_counts.values())
@@ -217,7 +218,7 @@ def _print_table_ops() -> None:
     avg_ms = (total_time_s / total_count) * 1000 if total_count else 0.0
     _timings_print("")
     _timings_print(
-        f"  {'TOTAL':40s}  {total_ms:8.1f}ms  "
+        f"  {'TOTAL':{table_width}s}  {total_ms:8.1f}ms  "
         f"{total_count:6d}  {total_rows:6d}  {avg_ms:10.3f}ms",
     )
     _timings_print("=====================================")

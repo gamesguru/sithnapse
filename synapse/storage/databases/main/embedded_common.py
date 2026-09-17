@@ -176,12 +176,35 @@ def _print_ffi_timings() -> None:
     total_s = sum(timings.values())
     total_count = sum(counts.values())
     total_ms = total_s * 1000
+    total_avg_ms = (total_s / total_count) * 1000 if total_count else 0.0
     _ffi_timings_print("")
     _ffi_timings_print(
-        f"  {'TOTAL':50s}  {total_ms:8.1f}ms  {total_count:6d}",
+        f"  {'TOTAL':50s}  {total_ms:8.1f}ms  {total_count:6d}  {total_avg_ms:10.3f}ms",
     )
     _ffi_timings_print("==============================")
     _ffi_timings_print("")
+    batch_timings = {
+        tag: (total_s, counts.get(tag, 0), latencies.get(tag, []))
+        for tag, total_s in timings.items()
+        if tag.endswith("_batch")
+    }
+    if batch_timings:
+        _ffi_timings_print("=== FFI batch timings ===")
+        _ffi_timings_print(
+            f"  {'operation':40s}  {'total':>10s}  {'event IDs':>9s}  {'batches':>8s}  {'avg/batch':>12s}  {'p50':>9s}  {'p95':>9s}  {'p99':>9s}"
+        )
+        for tag, (total_s, batch_count, samples) in sorted(batch_timings.items()):
+            request_count = counters.get(f"{tag[:-6]}_event_ids_requested", 0)
+            samples = sorted(samples)
+            p50 = _percentile(samples, 0.50) * 1000
+            p95 = _percentile(samples, 0.95) * 1000
+            p99 = _percentile(samples, 0.99) * 1000
+            avg_ms = (total_s / batch_count) * 1000 if batch_count else 0.0
+            _ffi_timings_print(
+                f"  {tag[:-6]:40s}  {total_s * 1000:8.1f}ms  {request_count:9,d}  {batch_count:8,d}  {avg_ms:10.3f}ms  {p50:7.3f}ms  {p95:7.3f}ms  {p99:7.3f}ms"
+            )
+        _ffi_timings_print("========================")
+        _ffi_timings_print("")
     if counters:
         _ffi_timings_print("=== FFI batch counters ===")
         for tag in sorted(counters):
