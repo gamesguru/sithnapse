@@ -54,6 +54,8 @@ from synapse.storage.databases.main.embedded_common import (
     _set_coalescer,
     _set_engine_configured,
     configure_sync,
+    ffi_batch_size,
+    ffi_count,
     ffi_timing,
     mark_dirty,
     mirror_timing,
@@ -62,6 +64,7 @@ from synapse.storage.databases.state.bg_updates import (
     StateBackgroundUpdateStore,
     _decode_state_hamt_root,
     _encode_state_hamt_root,
+    _state_counter,
     _state_timing,
 )
 from synapse.storage.engines import PostgresEngine
@@ -1045,7 +1048,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             # `send_events`; nothing to persist locally. root/lattice/nodes
             # are still returned below so the caller (and any further
             # incremental step in the same batch/chain) has them.
-            pass
+            _state_counter("state_mirror_write_skipped")
         else:
             # Exclusive by configured engine, not a dual-write: SQL owns this
             # data unless the embedded engine is configured, in which case it
@@ -1142,10 +1145,15 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 )
                 _state_timing("state_read_root_embedded", time.monotonic() - _et)
                 if embedded_root is not None:
+                    _state_counter("state_root_embedded_hits")
                     prev_root_hash, prev_lattice = embedded_root
+                else:
+                    _state_counter("state_root_embedded_misses")
             if prev_root_hash is None and (
                 not mtxdb_active or self._embedded_hamt_migration_pending_txn(txn)
             ):
+                if mtxdb_active:
+                    _state_counter("state_root_sql_fallback_migration")
                 _st = time.monotonic()
                 prev_root = self.db_pool.simple_select_one_txn(
                     txn,
@@ -1156,11 +1164,15 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 )
                 _state_timing("state_read_root_sql", time.monotonic() - _st)
                 if prev_root is not None and prev_root[1] is not None:
+                    _state_counter("state_root_sql_hits")
                     prev_root_hash, prev_lattice = (
                         bytes(prev_root[0]),
                         bytes(prev_root[1]),
                     )
+                else:
+                    _state_counter("state_root_sql_misses")
             if prev_root_hash is None or prev_lattice is None:
+                _state_counter("state_root_unusable")
                 return None
 
         assert prev_root_hash is not None
@@ -1171,10 +1183,14 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             _et = time.monotonic()
             root_node_bytes = self._get_embedded_hamt_node(room_prefix, prev_root_hash)
             _state_timing("state_read_node_embedded", time.monotonic() - _et)
+            if root_node_bytes is None:
+                _state_counter("state_node_embedded_misses")
         if root_node_bytes is None and (
             self._embedded_hamt_engine != "mtxdb"
             or self._embedded_hamt_migration_pending_txn(txn)
         ):
+            if self._embedded_hamt_engine == "mtxdb":
+                _state_counter("state_node_sql_fallback_migration")
             _st = time.monotonic()
             root_node_bytes = self.db_pool.simple_select_one_onecol_txn(
                 txn,
@@ -1184,6 +1200,11 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 allow_none=True,
             )
             _state_timing("state_read_node_sql", time.monotonic() - _st)
+            _state_counter(
+                "state_node_sql_hits"
+                if root_node_bytes is not None
+                else "state_node_sql_misses"
+            )
         if root_node_bytes is None:
             raise RuntimeError(
                 "Missing HAMT root node for state group "
@@ -1226,6 +1247,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 node_hash for node_hash in missing if node_hash not in found
             ]
             if still_missing:
+                _state_counter("state_node_child_sql_fallback", len(still_missing))
                 rows = self.db_pool.simple_select_many_txn(
                     txn,
                     table="state_hamt_nodes",
@@ -1240,6 +1262,14 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                         for node_hash, node_bytes in rows
                     }
                 )
+                _state_counter(
+                    "state_node_child_sql_hits",
+                    sum(node_hash in found for node_hash in still_missing),
+                )
+                _state_counter(
+                    "state_node_child_sql_misses",
+                    sum(node_hash not in found for node_hash in still_missing),
+                )
             nodes.update(found)
             unresolved = set(missing) - found.keys()
             if unresolved:
@@ -1253,7 +1283,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         if skip_mirror_write:
             # See the matching comment in _persist_state_hamt_txn's rebuild
             # branch -- the events writer redoes this from `updates`.
-            pass
+            _state_counter("state_mirror_write_skipped")
         else:
             self._store_state_hamt_nodes_txn(txn, room_prefix, new_nodes)
             if self._embedded_hamt_engine == "mtxdb":
@@ -1312,6 +1342,8 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             )
             ffi_timing("ffi_put_hamt_nodes", time.monotonic() - _et)
             _state_timing("state_write_nodes_embedded", time.monotonic() - _et)
+            _state_counter("state_write_nodes_embedded_batches")
+            _state_counter("state_write_nodes_embedded_records", len(nodes))
             # Record batch-size/byte-count stats for diagnostics.
             from synapse.storage.databases.state.bg_updates import (
                 _record_node_write_stats,
@@ -1333,6 +1365,8 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             ],
         )
         _state_timing("state_write_nodes_sql", time.monotonic() - _st)
+        _state_counter("state_write_nodes_sql_batches")
+        _state_counter("state_write_nodes_sql_records", len(nodes))
 
     def _embedded_hamt_migration_pending_txn(self, txn: LoggingTransaction) -> bool:
         """Whether `EMBEDDED_HAMT_MIGRATION_UPDATE_NAME` is still queued or
@@ -1393,7 +1427,12 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             self._embedded_hamt_namespace, room_prefix, [node_hash]
         )
         ffi_timing("ffi_get_hamt_node", time.monotonic() - _et)
-        return bytes(results[0]) if results and results[0] is not None else None
+        _state_counter("state_node_point_requests")
+        if not results or results[0] is None:
+            _state_counter("state_node_point_misses")
+            return None
+        _state_counter("state_node_point_hits")
+        return bytes(results[0])
 
     def _get_embedded_hamt_nodes_batch(
         self, room_prefix: bytes, node_hashes: list[bytes]
@@ -1412,6 +1451,21 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             self._embedded_hamt_namespace, room_prefix, node_hashes
         )
         ffi_timing("ffi_get_hamt_nodes_batch", time.monotonic() - _et)
+        ffi_count("ffi_get_hamt_nodes_node_hashes_requested", len(node_hashes))
+        ffi_count(
+            "ffi_get_hamt_nodes_node_hashes_returned",
+            sum(data is not None for data in results),
+        )
+        ffi_count(
+            "ffi_get_hamt_nodes_node_hashes_misses",
+            sum(data is None for data in results),
+        )
+        ffi_batch_size("ffi_get_hamt_nodes", len(node_hashes))
+        _state_counter("state_node_batch_requests", len(node_hashes))
+        _state_counter(
+            "state_node_batch_misses",
+            sum(data is None for data in results),
+        )
         return {
             node_hash: bytes(data)
             for node_hash, data in zip(node_hashes, results)
@@ -1507,6 +1561,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                     [(state_group, root_value)],
                 )
                 ffi_timing("ffi_put_state_hamt_roots", time.monotonic() - _et)
+                _state_counter("state_write_roots_embedded")
 
     async def _background_backfill_state_hamt_roots(
         self, progress: dict, batch_size: int
@@ -1902,6 +1957,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                     self._embedded_hamt_namespace, room_prefix, pending_room_roots
                 )
                 _state_timing("state_write_root_embedded", time.monotonic() - _et)
+                _state_counter("state_write_roots_embedded", len(pending_room_roots))
 
             # Dirty marking handled by _persist_state_hamt_txn via
             # txn.call_after(mark_dirty, Pool.STATE).

@@ -201,7 +201,7 @@ def _print_table_ops() -> None:
     table_width = max(40, *(len(table) for table, _ in ranked[:30]), len("TOTAL"))
     _timings_print("\n=== Per-table SQL timing (top 30) ===")
     _timings_print(
-        f"  {'table':{table_width}s}  {'total':>10s}  {'calls':>6s}  {'rows':>6s}  {'avg':>12s}",
+        f"  {'table':{table_width}s}  {'total':>8s}  {'calls':>6s}  {'rows':>6s}  {'avg':>10s}",
     )
     for table, total_s in ranked[:30]:
         count = table_counts.get(table, 0)

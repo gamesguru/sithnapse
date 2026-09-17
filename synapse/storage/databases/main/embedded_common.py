@@ -195,17 +195,29 @@ def _print_ffi_timings() -> None:
     if batch_timings:
         _ffi_timings_print("=== FFI batch timings ===")
         _ffi_timings_print(
-            f"  {'operation':40s}  {'total':>10s}  {'event IDs':>9s}  {'batches':>8s}  {'avg/batch':>12s}  {'p50':>9s}  {'p95':>9s}  {'p99':>9s}"
+            f"  {'operation':40s}  {'total':>10s}  {'items':>9s}  {'batches':>8s}  {'avg/batch':>12s}  {'p50':>9s}  {'p95':>9s}  {'p99':>9s}"
         )
         for tag, (total_s, batch_count, samples) in sorted(batch_timings.items()):
-            request_count = counters.get(f"{tag[:-6]}_event_ids_requested", 0)
+            operation = tag[:-6]
+            request_count = next(
+                (
+                    counters[key]
+                    for key in (
+                        f"{operation}_items_requested",
+                        f"{operation}_event_ids_requested",
+                        f"{operation}_node_hashes_requested",
+                    )
+                    if key in counters
+                ),
+                0,
+            )
             samples = sorted(samples)
             p50 = _percentile(samples, 0.50) * 1000
             p95 = _percentile(samples, 0.95) * 1000
             p99 = _percentile(samples, 0.99) * 1000
             avg_ms = (total_s / batch_count) * 1000 if batch_count else 0.0
             _ffi_timings_print(
-                f"  {tag[:-6]:40s}  {total_s * 1000:8.1f}ms  {request_count:9,d}  {batch_count:8,d}  {avg_ms:10.3f}ms  {p50:7.3f}ms  {p95:7.3f}ms  {p99:7.3f}ms"
+                f"  {operation:40s}  {total_s * 1000:8.1f}ms  {request_count:9,d}  {batch_count:8,d}  {avg_ms:10.3f}ms  {p50:7.3f}ms  {p95:7.3f}ms  {p99:7.3f}ms"
             )
         _ffi_timings_print("========================")
         _ffi_timings_print("")

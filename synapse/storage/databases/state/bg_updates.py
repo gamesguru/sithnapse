@@ -57,6 +57,7 @@ logger = logging.getLogger(__name__)
 # ── mtxdb-vs-SQL timing (opt-in via SYNAPSE_PG_TIMINGS=1) ───────────────
 _STATE_TIMINGS: dict[str, float] = defaultdict(float)
 _STATE_TIMING_COUNTS: dict[str, int] = defaultdict(int)
+_STATE_COUNTERS: dict[str, int] = defaultdict(int)
 _STATE_TIMING_LOCK: "threading.Lock | None" = (
     threading.Lock() if os.environ.get("SYNAPSE_PG_TIMINGS") else None
 )
@@ -102,6 +103,18 @@ def _state_timing(tag: str, elapsed: float) -> None:
     else:
         _STATE_TIMINGS[tag] += elapsed
         _STATE_TIMING_COUNTS[tag] += 1
+
+
+def _state_counter(tag: str, value: int = 1) -> None:
+    """Record diagnostic state-mirror counts when PostgreSQL timings are enabled."""
+    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+        return
+    lock = _STATE_TIMING_LOCK
+    if lock is not None:
+        with lock:
+            _STATE_COUNTERS[tag] += value
+    else:
+        _STATE_COUNTERS[tag] += value
 
 
 def _record_node_write_stats(nodes: list[tuple[bytes, bytes]], elapsed: float) -> None:
@@ -167,6 +180,7 @@ def _print_state_timings() -> None:
         # concurrent `_state_timing` on these dicts.
         timings = dict(_STATE_TIMINGS)
         counts = dict(_STATE_TIMING_COUNTS)
+        counters = dict(_STATE_COUNTERS)
 
     run_dir = os.environ.get("SYNAPSE_TIMINGS_RUN_DIR")
     if run_dir:
@@ -174,7 +188,9 @@ def _print_state_timings() -> None:
         final_path = os.path.join(run_dir, f"state_{os.getpid()}.json")
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump({"timings": timings, "counts": counts}, f)
+                json.dump(
+                    {"timings": timings, "counts": counts, "counters": counters}, f
+                )
             os.replace(tmp_path, final_path)
         except OSError:
             pass
@@ -229,6 +245,12 @@ def _print_state_timings() -> None:
     )
     _timings_print("=========================================")
     _timings_print("")
+    if counters:
+        _timings_print("=== State mirror diagnostics ===")
+        for tag in sorted(counters):
+            _timings_print(f"  {tag:50s}  {counters[tag]:>12,d}")
+        _timings_print("================================")
+        _timings_print("")
 
 
 def _print_node_write_stats() -> None:

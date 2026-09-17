@@ -218,7 +218,7 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
             )
             out("\n=== Per-table SQL timing (top 30) ===")
             out(
-                f"  {'table':{table_width}s}  {'total':>10s}  {'calls':>6s}  {'rows':>6s}  {'avg':>12s}"
+                f"  {'table':{table_width}s}  {'total':>8s}  {'calls':>6s}  {'rows':>6s}  {'avg':>10s}"
             )
             for table, total_s in ranked[:30]:
                 count = sql_counts.get(table, 0)
@@ -244,6 +244,7 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
     if state_files:
         st_timings: dict[str, float] = defaultdict(float)
         st_counts: dict[str, int] = defaultdict(int)
+        st_counters: dict[str, int] = defaultdict(int)
         for fname in state_files:
             try:
                 with open(
@@ -254,6 +255,8 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                     st_timings[k] += v
                 for k, v in data.get("counts", {}).items():
                     st_counts[k] += v
+                for k, v in data.get("counters", {}).items():
+                    st_counters[k] += v
             except Exception as e:
                 out(f"Warning: failed to read {fname}: {e}")
 
@@ -301,6 +304,13 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                 f"  {'TOTAL':40s}  {total_ms:8.1f}ms  {total_count:6d}  {avg_ms:10.3f}ms"
             )
             out("=========================================")
+            out("")
+
+        if st_counters:
+            out("=== State mirror diagnostics ===")
+            for tag in sorted(st_counters):
+                out(f"  {tag:50s}  {st_counters[tag]:>12,d}")
+            out("================================")
             out("")
 
     # 4. Node write diagnostics
@@ -359,6 +369,7 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
         ffi_timings: dict[str, float] = defaultdict(float)
         ffi_counts: dict[str, int] = defaultdict(int)
         ffi_counters: dict[str, int] = defaultdict(int)
+        ffi_batch_sizes: dict[str, list[int]] = defaultdict(list)
         ffi_latencies: dict[str, list[float]] = defaultdict(list)
         for fname in ffi_files:
             try:
@@ -370,6 +381,8 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                     ffi_counts[k] += v
                 for k, v in data.get("counters", {}).items():
                     ffi_counters[k] += v
+                for k, v in data.get("batch_sizes", {}).items():
+                    ffi_batch_sizes[k].extend(v)
                 for k, v in data.get("latencies", {}).items():
                     ffi_latencies[k].extend(v)
             except Exception as e:
@@ -433,13 +446,23 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
             if batch_timings:
                 out("=== FFI batch timings ===")
                 out(
-                    f"  {'operation':40s}  {'total':>10s}  {'event IDs':>9s}  {'batches':>8s}  {'avg/batch':>12s}  {'p50':>9s}  {'p95':>9s}  {'p99':>9s}"
+                    f"  {'operation':40s}  {'total':>10s}  {'items':>9s}  {'batches':>8s}  {'avg/batch':>12s}  {'p50':>9s}  {'p95':>9s}  {'p99':>9s}"
                 )
                 for tag, (total_s, batch_count, samples) in sorted(
                     batch_timings.items()
                 ):
-                    request_count = ffi_counters.get(
-                        f"{tag[:-6]}_event_ids_requested", 0
+                    operation = tag[:-6]
+                    request_count = next(
+                        (
+                            ffi_counters[key]
+                            for key in (
+                                f"{operation}_items_requested",
+                                f"{operation}_event_ids_requested",
+                                f"{operation}_node_hashes_requested",
+                            )
+                            if key in ffi_counters
+                        ),
+                        0,
                     )
                     samples = sorted(samples)
                     p50 = _pct(samples, 0.50) * 1000
@@ -447,9 +470,26 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                     p99 = _pct(samples, 0.99) * 1000
                     avg_ms = (total_s / batch_count) * 1000 if batch_count else 0.0
                     out(
-                        f"  {tag[:-6]:40s}  {total_s * 1000:8.1f}ms  {request_count:9,d}  {batch_count:8,d}  {avg_ms:10.3f}ms  {p50:7.3f}ms  {p95:7.3f}ms  {p99:7.3f}ms"
+                        f"  {operation:40s}  {total_s * 1000:8.1f}ms  {request_count:9,d}  {batch_count:8,d}  {avg_ms:10.3f}ms  {p50:7.3f}ms  {p95:7.3f}ms  {p99:7.3f}ms"
                     )
                 out("========================")
+                out("")
+            if ffi_counters:
+                out("=== FFI batch counters ===")
+                for tag in sorted(ffi_counters):
+                    out(f"  {tag:50s}  {ffi_counters[tag]:>12,d}")
+                out("===========================")
+                out("")
+            if ffi_batch_sizes:
+                out("=== FFI batch sizes ===")
+                for tag, values in sorted(ffi_batch_sizes.items()):
+                    values.sort()
+                    p50 = values[len(values) // 2]
+                    p95 = values[min(len(values) - 1, int(len(values) * 0.95))]
+                    out(
+                        f"  {tag:50s}  calls={len(values):,}  avg={sum(values) / len(values):.1f}  p50={p50}  p95={p95}"
+                    )
+                out("=======================")
                 out("")
 
 
