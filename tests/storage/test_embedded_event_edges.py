@@ -200,9 +200,11 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         persist_store = self.persist_store
         assert persist_store is not None
 
-        def bad_txn(txn: LoggingTransaction) -> None:
-            self.store.db_pool.simple_insert_txn(
-                txn,
+        # Commit the event row separately. The transaction under test should
+        # roll back the edge insert, not fail its foreign-key check because
+        # the fixture row was inserted in the same interaction.
+        self.get_success(
+            self.store.db_pool.simple_insert(
                 table="events",
                 values={
                     "instance_name": "master",
@@ -220,6 +222,9 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
                     "contains_url": False,
                 },
             )
+        )
+
+        def bad_txn(txn: LoggingTransaction) -> None:
             persist_store._handle_mult_prev_events(txn, [mock_ev])
             raise RuntimeError("simulated transaction failure")
 
