@@ -117,13 +117,13 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                     cd_s = lc_timings["create_database"]
                     cd_cnt = lc_counts["create_database"]
                     out(
-                        f"    ├── {'create_database':40s}  {cd_s * 1000:8.1f}ms  {cd_cnt:6d}  {(cd_s / cd_cnt) * 1000:10.3f}ms"
+                        f"    ├── {'create_database':38s}  {cd_s * 1000:8.1f}ms  {cd_cnt:6d}  {(cd_s / cd_cnt) * 1000:10.3f}ms"
                     )
                 if "hs_setup_total" in lc_timings:
                     st_s = lc_timings["hs_setup_total"]
                     st_cnt = lc_counts["hs_setup_total"]
                     out(
-                        f"    ├── {'hs_setup_total':40s}  {st_s * 1000:8.1f}ms  {st_cnt:6d}  {(st_s / st_cnt) * 1000:10.3f}ms"
+                        f"    ├── {'hs_setup_total':38s}  {st_s * 1000:8.1f}ms  {st_cnt:6d}  {(st_s / st_cnt) * 1000:10.3f}ms"
                     )
                     for inner_tag in (
                         "make_conn",
@@ -134,7 +134,7 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                             it_s = lc_timings[inner_tag]
                             it_cnt = lc_counts[inner_tag]
                             out(
-                                f"    │     ├── {inner_tag:36s}  {it_s * 1000:8.1f}ms  {it_cnt:6d}  {(it_s / it_cnt) * 1000:10.3f}ms"
+                                f"    │     ├── {inner_tag:32s}  {it_s * 1000:8.1f}ms  {it_cnt:6d}  {(it_s / it_cnt) * 1000:10.3f}ms"
                             )
                     sub_inner = sum(
                         lc_timings.get(t, 0.0)
@@ -142,14 +142,14 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                     )
                     store_res = max(0.0, st_s - sub_inner)
                     out(
-                        f"    │     └── {'store_init (residual)':36s}  {store_res * 1000:8.1f}ms  {st_cnt:6d}  {(store_res / st_cnt) * 1000:10.3f}ms"
+                        f"    │     └── {'store_init (residual)':32s}  {store_res * 1000:8.1f}ms  {st_cnt:6d}  {(store_res / st_cnt) * 1000:10.3f}ms"
                     )
                 sub_wall = lc_timings.get("create_database", 0.0) + lc_timings.get(
                     "hs_setup_total", 0.0
                 )
                 unatt_wall = max(0.0, wall_s - sub_wall)
                 out(
-                    f"    └── {'hs_unattributed':40s}  {unatt_wall * 1000:8.1f}ms  {wall_cnt:6d}  {(unatt_wall / wall_cnt) * 1000:10.3f}ms"
+                    f"    └── {'hs_unattributed':38s}  {unatt_wall * 1000:8.1f}ms  {wall_cnt:6d}  {(unatt_wall / wall_cnt) * 1000:10.3f}ms"
                 )
                 if "hs_shutdown" in lc_timings:
                     sd_s = lc_timings["hs_shutdown"]

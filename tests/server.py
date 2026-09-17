@@ -211,20 +211,20 @@ def _print_pg_timings() -> None:
             cd_s = timings["create_database"]
             cd_cnt = counts["create_database"]
             _timings_print(
-                f"    ├── {'create_database':40s}  {cd_s * 1000:8.1f}ms  {cd_cnt:6d}  {(cd_s / cd_cnt) * 1000:10.3f}ms"
+                f"    ├── {'create_database':38s}  {cd_s * 1000:8.1f}ms  {cd_cnt:6d}  {(cd_s / cd_cnt) * 1000:10.3f}ms"
             )
         if "hs_setup_total" in timings:
             st_s = timings["hs_setup_total"]
             st_cnt = counts["hs_setup_total"]
             _timings_print(
-                f"    ├── {'hs_setup_total':40s}  {st_s * 1000:8.1f}ms  {st_cnt:6d}  {(st_s / st_cnt) * 1000:10.3f}ms"
+                f"    ├── {'hs_setup_total':38s}  {st_s * 1000:8.1f}ms  {st_cnt:6d}  {(st_s / st_cnt) * 1000:10.3f}ms"
             )
             for inner_tag in ("make_conn", "prepare_database", "check_database"):
                 if inner_tag in timings:
                     it_s = timings[inner_tag]
                     it_cnt = counts[inner_tag]
                     _timings_print(
-                        f"    │     ├── {inner_tag:36s}  {it_s * 1000:8.1f}ms  {it_cnt:6d}  {(it_s / it_cnt) * 1000:10.3f}ms"
+                        f"    │     ├── {inner_tag:32s}  {it_s * 1000:8.1f}ms  {it_cnt:6d}  {(it_s / it_cnt) * 1000:10.3f}ms"
                     )
             sub_inner = sum(
                 timings.get(t, 0.0)
@@ -232,14 +232,14 @@ def _print_pg_timings() -> None:
             )
             store_res = max(0.0, st_s - sub_inner)
             _timings_print(
-                f"    │     └── {'store_init (residual)':36s}  {store_res * 1000:8.1f}ms  {st_cnt:6d}  {(store_res / st_cnt) * 1000:10.3f}ms"
+                f"    │     └── {'store_init (residual)':32s}  {store_res * 1000:8.1f}ms  {st_cnt:6d}  {(store_res / st_cnt) * 1000:10.3f}ms"
             )
         sub_wall = timings.get("create_database", 0.0) + timings.get(
             "hs_setup_total", 0.0
         )
         unatt_wall = max(0.0, wall_s - sub_wall)
         _timings_print(
-            f"    └── {'hs_unattributed':40s}  {unatt_wall * 1000:8.1f}ms  {wall_cnt:6d}  {(unatt_wall / wall_cnt) * 1000:10.3f}ms"
+            f"    └── {'hs_unattributed':38s}  {unatt_wall * 1000:8.1f}ms  {wall_cnt:6d}  {(unatt_wall / wall_cnt) * 1000:10.3f}ms"
         )
         if "hs_shutdown" in timings:
             sd_s = timings["hs_shutdown"]
