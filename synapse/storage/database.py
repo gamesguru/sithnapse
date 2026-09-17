@@ -198,28 +198,50 @@ def _print_table_ops() -> None:
 
     # Sort by total time descending
     ranked = sorted(table_ops.items(), key=lambda kv: kv[1], reverse=True)
-    table_width = max(40, *(len(table) for table, _ in ranked[:30]), len("TOTAL"))
-    _timings_print("\n=== Per-table SQL timing (top 30) ===")
-    _timings_print(
-        f"  {'table':{table_width}s}  {'total':>8s}  {'calls':>6s}  {'rows':>6s}  {'avg':>10s}",
-    )
+    rendered = []
     for table, total_s in ranked[:30]:
         count = table_counts.get(table, 0)
         rows = table_rows.get(table, 0)
-        total_ms = total_s * 1000
-        avg_ms = (total_s / count) * 1000 if count else 0.0
-        _timings_print(
-            f"  {table:{table_width}s}  {total_ms:8.1f}ms  {count:6d}  {rows:6d}  {avg_ms:10.3f}ms",
+        rendered.append(
+            (
+                table,
+                f"{total_s * 1000:.1f}ms",
+                f"{count:d}",
+                f"{rows:d}",
+                f"{(total_s / count) * 1000 if count else 0.0:.3f}ms",
+            )
         )
     total_time_s = sum(table_ops.values())
     total_count = sum(table_counts.values())
     total_rows = sum(table_rows.values())
-    total_ms = total_time_s * 1000
-    avg_ms = (total_time_s / total_count) * 1000 if total_count else 0.0
+    total_row = (
+        "TOTAL",
+        f"{total_time_s * 1000:.1f}ms",
+        f"{total_count:d}",
+        f"{total_rows:d}",
+        f"{(total_time_s / total_count) * 1000 if total_count else 0.0:.3f}ms",
+    )
+    table_width = max(40, *(len(row[0]) for row in rendered), len("TOTAL"))
+    total_width = max(
+        len("total"), *(len(row[1]) for row in rendered), len(total_row[1])
+    )
+    calls_width = max(
+        len("calls"), *(len(row[2]) for row in rendered), len(total_row[2])
+    )
+    rows_width = max(len("rows"), *(len(row[3]) for row in rendered), len(total_row[3]))
+    avg_width = max(len("avg"), *(len(row[4]) for row in rendered), len(total_row[4]))
+    _timings_print("\n=== Per-table SQL timing (top 30) ===")
+    _timings_print(
+        f"  {'table':{table_width}s}  {'total':>{total_width}s}  {'calls':>{calls_width}s}  {'rows':>{rows_width}s}  {'avg':>{avg_width}s}",
+    )
+    for table, total_text, count_text, rows_text, avg_text in rendered:
+        _timings_print(
+            f"  {table:{table_width}s}  {total_text:>{total_width}s}  {count_text:>{calls_width}s}  {rows_text:>{rows_width}s}  {avg_text:>{avg_width}s}",
+        )
     _timings_print("")
     _timings_print(
-        f"  {'TOTAL':{table_width}s}  {total_ms:8.1f}ms  "
-        f"{total_count:6d}  {total_rows:6d}  {avg_ms:10.3f}ms",
+        f"  {total_row[0]:{table_width}s}  {total_row[1]:>{total_width}s}  "
+        f"{total_row[2]:>{calls_width}s}  {total_row[3]:>{rows_width}s}  {total_row[4]:>{avg_width}s}",
     )
     _timings_print("=====================================")
     _timings_print("")

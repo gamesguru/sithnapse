@@ -51,6 +51,7 @@ from synapse.storage.database import (
     LoggingTransaction,
 )
 from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
+from synapse.storage.databases.main.embedded_common import ffi_count
 from synapse.storage.databases.main.events_worker import EventsWorkerStore
 from synapse.storage.databases.main.signatures import SignatureWorkerStore
 from synapse.storage.engines import PostgresEngine, Sqlite3Engine
@@ -178,6 +179,16 @@ class _WarnedIncompleteAuthGraphCache:
 _warned_incomplete_auth_graph = _WarnedIncompleteAuthGraphCache()
 
 
+def _auth_coverage(
+    operation: str, outcome: str, seeds: int, auth_events: int | None = None
+) -> None:
+    """Record opt-in auth-chain path coverage for the diagnostics report."""
+    ffi_count(f"auth_chain_{operation}_{outcome}_calls", 1)
+    ffi_count(f"auth_chain_{operation}_{outcome}_seeds", seeds)
+    if auth_events is not None:
+        ffi_count(f"auth_chain_{operation}_{outcome}_auth_events", auth_events)
+
+
 class EventFederationWorkerStore(
     SignatureWorkerStore, EventsWorkerStore, CacheInvalidationWorkerStore
 ):
@@ -299,8 +310,11 @@ class EventFederationWorkerStore(
             try:
                 if is_embedded_writer:
                     assert embedded_hamt_namespace is not None
+                    _auth_coverage(
+                        "get_auth_chain_ids", "embedded_attempt", len(event_ids)
+                    )
                     try:
-                        return await self.db_pool.runInteraction(
+                        result = await self.db_pool.runInteraction(
                             "get_auth_chain_ids_embedded",
                             self._get_auth_chain_ids_using_embedded_closures_txn,
                             embedded_hamt_namespace,
@@ -308,6 +322,10 @@ class EventFederationWorkerStore(
                             event_ids,
                             include_given,
                         )
+                        _auth_coverage(
+                            "get_auth_chain_ids", "embedded_complete", len(event_ids), len(result)
+                        )
+                        return result
                     except IncompleteAuthGraph:
                         # The embedded ramp is missing genuine data (e.g.
                         # cold-import hasn't caught up yet).  Bypass the
@@ -320,24 +338,40 @@ class EventFederationWorkerStore(
                                 "falling back to legacy SQL auth-chain traversal",
                                 room_id,
                             )
-                        return await self.db_pool.runInteraction(
+                        result = await self.db_pool.runInteraction(
                             "get_auth_chain_ids_legacy_fallback",
                             self._get_auth_chain_ids_txn,
                             event_ids,
                             include_given,
                         )
+                        _auth_coverage(
+                            "get_auth_chain_ids",
+                            "embedded_incomplete_sql_fallback",
+                            len(event_ids),
+                            len(result),
+                        )
+                        return result
 
                 # Non-writers (or instances without embedded HAMT): prefer the cover
                 # index when complete. Non-writers hold a read-only mtxdb handle and
                 # cannot safely repair missing links; if the cover index is incomplete or
                 # missing, fall back to the authoritative legacy SQL BFS walk.
-                return await self.db_pool.runInteraction(
+                result = await self.db_pool.runInteraction(
                     "get_auth_chain_ids_chains",
                     self._get_auth_chain_ids_using_cover_index_txn,
                     room_id,
                     event_ids,
                     include_given,
                 )
+                _auth_coverage(
+                    "get_auth_chain_ids",
+                    "embedded_complete"
+                    if embedded_hamt_namespace is not None
+                    else "sql_only",
+                    len(event_ids),
+                    len(result),
+                )
+                return result
             except (IncompleteAuthGraph, _NoChainCoverIndex):
                 # For whatever reason we don't actually have a complete chain cover index
                 # for the events in question, so we fall back to the old method
@@ -350,13 +384,21 @@ class EventFederationWorkerStore(
                         "falling back to legacy SQL auth-chain traversal",
                         room_id,
                     )
-                return await self.db_pool.runInteraction(
+                result = await self.db_pool.runInteraction(
                     "get_auth_chain_ids_legacy_fallback",
                     self._get_auth_chain_ids_txn,
                     event_ids,
                     include_given,
                 )
+                _auth_coverage(
+                    "get_auth_chain_ids",
+                    "embedded_incomplete_sql_fallback",
+                    len(event_ids),
+                    len(result),
+                )
+                return result
 
+        _auth_coverage("get_auth_chain_ids", "sql_only", len(event_ids))
         return await self.db_pool.runInteraction(
             "get_auth_chain_ids",
             self._get_auth_chain_ids_txn,
@@ -846,8 +888,13 @@ class EventFederationWorkerStore(
                 )
                 if is_embedded_writer:
                     assert embedded_hamt_namespace is not None
+                    _auth_coverage(
+                        "get_auth_chain_difference",
+                        "embedded_attempt",
+                        sum(len(state_set) for state_set in state_sets),
+                    )
                     try:
-                        return await self.db_pool.runInteraction(
+                        result = await self.db_pool.runInteraction(
                             "get_auth_chain_difference_embedded",
                             self._get_auth_chain_difference_using_embedded_closures_txn,
                             embedded_hamt_namespace,
@@ -856,6 +903,13 @@ class EventFederationWorkerStore(
                             conflicted_set,
                             additional_backwards_reachable_conflicted_events,
                         )
+                        _auth_coverage(
+                            "get_auth_chain_difference",
+                            "embedded_complete",
+                            sum(len(state_set) for state_set in state_sets),
+                            len(result.auth_difference),
+                        )
+                        return result
                     except IncompleteAuthGraph:
                         # The embedded ramp is missing genuine data (e.g.
                         # cold-import hasn't caught up yet).  The SQL
@@ -877,6 +931,12 @@ class EventFederationWorkerStore(
                             self._get_auth_chain_difference_txn,
                             state_sets,
                         )
+                        _auth_coverage(
+                            "get_auth_chain_difference",
+                            "embedded_incomplete_sql_fallback",
+                            sum(len(state_set) for state_set in state_sets),
+                            len(auth_diff),
+                        )
                         return StateDifference(
                             auth_difference=auth_diff, conflicted_subgraph=None
                         )
@@ -890,7 +950,7 @@ class EventFederationWorkerStore(
                 # index when complete. Non-writers hold a read-only mtxdb handle and
                 # cannot safely repair missing links; if the cover index is incomplete
                 # or missing, fall back to the authoritative legacy SQL traversal.
-                return await self.db_pool.runInteraction(
+                result = await self.db_pool.runInteraction(
                     "get_auth_chain_difference_chains",
                     self._get_auth_chain_difference_using_cover_index_txn,
                     room_id,
@@ -898,6 +958,15 @@ class EventFederationWorkerStore(
                     conflicted_set,
                     additional_backwards_reachable_conflicted_events,
                 )
+                _auth_coverage(
+                    "get_auth_chain_difference",
+                    "embedded_complete"
+                    if embedded_hamt_namespace is not None
+                    else "sql_only",
+                    sum(len(state_set) for state_set in state_sets),
+                    len(result.auth_difference),
+                )
+                return result
             except (IncompleteAuthGraph, _NoChainCoverIndex):
                 # For whatever reason we don't actually have a chain cover index
                 # for the events in question, so we fall back to the old method
@@ -920,6 +989,11 @@ class EventFederationWorkerStore(
         if conflicted_set is not None:
             raise _NoChainCoverIndex(room_id)
 
+        _auth_coverage(
+            "get_auth_chain_difference",
+            "sql_only",
+            sum(len(state_set) for state_set in state_sets),
+        )
         auth_diff = await self.db_pool.runInteraction(
             "get_auth_chain_difference",
             self._get_auth_chain_difference_txn,

@@ -129,7 +129,10 @@ def put_event_to_state_group_batch(
 
 
 def get_state_group_for_events_batch(
-    engine_name: str | None, namespace: str, event_ids: list[str]
+    engine_name: str | None,
+    namespace: str,
+    event_ids: list[str],
+    purpose: str = "read_batch",
 ) -> dict[str, int]:
     """Returns `event_id -> state_group` for every id found in the embedded
     engine; a missing id is simply absent from the result.
@@ -137,6 +140,7 @@ def get_state_group_for_events_batch(
     batch_started = time.monotonic()
     with mirror_timing("get_event_to_state_group"):
         ffi_count("event_to_state_group_event_ids_requested", len(event_ids))
+        ffi_count(f"event_to_state_group_{purpose}_items_requested", len(event_ids))
         ffi_batch_size("event_to_state_group", len(event_ids))
         engine = get_embedded_engine(engine_name)
         batch_get = engine.batch_get
@@ -158,6 +162,10 @@ def get_state_group_for_events_batch(
             out[key_to_event_id[bytes(key)]] = state_group
         ffi_count("event_to_state_group_records_returned", len(out))
         ffi_count("event_to_state_group_misses", len(event_ids) - len(out))
+        ffi_count(f"event_to_state_group_{purpose}_items_returned", len(out))
+        ffi_count(
+            f"event_to_state_group_{purpose}_items_missed", len(event_ids) - len(out)
+        )
     # This is the end-to-end time for the operation represented by the
     # event_to_state_group_* counters and batch-size samples. The lower-level
     # ffi_batch_get timing remains available separately.

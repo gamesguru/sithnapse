@@ -489,6 +489,7 @@ class EventsBackgroundUpdatesStore(
             self._embedded_hamt_engine,
             self._embedded_hamt_namespace,
             [event_id for event_id, _state_group in rows],
+            purpose="migration_probe",
         )
         new_rows = [
             (event_id, state_group)

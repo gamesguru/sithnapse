@@ -222,8 +222,21 @@ def _print_ffi_timings() -> None:
         _ffi_timings_print("========================")
         _ffi_timings_print("")
     if counters:
+        auth_counters = {
+            tag: value
+            for tag, value in counters.items()
+            if tag.startswith("auth_chain_")
+        }
+        if auth_counters:
+            _ffi_timings_print("=== Auth chain coverage ===")
+            for tag in sorted(auth_counters):
+                _ffi_timings_print(f"  {tag:70s}  {auth_counters[tag]:>12,d}")
+            _ffi_timings_print("===========================")
+            _ffi_timings_print("")
         _ffi_timings_print("=== FFI batch counters ===")
         for tag in sorted(counters):
+            if tag.startswith("auth_chain_"):
+                continue
             _ffi_timings_print(f"  {tag:50s}  {counters[tag]:>12,d}")
         _ffi_timings_print("===========================")
         _ffi_timings_print("")

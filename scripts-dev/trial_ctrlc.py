@@ -213,29 +213,53 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
 
         if sql_ops:
             ranked = sorted(sql_ops.items(), key=lambda kv: kv[1], reverse=True)
-            table_width = max(
-                40, *(len(table) for table, _ in ranked[:30]), len("TOTAL")
-            )
-            out("\n=== Per-table SQL timing (top 30) ===")
-            out(
-                f"  {'table':{table_width}s}  {'total':>8s}  {'calls':>6s}  {'rows':>6s}  {'avg':>10s}"
-            )
+            rendered = []
             for table, total_s in ranked[:30]:
                 count = sql_counts.get(table, 0)
                 rows = sql_rows.get(table, 0)
-                total_ms = total_s * 1000
-                avg_ms = (total_s / count) * 1000 if count else 0.0
-                out(
-                    f"  {table:{table_width}s}  {total_ms:8.1f}ms  {count:6d}  {rows:6d}  {avg_ms:10.3f}ms"
+                rendered.append(
+                    (
+                        table,
+                        f"{total_s * 1000:.1f}ms",
+                        f"{count:d}",
+                        f"{rows:d}",
+                        f"{(total_s / count) * 1000 if count else 0.0:.3f}ms",
+                    )
                 )
             total_time_s = sum(sql_ops.values())
             total_count = sum(sql_counts.values())
             total_rows = sum(sql_rows.values())
-            total_ms = total_time_s * 1000
-            avg_ms = (total_time_s / total_count) * 1000 if total_count else 0.0
+            total_row = (
+                "TOTAL",
+                f"{total_time_s * 1000:.1f}ms",
+                f"{total_count:d}",
+                f"{total_rows:d}",
+                f"{(total_time_s / total_count) * 1000 if total_count else 0.0:.3f}ms",
+            )
+            table_width = max(40, *(len(row[0]) for row in rendered), len("TOTAL"))
+            total_width = max(
+                len("total"), *(len(row[1]) for row in rendered), len(total_row[1])
+            )
+            calls_width = max(
+                len("calls"), *(len(row[2]) for row in rendered), len(total_row[2])
+            )
+            rows_width = max(
+                len("rows"), *(len(row[3]) for row in rendered), len(total_row[3])
+            )
+            avg_width = max(
+                len("avg"), *(len(row[4]) for row in rendered), len(total_row[4])
+            )
+            out("\n=== Per-table SQL timing (top 30) ===")
+            out(
+                f"  {'table':{table_width}s}  {'total':>{total_width}s}  {'calls':>{calls_width}s}  {'rows':>{rows_width}s}  {'avg':>{avg_width}s}"
+            )
+            for table, total_text, count_text, rows_text, avg_text in rendered:
+                out(
+                    f"  {table:{table_width}s}  {total_text:>{total_width}s}  {count_text:>{calls_width}s}  {rows_text:>{rows_width}s}  {avg_text:>{avg_width}s}"
+                )
             out("")
             out(
-                f"  {'TOTAL':{table_width}s}  {total_ms:8.1f}ms  {total_count:6d}  {total_rows:6d}  {avg_ms:10.3f}ms"
+                f"  {total_row[0]:{table_width}s}  {total_row[1]:>{total_width}s}  {total_row[2]:>{calls_width}s}  {total_row[3]:>{rows_width}s}  {total_row[4]:>{avg_width}s}"
             )
             out("=====================================")
             out("")
@@ -475,8 +499,21 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                 out("========================")
                 out("")
             if ffi_counters:
+                auth_counters = {
+                    tag: value
+                    for tag, value in ffi_counters.items()
+                    if tag.startswith("auth_chain_")
+                }
+                if auth_counters:
+                    out("=== Auth chain coverage ===")
+                    for tag in sorted(auth_counters):
+                        out(f"  {tag:70s}  {auth_counters[tag]:>12,d}")
+                    out("===========================")
+                    out("")
                 out("=== FFI batch counters ===")
                 for tag in sorted(ffi_counters):
+                    if tag.startswith("auth_chain_"):
+                        continue
                     out(f"  {tag:50s}  {ffi_counters[tag]:>12,d}")
                 out("===========================")
                 out("")

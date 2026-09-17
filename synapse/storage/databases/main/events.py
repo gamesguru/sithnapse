@@ -3836,6 +3836,7 @@ class PersistEventsStore:
                 self._embedded_hamt_engine,
                 self._embedded_hamt_namespace,
                 list(state_groups.keys()),
+                purpose="persist_existence_check",
             )
             new_event_ids = [
                 event_id for event_id in state_groups if event_id not in existing

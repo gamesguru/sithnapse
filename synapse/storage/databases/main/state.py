@@ -605,7 +605,10 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
     async def _get_state_group_for_event(self, event_id: str) -> int | None:
         if getattr(self, "_embedded_event_json_enabled", False):
             found = get_state_group_for_events_batch(
-                self._embedded_hamt_engine, self._embedded_hamt_namespace, [event_id]
+                self._embedded_hamt_engine,
+                self._embedded_hamt_namespace,
+                [event_id],
+                purpose="read_point",
             )
             if event_id in found:
                 return found[event_id]
@@ -654,6 +657,7 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
                 self._embedded_hamt_engine,
                 self._embedded_hamt_namespace,
                 requested_event_ids,
+                purpose="read_batch",
             )
             missing_event_ids = [
                 event_id for event_id in requested_event_ids if event_id not in res
@@ -806,6 +810,7 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
                 self._embedded_hamt_engine,
                 self._embedded_hamt_namespace,
                 [event.event_id],
+                purpose="partial_state_rewrite",
             )
             put_event_to_state_group_batch(
                 self._embedded_hamt_engine,
