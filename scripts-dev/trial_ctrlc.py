@@ -558,6 +558,17 @@ def run() -> None:
         os.environ["SYNAPSE_TIMINGS_RUN_DIR"] = timings_dir
 
     trialRunner = _makeRunner(config)
+    # Trial's default `_trial_temp` path is relative.  Distributed workers
+    # chdir into their own subdirectories, so an accidentally removed or
+    # inaccessible parent CWD can otherwise turn later `abspath()` calls into
+    # cascading FileNotFoundErrors.  Resolve the runner-owned path once before
+    # any worker is spawned.
+    if config["jobs"] is not None:
+        trialRunner._workingDirectory = os.path.abspath(  # type: ignore[attr-defined]
+            trialRunner._workingDirectory  # type: ignore[attr-defined]
+        )
+    else:
+        trialRunner.workingDirectory = os.path.abspath(trialRunner.workingDirectory)
     suite = _getSuite(config)
 
     interrupted = False

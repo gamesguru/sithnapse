@@ -12,6 +12,7 @@
 # <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
 
+import atexit
 import shutil
 import tempfile
 
@@ -36,6 +37,20 @@ from synapse.util.clock import Clock
 
 from tests import unittest
 from tests.unittest import HomeserverTestCase
+from tests.utils import EMBEDDED_HAMT_ENGINE, EMBEDDED_HAMT_PATH
+
+if EMBEDDED_HAMT_ENGINE and EMBEDDED_HAMT_PATH:
+    # The test harness has already selected a worker-specific store. Reuse
+    # that path instead of opening a private store before the homeserver is
+    # created, which would win the Rust process-global OnceCell.
+    _TEST_ENGINE_TMPDIR = EMBEDDED_HAMT_PATH
+else:
+    _TEST_ENGINE_TMPDIR = tempfile.mkdtemp(prefix="test-embedded-event-edges-")
+    # mtxdb's Python binding owns process-global pools. Keep this directory
+    # alive until process exit; deleting it during a test class teardown leaves
+    # the OnceCell-backed engine pointing at an unlinked store.
+    atexit.register(shutil.rmtree, _TEST_ENGINE_TMPDIR, ignore_errors=True)
+mtxdb_engine.open_client(_TEST_ENGINE_TMPDIR)
 
 
 class EmbeddedEventEdgesTestCase(unittest.TestCase):
@@ -44,21 +59,9 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
     mtxdb_engine.open_client() is backed by a Rust OnceCell: the engine is
     opened exactly once per process and subsequent calls are no-ops.  The
     engine's data directory must therefore survive for the life of the
-    process; setUp/tearDown must NOT delete it.  Use setUpClass/tearDownClass
-    so the directory is created once and cleaned up after all tests in the
-    class finish.
+    process; test setup and teardown must not delete it.  The module-level
+    fixture opens one store and removes it only at process exit.
     """
-
-    _engine_tmpdir: str  # set by setUpClass
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls._engine_tmpdir = tempfile.mkdtemp(prefix="test-embedded-event-edges-")
-        mtxdb_engine.open_client(cls._engine_tmpdir)
-
-    @classmethod
-    def tearDownClass(cls) -> None:
-        shutil.rmtree(cls._engine_tmpdir, ignore_errors=True)
 
     def setUp(self) -> None:
         self.namespace = "test-edges-ns"
@@ -117,10 +120,6 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         self.room_id = self.helper.create_room_as(
             room_creator=self.user_id, tok=self.tok
         )
-
-        tmpdir = tempfile.mkdtemp(prefix="test-embedded-event-edges-")
-        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
-        mtxdb_engine.open_client(tmpdir)
 
         self.store._embedded_event_edges_enabled = True
         self.store._embedded_event_edges_writable = True
