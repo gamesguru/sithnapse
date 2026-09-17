@@ -92,6 +92,14 @@ if USE_POSTGRES_FOR_TESTS and USE_FAST_PG:
         file=sys.stderr,
     )
 POSTGRES_BASE_DB = "_synapse_unit_tests_base_%s" % (os.getpid(),)
+POSTGRES_CREATE_DB_STRATEGY = ""
+POSTGRES_CLONE_STRATEGY_NAME = "DEFAULT"
+
+
+def get_postgres_clone_strategy() -> tuple[str, str]:
+    """Return (create_db_clause, strategy_name), e.g. (' STRATEGY = FILE_COPY', 'FILE_COPY')."""
+    return POSTGRES_CREATE_DB_STRATEGY, POSTGRES_CLONE_STRATEGY_NAME
+
 
 # When debugging a specific test, it's occasionally useful to write the
 # DB to disk and query it with the sqlite CLI.
@@ -203,6 +211,65 @@ def setupdb() -> None:
             "CREATE DATABASE %s ENCODING 'UTF8' LC_COLLATE='C' LC_CTYPE='C' "
             "template=template0;" % (POSTGRES_BASE_DB,)
         )
+
+        global POSTGRES_CREATE_DB_STRATEGY, POSTGRES_CLONE_STRATEGY_NAME
+        raw_strategy = os.environ.get("SYNAPSE_POSTGRES_CLONE_STRATEGY", "auto").strip()
+        override = raw_strategy.upper()
+        if override in ("FILE_COPY", "WAL_LOG"):
+            POSTGRES_CREATE_DB_STRATEGY = f" STRATEGY = {override}"
+            POSTGRES_CLONE_STRATEGY_NAME = override
+        elif override in ("DEFAULT", "NONE", "OFF"):
+            POSTGRES_CREATE_DB_STRATEGY = ""
+            POSTGRES_CLONE_STRATEGY_NAME = "DEFAULT"
+        elif override in ("AUTO", ""):
+            # Auto-detect: PostgreSQL 15+ introduces STRATEGY = FILE_COPY
+            cur.execute("SHOW server_version_num;")
+            row = cur.fetchone()
+            server_version = int(row[0]) if row else 0
+            if server_version >= 150000:
+                import psycopg2
+
+                probe_db = f"_synapse_probe_strat_{os.getpid()}"
+                probe_created = False
+                try:
+                    cur.execute(
+                        f"CREATE DATABASE {probe_db} WITH TEMPLATE template0 STRATEGY = FILE_COPY;"
+                    )
+                    probe_created = True
+                    POSTGRES_CREATE_DB_STRATEGY = " STRATEGY = FILE_COPY"
+                    POSTGRES_CLONE_STRATEGY_NAME = "FILE_COPY"
+                except psycopg2.Error as e:
+                    try:
+                        db_conn.rollback()
+                    except psycopg2.Error:
+                        pass
+                    # Only treat syntax errors as capability fallback (PostgreSQL < 15 syntax);
+                    # propagate any operational failures (permissions, disk space, catalog errors).
+                    if e.pgcode == "42601":  # syntax_error
+                        POSTGRES_CREATE_DB_STRATEGY = ""
+                        POSTGRES_CLONE_STRATEGY_NAME = "DEFAULT"
+                    else:
+                        raise
+                finally:
+                    if probe_created:
+                        try:
+                            cur.execute(f"DROP DATABASE IF EXISTS {probe_db};")
+                        except psycopg2.Error as cleanup_err:
+                            logger.warning(
+                                "Failed to drop probe database %s: %s",
+                                probe_db,
+                                cleanup_err,
+                            )
+                            raise
+            else:
+                POSTGRES_CREATE_DB_STRATEGY = ""
+                POSTGRES_CLONE_STRATEGY_NAME = "DEFAULT"
+        else:
+            raise ValueError(
+                f"Invalid SYNAPSE_POSTGRES_CLONE_STRATEGY={raw_strategy!r}. "
+                "Expected one of: AUTO, FILE_COPY, WAL_LOG, DEFAULT."
+            )
+
         cur.close()
         db_conn.close()
 

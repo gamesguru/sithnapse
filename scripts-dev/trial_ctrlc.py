@@ -85,6 +85,7 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
     if lifecycle_files:
         lc_timings: dict[str, float] = defaultdict(float)
         lc_counts: dict[str, int] = defaultdict(int)
+        strategies: set[str] = set()
         for fname in lifecycle_files:
             try:
                 with open(
@@ -95,22 +96,99 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                     lc_timings[k] += v
                 for k, v in data.get("counts", {}).items():
                     lc_counts[k] += v
+                if "strategy" in data and data["strategy"]:
+                    strategies.add(str(data["strategy"]))
             except Exception as e:
                 out(f"Warning: failed to read {fname}: {e}")
 
         if lc_timings:
-            out("\n=== Postgres test-DB lifecycle timings ===")
-            out(f"  {'':40s}  {'total':>9s}  {'calls':>6s}  {'avg':>11s}")
-            for tag in sorted(lc_timings):
-                total_s = lc_timings[tag]
-                count = lc_counts[tag]
+            strat_str = (
+                f" (strategy: {', '.join(sorted(strategies))})" if strategies else ""
+            )
+            out(f"\n=== Postgres test-DB lifecycle timings{strat_str} ===")
+            out(f"  {'':44s}  {'total':>9s}  {'calls':>6s}  {'avg':>11s}")
+            if "hs_setup_wall" in lc_timings:
+                wall_s = lc_timings["hs_setup_wall"]
+                wall_cnt = lc_counts["hs_setup_wall"]
+                out(
+                    f"  {'hs_setup_wall (outer)':44s}  {wall_s * 1000:8.1f}ms  {wall_cnt:6d}  {(wall_s / wall_cnt) * 1000:10.3f}ms"
+                )
+                if "create_database" in lc_timings:
+                    cd_s = lc_timings["create_database"]
+                    cd_cnt = lc_counts["create_database"]
+                    out(
+                        f"    ├── {'create_database':40s}  {cd_s * 1000:8.1f}ms  {cd_cnt:6d}  {(cd_s / cd_cnt) * 1000:10.3f}ms"
+                    )
+                if "hs_setup_total" in lc_timings:
+                    st_s = lc_timings["hs_setup_total"]
+                    st_cnt = lc_counts["hs_setup_total"]
+                    out(
+                        f"    ├── {'hs_setup_total':40s}  {st_s * 1000:8.1f}ms  {st_cnt:6d}  {(st_s / st_cnt) * 1000:10.3f}ms"
+                    )
+                    for inner_tag in (
+                        "make_conn",
+                        "prepare_database",
+                        "check_database",
+                    ):
+                        if inner_tag in lc_timings:
+                            it_s = lc_timings[inner_tag]
+                            it_cnt = lc_counts[inner_tag]
+                            out(
+                                f"    │     ├── {inner_tag:36s}  {it_s * 1000:8.1f}ms  {it_cnt:6d}  {(it_s / it_cnt) * 1000:10.3f}ms"
+                            )
+                    sub_inner = sum(
+                        lc_timings.get(t, 0.0)
+                        for t in ("make_conn", "prepare_database", "check_database")
+                    )
+                    store_res = max(0.0, st_s - sub_inner)
+                    out(
+                        f"    │     └── {'store_init (residual)':36s}  {store_res * 1000:8.1f}ms  {st_cnt:6d}  {(store_res / st_cnt) * 1000:10.3f}ms"
+                    )
+                sub_wall = lc_timings.get("create_database", 0.0) + lc_timings.get(
+                    "hs_setup_total", 0.0
+                )
+                unatt_wall = max(0.0, wall_s - sub_wall)
+                out(
+                    f"    └── {'hs_unattributed':40s}  {unatt_wall * 1000:8.1f}ms  {wall_cnt:6d}  {(unatt_wall / wall_cnt) * 1000:10.3f}ms"
+                )
+                if "hs_shutdown" in lc_timings:
+                    sd_s = lc_timings["hs_shutdown"]
+                    sd_cnt = lc_counts["hs_shutdown"]
+                    out(
+                        f"  {'hs_shutdown (teardown)':44s}  {sd_s * 1000:8.1f}ms  {sd_cnt:6d}  {(sd_s / sd_cnt) * 1000:10.3f}ms"
+                    )
+                known = {
+                    "hs_setup_wall",
+                    "create_database",
+                    "hs_setup_total",
+                    "make_conn",
+                    "prepare_database",
+                    "check_database",
+                    "hs_shutdown",
+                }
+                for tag in sorted(lc_timings):
+                    if tag not in known:
+                        t_s = lc_timings[tag]
+                        cnt = lc_counts[tag]
+                        out(
+                            f"  {tag:44s}  {t_s * 1000:8.1f}ms  {cnt:6d}  {(t_s / cnt) * 1000:10.3f}ms"
+                        )
+                non_overlap = wall_s + lc_timings.get("hs_shutdown", 0.0)
+                out("")
+                out(
+                    f"  {'TOTAL NON-OVERLAPPING LIFECYCLE':44s}  {non_overlap * 1000:8.1f}ms"
+                )
+            else:
+                for tag in sorted(lc_timings):
+                    total_s = lc_timings[tag]
+                    count = lc_counts[tag]
+                    total_ms = total_s * 1000
+                    avg_ms = (total_s / count) * 1000 if count else 0.0
+                    out(f"  {tag:44s}  {total_ms:8.1f}ms  {count:6d}  {avg_ms:10.3f}ms")
+                total_s = sum(lc_timings.values())
                 total_ms = total_s * 1000
-                avg_ms = (total_s / count) * 1000 if count else 0.0
-                out(f"  {tag:40s}  {total_ms:8.1f}ms  {count:6d}  {avg_ms:10.3f}ms")
-            total_s = sum(lc_timings.values())
-            total_ms = total_s * 1000
-            out("")
-            out(f"  {'TOTAL':40s}  {total_ms:8.1f}ms")
+                out("")
+                out(f"  {'TOTAL':44s}  {total_ms:8.1f}ms")
             out("==========================================")
             out("")
 

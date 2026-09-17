@@ -118,6 +118,7 @@ from tests.utils import (
     SQLITE_PERSIST_DB,
     USE_POSTGRES_FOR_TESTS,
     default_config,
+    get_postgres_clone_strategy,
 )
 
 logger = logging.getLogger(__name__)
@@ -174,36 +175,114 @@ def _print_pg_timings() -> None:
         timings = dict(_PG_TIMINGS)
         counts = dict(_PG_TIMING_COUNTS)
 
+    _, strategy_name = get_postgres_clone_strategy()
     run_dir = os.environ.get("SYNAPSE_TIMINGS_RUN_DIR")
     if run_dir:
         tmp_path = os.path.join(run_dir, f"lifecycle_{os.getpid()}.tmp")
         final_path = os.path.join(run_dir, f"lifecycle_{os.getpid()}.json")
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump({"timings": timings, "counts": counts}, f)
+                json.dump(
+                    {
+                        "timings": timings,
+                        "counts": counts,
+                        "strategy": strategy_name,
+                    },
+                    f,
+                )
             os.replace(tmp_path, final_path)
         except OSError:
             pass
         return
 
-    _timings_print("\n=== Postgres test-DB lifecycle timings ===")
     _timings_print(
-        f"  {'':40s}  {'total':>9s}  {'calls':>6s}  {'avg':>11s}",
+        f"\n=== Postgres test-DB lifecycle timings (strategy: {strategy_name}) ==="
     )
-    for tag in sorted(timings):
-        total_s = timings[tag]
-        count = counts[tag]
-        total_ms = total_s * 1000
-        avg_ms = (total_s / count) * 1000 if count else 0.0
+    _timings_print(
+        f"  {'':44s}  {'total':>9s}  {'calls':>6s}  {'avg':>11s}",
+    )
+    if "hs_setup_wall" in timings:
+        wall_s = timings["hs_setup_wall"]
+        wall_cnt = counts["hs_setup_wall"]
         _timings_print(
-            f"  {tag:40s}  {total_ms:8.1f}ms  {count:6d}  {avg_ms:10.3f}ms",
+            f"  {'hs_setup_wall (outer)':44s}  {wall_s * 1000:8.1f}ms  {wall_cnt:6d}  {(wall_s / wall_cnt) * 1000:10.3f}ms"
         )
-    total_s = sum(timings.values())
-    total_ms = total_s * 1000
-    _timings_print("")
-    _timings_print(
-        f"  {'TOTAL':40s}  {total_ms:8.1f}ms",
-    )
+        if "create_database" in timings:
+            cd_s = timings["create_database"]
+            cd_cnt = counts["create_database"]
+            _timings_print(
+                f"    ├── {'create_database':40s}  {cd_s * 1000:8.1f}ms  {cd_cnt:6d}  {(cd_s / cd_cnt) * 1000:10.3f}ms"
+            )
+        if "hs_setup_total" in timings:
+            st_s = timings["hs_setup_total"]
+            st_cnt = counts["hs_setup_total"]
+            _timings_print(
+                f"    ├── {'hs_setup_total':40s}  {st_s * 1000:8.1f}ms  {st_cnt:6d}  {(st_s / st_cnt) * 1000:10.3f}ms"
+            )
+            for inner_tag in ("make_conn", "prepare_database", "check_database"):
+                if inner_tag in timings:
+                    it_s = timings[inner_tag]
+                    it_cnt = counts[inner_tag]
+                    _timings_print(
+                        f"    │     ├── {inner_tag:36s}  {it_s * 1000:8.1f}ms  {it_cnt:6d}  {(it_s / it_cnt) * 1000:10.3f}ms"
+                    )
+            sub_inner = sum(
+                timings.get(t, 0.0)
+                for t in ("make_conn", "prepare_database", "check_database")
+            )
+            store_res = max(0.0, st_s - sub_inner)
+            _timings_print(
+                f"    │     └── {'store_init (residual)':36s}  {store_res * 1000:8.1f}ms  {st_cnt:6d}  {(store_res / st_cnt) * 1000:10.3f}ms"
+            )
+        sub_wall = timings.get("create_database", 0.0) + timings.get(
+            "hs_setup_total", 0.0
+        )
+        unatt_wall = max(0.0, wall_s - sub_wall)
+        _timings_print(
+            f"    └── {'hs_unattributed':40s}  {unatt_wall * 1000:8.1f}ms  {wall_cnt:6d}  {(unatt_wall / wall_cnt) * 1000:10.3f}ms"
+        )
+        if "hs_shutdown" in timings:
+            sd_s = timings["hs_shutdown"]
+            sd_cnt = counts["hs_shutdown"]
+            _timings_print(
+                f"  {'hs_shutdown (teardown)':44s}  {sd_s * 1000:8.1f}ms  {sd_cnt:6d}  {(sd_s / sd_cnt) * 1000:10.3f}ms"
+            )
+        known = {
+            "hs_setup_wall",
+            "create_database",
+            "hs_setup_total",
+            "make_conn",
+            "prepare_database",
+            "check_database",
+            "hs_shutdown",
+        }
+        for tag in sorted(timings):
+            if tag not in known:
+                t_s = timings[tag]
+                cnt = counts[tag]
+                _timings_print(
+                    f"  {tag:44s}  {t_s * 1000:8.1f}ms  {cnt:6d}  {(t_s / cnt) * 1000:10.3f}ms"
+                )
+        non_overlap = wall_s + timings.get("hs_shutdown", 0.0)
+        _timings_print("")
+        _timings_print(
+            f"  {'TOTAL NON-OVERLAPPING LIFECYCLE':44s}  {non_overlap * 1000:8.1f}ms"
+        )
+    else:
+        for tag in sorted(timings):
+            total_s = timings[tag]
+            count = counts[tag]
+            total_ms = total_s * 1000
+            avg_ms = (total_s / count) * 1000 if count else 0.0
+            _timings_print(
+                f"  {tag:44s}  {total_ms:8.1f}ms  {count:6d}  {avg_ms:10.3f}ms",
+            )
+        total_s = sum(timings.values())
+        total_ms = total_s * 1000
+        _timings_print("")
+        _timings_print(
+            f"  {'TOTAL':44s}  {total_ms:8.1f}ms",
+        )
     _timings_print("==========================================")
     _timings_print("")
 
@@ -1411,8 +1490,10 @@ def setup_test_homeserver(
         # `test_db` contains a freshly generated UUID, so it cannot collide with a
         # previous test database. Avoid an unnecessary round trip before cloning
         # the base database.
+        create_db_strategy, _ = get_postgres_clone_strategy()
         cur.execute(
-            "CREATE DATABASE %s WITH TEMPLATE %s;" % (test_db, POSTGRES_BASE_DB)
+            "CREATE DATABASE %s WITH TEMPLATE %s%s;"
+            % (test_db, POSTGRES_BASE_DB, create_db_strategy)
         )
         cur.close()
         db_conn.close()
