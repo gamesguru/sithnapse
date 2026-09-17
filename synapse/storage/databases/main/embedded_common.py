@@ -652,8 +652,15 @@ class _FlushCoalescer:
         self._RETRY_DELAY = Duration(seconds=1.0)
 
     def mark_dirty(self, pool: Pool) -> None:
-        """Mark a pool as dirty.  Called via txn.call_after after SQL commit."""
-        if self._closed or _sync_disabled:
+        """Mark a pool as dirty.  Called via txn.call_after after SQL commit.
+
+        The debounce timer is scheduled even when fsync is disabled
+        (`no_sync`): `_flush` also drains the coalesced edge-write queues, and
+        those queued rows must land in mtxdb (and be visible to reads) whether
+        or not the sync is skipped.  `_do_sync_pools` itself still no-ops under
+        `_sync_disabled`.
+        """
+        if self._closed:
             return
         was_clean = not self._dirty
         self._dirty.add(pool)

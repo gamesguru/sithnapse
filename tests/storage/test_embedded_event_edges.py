@@ -23,12 +23,12 @@ from twisted.test.proto_helpers import MemoryReactor
 from synapse.rest import admin
 from synapse.rest.client import login, room
 from synapse.server import HomeServer
+from synapse.storage.databases.main import embedded_common
 from synapse.storage.databases.main.embedded_common import (
     FLUSH_DELAY_SECS,
     _clear_coalescer,
     _FlushCoalescer,
     _set_coalescer,
-    configure_sync,
     enable_ffi_counting,
     get_ffi_count,
 )
@@ -245,6 +245,34 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
         back_live = get_event_edges_backward_batch(ns, ["$live"])
         self.assertEqual(back_live["$live"], [("$other", False)])
 
+    def test_enqueue_after_purge_cancel_is_tombstoned(self) -> None:
+        """The racy ordering the cancel step alone cannot cover: a transaction
+        that committed just before the purge runs its post-commit enqueue AFTER
+        the purge cancelled the queue.  The tombstone set must drop that row so
+        a later flush cannot resurrect the purged event's edges."""
+        ns = "test-edges-purge-late-enqueue"
+        try:
+            # Purge runs first: the event is gone from SQL and its mtxdb edge
+            # is tombstoned.
+            delete_event_edges_batch(ns, ["$late"])
+
+            # Now the racing enqueue lands, after cancellation.
+            queue_edge_write(ns, [(self.room_id, "$late", "$lateparent", False)])
+            self.assertEqual(
+                queued_edge_write_count(ns),
+                0,
+                "a tombstoned event must not be re-queued",
+            )
+
+            # Even an explicit drain must not resurrect it.
+            flush_edge_writes(ns)
+            back = get_event_edges_backward_batch(ns, ["$late"])
+            self.assertIsNone(back["$late"])
+            fwd = get_event_edges_forward_batch(ns, ["$lateparent"])
+            self.assertNotIn("$late", fwd.get("$lateparent") or [])
+        finally:
+            flush_edge_writes()
+
     def test_shutdown_drain_failure_retains_rows(self) -> None:
         """The shutdown drain retries on FFI failure, never drops rows, and
         close() still completes."""
@@ -293,13 +321,6 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
 
     def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
         self.store = hs.get_datastores().main
-        # The test harness sets embedded_hamt.no_sync (SYNAPSE_MTXDB_NO_SYNC) to
-        # skip mtxdb fsyncs, which also short-circuits the commit-aware flush
-        # coalescer's dirty-marking timer.  The timer tests below exercise that
-        # path, so re-enable coalescing for the class and restore the harness
-        # default in tearDown.
-        self._coalescer_sync_disabled = hs.config.database.embedded_hamt_no_sync
-        configure_sync(no_sync=False)
         self.user_id = self.register_user("alice", "test")
         self.tok = self.login("alice", "test")
         self.room_id = self.helper.create_room_as(
@@ -319,11 +340,6 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
             self.persist_store._embedded_hamt_engine = "mtxdb"
             if not getattr(self.persist_store, "_embedded_hamt_namespace", None):
                 self.persist_store._embedded_hamt_namespace = hs.hostname
-
-    def tearDown(self) -> None:
-        # Restore the harness no-sync default before the next test class runs.
-        configure_sync(no_sync=getattr(self, "_coalescer_sync_disabled", True))
-        super().tearDown()
 
     def test_event_edges_mirrored_on_persistence(self) -> None:
         """When events are persisted, event_edges are dual-written to mtxdb."""
@@ -352,39 +368,48 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
     def test_below_threshold_queue_flushes_on_timer(self) -> None:
         """A sub-threshold edge write is drained by the flush coalescer's
         bounded debounce timer -- no explicit flush, threshold, or shutdown
-        required (the low-volume case the no-timer implementation got wrong)."""
+        required -- and does so even when fsync is disabled (`no_sync`), since
+        the queue must land in mtxdb regardless of the sync setting."""
         ns = self.store._embedded_hamt_namespace
-        # Drain anything earlier tests left queued so this test controls queue
-        # content: the single edge below is then far below the threshold.
-        flush_edge_writes(ns)
-        res = self.helper.send(self.room_id, "ring", tok=self.tok)
-        e_id = res["event_id"]
+        # Force the no-sync path so the test proves the edge drain is not
+        # coupled to whether the sync coalescer actually fsyncs.
+        previous_no_sync = embedded_common._sync_disabled
+        embedded_common.configure_sync(no_sync=True)
+        try:
+            # Drain anything earlier tests left queued so this test controls
+            # queue content: the single edge below is then far below threshold.
+            flush_edge_writes(ns)
+            res = self.helper.send(self.room_id, "ring", tok=self.tok)
+            e_id = res["event_id"]
 
-        with enable_ffi_counting():
-            # Still queued (below threshold); the mirror has not been written.
-            self.assertEqual(get_ffi_count("event_edges_put_rows"), 0)
-            self.assertGreaterEqual(
-                queued_edge_write_count(ns),
-                1,
-                "the persisted edge should be waiting in the coalescing queue",
+            with enable_ffi_counting():
+                # Still queued (below threshold); mirror not written yet.
+                self.assertEqual(get_ffi_count("event_edges_put_rows"), 0)
+                self.assertGreaterEqual(
+                    queued_edge_write_count(ns),
+                    1,
+                    "the persisted edge should be waiting in the coalescing queue",
+                )
+
+                # Advance the reactor past the flush window: the coalescer
+                # drains the queue and syncs EVENT_DAG of its own accord.
+                self.reactor.advance(FLUSH_DELAY_SECS + 0.1)
+                self.assertEqual(
+                    queued_edge_write_count(ns),
+                    0,
+                    "the coalescer timer should have drained the queue",
+                )
+                self.assertGreater(get_ffi_count("event_edges_put_rows"), 0)
+
+            backward = get_event_edges_backward_batch(ns, [e_id])
+            self.assertIsNotNone(
+                backward[e_id],
+                "mirror should reflect the edge after the timer flush",
             )
-
-            # Advance the reactor past the flush window: the coalescer drains
-            # the queue and syncs EVENT_DAG of its own accord.
-            self.reactor.advance(FLUSH_DELAY_SECS + 0.1)
-            self.assertEqual(
-                queued_edge_write_count(ns),
-                0,
-                "the coalescer timer should have drained the queue",
-            )
-            self.assertGreater(get_ffi_count("event_edges_put_rows"), 0)
-
-        backward = get_event_edges_backward_batch(ns, [e_id])
-        self.assertIsNotNone(
-            backward[e_id], "mirror should reflect the edge after the timer flush"
-        )
-        prev_ids = [p for p, _ in backward[e_id] or []]
-        self.assertTrue(prev_ids)
+            prev_ids = [p for p, _ in backward[e_id] or []]
+            self.assertTrue(prev_ids)
+        finally:
+            embedded_common.configure_sync(no_sync=previous_no_sync)
 
     def test_event_edges_purge_cleans_forward_edges(self) -> None:
         """Purging an event removes it from its parents' forward lists in mtxdb."""
@@ -512,13 +537,17 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         res2 = self.helper.send(self.room_id, "child", tok=self.tok)
         c_id = res2["event_id"]
 
-        # Simulate post-commit write failure or missing edge in mtxdb by deleting the edge from mtxdb
-        delete_event_edges_batch(self.store._embedded_hamt_namespace, [c_id])
+        ns = self.store._embedded_hamt_namespace
+        # Persist the coalesced edges, then simulate a post-commit mirror write
+        # that never landed by deleting the edge directly at the FFI layer.
+        # Deliberately NOT `delete_event_edges_batch`: that records a purge
+        # tombstone, which would (correctly) refuse the repair below and
+        # misrepresent a lost write as a purge.
+        flush_edge_writes(ns)
+        mtxdb_engine.event_edges_delete(ns, [c_id])
 
         # Verify mtxdb has no forward edge for p_id
-        fwd_miss = get_event_edges_forward_batch(
-            self.store._embedded_hamt_namespace, [p_id]
-        )
+        fwd_miss = get_event_edges_forward_batch(ns, [p_id])
         self.assertIsNone(fwd_miss.get(p_id))
 
         # Querying successor events falls back to SQL, successfully finding c_id,
@@ -534,9 +563,7 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         self.reactor.advance(FLUSH_DELAY_SECS + 0.1)
 
         # Now mtxdb has been repaired in-process.
-        fwd_repaired = get_event_edges_forward_batch(
-            self.store._embedded_hamt_namespace, [p_id]
-        )
+        fwd_repaired = get_event_edges_forward_batch(ns, [p_id])
         self.assertIn(c_id, fwd_repaired.get(p_id) or [])
 
         # Exercise the read-only code path after the coalesced flush.

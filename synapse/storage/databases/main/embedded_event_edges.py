@@ -79,17 +79,37 @@ logger = logging.getLogger(__name__)
 #   * Drained rows are restored to the front of their queue if the FFI write
 #     fails -- committed rows are never silently dropped.
 #   * Destructive deletes cancel queued rows for the events being purged
-#     before draining+writing tombstones, so a late flush cannot resurrect a
-#     purged event's edges.
+#     before draining+writing tombstones, and record those ids as tombstones
+#     that `queue_edge_write` checks, so a late enqueue racing the purge
+#     cannot resurrect a purged event's edges.
 _EDGE_WRITE_THRESHOLD: int = 64
 # `(room_id, event_id, prev_event_id, is_state)`.
 EdgeRow = tuple[str, str, str, bool]
+# Queues are keyed by namespace rather than owned by a coalescer instance.
+# Namespaces partition the embedded data (and are unique per homeserver /
+# config, see `DatabaseConfig.embedded_hamt_namespace`), and the mtxdb engine
+# itself is a process-global OnceCell, so (engine, namespace) is already the
+# ownership boundary: two homeservers sharing a process cannot collide here
+# without also colliding in mtxdb.  A per-coalescer queue would not change
+# that, and would make the free-function write path need a coalescer handle.
 _edge_write_queues: dict[str, list[EdgeRow]] = {}
 _edge_write_queues_lock = threading.Lock()
 # One flush lock per namespace, serializing drains (and purge barriers) so at
-# most one in-flight FFI write exists per namespace at a time.
+# most one in-flight FFI write exists per namespace at a time.  Enqueue also
+# takes this lock so a row cannot be appended between a purge's cancel step
+# and its tombstone write -- see `delete_event_edges_batch`.
 _edge_write_flush_locks: dict[str, threading.Lock] = {}
 _edge_write_flush_locks_guard = threading.Lock()
+# Events purged by `delete_event_edges_batch`, per namespace, with the
+# monotonic deadline after which the tombstones may be dropped.  A purge is
+# registered here so that a transaction whose post-commit `queue_edge_write`
+# races the purge (its `txn.call_after` runs after the purge's cancel step)
+# cannot resurrect the purged event's edges.  The deadline only has to cover
+# the gap between a transaction committing and its `call_after` callback
+# running, which is tiny; the generous TTL bounds memory for repeatedly
+# purging namespaces.  Protected by `_edge_write_queues_lock`.
+_EDGE_WRITE_TOMBSTONE_TTL: float = 600.0
+_edge_write_tombstones: dict[str, dict[str, float]] = {}
 
 
 def _namespace_flush_lock(namespace: str) -> threading.Lock:
@@ -100,6 +120,19 @@ def _namespace_flush_lock(namespace: str) -> threading.Lock:
             lock = threading.Lock()
             _edge_write_flush_locks[namespace] = lock
         return lock
+
+
+def _prune_tombstones_locked(namespace: str, now: float) -> dict[str, float] | None:
+    """Drop expired tombstones for `namespace`; caller holds the queues lock."""
+    tombstones = _edge_write_tombstones.get(namespace)
+    if not tombstones:
+        return None
+    for event_id in [eid for eid, deadline in tombstones.items() if deadline <= now]:
+        del tombstones[event_id]
+    if not tombstones:
+        _edge_write_tombstones.pop(namespace, None)
+        return None
+    return tombstones
 
 
 def queued_edge_write_count(namespace: str | None = None) -> int:
@@ -121,6 +154,11 @@ def queue_edge_write(
 ) -> None:
     """Append edge rows to the per-namespace coalescing queue.
 
+    Rows for events already tombstoned by a purge are dropped, and the
+    append participates in the same per-namespace flush lock the purge
+    barrier holds, so an enqueue that races a purge is ordered before the
+    cancel step (and then cancelled) or after it (and then tombstoned away).
+
     Marks ``EVENT_DAG`` dirty so the flush coalescer schedules a bounded
     debounce drain, and flushes immediately when the queue grows past the
     threshold.
@@ -128,23 +166,31 @@ def queue_edge_write(
     row_list = list(rows)
     if not row_list:
         return
-    with _edge_write_queues_lock:
-        q = _edge_write_queues.setdefault(namespace, [])
-        q.extend(row_list)
-        over_threshold = len(q) >= _EDGE_WRITE_THRESHOLD
-    if over_threshold:
-        try:
-            flush_edge_writes(namespace, sync=sync)
-        except Exception:
-            # flush_edge_writes already restored the rows and re-marked the
-            # pool dirty; log and let the coalescer retry.
-            logger.warning(
-                "Edge-write threshold flush failed for namespace %s; rows retained",
-                namespace,
-                exc_info=True,
-            )
-    else:
-        mark_dirty(Pool.EVENT_DAG)
+    with _namespace_flush_lock(namespace):
+        with _edge_write_queues_lock:
+            tombstones = _prune_tombstones_locked(namespace, time.monotonic())
+            if tombstones:
+                row_list = [row for row in row_list if row[1] not in tombstones]
+                if not row_list:
+                    return
+            q = _edge_write_queues.setdefault(namespace, [])
+            q.extend(row_list)
+            over_threshold = len(q) >= _EDGE_WRITE_THRESHOLD
+        if over_threshold:
+            try:
+                # Take the flush lock only once: we already hold it, so drain
+                # directly rather than re-entering the (non-reentrant) lock.
+                _flush_namespace_locked(namespace, sync=sync)
+            except Exception:
+                # flush_edge_writes already restored the rows and re-marked the
+                # pool dirty; log and let the coalescer retry.
+                logger.warning(
+                    "Edge-write threshold flush failed for namespace %s; rows retained",
+                    namespace,
+                    exc_info=True,
+                )
+        else:
+            mark_dirty(Pool.EVENT_DAG)
 
 
 def flush_edge_writes(namespace: str | None = None, *, sync: bool = False) -> bool:
@@ -256,14 +302,26 @@ def delete_event_edges_batch(
     edge FOR a purged event (those mirror the SQL `event_edges` rows the purge
     is deleting).  Rows queued for events that are merely referencing the
     purged ids are kept and flushed before the tombstone.
+
+    The purged ids are also recorded as tombstones: `queue_edge_write` takes
+    the same flush lock and drops tombstoned rows, so a transaction whose
+    post-commit enqueue lands after the cancel step cannot resurrect the event.
     """
     if not event_ids:
         return
 
     purged = set(event_ids)
     with _namespace_flush_lock(namespace):
-        # 1. Cancel queued rows for the events being purged.
+        # 1. Record tombstones and cancel queued rows for the events being
+        #    purged, under the queues lock so a concurrent enqueue is either
+        #    cancelled here or filtered by the tombstone above.
+        now = time.monotonic()
+        deadline = now + _EDGE_WRITE_TOMBSTONE_TTL
         with _edge_write_queues_lock:
+            _prune_tombstones_locked(namespace, now)
+            tombstones = _edge_write_tombstones.setdefault(namespace, {})
+            for event_id in purged:
+                tombstones[event_id] = deadline
             q = _edge_write_queues.get(namespace)
             if q is not None:
                 kept = [r for r in q if r[1] not in purged]

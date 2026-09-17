@@ -9,8 +9,10 @@
 //! every prev_event id).  That keeps reads self-sufficient: repaired/backfilled
 //! edges for older events whose `event_json` locator was never mirrored can
 //! still resolve to their room collection.  The overwrite is idempotent and
-//! always carries the same value as `event_json_put`.  Deletion deliberately
-//! does NOT tombstone locators here -- `event_json_delete` owns that.
+//! always carries the same value as `event_json_put`, and repeated locators
+//! for the same event within one batch are deduplicated before the
+//! `put_many` call.  Deletion deliberately does NOT tombstone locators here
+//! -- `event_json_delete` owns that.
 
 use std::collections::{HashMap, HashSet};
 
@@ -135,6 +137,28 @@ fn decode_forward_edges(bytes: &[u8]) -> PyResult<Vec<String>> {
 /// resolved by the read paths.  `event_json_put` remains the primary locator
 /// writer for newly mirrored events; edge records land in (and reads resolve
 /// through) the same room collection either way.
+/// Publish an `event_id -> room collection` locator into a batch-local map.
+///
+/// The value (the owning room collection) is identical for every occurrence
+/// of an event within a batch, so the nested map keyed by `NodeId`
+/// deduplicates the repeated locators a batch produces -- an event appears
+/// once as its own backward row and once as the parent of each of its
+/// children -- avoiding redundant `put_many` entries.
+fn insert_event_locator(
+    locators: &mut HashMap<[u8; 16], HashMap<NodeId, NodeData>>,
+    namespace: &str,
+    room_id: &str,
+    event_id: &str,
+) {
+    let room_collection = event_dag_room_id(namespace, room_id);
+    let identity = event_node_id(namespace, event_id);
+    let locator_collection = event_locator_collection_id(namespace, &identity);
+    locators.entry(locator_collection).or_default().insert(
+        identity,
+        NodeData::new(bytes::Bytes::copy_from_slice(&room_collection)),
+    );
+}
+
 #[pyfunction]
 pub fn event_edges_put(
     py: Python<'_>,
@@ -163,30 +187,24 @@ pub fn event_edges_put(
         }
 
         let mut dag_puts: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
-        let mut locator_puts: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
+        // Nested map deduplicates repeated locators within the batch.
+        let mut locator_puts: HashMap<[u8; 16], HashMap<NodeId, NodeData>> = HashMap::new();
 
         for ((room_id, event_id), edges) in backward_map {
             let room_collection = event_dag_room_id(&namespace, &room_id);
-            let identity = event_node_id(&namespace, &event_id);
             let edge_node = event_edges_backward_node_id(&namespace, &event_id);
-            let locator_collection = event_locator_collection_id(&namespace, &identity);
 
             let encoded = encode_backward_edges(&edges);
             dag_puts
                 .entry(room_collection)
                 .or_default()
                 .push((edge_node, NodeData::new(bytes::Bytes::from(encoded))));
-            locator_puts.entry(locator_collection).or_default().push((
-                identity,
-                NodeData::new(bytes::Bytes::copy_from_slice(&room_collection)),
-            ));
+            insert_event_locator(&mut locator_puts, &namespace, &room_id, &event_id);
         }
 
         for ((room_id, prev_event_id), new_children) in forward_map {
             let room_collection = event_dag_room_id(&namespace, &room_id);
-            let prev_identity = event_node_id(&namespace, &prev_event_id);
             let forward_node = event_edges_forward_node_id(&namespace, &prev_event_id);
-            let parent_locator = event_locator_collection_id(&namespace, &prev_identity);
 
             // Read existing children if any
             let mut existing_children = match engine.get(&room_collection, &forward_node) {
@@ -210,10 +228,7 @@ pub fn event_edges_put(
                     .or_default()
                     .push((forward_node, NodeData::new(bytes::Bytes::from(encoded))));
             }
-            locator_puts.entry(parent_locator).or_default().push((
-                prev_identity,
-                NodeData::new(bytes::Bytes::copy_from_slice(&room_collection)),
-            ));
+            insert_event_locator(&mut locator_puts, &namespace, &room_id, &prev_event_id);
         }
 
         // Edge records first, locator publication last: a reader that races
@@ -225,6 +240,7 @@ pub fn event_edges_put(
             })?;
         }
         for (collection, pairs) in locator_puts {
+            let pairs: Vec<(NodeId, NodeData)> = pairs.into_iter().collect();
             engine.put_many(&collection, &pairs).map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {e}"))
             })?;
@@ -613,5 +629,26 @@ mod tests {
             // $p2 has no remaining children, so it was tombstoned
             assert_eq!(forward_after_delete[1].1, None);
         });
+    }
+
+    #[test]
+    fn locator_puts_are_deduplicated_within_a_batch() {
+        let ns = "ns-edges-locator-dedup";
+        let room = "!room-edges:example.org";
+        let mut locators: HashMap<[u8; 16], HashMap<NodeId, NodeData>> = HashMap::new();
+
+        // An event is touched many times in a single batch: as its own
+        // backward row and once as the parent of every child.  Each occurrence
+        // would otherwise publish the same `event_id -> room` locator.
+        insert_event_locator(&mut locators, ns, room, "$shared");
+        insert_event_locator(&mut locators, ns, room, "$shared");
+        insert_event_locator(&mut locators, ns, room, "$shared");
+
+        // A distinct event in the same room collection still gets its own
+        // locator, so deduplication does not drop real entries.
+        insert_event_locator(&mut locators, ns, room, "$other");
+
+        let total: usize = locators.values().map(|pairs| pairs.len()).sum();
+        assert_eq!(total, 2, "one locator per distinct event id");
     }
 }
