@@ -125,18 +125,6 @@ fn decode_forward_edges(bytes: &[u8]) -> PyResult<Vec<String>> {
     Ok(children)
 }
 
-/// Batch put event edges into the room-aware event_dag pool:
-/// 1. Backward edges: `event_id -> [(prev_event_id, is_state)]`
-/// 2. Forward edges: `prev_event_id -> [child_event_id]` (appended and deduplicated)
-///
-/// Locators are ALSO written here: for every event a row mentions (its own
-/// `event_id` and every `prev_event_id`), the `event_id -> room collection`
-/// locator is published with the same value `event_json_put` writes.  This is
-/// idempotent and exists so repaired/backfilled edges for legacy events --
-/// whose `event_json` locator may never have been mirrored -- can still be
-/// resolved by the read paths.  `event_json_put` remains the primary locator
-/// writer for newly mirrored events; edge records land in (and reads resolve
-/// through) the same room collection either way.
 /// Publish an `event_id -> room collection` locator into a batch-local map.
 ///
 /// The value (the owning room collection) is identical for every occurrence
@@ -158,6 +146,19 @@ fn insert_event_locator(
         NodeData::new(bytes::Bytes::copy_from_slice(&room_collection)),
     );
 }
+
+/// Batch put event edges into the room-aware event_dag pool:
+/// 1. Backward edges: `event_id -> [(prev_event_id, is_state)]`
+/// 2. Forward edges: `prev_event_id -> [child_event_id]` (appended and deduplicated)
+///
+/// Locators are ALSO written here: for every event a row mentions (its own
+/// `event_id` and every `prev_event_id`), the `event_id -> room collection`
+/// locator is published with the same value `event_json_put` writes.  This is
+/// idempotent and exists so repaired/backfilled edges for legacy events --
+/// whose `event_json` locator may never have been mirrored -- can still be
+/// resolved by the read paths.  `event_json_put` remains the primary locator
+/// writer for newly mirrored events; edge records land in (and reads resolve
+/// through) the same room collection either way.
 
 #[pyfunction]
 pub fn event_edges_put(

@@ -16,6 +16,7 @@ import atexit
 import shutil
 import tempfile
 import threading
+from typing import Any
 from unittest import mock
 
 from twisted.test.proto_helpers import MemoryReactor
@@ -272,6 +273,130 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
             self.assertNotIn("$late", fwd.get("$lateparent") or [])
         finally:
             flush_edge_writes()
+
+    def test_enqueue_child_of_purged_parent_is_dropped(self) -> None:
+        """A late child row must not recreate a purged parent's edge or locator."""
+        ns = "test-edges-purged-parent"
+        parent = "$purged_parent"
+        child = "$late_child"
+        try:
+            # Create and then remove the parent's locator, matching a purged
+            # event whose event_json mirror has already been deleted.
+            mtxdb_engine.event_json_put(
+                ns, [(self.room_id, parent, b"metadata", b"body")]
+            )
+            mtxdb_engine.event_json_delete(ns, [parent])
+
+            delete_event_edges_batch(ns, [parent])
+
+            # The child is live, but its prev_event_id is the purged parent.
+            # Accepting this row would recreate both the parent's forward edge
+            # and its locator in event_edges_put.
+            queue_edge_write(ns, [(self.room_id, child, parent, False)])
+            self.assertEqual(queued_edge_write_count(ns), 0)
+            flush_edge_writes(ns)
+
+            self.assertIsNone(get_event_edges_backward_batch(ns, [child])[child])
+            self.assertNotIn(
+                child,
+                get_event_edges_forward_batch(ns, [parent]).get(parent) or [],
+            )
+        finally:
+            flush_edge_writes()
+
+    def test_purge_enqueue_race_is_serialized(self) -> None:
+        """Force the dangerous ordering: an enqueue arriving while the purge is
+        paused between its cancel step and its FFI delete.  The namespace flush
+        lock parks the enqueue until the purge has recorded its tombstone, so
+        the row can never land in the cancel->delete window and a later drain
+        cannot resurrect the purged event."""
+        ns = "test-edges-purge-barrier"
+        victim = "$barrier_victim"
+        parent = "$barrier_parent"
+        real_delete = mtxdb_engine.event_edges_delete
+        delete_entered = threading.Event()
+        delete_release = threading.Event()
+        enqueue_started = threading.Event()
+        enqueue_finished = threading.Event()
+
+        def slow_delete(*args: Any, **kwargs: Any) -> Any:
+            delete_entered.set()
+            if not delete_release.wait(timeout=5):
+                raise TimeoutError("mocked delete was never released")
+            return real_delete(*args, **kwargs)
+
+        def purge() -> None:
+            delete_event_edges_batch(ns, [victim])
+
+        def enqueue() -> None:
+            enqueue_started.set()
+            queue_edge_write(ns, [(self.room_id, victim, parent, False)])
+            enqueue_finished.set()
+
+        try:
+            with mock.patch(
+                "synapse.synapse_rust.mtxdb_engine.event_edges_delete",
+                side_effect=slow_delete,
+            ):
+                purge_thread = threading.Thread(target=purge)
+                purge_thread.start()
+                self.assertTrue(
+                    delete_entered.wait(timeout=5), "purge never reached the delete"
+                )
+
+                enqueue_thread = threading.Thread(target=enqueue)
+                enqueue_thread.start()
+                self.assertTrue(enqueue_started.wait(timeout=5))
+                # The enqueue must be parked on the namespace flush lock for
+                # the whole cancel -> delete window.
+                self.assertFalse(
+                    enqueue_finished.wait(timeout=0.2),
+                    "enqueue landed between the purge cancel and delete",
+                )
+
+                delete_release.set()
+                purge_thread.join(timeout=5)
+                enqueue_thread.join(timeout=5)
+
+            self.assertFalse(purge_thread.is_alive())
+            self.assertFalse(enqueue_thread.is_alive())
+
+            # The (post-delete) enqueue was tombstoned, not applied.
+            self.assertEqual(queued_edge_write_count(ns), 0)
+            flush_edge_writes(ns)
+            back = get_event_edges_backward_batch(ns, [victim])
+            self.assertIsNone(back[victim])
+            fwd = get_event_edges_forward_batch(ns, [parent])
+            self.assertNotIn(victim, fwd.get(parent) or [])
+        finally:
+            delete_release.set()
+            flush_edge_writes(ns)
+
+    def test_purge_delete_failure_does_not_block_repair(self) -> None:
+        """If the FFI delete fails the purge must not leave a permanent
+        tombstone: the stale edges are still in mtxdb and a tombstone would
+        suppress the repair writes that recover from the failure."""
+        ns = "test-edges-purge-delete-fail"
+        try:
+            # A committed-but-unflushed row for the victim is cancelled ...
+            queue_edge_write(ns, [(self.room_id, "$victim", "$parent", False)])
+
+            with mock.patch(
+                "synapse.synapse_rust.mtxdb_engine.event_edges_delete",
+                side_effect=RuntimeError("simulated FFI delete failure"),
+            ):
+                with self.assertRaises(RuntimeError):
+                    delete_event_edges_batch(ns, ["$victim"])
+
+            # ... but no tombstone was recorded, so a repair/backfill write for
+            # the same event is accepted rather than suppressed for the TTL.
+            queue_edge_write(ns, [(self.room_id, "$victim", "$repaired", False)])
+            self.assertEqual(queued_edge_write_count(ns), 1)
+            flush_edge_writes(ns)
+            back = get_event_edges_backward_batch(ns, ["$victim"])
+            self.assertEqual(back["$victim"], [("$repaired", False)])
+        finally:
+            flush_edge_writes(ns)
 
     def test_shutdown_drain_failure_retains_rows(self) -> None:
         """The shutdown drain retries on FFI failure, never drops rows, and
