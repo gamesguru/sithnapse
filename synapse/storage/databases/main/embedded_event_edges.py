@@ -345,12 +345,14 @@ def delete_event_edges_batch(
         #    being purged, under the queues lock so a concurrent enqueue is
         #    either cancelled here or filtered by the markers.  The permanent
         #    tombstone is deferred until the FFI delete succeeds.
+        cancelled_rows: list[EdgeRow] = []
         with _edge_write_queues_lock:
             _prune_tombstones_locked(namespace, now)
             _edge_write_purging.setdefault(namespace, set()).update(purged)
             q = _edge_write_queues.get(namespace)
             if q is not None:
-                kept = [r for r in q if r[1] not in purged]
+                kept = [r for r in q if r[1] not in purged and r[2] not in purged]
+                cancelled_rows = [r for r in q if r not in kept]
                 if kept:
                     q[:] = kept
                 else:
@@ -389,6 +391,14 @@ def delete_event_edges_batch(
                     purging.difference_update(purged)
                     if not purging:
                         _edge_write_purging.pop(namespace, None)
+                # Restore cancelled rows so the stale edges remain reachable
+                # for repair/backfill writes -- a failed delete leaves the
+                # original data in mtxdb and a tombstone would suppress the
+                # repair writes that recover from it.
+                if cancelled_rows:
+                    restored = _edge_write_queues.setdefault(namespace, [])
+                    restored[0:0] = cancelled_rows
+            mark_dirty(Pool.EVENT_DAG)
             raise
 
         with _edge_write_queues_lock:

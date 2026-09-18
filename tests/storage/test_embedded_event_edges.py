@@ -426,6 +426,76 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
             _clear_coalescer(coalescer)
             flush_edge_writes()
 
+    def test_purge_forward_edge_filtered_by_prev_event_id(self) -> None:
+        """Purging an event that appears as prev_event_id in a queued forward
+        row filters that row, preventing resurrection of the purged event as a
+        parent."""
+        ns = "test-edges-purge-prev-event"
+        victim = "$purged_as_prev"
+        child = "$child_of_victim"
+        try:
+            queue_edge_write(ns, [(self.room_id, child, victim, False)])
+            self.assertEqual(queued_edge_write_count(ns), 1)
+
+            delete_event_edges_batch(ns, [victim])
+
+            # The forward row (child -> victim) must have been cancelled.
+            self.assertEqual(queued_edge_write_count(ns), 0)
+            flush_edge_writes(ns)
+            fwd = get_event_edges_forward_batch(ns, [victim])
+            self.assertNotIn(child, fwd.get(victim) or [])
+        finally:
+            flush_edge_writes(ns)
+
+    def test_purge_delete_failure_restores_cancelled_rows(self) -> None:
+        """When the FFI delete fails, rows cancelled by the purge are restored
+        to the queue so the stale edges remain reachable for repair."""
+        ns = "test-edges-purge-fail-restore"
+        victim = "$fail_victim"
+        child = "$fail_child"
+        try:
+            queue_edge_write(ns, [(self.room_id, child, victim, False)])
+            self.assertEqual(queued_edge_write_count(ns), 1)
+
+            with mock.patch(
+                "synapse.synapse_rust.mtxdb_engine.event_edges_delete",
+                side_effect=RuntimeError("simulated delete failure"),
+            ):
+                with self.assertRaises(RuntimeError):
+                    delete_event_edges_batch(ns, [victim])
+
+            # The cancelled row was restored to the queue for repair.
+            self.assertEqual(queued_edge_write_count(ns), 1)
+            flush_edge_writes(ns)
+            fwd = get_event_edges_forward_batch(ns, [victim])
+            self.assertIn(child, fwd.get(victim) or [])
+        finally:
+            flush_edge_writes(ns)
+
+    def test_two_namespaces_flush_independently(self) -> None:
+        """Rows in namespace A are not flushed when namespace B is drained."""
+        ns_a = "test-edges-ns-a"
+        ns_b = "test-edges-ns-b"
+        try:
+            queue_edge_write(ns_a, [(self.room_id, "$a1", "$a0", False)])
+            queue_edge_write(ns_b, [(self.room_id, "$b1", "$b0", False)])
+            self.assertEqual(queued_edge_write_count(ns_a), 1)
+            self.assertEqual(queued_edge_write_count(ns_b), 1)
+
+            # Flush only ns_a.
+            flush_edge_writes(ns_a)
+            self.assertEqual(queued_edge_write_count(ns_a), 0)
+            self.assertEqual(queued_edge_write_count(ns_b), 1)
+
+            # ns_b's row is still there.
+            back_a = get_event_edges_backward_batch(ns_a, ["$a1"])
+            self.assertEqual(back_a["$a1"], [("$a0", False)])
+            back_b = get_event_edges_backward_batch(ns_b, ["$b1"])
+            self.assertIsNone(back_b["$b1"])
+        finally:
+            flush_edge_writes(ns_a)
+            flush_edge_writes(ns_b)
+
     def test_edge_write_repairs_missing_legacy_locator(self) -> None:
         """Edges for events whose event_json locator was never mirrored are
         still resolvable: `event_edges_put` re-publishes locators."""
