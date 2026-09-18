@@ -351,8 +351,12 @@ def delete_event_edges_batch(
             _edge_write_purging.setdefault(namespace, set()).update(purged)
             q = _edge_write_queues.get(namespace)
             if q is not None:
-                kept = [r for r in q if r[1] not in purged and r[2] not in purged]
-                cancelled_rows = [r for r in q if r not in kept]
+                kept = []
+                for row in q:
+                    if row[1] in purged or row[2] in purged:
+                        cancelled_rows.append(row)
+                    else:
+                        kept.append(row)
                 if kept:
                     q[:] = kept
                 else:

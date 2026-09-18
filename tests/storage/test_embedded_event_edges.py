@@ -375,7 +375,9 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
     def test_purge_delete_failure_does_not_block_repair(self) -> None:
         """If the FFI delete fails the purge must not leave a permanent
         tombstone: the stale edges are still in mtxdb and a tombstone would
-        suppress the repair writes that recover from the failure."""
+        suppress the repair writes that recover from the failure.  The
+        cancelled rows from the purge are also restored so the original data
+        remains reachable."""
         ns = "test-edges-purge-delete-fail"
         try:
             # A committed-but-unflushed row for the victim is cancelled ...
@@ -390,11 +392,16 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
 
             # ... but no tombstone was recorded, so a repair/backfill write for
             # the same event is accepted rather than suppressed for the TTL.
+            # The cancelled row was also restored, so we have 2 rows queued.
             queue_edge_write(ns, [(self.room_id, "$victim", "$repaired", False)])
-            self.assertEqual(queued_edge_write_count(ns), 1)
+            self.assertEqual(queued_edge_write_count(ns), 2)
             flush_edge_writes(ns)
             back = get_event_edges_backward_batch(ns, ["$victim"])
-            self.assertEqual(back["$victim"], [("$repaired", False)])
+            # Both the restored original and the repair write are present:
+            # the restored row keeps the original edge reachable, and the
+            # repair write adds the new edge.
+            self.assertIn(("$parent", False), back["$victim"])
+            self.assertIn(("$repaired", False), back["$victim"])
         finally:
             flush_edge_writes(ns)
 
@@ -424,6 +431,32 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
             self.assertEqual(queued_edge_write_count(ns), 1)
         finally:
             _clear_coalescer(coalescer)
+            flush_edge_writes()
+
+    def test_edge_drain_failure_schedules_retry(self) -> None:
+        """A failed timer drain retains rows and schedules a retry."""
+        reactor = ThreadedMemoryReactorClock()
+        clock = Clock(reactor, server_name="test_server")  # type: ignore[multiple-internal-clocks]
+        coalescer = _FlushCoalescer(clock)
+        _set_coalescer(coalescer)
+        ns = "test-edges-drain-retry"
+        try:
+            queue_edge_write(ns, [(self.room_id, "$retry", "$retry_parent", False)])
+
+            with mock.patch(
+                "synapse.storage.databases.main.embedded_event_edges.put_event_edges_batch",
+                side_effect=RuntimeError("simulated timer FFI failure"),
+            ):
+                reactor.advance(FLUSH_DELAY_SECS + 0.1)
+
+            self.assertEqual(queued_edge_write_count(ns), 1)
+            self.assertIsNotNone(coalescer._delayed_call)
+
+            reactor.advance(1.1)
+            self.assertEqual(queued_edge_write_count(ns), 0)
+        finally:
+            _clear_coalescer(coalescer)
+            coalescer.close()
             flush_edge_writes()
 
     def test_purge_forward_edge_filtered_by_prev_event_id(self) -> None:
