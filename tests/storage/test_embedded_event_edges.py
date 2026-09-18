@@ -274,35 +274,31 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
         finally:
             flush_edge_writes()
 
-    def test_enqueue_child_of_purged_parent_is_dropped(self) -> None:
-        """A late child row must not recreate a purged parent's edge or locator."""
-        ns = "test-edges-purged-parent"
+    def test_backward_extremity_survives_purge(self) -> None:
+        """A queued forward row (live_child → purged_parent) is a backward
+        extremity and must survive purge.  Synapse's SQL purge only deletes
+        rows whose own event_id is purged; live children referencing a purged
+        prev_event_id are preserved.  The mtxdb coalescer must match."""
+        ns = "test-edges-backward-extremity"
         parent = "$purged_parent"
-        child = "$late_child"
+        child = "$live_child"
         try:
-            # Create and then remove the parent's locator, matching a purged
-            # event whose event_json mirror has already been deleted.
-            mtxdb_engine.event_json_put(
-                ns, [(self.room_id, parent, b"metadata", b"body")]
-            )
-            mtxdb_engine.event_json_delete(ns, [parent])
+            queue_edge_write(ns, [(self.room_id, child, parent, False)])
+            self.assertEqual(queued_edge_write_count(ns), 1)
 
             delete_event_edges_batch(ns, [parent])
 
-            # The child is live, but its prev_event_id is the purged parent.
-            # Accepting this row would recreate both the parent's forward edge
-            # and its locator in event_edges_put.
-            queue_edge_write(ns, [(self.room_id, child, parent, False)])
+            # The forward row (child → parent) was NOT cancelled — child
+            # (row[1]) is live — and was flushed during the purge's drain.
             self.assertEqual(queued_edge_write_count(ns), 0)
-            flush_edge_writes(ns)
 
-            self.assertIsNone(get_event_edges_backward_batch(ns, [child])[child])
-            self.assertNotIn(
-                child,
-                get_event_edges_forward_batch(ns, [parent]).get(parent) or [],
-            )
+            # The edge exists in mtxdb: backward and forward both present.
+            back = get_event_edges_backward_batch(ns, [child])
+            self.assertEqual(back[child], [(parent, False)])
+            fwd = get_event_edges_forward_batch(ns, [parent])
+            self.assertIn(child, fwd.get(parent) or [])
         finally:
-            flush_edge_writes()
+            flush_edge_writes(ns)
 
     def test_purge_enqueue_race_is_serialized(self) -> None:
         """Force the dangerous ordering: an enqueue arriving while the purge is
@@ -459,40 +455,36 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
             coalescer.close()
             flush_edge_writes()
 
-    def test_purge_forward_edge_filtered_by_prev_event_id(self) -> None:
-        """Purging an event that appears as prev_event_id in a queued forward
-        row filters that row, preventing resurrection of the purged event as a
-        parent."""
-        ns = "test-edges-purge-prev-event"
-        victim = "$purged_as_prev"
-        child = "$child_of_victim"
+    def test_purge_cancels_row_owned_by_purged_event(self) -> None:
+        """A queued row whose event_id (row[1]) is purged is cancelled."""
+        ns = "test-edges-purge-row1"
+        victim = "$purged_owner"
+        parent = "$owner_parent"
         try:
-            queue_edge_write(ns, [(self.room_id, child, victim, False)])
+            queue_edge_write(ns, [(self.room_id, victim, parent, False)])
             self.assertEqual(queued_edge_write_count(ns), 1)
 
             delete_event_edges_batch(ns, [victim])
 
-            # The forward row (child -> victim) must have been cancelled.
+            # victim is row[1] and purged → row cancelled.
             self.assertEqual(queued_edge_write_count(ns), 0)
-            flush_edge_writes(ns)
-            fwd = get_event_edges_forward_batch(ns, [victim])
-            self.assertNotIn(child, fwd.get(victim) or [])
         finally:
             flush_edge_writes(ns)
 
     def test_purge_delete_failure_restores_cancelled_rows(self) -> None:
-        """When the FFI delete fails, rows cancelled by the purge are restored
-        to the queue so the stale edges remain reachable for repair."""
+        """When the FFI delete fails, only rows owned by purged events (row[1])
+        are restored — live-child → purged-parent rows were never cancelled."""
         ns = "test-edges-purge-fail-restore"
         victim = "$fail_victim"
-        child = "$fail_child"
+        parent = "$fail_parent"
         try:
-            queue_edge_write(ns, [(self.room_id, child, victim, False)])
+            # Row owned by the purged event (row[1] = victim).
+            queue_edge_write(ns, [(self.room_id, victim, parent, False)])
             self.assertEqual(queued_edge_write_count(ns), 1)
 
             with mock.patch(
                 "synapse.synapse_rust.mtxdb_engine.event_edges_delete",
-                side_effect=RuntimeError("simulated delete failure"),
+                side_effect=RuntimeError("simulated FFI delete failure"),
             ):
                 with self.assertRaises(RuntimeError):
                     delete_event_edges_batch(ns, [victim])
@@ -500,37 +492,56 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
             # The cancelled row was restored to the queue for repair.
             self.assertEqual(queued_edge_write_count(ns), 1)
             flush_edge_writes(ns)
-            fwd = get_event_edges_forward_batch(ns, [victim])
-            self.assertIn(child, fwd.get(victim) or [])
+            back = get_event_edges_backward_batch(ns, [victim])
+            self.assertIn((parent, False), back.get(victim) or [])
         finally:
             flush_edge_writes(ns)
 
-    def test_restore_regression_row2_cancellation_and_flush(self) -> None:
-        """Regression: a queued forward row whose prev_event_id (row[2]) is
-        purged must be cancelled by the purge, restored on delete failure, and
-        later flushable as a repair write.  The dirty marker must cause the
-        coalescer to retry."""
+    def test_restore_regression_row1_cancellation_and_timer_retry(self) -> None:
+        """Regression: rows owned by purged events (row[1]) are cancelled,
+        restored on delete failure, and later flushed by the coalescer timer.
+        Live-child → purged-parent rows (backward extremities) survive purge."""
         ns = "test-edges-restore-regression"
         reactor = ThreadedMemoryReactorClock()
         clock = Clock(reactor, server_name="test_server")  # type: ignore[multiple-internal-clocks]
         coalescer = _FlushCoalescer(clock)
         _set_coalescer(coalescer)
         try:
-            # --- Cycle 1: successful purge cancels a row[2] match. ---
+            # --- Cycle 1: successful purge cancels row[1]-owned row, ---
+            # --- backward-extremity row (row[2] match) survives.     ---
             victim1 = "$reg_v1"
-            child1 = "$reg_c1"
-            queue_edge_write(ns, [(self.room_id, child1, victim1, False)])
-            self.assertEqual(queued_edge_write_count(ns), 1)
+            parent1 = "$reg_p1"
+            extremity1 = "$reg_ext1"
+            queue_edge_write(
+                ns,
+                [
+                    (
+                        self.room_id,
+                        victim1,
+                        parent1,
+                        False,
+                    ),  # row[1] = victim → cancelled
+                    (
+                        self.room_id,
+                        extremity1,
+                        victim1,
+                        False,
+                    ),  # row[2] = victim → kept
+                ],
+            )
+            self.assertEqual(queued_edge_write_count(ns), 2)
 
             delete_event_edges_batch(ns, [victim1])
+            # The row-owned-by-victim1 was cancelled; the extremity was
+            # flushed during the purge's drain step (queue now empty).
             self.assertEqual(queued_edge_write_count(ns), 0)
-            fwd = get_event_edges_forward_batch(ns, [victim1])
-            self.assertNotIn(child1, fwd.get(victim1) or [])
+            back_ext = get_event_edges_backward_batch(ns, [extremity1])
+            self.assertEqual(back_ext[extremity1], [(victim1, False)])
 
             # --- Cycle 2: failed purge restores the cancelled row. ---
             victim2 = "$reg_v2"
-            child2 = "$reg_c2"
-            queue_edge_write(ns, [(self.room_id, child2, victim2, False)])
+            parent2 = "$reg_p2"
+            queue_edge_write(ns, [(self.room_id, victim2, parent2, False)])
             self.assertEqual(queued_edge_write_count(ns), 1)
 
             with mock.patch(
@@ -540,17 +551,16 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     delete_event_edges_batch(ns, [victim2])
 
-            # The cancelled row was restored (not dropped).
+            # The cancelled row was restored; the timer was (re)scheduled.
             self.assertEqual(queued_edge_write_count(ns), 1)
-
-            # The dirty marker was set, causing the coalescer to retry.
             self.assertIsNotNone(coalescer._delayed_call)
 
-            # The restored row is flushable as a repair write.
-            flush_edge_writes(ns)
+            # Advance past the debounce — the coalescer drains the row.
+            reactor.advance(FLUSH_DELAY_SECS + 0.1)
             self.assertEqual(queued_edge_write_count(ns), 0)
-            fwd = get_event_edges_forward_batch(ns, [victim2])
-            self.assertIn(child2, fwd.get(victim2) or [])
+
+            back_v2 = get_event_edges_backward_batch(ns, [victim2])
+            self.assertIn((parent2, False), back_v2.get(victim2) or [])
         finally:
             _clear_coalescer(coalescer)
             coalescer.close()
@@ -820,8 +830,8 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         # Persist the coalesced edges, then simulate a post-commit mirror write
         # that never landed by deleting the edge directly at the FFI layer.
         # Deliberately NOT `delete_event_edges_batch`: that records a purge
-        # tombstone, which would (correctly) refuse the repair below and
-        # misrepresent a lost write as a purge.
+        # tombstone and this scenario is a lost write, not a purge.  (The purge
+        # tombstone + SQL-fallback repair case is `test_sql_fallback_repairs_preserved_row2_edge_despite_purge`.)
         flush_edge_writes(ns)
         mtxdb_engine.event_edges_delete(ns, [c_id])
 
@@ -866,3 +876,38 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
                 0,
                 "expected no SQL fallback for the read-only query after repair",
             )
+
+    def test_sql_fallback_repairs_preserved_row2_edge_despite_purge(self) -> None:
+        """SQL keeps the live-child → purged-parent `event_edges` row (a
+        backward extremity).  Even after a genuine purge tombstoned the parent,
+        the SQL fallback still returns that edge and the repair enqueue is
+        accepted: the tombstone is owner-based, so it only blocks rows whose
+        own event_id is purged -- the child is not.  Without the owner-based
+        filter this repair would be suppressed for the tombstone's TTL."""
+        res1 = self.helper.send(self.room_id, "parent", tok=self.tok)
+        p_id = res1["event_id"]
+        res2 = self.helper.send(self.room_id, "child", tok=self.tok)
+        c_id = res2["event_id"]
+
+        ns = self.store._embedded_hamt_namespace
+        flush_edge_writes(ns)
+
+        # True purge of the parent: records an owner-based tombstone for p_id.
+        delete_event_edges_batch(ns, [p_id])
+
+        # Simulate the child's forward edge write never landing in mtxdb.
+        mtxdb_engine.event_edges_delete(ns, [c_id])
+        fwd_miss = get_event_edges_forward_batch(ns, [p_id])
+        self.assertIsNone(fwd_miss.get(p_id))
+
+        # get_successor_events falls back to the preserved SQL row and queues
+        # the repair (child, purged parent).  The parent's tombstone must not
+        # suppress it.
+        successors = self.get_success(self.store.get_successor_events(p_id))
+        self.assertIn(c_id, successors)
+
+        self.reactor.advance(FLUSH_DELAY_SECS + 0.1)
+
+        # The preserved row[2] edge is repaired in mtxdb despite the tombstone.
+        fwd_repaired = get_event_edges_forward_batch(ns, [p_id])
+        self.assertIn(c_id, fwd_repaired.get(p_id) or [])

@@ -187,10 +187,7 @@ def queue_edge_write(
                 row_list = [
                     row
                     for row in row_list
-                    if (
-                        row[1] not in tombstones
-                        and row[1] not in purging
-                    )
+                    if (row[1] not in tombstones and row[1] not in purging)
                 ]
                 if not row_list:
                     return
