@@ -189,9 +189,7 @@ def queue_edge_write(
                     for row in row_list
                     if (
                         row[1] not in tombstones
-                        and row[2] not in tombstones
                         and row[1] not in purging
-                        and row[2] not in purging
                     )
                 ]
                 if not row_list:
@@ -351,9 +349,9 @@ def delete_event_edges_batch(
             _edge_write_purging.setdefault(namespace, set()).update(purged)
             q = _edge_write_queues.get(namespace)
             if q is not None:
-                kept = []
+                kept: list[EdgeRow] = []
                 for row in q:
-                    if row[1] in purged or row[2] in purged:
+                    if row[1] in purged:
                         cancelled_rows.append(row)
                     else:
                         kept.append(row)
@@ -402,6 +400,7 @@ def delete_event_edges_batch(
                 if cancelled_rows:
                     restored = _edge_write_queues.setdefault(namespace, [])
                     restored[0:0] = cancelled_rows
+            # Outside the queues lock to avoid lock-order surprises.
             mark_dirty(Pool.EVENT_DAG)
             raise
 

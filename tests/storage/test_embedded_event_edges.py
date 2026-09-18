@@ -505,6 +505,57 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
         finally:
             flush_edge_writes(ns)
 
+    def test_restore_regression_row2_cancellation_and_flush(self) -> None:
+        """Regression: a queued forward row whose prev_event_id (row[2]) is
+        purged must be cancelled by the purge, restored on delete failure, and
+        later flushable as a repair write.  The dirty marker must cause the
+        coalescer to retry."""
+        ns = "test-edges-restore-regression"
+        reactor = ThreadedMemoryReactorClock()
+        clock = Clock(reactor, server_name="test_server")  # type: ignore[multiple-internal-clocks]
+        coalescer = _FlushCoalescer(clock)
+        _set_coalescer(coalescer)
+        try:
+            # --- Cycle 1: successful purge cancels a row[2] match. ---
+            victim1 = "$reg_v1"
+            child1 = "$reg_c1"
+            queue_edge_write(ns, [(self.room_id, child1, victim1, False)])
+            self.assertEqual(queued_edge_write_count(ns), 1)
+
+            delete_event_edges_batch(ns, [victim1])
+            self.assertEqual(queued_edge_write_count(ns), 0)
+            fwd = get_event_edges_forward_batch(ns, [victim1])
+            self.assertNotIn(child1, fwd.get(victim1) or [])
+
+            # --- Cycle 2: failed purge restores the cancelled row. ---
+            victim2 = "$reg_v2"
+            child2 = "$reg_c2"
+            queue_edge_write(ns, [(self.room_id, child2, victim2, False)])
+            self.assertEqual(queued_edge_write_count(ns), 1)
+
+            with mock.patch(
+                "synapse.synapse_rust.mtxdb_engine.event_edges_delete",
+                side_effect=RuntimeError("simulated delete failure"),
+            ):
+                with self.assertRaises(RuntimeError):
+                    delete_event_edges_batch(ns, [victim2])
+
+            # The cancelled row was restored (not dropped).
+            self.assertEqual(queued_edge_write_count(ns), 1)
+
+            # The dirty marker was set, causing the coalescer to retry.
+            self.assertIsNotNone(coalescer._delayed_call)
+
+            # The restored row is flushable as a repair write.
+            flush_edge_writes(ns)
+            self.assertEqual(queued_edge_write_count(ns), 0)
+            fwd = get_event_edges_forward_batch(ns, [victim2])
+            self.assertIn(child2, fwd.get(victim2) or [])
+        finally:
+            _clear_coalescer(coalescer)
+            coalescer.close()
+            flush_edge_writes(ns)
+
     def test_two_namespaces_flush_independently(self) -> None:
         """Rows in namespace A are not flushed when namespace B is drained."""
         ns_a = "test-edges-ns-a"
