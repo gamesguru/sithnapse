@@ -161,13 +161,15 @@ _REACTOR_LAG_SAMPLES: deque[float] = deque(maxlen=_FFI_LATENCY_LIMIT)
 _reactor_lag_probe_started: bool = False
 
 
-def start_reactor_lag_probe(clock: "Clock") -> Callable[[], None] | None:
-    """Start the opt-in reactor-lag probe on the real Trial reactor.
+def start_reactor_lag_probe(
+    call_from_thread: Callable[[Callable[[], None]], None],
+) -> Callable[[], None] | None:
+    """Start an opt-in probe that measures callback delay on Trial's reactor.
 
     No-op unless SYNAPSE_PG_TIMINGS is set. Idempotent -- a second call
-    is a no-op. Do not pass a homeserver's test clock here: Synapse tests
-    commonly use a fake clock whose advances are controlled by the test and
-    are not evidence of reactor blocking.
+    is a no-op. A sampler thread posts timestamped callbacks via
+    ``call_from_thread`` so the probe doesn't leave a recurring DelayedCall
+    in Trial's reactor (which its per-test leak check would correctly reject).
     """
     global _reactor_lag_probe_started
     if not os.environ.get("SYNAPSE_PG_TIMINGS"):
@@ -176,27 +178,48 @@ def start_reactor_lag_probe(clock: "Clock") -> Callable[[], None] | None:
         return None
     _reactor_lag_probe_started = True
 
-    from synapse.util.duration import Duration
+    stop_event = threading.Event()
 
-    interval = Duration(seconds=_REACTOR_LAG_INTERVAL_SECS)
-    next_expected_fire = time.monotonic() + _REACTOR_LAG_INTERVAL_SECS
-
-    def _tick() -> None:
-        nonlocal next_expected_fire
-        now = time.monotonic()
-        lag = max(0.0, now - next_expected_fire)
+    def _record_lag(expected: float) -> None:
+        lag = max(0.0, time.monotonic() - expected)
         lock = _FFI_TIMING_LOCK
         if lock is not None:
             with lock:
                 _REACTOR_LAG_SAMPLES.append(lag)
         else:
             _REACTOR_LAG_SAMPLES.append(lag)
-        # Schedule from the actual callback time; don't generate catch-up
-        # ticks after a long stall and inflate the lag sample count.
-        next_expected_fire = now + _REACTOR_LAG_INTERVAL_SECS
 
-    looping_call = clock.looping_call(_tick, interval)
-    return looping_call.stop
+    def _sample() -> None:
+        expected = time.monotonic() + _REACTOR_LAG_INTERVAL_SECS
+        while not stop_event.wait(max(0.0, expected - time.monotonic())):
+            try:
+
+                def record_expected_lag(deadline: float = expected) -> None:
+                    _record_lag(deadline)
+
+                call_from_thread(record_expected_lag)
+            except Exception:
+                logger.debug(
+                    "Reactor-lag probe could not enqueue a sample", exc_info=True
+                )
+                return
+            # Keep a fixed cadence without flooding the reactor with
+            # catch-up callbacks after the sampler thread itself is delayed.
+            expected = max(
+                expected + _REACTOR_LAG_INTERVAL_SECS,
+                time.monotonic() + _REACTOR_LAG_INTERVAL_SECS,
+            )
+
+    sampler = threading.Thread(
+        target=_sample, name="synapse-reactor-lag-probe", daemon=True
+    )
+    sampler.start()
+
+    def stop() -> None:
+        stop_event.set()
+        sampler.join(timeout=1.0)
+
+    return stop
 
 
 @contextmanager

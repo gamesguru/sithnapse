@@ -20,7 +20,7 @@ import sys
 import tempfile
 import time
 from collections import defaultdict
-from typing import IO, Protocol, cast
+from typing import IO, Any, Callable, Protocol, cast
 
 from twisted.python import usage
 from twisted.scripts.trial import Options, _getSuite, _initialDebugSetup, _makeRunner
@@ -676,12 +676,12 @@ def run() -> None:
         from synapse.storage.databases.main.embedded_common import (
             start_reactor_lag_probe,
         )
-        from synapse.types import ISynapseThreadlessReactor
-        from synapse.util.clock import Clock
 
-        reactor_lag_probe_stop = start_reactor_lag_probe(
-            Clock(cast(ISynapseThreadlessReactor, reactor), server_name="trial")  # type: ignore[multiple-internal-clocks]
+        call_from_thread = cast(
+            Callable[[Callable[[], None]], None],
+            cast(Any, reactor).callFromThread,
         )
+        reactor_lag_probe_stop = start_reactor_lag_probe(call_from_thread)
 
     interrupted = False
     successful = False
