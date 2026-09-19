@@ -495,7 +495,7 @@ jobs:
         if: ${{ matrix.job.postgres-version }}
         timeout-minutes: 2
         run: until pg_isready -h localhost; do sleep 1; done
-      - run: uv run trial --jobs=6 tests
+      - run: uv run trial --jobs="$(nproc)" tests
         env:
           SYNAPSE_POSTGRES: ${{ matrix.job.database == 'postgres' || '' }}
           SYNAPSE_POSTGRES_HOST: /var/run/postgresql
@@ -570,7 +570,7 @@ jobs:
             sleep 2
             if [ $i -eq 5 ]; then exit 1; fi
           done
-      - run: uv run trial --jobs=6 tests
+      - run: uv run trial --jobs="$(nproc)" tests
         env:
           SYNAPSE_TEST_EMBEDDED_HAMT_ENGINE: mtxdb
           SYNAPSE_TEST_EMBEDDED_HAMT_PATH: /tmp/synapse-embedded-hamt
@@ -630,7 +630,7 @@ jobs:
       # Sanity check we can import/run Synapse
       - run: python -m synapse.app.homeserver --help
 
-      - run: python -m twisted.trial -j6 tests
+      - run: python -m twisted.trial -j"$(nproc)" tests
       - name: Dump logs
         # Logs are most useful when the command fails, always include them.
         if: ${{ always() }}
@@ -678,7 +678,7 @@ jobs:
             sleep 2
             if [ $i -eq 5 ]; then exit 1; fi
           done
-      - run: uv run trial --jobs=2 tests
+      - run: uv run trial --jobs="$(nproc)" tests
       - name: Dump logs
         # Logs are most useful when the command fails, always include them.
         if: ${{ always() }}
