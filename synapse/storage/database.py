@@ -29,7 +29,7 @@ import sys
 import threading
 import time
 import types
-from collections import defaultdict
+from collections import defaultdict, deque
 from time import monotonic as monotonic_time
 from typing import (
     IO,
@@ -121,6 +121,10 @@ _TABLE_OPS_ROWS: dict[str, int] = defaultdict(int)
 # "dictionary changed size during iteration" and lose the flush it exists
 # to produce.
 _TABLE_OPS_LOCK = threading.Lock()
+_SQL_SCHEDULING_LOCK = threading.Lock()
+_SQL_SCHEDULING_TOTAL: float = 0.0
+_SQL_SCHEDULING_COUNT: int = 0
+_SQL_SCHEDULING_LATENCIES: deque[float] = deque(maxlen=4096)
 
 _TABLE_RE = re.compile(
     r"(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM|FROM|JOIN)\s+(\w+)",
@@ -169,17 +173,40 @@ def _track_table_op(sql: str, elapsed: float, rowcount: int = 0) -> None:
             _TABLE_OPS_ROWS[table] += max(rowcount, 0)
 
 
+def _track_sql_scheduling(elapsed: float) -> None:
+    """Record pool checkout/thread scheduling delay for the opt-in report."""
+    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+        return
+    global _SQL_SCHEDULING_TOTAL, _SQL_SCHEDULING_COUNT
+    with _SQL_SCHEDULING_LOCK:
+        _SQL_SCHEDULING_TOTAL += elapsed
+        _SQL_SCHEDULING_COUNT += 1
+        _SQL_SCHEDULING_LATENCIES.append(elapsed)
+
+
 def _print_table_ops() -> None:
     if not os.environ.get("SYNAPSE_PG_TIMINGS"):
         return
     with _TABLE_OPS_LOCK:
-        if not _TABLE_OPS:
-            return
         # Snapshot under the lock so the SIGTERM/atexit flusher never races a
         # concurrent `_track_table_op` on `_TABLE_OPS` (see _TABLE_OPS_LOCK).
         table_ops = dict(_TABLE_OPS)
         table_counts = dict(_TABLE_OPS_COUNTS)
         table_rows = dict(_TABLE_OPS_ROWS)
+
+    with _SQL_SCHEDULING_LOCK:
+        scheduling_total = _SQL_SCHEDULING_TOTAL
+        scheduling_count = _SQL_SCHEDULING_COUNT
+        scheduling_samples = sorted(_SQL_SCHEDULING_LATENCIES)
+
+    if not table_ops and not scheduling_count:
+        return
+
+    scheduling = {
+        "total": scheduling_total,
+        "count": scheduling_count,
+        "latencies": scheduling_samples,
+    }
 
     run_dir = os.environ.get("SYNAPSE_TIMINGS_RUN_DIR")
     if run_dir:
@@ -188,7 +215,12 @@ def _print_table_ops() -> None:
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(
-                    {"ops": table_ops, "counts": table_counts, "rows": table_rows},
+                    {
+                        "ops": table_ops,
+                        "counts": table_counts,
+                        "rows": table_rows,
+                        "scheduling": scheduling,
+                    },
                     f,
                 )
             os.replace(tmp_path, final_path)
@@ -245,6 +277,25 @@ def _print_table_ops() -> None:
     )
     _timings_print("=====================================")
     _timings_print("")
+
+    if scheduling_count and scheduling_samples:
+        samples = scheduling_samples
+
+        def percentile(p: float) -> float:
+            return samples[min(int(len(samples) * p), len(samples) - 1)]
+
+        _timings_print("=== SQL pool scheduling delay (not query execution) ===")
+        _timings_print(
+            f"  total={scheduling_total * 1000:.1f}ms  "
+            f"calls={scheduling_count:,}  "
+            f"avg={scheduling_total * 1000 / scheduling_count:.3f}ms  "
+            f"p50={percentile(0.50) * 1000:.3f}ms  "
+            f"p95={percentile(0.95) * 1000:.3f}ms  "
+            f"p99={percentile(0.99) * 1000:.3f}ms  "
+            f"max={samples[-1] * 1000:.3f}ms"
+        )
+        _timings_print("======================================================")
+        _timings_print("")
 
 
 if os.environ.get("SYNAPSE_PG_TIMINGS"):
@@ -1352,6 +1403,7 @@ class DatabasePool:
                     sql_scheduling_timer.labels(
                         **{SERVER_NAME_LABEL: self.server_name}
                     ).observe(sched_duration_sec)
+                    _track_sql_scheduling(sched_duration_sec)
                     context.add_database_scheduled(sched_duration_sec)
 
                     if self._txn_limit > 0:

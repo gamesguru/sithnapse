@@ -49,6 +49,7 @@ from synapse.storage.databases.main.embedded_common import (
     ffi_batch_size,
     ffi_count,
     ffi_timing,
+    lock_wait_timing,
     mark_dirty,
     mirror_timing,
     sync_now,
@@ -152,7 +153,7 @@ def queued_edge_write_count(namespace: str | None = None) -> int:
 
     Exposed for tests/diagnostics; ``namespace=None`` counts every namespace.
     """
-    with _edge_write_queues_lock:
+    with lock_wait_timing(_edge_write_queues_lock, "edge_queues"):
         if namespace is None:
             return sum(len(q) for q in _edge_write_queues.values())
         return len(_edge_write_queues.get(namespace, []))
@@ -179,8 +180,11 @@ def queue_edge_write(
     row_list = list(rows)
     if not row_list:
         return
-    with _namespace_flush_lock(namespace):
-        with _edge_write_queues_lock:
+    # This callback may run on the reactor thread. Measure each lock's
+    # acquisition wait and hold time separately; reactor lag is measured by
+    # the process-level probe, not conflated with lock wait here.
+    with lock_wait_timing(_namespace_flush_lock(namespace), "edge_namespace_flush"):
+        with lock_wait_timing(_edge_write_queues_lock, "edge_queues"):
             tombstones = _prune_tombstones_locked(namespace, time.monotonic()) or {}
             purging = _edge_write_purging.get(namespace) or ()
             if tombstones or purging:
@@ -221,13 +225,13 @@ def flush_edge_writes(namespace: str | None = None, *, sync: bool = False) -> bo
     first restored the drained rows to the front of their queue.
     """
     if namespace is not None:
-        with _namespace_flush_lock(namespace):
+        with lock_wait_timing(_namespace_flush_lock(namespace), "edge_namespace_flush"):
             return _flush_namespace_locked(namespace, sync=sync)
-    with _edge_write_queues_lock:
+    with lock_wait_timing(_edge_write_queues_lock, "edge_queues"):
         namespaces = list(_edge_write_queues)
     flushed = False
     for ns in namespaces:
-        with _namespace_flush_lock(ns):
+        with lock_wait_timing(_namespace_flush_lock(ns), "edge_namespace_flush"):
             if _flush_namespace_locked(ns, sync=sync):
                 flushed = True
     return flushed
@@ -240,7 +244,7 @@ def _flush_namespace_locked(namespace: str, *, sync: bool = False) -> bool:
     succeeds; on failure the rows are restored to the front of the queue and
     the exception is re-raised.
     """
-    with _edge_write_queues_lock:
+    with lock_wait_timing(_edge_write_queues_lock, "edge_queues"):
         q = _edge_write_queues.get(namespace)
         if not q:
             return False
@@ -249,12 +253,12 @@ def _flush_namespace_locked(namespace: str, *, sync: bool = False) -> bool:
     try:
         put_event_edges_batch(namespace, rows, sync=sync)
     except Exception:
-        with _edge_write_queues_lock:
+        with lock_wait_timing(_edge_write_queues_lock, "edge_queues"):
             restored = _edge_write_queues.setdefault(namespace, [])
             restored[0:0] = rows
         mark_dirty(Pool.EVENT_DAG)
         raise
-    with _edge_write_queues_lock:
+    with lock_wait_timing(_edge_write_queues_lock, "edge_queues"):
         q = _edge_write_queues.get(namespace)
         if q is not None and not q:
             _edge_write_queues.pop(namespace, None)
@@ -332,7 +336,7 @@ def delete_event_edges_batch(
         return
 
     purged = set(event_ids)
-    with _namespace_flush_lock(namespace):
+    with lock_wait_timing(_namespace_flush_lock(namespace), "edge_namespace_flush"):
         now = time.monotonic()
         deadline = now + _EDGE_WRITE_TOMBSTONE_TTL
 
@@ -341,7 +345,7 @@ def delete_event_edges_batch(
         #    either cancelled here or filtered by the markers.  The permanent
         #    tombstone is deferred until the FFI delete succeeds.
         cancelled_rows: list[EdgeRow] = []
-        with _edge_write_queues_lock:
+        with lock_wait_timing(_edge_write_queues_lock, "edge_queues"):
             _prune_tombstones_locked(namespace, now)
             _edge_write_purging.setdefault(namespace, set()).update(purged)
             q = _edge_write_queues.get(namespace)
@@ -384,7 +388,7 @@ def delete_event_edges_batch(
                 ffi_timing("ffi_event_edges_delete", elapsed)
                 ffi_count("event_edges_deleted", len(event_ids))
         except Exception:
-            with _edge_write_queues_lock:
+            with lock_wait_timing(_edge_write_queues_lock, "edge_queues"):
                 purging = _edge_write_purging.get(namespace)
                 if purging is not None:
                     purging.difference_update(purged)
@@ -401,7 +405,7 @@ def delete_event_edges_batch(
             mark_dirty(Pool.EVENT_DAG)
             raise
 
-        with _edge_write_queues_lock:
+        with lock_wait_timing(_edge_write_queues_lock, "edge_queues"):
             purging = _edge_write_purging.get(namespace)
             if purging is not None:
                 purging.difference_update(purged)

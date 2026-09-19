@@ -10,7 +10,7 @@ import time
 from collections import defaultdict, deque
 from contextlib import contextmanager
 from enum import Enum, auto
-from typing import IO, TYPE_CHECKING, Iterable, Iterator
+from typing import IO, TYPE_CHECKING, Callable, Iterable, Iterator
 
 if TYPE_CHECKING:
     from synapse.util.clock import Clock, DelayedCallWrapper
@@ -143,6 +143,85 @@ def ffi_batch_size(tag: str, size: int) -> None:
         _FFI_BATCH_SIZES[tag].append(size)
 
 
+# ── Reactor-lag probe (opt-in via SYNAPSE_PG_TIMINGS=1) ──────────────────
+#
+# Every timer above brackets the duration of a call this module knows
+# about. None of them can see time spent *before* a call starts -- e.g. a
+# txn.call_after callback (queue_edge_write, a coalescer flush, sync_now)
+# blocking the Twisted reactor thread delays every other pending reactor
+# callback in the process, including unrelated tests' code that never
+# touches mtxdb. That delay is invisible to ffi_timing/mirror_timing and
+# shows up only as unexplained wall-clock time elsewhere. This probe makes
+# it visible directly: a looping call scheduled at a fixed interval records
+# how much later than requested it actually fired. A healthy, unblocked
+# reactor keeps this near zero; sustained lag spikes correlated with
+# mtxdb/edge-write activity are direct evidence of reactor starvation.
+_REACTOR_LAG_INTERVAL_SECS: float = 0.1
+_REACTOR_LAG_SAMPLES: deque[float] = deque(maxlen=_FFI_LATENCY_LIMIT)
+_reactor_lag_probe_started: bool = False
+
+
+def start_reactor_lag_probe(clock: "Clock") -> Callable[[], None] | None:
+    """Start the opt-in reactor-lag probe on the real Trial reactor.
+
+    No-op unless SYNAPSE_PG_TIMINGS is set. Idempotent -- a second call
+    is a no-op. Do not pass a homeserver's test clock here: Synapse tests
+    commonly use a fake clock whose advances are controlled by the test and
+    are not evidence of reactor blocking.
+    """
+    global _reactor_lag_probe_started
+    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+        return None
+    if _reactor_lag_probe_started:
+        return None
+    _reactor_lag_probe_started = True
+
+    from synapse.util.duration import Duration
+
+    interval = Duration(seconds=_REACTOR_LAG_INTERVAL_SECS)
+    next_expected_fire = time.monotonic() + _REACTOR_LAG_INTERVAL_SECS
+
+    def _tick() -> None:
+        nonlocal next_expected_fire
+        now = time.monotonic()
+        lag = max(0.0, now - next_expected_fire)
+        lock = _FFI_TIMING_LOCK
+        if lock is not None:
+            with lock:
+                _REACTOR_LAG_SAMPLES.append(lag)
+        else:
+            _REACTOR_LAG_SAMPLES.append(lag)
+        # Schedule from the actual callback time; don't generate catch-up
+        # ticks after a long stall and inflate the lag sample count.
+        next_expected_fire = now + _REACTOR_LAG_INTERVAL_SECS
+
+    looping_call = clock.looping_call(_tick, interval)
+    return looping_call.stop
+
+
+@contextmanager
+def lock_wait_timing(lock: threading.Lock, tag: str) -> Iterator[None]:
+    """Measure lock acquisition wait and hold time separately.
+
+    Recorded as `lock_wait_<tag>` and `lock_hold_<tag>` in the FFI timing
+    report. No timing calls are made unless SYNAPSE_PG_TIMINGS is enabled.
+    """
+    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+        with lock:
+            yield
+        return
+    start = time.monotonic()
+    lock.acquire()
+    acquired = time.monotonic()
+    try:
+        yield
+    finally:
+        held = time.monotonic() - acquired
+        lock.release()
+        ffi_timing(f"lock_wait_{tag}", acquired - start)
+        ffi_timing(f"lock_hold_{tag}", held)
+
+
 def _print_ffi_timings() -> None:
     if not os.environ.get("SYNAPSE_PG_TIMINGS"):
         return
@@ -157,6 +236,7 @@ def _print_ffi_timings() -> None:
         counters = dict(_FFI_COUNTERS)
         batch_sizes = {k: sorted(v) for k, v in _FFI_BATCH_SIZES.items() if v}
         latencies = {k: sorted(v) for k, v in _FFI_LATENCIES.items() if v}
+        reactor_lag_samples = sorted(_REACTOR_LAG_SAMPLES)
 
     run_dir = os.environ.get("SYNAPSE_TIMINGS_RUN_DIR")
     if run_dir:
@@ -171,6 +251,7 @@ def _print_ffi_timings() -> None:
                         "counters": counters,
                         "batch_sizes": batch_sizes,
                         "latencies": latencies,
+                        "reactor_lag_samples": reactor_lag_samples,
                     },
                     f,
                 )
@@ -295,6 +376,26 @@ def _print_ffi_timings() -> None:
                 f"  {tag:50s}  calls={len(values):,}  avg={sum(values) / len(values):.1f}  p50={p50}  p95={p95}"
             )
         _ffi_timings_print("=======================")
+        _ffi_timings_print("")
+    if reactor_lag_samples:
+        p50 = _percentile(reactor_lag_samples, 0.50) * 1000
+        p95 = _percentile(reactor_lag_samples, 0.95) * 1000
+        p99 = _percentile(reactor_lag_samples, 0.99) * 1000
+        worst = reactor_lag_samples[-1] * 1000
+        delayed_10ms = sum(sample >= 0.010 for sample in reactor_lag_samples)
+        delayed_50ms = sum(sample >= 0.050 for sample in reactor_lag_samples)
+        delayed_100ms = sum(sample >= 0.100 for sample in reactor_lag_samples)
+        _ffi_timings_print("=== Reactor callback scheduling lag ===")
+        _ffi_timings_print(
+            f"  interval={_REACTOR_LAG_INTERVAL_SECS * 1000:.0f}ms  "
+            f"samples={len(reactor_lag_samples):,} (last {_FFI_LATENCY_LIMIT:,})  "
+            f"p50={p50:.3f}ms  p95={p95:.3f}ms  p99={p99:.3f}ms  worst={worst:.3f}ms"
+        )
+        _ffi_timings_print(
+            f"  delayed ticks: >=10ms={delayed_10ms:,}  >=50ms={delayed_50ms:,}  "
+            f">=100ms={delayed_100ms:,}"
+        )
+        _ffi_timings_print("==========================================")
         _ffi_timings_print("")
 
 

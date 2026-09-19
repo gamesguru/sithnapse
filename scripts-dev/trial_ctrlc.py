@@ -261,6 +261,9 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
         sql_ops: dict[str, float] = defaultdict(float)
         sql_counts: dict[str, int] = defaultdict(int)
         sql_rows: dict[str, int] = defaultdict(int)
+        sql_scheduling_total = 0.0
+        sql_scheduling_count = 0
+        sql_scheduling_samples: list[float] = []
         for fname in sql_files:
             try:
                 with open(os.path.join(timings_dir, fname), encoding="utf-8") as sql_fh:
@@ -271,6 +274,10 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                     sql_counts[k] += v
                 for k, v in data.get("rows", {}).items():
                     sql_rows[k] += v
+                scheduling = data.get("scheduling", {})
+                sql_scheduling_total += scheduling.get("total", 0.0)
+                sql_scheduling_count += scheduling.get("count", 0)
+                sql_scheduling_samples.extend(scheduling.get("latencies", []))
             except Exception as e:
                 out(f"Warning: failed to read {fname}: {e}")
 
@@ -325,6 +332,30 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                 f"  {total_row[0]:{table_width}s}  {total_row[1]:>{total_width}s}  {total_row[2]:>{calls_width}s}  {total_row[3]:>{rows_width}s}  {total_row[4]:>{avg_width}s}"
             )
             out("=====================================")
+            out("")
+
+        if sql_scheduling_count and sql_scheduling_samples:
+            sql_scheduling_samples.sort()
+
+            def _sql_sched_percentile(p: float) -> float:
+                idx = min(
+                    int(len(sql_scheduling_samples) * p),
+                    len(sql_scheduling_samples) - 1,
+                )
+                return sql_scheduling_samples[idx]
+
+            out("\n=== SQL pool scheduling delay (not query execution) ===")
+            out(
+                f"  total={sql_scheduling_total * 1000:.1f}ms  "
+                f"calls={sql_scheduling_count:,}  "
+                f"avg={sql_scheduling_total * 1000 / sql_scheduling_count:.3f}ms  "
+                f"p50={_sql_sched_percentile(0.50) * 1000:.3f}ms  "
+                f"p95={_sql_sched_percentile(0.95) * 1000:.3f}ms  "
+                f"p99={_sql_sched_percentile(0.99) * 1000:.3f}ms  "
+                f"max={sql_scheduling_samples[-1] * 1000:.3f}ms  "
+                f"samples={len(sql_scheduling_samples):,} (capped per process)"
+            )
+            out("======================================================")
             out("")
 
     # 3. State store mtxdb-vs-SQL
@@ -636,6 +667,22 @@ def run() -> None:
         trialRunner.workingDirectory = os.path.abspath(trialRunner.workingDirectory)
     suite = _getSuite(config)
 
+    reactor_lag_probe_stop = None
+    if os.environ.get("SYNAPSE_PG_TIMINGS") and config["jobs"] is None:
+        # Measure lag on Trial's real reactor, not on the fake per-test
+        # reactors passed into most homeservers by Synapse's test harness.
+        from twisted.internet import reactor
+
+        from synapse.storage.databases.main.embedded_common import (
+            start_reactor_lag_probe,
+        )
+        from synapse.types import ISynapseThreadlessReactor
+        from synapse.util.clock import Clock
+
+        reactor_lag_probe_stop = start_reactor_lag_probe(
+            Clock(cast(ISynapseThreadlessReactor, reactor), server_name="trial")  # type: ignore[multiple-internal-clocks]
+        )
+
     interrupted = False
     successful = False
     timing_file: IO[str] | None = None
@@ -678,6 +725,8 @@ def run() -> None:
     finally:
         if timing_file is not None:
             timing_file.close()
+        if reactor_lag_probe_stop is not None:
+            reactor_lag_probe_stop()
         if timings_dir:
             try:
                 _flush_process_timings()
