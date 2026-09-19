@@ -292,6 +292,9 @@ class PersistEventsStore:
         self._embedded_event_json_enabled = open_embedded_event_json_engine(hs)
         self._embedded_event_edges_enabled = open_embedded_event_edges_engine(hs)
         self._embedded_event_edges_writable = embedded_event_edges_is_writable(hs)
+        self._embedded_event_edges_write_disabled = (
+            hs.config.database.embedded_hamt_disable_event_edges_writes
+        )
         self._embedded_hamt_engine = hs.config.database.embedded_hamt_engine
         self._embedded_hamt_namespace = (
             hs.config.database.embedded_hamt_namespace or hs.hostname
@@ -3941,7 +3944,10 @@ class PersistEventsStore:
             ],
         )
 
-        if self._embedded_event_edges_writable:
+        if (
+            self._embedded_event_edges_writable
+            and not self._embedded_event_edges_write_disabled
+        ):
             edge_rows = [
                 (ev.room_id, ev.event_id, e_id, False)
                 for ev in events

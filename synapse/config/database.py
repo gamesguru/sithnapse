@@ -98,6 +98,14 @@ class DatabaseConfig(Config):
         # NOT for production use.  Set via embedded_hamt.no_sync or
         # SYNAPSE_MTXDB_NO_SYNC env var.
         self.embedded_hamt_no_sync: bool = False
+        # Diagnostic escape hatch: when True, embedded event-edges writes are
+        # disabled entirely (the persist-path queue_edge_write enqueue is
+        # skipped) while reads, SQL event_edges writes, and the JSON/state HAMT
+        # writes continue as normal. Used to price the cost of the event-DAG
+        # mirror writes in isolation. NOT for production use. Set via
+        # embedded_hamt.disable_event_edges_writes or
+        # SYNAPSE_MTXDB_DISABLE_EVENT_EDGES env var.
+        self.embedded_hamt_disable_event_edges_writes: bool = False
 
     def read_config(self, config: JsonDict, **kwargs: Any) -> None:
         # We *experimentally* support specifying multiple databases via the
@@ -128,6 +136,14 @@ class DatabaseConfig(Config):
             if not isinstance(no_sync, bool):
                 raise ConfigError("embedded_hamt.no_sync must be a boolean")
             self.embedded_hamt_no_sync = no_sync
+            disable_event_edges = embedded_config.get(
+                "disable_event_edges_writes", False
+            )
+            if not isinstance(disable_event_edges, bool):
+                raise ConfigError(
+                    "embedded_hamt.disable_event_edges_writes must be a boolean"
+                )
+            self.embedded_hamt_disable_event_edges_writes = disable_event_edges
 
         env_engine = os.environ.get("SYNAPSE_EMBEDDED_HAMT_ENGINE")
         if env_engine:
@@ -137,6 +153,8 @@ class DatabaseConfig(Config):
             self.embedded_hamt_path = env_path
         if os.environ.get("SYNAPSE_MTXDB_NO_SYNC"):
             self.embedded_hamt_no_sync = True
+        if os.environ.get("SYNAPSE_MTXDB_DISABLE_EVENT_EDGES"):
+            self.embedded_hamt_disable_event_edges_writes = True
 
         # A concise production switch. The path is deliberately still
         # required: unlike tests, a production server must never silently put
