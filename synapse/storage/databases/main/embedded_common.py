@@ -5,8 +5,10 @@ import hashlib
 import json
 import logging
 import os
+import sys
 import threading
 import time
+import traceback
 from collections import defaultdict, deque
 from contextlib import contextmanager
 from enum import Enum, auto
@@ -152,19 +154,23 @@ def ffi_batch_size(tag: str, size: int) -> None:
 # callback in the process, including unrelated tests' code that never
 # touches mtxdb. That delay is invisible to ffi_timing/mirror_timing and
 # shows up only as unexplained wall-clock time elsewhere. This probe makes
-# it visible directly: a looping call scheduled at a fixed interval records
-# how much later than requested it actually fired. A healthy, unblocked
-# reactor keeps this near zero; sustained lag spikes correlated with
-# mtxdb/edge-write activity are direct evidence of reactor starvation.
+# it visible directly: a sampler thread posts callbacks at a fixed interval,
+# and the probe separates sampler wake lateness from callback dispatch delay.
+# When a prior callback is still pending, it also snapshots the main thread's
+# stack to show what is occupying it. This is diagnostic evidence, not by
+# itself proof that a particular subsystem caused the delay.
 _REACTOR_LAG_INTERVAL_SECS: float = 0.1
-_REACTOR_LAG_SAMPLES: deque[float] = deque(maxlen=_FFI_LATENCY_LIMIT)
+_REACTOR_LAG_RECORDS: deque[tuple[float, float, float]] = deque(
+    maxlen=_FFI_LATENCY_LIMIT
+)
+_REACTOR_LAG_STACKS: deque[tuple[float, str]] = deque(maxlen=256)
 _reactor_lag_probe_started: bool = False
 
 
 def start_reactor_lag_probe(
     call_from_thread: Callable[[Callable[[], None]], None],
 ) -> Callable[[], None] | None:
-    """Start an opt-in probe that measures callback delay on Trial's reactor.
+    """Start an opt-in probe for sampler and Trial-reactor callback delays.
 
     No-op unless SYNAPSE_PG_TIMINGS is set. Idempotent -- a second call
     is a no-op. A sampler thread posts timestamped callbacks via
@@ -180,25 +186,60 @@ def start_reactor_lag_probe(
 
     stop_event = threading.Event()
 
-    def _record_lag(expected: float) -> None:
-        lag = max(0.0, time.monotonic() - expected)
+    pending_lock = threading.Lock()
+    pending_callbacks = 0
+    main_thread_id = threading.main_thread().ident
+
+    def _record_lag(expected: float, posted_at: float) -> None:
+        nonlocal pending_callbacks
+        delivered_at = time.monotonic()
+        with pending_lock:
+            pending_callbacks -= 1
+        record = (expected, posted_at, delivered_at)
         lock = _FFI_TIMING_LOCK
         if lock is not None:
             with lock:
-                _REACTOR_LAG_SAMPLES.append(lag)
+                _REACTOR_LAG_RECORDS.append(record)
         else:
-            _REACTOR_LAG_SAMPLES.append(lag)
+            _REACTOR_LAG_RECORDS.append(record)
+
+    def _capture_main_stack(at: float) -> None:
+        if main_thread_id is None:
+            return
+        frame = sys._current_frames().get(main_thread_id)
+        if frame is None:
+            return
+        frames = traceback.extract_stack(frame, limit=12)
+        signature = " <- ".join(
+            f"{os.path.basename(item.filename)}:{item.lineno}:{item.name}"
+            for item in frames[-8:]
+        )
+        _REACTOR_LAG_STACKS.append((at, signature))
 
     def _sample() -> None:
+        nonlocal pending_callbacks
         expected = time.monotonic() + _REACTOR_LAG_INTERVAL_SECS
         while not stop_event.wait(max(0.0, expected - time.monotonic())):
+            posted_at = time.monotonic()
+            with pending_lock:
+                reactor_callback_pending = pending_callbacks > 0
+                pending_callbacks += 1
+            if reactor_callback_pending:
+                # Capture the main/reactor thread while an earlier posted
+                # probe callback is still waiting to run. This identifies
+                # the work occupying that thread during observed dispatch lag.
+                _capture_main_stack(posted_at)
             try:
 
-                def record_expected_lag(deadline: float = expected) -> None:
-                    _record_lag(deadline)
+                def record_expected_lag(
+                    deadline: float = expected, queued_at: float = posted_at
+                ) -> None:
+                    _record_lag(deadline, queued_at)
 
                 call_from_thread(record_expected_lag)
             except Exception:
+                with pending_lock:
+                    pending_callbacks -= 1
                 logger.debug(
                     "Reactor-lag probe could not enqueue a sample", exc_info=True
                 )
@@ -259,7 +300,8 @@ def _print_ffi_timings() -> None:
         counters = dict(_FFI_COUNTERS)
         batch_sizes = {k: sorted(v) for k, v in _FFI_BATCH_SIZES.items() if v}
         latencies = {k: sorted(v) for k, v in _FFI_LATENCIES.items() if v}
-        reactor_lag_samples = sorted(_REACTOR_LAG_SAMPLES)
+        reactor_lag_records = list(_REACTOR_LAG_RECORDS)
+        reactor_lag_stacks = list(_REACTOR_LAG_STACKS)
 
     run_dir = os.environ.get("SYNAPSE_TIMINGS_RUN_DIR")
     if run_dir:
@@ -274,7 +316,8 @@ def _print_ffi_timings() -> None:
                         "counters": counters,
                         "batch_sizes": batch_sizes,
                         "latencies": latencies,
-                        "reactor_lag_samples": reactor_lag_samples,
+                        "reactor_lag_records": reactor_lag_records,
+                        "reactor_lag_stacks": reactor_lag_stacks,
                     },
                     f,
                 )
@@ -400,24 +443,47 @@ def _print_ffi_timings() -> None:
             )
         _ffi_timings_print("=======================")
         _ffi_timings_print("")
-    if reactor_lag_samples:
-        p50 = _percentile(reactor_lag_samples, 0.50) * 1000
-        p95 = _percentile(reactor_lag_samples, 0.95) * 1000
-        p99 = _percentile(reactor_lag_samples, 0.99) * 1000
-        worst = reactor_lag_samples[-1] * 1000
-        delayed_10ms = sum(sample >= 0.010 for sample in reactor_lag_samples)
-        delayed_50ms = sum(sample >= 0.050 for sample in reactor_lag_samples)
-        delayed_100ms = sum(sample >= 0.100 for sample in reactor_lag_samples)
+    if reactor_lag_records:
+        wake_lag = sorted(
+            posted - expected for expected, posted, _ in reactor_lag_records
+        )
+        dispatch_lag = sorted(
+            delivered - posted for _, posted, delivered in reactor_lag_records
+        )
+        end_to_end_lag = sorted(
+            delivered - expected for expected, _, delivered in reactor_lag_records
+        )
+
+        def print_lag_summary(label: str, values: list[float]) -> None:
+            p50 = _percentile(values, 0.50) * 1000
+            p95 = _percentile(values, 0.95) * 1000
+            p99 = _percentile(values, 0.99) * 1000
+            worst = max(values) * 1000
+            _ffi_timings_print(
+                f"  {label}: p50={p50:.3f}ms p95={p95:.3f}ms "
+                f"p99={p99:.3f}ms worst={worst:.3f}ms"
+            )
+
         _ffi_timings_print("=== Reactor callback scheduling lag ===")
         _ffi_timings_print(
             f"  interval={_REACTOR_LAG_INTERVAL_SECS * 1000:.0f}ms  "
-            f"samples={len(reactor_lag_samples):,} (last {_FFI_LATENCY_LIMIT:,})  "
-            f"p50={p50:.3f}ms  p95={p95:.3f}ms  p99={p99:.3f}ms  worst={worst:.3f}ms"
+            f"samples={len(reactor_lag_records):,} (last {_FFI_LATENCY_LIMIT:,})"
         )
-        _ffi_timings_print(
-            f"  delayed ticks: >=10ms={delayed_10ms:,}  >=50ms={delayed_50ms:,}  "
-            f">=100ms={delayed_100ms:,}"
-        )
+        print_lag_summary("sampler wake lateness", wake_lag)
+        print_lag_summary("reactor dispatch delay", dispatch_lag)
+        print_lag_summary("expected-to-dispatch", end_to_end_lag)
+        if reactor_lag_stacks:
+            stack_counts: dict[str, int] = defaultdict(int)
+            for _, stack in reactor_lag_stacks:
+                stack_counts[stack] += 1
+            _ffi_timings_print(
+                f"  main-thread stacks captured while callback pending: "
+                f"{len(reactor_lag_stacks)}"
+            )
+            for stack, count in sorted(
+                stack_counts.items(), key=lambda item: item[1], reverse=True
+            )[:8]:
+                _ffi_timings_print(f"    {count:>4}x {stack}")
         _ffi_timings_print("==========================================")
         _ffi_timings_print("")
 
