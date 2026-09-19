@@ -6,6 +6,9 @@ behaviour. Also aggregates multi-worker diagnostics when SYNAPSE_PG_TIMINGS=1.
 
 Usage: same arguments as `trial`, e.g.:
     python scripts-dev/trial_ctrlc.py -j 4 tests.storage.test_state
+
+Set ``SYNAPSE_TEST_TIMINGS_FILE`` to write one compact JSONL record per
+completed test, including its test ID, process ID, and elapsed milliseconds.
 """
 
 import json
@@ -15,8 +18,9 @@ import shutil
 import signal
 import sys
 import tempfile
+import time
 from collections import defaultdict
-from typing import Protocol, cast
+from typing import IO, Protocol, cast
 
 from twisted.python import usage
 from twisted.scripts.trial import Options, _getSuite, _initialDebugSetup, _makeRunner
@@ -26,6 +30,60 @@ from twisted.trial.runner import TrialRunner, _logFile, _testDirectory
 
 class _DistributedRunner(Protocol):
     _workingDirectory: str
+
+
+class _TimedTest(Protocol):
+    def id(self) -> str: ...
+
+
+class _TestResult(Protocol):
+    def startTest(self, test: object) -> None: ...
+
+    def stopTest(self, test: object) -> None: ...
+
+
+def _install_test_timing_logging(
+    result: _TestResult,
+) -> IO[str] | None:
+    """Add opt-in per-test JSONL timing around a Trial result.
+
+    This deliberately wraps the result rather than the tests themselves, so
+    setup/teardown and failures are included without changing test execution.
+    It is enabled only when ``SYNAPSE_TEST_TIMINGS_FILE`` is set.
+    """
+    path = os.environ.get("SYNAPSE_TEST_TIMINGS_FILE")
+    if not path:
+        return None
+
+    try:
+        timing_file = open(path, "a", encoding="utf-8")
+    except OSError as e:
+        print(f"warning: unable to open test timings file {path}: {e}", file=sys.stderr)
+        return None
+
+    starts: dict[int, int] = {}
+    original_start = result.startTest
+    original_stop = result.stopTest
+
+    def start_test(test: object) -> None:
+        starts[id(test)] = time.perf_counter_ns()
+        original_start(test)
+
+    def stop_test(test: object) -> None:
+        started = starts.pop(id(test), None)
+        if started is not None:
+            record = {
+                "pid": os.getpid(),
+                "test": cast(_TimedTest, test).id(),
+                "elapsed_ms": (time.perf_counter_ns() - started) / 1_000_000,
+            }
+            timing_file.write(json.dumps(record, separators=(",", ":")) + "\n")
+            timing_file.flush()
+        original_stop(test)
+
+    result.startTest = start_test  # type: ignore[method-assign]
+    result.stopTest = stop_test  # type: ignore[method-assign]
+    return timing_file
 
 
 def _flush_process_timings() -> None:
@@ -580,6 +638,7 @@ def run() -> None:
 
     interrupted = False
     successful = False
+    timing_file: IO[str] | None = None
 
     try:
         if config["jobs"] is not None:
@@ -589,6 +648,7 @@ def run() -> None:
             assert isinstance(trialRunner, TrialRunner)
             test = unittest.decorate(suite, itrial.ITestCase)
             result = trialRunner._makeResult()
+            timing_file = _install_test_timing_logging(result)
 
             def onSigint(signum: int, frame: object) -> None:
                 nonlocal interrupted
@@ -616,6 +676,8 @@ def run() -> None:
                 result.done()
             successful = result.wasSuccessful()
     finally:
+        if timing_file is not None:
+            timing_file.close()
         if timings_dir:
             try:
                 _flush_process_timings()
