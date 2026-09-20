@@ -207,6 +207,14 @@ INSERT INTO device_lists_changes_in_room_max_pruned_stream_id (stream_id) VALUES
 INSERT INTO device_lists_changes_converted_stream_position (stream_id, room_id) VALUES (1, '');
 INSERT INTO delayed_events_stream_pos (stream_id) VALUES (1);
 INSERT INTO room_forgetter_stream_pos (stream_id) VALUES (1);
+-- Matches the one-time seed row from
+-- schema/main/delta/88/05_drop_old_otks.sql.postgres, which a fresh clone
+-- always has its own independent copy of but a recycled DB does not once
+-- some earlier test's run has consumed/completed the task.
+INSERT INTO scheduled_tasks (id, action, status, timestamp) VALUES (
+    'delete_old_otks_task', 'delete_old_otks', 'scheduled',
+    extract(epoch from current_timestamp) * 1000
+);
 """
 
 _RESET_SEQUENCES_SQL = """
