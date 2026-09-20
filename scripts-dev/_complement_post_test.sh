@@ -18,11 +18,9 @@
 #      compared test-to-test rather than only inspected live.
 #
 #   2. On failure, `docker commit` the container to a locally-tagged image
-#      before Complement's Destroy() force-removes it. Complement itself
-#      has no "keep failed containers" option (Destroy always removes
-#      regardless of the `failed` flag), so this is the only hook point
-#      that runs early enough to preserve anything. The saved image can
-#      later be inspected with, e.g.:
+#      before Complement's Destroy() force-removes it. This can snapshot a
+#      very large writable layer, so it must not happen for passing tests.
+#      The saved image can later be inspected with, e.g.:
 #        docker run --rm -it --entrypoint sh <tag>
 #        docker cp <a-container-from-that-image>:/data/embedded_hamt ./out
 #
@@ -75,25 +73,17 @@ mkdir -p "$stats_dir"
 
 safe_name="$(printf '%s' "$test_name" | tr -c 'A-Za-z0-9_.-' '_')"
 
-# NOTE: under COMPLEMENT_ENABLE_DIRTY_RUNS=1 (which complement.sh forces on
-# unconditionally), Complement calls this hook exactly ONCE per package, at
-# the very end, always with test_name="COMPLEMENT_ENABLE_DIRTY_RUNS" and
-# failed=false -- never per-test, never with the real pass/fail status (see
-# complement's config.go doc comment on COMPLEMENT_ENABLE_DIRTY_RUNS). So
-# `failed` is not a usable signal here and nothing below may depend on it
-# being accurate; both the commit and the event_auth dump below run
-# unconditionally, once, at the one point this hook actually fires -- the
-# container is still alive at that point (this runs before Destroy), so
-# it's the only chance to see the whole run's accumulated state before it's
-# torn down. Only `OldDeploy`/blueprint-based tests still get their own
-# dedicated deployment and their own real per-test call to this hook; for
-# those `failed` is accurate.
+# With dirty runs, Complement invokes this once at package teardown with
+# failed=false, so there is deliberately no image snapshot in that mode.
+# For non-dirty runs, preserve only containers belonging to a failed test.
+if [[ "$failed" == "true" ]]; then
 tag="complement-failed-debug:${safe_name}-$(date +%s)"
 if "$runtime" commit "$container_id" "$tag" >/dev/null 2>&1; then
 	echo "saved container ${container_id} (test ${test_name}, failed=${failed}) as image ${tag}" >&2
 	echo "${tag}" >>"${stats_dir}/failed_images.txt"
 else
 	echo "WARN: failed to ${runtime} commit ${container_id} for ${test_name}" >&2
+fi
 fi
 
 # The one thing that actually discriminates between "the closure walk
