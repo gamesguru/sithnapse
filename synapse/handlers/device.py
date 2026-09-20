@@ -1541,11 +1541,10 @@ class DeviceListUpdater(DeviceListWorkerUpdater):
         # Check if we are partially joining any rooms. If so we need to store
         # all device list updates so that we can handle them correctly once we
         # know who is in the room.
-        # TODO(faster_joins): this fetches and processes a bunch of data that we don't
-        # use. Could be replaced by a tighter query e.g.
-        #   SELECT EXISTS(SELECT 1 FROM partial_state_rooms)
-        partial_rooms = await self.store.get_partial_state_room_resync_info()
-        if partial_rooms:
+        # We only need to know whether any room is partial here. Building the
+        # full room/server resync-info map performs multiple SQL queries for
+        # every device-list update; use the cached existence check instead.
+        if await self.store.has_partial_state_rooms():
             await self.store.add_remote_device_list_to_pending(
                 user_id,
                 device_id,

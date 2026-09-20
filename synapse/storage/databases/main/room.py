@@ -1886,6 +1886,18 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
         partial_state_rooms = await self.get_partial_rooms()
         return {room_id: room_id in partial_state_rooms for room_id in room_ids}
 
+    @cached(num_args=0)
+    async def has_partial_state_rooms(self) -> bool:
+        """Check whether any rooms are currently in partial state."""
+
+        def _has_partial_state_rooms_txn(txn: LoggingTransaction) -> bool:
+            txn.execute("SELECT 1 FROM partial_state_rooms LIMIT 1")
+            return txn.fetchone() is not None
+
+        return await self.db_pool.runInteraction(
+            "has_partial_state_rooms", _has_partial_state_rooms_txn
+        )
+
     @cached(max_entries=10000, iterable=True)
     async def get_partial_rooms(self) -> AbstractSet[str]:
         """Get any "partial-state" rooms which the user is in.
@@ -3038,6 +3050,7 @@ class RoomStore(RoomBackgroundUpdateStore, RoomWorkerStore):
             txn, self._get_partial_state_servers_at_join, (room_id,)
         )
         self._invalidate_all_cache_and_stream(txn, self.get_partial_rooms)
+        self._invalidate_all_cache_and_stream(txn, self.has_partial_state_rooms)
 
     async def write_partial_state_rooms_join_event_id(
         self,
@@ -3221,6 +3234,7 @@ class RoomStore(RoomBackgroundUpdateStore, RoomWorkerStore):
             txn, self._get_partial_state_servers_at_join, (room_id,)
         )
         self._invalidate_all_cache_and_stream(txn, self.get_partial_rooms)
+        self._invalidate_all_cache_and_stream(txn, self.has_partial_state_rooms)
 
         DatabasePool.simple_insert_txn(
             txn,
