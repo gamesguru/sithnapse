@@ -193,22 +193,7 @@ _DB_DROP_LOCK = threading.Lock()
 
 _RECYCLED_PG_DB: str | None = None
 _RECYCLED_PG_DB_IN_USE: bool = False
-_DIRTY_TABLES_PREV_TEST: set[str] = set()
 _PREV_TEST_HAD_DDL: bool = False
-
-_MUTABLE_SEED_TABLES = {
-    "appservice_stream_position",
-    "event_push_summary_last_receipt_stream_id",
-    "event_push_summary_stream_ordering",
-    "stats_incremental_position",
-    "user_directory_stream_pos",
-    "federation_stream_position",
-    "device_lists_changes_in_room_max_pruned_stream_id",
-    "device_lists_changes_converted_stream_position",
-    "delayed_events_stream_pos",
-    "room_forgetter_stream_pos",
-    "scheduled_tasks",
-}
 
 _RESEED_SQL = """
 INSERT INTO appservice_stream_position VALUES ('X', 0);
@@ -320,7 +305,6 @@ def _reset_db_drop_state_after_fork() -> None:
     global \
         _RECYCLED_PG_DB, \
         _RECYCLED_PG_DB_IN_USE, \
-        _DIRTY_TABLES_PREV_TEST, \
         _PREV_TEST_HAD_DDL
     _DB_DROP_PID = os.getpid()
     _DB_DROP_QUEUE = queue.Queue(maxsize=_DB_DROP_QUEUE_MAXSIZE)
@@ -328,7 +312,6 @@ def _reset_db_drop_state_after_fork() -> None:
     _DB_DROP_LOCK = threading.Lock()
     _RECYCLED_PG_DB = None
     _RECYCLED_PG_DB_IN_USE = False
-    _DIRTY_TABLES_PREV_TEST = set()
     _PREV_TEST_HAD_DDL = False
 
 
@@ -1916,7 +1899,6 @@ def setup_test_homeserver(
         global \
             _RECYCLED_PG_DB, \
             _RECYCLED_PG_DB_IN_USE, \
-            _DIRTY_TABLES_PREV_TEST, \
             _PREV_TEST_HAD_DDL
         from synapse.storage.database import pop_dirty_tables
 
@@ -2089,7 +2071,6 @@ def setup_test_homeserver(
                 global \
                     _RECYCLED_PG_DB, \
                     _RECYCLED_PG_DB_IN_USE, \
-                    _DIRTY_TABLES_PREV_TEST, \
                     _PREV_TEST_HAD_DDL
                 if test_db == _RECYCLED_PG_DB:
                     # Dirty-table tracking is process-global, not per DB. Only
@@ -2099,7 +2080,7 @@ def setup_test_homeserver(
                     # recycled primary is reset for the next test.
                     from synapse.storage.database import pop_dirty_tables
 
-                    dirty, had_ddl, ddl_triggers = pop_dirty_tables()
+                    _, had_ddl, ddl_triggers = pop_dirty_tables()
                     if (
                         had_ddl
                         and ddl_triggers
@@ -2115,7 +2096,6 @@ def setup_test_homeserver(
                     if had_ddl:
                         _pg_counter("cleanup_dropped_primary_had_ddl")
                         _RECYCLED_PG_DB = None
-                        _DIRTY_TABLES_PREV_TEST = set()
                         _PREV_TEST_HAD_DDL = False
                         if os.environ.get("SYNAPSE_TEST_SYNC_DROP_DB") == "1":
                             _drop_test_db(test_db, test_name, db_engine)
@@ -2125,7 +2105,6 @@ def setup_test_homeserver(
                     elif os.environ.get("SYNAPSE_TEST_NO_RECYCLE_DB") == "1":
                         _pg_counter("cleanup_dropped_primary_env_disabled")
                         _RECYCLED_PG_DB = None
-                        _DIRTY_TABLES_PREV_TEST = set()
                         _PREV_TEST_HAD_DDL = False
                         if os.environ.get("SYNAPSE_TEST_SYNC_DROP_DB") == "1":
                             _drop_test_db(test_db, test_name, db_engine)
@@ -2134,7 +2113,6 @@ def setup_test_homeserver(
                             _DB_DROP_QUEUE.put((test_db, test_name, db_engine))
                     else:
                         _pg_counter("cleanup_recycled_primary")
-                        _DIRTY_TABLES_PREV_TEST = dirty
                         _PREV_TEST_HAD_DDL = False
                 else:
                     _pg_counter("cleanup_dropped_secondary_hs")
