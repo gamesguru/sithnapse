@@ -20,6 +20,7 @@ import sys
 import tempfile
 import time
 from collections import defaultdict
+from datetime import datetime, timezone
 from typing import IO, Any, Callable, Protocol, cast
 
 from twisted.python import usage
@@ -64,20 +65,36 @@ def _install_test_timing_logging(
         return None
 
     starts: dict[int, int] = {}
+    start_epochs: dict[int, int] = {}
     original_start = result.startTest
     original_stop = result.stopTest
 
+    def utc_timestamp(epoch_ns: int) -> str:
+        seconds, nanoseconds = divmod(epoch_ns, 1_000_000_000)
+        timestamp = datetime.fromtimestamp(seconds, timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%S"
+        )
+        return f"{timestamp}.{nanoseconds:09d}Z"
+
     def start_test(test: object) -> None:
         starts[id(test)] = time.perf_counter_ns()
+        start_epochs[id(test)] = time.time_ns()
         original_start(test)
 
     def stop_test(test: object) -> None:
         started = starts.pop(id(test), None)
+        start_epoch_ns = start_epochs.pop(id(test), None)
         if started is not None:
+            end_epoch_ns = time.time_ns()
+            assert start_epoch_ns is not None
             record = {
                 "pid": os.getpid(),
                 "test": cast(_TimedTest, test).id(),
                 "elapsed_ms": (time.perf_counter_ns() - started) / 1_000_000,
+                "start_time_utc": utc_timestamp(start_epoch_ns),
+                "start_time_epoch_ns": start_epoch_ns,
+                "end_time_utc": utc_timestamp(end_epoch_ns),
+                "end_time_epoch_ns": end_epoch_ns,
             }
             timing_file.write(json.dumps(record, separators=(",", ":")) + "\n")
             timing_file.flush()
@@ -818,7 +835,9 @@ def run() -> None:
                 signal.signal(signal.SIGINT, previous_handler)
                 distributed_reactor.spawnProcess = original_spawn_process
                 distributed_reactor.startRunning = original_start_running
-                type.__setattr__(distributed_runner_type, "_driveWorker", original_drive_worker)
+                type.__setattr__(
+                    distributed_runner_type, "_driveWorker", original_drive_worker
+                )
         else:
             assert isinstance(trialRunner, TrialRunner)
             test = unittest.decorate(suite, itrial.ITestCase)
