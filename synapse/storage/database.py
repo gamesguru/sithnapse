@@ -110,6 +110,14 @@ sql_txn_duration = Counter(
 )
 
 # ── per-table SQL ops timing (opt-in via SYNAPSE_PG_TIMINGS=1) ──────────
+# Read once at import time. The call sites below (`LoggingTransaction`'s
+# per-query hook and the pool-checkout scheduling hook) are the hottest
+# paths in the whole codebase -- re-running `os.environ.get(...)` on every
+# single query/checkout to discover "timings are off" is itself a real,
+# measurable per-query cost when multiplied across a full test suite or
+# a busy homeserver, even though the timing functions themselves no-op.
+_PG_TIMINGS_ENABLED = bool(os.environ.get("SYNAPSE_PG_TIMINGS"))
+
 _TABLE_OPS: dict[str, float] = defaultdict(float)
 _TABLE_OPS_COUNTS: dict[str, int] = defaultdict(int)
 _TABLE_OPS_ROWS: dict[str, int] = defaultdict(int)
@@ -143,7 +151,7 @@ def _timings_print(*args: object) -> None:
 
 
 _timings_file: IO[str] | None = None
-if os.environ.get("SYNAPSE_PG_TIMINGS"):
+if _PG_TIMINGS_ENABLED:
     _timings_path = os.environ.get("SYNAPSE_PG_TIMINGS_FILE")
     if _timings_path:
         try:
@@ -153,8 +161,6 @@ if os.environ.get("SYNAPSE_PG_TIMINGS"):
 
 
 def _track_table_op(sql: str, elapsed: float, rowcount: int = 0) -> None:
-    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
-        return
     if "--" in sql or "/*" in sql:
         sql = _SQL_COMMENT_RE.sub(" ", sql)
     m = _TABLE_RE.search(sql)
@@ -175,8 +181,6 @@ def _track_table_op(sql: str, elapsed: float, rowcount: int = 0) -> None:
 
 def _track_sql_scheduling(elapsed: float) -> None:
     """Record pool checkout/thread scheduling delay for the opt-in report."""
-    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
-        return
     global _SQL_SCHEDULING_TOTAL, _SQL_SCHEDULING_COUNT
     with _SQL_SCHEDULING_LOCK:
         _SQL_SCHEDULING_TOTAL += elapsed
@@ -185,7 +189,7 @@ def _track_sql_scheduling(elapsed: float) -> None:
 
 
 def _print_table_ops() -> None:
-    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+    if not _PG_TIMINGS_ENABLED:
         return
     with _TABLE_OPS_LOCK:
         # Snapshot under the lock so the SIGTERM/atexit flusher never races a
@@ -298,7 +302,7 @@ def _print_table_ops() -> None:
         _timings_print("")
 
 
-if os.environ.get("SYNAPSE_PG_TIMINGS"):
+if _PG_TIMINGS_ENABLED:
 
     def flush_table_ops() -> None:
         _print_table_ops()
@@ -758,7 +762,7 @@ class LoggingTransaction:
             sql_query_timer.labels(
                 verb=sql.split()[0], **{SERVER_NAME_LABEL: self.server_name}
             ).observe(secs)
-            if os.environ.get("SYNAPSE_PG_TIMINGS"):
+            if _PG_TIMINGS_ENABLED:
                 try:
                     rowcount = self.txn.rowcount
                 except Exception:
@@ -1403,7 +1407,8 @@ class DatabasePool:
                     sql_scheduling_timer.labels(
                         **{SERVER_NAME_LABEL: self.server_name}
                     ).observe(sched_duration_sec)
-                    _track_sql_scheduling(sched_duration_sec)
+                    if _PG_TIMINGS_ENABLED:
+                        _track_sql_scheduling(sched_duration_sec)
                     context.add_database_scheduled(sched_duration_sec)
 
                     if self._txn_limit > 0:

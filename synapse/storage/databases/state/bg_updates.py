@@ -55,11 +55,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # ── mtxdb-vs-SQL timing (opt-in via SYNAPSE_PG_TIMINGS=1) ───────────────
+# Read once at import time. `_state_timing`/`_state_counter` are called from
+# every state-group read/write -- including the plain-SQL fallback branches,
+# which run regardless of whether an embedded engine is configured -- so
+# re-running `os.environ.get(...)` inside them on every call is a real,
+# measurable per-event cost across a whole test suite or busy homeserver,
+# even though the call itself no-ops when timings are disabled.
+_PG_TIMINGS_ENABLED = bool(os.environ.get("SYNAPSE_PG_TIMINGS"))
+
 _STATE_TIMINGS: dict[str, float] = defaultdict(float)
 _STATE_TIMING_COUNTS: dict[str, int] = defaultdict(int)
 _STATE_COUNTERS: dict[str, int] = defaultdict(int)
 _STATE_TIMING_LOCK: "threading.Lock | None" = (
-    threading.Lock() if os.environ.get("SYNAPSE_PG_TIMINGS") else None
+    threading.Lock() if _PG_TIMINGS_ENABLED else None
 )
 
 # ── Node-write bucketed stats (opt-in via SYNAPSE_PG_TIMINGS=1) ────────
@@ -77,7 +85,7 @@ _NODE_WRITE_SIZE_BUCKETS: dict[str, int] = defaultdict(
 )  # batch-size bucket -> count
 
 _timings_file: IO[str] | None = None
-if os.environ.get("SYNAPSE_PG_TIMINGS"):
+if _PG_TIMINGS_ENABLED:
     _timings_path = os.environ.get("SYNAPSE_PG_TIMINGS_FILE")
     if _timings_path:
         try:
@@ -93,7 +101,7 @@ def _timings_print(*args: object) -> None:
 
 
 def _state_timing(tag: str, elapsed: float) -> None:
-    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+    if not _PG_TIMINGS_ENABLED:
         return
     lock = _STATE_TIMING_LOCK
     if lock is not None:
@@ -107,7 +115,7 @@ def _state_timing(tag: str, elapsed: float) -> None:
 
 def _state_counter(tag: str, value: int = 1) -> None:
     """Record diagnostic state-mirror counts when PostgreSQL timings are enabled."""
-    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+    if not _PG_TIMINGS_ENABLED:
         return
     lock = _STATE_TIMING_LOCK
     if lock is not None:
@@ -119,7 +127,7 @@ def _state_counter(tag: str, value: int = 1) -> None:
 
 def _record_node_write_stats(nodes: list[tuple[bytes, bytes]], elapsed: float) -> None:
     """Record batch-size/byte-count stats for put_state_hamt_nodes diagnostics."""
-    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+    if not _PG_TIMINGS_ENABLED:
         return
     global \
         _NODE_WRITE_CALLS, \
@@ -169,7 +177,7 @@ def _record_node_write_stats(nodes: list[tuple[bytes, bytes]], elapsed: float) -
 
 
 def _print_state_timings() -> None:
-    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+    if not _PG_TIMINGS_ENABLED:
         return
     lock = _STATE_TIMING_LOCK
     assert lock is not None
@@ -255,7 +263,7 @@ def _print_state_timings() -> None:
 
 def _print_node_write_stats() -> None:
     """Print node-write bucketed stats for put_state_hamt_nodes diagnostics."""
-    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+    if not _PG_TIMINGS_ENABLED:
         return
     lock = _STATE_TIMING_LOCK
     assert lock is not None
@@ -320,7 +328,7 @@ def _print_node_write_stats() -> None:
     _timings_print("")
 
 
-if os.environ.get("SYNAPSE_PG_TIMINGS"):
+if _PG_TIMINGS_ENABLED:
 
     def flush_state_timings() -> None:
         _print_state_timings()
