@@ -31,6 +31,9 @@ from synapse.storage.database import (
 )
 from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
 from synapse.storage.databases.main.embedded_event_json import put_event_json_batch
+from synapse.storage.databases.main.embedded_redactions import (
+    set_have_censored_batch,
+)
 from synapse.storage.databases.main.events_worker import EventsWorkerStore
 from synapse.synapse_rust.events import redact_event
 from synapse.util.duration import Duration
@@ -143,6 +146,16 @@ class CensorEventsStore(EventsWorkerStore, CacheInvalidationWorkerStore, SQLBase
                     keyvalues={"event_id": redaction_id},
                     updatevalues={"have_censored": True},
                 )
+
+                # Mirror the flag flip into the embedded engine if configured,
+                # keyed by the redacted event id -- see embedded_redactions.py.
+                if getattr(self, "_embedded_event_json_enabled", False):
+                    set_have_censored_batch(
+                        self._embedded_hamt_engine,
+                        self._embedded_hamt_namespace,
+                        [event_id],
+                        True,
+                    )
 
         await self.db_pool.runInteraction("_update_censor_txn", _update_censor_txn)
 

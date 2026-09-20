@@ -81,6 +81,11 @@ from synapse.storage.databases.main.embedded_event_to_state_group import (
     increment_state_group_refcounts_batch,
     put_event_to_state_group_batch,
 )
+from synapse.storage.databases.main.embedded_redactions import (
+    put_redaction_batch,
+    set_have_censored_batch,
+)
+from synapse.storage.databases.main.embedded_rejections import put_rejection_batch
 from synapse.storage.databases.main.event_federation import EventFederationStore
 from synapse.storage.databases.main.events_worker import EventCacheEntry
 from synapse.storage.databases.main.search import SearchEntry
@@ -3022,6 +3027,19 @@ class PersistEventsStore:
         )
         txn.execute(sql + clause, args)
 
+        # Mirror the same reset into the embedded engine if configured. This
+        # is the "original event re-persisted unredacted after its redaction"
+        # path, so an existing mirror record (which may have been flipped to
+        # True by censoring) must be rewritten back to False; ids with no
+        # mirror record are skipped by set_have_censored_batch.
+        if unredacted_events and getattr(self, "_embedded_event_json_enabled", False):
+            set_have_censored_batch(
+                self._embedded_hamt_engine,
+                self._embedded_hamt_namespace,
+                unredacted_events,
+                False,
+            )
+
         self.db_pool.simple_insert_many_txn(
             txn,
             table="state_events",
@@ -3253,6 +3271,19 @@ class PersistEventsStore:
         # The `redactions` emptiness cache is only ever invalidated by writes,
         # so make sure this one is reported once the transaction commits.
         self.db_pool.note_table_write_after(txn, "redactions")
+
+        # Mirror the new redaction into the embedded engine if configured.
+        # Keyed by the *redacted* event id so `have_censored_event` stays a
+        # point lookup -- see embedded_redactions.py's module docstring.
+        # `have_censored` starts False (matching the SQL column default); the
+        # censoring background job later flips it via
+        # set_have_censored_batch.
+        if getattr(self, "_embedded_event_json_enabled", False):
+            put_redaction_batch(
+                self._embedded_hamt_engine,
+                self._embedded_hamt_namespace,
+                [(event.redacts, event.event_id, False)],
+            )
 
     def insert_labels_for_event_txn(
         self,
@@ -3740,6 +3771,7 @@ class PersistEventsStore:
     def _store_rejections_txn(
         self, txn: LoggingTransaction, event_id: str, reason: str
     ) -> None:
+        last_check = str(self._clock.time_msec())
         self.db_pool.simple_insert_txn(
             txn,
             table="rejections",
@@ -3749,9 +3781,18 @@ class PersistEventsStore:
                 # `last_check` is a TEXT column, so store the timestamp as a
                 # string rather than relying on the driver to coerce an int.
                 # (Ideally we'd fix the schema, but that is non-trivial)
-                "last_check": str(self._clock.time_msec()),
+                "last_check": last_check,
             },
         )
+
+        # Mirror into the embedded engine if configured -- flat point lookup,
+        # see embedded_rejections.py.
+        if getattr(self, "_embedded_event_json_enabled", False):
+            put_rejection_batch(
+                self._embedded_hamt_engine,
+                self._embedded_hamt_namespace,
+                [(event_id, reason, last_check)],
+            )
 
     def _store_event_state_mappings_txn(
         self,
