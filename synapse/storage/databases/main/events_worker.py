@@ -87,6 +87,7 @@ from synapse.storage.databases.main.embedded_event_json import (
     get_event_json_batch,
     open_embedded_event_json_engine,
 )
+from synapse.storage.databases.main.embedded_redactions import get_redactions_batch
 from synapse.storage.types import Cursor
 from synapse.storage.util.id_generators import (
     AbstractStreamIdGenerator,
@@ -524,6 +525,18 @@ class EventsWorkerStore(SQLBaseStore):
         Returns:
             True if the event has been censored, False otherwise.
         """
+        # Fast path: the embedded mirror, if configured, is a point lookup
+        # keyed by the redacted event id -- see embedded_redactions.py. A miss
+        # falls through to the authoritative SQL row below.
+        if getattr(self, "_embedded_event_json_enabled", False):
+            found = get_redactions_batch(
+                self._embedded_hamt_engine,
+                self._embedded_hamt_namespace,
+                [event_id],
+            )
+            if event_id in found:
+                return found[event_id][1]
+
         censored_redactions_list = await self.db_pool.simple_select_onecol(
             table="redactions",
             keyvalues={"redacts": event_id},
