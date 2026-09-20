@@ -2087,7 +2087,18 @@ def setup_test_homeserver(
                     _PREV_TEST_HAD_DDL
                 from synapse.storage.database import pop_dirty_tables
 
-                dirty, had_ddl = pop_dirty_tables()
+                dirty, had_ddl, ddl_triggers = pop_dirty_tables()
+                if (
+                    had_ddl
+                    and ddl_triggers
+                    and os.environ.get("SYNAPSE_DEBUG_DDL_TRIGGERS") == "1"
+                ):
+                    import sys
+
+                    print(
+                        f"[DDL-TRIGGER] test={test_name} triggers={ddl_triggers!r}",
+                        file=sys.stderr,
+                    )
                 if test_db == _RECYCLED_PG_DB:
                     _RECYCLED_PG_DB_IN_USE = False
                     if had_ddl:
@@ -2130,6 +2141,15 @@ def setup_test_homeserver(
             if test_db == _RECYCLED_PG_DB:
                 _RECYCLED_PG_DB_IN_USE = False
                 _RECYCLED_PG_DB = None
+            # If setup failed after a fresh clone was created, drop it now so
+            # it doesn't leak.  (If it was a recycled DB we just cleared the
+            # pointer above; it will be re-cloned on the next test.)
+            if not is_recycled:
+                if os.environ.get("SYNAPSE_TEST_SYNC_DROP_DB") == "1":
+                    _drop_test_db(test_db, test_name, db_engine)
+                else:
+                    _ensure_db_drop_worker()
+                    _DB_DROP_QUEUE.put((test_db, test_name, db_engine))
             raise
 
     hs = homeserver_to_use(

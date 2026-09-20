@@ -163,6 +163,7 @@ if _PG_TIMINGS_ENABLED:
 _DIRTY_TABLES: set[str] = set()
 _HAD_DDL: bool = False
 _DIRTY_TABLES_LOCK = threading.Lock()
+_DDL_TRIGGERS: list[str] = []  # debug: first few DDL SQLs that set _HAD_DDL
 
 _MUTATING_TABLE_RE = re.compile(
     r"^\s*(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM|TRUNCATE(?:\s+TABLE)?)\s+(\w+)",
@@ -173,6 +174,8 @@ _DISRUPTIVE_DDL_RE = re.compile(
     re.IGNORECASE,
 )
 
+_DEBUG_DDL_TRIGGERS = os.environ.get("SYNAPSE_DEBUG_DDL_TRIGGERS") == "1"
+
 
 def track_dirty_table_from_sql(sql: str) -> None:
     global _HAD_DDL
@@ -181,6 +184,8 @@ def track_dirty_table_from_sql(sql: str) -> None:
     if _DISRUPTIVE_DDL_RE.search(sql):
         with _DIRTY_TABLES_LOCK:
             _HAD_DDL = True
+            if _DEBUG_DDL_TRIGGERS and len(_DDL_TRIGGERS) < 10:
+                _DDL_TRIGGERS.append(sql[:200])
         return
     m = _MUTATING_TABLE_RE.search(sql)
     if m:
@@ -189,14 +194,16 @@ def track_dirty_table_from_sql(sql: str) -> None:
             _DIRTY_TABLES.add(table)
 
 
-def pop_dirty_tables() -> tuple[set[str], bool]:
+def pop_dirty_tables() -> tuple[set[str], bool, list[str]]:
     global _HAD_DDL
     with _DIRTY_TABLES_LOCK:
         dirty = set(_DIRTY_TABLES)
         had_ddl = _HAD_DDL
+        triggers = list(_DDL_TRIGGERS)
         _DIRTY_TABLES.clear()
         _HAD_DDL = False
-        return dirty, had_ddl
+        _DDL_TRIGGERS.clear()
+        return dirty, had_ddl, triggers
 
 
 def _track_table_op(sql: str, elapsed: float, rowcount: int = 0) -> None:

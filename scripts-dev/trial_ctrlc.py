@@ -150,6 +150,7 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
     out(f"\n=== Diagnostics aggregated from {len(worker_pids)} process(es) ===")
 
     # 1. Lifecycle timings
+    lc_lifecycle_counters: dict[str, int] = defaultdict(int)
     if lifecycle_files:
         lc_timings: dict[str, float] = defaultdict(float)
         lc_counts: dict[str, int] = defaultdict(int)
@@ -164,6 +165,8 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                     lc_timings[k] += v
                 for k, v in data.get("counts", {}).items():
                     lc_counts[k] += v
+                for k, v in data.get("counters", {}).items():
+                    lc_lifecycle_counters[k] += v
                 if "strategy" in data and data["strategy"]:
                     strategies.add(str(data["strategy"]))
             except Exception as e:
@@ -269,6 +272,14 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                 out(f"  {'TOTAL':44s}  {total_ms:8.1f}ms")
             out("==========================================")
             out("")
+
+    if lc_lifecycle_counters:
+        out("=== DB lifecycle decision counters ===")
+        tag_width = max(40, *(len(t) for t in lc_lifecycle_counters))
+        for tag in sorted(lc_lifecycle_counters):
+            out(f"  {tag:{tag_width}s}  {lc_lifecycle_counters[tag]:>12,d}")
+        out("=" * (tag_width + 16))
+        out("")
 
     # 2. SQL timings
     if sql_files:
@@ -745,9 +756,12 @@ def run() -> None:
             from twisted.python.failure import Failure
 
             distributed_runner = cast(_DistributedRunner, trialRunner)
-            original_drive_worker = distributed_runner._driveWorker
+            distributed_runner_type: Any = type(distributed_runner)
+            original_drive_worker = distributed_runner_type._driveWorker
 
-            async def drive_worker(result: Any, test_cases: Any, worker: Any) -> None:
+            async def drive_worker(
+                runner: Any, result: Any, test_cases: Any, worker: Any
+            ) -> None:
                 for case in test_cases:
                     if interrupted:
                         break
@@ -756,7 +770,7 @@ def run() -> None:
                     except Exception:
                         result.original.addError(case, Failure())
 
-            distributed_runner._driveWorker = drive_worker
+            distributed_runner_type._driveWorker = drive_worker
 
             def on_distributed_sigint(signum: int, frame: object) -> None:
                 nonlocal interrupted
@@ -800,7 +814,7 @@ def run() -> None:
                 signal.signal(signal.SIGINT, previous_handler)
                 distributed_reactor.spawnProcess = original_spawn_process
                 distributed_reactor.startRunning = original_start_running
-                distributed_runner._driveWorker = original_drive_worker
+                distributed_runner_type._driveWorker = original_drive_worker
         else:
             assert isinstance(trialRunner, TrialRunner)
             test = unittest.decorate(suite, itrial.ITestCase)
