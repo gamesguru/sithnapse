@@ -770,7 +770,11 @@ def run() -> None:
                     except Exception:
                         result.original.addError(case, Failure())
 
-            distributed_runner_type._driveWorker = drive_worker
+            # DistTrialRunner uses __slots__ (no instance __dict__), so ordinary
+            # assignment is blocked by the attrs-generated __setattr__.  Bypass
+            # that by writing directly into the class's namespace via
+            # type.__setattr__, which goes through the metaclass (plain `type`).
+            type.__setattr__(distributed_runner_type, "_driveWorker", drive_worker)
 
             def on_distributed_sigint(signum: int, frame: object) -> None:
                 nonlocal interrupted
@@ -814,7 +818,7 @@ def run() -> None:
                 signal.signal(signal.SIGINT, previous_handler)
                 distributed_reactor.spawnProcess = original_spawn_process
                 distributed_reactor.startRunning = original_start_running
-                distributed_runner_type._driveWorker = original_drive_worker
+                type.__setattr__(distributed_runner_type, "_driveWorker", original_drive_worker)
         else:
             assert isinstance(trialRunner, TrialRunner)
             test = unittest.decorate(suite, itrial.ITestCase)
