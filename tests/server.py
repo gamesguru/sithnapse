@@ -2073,9 +2073,16 @@ def setup_test_homeserver(
         reactor=reactor,
     )
 
+    # Capture the `hs` as a `weakref` here to ensure there is no scenario where uncalled
+    # cleanup functions result in holding the `hs` in memory.
+    cleanup_hs_ref = weakref.ref(hs)
+
     def shutdown_hs_on_cleanup() -> "Deferred[None]":
+        cleanup_hs = cleanup_hs_ref()
+        if cleanup_hs is None:
+            return defer.succeed(None)
         _sd0 = time.monotonic()
-        deferred = defer.ensureDeferred(hs.shutdown())
+        deferred = defer.ensureDeferred(cleanup_hs.shutdown())
         if USE_POSTGRES_FOR_TESTS:
 
             def _record_shutdown_timing(result: Any) -> Any:
