@@ -174,18 +174,33 @@ def _pg_timing(tag: str, elapsed: float, test_name: str | None = None) -> None:
 
 
 # ── Background Postgres Test DB Dropper ──────────────────────────────────────
+_DB_DROP_PID: int = os.getpid()
 _DB_DROP_QUEUE: "queue.Queue[tuple[str, str | None, Any] | None]" = queue.Queue()
 _DB_DROP_THREAD: threading.Thread | None = None
 _DB_DROP_LOCK = threading.Lock()
 
 
+def _reset_db_drop_state_after_fork() -> None:
+    global _DB_DROP_PID, _DB_DROP_QUEUE, _DB_DROP_THREAD, _DB_DROP_LOCK
+    _DB_DROP_PID = os.getpid()
+    _DB_DROP_QUEUE = queue.Queue()
+    _DB_DROP_THREAD = None
+    _DB_DROP_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_db_drop_state_after_fork)
+
+
 def _ensure_db_drop_worker() -> None:
-    global _DB_DROP_THREAD
+    global _DB_DROP_PID, _DB_DROP_THREAD
+    if os.getpid() != _DB_DROP_PID:
+        _reset_db_drop_state_after_fork()
     with _DB_DROP_LOCK:
         if _DB_DROP_THREAD is None or not _DB_DROP_THREAD.is_alive():
             _DB_DROP_THREAD = threading.Thread(
                 target=_db_drop_worker_loop,
-                name="synapse-test-db-dropper",
+                name=f"synapse-test-db-dropper-{os.getpid()}",
                 daemon=True,
             )
             _DB_DROP_THREAD.start()
@@ -348,9 +363,14 @@ def _db_drop_worker_loop() -> None:
 
 
 def _drain_db_drop_queue() -> None:
+    global _DB_DROP_PID
+    if os.getpid() != _DB_DROP_PID:
+        _reset_db_drop_state_after_fork()
+        return
     with _DB_DROP_LOCK:
-        if _DB_DROP_THREAD is not None and _DB_DROP_THREAD.is_alive():
-            _DB_DROP_QUEUE.join()
+        thread = _DB_DROP_THREAD
+    if thread is not None and thread.is_alive():
+        _DB_DROP_QUEUE.join()
 
 
 def _print_pg_timings() -> None:
