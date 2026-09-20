@@ -48,7 +48,17 @@ p ?=
 # which is 0 workers for 0 tests, so nothing ever signals completion. Plain
 # `make test` stays on trial_ctrlc.py's non-distributed path (config["jobs"]
 # is None), which installs its own SIGINT handler and always exits cleanly.
-TRIAL_JOBS := $(shell printf '%s\n' "$(MAKEFLAGS)" | sed -n 's/.*-j\([0-9][0-9]*\).*/\1/p')
+TRIAL_JOBS_REQUESTED := $(shell printf '%s\n' "$(MAKEFLAGS)" | sed -n 's/.*-j\([0-9][0-9]*\).*/\1/p')
+# Clamp to (nproc - 1) so a `-jN` from MAKEFLAGS can never oversubscribe the
+# machine: each Trial worker drives its own rapid Postgres CREATE/DROP DATABASE
+# cycle plus the embedded storage engine, so requesting more workers than
+# spare cores starves the desktop (observed: a 6-core machine hard-froze
+# under 7 workers) rather than just running slower.
+TRIAL_MAX_JOBS := $(shell n=$$(nproc 2>/dev/null || echo 1); echo $$(( n > 1 ? n - 1 : 1 )))
+TRIAL_JOBS := $(shell if [ -n "$(TRIAL_JOBS_REQUESTED)" ]; then \
+	if [ "$(TRIAL_JOBS_REQUESTED)" -gt "$(TRIAL_MAX_JOBS)" ]; then echo "$(TRIAL_MAX_JOBS)"; \
+	else echo "$(TRIAL_JOBS_REQUESTED)"; fi; \
+	fi)
 
 .PHONY: test
 test: ##H Run tests, e.g., on tests/storage/
