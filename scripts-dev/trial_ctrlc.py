@@ -30,6 +30,8 @@ from twisted.trial.runner import TrialRunner, _logFile, _testDirectory
 
 class _DistributedRunner(Protocol):
     _workingDirectory: str
+    _reactor: Any
+    _driveWorker: Callable[..., Any]
 
 
 class _TimedTest(Protocol):
@@ -737,8 +739,68 @@ def run() -> None:
 
     try:
         if config["jobs"] is not None:
-            testResult = trialRunner.run(suite)
-            successful = testResult.wasSuccessful()
+            # Twisted's distributed runner doesn't expose a shouldStop flag.
+            # Its driver hands each worker the whole remaining suite, though,
+            # so stop each driver after its current test when interrupted.
+            from twisted.python.failure import Failure
+
+            distributed_runner = cast(_DistributedRunner, trialRunner)
+            original_drive_worker = distributed_runner._driveWorker
+
+            async def drive_worker(result: Any, test_cases: Any, worker: Any) -> None:
+                for case in test_cases:
+                    if interrupted:
+                        break
+                    try:
+                        await worker.run(case, result)
+                    except Exception:
+                        result.original.addError(case, Failure())
+
+            distributed_runner._driveWorker = drive_worker
+
+            def on_distributed_sigint(signum: int, frame: object) -> None:
+                nonlocal interrupted
+                if interrupted:
+                    signal.signal(signal.SIGINT, signal.default_int_handler)
+                    raise KeyboardInterrupt()
+                interrupted = True
+                sys.stderr.write(
+                    "\nInterrupted -- finishing tests already running, then "
+                    "printing results so far (Ctrl+C again to abort immediately)...\n"
+                )
+
+            # SIGINT from the terminal is sent to the whole process group.
+            # Ignored dispositions survive exec, unlike Python signal handlers,
+            # so temporarily ignore it while Twisted forks its worker processes.
+            distributed_reactor: Any = distributed_runner._reactor
+            original_spawn_process = distributed_reactor.spawnProcess
+            original_start_running = distributed_reactor.startRunning
+
+            def spawn_process(*args: Any, **kwargs: Any) -> Any:
+                previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+                try:
+                    return original_spawn_process(*args, **kwargs)
+                finally:
+                    signal.signal(signal.SIGINT, previous)
+
+            def start_running(*args: Any, **kwargs: Any) -> Any:
+                result = original_start_running(*args, **kwargs)
+                signal.signal(signal.SIGINT, on_distributed_sigint)
+                return result
+
+            distributed_reactor.spawnProcess = spawn_process
+            distributed_reactor.startRunning = start_running
+            previous_handler = signal.signal(signal.SIGINT, on_distributed_sigint)
+            try:
+                testResult = trialRunner.run(suite)
+                successful = testResult.wasSuccessful()
+            except KeyboardInterrupt:
+                interrupted = True
+            finally:
+                signal.signal(signal.SIGINT, previous_handler)
+                distributed_reactor.spawnProcess = original_spawn_process
+                distributed_reactor.startRunning = original_start_running
+                distributed_runner._driveWorker = original_drive_worker
         else:
             assert isinstance(trialRunner, TrialRunner)
             test = unittest.decorate(suite, itrial.ITestCase)
