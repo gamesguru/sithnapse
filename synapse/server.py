@@ -717,9 +717,7 @@ class HomeServer(metaclass=abc.ABCMeta):
             )
             _w(f"  {'server_name':44s}  {self.hostname}\n")
             _w("\n")
-            _w(
-                f"  {'tag':44s}  {'total':>10s}  {'calls':>6s}  {'avg':>12s}\n"
-            )
+            _w(f"  {'tag':44s}  {'total':>10s}  {'calls':>6s}  {'avg':>12s}\n")
             _sub = 0.0
             for _tag in _tags_ordered:
                 if _tag not in _timings:

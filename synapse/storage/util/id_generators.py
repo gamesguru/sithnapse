@@ -351,7 +351,6 @@ class MultiWriterIdGenerator(AbstractStreamIdGenerator):
                     self._persisted_upto_position
                 )
 
-
     def _load_current_ids(
         self,
         db_conn: LoggingDatabaseConnection,

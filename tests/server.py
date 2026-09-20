@@ -1529,7 +1529,6 @@ def setup_test_homeserver(
         database = DatabaseConnectionConfig("master", database_config)
         config.database.databases = [database]
 
-
         def cleanup() -> None:
             import psycopg2
 
