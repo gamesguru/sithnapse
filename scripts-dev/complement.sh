@@ -509,24 +509,21 @@ main() {
 
   if [[ -n "${SYNAPSE_PG_TIMINGS:-}" ]]; then
     export PASS_SYNAPSE_PG_TIMINGS=1
-    # The timing sections are only ever written by Synapse's atexit/SIGTERM
-    # flush handlers, which never run if the container is SIGKILLed --
-    # Complement's Destroy() only sends SIGTERM (ContainerStop) instead of
-    # SIGKILL (ContainerKillFunc) when printServerLogs is true, which
-    # defaults to failing tests only. Without this, a fully-passing run
-    # (the common case you'd want a timing report from) produces nothing:
-    # the docker-log-watcher below has nothing to catch because nothing
-    # ever got flushed. Force it on so every container gets a graceful
-    # stop regardless of pass/fail.
-    export COMPLEMENT_ALWAYS_PRINT_SERVER_LOGS=1
-    # ContainerStop's default grace period (COMPLEMENT_STOP_TIMEOUT_SECS,
-    # 1s upstream) is nowhere near enough for a worker-mode container --
-    # Postgres, Redis, nginx, and every worker process under supervisord
-    # all need to shut down before the flush handlers above can run, and
-    # if that overruns the grace period Docker sends SIGKILL instead,
-    # silently discarding whatever hadn't been flushed yet. Give it more
-    # room; a caller can still override by setting the var themselves.
-    export COMPLEMENT_STOP_TIMEOUT_SECS="${COMPLEMENT_STOP_TIMEOUT_SECS:-10}"
+    # NOTE: we do NOT force COMPLEMENT_ALWAYS_PRINT_SERVER_LOGS /
+    # COMPLEMENT_STOP_TIMEOUT_SECS here. Doing so forces every container in
+    # the run through a graceful SIGTERM stop (Postgres runs a full shutdown
+    # CHECKPOINT, flushing every dirty page) instead of an instant SIGKILL.
+    # That's fine for a single targeted `-run TestFoo` invocation, but it is
+    # actively harmful across a full/parallel suite run: hundreds of
+    # containers all doing a graceful multi-second shutdown at once causes
+    # real disk/CPU contention that measurably slows down and destabilizes
+    # unrelated, timing-sensitive tests -- confirmed against a full
+    # `make complement` run producing new failures and heavy sustained
+    # containerd disk writes, while still not reliably producing any timing
+    # output (the docker-log-watcher's start/scan race gets worse, not
+    # better, at that container-count scale). If you want a timing report,
+    # set these two vars yourself for a narrow `-run` invocation rather than
+    # enabling them here unconditionally for every run.
   fi
 
   # Complement's blueprint cache key is only (package namespace, blueprint
