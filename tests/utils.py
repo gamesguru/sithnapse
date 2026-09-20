@@ -240,15 +240,18 @@ def _drain_template_background_updates_postgres() -> None:
     # Register controller background updates (e.g. state group deletion)
     PurgeEventsStorageController(hs, hs.get_datastores())
 
+    from synapse.logging.context import LoggingContext
+
     stor = hs.get_datastores().main
-    d = ensureDeferred(stor.db_pool.updates.run_background_updates(False))
+    with LoggingContext("drain_template_bg_updates", server_name="test-template-draining"):
+        d = ensureDeferred(stor.db_pool.updates.run_background_updates(False))
 
-    while not d.called or d.paused:
-        time.sleep(0.001)
-        reactor.advance(0.01)
+        while not d.called or d.paused:
+            time.sleep(0.001)
+            reactor.advance(0.01)
 
-    stc = SynchronousTestCase()
-    stc.successResultOf(d)
+        stc = SynchronousTestCase()
+        stc.successResultOf(d)
 
     d_sd = ensureDeferred(hs.shutdown())
     while not d_sd.called or d_sd.paused:
