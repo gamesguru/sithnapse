@@ -158,6 +158,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             "state_group_id_seq",
             table="state_groups",
             id_column="id",
+            db_is_fresh=database.is_fresh,
         )
 
         self._embedded_hamt_engine = hs.config.database.embedded_hamt_engine

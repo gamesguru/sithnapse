@@ -921,6 +921,15 @@ class DatabasePool:
             and hs.get_instance_name() in events_writers
         )
 
+        # True when the database is a freshly-created empty clone (set by the
+        # test harness via _TEST_DB_IS_FRESH in the config dict).  When set,
+        # sequence generators and id_generators skip their startup consistency
+        # queries because all tables are guaranteed to be empty and all
+        # sequences are at their initial values.
+        self.is_fresh: bool = bool(
+            database_config.config.get("_TEST_DB_IS_FRESH", False)
+        )
+
         # A set of tables that are not safe to use native upserts in.
         self._unsafe_to_upsert_tables = set(UNIQUE_INDEX_BACKGROUND_UPDATES.keys())
 

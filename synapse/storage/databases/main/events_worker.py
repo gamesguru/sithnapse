@@ -367,6 +367,7 @@ class EventsWorkerStore(SQLBaseStore):
             "event_auth_chain_id",
             table="event_auth_chains",
             id_column="chain_id",
+            db_is_fresh=database.is_fresh,
         )
 
         self._un_partial_stated_events_stream_id_gen: AbstractStreamIdGenerator

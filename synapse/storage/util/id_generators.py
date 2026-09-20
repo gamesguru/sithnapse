@@ -303,42 +303,54 @@ class MultiWriterIdGenerator(AbstractStreamIdGenerator):
             positive=positive,
         )
 
-        # We check that the table and sequence haven't diverged.
-        for table, _, id_column in tables:
-            self._sequence_gen.check_consistency(
-                db_conn,
-                table=table,
-                id_column=id_column,
-                stream_name=stream_name,
-                positive=positive,
+        if db.is_fresh:
+            # Fresh empty clone: all tables are empty, all sequences are at
+            # their initial values.  Skip check_consistency and _load_current_ids
+            # entirely -- the defaults set above are already correct.
+            if not writers:
+                self._current_positions[self._instance_name] = (
+                    self._persisted_upto_position
+                )
+        else:
+            # We check that the table and sequence haven't diverged.
+            for table, _, id_column in tables:
+                self._sequence_gen.check_consistency(
+                    db_conn,
+                    table=table,
+                    id_column=id_column,
+                    stream_name=stream_name,
+                    positive=positive,
+                )
+
+            # This goes and fills out the above state from the database.
+            # This may read on the PostgreSQL sequence, and
+            # SequenceGenerator.check_consistency might have fixed up the sequence, which
+            # means the SequenceGenerator needs to be setup before we read the value from
+            # the sequence.
+            self._load_current_ids(db_conn, tables, sequence_name)
+
+            self._max_seen_allocated_stream_id = max(
+                self._current_positions.values(), default=1
             )
 
-        # This goes and fills out the above state from the database.
-        # This may read on the PostgreSQL sequence, and
-        # SequenceGenerator.check_consistency might have fixed up the sequence, which
-        # means the SequenceGenerator needs to be setup before we read the value from
-        # the sequence.
-        self._load_current_ids(db_conn, tables, sequence_name)
+            # For the case where `stream_positions` is not up to date,
+            # `_persisted_upto_position` may be higher.
+            self._max_seen_allocated_stream_id = max(
+                self._max_seen_allocated_stream_id, self._persisted_upto_position
+            )
 
-        self._max_seen_allocated_stream_id = max(
-            self._current_positions.values(), default=1
-        )
+            # Bump our local maximum position now that we've loaded things from the
+            # DB.
+            self._max_position_of_local_instance = self._max_seen_allocated_stream_id
 
-        # For the case where `stream_positions` is not up to date,
-        # `_persisted_upto_position` may be higher.
-        self._max_seen_allocated_stream_id = max(
-            self._max_seen_allocated_stream_id, self._persisted_upto_position
-        )
+            if not writers:
+                # If there have been no explicit writers given then any instance can
+                # write to the stream. In which case, let's pre-seed our own
+                # position with the current minimum.
+                self._current_positions[self._instance_name] = (
+                    self._persisted_upto_position
+                )
 
-        # Bump our local maximum position now that we've loaded things from the
-        # DB.
-        self._max_position_of_local_instance = self._max_seen_allocated_stream_id
-
-        if not writers:
-            # If there have been no explicit writers given then any instance can
-            # write to the stream. In which case, let's pre-seed our own
-            # position with the current minimum.
-            self._current_positions[self._instance_name] = self._persisted_upto_position
 
     def _load_current_ids(
         self,

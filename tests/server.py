@@ -1519,6 +1519,17 @@ def setup_test_homeserver(
         db_conn.close()
         _pg_timing("create_database", time.monotonic() - _t0)
 
+        # The clone is a verbatim copy of the empty template: all tables are
+        # empty and all sequences are at their initial values.  Signal this to
+        # DatabasePool so that MultiWriterIdGenerator and sequence generators
+        # skip their startup consistency queries (check_consistency +
+        # _load_current_ids), saving ~10-20 round-trips to Postgres per setup.
+        database_config["_TEST_DB_IS_FRESH"] = True
+        # Rebuild the DatabaseConnectionConfig so it picks up the new key.
+        database = DatabaseConnectionConfig("master", database_config)
+        config.database.databases = [database]
+
+
         def cleanup() -> None:
             import psycopg2
 
