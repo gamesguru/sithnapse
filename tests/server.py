@@ -1900,6 +1900,7 @@ def setup_test_homeserver(
             _PREV_TEST_HAD_DDL
         from synapse.storage.database import pop_dirty_tables
 
+        old_recycled_to_drop = None
         is_recycled = False
         if (
             _RECYCLED_PG_DB is not None
@@ -1914,10 +1915,13 @@ def setup_test_homeserver(
             is_recycled = True
         else:
             test_db = "synapse_test_%s" % uuid.uuid4().hex
-            if _RECYCLED_PG_DB is None:
+            if not _RECYCLED_PG_DB_IN_USE:
+                if _RECYCLED_PG_DB is not None and _RECYCLED_PG_DB != test_db:
+                    old_recycled_to_drop = _RECYCLED_PG_DB
                 pop_dirty_tables()
                 _RECYCLED_PG_DB = test_db
                 _RECYCLED_PG_DB_IN_USE = True
+                _PREV_TEST_HAD_DDL = False
 
         database_config: JsonDict = {
             "name": "psycopg2",
@@ -1996,10 +2000,18 @@ def setup_test_homeserver(
 
     # Create or reset the database before we actually try and connect to it
     if USE_POSTGRES_FOR_TESTS:
+        if old_recycled_to_drop is not None:
+            if os.environ.get("SYNAPSE_TEST_SYNC_DROP_DB") == "1":
+                _drop_test_db(old_recycled_to_drop, test_name, db_engine)
+            else:
+                _ensure_db_drop_worker()
+                _DB_DROP_QUEUE.put((old_recycled_to_drop, test_name, db_engine))
+
         if is_recycled:
             if not _reset_recycled_postgres_db(
                 test_db, db_engine, _DIRTY_TABLES_PREV_TEST, test_name=test_name
             ):
+                old_failed_db = test_db
                 # Fallback if reset failed: generate new test_db and clone
                 test_db = "synapse_test_%s" % uuid.uuid4().hex
                 _RECYCLED_PG_DB = test_db
@@ -2008,65 +2020,76 @@ def setup_test_homeserver(
                 database = DatabaseConnectionConfig("master", database_config)
                 config.database.databases = [database]
                 is_recycled = False
+                if os.environ.get("SYNAPSE_TEST_SYNC_DROP_DB") == "1":
+                    _drop_test_db(old_failed_db, test_name, db_engine)
+                else:
+                    _ensure_db_drop_worker()
+                    _DB_DROP_QUEUE.put((old_failed_db, test_name, db_engine))
 
-        if not is_recycled:
-            _t0 = time.monotonic()
-            db_conn = db_engine.module.connect(
-                dbname=POSTGRES_DBNAME_FOR_INITIAL_CREATE,
-                user=POSTGRES_USER,
-                host=POSTGRES_HOST,
-                port=POSTGRES_PORT,
-                password=POSTGRES_PASSWORD,
-            )
-            db_engine.attempt_to_set_autocommit(db_conn, True)
-            cur = db_conn.cursor()
-            create_db_strategy, _ = get_postgres_clone_strategy()
-            cur.execute(
-                "CREATE DATABASE %s WITH TEMPLATE %s%s;"
-                % (test_db, POSTGRES_BASE_DB, create_db_strategy)
-            )
-            cur.close()
-            db_conn.close()
-            _pg_timing("create_database", time.monotonic() - _t0, test_name=test_name)
+        try:
+            if not is_recycled:
+                _t0 = time.monotonic()
+                db_conn = db_engine.module.connect(
+                    dbname=POSTGRES_DBNAME_FOR_INITIAL_CREATE,
+                    user=POSTGRES_USER,
+                    host=POSTGRES_HOST,
+                    port=POSTGRES_PORT,
+                    password=POSTGRES_PASSWORD,
+                )
+                db_engine.attempt_to_set_autocommit(db_conn, True)
+                cur = db_conn.cursor()
+                create_db_strategy, _ = get_postgres_clone_strategy()
+                cur.execute(
+                    "CREATE DATABASE %s WITH TEMPLATE %s%s;"
+                    % (test_db, POSTGRES_BASE_DB, create_db_strategy)
+                )
+                cur.close()
+                db_conn.close()
+                _pg_timing("create_database", time.monotonic() - _t0, test_name=test_name)
 
-        database_config["_TEST_DB_IS_FRESH"] = True
-        database = DatabaseConnectionConfig("master", database_config)
-        config.database.databases = [database]
+            database_config["_TEST_DB_IS_FRESH"] = True
+            database = DatabaseConnectionConfig("master", database_config)
+            config.database.databases = [database]
 
-        def cleanup() -> None:
-            global \
-                _RECYCLED_PG_DB, \
-                _RECYCLED_PG_DB_IN_USE, \
-                _DIRTY_TABLES_PREV_TEST, \
-                _PREV_TEST_HAD_DDL
-            from synapse.storage.database import pop_dirty_tables
+            def cleanup() -> None:
+                global \
+                    _RECYCLED_PG_DB, \
+                    _RECYCLED_PG_DB_IN_USE, \
+                    _DIRTY_TABLES_PREV_TEST, \
+                    _PREV_TEST_HAD_DDL
+                from synapse.storage.database import pop_dirty_tables
 
-            dirty, had_ddl = pop_dirty_tables()
-            if test_db == _RECYCLED_PG_DB:
-                _RECYCLED_PG_DB_IN_USE = False
-                if had_ddl or os.environ.get("SYNAPSE_TEST_NO_RECYCLE_DB") == "1":
-                    _RECYCLED_PG_DB = None
-                    _DIRTY_TABLES_PREV_TEST = set()
-                    _PREV_TEST_HAD_DDL = False
+                dirty, had_ddl = pop_dirty_tables()
+                if test_db == _RECYCLED_PG_DB:
+                    _RECYCLED_PG_DB_IN_USE = False
+                    if had_ddl or os.environ.get("SYNAPSE_TEST_NO_RECYCLE_DB") == "1":
+                        _RECYCLED_PG_DB = None
+                        _DIRTY_TABLES_PREV_TEST = set()
+                        _PREV_TEST_HAD_DDL = False
+                        if os.environ.get("SYNAPSE_TEST_SYNC_DROP_DB") == "1":
+                            _drop_test_db(test_db, test_name, db_engine)
+                        else:
+                            _ensure_db_drop_worker()
+                            _DB_DROP_QUEUE.put((test_db, test_name, db_engine))
+                    else:
+                        _DIRTY_TABLES_PREV_TEST = dirty
+                        _PREV_TEST_HAD_DDL = False
+                else:
+                    # Extra homeserver in a multi-homeserver test (e.g. worker / federated peer)
                     if os.environ.get("SYNAPSE_TEST_SYNC_DROP_DB") == "1":
                         _drop_test_db(test_db, test_name, db_engine)
                     else:
                         _ensure_db_drop_worker()
                         _DB_DROP_QUEUE.put((test_db, test_name, db_engine))
-                else:
-                    _DIRTY_TABLES_PREV_TEST = dirty
-                    _PREV_TEST_HAD_DDL = False
-            else:
-                # Extra homeserver in a multi-homeserver test (e.g. worker / federated peer)
-                if os.environ.get("SYNAPSE_TEST_SYNC_DROP_DB") == "1":
-                    _drop_test_db(test_db, test_name, db_engine)
-                else:
-                    _ensure_db_drop_worker()
-                    _DB_DROP_QUEUE.put((test_db, test_name, db_engine))
 
-        if not LEAVE_DB:
-            # Register the cleanup hook
-            cleanup_func(cleanup)
+            if not LEAVE_DB:
+                # Register the cleanup hook
+                cleanup_func(cleanup)
+        except Exception:
+            if test_db == _RECYCLED_PG_DB:
+                _RECYCLED_PG_DB_IN_USE = False
+                _RECYCLED_PG_DB = None
+            raise
 
     hs = homeserver_to_use(
         server_name,
