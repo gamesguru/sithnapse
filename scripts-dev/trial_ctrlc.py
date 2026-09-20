@@ -776,9 +776,21 @@ def run() -> None:
             distributed_runner_type: Any = type(distributed_runner)
             original_drive_worker = distributed_runner_type._driveWorker
 
+            # DistTrialRunner calls `_driveWorker` once per worker process,
+            # each with its own `result` accumulator -- install the timing
+            # hook on each one so per-test JSONL timing also works under
+            # `-jN`, not just the single-process path below. All appends
+            # still land in the same file from this single coordinator
+            # process (workers themselves never touch it), so multiple open
+            # handles here is safe.
+            distributed_timing_files: list[IO[str]] = []
+
             async def drive_worker(
                 runner: Any, result: Any, test_cases: Any, worker: Any
             ) -> None:
+                worker_timing_file = _install_test_timing_logging(result)
+                if worker_timing_file is not None:
+                    distributed_timing_files.append(worker_timing_file)
                 for case in test_cases:
                     if interrupted:
                         break
@@ -838,6 +850,8 @@ def run() -> None:
                 type.__setattr__(
                     distributed_runner_type, "_driveWorker", original_drive_worker
                 )
+                for f in distributed_timing_files:
+                    f.close()
         else:
             assert isinstance(trialRunner, TrialRunner)
             test = unittest.decorate(suite, itrial.ITestCase)
