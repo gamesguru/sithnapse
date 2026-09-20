@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import os.path
+import queue
 import sqlite3
 import sys
 import threading
@@ -172,9 +173,190 @@ def _pg_timing(tag: str, elapsed: float, test_name: str | None = None) -> None:
             _PG_TEARDOWN_TEST_TIMINGS[test_name][tag] += elapsed
 
 
+# ── Background Postgres Test DB Dropper ──────────────────────────────────────
+_DB_DROP_QUEUE: "queue.Queue[tuple[str, str | None, Any] | None]" = queue.Queue()
+_DB_DROP_THREAD: threading.Thread | None = None
+_DB_DROP_LOCK = threading.Lock()
+
+
+def _ensure_db_drop_worker() -> None:
+    global _DB_DROP_THREAD
+    with _DB_DROP_LOCK:
+        if _DB_DROP_THREAD is None or not _DB_DROP_THREAD.is_alive():
+            _DB_DROP_THREAD = threading.Thread(
+                target=_db_drop_worker_loop,
+                name="synapse-test-db-dropper",
+                daemon=True,
+            )
+            _DB_DROP_THREAD.start()
+
+
+def _drop_test_db(
+    test_db: str,
+    test_name: str | None,
+    db_engine: Any,
+    conn: Any | None = None,
+    cur: Any | None = None,
+) -> tuple[bool, Any, Any]:
+    """Drop a test database. Reuses or creates the base connection/cursor."""
+    import psycopg2
+
+    _drop_t0 = time.monotonic()
+    dropped = False
+
+    if conn is None or conn.closed != 0 or cur is None or cur.closed:
+        _t_conn = time.monotonic()
+        conn = db_engine.module.connect(
+            dbname=POSTGRES_BASE_DB,
+            user=POSTGRES_USER,
+            host=POSTGRES_HOST,
+            port=POSTGRES_PORT,
+            password=POSTGRES_PASSWORD,
+        )
+        db_engine.attempt_to_set_autocommit(conn, True)
+        cur = conn.cursor()
+        _pg_timing("db_drop_connect", time.monotonic() - _t_conn, test_name=test_name)
+
+    _t_term = time.monotonic()
+    try:
+        cur.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            "WHERE datname = %s AND pid <> pg_backend_pid();",
+            (test_db,),
+        )
+    except psycopg2.Error:
+        warnings.warn(
+            "Could not terminate backends for %s (non-superuser?)" % (test_db,),
+            category=UserWarning,
+            stacklevel=2,
+        )
+    _pg_timing(
+        "db_drop_terminate_backends",
+        time.monotonic() - _t_term,
+        test_name=test_name,
+    )
+
+    for attempt in range(5):
+        _t_stmt = time.monotonic()
+        try:
+            cur.execute("DROP DATABASE IF EXISTS %s;" % (test_db,))
+            dropped = True
+            _pg_timing(
+                "db_drop_statement",
+                time.monotonic() - _t_stmt,
+                test_name=test_name,
+            )
+            break
+        except psycopg2.OperationalError as e:
+            _pg_timing(
+                "db_drop_statement",
+                time.monotonic() - _t_stmt,
+                test_name=test_name,
+            )
+            if attempt < 4:
+                warnings.warn(
+                    "Couldn't drop old db: " + str(e),
+                    category=UserWarning,
+                    stacklevel=2,
+                )
+                _t_sleep = time.monotonic()
+                time.sleep(0.5)
+                _pg_timing(
+                    "db_drop_retry_sleep",
+                    time.monotonic() - _t_sleep,
+                    test_name=test_name,
+                )
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = db_engine.module.connect(
+                    dbname=POSTGRES_BASE_DB,
+                    user=POSTGRES_USER,
+                    host=POSTGRES_HOST,
+                    port=POSTGRES_PORT,
+                    password=POSTGRES_PASSWORD,
+                )
+                db_engine.attempt_to_set_autocommit(conn, True)
+                cur = conn.cursor()
+
+    _pg_timing(
+        "db_drop_total",
+        time.monotonic() - _drop_t0,
+        test_name=test_name,
+    )
+
+    if not dropped:
+        warnings.warn(
+            "Failed to drop old DB %s." % (test_db,),
+            category=UserWarning,
+            stacklevel=2,
+        )
+
+    return dropped, conn, cur
+
+
+def _db_drop_worker_loop() -> None:
+    conn = None
+    cur = None
+    while True:
+        try:
+            item = _DB_DROP_QUEUE.get()
+            if item is None:
+                _DB_DROP_QUEUE.task_done()
+                break
+            test_db, test_name, db_engine = item
+            try:
+                _, conn, cur = _drop_test_db(
+                    test_db, test_name, db_engine, conn=conn, cur=cur
+                )
+            except Exception as e:
+                warnings.warn(
+                    f"Error in background drop worker for {test_db}: {e}",
+                    category=UserWarning,
+                    stacklevel=2,
+                )
+                if cur and not cur.closed:
+                    try:
+                        cur.close()
+                    except Exception:
+                        pass
+                if conn and conn.closed == 0:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                conn, cur = None, None
+            finally:
+                _DB_DROP_QUEUE.task_done()
+        except Exception:
+            try:
+                _DB_DROP_QUEUE.task_done()
+            except ValueError:
+                pass
+
+    if cur and not cur.closed:
+        try:
+            cur.close()
+        except Exception:
+            pass
+    if conn and conn.closed == 0:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _drain_db_drop_queue() -> None:
+    with _DB_DROP_LOCK:
+        if _DB_DROP_THREAD is not None and _DB_DROP_THREAD.is_alive():
+            _DB_DROP_QUEUE.join()
+
+
 def _print_pg_timings() -> None:
     if not os.environ.get("SYNAPSE_PG_TIMINGS"):
         return
+    _drain_db_drop_queue()
     with _PG_TIMINGS_LOCK:
         if not _PG_TIMINGS:
             return
@@ -424,6 +606,7 @@ def flush_pg_timings() -> None:
     _print_pg_timings()
 
 
+atexit.register(_drain_db_drop_queue)
 atexit.register(flush_pg_timings)
 
 if os.environ.get("SYNAPSE_PG_TIMINGS"):
@@ -1645,101 +1828,11 @@ def setup_test_homeserver(
         config.database.databases = [database]
 
         def cleanup() -> None:
-            import psycopg2
-
-            _drop_t0 = time.monotonic()
-            dropped = False
-
-            # Drop the test database
-            _t_conn = time.monotonic()
-            db_conn = db_engine.module.connect(
-                dbname=POSTGRES_BASE_DB,
-                user=POSTGRES_USER,
-                host=POSTGRES_HOST,
-                port=POSTGRES_PORT,
-                password=POSTGRES_PASSWORD,
-            )
-            _pg_timing(
-                "db_drop_connect",
-                time.monotonic() - _t_conn,
-                test_name=test_name,
-            )
-            db_engine.attempt_to_set_autocommit(db_conn, True)
-            cur = db_conn.cursor()
-
-            # Force-close any other sessions still attached to the test DB
-            # (e.g. a connection pool that hasn't finished tearing down yet)
-            # before we try to drop it, rather than relying purely on
-            # retry-with-sleep below. This is scoped to this test's own
-            # scratch DB via datname, so it can't affect any other test.
-            _t_term = time.monotonic()
-            try:
-                cur.execute(
-                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                    "WHERE datname = %s AND pid <> pg_backend_pid();",
-                    (test_db,),
-                )
-            except psycopg2.Error:
-                warnings.warn(
-                    "Could not terminate backends for %s (non-superuser?)" % (test_db,),
-                    category=UserWarning,
-                    stacklevel=2,
-                )
-            _pg_timing(
-                "db_drop_terminate_backends",
-                time.monotonic() - _t_term,
-                test_name=test_name,
-            )
-
-            # Try a few times to drop the DB. Some things may hold on to the
-            # database for a few more seconds due to flakiness, preventing
-            # us from dropping it when the test is over. If we can't drop
-            # it, warn and move on.
-            for _ in range(5):
-                _t_stmt = time.monotonic()
-                try:
-                    cur.execute("DROP DATABASE IF EXISTS %s;" % (test_db,))
-                    db_conn.commit()
-                    dropped = True
-                    _pg_timing(
-                        "db_drop_statement",
-                        time.monotonic() - _t_stmt,
-                        test_name=test_name,
-                    )
-                    break
-                except psycopg2.OperationalError as e:
-                    _pg_timing(
-                        "db_drop_statement",
-                        time.monotonic() - _t_stmt,
-                        test_name=test_name,
-                    )
-                    warnings.warn(
-                        "Couldn't drop old db: " + str(e),
-                        category=UserWarning,
-                        stacklevel=2,
-                    )
-                    _t_sleep = time.monotonic()
-                    time.sleep(0.5)
-                    _pg_timing(
-                        "db_drop_retry_sleep",
-                        time.monotonic() - _t_sleep,
-                        test_name=test_name,
-                    )
-
-            cur.close()
-            db_conn.close()
-            _pg_timing(
-                "db_drop_total",
-                time.monotonic() - _drop_t0,
-                test_name=test_name,
-            )
-
-            if not dropped:
-                warnings.warn(
-                    "Failed to drop old DB.",
-                    category=UserWarning,
-                    stacklevel=2,
-                )
+            if os.environ.get("SYNAPSE_TEST_SYNC_DROP_DB") == "1":
+                _drop_test_db(test_db, test_name, db_engine)
+            else:
+                _ensure_db_drop_worker()
+                _DB_DROP_QUEUE.put((test_db, test_name, db_engine))
 
         if not LEAVE_DB:
             # Register the cleanup hook
