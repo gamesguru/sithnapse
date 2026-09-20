@@ -139,6 +139,7 @@ PREPPED_SQLITE_DB_CONN: LoggingDatabaseConnection | None = None
 _PG_TIMINGS: dict[str, float] = defaultdict(float)
 _PG_TIMING_COUNTS: dict[str, int] = defaultdict(int)
 _PG_TIMING_MAX: dict[str, float] = defaultdict(float)
+_PG_LIFECYCLE_COUNTERS: dict[str, int] = defaultdict(int)
 _PG_TEARDOWN_TEST_TIMINGS: dict[str, dict[str, float]] = defaultdict(
     lambda: defaultdict(float)
 )
@@ -172,6 +173,11 @@ def _pg_timing(tag: str, elapsed: float, test_name: str | None = None) -> None:
             _PG_TIMING_MAX[tag] = elapsed
         if test_name:
             _PG_TEARDOWN_TEST_TIMINGS[test_name][tag] += elapsed
+
+
+def _pg_counter(tag: str, count: int = 1) -> None:
+    with _PG_TIMINGS_LOCK:
+        _PG_LIFECYCLE_COUNTERS[tag] += count
 
 
 # ── Background Postgres Test DB Dropper & Database Recycler ──────────────────
@@ -291,8 +297,10 @@ def _reset_recycled_postgres_db(
         cur.close()
         conn.close()
         _pg_timing("db_recycle_reset", time.monotonic() - _t0, test_name=test_name)
+        _pg_counter("recycle_reset_success")
         return True
     except Exception as e:
+        _pg_counter("recycle_reset_failed")
         warnings.warn(
             f"Failed to reset recycled DB {test_db}: {e}. Falling back to fresh clone.",
             category=UserWarning,
@@ -431,7 +439,10 @@ def _drop_test_db(
         test_name=test_name,
     )
 
-    if not dropped:
+    if dropped:
+        _pg_counter("db_drop_success")
+    else:
+        _pg_counter("db_drop_failed")
         warnings.warn(
             "Failed to drop old DB %s." % (test_db,),
             category=UserWarning,
@@ -517,6 +528,7 @@ def _drain_db_drop_queue() -> None:
 
     # Drop the process's recycled database on shutdown
     if _RECYCLED_PG_DB is not None:
+        _pg_counter("cleanup_dropped_worker_shutdown")
         db_to_drop = _RECYCLED_PG_DB
         _RECYCLED_PG_DB = None
         _drop_test_db(
@@ -536,13 +548,14 @@ def _print_pg_timings() -> None:
         return
     _drain_db_drop_queue()
     with _PG_TIMINGS_LOCK:
-        if not _PG_TIMINGS:
+        if not _PG_TIMINGS and not _PG_LIFECYCLE_COUNTERS:
             return
         # Snapshot under the lock so the SIGTERM/atexit flusher never races a
         # concurrent `_pg_timing` on these dicts.
         timings = dict(_PG_TIMINGS)
         counts = dict(_PG_TIMING_COUNTS)
         maxs = dict(_PG_TIMING_MAX)
+        lifecycle_counters = dict(_PG_LIFECYCLE_COUNTERS)
         test_timings = {k: dict(v) for k, v in _PG_TEARDOWN_TEST_TIMINGS.items()}
 
     _, strategy_name = get_postgres_clone_strategy()
@@ -557,6 +570,7 @@ def _print_pg_timings() -> None:
                         "timings": timings,
                         "counts": counts,
                         "maxs": maxs,
+                        "counters": lifecycle_counters,
                         "test_timings": test_timings,
                         "strategy": strategy_name,
                     },
