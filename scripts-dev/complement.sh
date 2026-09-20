@@ -519,6 +519,14 @@ main() {
     # ever got flushed. Force it on so every container gets a graceful
     # stop regardless of pass/fail.
     export COMPLEMENT_ALWAYS_PRINT_SERVER_LOGS=1
+    # ContainerStop's default grace period (COMPLEMENT_STOP_TIMEOUT_SECS,
+    # 1s upstream) is nowhere near enough for a worker-mode container --
+    # Postgres, Redis, nginx, and every worker process under supervisord
+    # all need to shut down before the flush handlers above can run, and
+    # if that overruns the grace period Docker sends SIGKILL instead,
+    # silently discarding whatever hadn't been flushed yet. Give it more
+    # room; a caller can still override by setting the var themselves.
+    export COMPLEMENT_STOP_TIMEOUT_SECS="${COMPLEMENT_STOP_TIMEOUT_SECS:-10}"
   fi
 
   # Complement's blueprint cache key is only (package namespace, blueprint

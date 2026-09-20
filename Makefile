@@ -56,6 +56,15 @@ test: ##H Run tests, e.g., on tests/storage/
 	if [ -n "$$SYNAPSE_POSTGRES" ] && [ -z "$$SYNAPSE_POSTGRES_HOST" ]; then eval "$$(scripts-dev/start_test_postgres.sh)" || exit 1; fi; \
 	uv run python scripts-dev/trial_ctrlc.py $(if $(TRIAL_JOBS),-j $(TRIAL_JOBS),) $(p)
 
+# Match Complement's package and in-package parallelism to an explicit GNU
+# Make -jN value. A plain `make complement` keeps the script's conservative
+# default; callers can also override COMPLEMENT_PARALLEL directly.
+COMPLEMENT_MAKE_JOBS := $(shell printf '%s\n' "$(MAKEFLAGS)" | sed -n 's/.*-j\([0-9][0-9]*\).*/\1/p')
+
+.PHONY: complement
+complement: ##H Run Complement tests (use -jN to set Complement parallelism)
+	COMPLEMENT_PARALLEL=$${COMPLEMENT_PARALLEL:-$(if $(COMPLEMENT_MAKE_JOBS),$(COMPLEMENT_MAKE_JOBS),2)} ./scripts-dev/complement.sh $(COMPLEMENT_ARGS)
+
 
 .PHONY: build
 build: ##H Build the package
