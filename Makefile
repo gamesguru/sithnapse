@@ -36,19 +36,25 @@ sync:	##H Runs: uv run maturin develop
 
 p ?=
 
-# Default Trial to one worker per available CPU. An explicit `make -jN test`
-# keeps its requested worker count; GNU Make normalizes both `-j N` and `-jN`
-# to `-jN` in MAKEFLAGS. An unbounded `make -j` uses the nproc default.
+# When the test target is invoked as `make -jN test`, pass the same worker
+# count through to Trial. GNU Make normalizes both `-j N` and `-jN` to `-jN`
+# in MAKEFLAGS. An unbounded `make -j` has no numeric value to propagate.
+#
+# Deliberately do NOT default this to nproc for a bare `make test`: passing
+# `-j` at all switches trial_ctrlc.py onto Twisted's distributed-trial
+# runner, which has no custom Ctrl+C handling and can hang indefinitely
+# (reactor.run() never returns) rather than exit cleanly -- e.g. an empty
+# or tiny suite starts a worker pool sized `min(len(testCases), maxWorkers)`,
+# which is 0 workers for 0 tests, so nothing ever signals completion. Plain
+# `make test` stays on trial_ctrlc.py's non-distributed path (config["jobs"]
+# is None), which installs its own SIGINT handler and always exits cleanly.
 TRIAL_JOBS := $(shell printf '%s\n' "$(MAKEFLAGS)" | sed -n 's/.*-j\([0-9][0-9]*\).*/\1/p')
-ifeq ($(TRIAL_JOBS),)
-TRIAL_JOBS := $(shell nproc)
-endif
 
 .PHONY: test
 test: ##H Run tests, e.g., on tests/storage/
 	cargo +nightly test
 	if [ -n "$$SYNAPSE_POSTGRES" ] && [ -z "$$SYNAPSE_POSTGRES_HOST" ]; then eval "$$(scripts-dev/start_test_postgres.sh)" || exit 1; fi; \
-	uv run python scripts-dev/trial_ctrlc.py -j $(TRIAL_JOBS) $(p)
+	uv run python scripts-dev/trial_ctrlc.py $(if $(TRIAL_JOBS),-j $(TRIAL_JOBS),) $(p)
 
 
 .PHONY: build
