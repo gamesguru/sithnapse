@@ -260,6 +260,9 @@ _METADATA_TABLES_IGNORE = {
 }
 
 
+_TABLES_TO_TRUNCATE_CACHE: list[str] | None = None
+
+
 def _reset_recycled_postgres_db(
     test_db: str,
     db_engine: Any,
@@ -291,13 +294,25 @@ def _reset_recycled_postgres_db(
         # Dirty-table tracking is process-global and SQL-shape-dependent, so it
         # cannot safely determine which rows belong to this particular DB.
         # Truncate every public table except schema identity metadata instead.
-        cur.execute(
-            "SELECT quote_ident(tablename) FROM pg_tables "
-            "WHERE schemaname = 'public' ORDER BY tablename"
-        )
-        tables_to_truncate = [
-            row[0] for row in cur.fetchall() if row[0] not in _METADATA_TABLES_IGNORE
-        ]
+        #
+        # The table *set* is schema-derived and identical for every recycled
+        # DB this worker process ever resets -- a DB that picked up DDL never
+        # reaches this function (it's dropped and replaced with a fresh clone
+        # instead, see the `had_ddl` branch in cleanup()). Cache the list
+        # after the first lookup so the recurring per-reset cost is just the
+        # TRUNCATE itself, not a repeated pg_tables catalog query too.
+        global _TABLES_TO_TRUNCATE_CACHE
+        if _TABLES_TO_TRUNCATE_CACHE is None:
+            cur.execute(
+                "SELECT quote_ident(tablename) FROM pg_tables "
+                "WHERE schemaname = 'public' ORDER BY tablename"
+            )
+            _TABLES_TO_TRUNCATE_CACHE = [
+                row[0]
+                for row in cur.fetchall()
+                if row[0] not in _METADATA_TABLES_IGNORE
+            ]
+        tables_to_truncate = _TABLES_TO_TRUNCATE_CACHE
         if tables_to_truncate:
             cur.execute(
                 "TRUNCATE TABLE "
