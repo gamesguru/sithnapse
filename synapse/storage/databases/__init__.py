@@ -100,7 +100,11 @@ class Databases(Generic[DataStoreT]):
 
         for database_config in hs.config.database.databases:
             db_name = database_config.name
+            if _pgt is not None:
+                _engine_t = time.monotonic()
             engine = create_engine(database_config.config)
+            if _pgt is not None:
+                _pgt("create_engine", time.monotonic() - _engine_t)
 
             _conn_t = time.monotonic()
             with make_conn(
@@ -133,7 +137,11 @@ class Databases(Generic[DataStoreT]):
                 if _pgt is not None:
                     _pgt("prepare_database", time.monotonic() - _t)
 
+                if _pgt is not None:
+                    _pool_t = time.monotonic()
                 database = DatabasePool(hs, database_config, engine)
+                if _pgt is not None:
+                    _pgt("database_pool_init", time.monotonic() - _pool_t)
 
                 if "main" in database_config.databases:
                     logger.info(
@@ -145,12 +153,23 @@ class Databases(Generic[DataStoreT]):
                     if main:
                         raise Exception("'main' data store already configured")
 
+                    if _pgt is not None:
+                        _main_store_t = time.monotonic()
                     main = main_store_class(database, db_conn, hs)
+                    if _pgt is not None:
+                        _pgt("main_store_init", time.monotonic() - _main_store_t)
 
                     # If we're on a process that can persist events also
                     # instantiate a `PersistEventsStore`
                     if hs.get_instance_name() in hs.config.worker.writers.events:
+                        if _pgt is not None:
+                            _persist_store_t = time.monotonic()
                         persist_events = PersistEventsStore(hs, database, main, db_conn)  # type: ignore[arg-type]
+                        if _pgt is not None:
+                            _pgt(
+                                "persist_events_store_init",
+                                time.monotonic() - _persist_store_t,
+                            )
 
                 if "state" in database_config.databases:
                     logger.info(
@@ -162,10 +181,25 @@ class Databases(Generic[DataStoreT]):
                     if state:
                         raise Exception("'state' data store already configured")
 
+                    if _pgt is not None:
+                        _state_deletion_t = time.monotonic()
                     state_deletion = StateDeletionDataStore(database, db_conn, hs)
+                    if _pgt is not None:
+                        _pgt(
+                            "state_deletion_store_init",
+                            time.monotonic() - _state_deletion_t,
+                        )
+                    if _pgt is not None:
+                        _state_store_t = time.monotonic()
                     state = StateGroupDataStore(database, db_conn, hs, state_deletion)
+                    if _pgt is not None:
+                        _pgt("state_store_init", time.monotonic() - _state_store_t)
 
+                if _pgt is not None:
+                    _commit_t = time.monotonic()
                 db_conn.commit()
+                if _pgt is not None:
+                    _pgt("databases_init_commit", time.monotonic() - _commit_t)
 
                 self.databases.append(database)
 

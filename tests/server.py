@@ -220,20 +220,32 @@ def _print_pg_timings() -> None:
             _timings_print(
                 f"    ├── {'hs_setup_total':38s}  {st_s * 1000:8.1f}ms  {st_cnt:6d}  {(st_s / st_cnt) * 1000:10.3f}ms"
             )
-            for inner_tag in ("make_conn", "prepare_database", "check_database"):
+            # Tags emitted by Databases.__init__ for each per-test homeserver.
+            # Shown in call order so the tree matches the actual execution path.
+            _STORE_INIT_TAGS: tuple[str, ...] = (
+                "create_engine",
+                "make_conn",
+                "check_database",
+                "prepare_database",
+                "database_pool_init",
+                "main_store_init",
+                "persist_events_store_init",
+                "state_deletion_store_init",
+                "state_store_init",
+                "databases_init_commit",
+            )
+            sub_inner = 0.0
+            for inner_tag in _STORE_INIT_TAGS:
                 if inner_tag in timings:
                     it_s = timings[inner_tag]
                     it_cnt = counts[inner_tag]
+                    sub_inner += it_s
                     _timings_print(
                         f"    │     ├── {inner_tag:32s}  {it_s * 1000:8.1f}ms  {it_cnt:6d}  {(it_s / it_cnt) * 1000:10.3f}ms"
                     )
-            sub_inner = sum(
-                timings.get(t, 0.0)
-                for t in ("make_conn", "prepare_database", "check_database")
-            )
             store_res = max(0.0, st_s - sub_inner)
             _timings_print(
-                f"    │     └── {'store_init (residual)':32s}  {store_res * 1000:8.1f}ms  {st_cnt:6d}  {(store_res / st_cnt) * 1000:10.3f}ms"
+                f"    │     └── {'store_init (unattributed)':32s}  {store_res * 1000:8.1f}ms  {st_cnt:6d}  {(store_res / st_cnt) * 1000:10.3f}ms"
             )
         sub_wall = timings.get("create_database", 0.0) + timings.get(
             "hs_setup_total", 0.0
@@ -253,8 +265,15 @@ def _print_pg_timings() -> None:
             "create_database",
             "hs_setup_total",
             "make_conn",
-            "prepare_database",
             "check_database",
+            "prepare_database",
+            "create_engine",
+            "database_pool_init",
+            "main_store_init",
+            "persist_events_store_init",
+            "state_deletion_store_init",
+            "state_store_init",
+            "databases_init_commit",
             "hs_shutdown",
         }
         for tag in sorted(timings):
