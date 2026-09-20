@@ -1310,14 +1310,15 @@ class DeviceWriterHandler(DeviceHandler):
             len(potentially_changed_hosts),
         )
 
-        for user_id, device_id in local_changes:
-            await self.store.add_device_list_outbound_pokes(
-                user_id=user_id,
-                device_id=device_id,
-                room_id=room_id,
-                hosts=potentially_changed_hosts,
-                context=None,
-            )
+        # Batch every affected device into one transaction instead of one
+        # round trip (its own stream ID allocation, connection checkout, and
+        # commit) per device -- a resync can affect many local users/devices
+        # at once, and they all share the same `hosts`/`room_id`/`context`.
+        await self.store.add_device_list_outbound_pokes_for_users(
+            user_device_ids=local_changes,
+            hosts=potentially_changed_hosts,
+            context=None,
+        )
 
         # Notify things that device lists need to be sent out.
         self.notifier.notify_replication()

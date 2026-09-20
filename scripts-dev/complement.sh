@@ -498,6 +498,16 @@ main() {
   echo "Synapse revision: ${synapse_revision}" >&2
   echo "Database: ${PASS_SYNAPSE_COMPLEMENT_DATABASE} (workers: ${PASS_SYNAPSE_COMPLEMENT_USE_WORKERS:-false}) | Embedded HAMT engine: ${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:-<none>}${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:+ at ${PASS_SYNAPSE_EMBEDDED_HAMT_PATH:-<not set>}}" >&2
 
+  # Complement's per-request HTTP client timeout defaults to 30s. Under real
+  # host contention (many "dirty" long-lived containers scheduled at once,
+  # a loaded dev machine, swapping) a homeserver can simply be slow to be
+  # scheduled rather than actually stuck, and a fixed 30s produces a
+  # spurious "context deadline exceeded" test failure that looks like a
+  # product bug but is really the test harness being impatient. Only raise
+  # it if not already set; a caller who wants the strict 30s default back
+  # (e.g. CI, where contention isn't expected) can still override it.
+  export COMPLEMENT_CLIENT_TIMEOUT_SECS="${COMPLEMENT_CLIENT_TIMEOUT_SECS:-90}"
+
   # Complement's Destroy() force-removes every homeserver container
   # unconditionally, pass or fail -- there is no "keep failed containers"
   # option, so this hook (which runs while the container is still up,
