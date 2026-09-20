@@ -13,6 +13,7 @@ enable Synapse's query-level timing instrumentation.
 from __future__ import annotations
 
 import argparse
+import bisect
 import hashlib
 import json
 import os
@@ -107,7 +108,7 @@ def utc(epoch_ns: int) -> str:
 
 def start_samplers(run_dir: Path, interval: int, device: str) -> list[tuple[Any, ...]]:
     samplers: list[tuple[list[str], str]] = [
-        (["iostat", "-y", "-x", "-t", str(interval), device], "iostat.log"),
+        (["iostat", "-y", "-x", "-t", device, str(interval)], "iostat.log"),
         (["pidstat", "-h", "-u", "-r", "-d", str(interval)], "pidstat.log"),
         (["vmstat", "-w", "-t", str(interval)], "vmstat.log"),
     ]
@@ -325,7 +326,7 @@ def main() -> int:
                 continue
             record = json.loads(line)
             all_tests.setdefault(record["test"], [None, None, None])[index] = record
-    comparisons = []
+    comparisons: list[dict[str, Any]] = []
     for test, records in all_tests.items():
         elapsed = [r["elapsed_ms"] if r else None for r in records]
         valid = [value for value in elapsed if value is not None]
@@ -341,6 +342,40 @@ def main() -> int:
             }
         )
     comparisons.sort(key=lambda row: row["range_ms"] or 0, reverse=True)
+    for row in comparisons[:20]:
+        overlaps: list[dict[str, int | None] | None] = []
+        for index, record in enumerate(row["records"]):
+            pg_path = output_dir / f"run-{index + 1}" / "postgres.jsonl"
+            samples = (
+                [
+                    json.loads(line)
+                    for line in pg_path.read_text(encoding="utf-8").splitlines()
+                    if line
+                ]
+                if pg_path.exists()
+                else []
+            )
+            samples.sort(key=lambda sample: sample["sample_epoch_ns"])
+            times = [sample["sample_epoch_ns"] for sample in samples]
+            if record is None:
+                overlaps.append(None)
+                continue
+            left = bisect.bisect_left(times, record["start_time_epoch_ns"])
+            right = bisect.bisect_right(times, record["end_time_epoch_ns"])
+            within = samples[left:right]
+            overlaps.append(
+                {
+                    "postgres_samples": len(within),
+                    "max_active_connections": max(
+                        (sample["active_connections"] for sample in within),
+                        default=None,
+                    ),
+                    "max_connections": max(
+                        (sample["connections"] for sample in within), default=None
+                    ),
+                }
+            )
+        row["postgres_activity_during_test"] = overlaps
     matching_counts = (
         len({(run["test_count"], run["skips"]) for run in runs}) == 1
         and runs[0]["test_count"] is not None
@@ -350,14 +385,20 @@ def main() -> int:
         and len({tuple(command) for _run in runs}) == 1
         and all(run["return_code"] == 0 for run in runs)
     )
+    accepted = (
+        matching_counts
+        and matching_identity
+        and identity["synapse_commit_matches_requested_baseline"]
+    )
+    acceptance: dict[str, bool] = {
+        "same_test_and_skip_counts": matching_counts,
+        "same_build_command_environment": matching_identity,
+        "full_capture_accepted": accepted,
+    }
     report = {
         "identity": identity,
         "runs": runs,
-        "acceptance": {
-            "same_test_and_skip_counts": matching_counts,
-            "same_build_command_environment": matching_identity,
-            "full_capture_accepted": matching_counts and matching_identity,
-        },
+        "acceptance": acceptance,
         "tests_by_elapsed_range": comparisons,
         "system_sample_logs": {
             f"run-{i}": ["iostat.log", "pidstat.log", "vmstat.log", "postgres.jsonl"]
@@ -367,9 +408,68 @@ def main() -> int:
     (output_dir / "comparison.json").write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
+    report_lines = [
+        "# Controlled Trial repeatability",
+        "",
+        f"- Synapse commit: `{identity['synapse_commit']}`",
+        f"- mtxdb lock commit: `{identity['mtxdb_lock_commit']}`",
+        f"- mtxdb extension SHA-256: `{identity['mtxdb_extension_sha256']}`",
+        f"- Command: `{' '.join(command)}`",
+        f"- Requested baseline match: `{identity['synapse_commit_matches_requested_baseline']}`",
+        f"- Accepted: `{accepted}`",
+        "",
+        "| Run | Wall (s) | Trial (s) | Tests | Skips | Outcome |",
+        "|---:|---:|---:|---:|---:|:---|",
+    ]
+    for run in runs:
+        report_lines.append(
+            f"| {run['run']} | {run['wall_seconds']:.3f} | "
+            f"{run['trial_elapsed_seconds']} | {run['test_count']} | "
+            f"{run['skips']} | {run['outcome']} |"
+        )
+    report_lines.extend(
+        [
+            "",
+            "Top per-test timing ranges; PostgreSQL activity is the maximum sampled "
+            "during each test interval. Short tests may have no overlapping 1-second sample.",
+            "",
+            "| Test | Range (ms) | R1 (ms / active) | R2 (ms / active) | R3 (ms / active) | R1−R3 (ms) |",
+            "|:---|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for row in comparisons[:20]:
+        cells = []
+        for elapsed, activity in zip(
+            row["elapsed_ms"], row["postgres_activity_during_test"]
+        ):
+            active = (
+                activity["max_active_connections"]
+                if activity and activity["max_active_connections"] is not None
+                else "n/a"
+            )
+            cells.append(f"{elapsed:.2f} / {active}" if elapsed is not None else "n/a")
+        delta = row["first_minus_third_ms"]
+        report_lines.append(
+            f"| `{row['test']}` | {row['range_ms']:.2f} | "
+            f"{cells[0]} | {cells[1]} | {cells[2]} | "
+            f"{delta:.2f} |"
+        )
+    report_lines.extend(
+        [
+            "",
+            "System samples: `iostat.log`, `pidstat.log`, `vmstat.log`, and "
+            "`postgres.jsonl` in each `run-N/` directory. Test JSONL records include "
+            "UTC and epoch-nanosecond start/end times for interval alignment.",
+            "",
+            "Unexplained timing differences remain unattributed; this report does not "
+            "infer causality from overlapping system samples.",
+            "",
+        ]
+    )
+    (output_dir / "comparison.md").write_text("\n".join(report_lines), encoding="utf-8")
     print(f"Repeatability artifacts: {output_dir}")
     print(f"Acceptance: {report['acceptance']}")
-    return 0 if matching_counts and matching_identity else 1
+    return 0 if accepted else 1
 
 
 if __name__ == "__main__":

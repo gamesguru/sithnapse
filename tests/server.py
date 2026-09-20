@@ -212,11 +212,10 @@ INSERT INTO event_push_summary_stream_ordering VALUES ('X', 0);
 INSERT INTO stats_incremental_position VALUES ('X', 1);
 INSERT INTO user_directory_stream_pos VALUES ('X', 1);
 INSERT INTO federation_stream_position VALUES ('federation', -1, 'master'), ('events', -1, 'master');
-INSERT INTO device_lists_changes_in_room_max_pruned_stream_id VALUES (0);
-INSERT INTO device_lists_changes_converted_stream_position VALUES ('master', 1);
-INSERT INTO delayed_events_stream_pos VALUES ('master', 1);
-INSERT INTO room_forgetter_stream_pos VALUES ('master', 1);
-INSERT INTO scheduled_tasks VALUES ('master', 1);
+INSERT INTO device_lists_changes_in_room_max_pruned_stream_id (stream_id) VALUES (0);
+INSERT INTO device_lists_changes_converted_stream_position (stream_id, room_id) VALUES (1, '');
+INSERT INTO delayed_events_stream_pos (stream_id) VALUES (1);
+INSERT INTO room_forgetter_stream_pos (stream_id) VALUES (1);
 """
 
 _RESET_SEQUENCES_SQL = """
