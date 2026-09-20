@@ -112,6 +112,7 @@ from synapse.util.json import json_encoder
 from tests.utils import (
     LEAVE_DB,
     POSTGRES_BASE_DB,
+    POSTGRES_DBNAME_FOR_INITIAL_CREATE,
     POSTGRES_HOST,
     POSTGRES_PASSWORD,
     POSTGRES_PORT,
@@ -222,7 +223,7 @@ def _drop_test_db(
     if conn is None or conn.closed != 0 or cur is None or cur.closed:
         _t_conn = time.monotonic()
         conn = db_engine.module.connect(
-            dbname=POSTGRES_BASE_DB,
+            dbname=POSTGRES_DBNAME_FOR_INITIAL_CREATE,
             user=POSTGRES_USER,
             host=POSTGRES_HOST,
             port=POSTGRES_PORT,
@@ -286,7 +287,7 @@ def _drop_test_db(
                 except Exception:
                     pass
                 conn = db_engine.module.connect(
-                    dbname=POSTGRES_BASE_DB,
+                    dbname=POSTGRES_DBNAME_FOR_INITIAL_CREATE,
                     user=POSTGRES_USER,
                     host=POSTGRES_HOST,
                     port=POSTGRES_PORT,
@@ -1817,7 +1818,7 @@ def setup_test_homeserver(
     if USE_POSTGRES_FOR_TESTS:
         _t0 = time.monotonic()
         db_conn = db_engine.module.connect(
-            dbname=POSTGRES_BASE_DB,
+            dbname=POSTGRES_DBNAME_FOR_INITIAL_CREATE,
             user=POSTGRES_USER,
             host=POSTGRES_HOST,
             port=POSTGRES_PORT,
