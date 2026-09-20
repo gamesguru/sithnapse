@@ -85,6 +85,21 @@ class EmbeddedRedactionsRejectionsTestCase(unittest.TestCase):
             ("$redaction", False),
         )
 
+    def test_put_is_create_only(self) -> None:
+        """A second redaction targeting the same event must not clobber the
+        existing slot's aggregate `have_censored` -- SQL's `_store_redaction`
+        upsert preserves it, and `redactions.redacts` is non-unique."""
+        ns = "test-redactions-create-only"
+        put_redaction_batch(_ENGINE, ns, [("$target", "$redaction1", False)])
+        set_have_censored_batch(_ENGINE, ns, ["$target"], True)
+
+        # A second redaction of the same event: the slot stays censored.
+        put_redaction_batch(_ENGINE, ns, [("$target", "$redaction2", False)])
+        self.assertEqual(
+            get_redactions_batch(_ENGINE, ns, ["$target"])["$target"],
+            ("$redaction1", True),
+        )
+
     def test_set_have_censored_skips_absent_ids(self) -> None:
         ns = "test-redactions-absent"
         # No mirror record for the id: a no-op, not an error.

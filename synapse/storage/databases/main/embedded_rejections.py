@@ -12,15 +12,18 @@
 # <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
 
-"""Mirrors `rejections` (event_id -> (reason, last_check)) into the same
-embedded mtxdb keyspace `event_json` and the state HAMT use. Flat point
-lookups only -- see `_store_rejections_txn` in `events.py` (the write).
+"""Mirrors `rejections` (event_id -> (reason, last_check)) into the embedded
+mtxdb State keyspace, alongside `event_json` and `event_to_state_group`. Flat
+point lookups only -- see `_store_rejections_txn` in `events.py` (the write).
 
 Modelled directly on `embedded_event_to_state_group.py`'s flat-KV pattern:
 plain idempotent `batch_put`/`batch_get` against the generic KV surface, no new
-Rust, no room-sharding/locator layer. SQL stays authoritative through this
-phase, so writes are `SyncTier.CACHE`: a lost unflushed write only costs a
-slower SQL-fallback read, never data loss.
+Rust, no room-sharding/locator layer. `shard_type_for_key`
+(`rust/src/database/mtxdb.rs:117`) routes the `rejection:` prefix -- like every
+non-`event_json:`/`prev_event_edges:` key -- to the State pool's single global
+flat-KV collection (`kv_room_id()`), not EventDag. SQL stays authoritative
+through this phase, so writes are `SyncTier.CACHE`: a lost unflushed write only
+costs a slower SQL-fallback read, never data loss.
 
 `last_check` is stored as its text form (matching the SQL column, which is
 TEXT and written as `str(time_msec)`), not re-encoded as an integer, so a

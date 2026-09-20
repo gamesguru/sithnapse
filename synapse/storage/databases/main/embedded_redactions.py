@@ -13,10 +13,10 @@
 #
 
 """Mirrors `redactions` (redacts_event_id -> the redaction event that targets
-it) into the same embedded mtxdb keyspace `event_json` and the state HAMT use.
-Flat point lookups only -- see `_store_redaction`/`_store_event_txn` in
-`events.py` (writes) and `have_censored_event` in `events_worker.py` (the
-read).
+it) into the embedded mtxdb State keyspace, alongside `event_json` and
+`event_to_state_group`. Flat point lookups only -- see
+`_store_redaction`/`_store_event_txn` in `events.py` (writes) and
+`have_censored_event` in `events_worker.py` (the read).
 
 Deliberately keyed by the *redacted* event id (`redacts`), not the redaction
 event's own id: the one read path, `have_censored_event(event_id)`, is a point
@@ -24,16 +24,31 @@ lookup "has the event `event_id` been censored" and in SQL selects by
 `redacts = event_id` (see events_worker.py). Keying by the redaction event id
 would make that lookup impossible without a secondary index.
 
-The value carries the redaction event's id plus `have_censored`, so a
-read-modify-write (`set_have_censored_batch`) can flip the flag without
-re-supplying the id. `received_ts` is intentionally dropped -- the plan
+The value carries the redaction event's id plus `have_censored`. Note that
+`redactions.redacts` is NOT unique -- several redaction events can target the
+same event, and `have_censored_event` ORs across all of them (`any(...)`). The
+single flat slot represents that aggregate, and the two writers keep it
+consistent with SQL:
+
+- `put_redaction_batch` (the insert path, `_store_redaction`) is **create-only**
+  and never overwrites an existing slot. This mirrors SQL exactly: the
+  `simple_upsert_txn` there only sets `redacts`/`received_ts`/`recheck`, so an
+  existing row's `have_censored` is preserved. Blindly overwriting would let a
+  second redaction of an already-censored event reset the aggregate to False.
+- `set_have_censored_batch` is an absolute setter for the aggregate: SQL's
+  `:3017` bulk update resets every row for the target to False, and censoring
+  sets one row True (so the OR is True) -- both map to a plain set here.
+
+`received_ts` is intentionally dropped -- the plan
 (`res/docs/2026-09-20-events-table-deprecation-plan.md`) treats it as derivable
 from the event's internal_metadata.
 
-Like `embedded_event_to_state_group.py`, this is a plain idempotent
-`batch_put`/`batch_get` against the generic KV surface -- no new Rust, and no
-room-sharding/locator layer (`event_to_state_group`-style flat keys into the
-`EventDag` pool). SQL stays authoritative through this phase, so writes are
+`shard_type_for_key` (`rust/src/database/mtxdb.rs:117`) routes the `redaction:`
+prefix -- like every non-`event_json:`/`prev_event_edges:` key, including
+`event_to_state_group:` -- to the State pool's single global flat-KV collection
+(`kv_room_id()`), not EventDag. That's the same generic `batch_put`/`batch_get`
+surface `event_to_state_group` uses; no new Rust, no room-sharding/locator
+layer. SQL stays authoritative through this phase, so writes are
 `SyncTier.CACHE`: a lost unflushed write only costs a slower SQL-fallback read,
 never data loss.
 
@@ -84,21 +99,15 @@ def _decode_redaction(value: bytes) -> tuple[str, bool]:
     return redaction_event_id, have_censored
 
 
-def put_redaction_batch(
+def _write_redaction_batch(
     engine_name: str | None,
     namespace: str,
     rows: list[tuple[str, str, bool]],
 ) -> None:
-    """`rows`: `(redacts_event_id, redaction_event_id, have_censored)`.
-
-    Plain idempotent `batch_put`, not create-once-guarded: `have_censored`
-    flips in both directions after the initial insert (see
-    `set_have_censored_batch`), and re-persisting the same redaction (a
-    transaction retry) must be able to rewrite the same key.
-
-    Does not sync() the embedded engine -- this is a CACHE-tier write (SQL
-    remains authoritative), same reasoning as
-    `embedded_event_json.put_event_json_batch`'s default.
+    """Raw unconditional write of `(redacts_event_id, redaction_event_id,
+    have_censored)` records. Callers decide whether an existing slot may be
+    overwritten -- see `put_redaction_batch` (create-only) and
+    `set_have_censored_batch` (absolute overwrite).
     """
     if not rows:
         return
@@ -114,6 +123,32 @@ def put_redaction_batch(
         _et = time.monotonic()
         engine.batch_put(pairs)
         ffi_timing("ffi_batch_put", time.monotonic() - _et)
+
+
+def put_redaction_batch(
+    engine_name: str | None,
+    namespace: str,
+    rows: list[tuple[str, str, bool]],
+) -> None:
+    """`rows`: `(redacts_event_id, redaction_event_id, have_censored)`.
+
+    Create-only: a slot that already exists is left untouched. This mirrors
+    SQL's `_store_redaction` upsert (which never rewrites an existing row's
+    `have_censored`) and keeps the aggregate correct when several redactions
+    target the same event -- see the module docstring.
+
+    Does not sync() the embedded engine -- this is a CACHE-tier write (SQL
+    remains authoritative), same reasoning as
+    `embedded_event_json.put_event_json_batch`'s default.
+    """
+    if not rows:
+        return
+    existing = get_redactions_batch(engine_name, namespace, [r[0] for r in rows])
+    _write_redaction_batch(
+        engine_name,
+        namespace,
+        [row for row in rows if row[0] not in existing],
+    )
 
 
 def get_redactions_batch(
@@ -145,7 +180,8 @@ def set_have_censored_batch(
     have_censored: bool,
 ) -> None:
     """Read-modify-write `have_censored` for the listed redacted event ids,
-    preserving each record's redaction event id.
+    preserving each record's redaction event id. This is an absolute setter
+    for the aggregate, not an OR -- see the module docstring.
 
     Ids with no mirror record are skipped: the redaction event that created
     them is written first (in `_store_redaction`), so a missing record means
@@ -157,7 +193,7 @@ def set_have_censored_batch(
     existing = get_redactions_batch(engine_name, namespace, redacts_event_ids)
     if not existing:
         return
-    put_redaction_batch(
+    _write_redaction_batch(
         engine_name,
         namespace,
         [
