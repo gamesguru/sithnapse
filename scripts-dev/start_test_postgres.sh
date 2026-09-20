@@ -145,7 +145,7 @@ EOF
 # Headroom for parallel trial workers (e.g. `trial --jobs=N`): each worker's
 # homeserver pool defaults to cp_max=5, plus setup/teardown connections
 # outside the pool.
-max_connections = 200
+max_connections = 500
 EOF
 
 	# listen_addresses='' means unix-socket only: this is a local throwaway
