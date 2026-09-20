@@ -317,7 +317,24 @@ def _db_drop_worker_loop() -> None:
     cur = None
     while True:
         try:
-            item = _DB_DROP_QUEUE.get()
+            try:
+                item = _DB_DROP_QUEUE.get(timeout=2.0)
+            except queue.Empty:
+                # Close connection when idle to free Postgres client slots
+                if cur and not cur.closed:
+                    try:
+                        cur.close()
+                    except Exception:
+                        pass
+                    cur = None
+                if conn and conn.closed == 0:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    conn = None
+                continue
+
             if item is None:
                 _DB_DROP_QUEUE.task_done()
                 break
