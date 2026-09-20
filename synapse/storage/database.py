@@ -168,8 +168,8 @@ _MUTATING_TABLE_RE = re.compile(
     r"^\s*(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM|TRUNCATE(?:\s+TABLE)?)\s+(\w+)",
     re.IGNORECASE,
 )
-_DDL_RE = re.compile(
-    r"^\s*(?:CREATE|DROP|ALTER)\s+(?:TABLE|INDEX|VIEW|SCHEMA|TYPE|SEQUENCE)",
+_DISRUPTIVE_DDL_RE = re.compile(
+    r"^\s*(?:CREATE\s+(?!TEMPORARY|TEMP|UNLOGGED)\s*TABLE\s+(?!IF\s+NOT\s+EXISTS)|DROP\s+TABLE\s+(?!IF\s+EXISTS\s+(?:temp_|tmp_|_extremities|events_to_purge)|_extremities)|DROP\s+SCHEMA|ALTER\s+TABLE\s+\w+\s+(?:DROP|RENAME))",
     re.IGNORECASE,
 )
 
@@ -178,7 +178,7 @@ def track_dirty_table_from_sql(sql: str) -> None:
     global _HAD_DDL
     if "--" in sql or "/*" in sql:
         sql = _SQL_COMMENT_RE.sub(" ", sql)
-    if _DDL_RE.search(sql):
+    if _DISRUPTIVE_DDL_RE.search(sql):
         with _DIRTY_TABLES_LOCK:
             _HAD_DDL = True
         return

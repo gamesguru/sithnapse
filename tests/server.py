@@ -2045,7 +2045,9 @@ def setup_test_homeserver(
                 )
                 cur.close()
                 db_conn.close()
-                _pg_timing("create_database", time.monotonic() - _t0, test_name=test_name)
+                _pg_timing(
+                    "create_database", time.monotonic() - _t0, test_name=test_name
+                )
 
             database_config["_TEST_DB_IS_FRESH"] = True
             database = DatabaseConnectionConfig("master", database_config)
