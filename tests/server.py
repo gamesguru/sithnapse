@@ -210,16 +210,30 @@ INSERT INTO room_forgetter_stream_pos (stream_id) VALUES (1);
 -- Matches the one-time seed row from
 -- schema/main/delta/88/05_drop_old_otks.sql.postgres, which a fresh clone
 -- always has its own independent copy of but a recycled DB does not once
--- some earlier test's run has consumed/completed the task.
+-- some earlier test's run has consumed/completed the task. The scheduler
+-- treats this timestamp as a "not due before" gate checked against the
+-- test's *simulated* reactor clock (see task_scheduler.py's
+-- max_timestamp=self._clock.time_msec()), which tests routinely rewind to
+-- the past and then fast-forward. The real migration's row is always
+-- safely in the past relative to that by the time any test runs (it's
+-- seeded once, at template-prep time). Using real wall-clock "now" here
+-- instead raced the exact moment a test's clock advances catch back up to
+-- real time. 0 is unconditionally in the past for every simulated clock,
+-- so the task is always immediately due.
 INSERT INTO scheduled_tasks (id, action, status, timestamp) VALUES (
-    'delete_old_otks_task', 'delete_old_otks', 'scheduled',
-    extract(epoch from current_timestamp) * 1000
+    'delete_old_otks_task', 'delete_old_otks', 'scheduled', 0
 );
 """
 
 _RESET_SEQUENCES_SQL = """
 -- Match the freshly prepared base DB: stream sequences are already marked
 -- called at their initial persisted position, so the first allocated ID is 2.
+-- These four sequences have a fresh-schema initial value of 1 with is_called
+-- false, so the first allocated ID is 1.
+SELECT setval('application_services_txn_id_seq', 1, false);
+SELECT setval('event_auth_chain_id', 1, false);
+SELECT setval('instance_map_instance_id_seq', 1, false);
+SELECT setval('user_id_seq', 1, false);
 SELECT setval('thread_subscriptions_sequence', 2, true);
 SELECT setval('events_stream_seq', 1, true);
 SELECT setval('receipts_sequence', 1, true);
