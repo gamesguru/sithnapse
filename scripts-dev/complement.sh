@@ -509,6 +509,12 @@ main() {
 
   if [[ -n "${SYNAPSE_PG_TIMINGS:-}" ]]; then
     export PASS_SYNAPSE_PG_TIMINGS=1
+    # Pass setup_timings_path="-" into the container so each Synapse process
+    # prints its Databases.__init__ breakdown to stderr immediately after
+    # setup() completes -- before any SIGTERM, so timing output is never lost
+    # to an instant SIGKILL.  "-" is the sentinel meaning stderr-only (no file
+    # write inside the container, which would be destroyed before retrieval).
+    export PASS_SYNAPSE_DB_SETUP_TIMINGS_PATH=-
     # NOTE: we do NOT force COMPLEMENT_ALWAYS_PRINT_SERVER_LOGS /
     # COMPLEMENT_STOP_TIMEOUT_SECS here. Doing so forces every container in
     # the run through a graceful SIGTERM stop (Postgres runs a full shutdown
