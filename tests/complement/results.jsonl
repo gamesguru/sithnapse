@@ -525,7 +525,7 @@
 {"Action":"pass","Test":"TestOutboundFederationProfile"}
 {"Action":"pass","Test":"TestOutboundFederationProfile/Outbound_federation_can_query_profile_data"}
 {"Action":"pass","Test":"TestOutboundFederationSend"}
-{"Action":"pass","Test":"TestPartialStateJoin"}
+{"Action":"fail","Test":"TestPartialStateJoin"}
 {"Action":"pass","Test":"TestPartialStateJoin/CanFastJoinDuringPartialStateJoin"}
 {"Action":"pass","Test":"TestPartialStateJoin/CanLazyLoadingSyncDuringPartialStateJoin"}
 {"Action":"pass","Test":"TestPartialStateJoin/CanReceiveDeviceListUpdateDuringPartialStateJoin"}
@@ -557,7 +557,7 @@
 {"Action":"pass","Test":"TestPartialStateJoin/GappySyncAfterPartialStateSynced"}
 {"Action":"pass","Test":"TestPartialStateJoin/Lazy-loading_gappy_sync_includes_remote_memberships_during_partial_state_join"}
 {"Action":"pass","Test":"TestPartialStateJoin/Lazy-loading_incremental_sync_includes_remote_memberships_during_partial_state_join"}
-{"Action":"pass","Test":"TestPartialStateJoin/Lazy-loading_initial_sync_includes_remote_memberships_during_partial_state_join"}
+{"Action":"fail","Test":"TestPartialStateJoin/Lazy-loading_initial_sync_includes_remote_memberships_during_partial_state_join"}
 {"Action":"pass","Test":"TestPartialStateJoin/Leave_during_resync"}
 {"Action":"pass","Test":"TestPartialStateJoin/Leave_during_resync/can_be_triggered_by_remote_ban"}
 {"Action":"pass","Test":"TestPartialStateJoin/Leave_during_resync/can_be_triggered_by_remote_kick"}

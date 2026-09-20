@@ -509,6 +509,16 @@ main() {
 
   if [[ -n "${SYNAPSE_PG_TIMINGS:-}" ]]; then
     export PASS_SYNAPSE_PG_TIMINGS=1
+    # The timing sections are only ever written by Synapse's atexit/SIGTERM
+    # flush handlers, which never run if the container is SIGKILLed --
+    # Complement's Destroy() only sends SIGTERM (ContainerStop) instead of
+    # SIGKILL (ContainerKillFunc) when printServerLogs is true, which
+    # defaults to failing tests only. Without this, a fully-passing run
+    # (the common case you'd want a timing report from) produces nothing:
+    # the docker-log-watcher below has nothing to catch because nothing
+    # ever got flushed. Force it on so every container gets a graceful
+    # stop regardless of pass/fail.
+    export COMPLEMENT_ALWAYS_PRINT_SERVER_LOGS=1
   fi
 
   # Complement's blueprint cache key is only (package namespace, blueprint
