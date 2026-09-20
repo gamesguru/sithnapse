@@ -777,20 +777,26 @@ def run() -> None:
             original_drive_worker = distributed_runner_type._driveWorker
 
             # DistTrialRunner calls `_driveWorker` once per worker process,
-            # each with its own `result` accumulator -- install the timing
-            # hook on each one so per-test JSONL timing also works under
-            # `-jN`, not just the single-process path below. All appends
-            # still land in the same file from this single coordinator
-            # process (workers themselves never touch it), so multiple open
-            # handles here is safe.
+            # but ALL of those calls share the same `DistReporter` instance
+            # for a given run pass (it's created once in runAsync() and bound
+            # via `partial(driveWorker, result, testCases)` before being
+            # handed to every worker). Installing the timing hook on every
+            # call would wrap startTest/stopTest N times for N workers, so
+            # each test completion would emit N nested JSONL records instead
+            # of one. Key on id(result) so each distinct result object (one
+            # per run pass; more than one only under --until-failure) is
+            # wrapped exactly once regardless of how many workers share it.
             distributed_timing_files: list[IO[str]] = []
+            installed_result_ids: set[int] = set()
 
             async def drive_worker(
                 runner: Any, result: Any, test_cases: Any, worker: Any
             ) -> None:
-                worker_timing_file = _install_test_timing_logging(result)
-                if worker_timing_file is not None:
-                    distributed_timing_files.append(worker_timing_file)
+                if id(result) not in installed_result_ids:
+                    installed_result_ids.add(id(result))
+                    worker_timing_file = _install_test_timing_logging(result)
+                    if worker_timing_file is not None:
+                        distributed_timing_files.append(worker_timing_file)
                 for case in test_cases:
                     if interrupted:
                         break
