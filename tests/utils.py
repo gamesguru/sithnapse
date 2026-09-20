@@ -25,6 +25,7 @@ import os
 import signal
 import sys
 import tempfile
+import time
 import uuid
 from types import FrameType, TracebackType
 from typing import (
@@ -191,6 +192,71 @@ if _embedded_hamt_path_is_tmp and not os.environ.get(
 POSTGRES_DBNAME_FOR_INITIAL_CREATE = "postgres"
 
 
+def _drain_template_background_updates_postgres() -> None:
+    """Pre-drain all background schema updates on POSTGRES_BASE_DB.
+
+    This runs all pending index creations and data updates once on the empty
+    template database, then cleanly shuts down so all sessions on POSTGRES_BASE_DB
+    are closed. Every clone created from POSTGRES_BASE_DB will inherit an empty
+    background_updates table and pre-created indexes.
+    """
+    from unittest.mock import Mock, patch
+
+    from twisted.internet.defer import ensureDeferred
+    from twisted.trial.unittest import SynchronousTestCase
+
+    from synapse.config.homeserver import HomeServerConfig
+    from synapse.storage.controllers.purge_events import PurgeEventsStorageController
+
+    from tests.server import (
+        TestHomeServer,
+        ThreadedMemoryReactorClock,
+        make_fake_db_pool,
+    )
+
+    reactor = ThreadedMemoryReactorClock()
+    raw_config = default_config(server_name="test-template-draining", parse=False)
+    raw_config["database"] = {
+        "name": "psycopg2",
+        "args": {
+            "database": POSTGRES_BASE_DB,
+            "user": POSTGRES_USER,
+            "host": POSTGRES_HOST,
+            "port": POSTGRES_PORT,
+            "password": POSTGRES_PASSWORD,
+            "cp_min": 1,
+            "cp_max": 1,
+        },
+    }
+    config = HomeServerConfig()
+    config.parse_config_dict(raw_config, "", "")
+
+    hs = TestHomeServer("test-template-draining", config=config, reactor=reactor)
+    hs.tls_server_context_factory = Mock()
+
+    with patch("synapse.storage.database.make_pool", side_effect=make_fake_db_pool):
+        hs.setup()
+
+    # Register controller background updates (e.g. state group deletion)
+    PurgeEventsStorageController(hs, hs.get_datastores())
+
+    stor = hs.get_datastores().main
+    d = ensureDeferred(stor.db_pool.updates.run_background_updates(False))
+
+    while not d.called or d.paused:
+        time.sleep(0.001)
+        reactor.advance(0.01)
+
+    stc = SynchronousTestCase()
+    stc.successResultOf(d)
+
+    d_sd = ensureDeferred(hs.shutdown())
+    while not d_sd.called or d_sd.paused:
+        time.sleep(0.001)
+        reactor.advance(0.01)
+    stc.successResultOf(d_sd)
+
+
 def setupdb() -> None:
     # If we're using PostgreSQL, set up the db once
     if USE_POSTGRES_FOR_TESTS:
@@ -289,6 +355,13 @@ def setupdb() -> None:
         )
         prepare_database(logging_conn, db_engine, None)
         logging_conn.close()
+
+        # Pre-drain all 50+ background schema updates (index creations, data
+        # migrations over empty tables) once on the template database. Every
+        # test clone will then inherit a database where all indexes already
+        # exist and background_updates is already empty, avoiding running 50+
+        # updates in every single test (~750k queries across the full suite).
+        _drain_template_background_updates_postgres()
 
         def _cleanup() -> None:
             db_conn = db_engine.module.connect(
