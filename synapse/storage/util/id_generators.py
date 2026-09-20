@@ -338,9 +338,7 @@ class MultiWriterIdGenerator(AbstractStreamIdGenerator):
             # If there have been no explicit writers given then any instance can
             # write to the stream. In which case, let's pre-seed our own
             # position with the current minimum.
-            self._current_positions[self._instance_name] = (
-                self._persisted_upto_position
-            )
+            self._current_positions[self._instance_name] = self._persisted_upto_position
 
     def _load_current_ids(
         self,

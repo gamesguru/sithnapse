@@ -136,6 +136,10 @@ PREPPED_SQLITE_DB_CONN: LoggingDatabaseConnection | None = None
 # ── Postgres per-test lifecycle timing (opt-in via SYNAPSE_PG_TIMINGS=1) ────
 _PG_TIMINGS: dict[str, float] = defaultdict(float)
 _PG_TIMING_COUNTS: dict[str, int] = defaultdict(int)
+_PG_TIMING_MAX: dict[str, float] = defaultdict(float)
+_PG_TEARDOWN_TEST_TIMINGS: dict[str, dict[str, float]] = defaultdict(
+    lambda: defaultdict(float)
+)
 
 # Guards the timing dicts: `_pg_timing` is fed from the database layer
 # (potentially a different thread than the reactor), while the
@@ -158,10 +162,14 @@ def _timings_print(*args: object) -> None:
         print(*args, file=_timings_file)
 
 
-def _pg_timing(tag: str, elapsed: float) -> None:
+def _pg_timing(tag: str, elapsed: float, test_name: str | None = None) -> None:
     with _PG_TIMINGS_LOCK:
         _PG_TIMINGS[tag] += elapsed
         _PG_TIMING_COUNTS[tag] += 1
+        if elapsed > _PG_TIMING_MAX[tag]:
+            _PG_TIMING_MAX[tag] = elapsed
+        if test_name:
+            _PG_TEARDOWN_TEST_TIMINGS[test_name][tag] += elapsed
 
 
 def _print_pg_timings() -> None:
@@ -174,6 +182,8 @@ def _print_pg_timings() -> None:
         # concurrent `_pg_timing` on these dicts.
         timings = dict(_PG_TIMINGS)
         counts = dict(_PG_TIMING_COUNTS)
+        maxs = dict(_PG_TIMING_MAX)
+        test_timings = {k: dict(v) for k, v in _PG_TEARDOWN_TEST_TIMINGS.items()}
 
     _, strategy_name = get_postgres_clone_strategy()
     run_dir = os.environ.get("SYNAPSE_TIMINGS_RUN_DIR")
@@ -186,6 +196,8 @@ def _print_pg_timings() -> None:
                     {
                         "timings": timings,
                         "counts": counts,
+                        "maxs": maxs,
+                        "test_timings": test_timings,
                         "strategy": strategy_name,
                     },
                     f,
@@ -200,25 +212,28 @@ def _print_pg_timings() -> None:
     )
     _timings_print("")
     _timings_print(
-        f"  {'':44s}  {'total':>10s}  {'calls':>6s}  {'avg':>12s}",
+        f"  {'':44s}  {'total':>10s}  {'calls':>6s}  {'avg':>12s}  {'max':>12s}",
     )
     if "hs_setup_wall" in timings:
         wall_s = timings["hs_setup_wall"]
         wall_cnt = counts["hs_setup_wall"]
+        wall_max = maxs.get("hs_setup_wall", 0.0)
         _timings_print(
-            f"  {'hs_setup_wall (outer)':44s}  {wall_s * 1000:8.1f}ms  {wall_cnt:6d}  {(wall_s / wall_cnt) * 1000:10.3f}ms"
+            f"  {'hs_setup_wall (outer)':44s}  {wall_s * 1000:8.1f}ms  {wall_cnt:6d}  {(wall_s / wall_cnt) * 1000:10.3f}ms  {wall_max * 1000:10.3f}ms"
         )
         if "create_database" in timings:
             cd_s = timings["create_database"]
             cd_cnt = counts["create_database"]
+            cd_max = maxs.get("create_database", 0.0)
             _timings_print(
-                f"    ├── {'create_database':38s}  {cd_s * 1000:8.1f}ms  {cd_cnt:6d}  {(cd_s / cd_cnt) * 1000:10.3f}ms"
+                f"    ├── {'create_database':38s}  {cd_s * 1000:8.1f}ms  {cd_cnt:6d}  {(cd_s / cd_cnt) * 1000:10.3f}ms  {cd_max * 1000:10.3f}ms"
             )
         if "hs_setup_total" in timings:
             st_s = timings["hs_setup_total"]
             st_cnt = counts["hs_setup_total"]
+            st_max = maxs.get("hs_setup_total", 0.0)
             _timings_print(
-                f"    ├── {'hs_setup_total':38s}  {st_s * 1000:8.1f}ms  {st_cnt:6d}  {(st_s / st_cnt) * 1000:10.3f}ms"
+                f"    ├── {'hs_setup_total':38s}  {st_s * 1000:8.1f}ms  {st_cnt:6d}  {(st_s / st_cnt) * 1000:10.3f}ms  {st_max * 1000:10.3f}ms"
             )
             # Tags emitted by Databases.__init__ for each per-test homeserver.
             # Shown in call order so the tree matches the actual execution path.
@@ -239,9 +254,10 @@ def _print_pg_timings() -> None:
                 if inner_tag in timings:
                     it_s = timings[inner_tag]
                     it_cnt = counts[inner_tag]
+                    it_max = maxs.get(inner_tag, 0.0)
                     sub_inner += it_s
                     _timings_print(
-                        f"    │     ├── {inner_tag:32s}  {it_s * 1000:8.1f}ms  {it_cnt:6d}  {(it_s / it_cnt) * 1000:10.3f}ms"
+                        f"    │     ├── {inner_tag:32s}  {it_s * 1000:8.1f}ms  {it_cnt:6d}  {(it_s / it_cnt) * 1000:10.3f}ms  {it_max * 1000:10.3f}ms"
                     )
             store_res = max(0.0, st_s - sub_inner)
             _timings_print(
@@ -254,12 +270,75 @@ def _print_pg_timings() -> None:
         _timings_print(
             f"    └── {'hs_unattributed':38s}  {unatt_wall * 1000:8.1f}ms  {wall_cnt:6d}  {(unatt_wall / wall_cnt) * 1000:10.3f}ms"
         )
-        if "hs_shutdown" in timings:
-            sd_s = timings["hs_shutdown"]
-            sd_cnt = counts["hs_shutdown"]
+
+        # ── Teardown phase breakdown ─────────────────────────────────────────
+        teardown_tags = (
+            "hs_shutdown",
+            "db_drop_total",
+            "db_drop_connect",
+            "db_drop_terminate_backends",
+            "db_drop_statement",
+            "db_drop_retry_sleep",
+        )
+        has_teardown = any(t in timings for t in teardown_tags)
+        teardown_total_s = 0.0
+
+        if has_teardown:
+            _timings_print("\n=== Teardown Phase Timings ===")
+            _timings_print("")
             _timings_print(
-                f"  {'hs_shutdown (teardown)':44s}  {sd_s * 1000:8.1f}ms  {sd_cnt:6d}  {(sd_s / sd_cnt) * 1000:10.3f}ms"
+                f"  {'':44s}  {'total':>10s}  {'calls':>6s}  {'avg':>12s}  {'max':>12s}",
             )
+            if "hs_shutdown" in timings:
+                sd_s = timings["hs_shutdown"]
+                sd_cnt = counts["hs_shutdown"]
+                sd_max = maxs.get("hs_shutdown", 0.0)
+                teardown_total_s += sd_s
+                _timings_print(
+                    f"  {'hs_shutdown (async)':44s}  {sd_s * 1000:8.1f}ms  {sd_cnt:6d}  {(sd_s / sd_cnt) * 1000:10.3f}ms  {sd_max * 1000:10.3f}ms"
+                )
+            if "db_drop_total" in timings:
+                dd_s = timings["db_drop_total"]
+                dd_cnt = counts["db_drop_total"]
+                dd_max = maxs.get("db_drop_total", 0.0)
+                teardown_total_s += dd_s
+                _timings_print(
+                    f"  {'db_drop_total':44s}  {dd_s * 1000:8.1f}ms  {dd_cnt:6d}  {(dd_s / dd_cnt) * 1000:10.3f}ms  {dd_max * 1000:10.3f}ms"
+                )
+                if "db_drop_connect" in timings:
+                    dbc_s = timings["db_drop_connect"]
+                    dbc_cnt = counts["db_drop_connect"]
+                    dbc_max = maxs.get("db_drop_connect", 0.0)
+                    _timings_print(
+                        f"    ├── {'db_drop_connect':38s}  {dbc_s * 1000:8.1f}ms  {dbc_cnt:6d}  {(dbc_s / dbc_cnt) * 1000:10.3f}ms  {dbc_max * 1000:10.3f}ms"
+                    )
+                if "db_drop_terminate_backends" in timings:
+                    dbt_s = timings["db_drop_terminate_backends"]
+                    dbt_cnt = counts["db_drop_terminate_backends"]
+                    dbt_max = maxs.get("db_drop_terminate_backends", 0.0)
+                    _timings_print(
+                        f"    ├── {'db_drop_terminate_backends':38s}  {dbt_s * 1000:8.1f}ms  {dbt_cnt:6d}  {(dbt_s / dbt_cnt) * 1000:10.3f}ms  {dbt_max * 1000:10.3f}ms"
+                    )
+                if "db_drop_statement" in timings:
+                    dbs_s = timings["db_drop_statement"]
+                    dbs_cnt = counts["db_drop_statement"]
+                    dbs_max = maxs.get("db_drop_statement", 0.0)
+                    _timings_print(
+                        f"    ├── {'db_drop_statement':38s}  {dbs_s * 1000:8.1f}ms  {dbs_cnt:6d}  {(dbs_s / dbs_cnt) * 1000:10.3f}ms  {dbs_max * 1000:10.3f}ms"
+                    )
+                if "db_drop_retry_sleep" in timings:
+                    dbr_s = timings["db_drop_retry_sleep"]
+                    dbr_cnt = counts["db_drop_retry_sleep"]
+                    dbr_max = maxs.get("db_drop_retry_sleep", 0.0)
+                    _timings_print(
+                        f"    └── {'db_drop_retry_sleep':38s}  {dbr_s * 1000:8.1f}ms  {dbr_cnt:6d}  {(dbr_s / dbr_cnt) * 1000:10.3f}ms  {dbr_max * 1000:10.3f}ms"
+                    )
+
+            _timings_print("")
+            _timings_print(
+                f"  {'TOTAL TEARDOWN WALL TIME':44s}  {teardown_total_s * 1000:8.1f}ms"
+            )
+
         known = {
             "hs_setup_wall",
             "create_database",
@@ -275,27 +354,61 @@ def _print_pg_timings() -> None:
             "state_store_init",
             "databases_init_commit",
             "hs_shutdown",
+            "db_drop_total",
+            "db_drop_connect",
+            "db_drop_terminate_backends",
+            "db_drop_statement",
+            "db_drop_retry_sleep",
         }
         for tag in sorted(timings):
             if tag not in known:
                 t_s = timings[tag]
                 cnt = counts[tag]
+                m_s = maxs.get(tag, 0.0)
                 _timings_print(
-                    f"  {tag:44s}  {t_s * 1000:8.1f}ms  {cnt:6d}  {(t_s / cnt) * 1000:10.3f}ms"
+                    f"  {tag:44s}  {t_s * 1000:8.1f}ms  {cnt:6d}  {(t_s / cnt) * 1000:10.3f}ms  {m_s * 1000:10.3f}ms"
                 )
-        non_overlap = wall_s + timings.get("hs_shutdown", 0.0)
+        non_overlap = wall_s + teardown_total_s
         _timings_print("")
         _timings_print(
             f"  {'TOTAL NON-OVERLAPPING LIFECYCLE':44s}  {non_overlap * 1000:8.1f}ms"
         )
+
+        # ── Slowest tests in teardown ────────────────────────────────────────
+        if test_timings:
+            slowest: list[tuple[float, str, dict[str, float]]] = []
+            for tname, ptimings in test_timings.items():
+                tot = ptimings.get("hs_shutdown", 0.0) + ptimings.get(
+                    "db_drop_total", 0.0
+                )
+                if tot > 0:
+                    slowest.append((tot, tname, ptimings))
+            slowest.sort(key=lambda item: item[0], reverse=True)
+            if slowest:
+                _timings_print("\n=== Slowest Tests in Teardown (Top 10) ===")
+                for rank, (tot_s, tname, ptimings) in enumerate(slowest[:10], 1):
+                    details = []
+                    for ptag in (
+                        "hs_shutdown",
+                        "db_drop_connect",
+                        "db_drop_terminate_backends",
+                        "db_drop_statement",
+                        "db_drop_retry_sleep",
+                    ):
+                        if ptag in ptimings and ptimings[ptag] > 0:
+                            details.append(f"{ptag}={ptimings[ptag] * 1000:.1f}ms")
+                    detail_str = f" ({', '.join(details)})" if details else ""
+                    _timings_print(f"  {rank:2d}. {tname}")
+                    _timings_print(f"      total: {tot_s * 1000:8.1f}ms{detail_str}")
     else:
         for tag in sorted(timings):
             total_s = timings[tag]
             count = counts[tag]
             total_ms = total_s * 1000
             avg_ms = (total_s / count) * 1000 if count else 0.0
+            max_ms = maxs.get(tag, 0.0) * 1000
             _timings_print(
-                f"  {tag:44s}  {total_ms:8.1f}ms  {count:6d}  {avg_ms:10.3f}ms",
+                f"  {tag:44s}  {total_ms:8.1f}ms  {count:6d}  {avg_ms:10.3f}ms  {max_ms:10.3f}ms",
             )
         total_s = sum(timings.values())
         total_ms = total_s * 1000
@@ -1371,6 +1484,7 @@ def setup_test_homeserver(
     reactor: Optional[ISynapseReactor] = None,
     homeserver_to_use: type[HomeServer] = TestHomeServer,
     db_txn_limit: int | None = None,
+    test_name: str | None = None,
     **extra_homeserver_attributes: Any,
 ) -> HomeServer:
     """
@@ -1391,6 +1505,7 @@ def setup_test_homeserver(
         db_txn_limit: Gives the maximum number of database transactions to run per
             connection before reconnecting. 0 means no limit. If unset, defaults to None
             here which will default upstream to `0`.
+        test_name: Optional test identifier used for attributing teardown timings.
         **extra_homeserver_attributes: Additional keyword arguments to install as
             `@cache_in_self` attributes on the homeserver. For example, `clock` will be
             installed as `hs._clock`.
@@ -1532,15 +1647,22 @@ def setup_test_homeserver(
         def cleanup() -> None:
             import psycopg2
 
+            _drop_t0 = time.monotonic()
             dropped = False
 
             # Drop the test database
+            _t_conn = time.monotonic()
             db_conn = db_engine.module.connect(
                 dbname=POSTGRES_BASE_DB,
                 user=POSTGRES_USER,
                 host=POSTGRES_HOST,
                 port=POSTGRES_PORT,
                 password=POSTGRES_PASSWORD,
+            )
+            _pg_timing(
+                "db_drop_connect",
+                time.monotonic() - _t_conn,
+                test_name=test_name,
             )
             db_engine.attempt_to_set_autocommit(db_conn, True)
             cur = db_conn.cursor()
@@ -1550,6 +1672,7 @@ def setup_test_homeserver(
             # before we try to drop it, rather than relying purely on
             # retry-with-sleep below. This is scoped to this test's own
             # scratch DB via datname, so it can't affect any other test.
+            _t_term = time.monotonic()
             try:
                 cur.execute(
                     "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
@@ -1562,27 +1685,54 @@ def setup_test_homeserver(
                     category=UserWarning,
                     stacklevel=2,
                 )
+            _pg_timing(
+                "db_drop_terminate_backends",
+                time.monotonic() - _t_term,
+                test_name=test_name,
+            )
 
             # Try a few times to drop the DB. Some things may hold on to the
             # database for a few more seconds due to flakiness, preventing
             # us from dropping it when the test is over. If we can't drop
             # it, warn and move on.
             for _ in range(5):
+                _t_stmt = time.monotonic()
                 try:
                     cur.execute("DROP DATABASE IF EXISTS %s;" % (test_db,))
                     db_conn.commit()
                     dropped = True
+                    _pg_timing(
+                        "db_drop_statement",
+                        time.monotonic() - _t_stmt,
+                        test_name=test_name,
+                    )
                     break
                 except psycopg2.OperationalError as e:
+                    _pg_timing(
+                        "db_drop_statement",
+                        time.monotonic() - _t_stmt,
+                        test_name=test_name,
+                    )
                     warnings.warn(
                         "Couldn't drop old db: " + str(e),
                         category=UserWarning,
                         stacklevel=2,
                     )
+                    _t_sleep = time.monotonic()
                     time.sleep(0.5)
+                    _pg_timing(
+                        "db_drop_retry_sleep",
+                        time.monotonic() - _t_sleep,
+                        test_name=test_name,
+                    )
 
             cur.close()
             db_conn.close()
+            _pg_timing(
+                "db_drop_total",
+                time.monotonic() - _drop_t0,
+                test_name=test_name,
+            )
 
             if not dropped:
                 warnings.warn(
@@ -1607,12 +1757,17 @@ def setup_test_homeserver(
 
     def shutdown_hs_on_cleanup() -> "Deferred[None]":
         cleanup_hs = cleanup_hs_ref()
-        deferred: "Deferred[None]" = defer.succeed(None)
-        if cleanup_hs is not None:
-            _sd0 = time.monotonic()
-            deferred = defer.ensureDeferred(cleanup_hs.shutdown())
-            if USE_POSTGRES_FOR_TESTS:
-                _pg_timing("hs_shutdown", time.monotonic() - _sd0)
+        if cleanup_hs is None:
+            return defer.succeed(None)
+        _sd0 = time.monotonic()
+        deferred = defer.ensureDeferred(cleanup_hs.shutdown())
+        if USE_POSTGRES_FOR_TESTS:
+
+            def _record_shutdown_timing(result: Any) -> Any:
+                _pg_timing("hs_shutdown", time.monotonic() - _sd0, test_name=test_name)
+                return result
+
+            deferred.addBoth(_record_shutdown_timing)
         return deferred
 
     # Install @cache_in_self attributes

@@ -707,6 +707,7 @@ class HomeserverTestCase(TestCase):
             config=config_obj,
             reactor=reactor,
             clock=clock,
+            test_name=self.id() if hasattr(self, "id") else None,
             **extra_homeserver_attributes,
         )
         stor = hs.get_datastores().main
