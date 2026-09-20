@@ -32,6 +32,7 @@ import threading
 import time
 import uuid
 import warnings
+import weakref
 from collections import defaultdict, deque
 from io import SEEK_END, BytesIO
 from typing import (
