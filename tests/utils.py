@@ -243,7 +243,9 @@ def _drain_template_background_updates_postgres() -> None:
     from synapse.logging.context import LoggingContext
 
     stor = hs.get_datastores().main
-    with LoggingContext(name="drain_template_bg_updates", server_name="test-template-draining"):
+    with LoggingContext(
+        name="drain_template_bg_updates", server_name="test-template-draining"
+    ):
         d = ensureDeferred(stor.db_pool.updates.run_background_updates(False))
 
         while not d.called or d.paused:

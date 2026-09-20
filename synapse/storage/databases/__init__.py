@@ -205,6 +205,11 @@ class Databases(Generic[DataStoreT]):
                     _pgt("databases_init_commit", time.monotonic() - _commit_t)
 
                 self.databases.append(database)
+                # Once store initialization is complete, the database is no longer
+                # virgin/empty. Reset is_fresh to False so any ID generators
+                # constructed dynamically later (e.g. in test suites) perform full
+                # stream position loading.
+                database.is_fresh = False
 
                 logger.info("[database config %r]: prepared", db_name)
 
