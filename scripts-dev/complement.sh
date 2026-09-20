@@ -426,10 +426,10 @@ main() {
 
     # And provide some more configuration to complement.
 
-    # It can take quite a while to spin up a worker-mode Synapse for the first
-    # time (the main problem is that we start 14 python processes for each test,
-    # and complement likes to do two of them in parallel).
-    export COMPLEMENT_SPAWN_HS_TIMEOUT_SECS=120
+    # Fail unhealthy worker deployments promptly rather than spending up to
+    # three minutes retrying each one. Callers can raise this when diagnosing
+    # a genuinely slow host.
+    export COMPLEMENT_SPAWN_HS_TIMEOUT_SECS=${COMPLEMENT_SPAWN_HS_TIMEOUT_SECS:-30}
   else
     export PASS_SYNAPSE_COMPLEMENT_USE_WORKERS=
     # Prefer the SYNAPSE_TEST_POSTGRES name used by tests/utils.py's
@@ -653,7 +653,10 @@ main() {
   export COMPLEMENT_WRAPPER_TOKEN="${COMPLEMENT_WRAPPER_TOKEN:-"complement-$$-$(date +%s%N)"}"
   export PASS_COMPLEMENT_WRAPPER_TOKEN="$COMPLEMENT_WRAPPER_TOKEN"
   export COMPLEMENT_SHARE_ENV_PREFIX=PASS_
-  export COMPLEMENT_SPAWN_HS_TIMEOUT_SECS=${COMPLEMENT_SPAWN_HS_TIMEOUT_SECS:-120}
+  # Complement retries a homeserver deploy up to 3x. Keep the default
+  # per-attempt startup timeout short so an unhealthy deployment fails
+  # promptly (about 90s worst-case), while allowing callers to override it.
+  export COMPLEMENT_SPAWN_HS_TIMEOUT_SECS=${COMPLEMENT_SPAWN_HS_TIMEOUT_SECS:-30}
   # Keep genuinely stalled requests from consuming a minute and a half of a
   # test run. Callers can still raise this for intentionally slow scenarios.
   export COMPLEMENT_CLIENT_TIMEOUT_SECS=${COMPLEMENT_CLIENT_TIMEOUT_SECS:-30}
