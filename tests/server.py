@@ -241,7 +241,6 @@ _METADATA_TABLES_IGNORE = {
     "applied_schema_deltas",
     "schema_version",
     "schema_compat_version",
-    "background_updates",
 }
 
 
