@@ -269,17 +269,21 @@ def _reset_recycled_postgres_db(
         except Exception:
             pass
 
-        tables_to_truncate = [
+        tables_to_truncate = {
             t for t in dirty_tables if t not in _METADATA_TABLES_IGNORE
-        ]
+        }
+        reseed = not dirty_tables or bool(tables_to_truncate & _MUTABLE_SEED_TABLES)
+        if reseed:
+            tables_to_truncate.update(_MUTABLE_SEED_TABLES)
+
         if tables_to_truncate:
             cur.execute(
                 "TRUNCATE TABLE "
-                + ", ".join(tables_to_truncate)
+                + ", ".join(sorted(tables_to_truncate))
                 + " RESTART IDENTITY CASCADE;"
             )
 
-        if not dirty_tables or any(t in _MUTABLE_SEED_TABLES for t in dirty_tables):
+        if reseed:
             cur.execute(_RESEED_SQL)
 
         cur.execute(_RESET_SEQUENCES_SQL)
