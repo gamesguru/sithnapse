@@ -271,9 +271,7 @@ def _reset_recycled_postgres_db(
             "WHERE schemaname = 'public' ORDER BY tablename"
         )
         tables_to_truncate = [
-            row[0]
-            for row in cur.fetchall()
-            if row[0] not in _METADATA_TABLES_IGNORE
+            row[0] for row in cur.fetchall() if row[0] not in _METADATA_TABLES_IGNORE
         ]
         if tables_to_truncate:
             cur.execute(
@@ -302,10 +300,7 @@ def _reset_recycled_postgres_db(
 
 def _reset_db_drop_state_after_fork() -> None:
     global _DB_DROP_PID, _DB_DROP_QUEUE, _DB_DROP_THREAD, _DB_DROP_LOCK
-    global \
-        _RECYCLED_PG_DB, \
-        _RECYCLED_PG_DB_IN_USE, \
-        _PREV_TEST_HAD_DDL
+    global _RECYCLED_PG_DB, _RECYCLED_PG_DB_IN_USE, _PREV_TEST_HAD_DDL
     _DB_DROP_PID = os.getpid()
     _DB_DROP_QUEUE = queue.Queue(maxsize=_DB_DROP_QUEUE_MAXSIZE)
     _DB_DROP_THREAD = None
@@ -1896,10 +1891,7 @@ def setup_test_homeserver(
     config.caches.resize_all_caches()
 
     if USE_POSTGRES_FOR_TESTS:
-        global \
-            _RECYCLED_PG_DB, \
-            _RECYCLED_PG_DB_IN_USE, \
-            _PREV_TEST_HAD_DDL
+        global _RECYCLED_PG_DB, _RECYCLED_PG_DB_IN_USE, _PREV_TEST_HAD_DDL
         from synapse.storage.database import pop_dirty_tables
 
         old_recycled_to_drop = None
@@ -2022,9 +2014,7 @@ def setup_test_homeserver(
                 _DB_DROP_QUEUE.put((old_recycled_to_drop, test_name, db_engine))
 
         if is_recycled:
-            if not _reset_recycled_postgres_db(
-                test_db, db_engine, test_name=test_name
-            ):
+            if not _reset_recycled_postgres_db(test_db, db_engine, test_name=test_name):
                 old_failed_db = test_db
                 # Fallback if reset failed: generate new test_db and clone
                 test_db = "synapse_test_%s" % uuid.uuid4().hex
@@ -2068,10 +2058,7 @@ def setup_test_homeserver(
             config.database.databases = [database]
 
             def cleanup() -> None:
-                global \
-                    _RECYCLED_PG_DB, \
-                    _RECYCLED_PG_DB_IN_USE, \
-                    _PREV_TEST_HAD_DDL
+                global _RECYCLED_PG_DB, _RECYCLED_PG_DB_IN_USE, _PREV_TEST_HAD_DDL
                 if test_db == _RECYCLED_PG_DB:
                     # Dirty-table tracking is process-global, not per DB. Only
                     # the primary DB cleanup may consume it; secondary
