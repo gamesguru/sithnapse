@@ -1077,17 +1077,8 @@ class FederationHandler:
             # of the room (prev_event_ids) just before fetching the current state, and
             # hope that the state we fetch corresponds to the prev events we chose.
             prev_event_ids = await self.store.get_prev_events_for_room(room_id)
-            # A full-state lookup can be served from the per-process current
-            # state cache. On a worker, that cache may not yet have received
-            # the invalidation for a just-persisted join-rules event. Since
-            # this state is used to authorize a remote join, read the relevant
-            # auth state directly from current_state_events instead of risking
-            # a stale allow-list admitting a join that should be rejected.
             state_ids = await self._state_storage_controller.get_current_state_ids(
-                room_id,
-                state_filter=StateFilter.from_types(
-                    [(EventTypes.JoinRules, ""), (EventTypes.Member, user_id)]
-                ),
+                room_id
             )
             if await self._event_auth_handler.has_restricted_join_rules(
                 state_ids, room_version
