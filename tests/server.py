@@ -253,10 +253,9 @@ _METADATA_TABLES_IGNORE = {
 def _reset_recycled_postgres_db(
     test_db: str,
     db_engine: Any,
-    dirty_tables: set[str],
     test_name: str | None = None,
 ) -> bool:
-    """Reset dirty tables and sequences in a recycled test DB. Returns True on success."""
+    """Reset a recycled test DB. Returns True on success."""
 
     _t0 = time.monotonic()
     try:
@@ -279,22 +278,26 @@ def _reset_recycled_postgres_db(
         except Exception:
             pass
 
-        tables_to_truncate = {
-            t for t in dirty_tables if t not in _METADATA_TABLES_IGNORE
-        }
-        reseed = not dirty_tables or bool(tables_to_truncate & _MUTABLE_SEED_TABLES)
-        if reseed:
-            tables_to_truncate.update(_MUTABLE_SEED_TABLES)
-
+        # Dirty-table tracking is process-global and SQL-shape-dependent, so it
+        # cannot safely determine which rows belong to this particular DB.
+        # Truncate every public table except schema identity metadata instead.
+        cur.execute(
+            "SELECT quote_ident(tablename) FROM pg_tables "
+            "WHERE schemaname = 'public' ORDER BY tablename"
+        )
+        tables_to_truncate = [
+            row[0]
+            for row in cur.fetchall()
+            if row[0] not in _METADATA_TABLES_IGNORE
+        ]
         if tables_to_truncate:
             cur.execute(
                 "TRUNCATE TABLE "
-                + ", ".join(sorted(tables_to_truncate))
+                + ", ".join(tables_to_truncate)
                 + " RESTART IDENTITY CASCADE;"
             )
 
-        if reseed:
-            cur.execute(_RESEED_SQL)
+        cur.execute(_RESEED_SQL)
 
         cur.execute(_RESET_SEQUENCES_SQL)
         cur.close()
@@ -2038,7 +2041,7 @@ def setup_test_homeserver(
 
         if is_recycled:
             if not _reset_recycled_postgres_db(
-                test_db, db_engine, _DIRTY_TABLES_PREV_TEST, test_name=test_name
+                test_db, db_engine, test_name=test_name
             ):
                 old_failed_db = test_db
                 # Fallback if reset failed: generate new test_db and clone
