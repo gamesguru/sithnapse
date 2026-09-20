@@ -32,6 +32,7 @@ import threading
 import time
 import uuid
 import warnings
+import weakref
 from collections import defaultdict, deque
 from io import SEEK_END, BytesIO
 from typing import (
@@ -2134,9 +2135,22 @@ def setup_test_homeserver(
         reactor=reactor,
     )
 
+    # A weakref, not a strong reference: tests/app/test_homeserver_shutdown.py
+    # explicitly shuts a homeserver down and checks it becomes garbage
+    # collectible *before* Trial ever invokes this cleanup, which would be
+    # impossible if this closure held a strong reference for the whole test.
+    # Worker/secondary homeservers created via `make_worker_hs` are kept
+    # alive independently for the test's duration (see
+    # `BaseMultiWorkerStreamTestCase._worker_homeservers`), so this no longer
+    # goes stale before it fires for them.
+    cleanup_hs_ref = weakref.ref(hs)
+
     def shutdown_hs_on_cleanup() -> "Deferred[None]":
+        cleanup_hs = cleanup_hs_ref()
+        if cleanup_hs is None:
+            return defer.succeed(None)
         _sd0 = time.monotonic()
-        deferred = defer.ensureDeferred(hs.shutdown())
+        deferred = defer.ensureDeferred(cleanup_hs.shutdown())
         if USE_POSTGRES_FOR_TESTS:
 
             def _record_shutdown_timing(result: Any) -> Any:
