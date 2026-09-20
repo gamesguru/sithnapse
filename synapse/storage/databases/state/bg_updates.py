@@ -380,15 +380,13 @@ def _print_root_write_stats() -> None:
     lock = _STATE_TIMING_LOCK
     assert lock is not None
     with lock:
-        data = {
-            "calls": _ROOT_WRITE_CALLS,
-            "total_roots": _ROOT_WRITE_TOTAL_ROOTS,
-            "total_bytes": _ROOT_WRITE_TOTAL_BYTES,
-            "total_time": _ROOT_WRITE_TOTAL_TIME,
-            "lat_buckets": dict(_ROOT_WRITE_LATENCY_BUCKETS),
-            "size_buckets": dict(_ROOT_WRITE_SIZE_BUCKETS),
-        }
-    if not data["calls"]:
+        calls = _ROOT_WRITE_CALLS
+        roots = _ROOT_WRITE_TOTAL_ROOTS
+        total_bytes = _ROOT_WRITE_TOTAL_BYTES
+        total_time = _ROOT_WRITE_TOTAL_TIME
+        lat_buckets = dict(_ROOT_WRITE_LATENCY_BUCKETS)
+        size_buckets = dict(_ROOT_WRITE_SIZE_BUCKETS)
+    if not calls:
         return
     run_dir = os.environ.get("SYNAPSE_TIMINGS_RUN_DIR")
     if run_dir:
@@ -396,16 +394,22 @@ def _print_root_write_stats() -> None:
         final_path = os.path.join(run_dir, f"root_writes_{os.getpid()}.json")
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(data, f)
+                json.dump(
+                    {
+                        "calls": calls,
+                        "total_roots": roots,
+                        "total_bytes": total_bytes,
+                        "total_time": total_time,
+                        "lat_buckets": lat_buckets,
+                        "size_buckets": size_buckets,
+                    },
+                    f,
+                )
             os.replace(tmp_path, final_path)
         except OSError:
             pass
         return
     _timings_print("\n=== put_state_hamt_roots batch diagnostics ===")
-    calls = int(data["calls"])
-    roots = int(data["total_roots"])
-    total_bytes = int(data["total_bytes"])
-    total_time = float(data["total_time"])
     _timings_print(f"  calls:                    {calls}")
     _timings_print(f"  total roots:              {roots}")
     _timings_print(f"  total bytes:              {total_bytes:,}")
@@ -413,19 +417,17 @@ def _print_root_write_stats() -> None:
     _timings_print(f"  avg roots/call:           {roots / calls:.1f}")
     _timings_print(f"  avg bytes/call:           {total_bytes / calls:.0f}")
     _timings_print(f"  avg time/call:            {total_time / calls * 1000:.3f}ms")
-    lat_buckets = data["lat_buckets"]
-    size_buckets = data["size_buckets"]
     _timings_print("==============================================")
     _timings_print("")
     _timings_print("  Latency distribution:")
     for bucket in ("<0.1ms", "<0.25ms", "<0.5ms", "<1ms", ">=1ms"):
-        count = lat_buckets.get(bucket, 0)  # type: ignore[union-attr]
+        count = lat_buckets.get(bucket, 0)
         pct = (count / calls) * 100 if calls else 0
         _timings_print(f"    {bucket:12s}  {count:6d}  ({pct:5.1f}%)")
     _timings_print("")
     _timings_print("  Batch-size distribution:")
     for bucket in ("1", "2-5", "6-20", "21-100", ">100"):
-        count = size_buckets.get(bucket, 0)  # type: ignore[union-attr]
+        count = size_buckets.get(bucket, 0)
         pct = (count / calls) * 100 if calls else 0
         _timings_print(f"    {bucket:12s}  {count:6d}  ({pct:5.1f}%)")
     _timings_print("=============================================")
