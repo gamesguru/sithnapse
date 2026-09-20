@@ -667,9 +667,10 @@ class HomeServer(metaclass=abc.ABCMeta):
         if timings_path:
             import json
             import os
-            import time
             import threading
+            import time
             from collections import defaultdict
+
             from synapse.storage.databases import set_pg_timing_callback
 
             _timings: dict[str, float] = defaultdict(float)
