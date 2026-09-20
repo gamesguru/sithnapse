@@ -1561,8 +1561,14 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                     room_prefix,
                     [(state_group, root_value)],
                 )
-                ffi_timing("ffi_put_state_hamt_roots", time.monotonic() - _et)
+                elapsed = time.monotonic() - _et
+                ffi_timing("ffi_put_state_hamt_roots", elapsed)
                 _state_counter("state_write_roots_embedded")
+                from synapse.storage.databases.state.bg_updates import (
+                    _record_root_write_stats,
+                )
+
+                _record_root_write_stats([(state_group, root_value)], elapsed)
 
     async def _background_backfill_state_hamt_roots(
         self, progress: dict, batch_size: int
@@ -1957,8 +1963,14 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 engine.put_state_hamt_roots(
                     self._embedded_hamt_namespace, room_prefix, pending_room_roots
                 )
-                _state_timing("state_write_root_embedded", time.monotonic() - _et)
+                elapsed = time.monotonic() - _et
+                _state_timing("state_write_root_embedded", elapsed)
                 _state_counter("state_write_roots_embedded", len(pending_room_roots))
+                from synapse.storage.databases.state.bg_updates import (
+                    _record_root_write_stats,
+                )
+
+                _record_root_write_stats(pending_room_roots, elapsed)
 
             # Dirty marking handled by _persist_state_hamt_txn via
             # txn.call_after(mark_dirty, Pool.STATE).

@@ -83,6 +83,12 @@ _NODE_WRITE_LATENCY_BUCKETS: dict[str, int] = defaultdict(
 _NODE_WRITE_SIZE_BUCKETS: dict[str, int] = defaultdict(
     int
 )  # batch-size bucket -> count
+_ROOT_WRITE_CALLS = 0
+_ROOT_WRITE_TOTAL_ROOTS = 0
+_ROOT_WRITE_TOTAL_BYTES = 0
+_ROOT_WRITE_TOTAL_TIME = 0.0
+_ROOT_WRITE_LATENCY_BUCKETS: dict[str, int] = defaultdict(int)
+_ROOT_WRITE_SIZE_BUCKETS: dict[str, int] = defaultdict(int)
 
 _timings_file: IO[str] | None = None
 if _PG_TIMINGS_ENABLED:
@@ -174,6 +180,45 @@ def _record_node_write_stats(nodes: list[tuple[bytes, bytes]], elapsed: float) -
         _NODE_WRITE_TOTAL_TIME += elapsed
         _NODE_WRITE_LATENCY_BUCKETS[lat_bucket] += 1
         _NODE_WRITE_SIZE_BUCKETS[size_bucket] += 1
+
+
+def _record_root_write_stats(roots: list[tuple[int, bytes]], elapsed: float) -> None:
+    """Record batch-size/byte-count stats for put_state_hamt_roots."""
+    if not _PG_TIMINGS_ENABLED:
+        return
+    global _ROOT_WRITE_CALLS, _ROOT_WRITE_TOTAL_ROOTS, _ROOT_WRITE_TOTAL_BYTES
+    global _ROOT_WRITE_TOTAL_TIME
+    batch_size = len(roots)
+    total_bytes = sum(8 + len(value) for _state_group, value in roots)
+    if elapsed < 0.0001:
+        lat_bucket = "<0.1ms"
+    elif elapsed < 0.00025:
+        lat_bucket = "<0.25ms"
+    elif elapsed < 0.0005:
+        lat_bucket = "<0.5ms"
+    elif elapsed < 0.001:
+        lat_bucket = "<1ms"
+    else:
+        lat_bucket = ">=1ms"
+    if batch_size == 1:
+        size_bucket = "1"
+    elif batch_size <= 5:
+        size_bucket = "2-5"
+    elif batch_size <= 20:
+        size_bucket = "6-20"
+    elif batch_size <= 100:
+        size_bucket = "21-100"
+    else:
+        size_bucket = ">100"
+    lock = _STATE_TIMING_LOCK
+    assert lock is not None
+    with lock:
+        _ROOT_WRITE_CALLS += 1
+        _ROOT_WRITE_TOTAL_ROOTS += batch_size
+        _ROOT_WRITE_TOTAL_BYTES += total_bytes
+        _ROOT_WRITE_TOTAL_TIME += elapsed
+        _ROOT_WRITE_LATENCY_BUCKETS[lat_bucket] += 1
+        _ROOT_WRITE_SIZE_BUCKETS[size_bucket] += 1
 
 
 def _print_state_timings() -> None:
@@ -328,6 +373,65 @@ def _print_node_write_stats() -> None:
     _timings_print("")
 
 
+def _print_root_write_stats() -> None:
+    """Write process-local root batch diagnostics for the trial aggregator."""
+    if not _PG_TIMINGS_ENABLED:
+        return
+    lock = _STATE_TIMING_LOCK
+    assert lock is not None
+    with lock:
+        data = {
+            "calls": _ROOT_WRITE_CALLS,
+            "total_roots": _ROOT_WRITE_TOTAL_ROOTS,
+            "total_bytes": _ROOT_WRITE_TOTAL_BYTES,
+            "total_time": _ROOT_WRITE_TOTAL_TIME,
+            "lat_buckets": dict(_ROOT_WRITE_LATENCY_BUCKETS),
+            "size_buckets": dict(_ROOT_WRITE_SIZE_BUCKETS),
+        }
+    if not data["calls"]:
+        return
+    run_dir = os.environ.get("SYNAPSE_TIMINGS_RUN_DIR")
+    if run_dir:
+        tmp_path = os.path.join(run_dir, f"root_writes_{os.getpid()}.tmp")
+        final_path = os.path.join(run_dir, f"root_writes_{os.getpid()}.json")
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp_path, final_path)
+        except OSError:
+            pass
+        return
+    _timings_print("\n=== put_state_hamt_roots batch diagnostics ===")
+    calls = int(data["calls"])
+    roots = int(data["total_roots"])
+    total_bytes = int(data["total_bytes"])
+    total_time = float(data["total_time"])
+    _timings_print(f"  calls:                    {calls}")
+    _timings_print(f"  total roots:              {roots}")
+    _timings_print(f"  total bytes:              {total_bytes:,}")
+    _timings_print(f"  total time:               {total_time * 1000:.1f}ms")
+    _timings_print(f"  avg roots/call:           {roots / calls:.1f}")
+    _timings_print(f"  avg bytes/call:           {total_bytes / calls:.0f}")
+    _timings_print(f"  avg time/call:            {total_time / calls * 1000:.3f}ms")
+    lat_buckets = data["lat_buckets"]
+    size_buckets = data["size_buckets"]
+    _timings_print("==============================================")
+    _timings_print("")
+    _timings_print("  Latency distribution:")
+    for bucket in ("<0.1ms", "<0.25ms", "<0.5ms", "<1ms", ">=1ms"):
+        count = lat_buckets.get(bucket, 0)  # type: ignore[union-attr]
+        pct = (count / calls) * 100 if calls else 0
+        _timings_print(f"    {bucket:12s}  {count:6d}  ({pct:5.1f}%)")
+    _timings_print("")
+    _timings_print("  Batch-size distribution:")
+    for bucket in ("1", "2-5", "6-20", "21-100", ">100"):
+        count = size_buckets.get(bucket, 0)  # type: ignore[union-attr]
+        pct = (count / calls) * 100 if calls else 0
+        _timings_print(f"    {bucket:12s}  {count:6d}  ({pct:5.1f}%)")
+    _timings_print("=============================================")
+    _timings_print("")
+
+
 if _PG_TIMINGS_ENABLED:
 
     def flush_state_timings() -> None:
@@ -336,8 +440,12 @@ if _PG_TIMINGS_ENABLED:
     def flush_node_write_stats() -> None:
         _print_node_write_stats()
 
+    def flush_root_write_stats() -> None:
+        _print_root_write_stats()
+
     atexit.register(flush_state_timings)
     atexit.register(flush_node_write_stats)
+    atexit.register(flush_root_write_stats)
 
     import signal as _signal
     from types import FrameType as _FrameType

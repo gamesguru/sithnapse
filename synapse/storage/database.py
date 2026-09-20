@@ -160,6 +160,45 @@ if _PG_TIMINGS_ENABLED:
             pass
 
 
+_DIRTY_TABLES: set[str] = set()
+_HAD_DDL: bool = False
+_DIRTY_TABLES_LOCK = threading.Lock()
+
+_MUTATING_TABLE_RE = re.compile(
+    r"^\s*(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM|TRUNCATE(?:\s+TABLE)?)\s+(\w+)",
+    re.IGNORECASE,
+)
+_DDL_RE = re.compile(
+    r"^\s*(?:CREATE|DROP|ALTER)\s+(?:TABLE|INDEX|VIEW|SCHEMA|TYPE|SEQUENCE)",
+    re.IGNORECASE,
+)
+
+
+def track_dirty_table_from_sql(sql: str) -> None:
+    global _HAD_DDL
+    if "--" in sql or "/*" in sql:
+        sql = _SQL_COMMENT_RE.sub(" ", sql)
+    if _DDL_RE.search(sql):
+        with _DIRTY_TABLES_LOCK:
+            _HAD_DDL = True
+        return
+    m = _MUTATING_TABLE_RE.search(sql)
+    if m:
+        table = m.group(1).lower()
+        with _DIRTY_TABLES_LOCK:
+            _DIRTY_TABLES.add(table)
+
+
+def pop_dirty_tables() -> tuple[set[str], bool]:
+    global _HAD_DDL
+    with _DIRTY_TABLES_LOCK:
+        dirty = set(_DIRTY_TABLES)
+        had_ddl = _HAD_DDL
+        _DIRTY_TABLES.clear()
+        _HAD_DDL = False
+        return dirty, had_ddl
+
+
 def _track_table_op(sql: str, elapsed: float, rowcount: int = 0) -> None:
     if "--" in sql or "/*" in sql:
         sql = _SQL_COMMENT_RE.sub(" ", sql)
@@ -762,6 +801,7 @@ class LoggingTransaction:
             sql_query_timer.labels(
                 verb=sql.split()[0], **{SERVER_NAME_LABEL: self.server_name}
             ).observe(secs)
+            track_dirty_table_from_sql(sql)
             if _PG_TIMINGS_ENABLED:
                 try:
                     rowcount = self.txn.rowcount

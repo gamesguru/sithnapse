@@ -131,6 +131,9 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
     node_files = [
         f for f in files if f.startswith("node_writes_") and f.endswith(".json")
     ]
+    root_files = [
+        f for f in files if f.startswith("root_writes_") and f.endswith(".json")
+    ]
     ffi_files = [f for f in files if f.startswith("ffi_") and f.endswith(".json")]
 
     worker_pids = set()
@@ -183,6 +186,12 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                     out(
                         f"    ├── {'create_database':38s}  {cd_s * 1000:8.1f}ms  {cd_cnt:6d}  {(cd_s / cd_cnt) * 1000:10.3f}ms"
                     )
+                if "db_recycle_reset" in lc_timings:
+                    rr_s = lc_timings["db_recycle_reset"]
+                    rr_cnt = lc_counts["db_recycle_reset"]
+                    out(
+                        f"    ├── {'db_recycle_reset':38s}  {rr_s * 1000:8.1f}ms  {rr_cnt:6d}  {(rr_s / rr_cnt) * 1000:10.3f}ms"
+                    )
                 if "hs_setup_total" in lc_timings:
                     st_s = lc_timings["hs_setup_total"]
                     st_cnt = lc_counts["hs_setup_total"]
@@ -208,8 +217,10 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                     out(
                         f"    │     └── {'store_init (residual)':32s}  {store_res * 1000:8.1f}ms  {st_cnt:6d}  {(store_res / st_cnt) * 1000:10.3f}ms"
                     )
-                sub_wall = lc_timings.get("create_database", 0.0) + lc_timings.get(
-                    "hs_setup_total", 0.0
+                sub_wall = (
+                    lc_timings.get("create_database", 0.0)
+                    + lc_timings.get("db_recycle_reset", 0.0)
+                    + lc_timings.get("hs_setup_total", 0.0)
                 )
                 unatt_wall = max(0.0, wall_s - sub_wall)
                 out(
@@ -224,6 +235,7 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                 known = {
                     "hs_setup_wall",
                     "create_database",
+                    "db_recycle_reset",
                     "hs_setup_total",
                     "make_conn",
                     "prepare_database",
@@ -480,6 +492,42 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                 pct = (cnt / tot_calls) * 100.0 if tot_calls else 0.0
                 out(f"    {b:15s}  {cnt:5d}  ({pct:5.1f}%)")
             out("=============================================")
+            out("")
+
+    if root_files:
+        root_calls = root_count = root_bytes = 0
+        root_time = 0.0
+        for fname in root_files:
+            try:
+                with open(
+                    os.path.join(timings_dir, fname), encoding="utf-8"
+                ) as root_fh:
+                    data = json.load(root_fh)
+                root_calls += data.get("calls", 0)
+                root_count += data.get("total_roots", 0)
+                root_bytes += data.get("total_bytes", 0)
+                root_time += data.get("total_time", 0.0)
+            except Exception as e:
+                out(f"Warning: failed to read {fname}: {e}")
+        if root_calls:
+            out("=== HAMT write comparison ===")
+            out(f"  {'metric':24s}  {'nodes':>14s}  {'roots':>14s}")
+            node_calls = tot_calls if node_files else 0
+            node_records = tot_nodes if node_files else 0
+            node_bytes = tot_bytes if node_files else 0
+            node_time = tot_time if node_files else 0.0
+            out(f"  {'calls':24s}  {node_calls:14,d}  {root_calls:14,d}")
+            out(f"  {'records':24s}  {node_records:14,d}  {root_count:14,d}")
+            out(f"  {'bytes':24s}  {node_bytes:14,d}  {root_bytes:14,d}")
+            out(
+                f"  {'total time (ms)':24s}  {node_time * 1000:14.1f}  "
+                f"{root_time * 1000:14.1f}"
+            )
+            node_avg = node_time / node_calls * 1000 if node_calls else 0.0
+            out(
+                f"  {'avg time/call (ms)':24s}  {node_avg:14.3f}  {root_time / root_calls * 1000:14.3f}"
+            )
+            out("===============================")
             out("")
 
     # 5. FFI boundary timings

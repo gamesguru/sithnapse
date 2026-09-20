@@ -174,19 +174,129 @@ def _pg_timing(tag: str, elapsed: float, test_name: str | None = None) -> None:
             _PG_TEARDOWN_TEST_TIMINGS[test_name][tag] += elapsed
 
 
-# ── Background Postgres Test DB Dropper ──────────────────────────────────────
+# ── Background Postgres Test DB Dropper & Database Recycler ──────────────────
 _DB_DROP_PID: int = os.getpid()
 _DB_DROP_QUEUE: "queue.Queue[tuple[str, str | None, Any] | None]" = queue.Queue()
 _DB_DROP_THREAD: threading.Thread | None = None
 _DB_DROP_LOCK = threading.Lock()
 
+_RECYCLED_PG_DB: str | None = None
+_DIRTY_TABLES_PREV_TEST: set[str] = set()
+_PREV_TEST_HAD_DDL: bool = False
+
+_MUTABLE_SEED_TABLES = {
+    "appservice_stream_position",
+    "event_push_summary_last_receipt_stream_id",
+    "event_push_summary_stream_ordering",
+    "stats_incremental_position",
+    "user_directory_stream_pos",
+    "federation_stream_position",
+    "device_lists_changes_in_room_max_pruned_stream_id",
+    "device_lists_changes_converted_stream_position",
+    "delayed_events_stream_pos",
+    "room_forgetter_stream_pos",
+    "scheduled_tasks",
+}
+
+_RESEED_SQL = """
+INSERT INTO appservice_stream_position VALUES ('X', 0);
+INSERT INTO event_push_summary_last_receipt_stream_id VALUES ('X', 0);
+INSERT INTO event_push_summary_stream_ordering VALUES ('X', 0);
+INSERT INTO stats_incremental_position VALUES ('X', 1);
+INSERT INTO user_directory_stream_pos VALUES ('X', 1);
+INSERT INTO federation_stream_position VALUES ('federation', -1, 'master'), ('events', -1, 'master');
+INSERT INTO device_lists_changes_in_room_max_pruned_stream_id VALUES (0);
+INSERT INTO device_lists_changes_converted_stream_position VALUES ('master', 1);
+INSERT INTO delayed_events_stream_pos VALUES ('master', 1);
+INSERT INTO room_forgetter_stream_pos VALUES ('master', 1);
+INSERT INTO scheduled_tasks VALUES ('master', 1);
+"""
+
+_RESET_SEQUENCES_SQL = """
+SELECT setval('thread_subscriptions_sequence', 2, false);
+SELECT setval('events_stream_seq', 1, false);
+SELECT setval('receipts_sequence', 1, false);
+SELECT setval('presence_stream_sequence', 1, false);
+SELECT setval('device_inbox_sequence', 1, false);
+SELECT setval('account_data_sequence', 1, false);
+SELECT setval('device_lists_sequence', 1, false);
+SELECT setval('push_rules_stream_sequence', 1, false);
+SELECT setval('pushers_sequence', 1, false);
+SELECT setval('cache_invalidation_stream_seq', 1, false);
+SELECT setval('un_partial_stated_room_stream_sequence', 1, false);
+SELECT setval('un_partial_stated_event_stream_sequence', 1, false);
+SELECT setval('e2e_cross_signing_keys_sequence', 1, false);
+SELECT setval('sticky_events_sequence', 1, false);
+SELECT setval('quarantined_media_id_seq', 1, false);
+SELECT setval('profile_updates_sequence', 1, false);
+SELECT setval('events_backfill_stream_seq', 1, false);
+"""
+
+_METADATA_TABLES_IGNORE = {
+    "applied_schema_deltas",
+    "schema_version",
+    "schema_compat_version",
+    "background_updates",
+}
+
+
+def _reset_recycled_postgres_db(
+    test_db: str,
+    db_engine: Any,
+    dirty_tables: set[str],
+    test_name: str | None = None,
+) -> bool:
+    """Reset dirty tables and sequences in a recycled test DB. Returns True on success."""
+
+    _t0 = time.monotonic()
+    try:
+        conn = db_engine.module.connect(
+            dbname=test_db,
+            user=POSTGRES_USER,
+            host=POSTGRES_HOST,
+            port=POSTGRES_PORT,
+            password=POSTGRES_PASSWORD,
+        )
+        db_engine.attempt_to_set_autocommit(conn, True)
+        cur = conn.cursor()
+
+        tables_to_truncate = [
+            t for t in dirty_tables if t not in _METADATA_TABLES_IGNORE
+        ]
+        if tables_to_truncate:
+            cur.execute(
+                "TRUNCATE TABLE "
+                + ", ".join(tables_to_truncate)
+                + " RESTART IDENTITY CASCADE;"
+            )
+
+        if not dirty_tables or any(t in _MUTABLE_SEED_TABLES for t in dirty_tables):
+            cur.execute(_RESEED_SQL)
+
+        cur.execute(_RESET_SEQUENCES_SQL)
+        cur.close()
+        conn.close()
+        _pg_timing("db_recycle_reset", time.monotonic() - _t0, test_name=test_name)
+        return True
+    except Exception as e:
+        warnings.warn(
+            f"Failed to reset recycled DB {test_db}: {e}. Falling back to fresh clone.",
+            category=UserWarning,
+            stacklevel=2,
+        )
+        return False
+
 
 def _reset_db_drop_state_after_fork() -> None:
     global _DB_DROP_PID, _DB_DROP_QUEUE, _DB_DROP_THREAD, _DB_DROP_LOCK
+    global _RECYCLED_PG_DB, _DIRTY_TABLES_PREV_TEST, _PREV_TEST_HAD_DDL
     _DB_DROP_PID = os.getpid()
     _DB_DROP_QUEUE = queue.Queue()
     _DB_DROP_THREAD = None
     _DB_DROP_LOCK = threading.Lock()
+    _RECYCLED_PG_DB = None
+    _DIRTY_TABLES_PREV_TEST = set()
+    _PREV_TEST_HAD_DDL = False
 
 
 if hasattr(os, "register_at_fork"):
@@ -381,10 +491,21 @@ def _db_drop_worker_loop() -> None:
 
 
 def _drain_db_drop_queue() -> None:
-    global _DB_DROP_PID
+    global _DB_DROP_PID, _RECYCLED_PG_DB
     if os.getpid() != _DB_DROP_PID:
         _reset_db_drop_state_after_fork()
         return
+
+    # Drop the process's recycled database on shutdown
+    if _RECYCLED_PG_DB is not None:
+        db_to_drop = _RECYCLED_PG_DB
+        _RECYCLED_PG_DB = None
+        _drop_test_db(
+            db_to_drop,
+            "process_shutdown",
+            create_engine({"name": "psycopg2", "args": {}}),
+        )
+
     with _DB_DROP_LOCK:
         thread = _DB_DROP_THREAD
     if thread is not None and thread.is_alive():
@@ -1753,7 +1874,23 @@ def setup_test_homeserver(
     config.caches.resize_all_caches()
 
     if USE_POSTGRES_FOR_TESTS:
-        test_db = "synapse_test_%s" % uuid.uuid4().hex
+        global _RECYCLED_PG_DB, _DIRTY_TABLES_PREV_TEST, _PREV_TEST_HAD_DDL
+        from synapse.storage.database import pop_dirty_tables
+
+        # Clear any dirty table leftovers before starting test setup
+        pop_dirty_tables()
+
+        is_recycled = False
+        if (
+            _RECYCLED_PG_DB is not None
+            and not _PREV_TEST_HAD_DDL
+            and os.environ.get("SYNAPSE_TEST_NO_RECYCLE_DB") != "1"
+        ):
+            test_db = _RECYCLED_PG_DB
+            is_recycled = True
+        else:
+            test_db = "synapse_test_%s" % uuid.uuid4().hex
+            _RECYCLED_PG_DB = test_db
 
         database_config: JsonDict = {
             "name": "psycopg2",
@@ -1830,47 +1967,61 @@ def setup_test_homeserver(
 
     db_engine = create_engine(database.config)
 
-    # Create the database before we actually try and connect to it, based off
-    # the template database we generate in setupdb()
+    # Create or reset the database before we actually try and connect to it
     if USE_POSTGRES_FOR_TESTS:
-        _t0 = time.monotonic()
-        db_conn = db_engine.module.connect(
-            dbname=POSTGRES_DBNAME_FOR_INITIAL_CREATE,
-            user=POSTGRES_USER,
-            host=POSTGRES_HOST,
-            port=POSTGRES_PORT,
-            password=POSTGRES_PASSWORD,
-        )
-        db_engine.attempt_to_set_autocommit(db_conn, True)
-        cur = db_conn.cursor()
-        # `test_db` contains a freshly generated UUID, so it cannot collide with a
-        # previous test database. Avoid an unnecessary round trip before cloning
-        # the base database.
-        create_db_strategy, _ = get_postgres_clone_strategy()
-        cur.execute(
-            "CREATE DATABASE %s WITH TEMPLATE %s%s;"
-            % (test_db, POSTGRES_BASE_DB, create_db_strategy)
-        )
-        cur.close()
-        db_conn.close()
-        _pg_timing("create_database", time.monotonic() - _t0)
+        if is_recycled:
+            if not _reset_recycled_postgres_db(
+                test_db, db_engine, _DIRTY_TABLES_PREV_TEST, test_name=test_name
+            ):
+                # Fallback if reset failed: generate new test_db and clone
+                test_db = "synapse_test_%s" % uuid.uuid4().hex
+                _RECYCLED_PG_DB = test_db
+                database_config["args"]["dbname"] = test_db
+                database = DatabaseConnectionConfig("master", database_config)
+                config.database.databases = [database]
+                is_recycled = False
 
-        # The clone is a verbatim copy of the empty template: all tables are
-        # empty and all sequences are at their initial values.  Signal this to
-        # DatabasePool so that MultiWriterIdGenerator and sequence generators
-        # skip their startup consistency queries (check_consistency +
-        # _load_current_ids), saving ~10-20 round-trips to Postgres per setup.
+        if not is_recycled:
+            _t0 = time.monotonic()
+            db_conn = db_engine.module.connect(
+                dbname=POSTGRES_DBNAME_FOR_INITIAL_CREATE,
+                user=POSTGRES_USER,
+                host=POSTGRES_HOST,
+                port=POSTGRES_PORT,
+                password=POSTGRES_PASSWORD,
+            )
+            db_engine.attempt_to_set_autocommit(db_conn, True)
+            cur = db_conn.cursor()
+            create_db_strategy, _ = get_postgres_clone_strategy()
+            cur.execute(
+                "CREATE DATABASE %s WITH TEMPLATE %s%s;"
+                % (test_db, POSTGRES_BASE_DB, create_db_strategy)
+            )
+            cur.close()
+            db_conn.close()
+            _pg_timing("create_database", time.monotonic() - _t0, test_name=test_name)
+
         database_config["_TEST_DB_IS_FRESH"] = True
-        # Rebuild the DatabaseConnectionConfig so it picks up the new key.
         database = DatabaseConnectionConfig("master", database_config)
         config.database.databases = [database]
 
         def cleanup() -> None:
-            if os.environ.get("SYNAPSE_TEST_SYNC_DROP_DB") == "1":
-                _drop_test_db(test_db, test_name, db_engine)
+            global _RECYCLED_PG_DB, _DIRTY_TABLES_PREV_TEST, _PREV_TEST_HAD_DDL
+            from synapse.storage.database import pop_dirty_tables
+
+            dirty, had_ddl = pop_dirty_tables()
+            if had_ddl or os.environ.get("SYNAPSE_TEST_NO_RECYCLE_DB") == "1":
+                _RECYCLED_PG_DB = None
+                _DIRTY_TABLES_PREV_TEST = set()
+                _PREV_TEST_HAD_DDL = False
+                if os.environ.get("SYNAPSE_TEST_SYNC_DROP_DB") == "1":
+                    _drop_test_db(test_db, test_name, db_engine)
+                else:
+                    _ensure_db_drop_worker()
+                    _DB_DROP_QUEUE.put((test_db, test_name, db_engine))
             else:
-                _ensure_db_drop_worker()
-                _DB_DROP_QUEUE.put((test_db, test_name, db_engine))
+                _DIRTY_TABLES_PREV_TEST = dirty
+                _PREV_TEST_HAD_DDL = False
 
         if not LEAVE_DB:
             # Register the cleanup hook
