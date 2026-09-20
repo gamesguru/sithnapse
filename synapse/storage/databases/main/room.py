@@ -1866,15 +1866,11 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
         complete.
         """
 
-        entry = await self.db_pool.simple_select_one_onecol(
-            table="partial_state_rooms",
-            keyvalues={"room_id": room_id},
-            retcol="room_id",
-            allow_none=True,
-            desc="is_partial_state_room",
-        )
-
-        return entry is not None
+        # Partial-state rooms are rare compared to the number of room checks.
+        # Reuse the cached set instead of issuing one SQL lookup per distinct
+        # room. The set cache is invalidated and replicated whenever a room is
+        # added to or removed from partial_state_rooms.
+        return room_id in await self.get_partial_rooms()
 
     @cachedList(cached_method_name="is_partial_state_room", list_name="room_ids")
     async def is_partial_state_room_batched(
@@ -1887,17 +1883,7 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
         complete.
         """
 
-        rows = cast(
-            list[tuple[str]],
-            await self.db_pool.simple_select_many_batch(
-                table="partial_state_rooms",
-                column="room_id",
-                iterable=room_ids,
-                retcols=("room_id",),
-                desc="is_partial_state_room_batched",
-            ),
-        )
-        partial_state_rooms = {row[0] for row in rows}
+        partial_state_rooms = await self.get_partial_rooms()
         return {room_id: room_id in partial_state_rooms for room_id in room_ids}
 
     @cached(max_entries=10000, iterable=True)
