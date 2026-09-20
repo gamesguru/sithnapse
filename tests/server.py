@@ -180,6 +180,7 @@ _DB_DROP_THREAD: threading.Thread | None = None
 _DB_DROP_LOCK = threading.Lock()
 
 _RECYCLED_PG_DB: str | None = None
+_RECYCLED_PG_DB_IN_USE: bool = False
 _DIRTY_TABLES_PREV_TEST: set[str] = set()
 _PREV_TEST_HAD_DDL: bool = False
 
@@ -293,12 +294,6 @@ def _reset_recycled_postgres_db(
             stacklevel=2,
         )
         return False
-
-
-_RECYCLED_PG_DB: str | None = None
-_RECYCLED_PG_DB_IN_USE: bool = False
-_DIRTY_TABLES_PREV_TEST: set[str] = set()
-_PREV_TEST_HAD_DDL: bool = False
 
 
 def _reset_db_drop_state_after_fork() -> None:
