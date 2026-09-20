@@ -662,7 +662,50 @@ class HomeServer(metaclass=abc.ABCMeta):
     def setup(self) -> None:
         logger.info("Setting up.")
         self.start_time = int(self.get_clock().time())
+
+        timings_path = self.config.database.setup_timings_path
+        if timings_path:
+            import json
+            import os
+            import time
+            import threading
+            from collections import defaultdict
+            from synapse.storage.databases import set_pg_timing_callback
+
+            _timings: dict[str, float] = defaultdict(float)
+            _counts: dict[str, int] = defaultdict(int)
+            _lock = threading.Lock()
+
+            def _record(tag: str, elapsed: float) -> None:
+                with _lock:
+                    _timings[tag] += elapsed
+                    _counts[tag] += 1
+
+            set_pg_timing_callback(_record)
+            _t0 = time.monotonic()
+
         self.datastores = Databases(self.DATASTORE_CLASS, self)
+
+        if timings_path:
+            set_pg_timing_callback(None)
+            _elapsed = time.monotonic() - _t0
+            _record("databases_init_total", _elapsed)
+            payload = {
+                "timings": dict(_timings),
+                "counts": dict(_counts),
+                "server_name": self.hostname,
+            }
+            _tmp = timings_path + ".tmp"
+            try:
+                with open(_tmp, "w", encoding="utf-8") as _f:
+                    json.dump(payload, _f)
+                os.replace(_tmp, timings_path)
+                logger.info("Database setup timings written to %s", timings_path)
+            except OSError:
+                logger.warning(
+                    "Failed to write database setup timings to %s", timings_path
+                )
+
         logger.info("Finished setting up.")
 
     # def __del__(self) -> None:

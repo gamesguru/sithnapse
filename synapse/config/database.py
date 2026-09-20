@@ -98,6 +98,13 @@ class DatabaseConfig(Config):
         # NOT for production use.  Set via embedded_hamt.no_sync or
         # SYNAPSE_MTXDB_NO_SYNC env var.
         self.embedded_hamt_no_sync: bool = False
+        # If set, Databases.__init__ timing data (tag → total seconds + call
+        # count) is written as JSON to this path after HomeServer.setup()
+        # completes.  Intended for profiling production startup (e.g.
+        # Complement runs) without the Trial test harness.  Set via
+        # database.setup_timings_path in config or SYNAPSE_DB_SETUP_TIMINGS_PATH
+        # env var.
+        self.setup_timings_path: str | None = None
 
     def read_config(self, config: JsonDict, **kwargs: Any) -> None:
         # We *experimentally* support specifying multiple databases via the
@@ -150,6 +157,10 @@ class DatabaseConfig(Config):
                 raise ConfigError(
                     "SYNAPSE_MTXDB requires SYNAPSE_MTXDB_PATH or embedded_hamt.path"
                 )
+
+        self.setup_timings_path = config.get("setup_timings_path") or os.environ.get(
+            "SYNAPSE_DB_SETUP_TIMINGS_PATH"
+        )
 
         # Validate embedded_hamt engine/path consistency.
         # A half-set config (engine without path) boots fine but crashes on
