@@ -210,23 +210,25 @@ INSERT INTO room_forgetter_stream_pos (stream_id) VALUES (1);
 """
 
 _RESET_SEQUENCES_SQL = """
-SELECT setval('thread_subscriptions_sequence', 2, false);
-SELECT setval('events_stream_seq', 1, false);
-SELECT setval('receipts_sequence', 1, false);
-SELECT setval('presence_stream_sequence', 1, false);
-SELECT setval('device_inbox_sequence', 1, false);
-SELECT setval('account_data_sequence', 1, false);
-SELECT setval('device_lists_sequence', 1, false);
-SELECT setval('push_rules_stream_sequence', 1, false);
-SELECT setval('pushers_sequence', 1, false);
-SELECT setval('cache_invalidation_stream_seq', 1, false);
-SELECT setval('un_partial_stated_room_stream_sequence', 1, false);
-SELECT setval('un_partial_stated_event_stream_sequence', 1, false);
-SELECT setval('e2e_cross_signing_keys_sequence', 1, false);
-SELECT setval('sticky_events_sequence', 1, false);
-SELECT setval('quarantined_media_id_seq', 1, false);
-SELECT setval('profile_updates_sequence', 1, false);
-SELECT setval('events_backfill_stream_seq', 1, false);
+-- Match the freshly prepared base DB: stream sequences are already marked
+-- called at their initial persisted position, so the first allocated ID is 2.
+SELECT setval('thread_subscriptions_sequence', 2, true);
+SELECT setval('events_stream_seq', 1, true);
+SELECT setval('receipts_sequence', 1, true);
+SELECT setval('presence_stream_sequence', 1, true);
+SELECT setval('device_inbox_sequence', 1, true);
+SELECT setval('account_data_sequence', 1, true);
+SELECT setval('device_lists_sequence', 1, true);
+SELECT setval('push_rules_stream_sequence', 1, true);
+SELECT setval('pushers_sequence', 1, true);
+SELECT setval('cache_invalidation_stream_seq', 1, true);
+SELECT setval('un_partial_stated_room_stream_sequence', 1, true);
+SELECT setval('un_partial_stated_event_stream_sequence', 1, true);
+SELECT setval('e2e_cross_signing_keys_sequence', 1, true);
+SELECT setval('sticky_events_sequence', 1, true);
+SELECT setval('quarantined_media_id_seq', 1, true);
+SELECT setval('profile_updates_sequence', 1, true);
+SELECT setval('events_backfill_stream_seq', 1, true);
 """
 
 _METADATA_TABLES_IGNORE = {
