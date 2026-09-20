@@ -181,7 +181,13 @@ def _pg_counter(tag: str, count: int = 1) -> None:
 
 # ── Background Postgres Test DB Dropper & Database Recycler ──────────────────
 _DB_DROP_PID: int = os.getpid()
-_DB_DROP_QUEUE: "queue.Queue[tuple[str, str | None, Any] | None]" = queue.Queue()
+# Keep only a small number of disposable databases waiting to be dropped.
+# The test cluster may live on tmpfs, so letting test setup outrun the single
+# dropper can otherwise retain an unbounded number of full database clones.
+_DB_DROP_QUEUE_MAXSIZE = 2
+_DB_DROP_QUEUE: "queue.Queue[tuple[str, str | None, Any] | None]" = queue.Queue(
+    maxsize=_DB_DROP_QUEUE_MAXSIZE
+)
 _DB_DROP_THREAD: threading.Thread | None = None
 _DB_DROP_LOCK = threading.Lock()
 
@@ -314,7 +320,7 @@ def _reset_db_drop_state_after_fork() -> None:
         _DIRTY_TABLES_PREV_TEST, \
         _PREV_TEST_HAD_DDL
     _DB_DROP_PID = os.getpid()
-    _DB_DROP_QUEUE = queue.Queue()
+    _DB_DROP_QUEUE = queue.Queue(maxsize=_DB_DROP_QUEUE_MAXSIZE)
     _DB_DROP_THREAD = None
     _DB_DROP_LOCK = threading.Lock()
     _RECYCLED_PG_DB = None
@@ -2082,21 +2088,26 @@ def setup_test_homeserver(
                     _RECYCLED_PG_DB_IN_USE, \
                     _DIRTY_TABLES_PREV_TEST, \
                     _PREV_TEST_HAD_DDL
-                from synapse.storage.database import pop_dirty_tables
-
-                dirty, had_ddl, ddl_triggers = pop_dirty_tables()
-                if (
-                    had_ddl
-                    and ddl_triggers
-                    and os.environ.get("SYNAPSE_DEBUG_DDL_TRIGGERS") == "1"
-                ):
-                    import sys
-
-                    print(
-                        f"[DDL-TRIGGER] test={test_name} triggers={ddl_triggers!r}",
-                        file=sys.stderr,
-                    )
                 if test_db == _RECYCLED_PG_DB:
+                    # Dirty-table tracking is process-global, not per DB. Only
+                    # the primary DB cleanup may consume it; secondary
+                    # homeserver cleanups run first (Trial cleanups are LIFO)
+                    # and would otherwise erase the table list before the
+                    # recycled primary is reset for the next test.
+                    from synapse.storage.database import pop_dirty_tables
+
+                    dirty, had_ddl, ddl_triggers = pop_dirty_tables()
+                    if (
+                        had_ddl
+                        and ddl_triggers
+                        and os.environ.get("SYNAPSE_DEBUG_DDL_TRIGGERS") == "1"
+                    ):
+                        import sys
+
+                        print(
+                            f"[DDL-TRIGGER] test={test_name} triggers={ddl_triggers!r}",
+                            file=sys.stderr,
+                        )
                     _RECYCLED_PG_DB_IN_USE = False
                     if had_ddl:
                         _pg_counter("cleanup_dropped_primary_had_ddl")
