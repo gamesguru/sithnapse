@@ -668,20 +668,45 @@ main() {
 
   # Split top-level | into separate go test invocations (go test's -run re-splits
   # on every /, silently dropping one side of alternations with differing depth).
+  #
+  # That depth-mismatch bug can only fire when the alternatives being OR'd
+  # together have differing "/" depth (e.g. `TestFoo|TestBar/SomeSubtest`).
+  # When every alternative is a single flat segment (no "/" at all -- no
+  # subtest is being targeted by any of them), depth is uniformly 1 and the
+  # bug cannot trigger, so there is nothing to protect against by splitting.
+  # In that case, combine everything into one `^(a|b|c)$`-style alternation
+  # and run go test once instead of once per name -- this is the common case
+  # for a targeted top-level test-name batch and the split's per-invocation
+  # process/container-churn overhead is otherwise paid for nothing.
   ALT_PATTERNS=()
   if [ "$RUN_TESTS" = "." ]; then
     ALT_PATTERNS=(".")
   else
     local -a raw_alts
     IFS='|' read -r -a raw_alts <<<"$RUN_TESTS"
+    local _all_flat=1
     for alt in "${raw_alts[@]}"; do
-      ALT_PATTERNS+=("$(anchor_one "$alt")")
+      if [[ "$alt" == */* ]]; then
+        _all_flat=0
+        break
+      fi
     done
-    if [ "${#ALT_PATTERNS[@]}" -gt 1 ]; then
-      echo "Anchored run regexes (one go test invocation each):" >&2
-      for alt in "${ALT_PATTERNS[@]}"; do echo "  $alt" >&2; done
+    if [ "${#raw_alts[@]}" -gt 1 ] && [ "$_all_flat" -eq 1 ]; then
+      local _combined
+      _combined="$(IFS='|'; echo "${raw_alts[*]}")"
+      ALT_PATTERNS=("^(${_combined})\$")
+      echo "All alternatives are flat top-level names; combined into one go test invocation:" >&2
+      echo "  ${ALT_PATTERNS[0]}" >&2
     else
-      echo "Anchored run regex: ${ALT_PATTERNS[0]}" >&2
+      for alt in "${raw_alts[@]}"; do
+        ALT_PATTERNS+=("$(anchor_one "$alt")")
+      done
+      if [ "${#ALT_PATTERNS[@]}" -gt 1 ]; then
+        echo "Anchored run regexes (one go test invocation each):" >&2
+        for alt in "${ALT_PATTERNS[@]}"; do echo "  $alt" >&2; done
+      else
+        echo "Anchored run regex: ${ALT_PATTERNS[0]}" >&2
+      fi
     fi
   fi
 
@@ -915,15 +940,25 @@ run_one_pattern() {
     packages=("${available_complement_test_packages[@]}")
   fi
 
-  if [[ "$pattern" != "." ]] && [[ "$pattern" =~ ^\^?(Test[[:alnum:]_]+)(/.*)?$ ]]; then
-    local _test_name="${BASH_REMATCH[1]}"
+  # A single flat name (`^TestFoo$`) or the combined-flat-batch form
+  # (`^(TestFoo|TestBar|...)$`, produced above when every alternative in the
+  # batch is a top-level name) both narrow packages the same way: union the
+  # package(s) each individual name's `func TestX` lives in.
+  local -a _batch_names=()
+  if [[ "$pattern" != "." ]] && [[ "$pattern" =~ ^\^\((Test[[:alnum:]_|]+)\)\$$ ]]; then
+    IFS='|' read -r -a _batch_names <<<"${BASH_REMATCH[1]}"
+  elif [[ "$pattern" != "." ]] && [[ "$pattern" =~ ^\^?(Test[[:alnum:]_]+)(/.*)?$ ]]; then
+    _batch_names=("${BASH_REMATCH[1]}")
+  fi
+
+  if [ "${#_batch_names[@]}" -gt 0 ]; then
     local _base_dir="$COMPLEMENT_DIR"
     if [ -n "$use_in_repo_tests" ]; then _base_dir="${repo_root}/complement"; fi
     if command -v rg &>/dev/null; then
       local -a matched_pkgs=()
       mapfile -t matched_pkgs < <(
         cd "$_base_dir" \
-          && rg -l --glob '*_test.go' "^func[[:space:]]+${_test_name}" tests 2>/dev/null \
+          && rg -l --glob '*_test.go' "^func[[:space:]]+(${_batch_names[0]}$(printf '|%s' "${_batch_names[@]:1}"))\\b" tests 2>/dev/null \
           | xargs -r -n1 dirname | sed 's#^#./#' | sort -u || true
       )
       if [ "${#matched_pkgs[@]}" -gt 0 ]; then
