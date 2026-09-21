@@ -23,8 +23,8 @@ use pyo3::types::{PyAny, PyDict, PySet, PyTuple};
 use pythonize::depythonize;
 use rezzy::basespec::event_types::MAX_POWER_LEVEL_JSON;
 use rezzy::{
-    auth::roaring::AuthGraph, basespec::event_types::EventType, resolve_semilattice_fold,
-    EventContent, LeanEvent, RoomId, SharedState, StateResVersion,
+    auth::roaring::AuthGraph, basespec::event_types::EventType, is_valid_mxid,
+    resolve_semilattice_fold, EventContent, LeanEvent, RoomId, SharedState, StateResVersion,
 };
 use serde_json::Value;
 
@@ -137,33 +137,15 @@ impl ResolverContent {
     }
 }
 
-// Keep aligned with rezzy::is_valid_mxid until the Sithnapse dependency
-// includes that public helper.
-fn is_valid_resolver_mxid(id: &str) -> bool {
-    let Some((localpart, domain)) = id.strip_prefix('@').and_then(|rest| rest.split_once(':'))
-    else {
-        return false;
-    };
-    !localpart.is_empty()
-        && !domain.is_empty()
-        && localpart.bytes().all(
-            |b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'=' | b'-' | b'/' | b'+'),
-        )
-}
-
+// Delegate to rezzy's coercion so the adapter can never drift from the
+// resolver's own numeric rules.
 fn coerce_serde_json_to_i64(value: &Value) -> Option<i64> {
-    let integer = value
-        .as_i64()
-        .or_else(|| value.as_u64().map(|n| i64::try_from(n).unwrap_or(i64::MAX)))
-        .or_else(|| {
-            value.as_f64().and_then(|number| {
-                let truncated = number.trunc();
-                (truncated >= i64::MIN as f64 && truncated <= i64::MAX as f64)
-                    .then_some(truncated as i64)
-            })
-        })
-        .or_else(|| value.as_str().and_then(|text| text.parse::<i64>().ok()));
-    integer.map(|n| n.clamp(-9_007_199_254_740_991, 9_007_199_254_740_991))
+    rezzy::coerce_json_integer_parts(
+        value.as_i64(),
+        value.as_u64(),
+        value.as_f64(),
+        value.as_str(),
+    )
 }
 
 impl EventContent for ResolverContent {
@@ -264,7 +246,7 @@ impl EventContent for ResolverContent {
             None => true,
             Some(v) => v.as_array().is_some_and(|arr| {
                 arr.iter()
-                    .all(|entry| entry.as_str().is_some_and(is_valid_resolver_mxid))
+                    .all(|entry| entry.as_str().is_some_and(is_valid_mxid))
             }),
         }
     }
@@ -674,5 +656,46 @@ mod tests {
             assert!(content.has_additional_creator("@b:test"));
             assert!(content.additional_creators_are_valid());
         }
+    }
+
+    #[test]
+    fn resolver_number_coercion_matches_rezzy_across_json_spellings() {
+        // serde_json is built with `arbitrary_precision`, so pin the adapter's
+        // coercion against rezzy's own across the spellings that actually occur
+        // in the wild (legacy float/string power levels, 2^53 boundaries, u64
+        // overflow).
+        for source in [
+            "0",
+            "-0",
+            "50",
+            "50.0",
+            "-50.5",
+            "\"50\"",
+            "\"not-a-number\"",
+            "9007199254740993",
+            "18446744073709551616",
+            "-9007199254740992",
+            "1.25",
+        ] {
+            let serde_value: Value = serde_json::from_str(source).expect("valid serde number");
+            let rezzy_value = rezzy::JsonValue::parse(source).expect("valid rezzy number");
+            assert_eq!(
+                coerce_serde_json_to_i64(&serde_value),
+                rezzy::coerce_json_to_i64(&rezzy_value),
+                "coercion parity for {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolver_content_enforces_v12_mxid_grammar() {
+        let valid: Value = serde_json::from_str(r#"{"additional_creators":["@a:test","@b:test"]}"#)
+            .expect("valid event content");
+        let invalid: Value = serde_json::from_str(r#"{"additional_creators":["@A:test"]}"#)
+            .expect("valid event content");
+        let valid = ResolverContent::SharedValue(Arc::new(valid));
+        let invalid = ResolverContent::SharedValue(Arc::new(invalid));
+        assert!(valid.additional_creators_are_valid());
+        assert!(!invalid.additional_creators_are_valid());
     }
 }
