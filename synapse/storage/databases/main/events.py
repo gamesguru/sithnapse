@@ -73,6 +73,7 @@ from synapse.storage.databases.main.embedded_event_edges import (
     queue_edge_write,
 )
 from synapse.storage.databases.main.embedded_event_json import (
+    get_event_json_batch,
     open_embedded_event_json_engine,
     put_event_json_batch,
 )
@@ -986,7 +987,7 @@ class PersistEventsStore:
             txn: LoggingTransaction, batch: Collection[str]
         ) -> None:
             sql = """
-            SELECT prev_event_id, internal_metadata
+            SELECT prev_event_id, internal_metadata, event_id
             FROM event_edges
                 INNER JOIN events USING (event_id)
                 LEFT JOIN rejections USING (event_id)
@@ -1002,7 +1003,28 @@ class PersistEventsStore:
             )
 
             txn.execute(sql + clause, args)
-            results.extend(r[0] for r in txn if not db_to_json(r[1]).get("soft_failed"))
+            rows = txn.fetchall()
+            if not rows:
+                return
+
+            missing_meta_ids = [event_id for _, meta, event_id in rows if meta is None]
+            meta_by_id = {}
+            if missing_meta_ids and getattr(
+                self, "_embedded_event_json_enabled", False
+            ):
+                found = get_event_json_batch(
+                    self._embedded_hamt_engine,
+                    self._embedded_hamt_namespace,
+                    missing_meta_ids,
+                )
+                for eid, (m, _, _) in found.items():
+                    meta_by_id[eid] = m
+
+            for prev_event_id, meta, event_id in rows:
+                if meta is None:
+                    meta = meta_by_id.get(event_id)
+                if not meta or not db_to_json(meta).get("soft_failed"):
+                    results.append(prev_event_id)
 
         for chunk in batch_iter(event_ids, 100):
             await self.db_pool.runInteraction(
@@ -1061,13 +1083,33 @@ class PersistEventsStore:
                 )
 
                 txn.execute(sql + clause, args)
+                rows = txn.fetchall()
                 to_recursively_check = []
 
-                for _, prev_event_id, metadata, rejected in txn:
+                missing_meta_ids = [
+                    event_id for event_id, _, meta, _ in rows if meta is None
+                ]
+                meta_by_id = {}
+                if missing_meta_ids and getattr(
+                    self, "_embedded_event_json_enabled", False
+                ):
+                    found = get_event_json_batch(
+                        self._embedded_hamt_engine,
+                        self._embedded_hamt_namespace,
+                        missing_meta_ids,
+                    )
+                    for eid, (m, _, _) in found.items():
+                        meta_by_id[eid] = m
+
+                for event_id, prev_event_id, metadata, rejected in rows:
                     if prev_event_id in existing_prevs:
                         continue
+                    if metadata is None:
+                        metadata = meta_by_id.get(event_id)
 
-                    soft_failed = db_to_json(metadata).get("soft_failed")
+                    soft_failed = (
+                        db_to_json(metadata).get("soft_failed") if metadata else False
+                    )
                     if (include_soft_failed and soft_failed) or rejected:
                         to_recursively_check.append(prev_event_id)
                         existing_prevs.add(prev_event_id)
@@ -2660,25 +2702,40 @@ class PersistEventsStore:
         """
 
         sql = """
-            SELECT json FROM event_json
-            INNER JOIN current_state_events USING (room_id, event_id)
+            SELECT event_id, json FROM current_state_events
+            LEFT JOIN event_json USING (room_id, event_id)
             WHERE room_id = ? AND type = ? AND state_key = ?
         """
         txn.execute(sql, (room_id, EventTypes.Create, ""))
         row = txn.fetchone()
         if row:
-            event_json = db_to_json(row[0])
-            content = event_json.get("content", {})
-            creator = content.get("creator")
-            room_version_id = content.get("room_version", RoomVersions.V1.identifier)
+            event_id, json_str = row
+            if json_str is None and getattr(
+                self, "_embedded_event_json_enabled", False
+            ):
+                found = get_event_json_batch(
+                    self._embedded_hamt_engine,
+                    self._embedded_hamt_namespace,
+                    [event_id],
+                )
+                if event_id in found:
+                    json_str = found[event_id][1]
 
-            self.db_pool.simple_upsert_txn(
-                txn,
-                table="rooms",
-                keyvalues={"room_id": room_id},
-                values={"room_version": room_version_id},
-                insertion_values={"is_public": False, "creator": creator},
-            )
+            if json_str:
+                event_json = db_to_json(json_str)
+                content = event_json.get("content", {})
+                creator = content.get("creator")
+                room_version_id = content.get(
+                    "room_version", RoomVersions.V1.identifier
+                )
+
+                self.db_pool.simple_upsert_txn(
+                    txn,
+                    table="rooms",
+                    keyvalues={"room_id": room_id},
+                    values={"room_version": room_version_id},
+                    insertion_values={"is_public": False, "creator": creator},
+                )
 
     def _update_forward_extremities_txn(
         self,
@@ -2948,18 +3005,22 @@ class PersistEventsStore:
             for event, _ in events_and_contexts
         ]
 
-        self.db_pool.simple_insert_many_txn(
-            txn,
-            table="event_json",
-            keys=("event_id", "room_id", "internal_metadata", "json", "format_version"),
-            values=event_json_rows,
-        )
-
-        # Mirror into the embedded engine if configured -- event_json is
-        # the highest-disk-usage, highest-cache-miss table in a busy
-        # homeserver (see scripts-dev/benchmark_event_json_storage.py);
-        # Postgres stays authoritative, this is a read fast path.
-        if self._embedded_event_json_enabled:
+        if not self._embedded_event_json_enabled:
+            self.db_pool.simple_insert_many_txn(
+                txn,
+                table="event_json",
+                keys=(
+                    "event_id",
+                    "room_id",
+                    "internal_metadata",
+                    "json",
+                    "format_version",
+                ),
+                values=event_json_rows,
+            )
+        else:
+            # Exclusive by configured engine -- event_json writes go directly
+            # to mtxdb without duplicating the highest-disk-usage table in SQL.
             put_event_json_batch(
                 self._embedded_hamt_engine,
                 self._embedded_hamt_namespace,

@@ -12,15 +12,19 @@
  * <https://www.gnu.org/licenses/agpl-3.0.html>.
  */
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    sync::Arc,
+};
 
-use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PySet, PyTuple};
 use pythonize::depythonize;
+use rezzy::basespec::event_types::MAX_POWER_LEVEL_JSON;
 use rezzy::{
     auth::roaring::AuthGraph, basespec::event_types::EventType, resolve_semilattice_fold,
-    JsonValue, LeanEvent, RoomId, SharedState, StateResVersion,
+    EventContent, LeanEvent, RoomId, SharedState, StateResVersion,
 };
 use serde_json::Value;
 
@@ -98,105 +102,336 @@ pub fn get_auth_chain_difference_from_event_graph<'py>(
     PySet::new(py, result)
 }
 
-/// Resolver-only adapter; do not use this for canonical JSON or event hashing.
-///
-/// Typed events retain their shared JsonObject until this boundary, avoiding
-/// an intermediate serde_json::Value. The conversion is bounded because values
-/// can also arrive through Python's depythonize path.
-const MAX_RESOLVER_JSON_DEPTH: usize = 128;
+/// The resolver keeps the source JSON tree and reads the fields it needs in place.
+/// Typed events share their existing JsonObject; Python events own the depythonized
+/// serde_json tree behind an Arc so event clones stay cheap.
+#[derive(Clone)]
+enum ResolverContent {
+    SharedObject(JsonObject),
+    SharedValue(Arc<Value>),
+}
 
-fn convert_number(number: &serde_json::Number) -> PyResult<JsonValue> {
-    // Preserve floating negative zero before other numeric accessors normalize it.
-    if number
-        .as_f64()
-        .is_some_and(|value| value == 0.0 && value.is_sign_negative())
-    {
-        Ok(JsonValue::from(-0.0))
-    } else if let Some(value) = number.as_i64() {
-        Ok(JsonValue::from(value))
-    } else if let Some(value) = number.as_u64() {
-        Ok(JsonValue::from(value))
-    } else if let Some(value) = number.as_f64().filter(|value| value.is_finite()) {
-        Ok(JsonValue::from(value))
-    } else {
-        Err(PyValueError::new_err(format!(
-            "JSON number cannot be represented by rezzy: {number}"
-        )))
+impl Default for ResolverContent {
+    fn default() -> Self {
+        Self::SharedValue(Arc::new(Value::Null))
     }
 }
 
-fn check_resolver_json_depth(depth: usize) -> PyResult<()> {
-    if depth > MAX_RESOLVER_JSON_DEPTH {
-        return Err(PyValueError::new_err(format!(
-            "event content exceeds the maximum nesting depth of {MAX_RESOLVER_JSON_DEPTH}"
-        )));
+impl fmt::Debug for ResolverContent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SharedObject(value) => {
+                f.debug_tuple("SharedObject").field(value.as_map()).finish()
+            }
+            Self::SharedValue(value) => f.debug_tuple("SharedValue").field(value).finish(),
+        }
     }
-    Ok(())
 }
 
-fn convert_json_value_ref(value: &Value, depth: usize) -> PyResult<JsonValue> {
-    check_resolver_json_depth(depth)?;
-    Ok(match value {
-        Value::Null => JsonValue::Null,
-        Value::Bool(value) => JsonValue::Bool(*value),
-        Value::Number(number) => convert_number(number)?,
-        Value::String(value) => JsonValue::String(value.clone()),
-        Value::Array(values) => JsonValue::Array(
-            values
-                .iter()
-                .map(|value| convert_json_value_ref(value, depth.saturating_add(1)))
-                .collect::<PyResult<Vec<_>>>()?,
-        ),
-        Value::Object(values) => JsonValue::Object(
-            values
-                .iter()
-                .map(|(key, value)| {
-                    convert_json_value_ref(value, depth.saturating_add(1))
-                        .map(|value| (key.clone(), value))
-                })
-                .collect::<PyResult<_>>()?,
-        ),
-    })
+impl ResolverContent {
+    fn get(&self, key: &str) -> Option<&Value> {
+        match self {
+            Self::SharedObject(object) => object.get_field(key),
+            Self::SharedValue(value) => value.get(key),
+        }
+    }
 }
 
-fn convert_json_value_owned(value: Value, depth: usize) -> PyResult<JsonValue> {
-    check_resolver_json_depth(depth)?;
-    Ok(match value {
-        Value::Null => JsonValue::Null,
-        Value::Bool(value) => JsonValue::Bool(value),
-        Value::Number(number) => convert_number(&number)?,
-        Value::String(value) => JsonValue::String(value),
-        Value::Array(values) => JsonValue::Array(
-            values
-                .into_iter()
-                .map(|value| convert_json_value_owned(value, depth.saturating_add(1)))
-                .collect::<PyResult<Vec<_>>>()?,
-        ),
-        Value::Object(values) => JsonValue::Object(
-            values
-                .into_iter()
-                .map(|(key, value)| {
-                    convert_json_value_owned(value, depth.saturating_add(1))
-                        .map(|value| (key, value))
-                })
-                .collect::<PyResult<_>>()?,
-        ),
-    })
+// Keep aligned with rezzy::is_valid_mxid until the Sithnapse dependency
+// includes that public helper.
+fn is_valid_resolver_mxid(id: &str) -> bool {
+    let Some((localpart, domain)) = id.strip_prefix('@').and_then(|rest| rest.split_once(':'))
+    else {
+        return false;
+    };
+    !localpart.is_empty()
+        && !domain.is_empty()
+        && localpart.bytes().all(
+            |b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'=' | b'-' | b'/' | b'+'),
+        )
 }
 
-fn to_rezzy_content(content: &JsonObject) -> PyResult<JsonValue> {
-    content
-        .as_map()
-        .iter()
-        .map(|(key, value)| convert_json_value_ref(value, 1).map(|value| (key.to_string(), value)))
-        .collect::<PyResult<_>>()
-        .map(JsonValue::Object)
+fn coerce_serde_json_to_i64(value: &Value) -> Option<i64> {
+    let integer = value
+        .as_i64()
+        .or_else(|| value.as_u64().map(|n| i64::try_from(n).unwrap_or(i64::MAX)))
+        .or_else(|| {
+            value.as_f64().and_then(|number| {
+                let truncated = number.trunc();
+                (truncated >= i64::MIN as f64 && truncated <= i64::MAX as f64)
+                    .then_some(truncated as i64)
+            })
+        })
+        .or_else(|| value.as_str().and_then(|text| text.parse::<i64>().ok()));
+    integer.map(|n| n.clamp(-9_007_199_254_740_991, 9_007_199_254_740_991))
 }
 
-fn to_rezzy_content_owned(content: Value) -> PyResult<JsonValue> {
-    convert_json_value_owned(content, 0)
+impl EventContent for ResolverContent {
+    fn get_membership(&self) -> Option<&str> {
+        self.get(rezzy::basespec::event_types::FIELD_MEMBERSHIP)?
+            .as_str()
+    }
+
+    fn get_cdo_active_member(&self) -> Option<&str> {
+        self.get("tk.nutra.cdo")?.get("active_member")?.as_str()
+    }
+
+    fn get_join_rule(&self) -> Option<&str> {
+        self.get(rezzy::basespec::event_types::FIELD_JOIN_RULE)?
+            .as_str()
+    }
+
+    fn get_user_power_level(&self, user: &str) -> Option<i64> {
+        let users = self
+            .get(rezzy::basespec::event_types::FIELD_USERS)?
+            .as_object()?;
+        coerce_serde_json_to_i64(users.get(user)?).map(|i| i.min(MAX_POWER_LEVEL_JSON))
+    }
+
+    fn get_event_power_level(&self, event_type: &str) -> Option<i64> {
+        let events = self
+            .get(rezzy::basespec::event_types::FIELD_EVENTS)?
+            .as_object()?;
+        coerce_serde_json_to_i64(events.get(event_type)?).map(|i| i.min(MAX_POWER_LEVEL_JSON))
+    }
+
+    fn get_users_default(&self) -> Option<i64> {
+        coerce_serde_json_to_i64(self.get(rezzy::basespec::event_types::FIELD_USERS_DEFAULT)?)
+            .map(|i| i.min(MAX_POWER_LEVEL_JSON))
+    }
+
+    fn get_events_default(&self) -> Option<i64> {
+        coerce_serde_json_to_i64(self.get(rezzy::basespec::event_types::FIELD_EVENTS_DEFAULT)?)
+            .map(|i| i.min(MAX_POWER_LEVEL_JSON))
+    }
+
+    fn get_state_default(&self) -> Option<i64> {
+        coerce_serde_json_to_i64(self.get(rezzy::basespec::event_types::FIELD_STATE_DEFAULT)?)
+            .map(|i| i.min(MAX_POWER_LEVEL_JSON))
+    }
+
+    fn get_ban(&self) -> Option<i64> {
+        coerce_serde_json_to_i64(self.get(rezzy::basespec::event_types::FIELD_BAN)?)
+            .map(|i| i.min(MAX_POWER_LEVEL_JSON))
+    }
+
+    fn get_kick(&self) -> Option<i64> {
+        coerce_serde_json_to_i64(self.get(rezzy::basespec::event_types::FIELD_KICK)?)
+            .map(|i| i.min(MAX_POWER_LEVEL_JSON))
+    }
+
+    fn get_invite(&self) -> Option<i64> {
+        coerce_serde_json_to_i64(self.get(rezzy::basespec::event_types::FIELD_INVITE)?)
+            .map(|i| i.min(MAX_POWER_LEVEL_JSON))
+    }
+
+    fn get_redact(&self) -> Option<i64> {
+        coerce_serde_json_to_i64(self.get(rezzy::basespec::event_types::FIELD_REDACT)?)
+    }
+
+    fn get_creator(&self) -> Option<&str> {
+        self.get(rezzy::basespec::event_types::FIELD_CREATOR)?
+            .as_str()
+    }
+
+    fn get_room_version(&self) -> Option<&str> {
+        self.get(rezzy::basespec::event_types::FIELD_ROOM_VERSION)?
+            .as_str()
+    }
+
+    fn has_malformed_room_version(&self) -> bool {
+        self.get(rezzy::basespec::event_types::FIELD_ROOM_VERSION)
+            .is_some_and(|v| v.as_str().is_none())
+    }
+
+    fn get_m_federate(&self) -> Option<bool> {
+        self.get("m.federate")?.as_bool()
+    }
+
+    fn get_redacts(&self) -> Option<&str> {
+        self.get(rezzy::basespec::event_types::FIELD_REDACTS)?
+            .as_str()
+    }
+
+    fn has_additional_creator(&self, sender: &str) -> bool {
+        self.get(rezzy::basespec::event_types::FIELD_ADDITIONAL_CREATORS)
+            .and_then(|v| v.as_array())
+            .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some(sender)))
+    }
+
+    fn additional_creators_are_valid(&self) -> bool {
+        match self.get(rezzy::basespec::event_types::FIELD_ADDITIONAL_CREATORS) {
+            None => true,
+            Some(v) => v.as_array().is_some_and(|arr| {
+                arr.iter()
+                    .all(|entry| entry.as_str().is_some_and(is_valid_resolver_mxid))
+            }),
+        }
+    }
+
+    fn get_join_authorised_via_users_server(&self) -> Option<&str> {
+        self.get(rezzy::basespec::event_types::FIELD_JOIN_AUTHORISED_VIA_USERS_SERVER)?
+            .as_str()
+    }
+
+    fn has_third_party_invite(&self) -> bool {
+        self.get(rezzy::basespec::event_types::FIELD_THIRD_PARTY_INVITE)
+            .is_some()
+    }
+
+    fn get_third_party_invite_token(&self) -> Option<&str> {
+        self.get(rezzy::basespec::event_types::FIELD_THIRD_PARTY_INVITE)?
+            .get(rezzy::basespec::event_types::FIELD_SIGNED)?
+            .get(rezzy::basespec::event_types::FIELD_TOKEN)?
+            .as_str()
+    }
+
+    fn get_third_party_invite_mxid(&self) -> Option<&str> {
+        self.get(rezzy::basespec::event_types::FIELD_THIRD_PARTY_INVITE)?
+            .get(rezzy::basespec::event_types::FIELD_SIGNED)?
+            .get(rezzy::basespec::event_types::FIELD_MXID)?
+            .as_str()
+    }
+
+    fn has_third_party_invite_signatures(&self) -> bool {
+        self.get(rezzy::basespec::event_types::FIELD_THIRD_PARTY_INVITE)
+            .and_then(|tpi| tpi.get(rezzy::basespec::event_types::FIELD_SIGNED))
+            .and_then(|signed| signed.get(rezzy::basespec::event_types::FIELD_SIGNATURES))
+            .and_then(|s| s.as_object())
+            .is_some_and(|m| !m.is_empty())
+    }
+
+    fn visit_event_power_levels<'a>(&'a self, visitor: &mut dyn FnMut(&'a str, i64)) {
+        if let Some(obj) = self
+            .get(rezzy::basespec::event_types::FIELD_EVENTS)
+            .and_then(|v| v.as_object())
+        {
+            for (k, v) in obj {
+                if let Some(pl) = coerce_serde_json_to_i64(v) {
+                    visitor(k.as_str(), pl.min(MAX_POWER_LEVEL_JSON));
+                }
+            }
+        }
+    }
+
+    fn visit_user_power_levels<'a>(&'a self, visitor: &mut dyn FnMut(&'a str, i64)) {
+        if let Some(obj) = self
+            .get(rezzy::basespec::event_types::FIELD_USERS)
+            .and_then(|v| v.as_object())
+        {
+            for (k, v) in obj {
+                if let Some(pl) = coerce_serde_json_to_i64(v) {
+                    visitor(k.as_str(), pl.min(MAX_POWER_LEVEL_JSON));
+                }
+            }
+        }
+    }
+
+    fn visit_notification_power_levels<'a>(&'a self, visitor: &mut dyn FnMut(&'a str, i64)) {
+        if let Some(obj) = self
+            .get(rezzy::basespec::event_types::FIELD_NOTIFICATIONS)
+            .and_then(|v| v.as_object())
+        {
+            for (k, v) in obj {
+                if let Some(pl) = coerce_serde_json_to_i64(v) {
+                    visitor(k.as_str(), pl.min(MAX_POWER_LEVEL_JSON));
+                }
+            }
+        }
+    }
+
+    fn find_non_integer_scalar_pl(&self) -> Option<&'static str> {
+        use rezzy::basespec::event_types::{
+            FIELD_BAN, FIELD_EVENTS_DEFAULT, FIELD_INVITE, FIELD_KICK, FIELD_REDACT,
+            FIELD_STATE_DEFAULT, FIELD_USERS_DEFAULT,
+        };
+        let scalars: &[(&str, &'static str)] = &[
+            (FIELD_USERS_DEFAULT, "users_default"),
+            (FIELD_EVENTS_DEFAULT, "events_default"),
+            (FIELD_STATE_DEFAULT, "state_default"),
+            (FIELD_BAN, "ban"),
+            (FIELD_REDACT, "redact"),
+            (FIELD_KICK, "kick"),
+            (FIELD_INVITE, "invite"),
+        ];
+        for &(field, label) in scalars {
+            if let Some(val) = self.get(field) {
+                // V10+ strict integer checking (forbids strings/floats)
+                if !val.is_i64() && !val.is_u64() {
+                    return Some(label);
+                }
+            }
+        }
+        None
+    }
+
+    fn find_non_integer_map_pl(&self) -> Option<&'static str> {
+        use rezzy::basespec::event_types::{FIELD_EVENTS, FIELD_NOTIFICATIONS};
+        let maps: &[(&str, &'static str)] = &[
+            (FIELD_EVENTS, "events"),
+            (FIELD_NOTIFICATIONS, "notifications"),
+        ];
+        for &(field, label) in maps {
+            if let Some(val) = self.get(field) {
+                let Some(obj) = val.as_object() else {
+                    return Some(label);
+                };
+
+                for v in obj.values() {
+                    // V10+ strict integer checking
+                    if !v.is_i64() && !v.is_u64() {
+                        return Some(label);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn has_non_integer_users_pl(&self, strict: bool) -> bool {
+        use rezzy::basespec::event_types::FIELD_USERS;
+        if let Some(val) = self.get(FIELD_USERS) {
+            if let Some(obj) = val.as_object() {
+                for v in obj.values() {
+                    if strict {
+                        // V10+ strict integer checking
+                        if !v.is_i64() && !v.is_u64() {
+                            return true;
+                        }
+                    } else if coerce_serde_json_to_i64(v).is_none() {
+                        // V1-V9 allows coercible strings
+                        return true;
+                    }
+                }
+            } else {
+                // `users` present but not an object
+                return true;
+            }
+        }
+        false
+    }
+
+    fn visit_user_keys<'a>(&'a self, visitor: &mut dyn FnMut(&'a str)) {
+        if let Some(obj) = self
+            .get(rezzy::basespec::event_types::FIELD_USERS)
+            .and_then(|v| v.as_object())
+        {
+            for k in obj.keys() {
+                visitor(k.as_str());
+            }
+        }
+    }
+
+    fn has_user_in_users(&self, user_id: &str) -> bool {
+        self.get(rezzy::basespec::event_types::FIELD_USERS)
+            .and_then(|v| v.as_object())
+            .is_some_and(|obj| obj.contains_key(user_id))
+    }
 }
-fn resolver_data_to_lean_event(data: EventResolverData) -> PyResult<LeanEvent<String, JsonValue>> {
+
+fn resolver_data_to_lean_event(
+    data: EventResolverData,
+) -> PyResult<LeanEvent<String, ResolverContent>> {
     // For MSC4242 (room version 2.2), events carry `prev_state_events` instead
     // of `auth_events`. rezzy's LeanEvent folds both into a single `auth_events`
     // field and exposes them via `prev_state_events()` returning `&self.auth_events`.
@@ -217,7 +452,7 @@ fn resolver_data_to_lean_event(data: EventResolverData) -> PyResult<LeanEvent<St
         power_level: 0,
         origin_server_ts: data.origin_server_ts,
         sender: data.sender,
-        content: to_rezzy_content(&data.content)?,
+        content: ResolverContent::SharedObject(data.content),
         prev_events: data.prev_events,
         auth_events,
         depth: data.depth,
@@ -227,7 +462,7 @@ fn resolver_data_to_lean_event(data: EventResolverData) -> PyResult<LeanEvent<St
     })
 }
 
-fn py_to_lean_event(py_ev: &Bound<'_, PyAny>) -> PyResult<LeanEvent<String, JsonValue>> {
+fn py_to_lean_event(py_ev: &Bound<'_, PyAny>) -> PyResult<LeanEvent<String, ResolverContent>> {
     let event_id: String = py_ev.getattr("event_id")?.extract()?;
     let room_id: String = py_ev.getattr("room_id")?.extract()?;
     let event_type: String = py_ev.getattr("type")?.extract()?;
@@ -276,7 +511,7 @@ fn py_to_lean_event(py_ev: &Bound<'_, PyAny>) -> PyResult<LeanEvent<String, Json
         power_level,
         origin_server_ts,
         sender,
-        content: to_rezzy_content_owned(content)?,
+        content: ResolverContent::SharedValue(Arc::new(content)),
         prev_events,
         auth_events,
         depth,
@@ -300,7 +535,7 @@ pub fn resolve_v2_via_lattice_fold<'py>(
 
 fn parse_event_map(
     event_map: Bound<'_, PyDict>,
-) -> PyResult<HashMap<String, LeanEvent<String, JsonValue>>> {
+) -> PyResult<HashMap<String, LeanEvent<String, ResolverContent>>> {
     let mut parsed_events = HashMap::with_capacity(event_map.len());
     for (k, v) in event_map.iter() {
         let event_id: String = k.extract()?;
@@ -318,7 +553,7 @@ fn resolve_v2_from_parsed_events<'py>(
     py: Python<'py>,
     unconflicted_state: Bound<'py, PyDict>,
     conflicted_event_ids: Bound<'py, PyAny>,
-    parsed_events: &HashMap<String, LeanEvent<String, JsonValue>>,
+    parsed_events: &HashMap<String, LeanEvent<String, ResolverContent>>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let mut unconf_state = SharedState::new();
     for (k, v) in unconflicted_state.iter() {
@@ -423,36 +658,21 @@ mod tests {
     }
 
     #[test]
-    fn content_conversion_preserves_resolver_number_semantics() {
-        for (source, expected) in [
-            ("-0", "0"), // serde_json normalizes integer-shaped negative zero to zero.
-            ("-0.0", "-0.0"),
-            ("9007199254740993", "9007199254740993"),
-            ("18446744073709551616", "18446744073709551616"),
-            ("1.25", "1.25"),
-        ] {
-            let value: Value = serde_json::from_str(source).expect("valid JSON number");
-            let actual = to_rezzy_content_owned(value).expect("number conversion");
-            let expected = JsonValue::parse(expected).expect("valid rezzy number");
-            assert_eq!(actual, expected, "source number {source}");
+    fn resolver_content_reads_both_retained_json_sources() {
+        let source = r#"{"membership":"join","users":{"@a:test":100},"events":{"m.room.name":50},"creator":"@a:test","additional_creators":["@b:test"]}"#;
+        let shared: JsonObject = serde_json::from_str(source).expect("valid event content");
+        let parsed: Value = serde_json::from_str(source).expect("valid event content");
+        let contents = [
+            ResolverContent::SharedObject(shared),
+            ResolverContent::SharedValue(Arc::new(parsed)),
+        ];
+        for content in contents {
+            assert_eq!(content.get_membership(), Some("join"));
+            assert_eq!(content.get_user_power_level("@a:test"), Some(100));
+            assert_eq!(content.get_event_power_level("m.room.name"), Some(50));
+            assert_eq!(content.get_creator(), Some("@a:test"));
+            assert!(content.has_additional_creator("@b:test"));
+            assert!(content.additional_creators_are_valid());
         }
-
-        let too_large: Value = serde_json::from_str("1e999").expect("arbitrary precision number");
-        assert!(to_rezzy_content_owned(too_large).is_err());
-    }
-
-    #[test]
-    fn content_conversion_handles_nested_objects_and_depth_limit() {
-        let source = r#"{"users":{"@a:test":100},"nested":[true,null,{"x":"y"}]}"#;
-        let content: JsonObject = serde_json::from_str(source).expect("valid event content");
-        let actual = to_rezzy_content(&content).expect("content conversion");
-        let expected = JsonValue::parse(source).expect("valid rezzy content");
-        assert_eq!(actual, expected);
-
-        let mut nested = Value::Null;
-        for _ in 0..=MAX_RESOLVER_JSON_DEPTH {
-            nested = Value::Array(vec![nested]);
-        }
-        assert!(to_rezzy_content_owned(nested).is_err());
     }
 }
