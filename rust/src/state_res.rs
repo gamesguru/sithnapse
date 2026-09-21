@@ -672,9 +672,14 @@ mod tests {
             "-50.5",
             "\"50\"",
             "\"not-a-number\"",
+            // Both sides of the 2^53 +- 1 boundary, plus u64 overflow.
+            "9007199254740991",
+            "9007199254740992",
             "9007199254740993",
-            "18446744073709551616",
+            "-9007199254740991",
             "-9007199254740992",
+            "-9007199254740993",
+            "18446744073709551616",
             "1.25",
         ] {
             let serde_value: Value = serde_json::from_str(source).expect("valid serde number");
