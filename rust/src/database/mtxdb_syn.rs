@@ -9,7 +9,7 @@ use once_cell::sync::OnceCell;
 use pyo3::prelude::*;
 use sha2::{Digest, Sha256};
 
-use crate::database::core::{NodeStore, ROOM_PREFIX_LEN};
+use crate::database::hamt_store::{NodeStore, ROOM_PREFIX_LEN};
 
 struct MtxdbPools {
     state: Arc<PackfileStorage>,
@@ -2368,13 +2368,13 @@ pub fn event_json_purge_room(py: Python<'_>, namespace: String, room_id: String)
 
 use rezzy::hamt::StructuralHash;
 
-use crate::database::core::{self, NodeCache, StateEntries};
+use crate::database::hamt_store::{self, NodeCache, StateEntries};
 use crate::state_hamt::room_structural_key_raw;
 
 static NODE_CACHE: OnceCell<NodeCache> = OnceCell::new();
 
 fn node_cache() -> &'static NodeCache {
-    NODE_CACHE.get_or_init(core::new_node_cache)
+    NODE_CACHE.get_or_init(hamt_store::new_node_cache)
 }
 
 #[pyfunction]
@@ -2402,7 +2402,7 @@ pub fn materialize_state_hamt(
             engine: Arc::clone(engine),
         };
 
-        core::materialize_state_hamt(
+        hamt_store::materialize_state_hamt(
             &store,
             node_cache(),
             &namespace,
@@ -2444,7 +2444,7 @@ pub fn materialize_state_hamts(
             engine: Arc::clone(engine),
         };
 
-        core::materialize_state_hamts(&store, node_cache(), &namespace, roots)
+        hamt_store::materialize_state_hamts(&store, node_cache(), &namespace, roots)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     })
 }
@@ -2482,7 +2482,7 @@ pub fn lookup_state_hamts(
             engine: Arc::clone(engine),
         };
 
-        core::lookup_state_hamts(&store, node_cache(), &namespace, parsed_queries)
+        hamt_store::lookup_state_hamts(&store, node_cache(), &namespace, parsed_queries)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     })
 }

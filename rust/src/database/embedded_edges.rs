@@ -20,7 +20,7 @@ use mtxdb_core::{NodeData, NodeId, StorageEngine};
 use pyo3::prelude::*;
 use sha2::{Digest, Sha256};
 
-use super::mtxdb::{
+use super::mtxdb_syn::{
     assert_writable, event_dag_db, event_dag_room_id, event_locator_collection_id, event_node_id,
     RMW_LOCK,
 };
@@ -521,7 +521,7 @@ mod tests {
 
     #[test]
     fn put_get_backward_and_forward_round_trip() {
-        crate::database::mtxdb::auth_chain_closure_tests::ensure_open();
+        crate::database::mtxdb_syn::auth_chain_closure_tests::ensure_open();
         let ns = "ns-edges-roundtrip";
         let room = "!room-edges:example.org";
 

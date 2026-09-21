@@ -1,9 +1,9 @@
 //! Generic HAMT node-store logic backing the embedded single-process KV
-//! engine ([`crate::database::mtxdb`]). The backend implements only
+//! engine ([`crate::database::mtxdb_syn`]). The backend implements only
 //! [`NodeStore`] (a thin point-lookup/write surface over its own storage
 //! primitive) and owns its own process-global handle + node cache; the BFS
 //! materialize/selective-lookup walk, the node-cache verify-on-hit logic,
-//! and the key-encoding scheme live here. Kept separate from `mtxdb.rs`
+//! and the key-encoding scheme live here. Kept separate from `mtxdb_syn.rs`
 //! (rather than folded together) to keep the BFS logic engine-agnostic.
 
 use std::collections::{HashMap, HashSet};
