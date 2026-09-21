@@ -1213,11 +1213,11 @@ class DatabasePool:
                         opentracing.log_kv({"message": "commit"})
                         conn.commit()
                         return r
-                except self.engine.module.OperationalError as e:
-                    # This can happen if the database disappears mid
-                    # transaction.
+                except (self.engine.module.OperationalError, BlockingIOError) as e:
+                    # A transient mtxdb journal/checkpoint race is surfaced as
+                    # BlockingIOError so this transaction attempt can be retried.
                     transaction_logger.warning(
-                        "[TXN OPERROR] {%s} %s %d/%d",
+                        "[TXN RETRYABLE ERROR] {%s} %s %d/%d",
                         name,
                         e,
                         attempt_number,

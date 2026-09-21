@@ -5,6 +5,7 @@ use std::sync::{
 };
 
 use mtxdb_core::journal::Journal;
+use mtxdb_core::storage::StorageError;
 use mtxdb_core::{DatabaseLayout, NodeData, NodeId, PackfileStorage, ShardType, StorageEngine};
 use once_cell::sync::OnceCell;
 use pyo3::prelude::*;
@@ -113,6 +114,42 @@ pub(crate) fn event_dag_db() -> PyResult<&'static Arc<PackfileStorage>> {
 
 fn auth_chain_db() -> PyResult<&'static Arc<PackfileStorage>> {
     Ok(&pools()?.auth_chain)
+}
+
+const RETRYABLE_READ_ERROR_PREFIX: &str = "__MTXDB_RETRYABLE_READ__: ";
+
+/// Preserve journal contention as a retryable Python I/O error. Other storage
+/// failures remain runtime errors so corruption is never retried as contention.
+fn map_read_storage_error(error: StorageError) -> PyErr {
+    let retryable = matches!(
+        &error,
+        StorageError::Io(io_error) if io_error.kind() == std::io::ErrorKind::WouldBlock
+    );
+    let message = format!("mtxdb get_read_committed error: {error}");
+    if retryable {
+        pyo3::exceptions::PyBlockingIOError::new_err(message)
+    } else {
+        pyo3::exceptions::PyRuntimeError::new_err(message)
+    }
+}
+
+/// The generic HAMT NodeStore API carries string errors. Prefix transient
+/// journal contention so its Python boundary can restore the retryable type.
+fn storage_error_to_hamt_string(error: StorageError) -> String {
+    match &error {
+        StorageError::Io(io_error) if io_error.kind() == std::io::ErrorKind::WouldBlock => {
+            format!("{RETRYABLE_READ_ERROR_PREFIX}{error}")
+        }
+        _ => error.to_string(),
+    }
+}
+
+fn map_hamt_read_error(error: String) -> PyErr {
+    if let Some(message) = error.strip_prefix(RETRYABLE_READ_ERROR_PREFIX) {
+        pyo3::exceptions::PyBlockingIOError::new_err(message.to_owned())
+    } else {
+        pyo3::exceptions::PyRuntimeError::new_err(error)
+    }
 }
 
 fn shard_type_for_key(key: &[u8]) -> ShardType {
@@ -291,12 +328,7 @@ pub fn get_state_hamt_roots_for_room(
         // opened is visible (same pattern as `auth_chain_edges_get`).
         let results = engine
             .get_read_committed(&room_id, &node_ids)
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "mtxdb get_read_committed error: {}",
-                    e
-                ))
-            })?;
+            .map_err(map_read_storage_error)?;
         Ok(results
             .into_iter()
             .map(|res| {
@@ -394,11 +426,7 @@ pub fn get_state_hamt_roots_bulk(
             // after this worker opened are resolved instead of reported absent.
             let response_records = engine
                 .get_read_committed(&room_id, &node_ids)
-                .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "mtxdb get_read_committed error: {e}"
-                    ))
-                })?;
+                .map_err(map_read_storage_error)?;
 
             for ((index, _), record) in room_groups.into_iter().zip(response_records) {
                 if let Some(record) = record.filter(|record| !record.bytes.is_empty()) {
@@ -954,7 +982,7 @@ impl NodeStore for MtxdbStore {
             let result = self
                 .engine
                 .get_read_committed(&room_id, &[node_id])
-                .map_err(|e| e.to_string())?
+                .map_err(storage_error_to_hamt_string)?
                 .into_iter()
                 .next()
                 .flatten();
@@ -973,7 +1001,7 @@ impl NodeStore for MtxdbStore {
             let result = self
                 .engine
                 .get_read_committed(&room_id, &[node_id])
-                .map_err(|e| e.to_string())?
+                .map_err(storage_error_to_hamt_string)?
                 .into_iter()
                 .next()
                 .flatten();
@@ -1487,12 +1515,7 @@ pub fn get_auth_chain_links_batch(
         // opened are visible (same pattern as `auth_chain_edges_get`).
         let results = engine
             .get_read_committed(&room_id, &node_ids)
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "mtxdb get_read_committed error: {}",
-                    e
-                ))
-            })?;
+            .map_err(map_read_storage_error)?;
 
         let mut out = Vec::with_capacity(node_ids.len());
         for (chain_id, res) in chain_ids.into_iter().zip(results) {
@@ -1794,12 +1817,7 @@ pub fn resolve_short_ids_to_event_ids(
         // opened are resolved instead of reported absent.
         let results = engine
             .get_read_committed(&collection, &node_ids)
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "mtxdb get_read_committed error: {}",
-                    e
-                ))
-            })?;
+            .map_err(map_read_storage_error)?;
         results
             .into_iter()
             .map(|opt| match opt {
@@ -1836,12 +1854,7 @@ pub fn auth_chain_edges_get(
             .collect();
         let results = engine
             .get_read_committed(&collection, &node_ids)
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "mtxdb get_read_committed error: {}",
-                    e
-                ))
-            })?;
+            .map_err(map_read_storage_error)?;
 
         results
             .into_iter()
@@ -1910,12 +1923,7 @@ pub fn auth_chain_children_get(
         // this worker opened are visible (see `auth_chain_edges_get`).
         let results = engine
             .get_read_committed(&collection, &node_ids)
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "mtxdb get_read_committed error: {}",
-                    e
-                ))
-            })?;
+            .map_err(map_read_storage_error)?;
         results
             .into_iter()
             .map(|opt| match opt {
@@ -2071,11 +2079,7 @@ pub fn batch_get(py: Python<'_>, keys: Vec<Vec<u8>>) -> PyResult<Vec<(Vec<u8>, V
             // collection (see mtxdb-core's `get_read_committed`).
             let found = engine
                 .get_read_committed(&room_id, &node_ids)
-                .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "mtxdb get_read_committed error: {e}"
-                    ))
-                })?;
+                .map_err(map_read_storage_error)?;
             for ((position, _), value) in ids.into_iter().zip(found) {
                 values[position] = value;
             }
@@ -2357,11 +2361,7 @@ pub fn event_json_get(
             // resolve instead of reporting the event absent.
             let found = engine
                 .get_read_committed(&collection, &node_ids_only)
-                .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "mtxdb get_read_committed error: {e}"
-                    ))
-                })?;
+                .map_err(map_read_storage_error)?;
             for ((position, _), value) in ids.into_iter().zip(found) {
                 if let Some(data) = value {
                     if !data.bytes.is_empty() {
@@ -2402,11 +2402,7 @@ pub fn event_json_get(
             // after this worker opened are visible to the read.
             let found = engine
                 .get_read_committed(&collection, &node_ids_only)
-                .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "mtxdb get_read_committed error: {e}"
-                    ))
-                })?;
+                .map_err(map_read_storage_error)?;
             for ((position, kind, _), value) in ids.into_iter().zip(found) {
                 if let Some(data) = value {
                     if !data.bytes.is_empty() {
@@ -2577,7 +2573,7 @@ pub fn materialize_state_hamt(
             &structural_key,
         )
         .map(Some)
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        .map_err(map_hamt_read_error)
     })
 }
 
@@ -2611,7 +2607,7 @@ pub fn materialize_state_hamts(
         };
 
         hamt_store::materialize_state_hamts(&store, node_cache(), &namespace, roots)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+            .map_err(map_hamt_read_error)
     })
 }
 
@@ -2649,7 +2645,7 @@ pub fn lookup_state_hamts(
         };
 
         hamt_store::lookup_state_hamts(&store, node_cache(), &namespace, parsed_queries)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+            .map_err(map_hamt_read_error)
     })
 }
 
@@ -2743,12 +2739,7 @@ pub fn get_state_hamt_nodes_batch(
         // worker opened are visible to the read.
         let results = engine
             .get_read_committed(&room_id, &node_ids)
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "mtxdb get_read_committed error: {}",
-                    e
-                ))
-            })?;
+            .map_err(map_read_storage_error)?;
         Ok(results
             .into_iter()
             .map(|opt| opt.map(|d| d.bytes.to_vec()))
