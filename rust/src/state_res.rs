@@ -106,11 +106,10 @@ pub fn get_auth_chain_difference_from_event_graph<'py>(
 const MAX_RESOLVER_JSON_DEPTH: usize = 128;
 
 fn convert_number(number: &serde_json::Number) -> PyResult<JsonValue> {
-    // Preserve negative zero, including serde_json's integer-shaped -0.
-    if ((number.as_i64() == Some(0) || number.as_u64() == Some(0)) && number.to_string() == "-0")
-        || number
-            .as_f64()
-            .is_some_and(|value| value == 0.0 && value.is_sign_negative())
+    // Preserve floating negative zero before other numeric accessors normalize it.
+    if number
+        .as_f64()
+        .is_some_and(|value| value == 0.0 && value.is_sign_negative())
     {
         Ok(JsonValue::from(-0.0))
     } else if let Some(value) = number.as_i64() {
