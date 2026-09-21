@@ -2661,6 +2661,10 @@ fn stats_to_dict(
     d.set_item("miss_refresh_skips", s.miss_refresh_skips)?;
     d.set_item("miss_refresh_recovered", s.miss_refresh_recovered)?;
     d.set_item("miss_refresh_retry_ids", s.miss_refresh_retry_ids)?;
+    d.set_item("index_candidates", s.index_candidates)?;
+    d.set_item("candidate_reads", s.candidate_reads)?;
+    d.set_item("candidate_hash_mismatches", s.candidate_hash_mismatches)?;
+    d.set_item("candidate_frame_bytes", s.candidate_frame_bytes)?;
     d.set_item("put_calls", s.put_calls)?;
     d.set_item("put_bytes", s.put_bytes)?;
     d.set_item("put_many_calls", s.put_many_calls)?;

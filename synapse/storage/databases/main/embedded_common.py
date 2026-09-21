@@ -557,6 +557,34 @@ def _print_mtxdb_stats() -> None:
                 file=out,
             )
 
+        # Lossy-index candidate fan-out. The 16-bit slot tag is only a
+        # candidate filter: a tag match can admit a record that full-hash
+        # verification then rejects. A nonzero false_rate is extra packfile
+        # read work, never a wrong result. Tracked only while stats are on.
+        cr = ps.get("candidate_reads", 0)
+        if cr:
+            cm = ps.get("candidate_hash_mismatches", 0)
+            false_rate = cm / cr
+            print(
+                f"    candidates: index={ps.get('index_candidates', 0):,}  reads={cr:,}  "
+                f"hash_mismatches={cm:,}  false_rate={false_rate:.3f}  "
+                f"frame_bytes={ps.get('candidate_frame_bytes', 0):,}",
+                file=out,
+            )
+
+        # Read-miss refresh attribution, captured alongside the candidate
+        # counters above so one snapshot can tell them apart: recovered > 0
+        # means the tail is paying full rescans, not 16-bit tag collisions.
+        mr = ps.get("miss_refreshes", 0)
+        mrs = ps.get("miss_refresh_skips", 0)
+        mrr = ps.get("miss_refresh_recovered", 0)
+        if mr or mrs or mrr:
+            print(
+                f"    refreshes: rescans={mr:,}  skips={mrs:,}  recovered={mrr:,}  "
+                f"retry_ids={ps.get('miss_refresh_retry_ids', 0):,}",
+                file=out,
+            )
+
         # Write / batch counters.
         pc = ps.get("put_calls", 0)
         pmc = ps.get("put_many_calls", 0)
