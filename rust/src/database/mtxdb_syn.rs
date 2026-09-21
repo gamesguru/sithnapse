@@ -1172,17 +1172,22 @@ fn decode_auth_edges(bytes: &[u8]) -> PyResult<Vec<u32>> {
 
 /// Whether the write-ahead journal is enabled for writable opens.
 ///
-/// On by default; `SYNAPSE_MTXDB_NO_WAL` set to a truthy value reverts to the
-/// historical behavior where packfile shard fsyncs are the sync point. Falsey
-/// values (0/false/no/off/empty) keep the journal on, matching the trial and
-/// Complement env semantics for `SYNAPSE_MTXDB_NO_SYNC`.
+/// Off by default: the historical packfile-shard fsync remains the sync point,
+/// which is the invariant multi-process read-only workers depend on. Read-only
+/// workers only scan packfiles, so WAL-committed-but-unflushed writes are
+/// invisible to them; enabling the journal before mtxdb-core grows a read-only
+/// journal-apply path would make those readers silently miss recent writes.
+///
+/// `SYNAPSE_MTXDB_NO_WAL` set to a falsey value (0/false/no/off/empty) opts in
+/// to the journal for controlled testing; a truthy value (or unset) leaves it
+/// off. The falsey/truthy parsing matches `SYNAPSE_MTXDB_NO_SYNC`.
 fn wal_enabled() -> bool {
     match std::env::var("SYNAPSE_MTXDB_NO_WAL") {
         Ok(value) => matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "" | "0" | "false" | "no" | "off"
         ),
-        Err(_) => true,
+        Err(_) => false,
     }
 }
 
@@ -1233,11 +1238,9 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
         for store in [&state, &event_dag, &auth_chain] {
             store.set_refresh_on_miss(false);
         }
-        // Durability routes through the write-ahead journal by default: each
-        // pool's `sync` becomes one sequential WAL fsync, and the packfiles
-        // plus index checkpoint fall back to acceleration-only, replayed from
-        // the journal on reopen. Opt out (historical packfile-as-sync-point)
-        // with a truthy SYNAPSE_MTXDB_NO_WAL, mirroring SYNAPSE_MTXDB_NO_SYNC.
+        // The journal remains opt-in until read-only workers can observe
+        // committed journal entries before packfile materialization. Set
+        // SYNAPSE_MTXDB_NO_WAL=0 to enable it for controlled testing.
         // See mtxdb-core's `PackfileStorage::enable_journal`.
         if wal_enabled() {
             for (store, dir) in [
