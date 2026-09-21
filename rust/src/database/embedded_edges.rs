@@ -203,15 +203,55 @@ pub fn event_edges_put(
             insert_event_locator(&mut locator_puts, &namespace, &room_id, &event_id);
         }
 
+        // Batch-read the existing forward child lists for every distinct
+        // (room, parent) this batch touches, instead of one `get` per parent.
+        // `get_many` groups by shard and orders by offset, so a persist batch
+        // touching many parents costs one round trip per room collection.
+        let mut forward_by_collection: HashMap<[u8; 16], Vec<NodeId>> = HashMap::new();
+        for (room_id, prev_event_id) in forward_map.keys() {
+            let room_collection = event_dag_room_id(&namespace, room_id);
+            let forward_node = event_edges_forward_node_id(&namespace, prev_event_id);
+            forward_by_collection
+                .entry(room_collection)
+                .or_default()
+                .push(forward_node);
+        }
+        let mut forward_cache: HashMap<([u8; 16], NodeId), Vec<String>> = HashMap::new();
+        for (collection, node_ids) in forward_by_collection.iter_mut() {
+            // Distinct nodes only: two logical (room, parent) keys can in
+            // principle derive the same collection/node pair, and this makes
+            // "one read per distinct node" true.
+            node_ids.sort_unstable();
+            node_ids.dedup();
+            let found = engine.get_many(collection, node_ids).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {e}"))
+            })?;
+            for (forward_node, value) in node_ids.iter().zip(found) {
+                let children = match value {
+                    Some(data) if !data.bytes.is_empty() => decode_forward_edges(&data.bytes)?,
+                    _ => Vec::new(),
+                };
+                forward_cache.insert((*collection, *forward_node), children);
+            }
+        }
+
         for ((room_id, prev_event_id), new_children) in forward_map {
             let room_collection = event_dag_room_id(&namespace, &room_id);
             let forward_node = event_edges_forward_node_id(&namespace, &prev_event_id);
 
-            // Read existing children if any
-            let mut existing_children = match engine.get(&room_collection, &forward_node) {
-                Ok(Some(data)) if !data.bytes.is_empty() => decode_forward_edges(&data.bytes)?,
-                _ => Vec::new(),
-            };
+            // Every (room, parent) key was read above, so the cached list can
+            // be moved out rather than cloned. A miss means two logical keys
+            // derived the same collection/node pair (a node-id collision) or
+            // the cache was built inconsistently; fail loudly rather than
+            // write an empty list over existing children. Nothing has been
+            // written yet, so a failure here leaves the store untouched.
+            let mut existing_children = forward_cache
+                .remove(&(room_collection, forward_node))
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyRuntimeError::new_err(
+                        "forward-edge node id collision while batching parent reads",
+                    )
+                })?;
 
             let mut seen: HashSet<String> = existing_children.iter().cloned().collect();
             let mut changed = false;
