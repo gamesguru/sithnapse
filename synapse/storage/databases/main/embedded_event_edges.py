@@ -383,9 +383,38 @@ def delete_event_edges_batch(
                 from synapse.synapse_rust.mtxdb_engine import event_edges_delete
 
                 _et = time.monotonic()
-                event_edges_delete(namespace, event_ids)
+                phase_timings = event_edges_delete(namespace, event_ids)
                 elapsed = time.monotonic() - _et
                 ffi_timing("ffi_event_edges_delete", elapsed)
+                ffi_timing(
+                    "ffi_event_edges_delete_lock_wait", phase_timings["lock_wait"]
+                )
+                ffi_timing(
+                    "ffi_event_edges_delete_locator_read",
+                    phase_timings["locator_read"],
+                )
+                ffi_timing(
+                    "ffi_event_edges_delete_backward_read",
+                    phase_timings["backward_read"],
+                )
+                ffi_timing(
+                    "ffi_event_edges_delete_forward_read",
+                    phase_timings["forward_read"],
+                )
+                ffi_timing(
+                    "ffi_event_edges_delete_mutate_write",
+                    phase_timings["mutate_write"],
+                )
+                # The Rust dict is typed float | int; the counts are integers.
+                forward_count = int(phase_timings["forward_nodes"])
+                room_count = int(phase_timings["rooms"])
+                ffi_count("event_edges_delete_forward_nodes", forward_count)
+                ffi_count("event_edges_delete_rooms", room_count)
+                # Per-call batch shape, so a slow delete can be matched to the
+                # event/parent/room counts that produced it.
+                ffi_batch_size("event_edges_delete_events", len(event_ids))
+                ffi_batch_size("event_edges_delete_forward_nodes", forward_count)
+                ffi_batch_size("event_edges_delete_rooms", room_count)
                 ffi_count("event_edges_deleted", len(event_ids))
         except Exception:
             with lock_wait_timing(_edge_write_queues_lock, "edge_queues"):

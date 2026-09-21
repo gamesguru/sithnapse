@@ -61,7 +61,7 @@ def event_edges_get_forward(
 def event_edges_delete(
     namespace: str,
     event_ids: list[str],
-) -> None: ...
+) -> dict[str, float | int]: ...
 def materialize_state_hamt(
     namespace: str,
     room_prefix: bytes,

@@ -18,6 +18,7 @@ use std::collections::{HashMap, HashSet};
 
 use mtxdb_core::{NodeData, NodeId, StorageEngine};
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use sha2::{Digest, Sha256};
 
 use super::mtxdb_syn::{
@@ -441,11 +442,28 @@ pub fn event_edges_delete(
     py: Python<'_>,
     namespace: String,
     event_ids: Vec<String>,
-) -> PyResult<()> {
+) -> PyResult<Py<PyDict>> {
     assert_writable()?;
-    let _guard = RMW_LOCK.lock().unwrap();
-    py.detach(|| {
+    // Phase timings returned as a named dict (not a positional tuple) so the
+    // Python diagnostics layer can't silently misread a field if one is added
+    // or reordered. See `embedded_event_edges.delete_event_edges_batch`.
+    let (
+        lock_wait,
+        locator_read,
+        backward_read,
+        forward_read,
+        mutate_write,
+        forward_count,
+        room_count,
+    ) = py.detach(|| -> PyResult<(f64, f64, f64, f64, f64, usize, usize)> {
+        // Keep lock acquisition outside the GIL, otherwise a purge waiting
+        // behind another read/modify/write operation stalls unrelated Python
+        // work as well. The caller consumes the returned phase timings.
+        let lock_started = std::time::Instant::now();
+        let _guard = RMW_LOCK.lock().unwrap();
+        let lock_wait = lock_started.elapsed().as_secs_f64();
         let engine = event_dag_db()?;
+        let locator_started = std::time::Instant::now();
         let node_ids: Vec<NodeId> = event_ids
             .iter()
             .map(|id| event_node_id(&namespace, id))
@@ -475,6 +493,7 @@ pub fn event_edges_delete(
                 }
             }
         }
+        let locator_read = locator_started.elapsed().as_secs_f64();
 
         let mut dag_updates: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
 
@@ -490,6 +509,7 @@ pub fn event_edges_delete(
             }
         }
 
+        let backward_started = std::time::Instant::now();
         let mut backward_preds: Vec<Option<Vec<(String, bool)>>> = vec![None; event_ids.len()];
         for (collection, ids) in &backward_ids {
             let node_ids_only: Vec<NodeId> = ids.iter().map(|(_, id)| *id).collect();
@@ -504,6 +524,7 @@ pub fn event_edges_delete(
                 }
             }
         }
+        let backward_read = backward_started.elapsed().as_secs_f64();
 
         // 2. Collect the distinct (room, parent) forward nodes touched by
         // those backward edges and batch-read them in one pass per room
@@ -531,6 +552,7 @@ pub fn event_edges_delete(
                 .push(*forward_node);
         }
 
+        let forward_started = std::time::Instant::now();
         let mut forward_cache: HashMap<([u8; 16], NodeId), Vec<String>> = HashMap::new();
         for (collection, node_ids_only) in &forward_by_collection {
             let found = engine.get_many(collection, node_ids_only).map_err(|e| {
@@ -544,7 +566,9 @@ pub fn event_edges_delete(
                 forward_cache.insert((*collection, *forward_node), children);
             }
         }
+        let forward_read = forward_started.elapsed().as_secs_f64();
 
+        let mutate_started = std::time::Instant::now();
         // 3. Remove the purged events from their parents' cached forward lists.
         for ((room_collection, forward_node), positions) in &forward_positions {
             if let Some(children) = forward_cache.get_mut(&(*room_collection, *forward_node)) {
@@ -567,6 +591,13 @@ pub fn event_edges_delete(
         }
 
         // 5. Write updated or tombstoned forward edges.
+        let forward_count = forward_cache.len();
+        // Distinct room collections this purge resolved a locator into. Built
+        // from every resolved event before any backward-edge hit/miss, so it
+        // means "rooms touched", not "rooms with a stored backward edge". The
+        // batch shape is what separates a genuinely large purge from lock
+        // contention.
+        let room_count = backward_ids.len();
         for ((room_col, forward_node), children) in forward_cache {
             let data = if children.is_empty() {
                 NodeData::new(bytes::Bytes::new())
@@ -585,8 +616,25 @@ pub fn event_edges_delete(
             })?;
         }
 
-        Ok(())
-    })
+        Ok((
+            lock_wait,
+            locator_read,
+            backward_read,
+            forward_read,
+            mutate_started.elapsed().as_secs_f64(),
+            forward_count,
+            room_count,
+        ))
+    })?;
+    let timings = PyDict::new(py);
+    timings.set_item("lock_wait", lock_wait)?;
+    timings.set_item("locator_read", locator_read)?;
+    timings.set_item("backward_read", backward_read)?;
+    timings.set_item("forward_read", forward_read)?;
+    timings.set_item("mutate_write", mutate_write)?;
+    timings.set_item("forward_nodes", forward_count)?;
+    timings.set_item("rooms", room_count)?;
+    Ok(timings.unbind())
 }
 
 pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
