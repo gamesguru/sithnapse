@@ -921,7 +921,7 @@ dependencies = [
 [[package]]
 name = "mtxdb"
 version = "0.1.0-beta.1"
-source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=dev#4a267da8bc06877166f9fb3b663359852cfda7d4"
+source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=dev#d3662a18b02f2acc0354b9cb510308bbc08fe540"
 dependencies = [
  "mtxdb-core",
 ]
@@ -929,7 +929,7 @@ dependencies = [
 [[package]]
 name = "mtxdb-core"
 version = "0.1.0-beta.1"
-source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=dev#4a267da8bc06877166f9fb3b663359852cfda7d4"
+source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=dev#d3662a18b02f2acc0354b9cb510308bbc08fe540"
 dependencies = [
  "arc-swap",
  "bytes",
