@@ -17,7 +17,7 @@ import shutil
 import tempfile
 import threading
 from typing import Any
-from unittest import mock
+from unittest import mock, skipUnless
 
 from twisted.test.proto_helpers import MemoryReactor
 
@@ -654,6 +654,7 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         successors = self.get_success(self.store.get_successor_events(e1_id))
         self.assertIn(e2_id, successors)
 
+    @skipUnless(EMBEDDED_HAMT_ENGINE, "requires embedded HAMT engine")
     def test_below_threshold_queue_flushes_on_timer(self) -> None:
         """A sub-threshold edge write is drained by the flush coalescer's
         bounded debounce timer -- no explicit flush, threshold, or shutdown
@@ -808,6 +809,7 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         successors = self.get_success(self.store.get_successor_events(e1_id))
         self.assertIn(e2_id, successors)
 
+    @skipUnless(EMBEDDED_HAMT_ENGINE, "requires embedded HAMT engine")
     def test_sql_fallback_and_repair_on_missing_mtxdb_edges(self) -> None:
         """SQL fallback returns edges missing from mtxdb and repairs the local store.
 
@@ -877,6 +879,7 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
                 "expected no SQL fallback for the read-only query after repair",
             )
 
+    @skipUnless(EMBEDDED_HAMT_ENGINE, "requires embedded HAMT engine")
     def test_sql_fallback_repairs_preserved_row2_edge_despite_purge(self) -> None:
         """SQL keeps the live-child → purged-parent `event_edges` row (a
         backward extremity).  Even after a genuine purge tombstoned the parent,
