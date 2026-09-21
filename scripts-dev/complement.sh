@@ -502,12 +502,22 @@ main() {
     *) export PASS_SYNAPSE_MTXDB_NO_SYNC=1 ;;
   esac
 
-  # The write-ahead journal is opt-in. Its read-committed overlay can only help
-  # once the writer publishes committed mutations at the transaction boundary,
-  # which is not wired yet, so the default stays on the packfile-only sync path.
-  # This forwards an explicit opt-in for controlled A/B captures against the
-  # journal lane. Same truthy/falsey semantics as above, positive (opt-in).
-  case "${SYNAPSE_TEST_MTXDB_WAL:-}" in
+  # The embedded engine requires the write-ahead journal (see the
+  # embedded_hamt_engine validation in synapse/config/database.py): with no
+  # SQL fallback for the data it owns, a write that hasn't reached the flush
+  # coalescer's periodic sync is both unrecoverable on crash and invisible to
+  # other readers -- the WAL's read-committed overlay is the only read path
+  # that closes both, independent of whether an index checkpoint rewrite is
+  # deferred. So default WAL on whenever the engine is on; there is no
+  # supported WAL-off shape left to A/B against. SYNAPSE_TEST_MTXDB_WAL can
+  # still force it off, which now only serves to exercise that startup
+  # validation itself (the container will refuse to start). Same
+  # truthy/falsey semantics as above.
+  _default_mtxdb_wal=""
+  if [[ -n "$SYNAPSE_EMBEDDED_HAMT_ENGINE" ]]; then
+    _default_mtxdb_wal=1
+  fi
+  case "${SYNAPSE_TEST_MTXDB_WAL:-$_default_mtxdb_wal}" in
     "" | 0 | false | False | no | No | off | Off) ;;
     *) export PASS_SYNAPSE_MTXDB_WAL=1 ;;
   esac
