@@ -845,8 +845,32 @@ class EventsBackgroundUpdatesStore(
                 """,
                 (batch_size,),
             )
+            rows = txn.fetchall()
 
-            for prev_event_id, event_id, metadata, rejected, outlier in txn:
+            # The initial query's `event_json` join is SQL-only, but the
+            # embedded event-JSON backend (when enabled) is the read-path
+            # authority and leaves no SQL row. Pull the missing
+            # `internal_metadata` from it so soft-failed extremities are
+            # classified correctly -- same fallback the recursive query below
+            # already applies.
+            missing_meta_ids = [
+                event_id
+                for _, event_id, metadata, _, _ in rows
+                if event_id and metadata is None
+            ]
+            meta_by_id = {}
+            if missing_meta_ids and getattr(
+                self, "_embedded_event_json_enabled", False
+            ):
+                found = get_event_json_batch(
+                    self._embedded_hamt_engine,
+                    self._embedded_hamt_namespace,
+                    missing_meta_ids,
+                )
+                for eid, (m, _, _) in found.items():
+                    meta_by_id[eid] = m
+
+            for prev_event_id, event_id, metadata, rejected, outlier in rows:
                 original_set.add(prev_event_id)
 
                 if not event_id or outlier:
@@ -856,9 +880,11 @@ class EventsBackgroundUpdatesStore(
 
                 graph.setdefault(event_id, set()).add(prev_event_id)
 
-                soft_failed = False
-                if metadata:
-                    soft_failed = db_to_json(metadata).get("soft_failed")
+                if metadata is None:
+                    metadata = meta_by_id.get(event_id)
+                soft_failed = (
+                    db_to_json(metadata).get("soft_failed") if metadata else False
+                )
 
                 if soft_failed or rejected:
                     soft_failed_events_to_lookup.add(event_id)
@@ -1075,8 +1101,29 @@ class EventsBackgroundUpdatesStore(
             if not rows:
                 return 0
 
+            # The join is SQL-only; under the embedded event-JSON backend the
+            # `internal_metadata` lives solely in mtxdb, so pull the missing
+            # rows from the mirror before deciding `recheck` -- otherwise every
+            # row looks like metadata-free and gets forced to false.
+            missing_meta_ids = [
+                event_id for event_id, metadata in rows if metadata is None
+            ]
+            meta_by_id = {}
+            if missing_meta_ids and getattr(
+                self, "_embedded_event_json_enabled", False
+            ):
+                found = get_event_json_batch(
+                    self._embedded_hamt_engine,
+                    self._embedded_hamt_namespace,
+                    missing_meta_ids,
+                )
+                for eid, (m, _, _) in found.items():
+                    meta_by_id[eid] = m
+
             updates = []
             for event_id, internal_metadata_json in rows:
+                if internal_metadata_json is None:
+                    internal_metadata_json = meta_by_id.get(event_id)
                 if internal_metadata_json is not None:
                     internal_metadata = db_to_json(internal_metadata_json)
                     recheck = bool(internal_metadata.get("recheck_redaction", False))

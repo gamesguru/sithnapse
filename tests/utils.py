@@ -40,6 +40,7 @@ from synapse.config.homeserver import HomeServerConfig
 from synapse.config.server import DEFAULT_ROOM_VERSION
 from synapse.server import HomeServer
 from synapse.storage.database import LoggingDatabaseConnection
+from synapse.storage.databases.main import embedded_common
 from synapse.storage.engines import create_engine
 from synapse.storage.prepare_database import prepare_database
 
@@ -507,6 +508,13 @@ def default_config(
             "path": EMBEDDED_HAMT_PATH,
             "namespace": f"trial-{os.getpid()}-{uuid.uuid4().hex}",
             "no_sync": EMBEDDED_HAMT_NO_SYNC,
+            # Tests rely on FLUSH_DELAY_SECS to know exactly how far to
+            # advance the reactor to drain the coalescer. Pin the runtime
+            # value to match it explicitly rather than letting production's
+            # rotational-disk auto-tuning (synapse.config.database) pick a
+            # different delay when SYNAPSE_TEST_EMBEDDED_HAMT_PATH happens to
+            # sit on a physical HDD.
+            "flush_delay_secs": embedded_common.FLUSH_DELAY_SECS,
         }
 
     if parse:

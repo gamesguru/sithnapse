@@ -610,6 +610,13 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
 
     def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
         self.store = hs.get_datastores().main
+        # The coalescer window is auto-tuned to the store's backing disk
+        # (2.0s when rotational) unless the config pinned it, so advance the
+        # reactor by what this homeserver actually got instead of assuming
+        # the module constant matches the runtime value.
+        self._flush_delay_secs = (
+            hs.config.database.embedded_hamt_flush_delay_secs or FLUSH_DELAY_SECS
+        )
         self.user_id = self.register_user("alice", "test")
         self.tok = self.login("alice", "test")
         self.room_id = self.helper.create_room_as(
@@ -629,6 +636,10 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
             self.persist_store._embedded_hamt_engine = "mtxdb"
             if not getattr(self.persist_store, "_embedded_hamt_namespace", None):
                 self.persist_store._embedded_hamt_namespace = hs.hostname
+
+    def _advance_past_flush_window(self) -> None:
+        """Advance the reactor past the coalescer's actual debounce window."""
+        self.reactor.advance(self._flush_delay_secs + 0.1)
 
     def test_event_edges_mirrored_on_persistence(self) -> None:
         """When events are persisted, event_edges are dual-written to mtxdb."""
@@ -683,7 +694,7 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
 
                 # Advance the reactor past the flush window: the coalescer
                 # drains the queue and syncs EVENT_DAG of its own accord.
-                self.reactor.advance(FLUSH_DELAY_SECS + 0.1)
+                self._advance_past_flush_window()
                 self.assertEqual(
                     queued_edge_write_count(ns),
                     0,
@@ -851,7 +862,7 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         # the queued repair (and syncs EVENT_DAG).  Use FLUSH_DELAY_SECS plus
         # a small margin so the test is not fragile to floating-point
         # boundaries or minor changes to the delay value.
-        self.reactor.advance(FLUSH_DELAY_SECS + 0.1)
+        self._advance_past_flush_window()
 
         # Now mtxdb has been repaired in-process.
         fwd_repaired = get_event_edges_forward_batch(ns, [p_id])
@@ -909,7 +920,7 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         successors = self.get_success(self.store.get_successor_events(p_id))
         self.assertIn(c_id, successors)
 
-        self.reactor.advance(FLUSH_DELAY_SECS + 0.1)
+        self._advance_past_flush_window()
 
         # The preserved row[2] edge is repaired in mtxdb despite the tombstone.
         fwd_repaired = get_event_edges_forward_batch(ns, [p_id])
