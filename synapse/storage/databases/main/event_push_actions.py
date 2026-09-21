@@ -1336,7 +1336,7 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
                 continue
 
             middle_ts = row[0]
-            if ts > middle_ts:
+            if middle_ts is None or ts > middle_ts:
                 # we got a timestamp lower than the one we were looking for.
                 # definitely need to look higher: X > middle.
                 range_start = middle + 1

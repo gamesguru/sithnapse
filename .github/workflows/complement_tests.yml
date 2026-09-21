@@ -40,19 +40,19 @@ jobs:
             database: SQLite
 
           - arrangement: hybrid
-            database: SQLite (hybrid, mdbx)
+            database: SQLite (hybrid, mtxdb)
 
           - arrangement: monolith
             database: Postgres
 
           - arrangement: hybrid
-            database: Postgres (hybrid, mdbx)
+            database: Postgres (hybrid, mtxdb)
 
           - arrangement: workers
             database: Postgres
 
           - arrangement: workers
-            database: Postgres (hybrid, mdbx)
+            database: Postgres (hybrid, mtxdb)
 
     steps:
       - name: Checkout synapse codebase
@@ -98,35 +98,6 @@ jobs:
           uv lock
         working-directory: synapse
 
-      # Run the image sanity check test first as this is the first thing we want to know
-      # about (are we actually testing what we expect?) and we don't want to debug
-      # downstream failures (wild goose chase).
-      - name: Sanity check Complement image
-        id: run_sanity_check_complement_image_test
-        # -p=1: We're using `-p 1` to force the test packages to run serially as GHA boxes
-        #     are underpowered and don't like running tons of Synapse instances at once.
-        # `complement.sh` writes the full `go test -json` stream to RESULTS_DIR
-        # and emits compact PASS/FAIL/SKIP progress as each test completes.
-        # Keep those streams separate: the previous outer `tee` mixed human
-        # progress lines into the JSON log, then made gotestfmt panic on them.
-        run: |
-          COMPLEMENT_DIR=`pwd`/complement synapse/scripts-dev/complement.sh --in-repo -p 1 -run 'TestSynapseVersion/Synapse_version_matches_current_git_checkout'
-        shell: bash
-        env:
-          POSTGRES: ${{ (startsWith(matrix.database, 'Postgres')) && 1 || '' }}
-          WORKERS: ${{ (matrix.arrangement == 'workers') && 1 || '' }}
-          SYNAPSE_EMBEDDED_HAMT_ENGINE: ${{ (contains(matrix.database, 'mdbx')) && 'mdbx' || '' }}
-          SYNAPSE_EMBEDDED_HAMT_PATH: ${{ (contains(matrix.database, 'mdbx')) && '/data/embedded_hamt' || '' }}
-          RESULTS_DIR: tests/complement/sanity
-
-      - name: Formatted sanity-check Complement log
-        if: always() && steps.run_sanity_check_complement_image_test.outcome != 'skipped'
-        continue-on-error: true
-        # The runner's JSONL is written continuously while tests run. Filter
-        # defensively anyway: a formatter must never make noisy output mask a
-        # real test result.
-        run: jq -Rrc 'fromjson? // empty' synapse/tests/complement/sanity/logs.jsonl | gotestfmt -hide "successful-downloads,empty-packages"
-
       - name: Run Complement Tests
         id: run_complement_tests
         # -p=1: We're using `-p 1` to force the test packages to run serially as GHA boxes
@@ -137,8 +108,8 @@ jobs:
         env:
           POSTGRES: ${{ (startsWith(matrix.database, 'Postgres')) && 1 || '' }}
           WORKERS: ${{ (matrix.arrangement == 'workers') && 1 || '' }}
-          SYNAPSE_EMBEDDED_HAMT_ENGINE: ${{ (contains(matrix.database, 'mdbx')) && 'mdbx' || '' }}
-          SYNAPSE_EMBEDDED_HAMT_PATH: ${{ (contains(matrix.database, 'mdbx')) && '/data/embedded_hamt' || '' }}
+          SYNAPSE_EMBEDDED_HAMT_ENGINE: ${{ (contains(matrix.database, 'mtxdb')) && 'mtxdb' || '' }}
+          SYNAPSE_EMBEDDED_HAMT_PATH: ${{ (contains(matrix.database, 'mtxdb')) && '/data/embedded_hamt' || '' }}
           TEST_ONLY_IGNORE_POETRY_LOCKFILE: ${{ inputs.use_latest_deps && 1 || '' }}
           TEST_ONLY_SKIP_DEP_HASH_VERIFICATION: ${{ inputs.use_twisted_trunk  && 1 || '' }}
           RESULTS_DIR: tests/complement/main
@@ -152,14 +123,16 @@ jobs:
         id: run_in_repo_complement_tests
         # -p=1: We're using `-p 1` to force the test packages to run serially as GHA boxes
         #     are underpowered and don't like running tons of Synapse instances at once.
+        # -f: reuse the image built by the main run above (same checkout, same
+        #     PASS_* env) instead of rebuilding 3 images a second time.
         run: |
-          COMPLEMENT_DIR=`pwd`/complement synapse/scripts-dev/complement.sh --in-repo -p 1
+          COMPLEMENT_DIR=`pwd`/complement synapse/scripts-dev/complement.sh --in-repo -f -p 1
         shell: bash
         env:
           POSTGRES: ${{ (startsWith(matrix.database, 'Postgres')) && 1 || '' }}
           WORKERS: ${{ (matrix.arrangement == 'workers') && 1 || '' }}
-          SYNAPSE_EMBEDDED_HAMT_ENGINE: ${{ (contains(matrix.database, 'mdbx')) && 'mdbx' || '' }}
-          SYNAPSE_EMBEDDED_HAMT_PATH: ${{ (contains(matrix.database, 'mdbx')) && '/data/embedded_hamt' || '' }}
+          SYNAPSE_EMBEDDED_HAMT_ENGINE: ${{ (contains(matrix.database, 'mtxdb')) && 'mtxdb' || '' }}
+          SYNAPSE_EMBEDDED_HAMT_PATH: ${{ (contains(matrix.database, 'mtxdb')) && '/data/embedded_hamt' || '' }}
           TEST_ONLY_IGNORE_POETRY_LOCKFILE: ${{ inputs.use_latest_deps && 1 || '' }}
           TEST_ONLY_SKIP_DEP_HASH_VERIFICATION: ${{ inputs.use_twisted_trunk  && 1 || '' }}
           RESULTS_DIR: tests/complement/in-repo
@@ -210,8 +183,6 @@ jobs:
           # combinations (upload-artifact rejects duplicate names within a run).
           name: Complement Logs - ${{ job.status }} - (${{ matrix.arrangement }}, ${{ matrix.database }})
           path: |
-            synapse/tests/complement/sanity/logs.jsonl
-            synapse/tests/complement/sanity/results.jsonl
             synapse/tests/complement/main/logs.jsonl
             synapse/tests/complement/main/results.jsonl
             synapse/tests/complement/in-repo/logs.jsonl

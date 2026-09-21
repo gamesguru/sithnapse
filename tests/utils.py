@@ -22,10 +22,10 @@
 import atexit
 import logging
 import os
-import shutil
 import signal
 import sys
 import tempfile
+import time
 import uuid
 from types import FrameType, TracebackType
 from typing import (
@@ -93,35 +93,173 @@ if USE_POSTGRES_FOR_TESTS and USE_FAST_PG:
         file=sys.stderr,
     )
 POSTGRES_BASE_DB = "_synapse_unit_tests_base_%s" % (os.getpid(),)
+POSTGRES_CREATE_DB_STRATEGY = ""
+POSTGRES_CLONE_STRATEGY_NAME = "DEFAULT"
+
+
+def get_postgres_clone_strategy() -> tuple[str, str]:
+    """Return (create_db_clause, strategy_name), e.g. (' STRATEGY = FILE_COPY', 'FILE_COPY')."""
+    return POSTGRES_CREATE_DB_STRATEGY, POSTGRES_CLONE_STRATEGY_NAME
+
 
 # When debugging a specific test, it's occasionally useful to write the
 # DB to disk and query it with the sqlite CLI.
 SQLITE_PERSIST_DB = os.environ.get("SYNAPSE_TEST_PERSIST_SQLITE_DB") is not None
 
 # When set, every test homeserver runs its HAMT state store through the
-# embedded engine (mdbx) instead of plain SQL -- the trial-mdbx CI job's
-# whole purpose. mdbx is just a local file, so no "is a server reachable"
-# check is needed here -- config/database.py opens it directly.
+# embedded engine (mtxdb) instead of plain SQL -- the trial-embedded
+# CI job's whole purpose. The embedded engine is just a local file, so no
+# "is a server reachable" check is needed here -- config/database.py opens
+# it directly.
 #
 # Deliberately *not* falling back to the bare deployment switches
-# (SYNAPSE_EMBEDDED_HAMT_ENGINE / SYNAPSE_EMBEDDED_HAMT_PATH / SYNAPSE_MDBX):
+# (SYNAPSE_EMBEDDED_HAMT_ENGINE / SYNAPSE_EMBEDDED_HAMT_PATH / SYNAPSE_MTXDB):
 # unit tests inherit the process environment, and a shell configured for
 # running a real homeserver (e.g. SYNAPSE_EMBEDDED_HAMT_PATH pointing at a
-# production mdbx store) must not have `trial` silently open and mutate
-# that store. Only the SYNAPSE_TEST_-prefixed, test-only variables are
-# honoured here. SYNAPSE_TEST_MDBX is a shorthand alias for the common case
-# of just wanting the mdbx engine, without spelling out the engine name.
+# production store) must not have `trial` silently open and mutate that
+# store. Only the SYNAPSE_TEST_-prefixed, test-only variables are honoured
+# here. SYNAPSE_TEST_MTXDB is a shorthand alias for
+# the common case of just wanting the mtxdb engine, without spelling out the name.
 EMBEDDED_HAMT_ENGINE = os.environ.get("SYNAPSE_TEST_EMBEDDED_HAMT_ENGINE")
-if EMBEDDED_HAMT_ENGINE is None and os.environ.get("SYNAPSE_TEST_MDBX"):
-    EMBEDDED_HAMT_ENGINE = "mdbx"
+if EMBEDDED_HAMT_ENGINE is None and os.environ.get("SYNAPSE_TEST_MTXDB"):
+    EMBEDDED_HAMT_ENGINE = "mtxdb"
 
 EMBEDDED_HAMT_PATH = os.environ.get("SYNAPSE_TEST_EMBEDDED_HAMT_PATH")
-if EMBEDDED_HAMT_PATH is None and EMBEDDED_HAMT_ENGINE:
+_embedded_hamt_path_is_tmp = EMBEDDED_HAMT_PATH is None and EMBEDDED_HAMT_ENGINE
+if _embedded_hamt_path_is_tmp:
     EMBEDDED_HAMT_PATH = tempfile.mkdtemp()
-    atexit.register(shutil.rmtree, EMBEDDED_HAMT_PATH, ignore_errors=True)
+elif EMBEDDED_HAMT_PATH is not None:
+    # `trial --jobs=N` (see .github/workflows/tests.yml's trial-mtxdb job)
+    # forks N worker *processes* that all inherit the same
+    # SYNAPSE_TEST_EMBEDDED_HAMT_PATH env var. mtxdb takes an exclusive
+    # lock on its storage directory, so N workers all opening the literal
+    # configured path meant only the first ever succeeded -- every other
+    # worker's very first homeserver setup failed with "Failed to open
+    # embedded mtxdb engine" and every test in it errored. Namespace the
+    # configured path by pid so each worker process gets its own
+    # subdirectory instead of racing for the same one; a single-process
+    # run (no --jobs) just gets a `pid-<n>` subdir of the configured path,
+    # which is harmless.
+    EMBEDDED_HAMT_PATH = os.path.join(EMBEDDED_HAMT_PATH, f"pid-{os.getpid()}")
+    os.makedirs(EMBEDDED_HAMT_PATH, exist_ok=True)
+
+    # Reap stale pid-* subdirs left behind by dead trial workers (crashed
+    # or SIGKILL'd before their own cleanup could run).  Only touches
+    # dirs whose PID is no longer alive; never touches our own dir or
+    # non-pid-* entries.
+    import shutil
+
+    _parent_dir = os.path.dirname(EMBEDDED_HAMT_PATH)
+    _reaped = 0
+    if os.path.isdir(_parent_dir):
+        for _entry in os.listdir(_parent_dir):
+            if _entry.startswith("pid-") and _entry != f"pid-{os.getpid()}":
+                try:
+                    _pid = int(_entry[4:])
+                except ValueError:
+                    continue
+                try:
+                    os.kill(_pid, 0)
+                except ProcessLookupError:
+                    shutil.rmtree(os.path.join(_parent_dir, _entry), ignore_errors=True)
+                    _reaped += 1
+                except PermissionError:
+                    pass  # alive but not ours
+    if _reaped:
+        print(f"Reaped {_reaped} stale pid-* dirs from {_parent_dir}", file=sys.stderr)
+
+if EMBEDDED_HAMT_ENGINE:
+    print(
+        f"Embedded HAMT engine: {EMBEDDED_HAMT_ENGINE} at {EMBEDDED_HAMT_PATH}",
+        file=sys.stderr,
+    )
+
+if _embedded_hamt_path_is_tmp and not os.environ.get(
+    "SYNAPSE_TEST_KEEP_EMBEDDED_HAMT_PATH"
+):
+    # Clean up an auto-created store (set e.g. when debugging a failure and
+    # you want to inspect the store afterwards). An explicitly-configured
+    # `SYNAPSE_TEST_EMBEDDED_HAMT_PATH` is never touched.
+    import shutil
+
+    def _cleanup_embedded_hamt(path: str) -> None:
+        shutil.rmtree(path, ignore_errors=True)
+
+    assert EMBEDDED_HAMT_PATH is not None
+    atexit.register(_cleanup_embedded_hamt, EMBEDDED_HAMT_PATH)
 
 # the dbname we will connect to in order to create the base database.
 POSTGRES_DBNAME_FOR_INITIAL_CREATE = "postgres"
+
+
+def _drain_template_background_updates_postgres() -> None:
+    """Pre-drain all background schema updates on POSTGRES_BASE_DB.
+
+    This runs all pending index creations and data updates once on the empty
+    template database, then cleanly shuts down so all sessions on POSTGRES_BASE_DB
+    are closed. Every clone created from POSTGRES_BASE_DB will inherit an empty
+    background_updates table and pre-created indexes.
+    """
+    from unittest.mock import Mock, patch
+
+    from twisted.internet.defer import ensureDeferred
+    from twisted.trial.unittest import SynchronousTestCase
+
+    from synapse.config.homeserver import HomeServerConfig
+    from synapse.storage.controllers.purge_events import PurgeEventsStorageController
+
+    from tests.server import (
+        TestHomeServer,
+        ThreadedMemoryReactorClock,
+        make_fake_db_pool,
+    )
+
+    reactor = ThreadedMemoryReactorClock()
+    raw_config = default_config(server_name="test-template-draining", parse=False)
+    raw_config["database"] = {
+        "name": "psycopg2",
+        "args": {
+            "database": POSTGRES_BASE_DB,
+            "user": POSTGRES_USER,
+            "host": POSTGRES_HOST,
+            "port": POSTGRES_PORT,
+            "password": POSTGRES_PASSWORD,
+            "cp_min": 1,
+            "cp_max": 1,
+        },
+    }
+    config = HomeServerConfig()
+    config.parse_config_dict(raw_config, "", "")
+
+    hs = TestHomeServer("test-template-draining", config=config, reactor=reactor)
+    hs.tls_server_context_factory = Mock()
+
+    with patch("synapse.storage.database.make_pool", side_effect=make_fake_db_pool):
+        hs.setup()
+
+    # Register controller background updates (e.g. state group deletion)
+    PurgeEventsStorageController(hs, hs.get_datastores())
+
+    from synapse.logging.context import LoggingContext
+
+    stor = hs.get_datastores().main
+    with LoggingContext(
+        name="drain_template_bg_updates", server_name="test-template-draining"
+    ):
+        d = ensureDeferred(stor.db_pool.updates.run_background_updates(False))
+
+        while not d.called or d.paused:
+            time.sleep(0.001)
+            reactor.advance(0.01)
+
+        stc = SynchronousTestCase()
+        stc.successResultOf(d)
+
+    d_sd = ensureDeferred(hs.shutdown())
+    while not d_sd.called or d_sd.paused:
+        time.sleep(0.001)
+        reactor.advance(0.01)
+    stc.successResultOf(d_sd)
 
 
 def setupdb() -> None:
@@ -144,6 +282,65 @@ def setupdb() -> None:
             "CREATE DATABASE %s ENCODING 'UTF8' LC_COLLATE='C' LC_CTYPE='C' "
             "template=template0;" % (POSTGRES_BASE_DB,)
         )
+
+        global POSTGRES_CREATE_DB_STRATEGY, POSTGRES_CLONE_STRATEGY_NAME
+        raw_strategy = os.environ.get("SYNAPSE_POSTGRES_CLONE_STRATEGY", "auto").strip()
+        override = raw_strategy.upper()
+        if override in ("FILE_COPY", "WAL_LOG"):
+            POSTGRES_CREATE_DB_STRATEGY = f" STRATEGY = {override}"
+            POSTGRES_CLONE_STRATEGY_NAME = override
+        elif override in ("DEFAULT", "NONE", "OFF"):
+            POSTGRES_CREATE_DB_STRATEGY = ""
+            POSTGRES_CLONE_STRATEGY_NAME = "DEFAULT"
+        elif override in ("AUTO", ""):
+            # Auto-detect: PostgreSQL 15+ introduces STRATEGY = FILE_COPY
+            cur.execute("SHOW server_version_num;")
+            row = cur.fetchone()
+            server_version = int(row[0]) if row else 0
+            if server_version >= 150000:
+                import psycopg2
+
+                probe_db = f"_synapse_probe_strat_{os.getpid()}"
+                probe_created = False
+                try:
+                    cur.execute(
+                        f"CREATE DATABASE {probe_db} WITH TEMPLATE template0 STRATEGY = FILE_COPY;"
+                    )
+                    probe_created = True
+                    POSTGRES_CREATE_DB_STRATEGY = " STRATEGY = FILE_COPY"
+                    POSTGRES_CLONE_STRATEGY_NAME = "FILE_COPY"
+                except psycopg2.Error as e:
+                    try:
+                        db_conn.rollback()
+                    except psycopg2.Error:
+                        pass
+                    # Only treat syntax errors as capability fallback (PostgreSQL < 15 syntax);
+                    # propagate any operational failures (permissions, disk space, catalog errors).
+                    if e.pgcode == "42601":  # syntax_error
+                        POSTGRES_CREATE_DB_STRATEGY = ""
+                        POSTGRES_CLONE_STRATEGY_NAME = "DEFAULT"
+                    else:
+                        raise
+                finally:
+                    if probe_created:
+                        try:
+                            cur.execute(f"DROP DATABASE IF EXISTS {probe_db};")
+                        except psycopg2.Error as cleanup_err:
+                            logger.warning(
+                                "Failed to drop probe database %s: %s",
+                                probe_db,
+                                cleanup_err,
+                            )
+                            raise
+            else:
+                POSTGRES_CREATE_DB_STRATEGY = ""
+                POSTGRES_CLONE_STRATEGY_NAME = "DEFAULT"
+        else:
+            raise ValueError(
+                f"Invalid SYNAPSE_POSTGRES_CLONE_STRATEGY={raw_strategy!r}. "
+                "Expected one of: AUTO, FILE_COPY, WAL_LOG, DEFAULT."
+            )
+
         cur.close()
         db_conn.close()
 
@@ -163,6 +360,13 @@ def setupdb() -> None:
         )
         prepare_database(logging_conn, db_engine, None)
         logging_conn.close()
+
+        # Pre-drain all 50+ background schema updates (index creations, data
+        # migrations over empty tables) once on the template database. Every
+        # test clone will then inherit a database where all indexes already
+        # exist and background_updates is already empty, avoiding running 50+
+        # updates in every single test (~750k queries across the full suite).
+        _drain_template_background_updates_postgres()
 
         def _cleanup() -> None:
             db_conn = db_engine.module.connect(
@@ -286,9 +490,9 @@ def default_config(
     if EMBEDDED_HAMT_ENGINE and EMBEDDED_HAMT_PATH:
         # Many test homeservers (each with their own fresh SQL database, so
         # each restarting its state_group id sequence at 1) can share this
-        # one mdbx file across a whole trial worker process. Without a
+        # one mtxdb file across a whole trial worker process. Without a
         # unique namespace per homeserver, two different tests' state_group
-        # 1 would collide on the same mdbx keys and silently read each
+        # 1 would collide on the same mtxdb keys and silently read each
         # other's data.
         config_dict["embedded_hamt"] = {
             "engine": EMBEDDED_HAMT_ENGINE,

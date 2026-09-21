@@ -76,6 +76,11 @@ RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -yqq --
 
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain stable --profile minimal
 
+# mtxdb uses #![feature(...)] which requires RUSTC_BOOTSTRAP on stable.
+# Scoped to the single command that builds the extension (the `uv pip install`
+# below) instead of exported for the whole stage.
+ARG RUSTC_BOOTSTRAP=1
+
 # arm64 builds consume a lot of memory if `CARGO_NET_GIT_FETCH_WITH_CLI` is not
 # set to true, so we expose it as a build-arg.
 ARG CARGO_NET_GIT_FETCH_WITH_CLI=false
@@ -108,9 +113,9 @@ RUN \
   --mount=type=cache,target=/synapse/target,sharing=locked \
   --mount=type=cache,target=${CARGO_HOME}/registry,sharing=locked \
   if [ -z "$TEST_ONLY_IGNORE_LOCKFILE" ]; then \
-    uv pip install --system --prefix="/install" --no-deps /synapse[all]; \
+    RUSTC_BOOTSTRAP=$RUSTC_BOOTSTRAP uv pip install --system --prefix="/install" --no-deps /synapse[all]; \
   else \
-    uv pip install --system --prefix="/install" /synapse[all]; \
+    RUSTC_BOOTSTRAP=$RUSTC_BOOTSTRAP uv pip install --system --prefix="/install" /synapse[all]; \
   fi
 
 ###

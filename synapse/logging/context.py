@@ -404,6 +404,12 @@ class LoggingContext:
         )
         current = set_current_context(self.previous_context)
         if current is not self:
+            if type is GeneratorExit:
+                # The generator is being unwound; the context is not
+                # recoverable, but the caller is done with it either way --
+                # mark it finished instead of leaving it permanently active.
+                self.finished = True
+                return
             if current is SENTINEL_CONTEXT:
                 logcontext_error("Expected logging context %s was lost" % (self,))
             else:
@@ -719,6 +725,8 @@ class PreserveLoggingContext:
         context = set_current_context(self._old_context)
 
         if context != self._new_context:
+            if type is GeneratorExit:
+                return
             if not context:
                 logcontext_error(
                     "Expected logging context %s was lost" % (self._new_context,)

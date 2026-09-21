@@ -18,20 +18,25 @@
 # [This file includes modifications made by New Vector Limited]
 #
 #
+import atexit
 import hashlib
 import ipaddress
 import json
 import logging
 import os
 import os.path
+import queue
 import sqlite3
+import sys
+import threading
 import time
 import uuid
 import warnings
 import weakref
-from collections import deque
+from collections import defaultdict, deque
 from io import SEEK_END, BytesIO
 from typing import (
+    IO,
     Any,
     Awaitable,
     Callable,
@@ -107,6 +112,7 @@ from synapse.util.json import json_encoder
 from tests.utils import (
     LEAVE_DB,
     POSTGRES_BASE_DB,
+    POSTGRES_DBNAME_FOR_INITIAL_CREATE,
     POSTGRES_HOST,
     POSTGRES_PASSWORD,
     POSTGRES_PORT,
@@ -114,6 +120,7 @@ from tests.utils import (
     SQLITE_PERSIST_DB,
     USE_POSTGRES_FOR_TESTS,
     default_config,
+    get_postgres_clone_strategy,
 )
 
 logger = logging.getLogger(__name__)
@@ -127,6 +134,712 @@ CustomHeaderType = tuple[str | bytes, str | bytes]
 # A pre-prepared SQLite DB that is used as a template when creating new SQLite
 # DB each test run. This dramatically speeds up test set up when using SQLite.
 PREPPED_SQLITE_DB_CONN: LoggingDatabaseConnection | None = None
+
+# ── Postgres per-test lifecycle timing (opt-in via SYNAPSE_PG_TIMINGS=1) ────
+_PG_TIMINGS: dict[str, float] = defaultdict(float)
+_PG_TIMING_COUNTS: dict[str, int] = defaultdict(int)
+_PG_TIMING_MAX: dict[str, float] = defaultdict(float)
+_PG_LIFECYCLE_COUNTERS: dict[str, int] = defaultdict(int)
+_PG_TEARDOWN_TEST_TIMINGS: dict[str, dict[str, float]] = defaultdict(
+    lambda: defaultdict(float)
+)
+
+# Guards the timing dicts: `_pg_timing` is fed from the database layer
+# (potentially a different thread than the reactor), while the
+# SIGTERM/atexit flushers below sort and iterate it.
+_PG_TIMINGS_LOCK = threading.Lock()
+
+_timings_file: IO[str] | None = None
+if os.environ.get("SYNAPSE_PG_TIMINGS"):
+    _timings_path = os.environ.get("SYNAPSE_PG_TIMINGS_FILE")
+    if _timings_path:
+        try:
+            _timings_file = open(_timings_path, "a")
+        except OSError:
+            pass
+
+
+def _timings_print(*args: object) -> None:
+    print(*args, file=sys.stderr)
+    if _timings_file is not None:
+        print(*args, file=_timings_file)
+
+
+def _pg_timing(tag: str, elapsed: float, test_name: str | None = None) -> None:
+    with _PG_TIMINGS_LOCK:
+        _PG_TIMINGS[tag] += elapsed
+        _PG_TIMING_COUNTS[tag] += 1
+        if elapsed > _PG_TIMING_MAX[tag]:
+            _PG_TIMING_MAX[tag] = elapsed
+        if test_name:
+            _PG_TEARDOWN_TEST_TIMINGS[test_name][tag] += elapsed
+
+
+def _pg_counter(tag: str, count: int = 1) -> None:
+    with _PG_TIMINGS_LOCK:
+        _PG_LIFECYCLE_COUNTERS[tag] += count
+
+
+# ── Background Postgres Test DB Dropper & Database Recycler ──────────────────
+_DB_DROP_PID: int = os.getpid()
+# Keep only a small number of disposable databases waiting to be dropped.
+# The test cluster may live on tmpfs, so letting test setup outrun the single
+# dropper can otherwise retain an unbounded number of full database clones.
+_DB_DROP_QUEUE_MAXSIZE = 2
+_DB_DROP_QUEUE: "queue.Queue[tuple[str, str | None, Any] | None]" = queue.Queue(
+    maxsize=_DB_DROP_QUEUE_MAXSIZE
+)
+_DB_DROP_THREAD: threading.Thread | None = None
+_DB_DROP_LOCK = threading.Lock()
+
+_RECYCLED_PG_DB: str | None = None
+_RECYCLED_PG_DB_IN_USE: bool = False
+_PREV_TEST_HAD_DDL: bool = False
+
+_RESEED_SQL = """
+INSERT INTO appservice_stream_position VALUES ('X', 0);
+INSERT INTO event_push_summary_last_receipt_stream_id VALUES ('X', 0);
+INSERT INTO event_push_summary_stream_ordering VALUES ('X', 0);
+INSERT INTO stats_incremental_position VALUES ('X', 1);
+INSERT INTO user_directory_stream_pos VALUES ('X', 1);
+INSERT INTO federation_stream_position VALUES ('federation', -1, 'master'), ('events', -1, 'master');
+INSERT INTO device_lists_changes_in_room_max_pruned_stream_id (stream_id) VALUES (0);
+INSERT INTO device_lists_changes_converted_stream_position (stream_id, room_id) VALUES (1, '');
+INSERT INTO delayed_events_stream_pos (stream_id) VALUES (1);
+INSERT INTO room_forgetter_stream_pos (stream_id) VALUES (1);
+-- Matches the one-time seed row from
+-- schema/main/delta/88/05_drop_old_otks.sql.postgres, which a fresh clone
+-- always has its own independent copy of but a recycled DB does not once
+-- some earlier test's run has consumed/completed the task. The scheduler
+-- treats this timestamp as a "not due before" gate checked against the
+-- test's *simulated* reactor clock (see task_scheduler.py's
+-- max_timestamp=self._clock.time_msec()), which tests routinely rewind to
+-- the past and then fast-forward. Keep the row pending during the initial
+-- clock rewind, but make it due early enough for the periodic scheduler to
+-- observe it before tests finish fast-forwarding back to wall-clock time.
+-- Do not use 0: that would let the task run and complete during the initial
+-- clock jump, before test_delete_old_one_time_keys inserts its test keys.
+INSERT INTO scheduled_tasks (id, action, status, timestamp) VALUES (
+    'delete_old_otks_task', 'delete_old_otks', 'scheduled',
+    extract(epoch from current_timestamp) * 1000 - 120000
+);
+"""
+
+_RESET_SEQUENCES_SQL = """
+-- Match the freshly prepared base DB: stream sequences are already marked
+-- called at their initial persisted position, so the first allocated ID is 2.
+-- These four sequences have a fresh-schema initial value of 1 with is_called
+-- false, so the first allocated ID is 1.
+SELECT setval('application_services_txn_id_seq', 1, false);
+SELECT setval('event_auth_chain_id', 1, false);
+SELECT setval('instance_map_instance_id_seq', 1, false);
+SELECT setval('user_id_seq', 1, false);
+SELECT setval('thread_subscriptions_sequence', 2, true);
+SELECT setval('events_stream_seq', 1, true);
+SELECT setval('receipts_sequence', 1, true);
+SELECT setval('presence_stream_sequence', 1, true);
+SELECT setval('device_inbox_sequence', 1, true);
+SELECT setval('account_data_sequence', 1, true);
+SELECT setval('device_lists_sequence', 1, true);
+SELECT setval('push_rules_stream_sequence', 1, true);
+SELECT setval('pushers_sequence', 1, true);
+SELECT setval('cache_invalidation_stream_seq', 1, true);
+SELECT setval('un_partial_stated_room_stream_sequence', 1, true);
+SELECT setval('un_partial_stated_event_stream_sequence', 1, true);
+SELECT setval('e2e_cross_signing_keys_sequence', 1, true);
+SELECT setval('sticky_events_sequence', 1, true);
+SELECT setval('quarantined_media_id_seq', 1, true);
+SELECT setval('profile_updates_sequence', 1, true);
+SELECT setval('events_backfill_stream_seq', 1, true);
+"""
+
+_METADATA_TABLES_IGNORE = {
+    "applied_schema_deltas",
+    "schema_version",
+    "schema_compat_version",
+}
+
+
+_TABLES_TO_TRUNCATE_CACHE: list[str] | None = None
+
+
+def _reset_recycled_postgres_db(
+    test_db: str,
+    db_engine: Any,
+    test_name: str | None = None,
+) -> bool:
+    """Reset a recycled test DB. Returns True on success."""
+
+    _t0 = time.monotonic()
+    try:
+        conn = db_engine.module.connect(
+            dbname=test_db,
+            user=POSTGRES_USER,
+            host=POSTGRES_HOST,
+            port=POSTGRES_PORT,
+            password=POSTGRES_PASSWORD,
+        )
+        db_engine.attempt_to_set_autocommit(conn, True)
+        cur = conn.cursor()
+
+        try:
+            cur.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE datname = %s AND pid <> pg_backend_pid();",
+                (test_db,),
+            )
+        except Exception:
+            pass
+
+        # Dirty-table tracking is process-global and SQL-shape-dependent, so it
+        # cannot safely determine which rows belong to this particular DB.
+        # Truncate every public table except schema identity metadata instead.
+        #
+        # The table *set* is schema-derived and identical for every recycled
+        # DB this worker process ever resets -- a DB that picked up DDL never
+        # reaches this function (it's dropped and replaced with a fresh clone
+        # instead, see the `had_ddl` branch in cleanup()). Cache the list
+        # after the first lookup so the recurring per-reset cost is just the
+        # TRUNCATE itself, not a repeated pg_tables catalog query too.
+        global _TABLES_TO_TRUNCATE_CACHE
+        if _TABLES_TO_TRUNCATE_CACHE is None:
+            cur.execute(
+                "SELECT quote_ident(tablename) FROM pg_tables "
+                "WHERE schemaname = 'public' ORDER BY tablename"
+            )
+            _TABLES_TO_TRUNCATE_CACHE = [
+                row[0]
+                for row in cur.fetchall()
+                if row[0] not in _METADATA_TABLES_IGNORE
+            ]
+        tables_to_truncate = _TABLES_TO_TRUNCATE_CACHE
+        if tables_to_truncate:
+            cur.execute(
+                "TRUNCATE TABLE "
+                + ", ".join(tables_to_truncate)
+                + " RESTART IDENTITY CASCADE;"
+            )
+
+        cur.execute(_RESEED_SQL)
+
+        cur.execute(_RESET_SEQUENCES_SQL)
+        cur.close()
+        conn.close()
+        _pg_timing("db_recycle_reset", time.monotonic() - _t0, test_name=test_name)
+        _pg_counter("recycle_reset_success")
+        return True
+    except Exception as e:
+        _pg_counter("recycle_reset_failed")
+        warnings.warn(
+            f"Failed to reset recycled DB {test_db}: {e}. Falling back to fresh clone.",
+            category=UserWarning,
+            stacklevel=2,
+        )
+        return False
+
+
+def _reset_db_drop_state_after_fork() -> None:
+    global _DB_DROP_PID, _DB_DROP_QUEUE, _DB_DROP_THREAD, _DB_DROP_LOCK
+    global _RECYCLED_PG_DB, _RECYCLED_PG_DB_IN_USE, _PREV_TEST_HAD_DDL
+    _DB_DROP_PID = os.getpid()
+    _DB_DROP_QUEUE = queue.Queue(maxsize=_DB_DROP_QUEUE_MAXSIZE)
+    _DB_DROP_THREAD = None
+    _DB_DROP_LOCK = threading.Lock()
+    _RECYCLED_PG_DB = None
+    _RECYCLED_PG_DB_IN_USE = False
+    _PREV_TEST_HAD_DDL = False
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_db_drop_state_after_fork)
+
+
+def _ensure_db_drop_worker() -> None:
+    global _DB_DROP_PID, _DB_DROP_THREAD
+    if os.getpid() != _DB_DROP_PID:
+        _reset_db_drop_state_after_fork()
+    with _DB_DROP_LOCK:
+        if _DB_DROP_THREAD is None or not _DB_DROP_THREAD.is_alive():
+            _DB_DROP_THREAD = threading.Thread(
+                target=_db_drop_worker_loop,
+                name=f"synapse-test-db-dropper-{os.getpid()}",
+                daemon=True,
+            )
+            _DB_DROP_THREAD.start()
+
+
+def _drop_test_db(
+    test_db: str,
+    test_name: str | None,
+    db_engine: Any,
+    conn: Any | None = None,
+    cur: Any | None = None,
+) -> tuple[bool, Any, Any]:
+    """Drop a test database. Reuses or creates the base connection/cursor."""
+    import psycopg2
+
+    _drop_t0 = time.monotonic()
+    dropped = False
+
+    if conn is None or conn.closed != 0 or cur is None or cur.closed:
+        _t_conn = time.monotonic()
+        conn = db_engine.module.connect(
+            dbname=POSTGRES_DBNAME_FOR_INITIAL_CREATE,
+            user=POSTGRES_USER,
+            host=POSTGRES_HOST,
+            port=POSTGRES_PORT,
+            password=POSTGRES_PASSWORD,
+        )
+        db_engine.attempt_to_set_autocommit(conn, True)
+        cur = conn.cursor()
+        _pg_timing("db_drop_connect", time.monotonic() - _t_conn, test_name=test_name)
+
+    _t_term = time.monotonic()
+    try:
+        cur.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            "WHERE datname = %s AND pid <> pg_backend_pid();",
+            (test_db,),
+        )
+    except psycopg2.Error:
+        warnings.warn(
+            "Could not terminate backends for %s (non-superuser?)" % (test_db,),
+            category=UserWarning,
+            stacklevel=2,
+        )
+    _pg_timing(
+        "db_drop_terminate_backends",
+        time.monotonic() - _t_term,
+        test_name=test_name,
+    )
+
+    for attempt in range(5):
+        _t_stmt = time.monotonic()
+        try:
+            cur.execute("DROP DATABASE IF EXISTS %s;" % (test_db,))
+            dropped = True
+            _pg_timing(
+                "db_drop_statement",
+                time.monotonic() - _t_stmt,
+                test_name=test_name,
+            )
+            break
+        except psycopg2.OperationalError as e:
+            _pg_timing(
+                "db_drop_statement",
+                time.monotonic() - _t_stmt,
+                test_name=test_name,
+            )
+            if attempt < 4:
+                warnings.warn(
+                    "Couldn't drop old db: " + str(e),
+                    category=UserWarning,
+                    stacklevel=2,
+                )
+                _t_sleep = time.monotonic()
+                time.sleep(0.5)
+                _pg_timing(
+                    "db_drop_retry_sleep",
+                    time.monotonic() - _t_sleep,
+                    test_name=test_name,
+                )
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = db_engine.module.connect(
+                    dbname=POSTGRES_DBNAME_FOR_INITIAL_CREATE,
+                    user=POSTGRES_USER,
+                    host=POSTGRES_HOST,
+                    port=POSTGRES_PORT,
+                    password=POSTGRES_PASSWORD,
+                )
+                db_engine.attempt_to_set_autocommit(conn, True)
+                cur = conn.cursor()
+
+    _pg_timing(
+        "db_drop_total",
+        time.monotonic() - _drop_t0,
+        test_name=test_name,
+    )
+
+    if dropped:
+        _pg_counter("db_drop_success")
+    else:
+        _pg_counter("db_drop_failed")
+        warnings.warn(
+            "Failed to drop old DB %s." % (test_db,),
+            category=UserWarning,
+            stacklevel=2,
+        )
+
+    return dropped, conn, cur
+
+
+def _db_drop_worker_loop() -> None:
+    conn = None
+    cur = None
+    while True:
+        try:
+            try:
+                item = _DB_DROP_QUEUE.get(timeout=2.0)
+            except queue.Empty:
+                # Close connection when idle to free Postgres client slots
+                if cur and not cur.closed:
+                    try:
+                        cur.close()
+                    except Exception:
+                        pass
+                    cur = None
+                if conn and conn.closed == 0:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    conn = None
+                continue
+
+            if item is None:
+                _DB_DROP_QUEUE.task_done()
+                break
+            test_db, test_name, db_engine = item
+            try:
+                _, conn, cur = _drop_test_db(
+                    test_db, test_name, db_engine, conn=conn, cur=cur
+                )
+            except Exception as e:
+                warnings.warn(
+                    f"Error in background drop worker for {test_db}: {e}",
+                    category=UserWarning,
+                    stacklevel=2,
+                )
+                if cur and not cur.closed:
+                    try:
+                        cur.close()
+                    except Exception:
+                        pass
+                if conn and conn.closed == 0:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                conn, cur = None, None
+            finally:
+                _DB_DROP_QUEUE.task_done()
+        except Exception:
+            try:
+                _DB_DROP_QUEUE.task_done()
+            except ValueError:
+                pass
+
+    if cur and not cur.closed:
+        try:
+            cur.close()
+        except Exception:
+            pass
+    if conn and conn.closed == 0:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _drain_db_drop_queue() -> None:
+    global _DB_DROP_PID, _RECYCLED_PG_DB
+    if os.getpid() != _DB_DROP_PID:
+        _reset_db_drop_state_after_fork()
+        return
+
+    # Drop the process's recycled database on shutdown
+    if _RECYCLED_PG_DB is not None:
+        _pg_counter("cleanup_dropped_worker_shutdown")
+        db_to_drop = _RECYCLED_PG_DB
+        _RECYCLED_PG_DB = None
+        _drop_test_db(
+            db_to_drop,
+            "process_shutdown",
+            create_engine({"name": "psycopg2", "args": {}}),
+        )
+
+    with _DB_DROP_LOCK:
+        thread = _DB_DROP_THREAD
+    if thread is not None and thread.is_alive():
+        _DB_DROP_QUEUE.join()
+
+
+def _print_pg_timings() -> None:
+    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+        return
+    _drain_db_drop_queue()
+    with _PG_TIMINGS_LOCK:
+        if not _PG_TIMINGS and not _PG_LIFECYCLE_COUNTERS:
+            return
+        # Snapshot under the lock so the SIGTERM/atexit flusher never races a
+        # concurrent `_pg_timing` on these dicts.
+        timings = dict(_PG_TIMINGS)
+        counts = dict(_PG_TIMING_COUNTS)
+        maxs = dict(_PG_TIMING_MAX)
+        lifecycle_counters = dict(_PG_LIFECYCLE_COUNTERS)
+        test_timings = {k: dict(v) for k, v in _PG_TEARDOWN_TEST_TIMINGS.items()}
+
+    _, strategy_name = get_postgres_clone_strategy()
+    run_dir = os.environ.get("SYNAPSE_TIMINGS_RUN_DIR")
+    if run_dir:
+        tmp_path = os.path.join(run_dir, f"lifecycle_{os.getpid()}.tmp")
+        final_path = os.path.join(run_dir, f"lifecycle_{os.getpid()}.json")
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "timings": timings,
+                        "counts": counts,
+                        "maxs": maxs,
+                        "counters": lifecycle_counters,
+                        "test_timings": test_timings,
+                        "strategy": strategy_name,
+                    },
+                    f,
+                )
+            os.replace(tmp_path, final_path)
+        except OSError:
+            pass
+        return
+
+    _timings_print(
+        f"\n=== Postgres test-DB lifecycle timings (strategy: {strategy_name}) ==="
+    )
+    _timings_print("")
+    _timings_print(
+        f"  {'':44s}  {'total':>10s}  {'calls':>6s}  {'avg':>12s}  {'max':>12s}",
+    )
+    if "hs_setup_wall" in timings:
+        wall_s = timings["hs_setup_wall"]
+        wall_cnt = counts["hs_setup_wall"]
+        wall_max = maxs.get("hs_setup_wall", 0.0)
+        _timings_print(
+            f"  {'hs_setup_wall (outer)':44s}  {wall_s * 1000:8.1f}ms  {wall_cnt:6d}  {(wall_s / wall_cnt) * 1000:10.3f}ms  {wall_max * 1000:10.3f}ms"
+        )
+        if "create_database" in timings:
+            cd_s = timings["create_database"]
+            cd_cnt = counts["create_database"]
+            cd_max = maxs.get("create_database", 0.0)
+            _timings_print(
+                f"    ├── {'create_database':38s}  {cd_s * 1000:8.1f}ms  {cd_cnt:6d}  {(cd_s / cd_cnt) * 1000:10.3f}ms  {cd_max * 1000:10.3f}ms"
+            )
+        if "hs_setup_total" in timings:
+            st_s = timings["hs_setup_total"]
+            st_cnt = counts["hs_setup_total"]
+            st_max = maxs.get("hs_setup_total", 0.0)
+            _timings_print(
+                f"    ├── {'hs_setup_total':38s}  {st_s * 1000:8.1f}ms  {st_cnt:6d}  {(st_s / st_cnt) * 1000:10.3f}ms  {st_max * 1000:10.3f}ms"
+            )
+            # Tags emitted by Databases.__init__ for each per-test homeserver.
+            # Shown in call order so the tree matches the actual execution path.
+            _STORE_INIT_TAGS: tuple[str, ...] = (
+                "create_engine",
+                "make_conn",
+                "check_database",
+                "prepare_database",
+                "database_pool_init",
+                "main_store_init",
+                "persist_events_store_init",
+                "state_deletion_store_init",
+                "state_store_init",
+                "databases_init_commit",
+            )
+            sub_inner = 0.0
+            for inner_tag in _STORE_INIT_TAGS:
+                if inner_tag in timings:
+                    it_s = timings[inner_tag]
+                    it_cnt = counts[inner_tag]
+                    it_max = maxs.get(inner_tag, 0.0)
+                    sub_inner += it_s
+                    _timings_print(
+                        f"    │     ├── {inner_tag:32s}  {it_s * 1000:8.1f}ms  {it_cnt:6d}  {(it_s / it_cnt) * 1000:10.3f}ms  {it_max * 1000:10.3f}ms"
+                    )
+            store_res = max(0.0, st_s - sub_inner)
+            _timings_print(
+                f"    │     └── {'store_init (unattributed)':32s}  {store_res * 1000:8.1f}ms  {st_cnt:6d}  {(store_res / st_cnt) * 1000:10.3f}ms"
+            )
+        sub_wall = timings.get("create_database", 0.0) + timings.get(
+            "hs_setup_total", 0.0
+        )
+        unatt_wall = max(0.0, wall_s - sub_wall)
+        _timings_print(
+            f"    └── {'hs_unattributed':38s}  {unatt_wall * 1000:8.1f}ms  {wall_cnt:6d}  {(unatt_wall / wall_cnt) * 1000:10.3f}ms"
+        )
+
+        # ── Teardown phase breakdown ─────────────────────────────────────────
+        teardown_tags = (
+            "hs_shutdown",
+            "db_drop_total",
+            "db_drop_connect",
+            "db_drop_terminate_backends",
+            "db_drop_statement",
+            "db_drop_retry_sleep",
+        )
+        has_teardown = any(t in timings for t in teardown_tags)
+        teardown_total_s = 0.0
+
+        if has_teardown:
+            _timings_print("\n=== Teardown Phase Timings ===")
+            _timings_print("")
+            _timings_print(
+                f"  {'':44s}  {'total':>10s}  {'calls':>6s}  {'avg':>12s}  {'max':>12s}",
+            )
+            if "hs_shutdown" in timings:
+                sd_s = timings["hs_shutdown"]
+                sd_cnt = counts["hs_shutdown"]
+                sd_max = maxs.get("hs_shutdown", 0.0)
+                teardown_total_s += sd_s
+                _timings_print(
+                    f"  {'hs_shutdown (async)':44s}  {sd_s * 1000:8.1f}ms  {sd_cnt:6d}  {(sd_s / sd_cnt) * 1000:10.3f}ms  {sd_max * 1000:10.3f}ms"
+                )
+            if "db_drop_total" in timings:
+                dd_s = timings["db_drop_total"]
+                dd_cnt = counts["db_drop_total"]
+                dd_max = maxs.get("db_drop_total", 0.0)
+                teardown_total_s += dd_s
+                _timings_print(
+                    f"  {'db_drop_total':44s}  {dd_s * 1000:8.1f}ms  {dd_cnt:6d}  {(dd_s / dd_cnt) * 1000:10.3f}ms  {dd_max * 1000:10.3f}ms"
+                )
+                if "db_drop_connect" in timings:
+                    dbc_s = timings["db_drop_connect"]
+                    dbc_cnt = counts["db_drop_connect"]
+                    dbc_max = maxs.get("db_drop_connect", 0.0)
+                    _timings_print(
+                        f"    ├── {'db_drop_connect':38s}  {dbc_s * 1000:8.1f}ms  {dbc_cnt:6d}  {(dbc_s / dbc_cnt) * 1000:10.3f}ms  {dbc_max * 1000:10.3f}ms"
+                    )
+                if "db_drop_terminate_backends" in timings:
+                    dbt_s = timings["db_drop_terminate_backends"]
+                    dbt_cnt = counts["db_drop_terminate_backends"]
+                    dbt_max = maxs.get("db_drop_terminate_backends", 0.0)
+                    _timings_print(
+                        f"    ├── {'db_drop_terminate_backends':38s}  {dbt_s * 1000:8.1f}ms  {dbt_cnt:6d}  {(dbt_s / dbt_cnt) * 1000:10.3f}ms  {dbt_max * 1000:10.3f}ms"
+                    )
+                if "db_drop_statement" in timings:
+                    dbs_s = timings["db_drop_statement"]
+                    dbs_cnt = counts["db_drop_statement"]
+                    dbs_max = maxs.get("db_drop_statement", 0.0)
+                    _timings_print(
+                        f"    ├── {'db_drop_statement':38s}  {dbs_s * 1000:8.1f}ms  {dbs_cnt:6d}  {(dbs_s / dbs_cnt) * 1000:10.3f}ms  {dbs_max * 1000:10.3f}ms"
+                    )
+                if "db_drop_retry_sleep" in timings:
+                    dbr_s = timings["db_drop_retry_sleep"]
+                    dbr_cnt = counts["db_drop_retry_sleep"]
+                    dbr_max = maxs.get("db_drop_retry_sleep", 0.0)
+                    _timings_print(
+                        f"    └── {'db_drop_retry_sleep':38s}  {dbr_s * 1000:8.1f}ms  {dbr_cnt:6d}  {(dbr_s / dbr_cnt) * 1000:10.3f}ms  {dbr_max * 1000:10.3f}ms"
+                    )
+
+            _timings_print("")
+            _timings_print(
+                f"  {'TOTAL TEARDOWN WALL TIME':44s}  {teardown_total_s * 1000:8.1f}ms"
+            )
+
+        known = {
+            "hs_setup_wall",
+            "create_database",
+            "hs_setup_total",
+            "make_conn",
+            "check_database",
+            "prepare_database",
+            "create_engine",
+            "database_pool_init",
+            "main_store_init",
+            "persist_events_store_init",
+            "state_deletion_store_init",
+            "state_store_init",
+            "databases_init_commit",
+            "hs_shutdown",
+            "db_drop_total",
+            "db_drop_connect",
+            "db_drop_terminate_backends",
+            "db_drop_statement",
+            "db_drop_retry_sleep",
+        }
+        for tag in sorted(timings):
+            if tag not in known:
+                t_s = timings[tag]
+                cnt = counts[tag]
+                m_s = maxs.get(tag, 0.0)
+                _timings_print(
+                    f"  {tag:44s}  {t_s * 1000:8.1f}ms  {cnt:6d}  {(t_s / cnt) * 1000:10.3f}ms  {m_s * 1000:10.3f}ms"
+                )
+        non_overlap = wall_s + teardown_total_s
+        _timings_print("")
+        _timings_print(
+            f"  {'TOTAL NON-OVERLAPPING LIFECYCLE':44s}  {non_overlap * 1000:8.1f}ms"
+        )
+
+        # ── Slowest tests in teardown ────────────────────────────────────────
+        if test_timings:
+            slowest: list[tuple[float, str, dict[str, float]]] = []
+            for tname, ptimings in test_timings.items():
+                tot = ptimings.get("hs_shutdown", 0.0) + ptimings.get(
+                    "db_drop_total", 0.0
+                )
+                if tot > 0:
+                    slowest.append((tot, tname, ptimings))
+            slowest.sort(key=lambda item: item[0], reverse=True)
+            if slowest:
+                _timings_print("\n=== Slowest Tests in Teardown (Top 10) ===")
+                for rank, (tot_s, tname, ptimings) in enumerate(slowest[:10], 1):
+                    details = []
+                    for ptag in (
+                        "hs_shutdown",
+                        "db_drop_connect",
+                        "db_drop_terminate_backends",
+                        "db_drop_statement",
+                        "db_drop_retry_sleep",
+                    ):
+                        if ptag in ptimings and ptimings[ptag] > 0:
+                            details.append(f"{ptag}={ptimings[ptag] * 1000:.1f}ms")
+                    detail_str = f" ({', '.join(details)})" if details else ""
+                    _timings_print(f"  {rank:2d}. {tname}")
+                    _timings_print(f"      total: {tot_s * 1000:8.1f}ms{detail_str}")
+    else:
+        for tag in sorted(timings):
+            total_s = timings[tag]
+            count = counts[tag]
+            total_ms = total_s * 1000
+            avg_ms = (total_s / count) * 1000 if count else 0.0
+            max_ms = maxs.get(tag, 0.0) * 1000
+            _timings_print(
+                f"  {tag:44s}  {total_ms:8.1f}ms  {count:6d}  {avg_ms:10.3f}ms  {max_ms:10.3f}ms",
+            )
+        total_s = sum(timings.values())
+        total_ms = total_s * 1000
+        _timings_print("")
+        _timings_print(
+            f"  {'TOTAL':44s}  {total_ms:8.1f}ms",
+        )
+    _timings_print("==========================================")
+    _timings_print("")
+
+
+def flush_pg_timings() -> None:
+    _print_pg_timings()
+
+
+atexit.register(_drain_db_drop_queue)
+atexit.register(flush_pg_timings)
+
+if os.environ.get("SYNAPSE_PG_TIMINGS"):
+    import signal as _signal
+    from types import FrameType as _FrameType
+
+    _original_sigterm_pg_timings = _signal.getsignal(_signal.SIGTERM)
+
+    def _flush_pg_timings_on_sigterm(signum: int, frame: _FrameType | None) -> None:
+        _print_pg_timings()
+        if callable(_original_sigterm_pg_timings):
+            _original_sigterm_pg_timings(signum, frame)
+        elif _original_sigterm_pg_timings == _signal.SIG_DFL:
+            _signal.signal(_signal.SIGTERM, _signal.SIG_DFL)
+            _signal.raise_signal(_signal.SIGTERM)
+
+    _signal.signal(_signal.SIGTERM, _flush_pg_timings_on_sigterm)
 
 
 class TimedOutException(Exception):
@@ -1170,6 +1883,7 @@ def setup_test_homeserver(
     reactor: Optional[ISynapseReactor] = None,
     homeserver_to_use: type[HomeServer] = TestHomeServer,
     db_txn_limit: int | None = None,
+    test_name: str | None = None,
     **extra_homeserver_attributes: Any,
 ) -> HomeServer:
     """
@@ -1190,6 +1904,7 @@ def setup_test_homeserver(
         db_txn_limit: Gives the maximum number of database transactions to run per
             connection before reconnecting. 0 means no limit. If unset, defaults to None
             here which will default upstream to `0`.
+        test_name: Optional test identifier used for attributing teardown timings.
         **extra_homeserver_attributes: Additional keyword arguments to install as
             `@cache_in_self` attributes on the homeserver. For example, `clock` will be
             installed as `hs._clock`.
@@ -1197,6 +1912,7 @@ def setup_test_homeserver(
     Calling this method directly is deprecated: you should instead derive from
     HomeserverTestCase.
     """
+    _t0_wall = time.monotonic()
     if reactor is None:
         reactor = ThreadedMemoryReactorClock()
 
@@ -1215,7 +1931,43 @@ def setup_test_homeserver(
     config.caches.resize_all_caches()
 
     if USE_POSTGRES_FOR_TESTS:
-        test_db = "synapse_test_%s" % uuid.uuid4().hex
+        global _RECYCLED_PG_DB, _RECYCLED_PG_DB_IN_USE, _PREV_TEST_HAD_DDL
+        from synapse.storage.database import pop_dirty_tables
+
+        old_recycled_to_drop = None
+        is_recycled = False
+        if (
+            _RECYCLED_PG_DB is not None
+            and not _RECYCLED_PG_DB_IN_USE
+            and not _PREV_TEST_HAD_DDL
+            and os.environ.get("SYNAPSE_TEST_NO_RECYCLE_DB") != "1"
+        ):
+            # Primary test DB reuse
+            _pg_counter("recycle_hit")
+            pop_dirty_tables()
+            test_db = _RECYCLED_PG_DB
+            _RECYCLED_PG_DB_IN_USE = True
+            is_recycled = True
+        else:
+            if os.environ.get("SYNAPSE_TEST_NO_RECYCLE_DB") == "1":
+                _pg_counter("recycle_miss_env_disabled")
+            elif _RECYCLED_PG_DB is None:
+                _pg_counter("recycle_miss_no_worker_db")
+            elif _RECYCLED_PG_DB_IN_USE:
+                _pg_counter("recycle_miss_cached_db_in_use")
+            elif _PREV_TEST_HAD_DDL:
+                _pg_counter("recycle_miss_prev_had_ddl")
+            else:
+                _pg_counter("recycle_miss_other")
+
+            test_db = "synapse_test_%s" % uuid.uuid4().hex
+            if not _RECYCLED_PG_DB_IN_USE:
+                if _RECYCLED_PG_DB is not None and _RECYCLED_PG_DB != test_db:
+                    old_recycled_to_drop = _RECYCLED_PG_DB
+                pop_dirty_tables()
+                _RECYCLED_PG_DB = test_db
+                _RECYCLED_PG_DB_IN_USE = True
+                _PREV_TEST_HAD_DDL = False
 
         database_config: JsonDict = {
             "name": "psycopg2",
@@ -1226,7 +1978,7 @@ def setup_test_homeserver(
                 "user": POSTGRES_USER,
                 "port": POSTGRES_PORT,
                 "cp_min": 1,
-                "cp_max": 5,
+                "cp_max": 1,
             },
         }
     else:
@@ -1292,71 +2044,129 @@ def setup_test_homeserver(
 
     db_engine = create_engine(database.config)
 
-    # Create the database before we actually try and connect to it, based off
-    # the template database we generate in setupdb()
+    # Create or reset the database before we actually try and connect to it
     if USE_POSTGRES_FOR_TESTS:
-        db_conn = db_engine.module.connect(
-            dbname=POSTGRES_BASE_DB,
-            user=POSTGRES_USER,
-            host=POSTGRES_HOST,
-            port=POSTGRES_PORT,
-            password=POSTGRES_PASSWORD,
-        )
-        db_engine.attempt_to_set_autocommit(db_conn, True)
-        cur = db_conn.cursor()
-        cur.execute("DROP DATABASE IF EXISTS %s;" % (test_db,))
-        cur.execute(
-            "CREATE DATABASE %s WITH TEMPLATE %s;" % (test_db, POSTGRES_BASE_DB)
-        )
-        cur.close()
-        db_conn.close()
+        if old_recycled_to_drop is not None:
+            if os.environ.get("SYNAPSE_TEST_SYNC_DROP_DB") == "1":
+                _drop_test_db(old_recycled_to_drop, test_name, db_engine)
+            else:
+                _ensure_db_drop_worker()
+                _DB_DROP_QUEUE.put((old_recycled_to_drop, test_name, db_engine))
 
-        def cleanup() -> None:
-            import psycopg2
+        if is_recycled:
+            if not _reset_recycled_postgres_db(test_db, db_engine, test_name=test_name):
+                old_failed_db = test_db
+                # Fallback if reset failed: generate new test_db and clone
+                test_db = "synapse_test_%s" % uuid.uuid4().hex
+                _RECYCLED_PG_DB = test_db
+                _RECYCLED_PG_DB_IN_USE = True
+                database_config["args"]["dbname"] = test_db
+                database = DatabaseConnectionConfig("master", database_config)
+                config.database.databases = [database]
+                is_recycled = False
+                if os.environ.get("SYNAPSE_TEST_SYNC_DROP_DB") == "1":
+                    _drop_test_db(old_failed_db, test_name, db_engine)
+                else:
+                    _ensure_db_drop_worker()
+                    _DB_DROP_QUEUE.put((old_failed_db, test_name, db_engine))
 
-            dropped = False
-
-            # Drop the test database
-            db_conn = db_engine.module.connect(
-                dbname=POSTGRES_BASE_DB,
-                user=POSTGRES_USER,
-                host=POSTGRES_HOST,
-                port=POSTGRES_PORT,
-                password=POSTGRES_PASSWORD,
-            )
-            db_engine.attempt_to_set_autocommit(db_conn, True)
-            cur = db_conn.cursor()
-
-            # Try a few times to drop the DB. Some things may hold on to the
-            # database for a few more seconds due to flakiness, preventing
-            # us from dropping it when the test is over. If we can't drop
-            # it, warn and move on.
-            for _ in range(5):
-                try:
-                    cur.execute("DROP DATABASE IF EXISTS %s;" % (test_db,))
-                    db_conn.commit()
-                    dropped = True
-                except psycopg2.OperationalError as e:
-                    warnings.warn(
-                        "Couldn't drop old db: " + str(e),
-                        category=UserWarning,
-                        stacklevel=2,
-                    )
-                    time.sleep(0.5)
-
-            cur.close()
-            db_conn.close()
-
-            if not dropped:
-                warnings.warn(
-                    "Failed to drop old DB.",
-                    category=UserWarning,
-                    stacklevel=2,
+        try:
+            if not is_recycled:
+                _t0 = time.monotonic()
+                db_conn = db_engine.module.connect(
+                    dbname=POSTGRES_DBNAME_FOR_INITIAL_CREATE,
+                    user=POSTGRES_USER,
+                    host=POSTGRES_HOST,
+                    port=POSTGRES_PORT,
+                    password=POSTGRES_PASSWORD,
+                )
+                db_engine.attempt_to_set_autocommit(db_conn, True)
+                cur = db_conn.cursor()
+                create_db_strategy, _ = get_postgres_clone_strategy()
+                cur.execute(
+                    "CREATE DATABASE %s WITH TEMPLATE %s%s;"
+                    % (test_db, POSTGRES_BASE_DB, create_db_strategy)
+                )
+                cur.close()
+                db_conn.close()
+                _pg_timing(
+                    "create_database", time.monotonic() - _t0, test_name=test_name
                 )
 
-        if not LEAVE_DB:
-            # Register the cleanup hook
-            cleanup_func(cleanup)
+            database_config["_TEST_DB_IS_FRESH"] = True
+            database = DatabaseConnectionConfig("master", database_config)
+            config.database.databases = [database]
+
+            def cleanup() -> None:
+                global _RECYCLED_PG_DB, _RECYCLED_PG_DB_IN_USE, _PREV_TEST_HAD_DDL
+                if test_db == _RECYCLED_PG_DB:
+                    # Dirty-table tracking is process-global, not per DB. Only
+                    # the primary DB cleanup may consume it; secondary
+                    # homeserver cleanups run first (Trial cleanups are LIFO)
+                    # and would otherwise erase the table list before the
+                    # recycled primary is reset for the next test.
+                    from synapse.storage.database import pop_dirty_tables
+
+                    _, had_ddl, ddl_triggers = pop_dirty_tables()
+                    if (
+                        had_ddl
+                        and ddl_triggers
+                        and os.environ.get("SYNAPSE_DEBUG_DDL_TRIGGERS") == "1"
+                    ):
+                        import sys
+
+                        print(
+                            f"[DDL-TRIGGER] test={test_name} triggers={ddl_triggers!r}",
+                            file=sys.stderr,
+                        )
+                    _RECYCLED_PG_DB_IN_USE = False
+                    if had_ddl:
+                        _pg_counter("cleanup_dropped_primary_had_ddl")
+                        _RECYCLED_PG_DB = None
+                        _PREV_TEST_HAD_DDL = False
+                        if os.environ.get("SYNAPSE_TEST_SYNC_DROP_DB") == "1":
+                            _drop_test_db(test_db, test_name, db_engine)
+                        else:
+                            _ensure_db_drop_worker()
+                            _DB_DROP_QUEUE.put((test_db, test_name, db_engine))
+                    elif os.environ.get("SYNAPSE_TEST_NO_RECYCLE_DB") == "1":
+                        _pg_counter("cleanup_dropped_primary_env_disabled")
+                        _RECYCLED_PG_DB = None
+                        _PREV_TEST_HAD_DDL = False
+                        if os.environ.get("SYNAPSE_TEST_SYNC_DROP_DB") == "1":
+                            _drop_test_db(test_db, test_name, db_engine)
+                        else:
+                            _ensure_db_drop_worker()
+                            _DB_DROP_QUEUE.put((test_db, test_name, db_engine))
+                    else:
+                        _pg_counter("cleanup_recycled_primary")
+                        _PREV_TEST_HAD_DDL = False
+                else:
+                    _pg_counter("cleanup_dropped_secondary_hs")
+                    # Extra homeserver in a multi-homeserver test (e.g. worker / federated peer)
+                    if os.environ.get("SYNAPSE_TEST_SYNC_DROP_DB") == "1":
+                        _drop_test_db(test_db, test_name, db_engine)
+                    else:
+                        _ensure_db_drop_worker()
+                        _DB_DROP_QUEUE.put((test_db, test_name, db_engine))
+
+            if not LEAVE_DB:
+                # Register the cleanup hook
+                cleanup_func(cleanup)
+        except Exception:
+            if test_db == _RECYCLED_PG_DB:
+                _RECYCLED_PG_DB_IN_USE = False
+                _RECYCLED_PG_DB = None
+            # If setup failed after a fresh clone was created, drop it now so
+            # it doesn't leak.  (If it was a recycled DB we just cleared the
+            # pointer above; it will be re-cloned on the next test.)
+            if not is_recycled:
+                if os.environ.get("SYNAPSE_TEST_SYNC_DROP_DB") == "1":
+                    _drop_test_db(test_db, test_name, db_engine)
+                else:
+                    _ensure_db_drop_worker()
+                    _DB_DROP_QUEUE.put((test_db, test_name, db_engine))
+            raise
 
     hs = homeserver_to_use(
         server_name,
@@ -1364,15 +2174,29 @@ def setup_test_homeserver(
         reactor=reactor,
     )
 
-    # Capture the `hs` as a `weakref` here to ensure there is no scenario where uncalled
-    # cleanup functions result in holding the `hs` in memory.
+    # A weakref, not a strong reference: tests/app/test_homeserver_shutdown.py
+    # explicitly shuts a homeserver down and checks it becomes garbage
+    # collectible *before* Trial ever invokes this cleanup, which would be
+    # impossible if this closure held a strong reference for the whole test.
+    # Worker/secondary homeservers created via `make_worker_hs` are kept
+    # alive independently for the test's duration (see
+    # `BaseMultiWorkerStreamTestCase._worker_homeservers`), so this no longer
+    # goes stale before it fires for them.
     cleanup_hs_ref = weakref.ref(hs)
 
     def shutdown_hs_on_cleanup() -> "Deferred[None]":
         cleanup_hs = cleanup_hs_ref()
-        deferred: "Deferred[None]" = defer.succeed(None)
-        if cleanup_hs is not None:
-            deferred = defer.ensureDeferred(cleanup_hs.shutdown())
+        if cleanup_hs is None:
+            return defer.succeed(None)
+        _sd0 = time.monotonic()
+        deferred = defer.ensureDeferred(cleanup_hs.shutdown())
+        if USE_POSTGRES_FOR_TESTS:
+
+            def _record_shutdown_timing(result: Any) -> Any:
+                _pg_timing("hs_shutdown", time.monotonic() - _sd0, test_name=test_name)
+                return result
+
+            deferred.addBoth(_record_shutdown_timing)
         return deferred
 
     # Install @cache_in_self attributes
@@ -1384,8 +2208,23 @@ def setup_test_homeserver(
 
     # Patch `make_pool` before initialising the database, to make database transactions
     # synchronous for testing.
+    _t0 = time.monotonic()
+
+    # Set up PG timing callback for database timing profiling.
+    from synapse.storage.databases import set_pg_timing_callback
+
+    if os.environ.get("SYNAPSE_PG_TIMINGS"):
+        set_pg_timing_callback(_pg_timing)
+
     with patch("synapse.storage.database.make_pool", side_effect=make_fake_db_pool):
         hs.setup()
+    if USE_POSTGRES_FOR_TESTS:
+        # Only counted for PG: the "Postgres test-DB lifecycle timings"
+        # summary must not silently fold SQLite setup into PG numbers.
+        _pg_timing("hs_setup_total", time.monotonic() - _t0)
+
+    if os.environ.get("SYNAPSE_PG_TIMINGS"):
+        set_pg_timing_callback(None)
 
     # Ideally, setup/start would be separated but since this is historically used
     # throughout tests, we keep the existing behavior for now. We probably just need to
@@ -1400,6 +2239,14 @@ def setup_test_homeserver(
     # pool has already been closed can leave a live PostgreSQL session behind
     # and make DROP DATABASE fail.
     cleanup_func(shutdown_hs_on_cleanup)
+
+    if USE_POSTGRES_FOR_TESTS:
+        # Whole-function wall time: homeserver construction + DB lifecycle +
+        # `hs.setup()` + `start_test_homeserver`. `hs_setup_total` above only
+        # measures the database-initialisation slice of this, so the difference
+        # between the two tags is the pure Python-side construction cost --
+        # that's the slice the per-table/lifecycle timers have never covered.
+        _pg_timing("hs_setup_wall", time.monotonic() - _t0_wall)
 
     return hs
 

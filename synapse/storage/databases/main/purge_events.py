@@ -25,6 +25,8 @@ from typing import Any, cast
 from synapse.api.errors import SynapseError
 from synapse.storage.database import LoggingTransaction
 from synapse.storage.databases.main import CacheInvalidationWorkerStore
+from synapse.storage.databases.main.embedded_common import Pool, sync_now
+from synapse.storage.databases.main.embedded_event_edges import delete_event_edges_batch
 from synapse.storage.databases.main.embedded_event_json import delete_event_json_batch
 from synapse.storage.databases.main.embedded_event_to_state_group import (
     decrement_state_group_refcounts_batch,
@@ -296,13 +298,16 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             # Exclusive by configured engine, not a dual-write -- see
             # embedded_event_to_state_group.py. This is the *forward*
             # lookup (event_id -> state_group) for exactly the event_ids in
-            # this purge batch's temp table, which mdbx answers directly;
+            # this purge batch's temp table, which mtxdb answers directly;
             # it is not the reverse "is state_group X still referenced
             # elsewhere" question (that's get_referenced_state_groups,
             # backed by the separate refcount).
             all_purge_event_ids = [event_id for event_id, _should_delete in event_rows]
             event_id_to_state_group = get_state_group_for_events_batch(
-                self._embedded_hamt_namespace, all_purge_event_ids
+                self._embedded_hamt_engine,
+                self._embedded_hamt_namespace,
+                all_purge_event_ids,
+                purpose="purge_traversal",
             )
             referenced_state_groups = set(event_id_to_state_group.values())
             logger.info(
@@ -311,12 +316,17 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
 
             logger.info("[purge] removing events from event_to_state_groups")
             delete_event_to_state_group_batch(
-                self._embedded_hamt_namespace, list(event_id_to_state_group.keys())
+                self._embedded_hamt_engine,
+                self._embedded_hamt_namespace,
+                list(event_id_to_state_group.keys()),
             )
             decrement_state_group_refcounts_batch(
+                self._embedded_hamt_engine,
                 self._embedded_hamt_namespace,
                 list(event_id_to_state_group.values()),
             )
+            # Immediate sync + clear dirty flags for the whole purge batch.
+            sync_now(pools=[Pool.STATE])
         else:
             # Get all state groups that are referenced by events that are to be
             # deleted.
@@ -361,11 +371,23 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
         # The `event_json` DELETE above only removed the SQL rows; the
         # embedded mirror (if any) has its own copy under `event_json:<id>`
         # keys that must be removed too, or purged events keep serving their
-        # pre-purge content forever from mdbx -- see embedded_event_json.py.
+        # pre-purge content forever from mtxdb -- see embedded_event_json.py.
         if getattr(self, "_embedded_event_json_enabled", False):
             delete_event_json_batch(
-                [event_id for event_id, should_delete in event_rows if should_delete]
+                self._embedded_hamt_engine,
+                self._embedded_hamt_namespace,
+                [event_id for event_id, should_delete in event_rows if should_delete],
             )
+        if getattr(self, "_embedded_event_edges_writable", False):
+            deleted_edge_ids = [
+                event_id for event_id, should_delete in event_rows if should_delete
+            ]
+            if deleted_edge_ids:
+                txn.call_after(
+                    delete_event_edges_batch,
+                    self._embedded_hamt_namespace,
+                    deleted_edge_ids,
+                )
 
         # Some of the `event_push_actions` we're about to delete may have already
         # been rotated into the aggregate `event_push_summary` counts. Deleting
@@ -484,7 +506,7 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
 
         self._invalidate_cache_and_stream_bulk(
             txn,
-            self._get_state_group_for_event,
+            self._get_state_group_for_event_sql,
             [(event_id,) for event_id, _ in event_rows],
         )
 
@@ -581,19 +603,21 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             # embedded_event_auth_chain_links.py. The `LEFT JOIN` above can
             # yield `(None, None)` for events with no chain cover entry
             # (e.g. non-state events); a raw SQL `WHERE origin_chain_id =
-            # NULL` matches nothing harmlessly, but building an mdbx key
+            # NULL` matches nothing harmlessly, but building an mtxdb key
             # from `None` would crash, so filter those out explicitly.
             from synapse.storage.databases.main.embedded_event_auth_chain_links import (
                 delete_chain_links_batch,
             )
 
             delete_chain_links_batch(
+                self._embedded_hamt_engine,
                 self._embedded_hamt_namespace,
                 [
                     (chain_id, sequence_number)
                     for chain_id, sequence_number in referenced_chain_id_tuples
                     if chain_id is not None
                 ],
+                sync=True,
             )
         else:
             txn.executemany(
@@ -627,19 +651,38 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
         # As in _purge_history_txn: the event_json DELETE above only cleared
         # SQL, the embedded mirror needs its own delete pass.
         if room_event_ids:
-            delete_event_json_batch(room_event_ids)
+            delete_event_json_batch(
+                self._embedded_hamt_engine,
+                self._embedded_hamt_namespace,
+                room_event_ids,
+            )
+            if getattr(self, "_embedded_event_edges_writable", False):
+                txn.call_after(
+                    delete_event_edges_batch,
+                    self._embedded_hamt_namespace,
+                    room_event_ids,
+                )
             # Same for event_to_state_groups: fetch state_groups before
             # deleting so the refcount can be rebalanced.
             event_id_to_state_group = get_state_group_for_events_batch(
-                self._embedded_hamt_namespace, room_event_ids
+                self._embedded_hamt_engine,
+                self._embedded_hamt_namespace,
+                room_event_ids,
+                purpose="purge_traversal",
             )
             delete_event_to_state_group_batch(
-                self._embedded_hamt_namespace, list(event_id_to_state_group.keys())
+                self._embedded_hamt_engine,
+                self._embedded_hamt_namespace,
+                list(event_id_to_state_group.keys()),
             )
             decrement_state_group_refcounts_batch(
+                self._embedded_hamt_engine,
                 self._embedded_hamt_namespace,
                 list(event_id_to_state_group.values()),
             )
+            # One sync for the whole purge batch (event_json delete +
+            # Immediate sync + clear dirty flags for event_dag and state.
+            sync_now(pools=[Pool.EVENT_DAG, Pool.STATE])
 
         # Other tables we do NOT need to clear out:
         #

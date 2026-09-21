@@ -90,8 +90,21 @@ class DatabaseConfig(Config):
         # (see StateGroupDataStore.hamt_namespace) -- defaults to the server
         # name when unset. Only useful for isolating multiple homeservers
         # that share one embedded-engine file (e.g. many trial test
-        # processes reusing one mdbx path), not a normal deployment concern.
+        # processes reusing one mtxdb path), not a normal deployment concern.
         self.embedded_hamt_namespace: str | None = None
+        # Diagnostic escape hatch: when True, all DURABLE-tier sync() calls
+        # are suppressed (maybe_sync returns immediately).  Reintroduces the
+        # silent-data-loss window that SyncTier.DURABLE exists to close --
+        # NOT for production use.  Set via embedded_hamt.no_sync or
+        # SYNAPSE_MTXDB_NO_SYNC env var.
+        self.embedded_hamt_no_sync: bool = False
+        # If set, Databases.__init__ timing data (tag → total seconds + call
+        # count) is written as JSON to this path after HomeServer.setup()
+        # completes.  Intended for profiling production startup (e.g.
+        # Complement runs) without the Trial test harness.  Set via
+        # database.setup_timings_path in config or SYNAPSE_DB_SETUP_TIMINGS_PATH
+        # env var.
+        self.setup_timings_path: str | None = None
 
     def read_config(self, config: JsonDict, **kwargs: Any) -> None:
         # We *experimentally* support specifying multiple databases via the
@@ -118,6 +131,10 @@ class DatabaseConfig(Config):
             self.embedded_hamt_engine = embedded_config.get("engine")
             self.embedded_hamt_path = embedded_config.get("path")
             self.embedded_hamt_namespace = embedded_config.get("namespace")
+            no_sync = embedded_config.get("no_sync", False)
+            if not isinstance(no_sync, bool):
+                raise ConfigError("embedded_hamt.no_sync must be a boolean")
+            self.embedded_hamt_no_sync = no_sync
 
         env_engine = os.environ.get("SYNAPSE_EMBEDDED_HAMT_ENGINE")
         if env_engine:
@@ -125,23 +142,29 @@ class DatabaseConfig(Config):
         env_path = os.environ.get("SYNAPSE_EMBEDDED_HAMT_PATH")
         if env_path:
             self.embedded_hamt_path = env_path
+        if os.environ.get("SYNAPSE_MTXDB_NO_SYNC"):
+            self.embedded_hamt_no_sync = True
 
         # A concise production switch. The path is deliberately still
         # required: unlike tests, a production server must never silently put
         # persistent state into a temporary directory.
-        if os.environ.get("SYNAPSE_MDBX"):
-            self.embedded_hamt_engine = "mdbx"
+        if os.environ.get("SYNAPSE_MTXDB"):
+            self.embedded_hamt_engine = "mtxdb"
             self.embedded_hamt_path = os.environ.get(
-                "SYNAPSE_MDBX_PATH", self.embedded_hamt_path
+                "SYNAPSE_MTXDB_PATH", self.embedded_hamt_path
             )
             if not self.embedded_hamt_path:
                 raise ConfigError(
-                    "SYNAPSE_MDBX requires SYNAPSE_MDBX_PATH or embedded_hamt.path"
+                    "SYNAPSE_MTXDB requires SYNAPSE_MTXDB_PATH or embedded_hamt.path"
                 )
+
+        self.setup_timings_path = config.get("setup_timings_path") or os.environ.get(
+            "SYNAPSE_DB_SETUP_TIMINGS_PATH"
+        )
 
         # Validate embedded_hamt engine/path consistency.
         # A half-set config (engine without path) boots fine but crashes on
-        # first state write with "RuntimeError: mdbx not opened".
+        # first state write with "RuntimeError: mtxdb not opened".
         if self.embedded_hamt_engine and not self.embedded_hamt_path:
             raise ConfigError(
                 f"embedded_hamt.engine is set to {self.embedded_hamt_engine!r} "
@@ -153,12 +176,12 @@ class DatabaseConfig(Config):
             raise ConfigError(
                 "embedded_hamt.path is set but embedded_hamt.engine is not. "
                 "Set embedded_hamt.engine (or SYNAPSE_EMBEDDED_HAMT_ENGINE) to "
-                "'mdbx', or remove the path setting."
+                "'mtxdb', or remove the path setting."
             )
-        if self.embedded_hamt_engine and self.embedded_hamt_engine != "mdbx":
+        if self.embedded_hamt_engine and self.embedded_hamt_engine != "mtxdb":
             raise ConfigError(
                 f"embedded_hamt.engine is {self.embedded_hamt_engine!r}, "
-                "but only 'mdbx' is supported."
+                "but only 'mtxdb' is supported."
             )
 
         if multi_database_config and database_config:

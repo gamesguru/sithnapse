@@ -96,6 +96,7 @@ def prepare_database(
     database_engine: BaseDatabaseEngine,
     config: HomeServerConfig | None,
     databases: Collection[str] = ("main", "state"),
+    db_is_fresh: bool = False,
 ) -> None:
     """Prepares a physical database for usage. Will either create all necessary tables
     or upgrade from an older schema version.
@@ -109,6 +110,12 @@ def prepare_database(
             is skipped when `None` is passed.
         databases: The name of the databases that will be used
             with this physical database. Defaults to all databases.
+        db_is_fresh: If True, the database is a freshly-created empty clone of a
+            fully-prepared template.  The schema is already at SCHEMA_VERSION with no
+            outstanding deltas.  Skip the schema-state queries and the delta loop;
+            only run _apply_module_schemas so config-specific module schemas are
+            applied.  Must only be set by the test harness immediately after
+            CREATE DATABASE ... WITH TEMPLATE.
     Raises:
         ValueError: Passing `config=None` when a database already has a schema raises
             `ValueError`, as we can't upgrade an existing database without the config.
@@ -131,48 +138,62 @@ def prepare_database(
         ):
             cur.execute("BEGIN TRANSACTION")
 
-        logger.info("%r: Checking existing schema version", databases)
-        version_info = _get_or_create_schema_state(cur, database_engine)
-
-        if version_info:
-            logger.info(
-                "%r: Existing schema is %i (+%i deltas)",
+        if db_is_fresh:
+            # The database is a verbatim clone of a fully-prepared template:
+            # schema_version == SCHEMA_VERSION, no outstanding deltas, and
+            # compat_version is already current.  Skip the schema-state queries
+            # and the delta scan entirely.  Only run _apply_module_schemas so
+            # any config-specific password-provider schemas are applied (this is
+            # a no-op in all current tests).
+            logger.debug(
+                "%r: fresh clone — skipping schema-state check and delta loop",
                 databases,
-                version_info.current_version,
-                len(version_info.applied_deltas),
             )
+            if config is not None:
+                _apply_module_schemas(cur, database_engine, config)
+        else:
+            logger.info("%r: Checking existing schema version", databases)
+            version_info = _get_or_create_schema_state(cur, database_engine)
 
-            # config should only be None when we are preparing an in-memory SQLite db,
-            # which should be empty.
-            if config is None:
-                raise ValueError(
-                    "config==None in prepare_database, but database is not empty"
+            if version_info:
+                logger.info(
+                    "%r: Existing schema is %i (+%i deltas)",
+                    databases,
+                    version_info.current_version,
+                    len(version_info.applied_deltas),
                 )
 
-            # This should be run on all processes, master or worker. The master will
-            # apply the deltas, while workers will check if any outstanding deltas
-            # exist and raise an PrepareDatabaseException if they do.
-            _upgrade_existing_database(
-                cur,
-                version_info,
-                database_engine,
-                config,
-                databases=databases,
-            )
+                # config should only be None when we are preparing an in-memory SQLite db,
+                # which should be empty.
+                if config is None:
+                    raise ValueError(
+                        "config==None in prepare_database, but database is not empty"
+                    )
 
-        else:
-            logger.info("%r: Initialising new database", databases)
+                # This should be run on all processes, master or worker. The master will
+                # apply the deltas, while workers will check if any outstanding deltas
+                # exist and raise an PrepareDatabaseException if they do.
+                _upgrade_existing_database(
+                    cur,
+                    version_info,
+                    database_engine,
+                    config,
+                    databases=databases,
+                )
 
-            # if it's a worker app, refuse to upgrade the database, to avoid multiple
-            # workers doing it at once.
-            if config and config.worker.worker_app is not None:
-                raise UpgradeDatabaseException(EMPTY_DATABASE_ON_WORKER_ERROR)
+            else:
+                logger.info("%r: Initialising new database", databases)
 
-            _setup_new_database(cur, database_engine, databases=databases)
+                # if it's a worker app, refuse to upgrade the database, to avoid multiple
+                # workers doing it at once.
+                if config and config.worker.worker_app is not None:
+                    raise UpgradeDatabaseException(EMPTY_DATABASE_ON_WORKER_ERROR)
 
-        # check if any of our configured dynamic modules want a database
-        if config is not None:
-            _apply_module_schemas(cur, database_engine, config)
+                _setup_new_database(cur, database_engine, databases=databases)
+
+            # check if any of our configured dynamic modules want a database
+            if config is not None:
+                _apply_module_schemas(cur, database_engine, config)
 
         cur.close()
         db_conn.commit()

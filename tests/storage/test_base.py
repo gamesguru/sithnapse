@@ -51,11 +51,13 @@ class SQLBaseStoreTestCase(unittest.TestCase):
                 extras, "execute_batch", new=self.mock_execute_batch
             )
             self.execute_batch_patcher.start()
+            self.addCleanup(self.execute_batch_patcher.stop)
             self.mock_execute_values = Mock()
             self.execute_values_patcher = patch.object(
                 extras, "execute_values", new=self.mock_execute_values
             )
             self.execute_values_patcher.start()
+            self.addCleanup(self.execute_values_patcher.stop)
 
             self.mock_conn = Mock(
                 spec_set=[
@@ -109,11 +111,6 @@ class SQLBaseStoreTestCase(unittest.TestCase):
         db._db_pool = conn_pool
 
         self.datastore = SQLBaseStore(db, None, hs)  # type: ignore[arg-type]
-
-    def tearDown(self) -> None:
-        if USE_POSTGRES_FOR_TESTS:
-            self.execute_batch_patcher.stop()
-            self.execute_values_patcher.stop()
 
     @defer.inlineCallbacks
     def test_insert_1col(self) -> Generator["defer.Deferred[object]", object, None]:

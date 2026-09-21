@@ -251,6 +251,18 @@ class StateHandler:
         Returns:
             The hosts in the room at the given events
         """
+        if len(event_ids) > 1:
+            rows = await self.store.db_pool.simple_select_many_batch(
+                table="event_to_state_groups",
+                column="event_id",
+                iterable=event_ids,
+                retcols=("event_id",),
+                desc="get_hosts_in_room_at_events_filter_outliers",
+            )
+            non_outlier_event_ids = {r[0] for r in rows}
+            if non_outlier_event_ids:
+                event_ids = non_outlier_event_ids
+
         entry = await self.resolve_state_groups_for_events(room_id, event_ids)
         return await self._state_storage_controller.get_joined_hosts(room_id, entry)
 
@@ -333,9 +345,23 @@ class StateHandler:
             # we've already taken into account partial state, so no need to wait for
             # complete state here.
 
+            state_prev_event_ids = prev_event_ids
+            if len(prev_event_ids) > 1:
+                # If there are multiple prev_events, some may be stateless
+                # outliers (e.g. an out-of-band remote invite in a room the
+                # server is already participating in). Filter them out for state
+                # resolution so long as at least one state-bearing event remains.
+                non_outlier_prev_events = set()
+                for prev_id in prev_event_ids:
+                    sg = await self.store._get_state_group_for_event(prev_id)
+                    if sg is not None:
+                        non_outlier_prev_events.add(prev_id)
+                if non_outlier_prev_events:
+                    state_prev_event_ids = frozenset(non_outlier_prev_events)
+
             entry = await self.resolve_state_groups_for_events(
                 event.room_id,
-                prev_event_ids,
+                state_prev_event_ids,
                 await_full_state=False,
             )
 
@@ -505,9 +531,23 @@ class StateHandler:
         """
         logger.debug("resolve_state_groups event_ids %s", event_ids)
 
-        state_groups = await self._state_storage_controller.get_state_group_for_events(
-            event_ids, await_full_state=await_full_state
-        )
+        try:
+            state_groups = (
+                await self._state_storage_controller.get_state_group_for_events(
+                    event_ids, await_full_state=await_full_state
+                )
+            )
+        except RuntimeError:
+            # Tolerate unresolvable events when the caller explicitly opted out
+            # of waiting for full state (`await_full_state=False`): event
+            # creation passes this and falls back to caller-supplied auth
+            # events when the prev events are not (yet) resolvable -- a
+            # mid-flight event whose state-group mapping is only published at
+            # event persist, or a stateless outlier. Return the same empty
+            # state entry as the all-unknown branch below rather than raising.
+            if not await_full_state:
+                return _StateCacheEntry(state={}, state_group=None)
+            raise
 
         state_group_ids = state_groups.values()
 

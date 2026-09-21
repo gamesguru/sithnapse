@@ -1310,14 +1310,15 @@ class DeviceWriterHandler(DeviceHandler):
             len(potentially_changed_hosts),
         )
 
-        for user_id, device_id in local_changes:
-            await self.store.add_device_list_outbound_pokes(
-                user_id=user_id,
-                device_id=device_id,
-                room_id=room_id,
-                hosts=potentially_changed_hosts,
-                context=None,
-            )
+        # Batch every affected device into one transaction instead of one
+        # round trip (its own stream ID allocation, connection checkout, and
+        # commit) per device -- a resync can affect many local users/devices
+        # at once, and they all share the same `hosts`/`room_id`/`context`.
+        await self.store.add_device_list_outbound_pokes_for_users(
+            user_device_ids=local_changes,
+            hosts=potentially_changed_hosts,
+            context=None,
+        )
 
         # Notify things that device lists need to be sent out.
         self.notifier.notify_replication()
@@ -1541,11 +1542,10 @@ class DeviceListUpdater(DeviceListWorkerUpdater):
         # Check if we are partially joining any rooms. If so we need to store
         # all device list updates so that we can handle them correctly once we
         # know who is in the room.
-        # TODO(faster_joins): this fetches and processes a bunch of data that we don't
-        # use. Could be replaced by a tighter query e.g.
-        #   SELECT EXISTS(SELECT 1 FROM partial_state_rooms)
-        partial_rooms = await self.store.get_partial_state_room_resync_info()
-        if partial_rooms:
+        # We only need to know whether any room is partial here. Building the
+        # full room/server resync-info map performs multiple SQL queries for
+        # every device-list update; use the cached existence check instead.
+        if await self.store.has_partial_state_rooms():
             await self.store.add_remote_device_list_to_pending(
                 user_id,
                 device_id,

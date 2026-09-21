@@ -554,7 +554,7 @@ class CacheInvalidationWorkerStore(SQLBaseStore):
         self._attempt_to_invalidate_cache("get_room_type", (room_id,))
         self._attempt_to_invalidate_cache("get_room_encryption", (room_id,))
 
-        self._attempt_to_invalidate_cache("_get_state_group_for_event", None)
+        self._attempt_to_invalidate_cache("_get_state_group_for_event_sql", None)
 
         self._attempt_to_invalidate_cache("get_event_ordering", None)
         self._attempt_to_invalidate_cache("get_metadata_for_event", (room_id,))

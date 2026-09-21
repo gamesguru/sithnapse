@@ -2377,7 +2377,13 @@ class FederationEventHandler:
             logger.info("Failed to get event auth from remote: %s", e1)
             return
 
-        logger.info("/event_auth returned %i events", len(remote_events))
+        returned_event_ids = {remote_event.event_id for remote_event in remote_events}
+        logger.info(
+            "/event_auth returned %i events for %s: %s",
+            len(returned_event_ids),
+            event_id,
+            sorted(returned_event_ids),
+        )
 
         # `event` may be returned, but we should not yet process it.
         remote_auth_events = (e for e in remote_events if e.event_id != event_id)

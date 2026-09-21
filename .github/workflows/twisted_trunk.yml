@@ -90,7 +90,7 @@ jobs:
           uv remove twisted
           uv add "twisted[tls] @ git+https://github.com/twisted/twisted.git#trunk"
           uv sync --all-extras
-      - run: uv run trial --jobs 2 tests
+      - run: uv run trial --jobs "$(nproc)" tests
       - name: Dump logs
         # Logs are most useful when the command fails, always include them.
         if: ${{ always() }}

@@ -72,6 +72,7 @@ from synapse.handlers.worker_lock import NEW_EVENT_DURING_PURGE_LOCK_NAME
 from synapse.logging import opentracing
 from synapse.logging.context import make_deferred_yieldable, run_in_background
 from synapse.replication.http.send_events import ReplicationSendEventsRestServlet
+from synapse.state import _StateCacheEntry
 from synapse.storage.databases.main.events_worker import EventRedactBehaviour
 from synapse.types import (
     JsonDict,
@@ -1920,6 +1921,12 @@ class EventCreationHandler:
         assert self._external_cache_joined_hosts_updates is not None
 
         for event, event_context in events_and_context:
+            # OOB membership events are never sent to federation. They may
+            # intentionally have no state group, so there is no useful
+            # joined-hosts cache entry to calculate for them.
+            if event.internal_metadata.is_out_of_band_membership():
+                continue
+
             if event_context.partial_state:
                 # To populate the cache for a partial-state event, we either have to
                 # block until full state, which the code below does, or change the
@@ -1941,12 +1948,24 @@ class EventCreationHandler:
             # Note: We set the state group -> joined hosts cache if it hasn't been
             # set for a while, so that the expiry time is reset.
 
-            state_entry = await self.state.resolve_state_groups_for_events(
-                event.room_id,
-                event_ids=event.prev_state_events
-                if supports_msc4242_state_dag(event)
-                else event.prev_event_ids(),
+            # A persisted context already contains the state group before the
+            # event. Use it directly instead of resolving prev_events again:
+            # an OOB membership event is intentionally stateless and may be a
+            # prev_event of the local join/leave event.
+            state_group_before_event = getattr(
+                event_context, "state_group_before_event", None
             )
+            if state_group_before_event is not None:
+                state_entry = _StateCacheEntry(
+                    state=None, state_group=state_group_before_event
+                )
+            else:
+                state_entry = await self.state.resolve_state_groups_for_events(
+                    event.room_id,
+                    event_ids=event.prev_state_events
+                    if supports_msc4242_state_dag(event)
+                    else event.prev_event_ids(),
+                )
 
             if state_entry.state_group:
                 await self._external_cache.set(

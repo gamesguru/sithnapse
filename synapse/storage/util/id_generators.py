@@ -303,21 +303,21 @@ class MultiWriterIdGenerator(AbstractStreamIdGenerator):
             positive=positive,
         )
 
-        # We check that the table and sequence haven't diverged.
-        for table, _, id_column in tables:
-            self._sequence_gen.check_consistency(
-                db_conn,
-                table=table,
-                id_column=id_column,
-                stream_name=stream_name,
-                positive=positive,
-            )
+        if not db.is_fresh:
+            # We check that the table and sequence haven't diverged.
+            for table, _, id_column in tables:
+                self._sequence_gen.check_consistency(
+                    db_conn,
+                    table=table,
+                    id_column=id_column,
+                    stream_name=stream_name,
+                    positive=positive,
+                )
 
         # This goes and fills out the above state from the database.
-        # This may read on the PostgreSQL sequence, and
-        # SequenceGenerator.check_consistency might have fixed up the sequence, which
-        # means the SequenceGenerator needs to be setup before we read the value from
-        # the sequence.
+        # This reads on the PostgreSQL sequence (ensuring advanced sequences like
+        # thread_subscriptions_sequence are correctly initialized) and sets up
+        # _current_positions for all configured writers.
         self._load_current_ids(db_conn, tables, sequence_name)
 
         self._max_seen_allocated_stream_id = max(

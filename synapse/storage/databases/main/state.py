@@ -50,6 +50,10 @@ from synapse.storage.database import (
     LoggingTransaction,
     make_in_list_sql_clause,
 )
+from synapse.storage.databases.main.embedded_common import (
+    Pool,
+    sync_now,
+)
 from synapse.storage.databases.main.embedded_event_to_state_group import (
     decrement_state_group_refcounts_batch,
     get_referenced_state_groups_batch,
@@ -118,7 +122,7 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
         if stream_name == UnPartialStatedEventStream.NAME:
             for row in rows:
                 assert isinstance(row, UnPartialStatedEventStreamRow)
-                self._get_state_group_for_event.invalidate((row.event_id,))
+                self._get_state_group_for_event_sql.invalidate((row.event_id,))
                 self.is_partial_state_event.invalidate((row.event_id,))
 
         super().process_replication_rows(stream_name, instance_name, token, rows)
@@ -598,13 +602,34 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             "get_filtered_current_state_ids", _get_filtered_current_state_ids_txn
         )
 
-    @cached(max_entries=50000)
     async def _get_state_group_for_event(self, event_id: str) -> int | None:
         if getattr(self, "_embedded_event_json_enabled", False):
-            found = get_state_group_for_events_batch(
-                self._embedded_hamt_namespace, [event_id]
+            if event_id not in self._un_partial_stated_event_ids:
+                found = get_state_group_for_events_batch(
+                    self._embedded_hamt_engine,
+                    self._embedded_hamt_namespace,
+                    [event_id],
+                    purpose="read_point",
+                )
+                if event_id in found:
+                    return found[event_id]
+            row = await self.db_pool.simple_select_one_onecol(
+                table="event_to_state_groups",
+                keyvalues={"event_id": event_id},
+                retcol="state_group",
+                allow_none=True,
+                desc="_get_state_group_for_event_sql_fallback",
             )
-            return found.get(event_id)
+            if row is not None:
+                return row
+            return self._get_state_group_for_event_sql.cache.get_immediate(
+                event_id,
+                None,
+            )
+        return await self._get_state_group_for_event_sql(event_id)
+
+    @cached(max_entries=50000)
+    async def _get_state_group_for_event_sql(self, event_id: str) -> int | None:
         return await self.db_pool.simple_select_one_onecol(
             table="event_to_state_groups",
             keyvalues={"event_id": event_id},
@@ -613,29 +638,48 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             desc="_get_state_group_for_event",
         )
 
-    @cachedList(
-        cached_method_name="_get_state_group_for_event",
-        list_name="event_ids",
-        num_args=1,
-    )
     async def _get_state_group_for_events(
         self, event_ids: Collection[str]
     ) -> Mapping[str, int]:
         """Returns mapping event_id -> state_group.
 
+        This deliberately does not use ``@cachedList``. That decorator uses
+        the scalar cache and treats ``None`` as a cacheable negative result.
+        For the embedded backend, a worker can observe a temporary miss while
+        another worker is persisting the mapping; reusing that negative would
+        prevent the refresh-aware mtxdb lookup from running.
+
         Raises:
              RuntimeError if the state is unknown at any of the given events
         """
         if getattr(self, "_embedded_event_json_enabled", False):
-            # Exclusive by configured engine, not a dual-write -- see
-            # embedded_event_to_state_group.py. A miss here (unlike
-            # embedded_event_json's mirror) is not silently re-read from
-            # SQL: once this engine is configured it's the source of truth
-            # for state_group mappings, so a genuine miss surfaces as the
-            # same RuntimeError a SQL miss would.
+            un_partial_stated = {
+                eid for eid in event_ids if eid in self._un_partial_stated_event_ids
+            }
+            embedded_event_ids = [e for e in event_ids if e not in un_partial_stated]
             res = get_state_group_for_events_batch(
-                self._embedded_hamt_namespace, list(event_ids)
+                self._embedded_hamt_engine,
+                self._embedded_hamt_namespace,
+                embedded_event_ids,
+                purpose="read_batch",
             )
+            missing_event_ids = [
+                event_id for event_id in embedded_event_ids if event_id not in res
+            ]
+            missing_event_ids.extend(un_partial_stated)
+            if missing_event_ids:
+                rows = cast(
+                    list[tuple[str, int]],
+                    await self.db_pool.simple_select_many_batch(
+                        table="event_to_state_groups",
+                        column="event_id",
+                        iterable=missing_event_ids,
+                        keyvalues={},
+                        retcols=("event_id", "state_group"),
+                        desc="_get_state_group_for_events_sql_fallback",
+                    ),
+                )
+                res.update(dict(rows))
         else:
             rows = cast(
                 list[tuple[str, int]],
@@ -650,9 +694,33 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             )
             res = dict(rows)
 
-        for e in event_ids:
-            if e not in res:
-                raise RuntimeError("No state group for unknown or outlier event %s" % e)
+        missing = set(event_ids).difference(res)
+        if missing:
+            # The batch reads above can transiently miss an event whose
+            # mapping was already prefilled into the scalar cache at persist
+            # commit: the embedded engine's mapping publication is coalesced,
+            # and a worker may observe the event before the fallback SQL row
+            # is visible to it. Peek the scalar cache for *completed* values
+            # (never call it, so no negative results are planted) before
+            # giving up.
+            for event_id in list(missing):
+                # `_get_state_group_for_event_sql` takes a single arg, so its
+                # cache key is the bare event_id, not a 1-tuple -- the
+                # key-builder special-cases num_args == 1 to skip wrapping.
+                cached = self._get_state_group_for_event_sql.cache.get_immediate(
+                    # A cached `None` (e.g. a rejected event's mapping) is the
+                    # same as a miss here: it carries no usable state group.
+                    event_id,
+                    None,
+                )
+                if cached is not None:
+                    res[event_id] = cached
+            missing = set(event_ids).difference(res)
+        if missing:
+            raise RuntimeError(
+                "State mapping disappeared before _get_state_group_for_events "
+                f"returned: {missing}"
+            )
         return res
 
     async def get_referenced_state_groups(
@@ -676,7 +744,9 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             # module docstring for why a count (not an event-list index)
             # keeps this O(1) per write regardless of room activity.
             return get_referenced_state_groups_batch(
-                self._embedded_hamt_namespace, list(state_groups)
+                self._embedded_hamt_engine,
+                self._embedded_hamt_namespace,
+                list(state_groups),
             )
 
         rows = cast(
@@ -742,19 +812,37 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             # reference forever, since a partial-state event's placeholder
             # group is never otherwise decremented).
             old = get_state_group_for_events_batch(
-                self._embedded_hamt_namespace, [event.event_id]
+                self._embedded_hamt_engine,
+                self._embedded_hamt_namespace,
+                [event.event_id],
+                purpose="partial_state_rewrite",
             )
             put_event_to_state_group_batch(
-                self._embedded_hamt_namespace, [(event.event_id, state_group)]
+                self._embedded_hamt_engine,
+                self._embedded_hamt_namespace,
+                [(event.event_id, state_group)],
             )
             old_state_group = old.get(event.event_id)
             if old_state_group is not None and old_state_group != state_group:
                 decrement_state_group_refcounts_batch(
-                    self._embedded_hamt_namespace, [old_state_group]
+                    self._embedded_hamt_engine,
+                    self._embedded_hamt_namespace,
+                    [old_state_group],
                 )
                 increment_state_group_refcounts_batch(
-                    self._embedded_hamt_namespace, [state_group]
+                    self._embedded_hamt_engine,
+                    self._embedded_hamt_namespace,
+                    [state_group],
                 )
+            self.db_pool.simple_update_txn(
+                txn,
+                table="event_to_state_groups",
+                keyvalues={"event_id": event.event_id},
+                updatevalues={"state_group": state_group},
+            )
+            # Immediately sync STATE pool to mtxdb after SQL commit so reader workers
+            # see the updated state group without waiting for debounce.
+            txn.call_after(sync_now, [Pool.STATE])
         else:
             self.db_pool.simple_update_txn(
                 txn,
@@ -762,6 +850,9 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
                 keyvalues={"event_id": event.event_id},
                 updatevalues={"state_group": state_group},
             )
+
+        self._un_partial_stated_event_ids.add(event.event_id)
+        txn.call_after(self.is_un_partial_stated_event.invalidate, (event.event_id,))
 
         # the event may now be rejected where it was not before, or vice versa,
         # in which case we need to update the rejected flags.
@@ -779,7 +870,7 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
 
         txn.call_after(self.is_partial_state_event.invalidate, (event.event_id,))
         txn.call_after(
-            self._get_state_group_for_event.prefill,
+            self._get_state_group_for_event_sql.prefill,
             (event.event_id,),
             state_group,
         )

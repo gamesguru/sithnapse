@@ -21,6 +21,7 @@
 
 import json
 import logging
+import unittest
 from typing import cast
 from unittest.mock import patch
 
@@ -31,14 +32,16 @@ from twisted.internet.testing import MemoryReactor
 from synapse.api.constants import EventTypes, Membership
 from synapse.api.room_versions import RoomVersions
 from synapse.events import EventBase
-from synapse.events.snapshot import UnpersistedEventContext
+from synapse.events.snapshot import EventContext, UnpersistedEventContext
 from synapse.server import HomeServer
+from synapse.storage.database import LoggingTransaction
 from synapse.types import JsonDict, RoomID, StateMap, UserID, create_requester
 from synapse.types.state import StateFilter
 from synapse.util.clock import Clock
 from synapse.util.stringutils import random_string
 
 from tests.unittest import HomeserverTestCase
+from tests.utils import EMBEDDED_HAMT_ENGINE
 
 logger = logging.getLogger(__name__)
 
@@ -68,12 +71,12 @@ class StateStoreTestCase(HomeserverTestCase):
     def _force_sql_only_hamt(self) -> None:
         """Some tests assert pure-SQL HAMT behaviour specifically and must
         stay deterministic regardless of SYNAPSE_TEST_EMBEDDED_HAMT_ENGINE
-        (the trial-mdbx CI job runs the *whole* suite through the embedded
+        (the trial-mtxdb CI job runs the *whole* suite through the embedded
         engine by default -- see tests/utils.py's default_config -- so a
         test that specifically wants SQL must force it off locally rather
         than assume it's already off).
         """
-        self.state_datastore.embedded_hamt_engine = None
+        self.state_datastore._embedded_hamt_engine = None
 
     def inject_state_event(
         self, room: RoomID, sender: UserID, typ: str, state_key: str, content: JsonDict
@@ -158,24 +161,31 @@ class StateStoreTestCase(HomeserverTestCase):
             {(EventTypes.Create, ""): e1.event_id, (EventTypes.Name, ""): e2.event_id},
         )
 
-    def test_state_group_reads_via_embedded_mdbx_engine(self) -> None:
+    @unittest.skipUnless(EMBEDDED_HAMT_ENGINE, "requires embedded HAMT engine")
+    def test_state_group_reads_via_embedded_mtxdb_engine(self) -> None:
         """With `embedded_hamt_engine` configured before these events are
-        persisted, `_store_state_hamt_nodes_txn` writes exclusively to mdbx
+        persisted, `_store_state_hamt_nodes_txn` writes exclusively to mtxdb
         (not SQL -- see `_persist_state_hamt_txn`), and reads resolve
         entirely through `_materialize_state_hamts_from_embedded_txn` /
-        `_lookup_state_hamts_from_embedded_txn` against a real mdbx
+        `_lookup_state_hamts_from_embedded_txn` against a real mtxdb
         database.
         """
         import shutil
         import tempfile
 
-        from synapse.synapse_rust import mdbx_engine
+        from synapse.synapse_rust import mtxdb_engine
 
-        tmpdir = tempfile.mkdtemp(prefix="test-embedded-mdbx-")
+        tmpdir = tempfile.mkdtemp(prefix="test-embedded-mtxdb-")
         self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
-        mdbx_engine.open_client(tmpdir)
-        self.state_datastore.embedded_hamt_engine = "mdbx"
-        self.state_datastore.embedded_hamt_path = tmpdir
+        mtxdb_engine.open_client(tmpdir)
+        self.state_datastore._embedded_hamt_engine = "mtxdb"
+        self.state_datastore._embedded_hamt_path = tmpdir
+        # Note: __init__ already set self._embedded_hamt_namespace to a
+        # unique per-test value (see tests/utils.py's default_config), which
+        # keeps different tests' state_group ids from colliding on the same
+        # mtxdb keys. Don't override it here -- rewriting it to a shared
+        # value like server_name would make every test in this file collide
+        # on the same namespace against the same process-global mtxdb client.
 
         e1 = self.inject_state_event(self.room, self.u_alice, EventTypes.Create, "", {})
         e2 = self.inject_state_event(
@@ -188,6 +198,26 @@ class StateStoreTestCase(HomeserverTestCase):
             self.store._get_state_group_for_event(e3.event_id)
         )
         assert state_group is not None
+
+        # The room index is the lookup bridge from a bare state-group id to
+        # its per-room mtxdb collection. Its on-disk records must contain the
+        # real eight-byte HAMT prefix, rather than an internally padded value:
+        # the Rust materialize/lookup APIs reject any other length.
+        from synapse.synapse_rust import state_hamt
+
+        expected_room_prefix = bytes(
+            state_hamt.room_hamt_prefix(
+                self.room.to_string(),
+                e3.room_version.msc4291_room_ids_as_hashes,
+            )
+        )
+        self.assertEqual(
+            mtxdb_engine.get_room_index(
+                self.state_datastore._embedded_hamt_namespace,
+                [state_group],
+            ),
+            [expected_room_prefix],
+        )
 
         # Full materialize via the embedded engine.
         full_state = self.get_success(
@@ -216,21 +246,28 @@ class StateStoreTestCase(HomeserverTestCase):
             {(EventTypes.Name, ""): e2.event_id},
         )
 
+    @unittest.skipUnless(EMBEDDED_HAMT_ENGINE, "requires embedded HAMT engine")
     def test_embedded_engine_writes_are_exclusive_not_dual(self) -> None:
         """Once `embedded_hamt_engine` is configured, new state groups are
-        written to mdbx ONLY -- `state_hamt_roots`/`state_hamt_nodes` SQL
+        written to mtxdb ONLY -- `state_hamt_roots`/`state_hamt_nodes` SQL
         rows are not also inserted (see `_persist_state_hamt_txn`).
         """
         import shutil
         import tempfile
 
-        from synapse.synapse_rust import mdbx_engine
+        from synapse.synapse_rust import mtxdb_engine
 
-        tmpdir = tempfile.mkdtemp(prefix="test-exclusive-write-mdbx-")
+        tmpdir = tempfile.mkdtemp(prefix="test-exclusive-write-mtxdb-")
         self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
-        mdbx_engine.open_client(tmpdir)
-        self.state_datastore.embedded_hamt_engine = "mdbx"
-        self.state_datastore.embedded_hamt_path = tmpdir
+        mtxdb_engine.open_client(tmpdir)
+        self.state_datastore._embedded_hamt_engine = "mtxdb"
+        self.state_datastore._embedded_hamt_path = tmpdir
+        # Note: __init__ already set self._embedded_hamt_namespace to a
+        # unique per-test value (see tests/utils.py's default_config), which
+        # keeps different tests' state_group ids from colliding on the same
+        # mtxdb keys. Don't override it here -- rewriting it to a shared
+        # value like server_name would make every test in this file collide
+        # on the same namespace against the same process-global mtxdb client.
 
         event = self.inject_state_event(
             self.room, self.u_alice, EventTypes.Create, "", {}
@@ -256,7 +293,7 @@ class StateStoreTestCase(HomeserverTestCase):
             "dual",
         )
 
-        # But it really is in mdbx -- not just "nowhere".
+        # But it really is in mtxdb -- not just "nowhere".
         full_state = self.get_success(
             self.state_datastore._get_state_groups_from_groups(
                 [state_group], StateFilter.all()
@@ -266,17 +303,18 @@ class StateStoreTestCase(HomeserverTestCase):
             full_state[state_group], {(EventTypes.Create, ""): event.event_id}
         )
 
+    @unittest.skipUnless(EMBEDDED_HAMT_ENGINE, "requires embedded HAMT engine")
     def test_embedded_hamt_migration_copies_existing_sql_data(self) -> None:
         """A state group written before `embedded_hamt_engine` was turned on
         stays SQL-only until `_background_migrate_state_hamt_to_embedded`
-        runs; after it completes, the group is readable via mdbx with SQL
+        runs; after it completes, the group is readable via mtxdb with SQL
         deleted out from under it -- proving the data actually moved, not
         just that the SQL fallback happened to still work.
         """
         import shutil
         import tempfile
 
-        from synapse.synapse_rust import mdbx_engine
+        from synapse.synapse_rust import mtxdb_engine
 
         # Persist with no embedded engine configured -- goes to SQL only.
         self._force_sql_only_hamt()
@@ -309,11 +347,17 @@ class StateStoreTestCase(HomeserverTestCase):
         # poller: it would race this test's direct handler invocation and
         # repeatedly fail to dispatch the unregistered handler. Drive the
         # handler directly instead.
-        tmpdir = tempfile.mkdtemp(prefix="test-hamt-migration-mdbx-")
+        tmpdir = tempfile.mkdtemp(prefix="test-hamt-migration-mtxdb-")
         self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
-        mdbx_engine.open_client(tmpdir)
-        self.state_datastore.embedded_hamt_engine = "mdbx"
-        self.state_datastore.embedded_hamt_path = tmpdir
+        mtxdb_engine.open_client(tmpdir)
+        self.state_datastore._embedded_hamt_engine = "mtxdb"
+        self.state_datastore._embedded_hamt_path = tmpdir
+        # Note: __init__ already set self._embedded_hamt_namespace to a
+        # unique per-test value (see tests/utils.py's default_config), which
+        # keeps different tests' state_group ids from colliding on the same
+        # mtxdb keys. Don't override it here -- rewriting it to a shared
+        # value like server_name would make every test in this file collide
+        # on the same namespace against the same process-global mtxdb client.
 
         with patch.object(
             self.store.db_pool.updates, "start_doing_background_updates"
@@ -342,7 +386,7 @@ class StateStoreTestCase(HomeserverTestCase):
             progress = {"last_state_group": state_group}
 
         # Delete the SQL rows entirely -- if the read below still works,
-        # the data really moved into mdbx rather than the read just still
+        # the data really moved into mtxdb rather than the read just still
         # falling back to SQL.
         self.get_success(
             self.store.db_pool.simple_delete(
@@ -361,6 +405,7 @@ class StateStoreTestCase(HomeserverTestCase):
             full_state[state_group], {(EventTypes.Create, ""): event.event_id}
         )
 
+    @unittest.skipUnless(EMBEDDED_HAMT_ENGINE, "requires embedded HAMT engine")
     def test_embedded_engine_root_lookup_does_not_need_sql(self) -> None:
         """`_store_state_hamt_root_embedded_txn` mirrors the HAMT root
         record into the embedded engine itself (under the `hamt:root:...`
@@ -372,13 +417,19 @@ class StateStoreTestCase(HomeserverTestCase):
         import shutil
         import tempfile
 
-        from synapse.synapse_rust import mdbx_engine
+        from synapse.synapse_rust import mtxdb_engine
 
-        tmpdir = tempfile.mkdtemp(prefix="test-embedded-root-mdbx-")
+        tmpdir = tempfile.mkdtemp(prefix="test-embedded-root-mtxdb-")
         self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
-        mdbx_engine.open_client(tmpdir)
-        self.state_datastore.embedded_hamt_engine = "mdbx"
-        self.state_datastore.embedded_hamt_path = tmpdir
+        mtxdb_engine.open_client(tmpdir)
+        self.state_datastore._embedded_hamt_engine = "mtxdb"
+        self.state_datastore._embedded_hamt_path = tmpdir
+        # Note: __init__ already set self._embedded_hamt_namespace to a
+        # unique per-test value (see tests/utils.py's default_config), which
+        # keeps different tests' state_group ids from colliding on the same
+        # mtxdb keys. Don't override it here -- rewriting it to a shared
+        # value like server_name would make every test in this file collide
+        # on the same namespace against the same process-global mtxdb client.
 
         e1 = self.inject_state_event(self.room, self.u_alice, EventTypes.Create, "", {})
         e2 = self.inject_state_event(
@@ -643,6 +694,418 @@ class StateStoreTestCase(HomeserverTestCase):
         self.get_failure(
             self.state_datastore._get_state_groups_from_groups(
                 [state_group], StateFilter.all()
+            ),
+            RuntimeError,
+        )
+
+    def _setup_embedded_engine_for_room(self, prefix: str) -> None:
+        """Point `self.state_datastore` at a fresh embedded mtxdb client,
+        mirroring the other `test_embedded_*` tests in this file."""
+        import shutil
+        import tempfile
+
+        from synapse.synapse_rust import mtxdb_engine
+
+        tmpdir = tempfile.mkdtemp(prefix=prefix)
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        mtxdb_engine.open_client(tmpdir)
+        self.state_datastore._embedded_hamt_engine = "mtxdb"
+        self.state_datastore._embedded_hamt_path = tmpdir
+
+    def test_purge_unreferenced_state_groups_deletes_embedded_root(self) -> None:
+        """Regression test: `purge_unreferenced_state_groups` used to call
+        `batch_delete` against the old global root collection, which
+        nothing writes to any more (roots live per-room -- see
+        `put_state_hamt_roots`) -- making the purge a silent no-op that
+        reported success while leaving the purged group's root permanently
+        readable. Verify the root is actually gone afterwards.
+        """
+        self._setup_embedded_engine_for_room("test-purge-embedded-mtxdb-")
+
+        e1 = self.inject_state_event(self.room, self.u_alice, EventTypes.Create, "", {})
+        e2 = self.inject_state_event(
+            self.room, self.u_alice, EventTypes.Name, "", {"name": "test room"}
+        )
+        state_group = self.get_success(
+            self.store._get_state_group_for_event(e2.event_id)
+        )
+        assert state_group is not None
+
+        from synapse.synapse_rust import state_hamt
+
+        room_version = self.get_success(
+            self.store.get_room_version(self.room.to_string())
+        )
+        room_prefix = state_hamt.room_hamt_prefix(
+            self.room.to_string(), room_version.msc4291_room_ids_as_hashes
+        )
+
+        # Sanity check: the root really is there before purging.
+        self.assertIsNotNone(
+            self.state_datastore._get_embedded_hamt_root(room_prefix, state_group)
+        )
+
+        with patch.object(
+            self.state_datastore,
+            "_purge_unreferenced_state_groups",
+            return_value=(True, {state_group}),
+        ):
+            deleted = self.get_success(
+                self.state_datastore.purge_unreferenced_state_groups(
+                    self.room.to_string(), {state_group: 0}
+                )
+            )
+        self.assertTrue(deleted)
+
+        self.assertIsNone(
+            self.state_datastore._get_embedded_hamt_root(room_prefix, state_group)
+        )
+        # e1's create-event state group must be untouched.
+        prev_state_group = self.get_success(
+            self.store._get_state_group_for_event(e1.event_id)
+        )
+        assert prev_state_group is not None
+        self.assertIsNotNone(
+            self.state_datastore._get_embedded_hamt_root(room_prefix, prev_state_group)
+        )
+
+    def test_drain_embedded_root_deletion_queue_deletes_and_empties_queue(
+        self,
+    ) -> None:
+        """Regression test: the deletion-queue drain had the same
+        defunct-global-collection bug as `purge_unreferenced_state_groups`.
+        Verify it resolves the room via the room-index, actually deletes
+        the embedded root, and drains the SQL queue row.
+        """
+        self._setup_embedded_engine_for_room("test-drain-queue-embedded-mtxdb-")
+
+        e1 = self.inject_state_event(self.room, self.u_alice, EventTypes.Create, "", {})
+        state_group = self.get_success(
+            self.store._get_state_group_for_event(e1.event_id)
+        )
+        assert state_group is not None
+
+        from synapse.synapse_rust import state_hamt
+
+        room_version = self.get_success(
+            self.store.get_room_version(self.room.to_string())
+        )
+        room_prefix = state_hamt.room_hamt_prefix(
+            self.room.to_string(), room_version.msc4291_room_ids_as_hashes
+        )
+        self.assertIsNotNone(
+            self.state_datastore._get_embedded_hamt_root(room_prefix, state_group)
+        )
+
+        self.get_success(
+            self.store.db_pool.simple_insert(
+                table="state_hamt_root_deletion_queue",
+                values={"state_group": state_group},
+                desc="test_drain_queue.enqueue",
+            )
+        )
+
+        self.get_success(
+            self.state_datastore._drain_embedded_state_hamt_root_deletion_queue()
+        )
+
+        self.assertIsNone(
+            self.state_datastore._get_embedded_hamt_root(room_prefix, state_group)
+        )
+        remaining = self.get_success(
+            self.store.db_pool.simple_select_list(
+                table="state_hamt_root_deletion_queue",
+                keyvalues={},
+                retcols=("state_group",),
+                desc="test_drain_queue.check_empty",
+            )
+        )
+        self.assertEqual(remaining, [])
+
+    def test_drain_embedded_root_deletion_queue_retains_index_misses(self) -> None:
+        """An index miss must not discard the retry record for a root."""
+        self._setup_embedded_engine_for_room("test-drain-queue-index-miss-mtxdb-")
+
+        e1 = self.inject_state_event(self.room, self.u_alice, EventTypes.Create, "", {})
+        state_group = self.get_success(
+            self.store._get_state_group_for_event(e1.event_id)
+        )
+        assert state_group is not None
+
+        self.get_success(
+            self.store.db_pool.simple_insert(
+                table="state_hamt_root_deletion_queue",
+                values={"state_group": state_group},
+                desc="test_drain_queue_index_miss.enqueue",
+            )
+        )
+
+        from synapse.synapse_rust import mtxdb_engine
+
+        with patch.object(mtxdb_engine, "get_room_index", return_value=[None]):
+            self.get_success(
+                self.state_datastore._drain_embedded_state_hamt_root_deletion_queue()
+            )
+
+        remaining = self.get_success(
+            self.store.db_pool.simple_select_list(
+                table="state_hamt_root_deletion_queue",
+                keyvalues={},
+                retcols=("state_group",),
+                desc="test_drain_queue_index_miss.check_remaining",
+            )
+        )
+        self.assertEqual(remaining, [(state_group,)])
+
+    def test_backfill_state_hamt_roots_skips_already_embedded_groups(self) -> None:
+        """Regression test: the backfill's `already_embedded` dedup check
+        used to read via `batch_get_state_hamt_roots` against the same
+        defunct global collection, so it always came back empty post-
+        migration and the backfill silently re-persisted every already-
+        migrated group on every pass forever. Verify a second pass over a
+        group that already has an embedded root does not call
+        `_persist_state_hamt_txn` for it again.
+        """
+        self._setup_embedded_engine_for_room("test-backfill-dedup-embedded-mtxdb-")
+
+        e1 = self.inject_state_event(self.room, self.u_alice, EventTypes.Create, "", {})
+        state_group = self.get_success(
+            self.store._get_state_group_for_event(e1.event_id)
+        )
+        assert state_group is not None
+
+        # The background update only picks up groups with no SQL
+        # `state_hamt_roots` row (LEFT JOIN ... IS NULL) -- which is the
+        # normal state for every group once the embedded engine is
+        # exclusive, since nothing writes that SQL row any more. Simulate
+        # the backfill re-scanning a group it already handled.
+        # This background update already ran to completion at homeserver
+        # startup (before this test created any state groups); reinsert its
+        # row so `_background_update_progress_txn` has something to update.
+        self.get_success(
+            self.store.db_pool.simple_insert(
+                table="background_updates",
+                values={
+                    "update_name": self.state_datastore.STATE_HAMT_BACKFILL_ROOTS_UPDATE_NAME,
+                    "progress_json": "{}",
+                },
+                desc="test_backfill_dedup.reinsert_bg_update",
+            )
+        )
+
+        with patch.object(
+            self.state_datastore,
+            "_persist_state_hamt_txn",
+            side_effect=AssertionError("must not re-persist a group already embedded"),
+        ):
+            progress: dict = {}
+            num_processed = self.get_success(
+                self.state_datastore._background_backfill_state_hamt_roots(
+                    progress, batch_size=100
+                )
+            )
+        # The row(s) are still reported as processed (progress advances, so
+        # the background update doesn't loop forever on them) even though
+        # nothing was re-persisted -- the AssertionError patched above would
+        self.assertGreaterEqual(num_processed, 1)
+
+    def test_redo_mirror_write_v1_success(self) -> None:
+        """Replaying a version-1 payload with full state map succeeds and publishes root."""
+        self._setup_embedded_engine_for_room("test-redo-v1-")
+        room_id = self.room.to_string()
+        room_version = self.get_success(self.store.get_room_version(room_id))
+
+        from synapse.synapse_rust import state_hamt
+
+        state_map = {
+            ("m.room.create", ""): "$create",
+            ("m.room.member", "@alice:example.com"): "$member",
+        }
+        root_hash, _sg, lattice, _ = state_hamt.build_root_handle_with_lattice(
+            room_id,
+            [(k[0], k[1], v) for k, v in state_map.items()],
+        )
+        room_prefix = state_hamt.room_hamt_prefix(
+            room_id, room_version.msc4291_room_ids_as_hashes
+        )
+        sg = 80001
+        self.get_success(
+            self.state_datastore.redo_embedded_hamt_mirror_writes_batch(
+                room_id,
+                room_version,
+                [
+                    {
+                        "state_group": sg,
+                        "prev_state_group": None,
+                        "expected_root_hash": root_hash,
+                        "expected_lattice": lattice,
+                        "expected_room_prefix": room_prefix,
+                        "state_map": state_map,
+                        "state_count": len(state_map),
+                        "version": 1,
+                    }
+                ],
+            )
+        )
+        stored_root = self.state_datastore._get_embedded_hamt_root(room_prefix, sg)
+        self.assertIsNotNone(stored_root)
+        assert stored_root is not None
+        self.assertEqual(stored_root[0], root_hash)
+
+    def test_redo_mirror_write_batch_atomic_success(self) -> None:
+        """Batch replay of parent and child groups succeeds and publishes both."""
+        self._setup_embedded_engine_for_room("test-redo-batch-")
+        room_id = self.room.to_string()
+        room_version = self.get_success(self.store.get_room_version(room_id))
+
+        from synapse.synapse_rust import state_hamt
+
+        state_map_1 = {("m.room.create", ""): "$create"}
+        state_map_2 = {
+            ("m.room.create", ""): "$create",
+            ("m.room.name", ""): "$name",
+        }
+        root_1, _sg1, lat_1, _ = state_hamt.build_root_handle_with_lattice(
+            room_id,
+            [(k[0], k[1], v) for k, v in state_map_1.items()],
+        )
+        root_2, _sg2, lat_2, _ = state_hamt.build_root_handle_with_lattice(
+            room_id,
+            [(k[0], k[1], v) for k, v in state_map_2.items()],
+        )
+        room_prefix = state_hamt.room_hamt_prefix(
+            room_id, room_version.msc4291_room_ids_as_hashes
+        )
+        sg1, sg2 = 80002, 80003
+        self.get_success(
+            self.state_datastore.redo_embedded_hamt_mirror_writes_batch(
+                room_id,
+                room_version,
+                [
+                    {
+                        "state_group": sg1,
+                        "prev_state_group": None,
+                        "expected_root_hash": root_1,
+                        "expected_lattice": lat_1,
+                        "state_map": state_map_1,
+                        "state_count": len(state_map_1),
+                        "version": 1,
+                    },
+                    {
+                        "state_group": sg2,
+                        "prev_state_group": sg1,
+                        "expected_root_hash": root_2,
+                        "expected_lattice": lat_2,
+                        "state_map": state_map_2,
+                        "state_count": len(state_map_2),
+                        "version": 1,
+                    },
+                ],
+            )
+        )
+        self.assertIsNotNone(
+            self.state_datastore._get_embedded_hamt_root(room_prefix, sg1)
+        )
+        self.assertIsNotNone(
+            self.state_datastore._get_embedded_hamt_root(room_prefix, sg2)
+        )
+
+    def test_redo_mirror_write_batch_atomic_rollback_on_mismatch(self) -> None:
+        """If any group in a batch has a mismatch, all writes in the batch are aborted."""
+        self._setup_embedded_engine_for_room("test-redo-abort-")
+        room_id = self.room.to_string()
+        room_version = self.get_success(self.store.get_room_version(room_id))
+
+        from synapse.synapse_rust import state_hamt
+
+        state_map_1 = {("m.room.create", ""): "$create"}
+        state_map_2 = {("m.room.create", ""): "$create", ("m.room.name", ""): "$name"}
+        root_1, _sg1, lat_1, _ = state_hamt.build_root_handle_with_lattice(
+            room_id,
+            [(k[0], k[1], v) for k, v in state_map_1.items()],
+        )
+        room_prefix = state_hamt.room_hamt_prefix(
+            room_id, room_version.msc4291_room_ids_as_hashes
+        )
+        sg1, sg2 = 80004, 80005
+        self.get_failure(
+            self.state_datastore.redo_embedded_hamt_mirror_writes_batch(
+                room_id,
+                room_version,
+                [
+                    {
+                        "state_group": sg1,
+                        "prev_state_group": None,
+                        "expected_root_hash": root_1,
+                        "expected_lattice": lat_1,
+                        "state_map": state_map_1,
+                        "state_count": len(state_map_1),
+                        "version": 1,
+                    },
+                    {
+                        "state_group": sg2,
+                        "prev_state_group": sg1,
+                        "expected_root_hash": b"\x00" * 32,  # deliberately wrong!
+                        "expected_lattice": lat_1,
+                        "state_map": state_map_2,
+                        "state_count": len(state_map_2),
+                        "version": 1,
+                    },
+                ],
+            ),
+            RuntimeError,
+        )
+        # Neither group was published
+        self.assertIsNone(
+            self.state_datastore._get_embedded_hamt_root(room_prefix, sg1)
+        )
+        self.assertIsNone(
+            self.state_datastore._get_embedded_hamt_root(room_prefix, sg2)
+        )
+
+    def test_redo_mirror_write_v0_missing_predecessor_fails_closed(self) -> None:
+        """Version-0 replay without state map fails closed when predecessor is missing."""
+        self._setup_embedded_engine_for_room("test-redo-v0-fail-")
+        room_id = self.room.to_string()
+        room_version = self.get_success(self.store.get_room_version(room_id))
+
+        self.get_failure(
+            self.state_datastore.redo_embedded_hamt_mirror_writes_batch(
+                room_id,
+                room_version,
+                [
+                    {
+                        "state_group": 80006,
+                        "prev_state_group": 77777,  # nonexistent in mtxdb
+                        "expected_root_hash": b"\x11" * 32,
+                        "updates": [("m.room.name", "", "$name")],
+                        "version": 0,
+                    }
+                ],
+            ),
+            RuntimeError,
+        )
+
+    def test_redo_mirror_write_state_count_mismatch(self) -> None:
+        """Mismatch between state_count and state_map length raises RuntimeError."""
+        self._setup_embedded_engine_for_room("test-redo-count-mismatch-")
+        room_id = self.room.to_string()
+        room_version = self.get_success(self.store.get_room_version(room_id))
+
+        self.get_failure(
+            self.state_datastore.redo_embedded_hamt_mirror_writes_batch(
+                room_id,
+                room_version,
+                [
+                    {
+                        "state_group": 80007,
+                        "prev_state_group": None,
+                        "expected_root_hash": b"\x22" * 32,
+                        "state_map": {("m.room.create", ""): "$create"},
+                        "state_count": 99,  # mismatch!
+                        "version": 1,
+                    }
+                ],
             ),
             RuntimeError,
         )
@@ -1850,11 +2313,11 @@ class HAMTStructuralKeyRegressionTest(HomeserverTestCase):
         # would pass regardless of what fed the hash, so pin the exact bytes.
         self.assertEqual(
             hash_a.hex(),
-            "8dd913b7c06b71b0922167cc5468e40b83617ebbf3789483c05afb312343c32a",
+            "fb95526dd1daa672eb9aeeae34b27de638a69a2ddc8ee5350eae79e944fcd56b",
         )
         self.assertEqual(
             sg_a.hex(),
-            "cbd967fa5a267868fd32c3701ef0e9c7afb78b0ace049003701393ee59f903a8",
+            "8b94bfad590b925e09f0a9b22ce4aadffd205d82948671760e0ad52ed129e332",
         )
 
     def test_room_structural_key_is_sha256_of_room_id(self) -> None:
@@ -1884,3 +2347,140 @@ class HAMTStructuralKeyRegressionTest(HomeserverTestCase):
             "!room2:example.com", entries
         )
         self.assertNotEqual(hash_a, hash_b)
+
+
+class RejectedEventStateGroupTestCase(HomeserverTestCase):
+    """Regression tests for `_store_event_state_mappings_txn` ordering: a
+    rejected event's `EventContext.state_group` property raises, so the
+    rejected-event check must run before anything that would touch it.
+    """
+
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
+        self.store = hs.get_datastores().main
+        self.storage = hs.get_storage_controllers()
+        persist_events_store = hs.get_datastores().persist_events
+        assert persist_events_store is not None
+        self.persist_events_store = persist_events_store
+
+        self.room_id = "!rejected-state-group:test"
+        self.get_success(
+            self.store.store_room(
+                room_id=self.room_id,
+                room_creator_user_id="",
+                is_public=True,
+                room_version=RoomVersions.V6,
+            )
+        )
+
+    def test_rejected_event_uses_state_group_before_event(self) -> None:
+        """A rejected event must be recorded against
+        `state_group_before_event` without the code ever evaluating the
+        `state_group` property, which raises for a rejected event's
+        context.
+        """
+        event_factory = self.hs.get_event_builder_factory()
+        bob = "@bob:test"
+
+        create = self.get_success(
+            event_factory.for_room_version(
+                RoomVersions.V6,
+                {
+                    "type": EventTypes.Create,
+                    "state_key": "",
+                    "sender": bob,
+                    "room_id": self.room_id,
+                    "content": {"tag": "create"},
+                },
+            ).build(prev_event_ids=[], auth_event_ids=[])
+        )
+
+        rejected = self.get_success(
+            event_factory.for_room_version(
+                RoomVersions.V6,
+                {
+                    "type": EventTypes.Message,
+                    "sender": bob,
+                    "room_id": self.room_id,
+                    "content": {"tag": "rejected"},
+                },
+            ).build(prev_event_ids=[create.event_id], auth_event_ids=[create.event_id])
+        )
+
+        # A real EventContext for a rejected event: `_state_group` is left
+        # unset (None), matching production, where a rejected event's
+        # `state_group` is genuinely not something the caller may read.
+        # Touching `.state_group` here raises `RuntimeError` -- that's the
+        # bug this test exists to catch.
+        context = EventContext(
+            storage=self.storage,
+            state_group_deltas={},
+            rejected="test rejection reason",
+            state_group_before_event=42,
+        )
+
+        def _persist_txn(txn: LoggingTransaction) -> None:
+            self.persist_events_store._store_event_state_mappings_txn(
+                txn, [(rejected, context)]
+            )
+
+        self.get_success(
+            self.store.db_pool.runInteraction("test_rejected_state_group", _persist_txn)
+        )
+
+        state_group = self.get_success(
+            self.store.db_pool.simple_select_one_onecol(
+                table="event_to_state_groups",
+                keyvalues={"event_id": rejected.event_id},
+                retcol="state_group",
+                allow_none=True,
+            )
+        )
+        self.assertEqual(
+            state_group,
+            42,
+            "rejected event must be recorded against state_group_before_event",
+        )
+
+
+class GetStateGroupForEventsCacheFallbackTestCase(HomeserverTestCase):
+    """Regression test for the race where `_get_state_group_for_events`'s
+    batch read misses an event whose mapping was already published into the
+    `_get_state_group_for_event_sql` scalar cache.
+    """
+
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
+        self.store = hs.get_datastores().main
+
+    def test_missing_from_batch_read_is_recovered_from_cache(self) -> None:
+        cached_event_id = "$only-in-cache:test"
+
+        # Seed the scalar cache directly, simulating a mapping that was
+        # already published there but whose row the batch SQL read below
+        # doesn't (yet) see. `prefill` is synchronous.
+        self.store._get_state_group_for_event_sql.prefill((cached_event_id,), 99)
+
+        with patch.object(
+            self.store.db_pool,
+            "simple_select_many_batch",
+            return_value=[],
+        ):
+            result = self.get_success(
+                self.store._get_state_group_for_events([cached_event_id])
+            )
+
+        self.assertEqual(
+            result[cached_event_id],
+            99,
+            "a mapping already in the scalar cache must be used instead of raising",
+        )
+
+    def test_missing_everywhere_still_raises(self) -> None:
+        with patch.object(
+            self.store.db_pool,
+            "simple_select_many_batch",
+            return_value=[],
+        ):
+            self.get_failure(
+                self.store._get_state_group_for_events(["$ghost-event:test"]),
+                RuntimeError,
+            )

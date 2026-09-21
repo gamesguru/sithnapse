@@ -1080,6 +1080,17 @@ class BundledAggregationsTestCase(BaseRelationsTestCase):
     get bundled via that API. See test_aggregation_get_event_for_thread.
     """
 
+    def _expected_db_txn_count(self, mtxdb: int, sql: int) -> int:
+        """Pick the expected DB transaction count for the active state
+        backend.
+
+        The embedded HAMT engine (mtxdb) serves state HAMT nodes/roots from
+        an in-process store, so a SQL-only configuration issues one extra DB
+        transaction per state lookup (the SQL `state_hamt_roots`/`nodes`
+        fallback) relative to mtxdb.
+        """
+        return mtxdb if self.hs.config.database.embedded_hamt_engine else sql
+
     def _test_bundled_aggregations(
         self,
         relation_type: str,
@@ -1181,7 +1192,11 @@ class BundledAggregationsTestCase(BaseRelationsTestCase):
                 bundled_aggregations,
             )
 
-        self._test_bundled_aggregations(RelationTypes.REFERENCE, assert_annotations, 7)
+        self._test_bundled_aggregations(
+            RelationTypes.REFERENCE,
+            assert_annotations,
+            self._expected_db_txn_count(7, 8),
+        )
 
     def test_thread(self) -> None:
         """
@@ -1226,21 +1241,29 @@ class BundledAggregationsTestCase(BaseRelationsTestCase):
 
         # The "user" sent the root event and is making queries for the bundled
         # aggregations: they have participated.
-        self._test_bundled_aggregations(RelationTypes.THREAD, _gen_assert(True), 7)
+        self._test_bundled_aggregations(
+            RelationTypes.THREAD, _gen_assert(True), self._expected_db_txn_count(7, 8)
+        )
         # The "user2" sent replies in the thread and is making queries for the
         # bundled aggregations: they have participated.
         #
         # Note that this re-uses some cached values, so the total number of
         # queries is much smaller.
         self._test_bundled_aggregations(
-            RelationTypes.THREAD, _gen_assert(True), 4, access_token=self.user2_token
+            RelationTypes.THREAD,
+            _gen_assert(True),
+            self._expected_db_txn_count(4, 5),
+            access_token=self.user2_token,
         )
 
         # A user with no interactions with the thread: they have not participated.
         user3_id, user3_token = self._create_user("charlie")
         self.helper.join(self.room, user=user3_id, tok=user3_token)
         self._test_bundled_aggregations(
-            RelationTypes.THREAD, _gen_assert(False), 4, access_token=user3_token
+            RelationTypes.THREAD,
+            _gen_assert(False),
+            self._expected_db_txn_count(4, 5),
+            access_token=user3_token,
         )
 
     def test_thread_with_bundled_aggregations_for_latest(self) -> None:
@@ -1287,7 +1310,9 @@ class BundledAggregationsTestCase(BaseRelationsTestCase):
                 bundled_aggregations["latest_event"].get("unsigned"),
             )
 
-        self._test_bundled_aggregations(RelationTypes.THREAD, assert_thread, 7)
+        self._test_bundled_aggregations(
+            RelationTypes.THREAD, assert_thread, self._expected_db_txn_count(7, 8)
+        )
 
     def test_nested_thread(self) -> None:
         """

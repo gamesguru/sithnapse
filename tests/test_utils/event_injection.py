@@ -103,6 +103,10 @@ async def create_event(
             kwargs["room_id"]
         )
 
+    auth_event_ids = kwargs.pop("auth_event_ids", None)
+    state_event_ids = kwargs.pop("state_event_ids", None)
+    depth = kwargs.pop("depth", None)
+
     builder = hs.get_event_builder_factory().for_room_version(
         KNOWN_ROOM_VERSIONS[room_version], kwargs
     )
@@ -110,7 +114,11 @@ async def create_event(
         event,
         unpersisted_context,
     ) = await hs.get_event_creation_handler().create_new_client_event(
-        builder, prev_event_ids=prev_event_ids
+        builder,
+        prev_event_ids=prev_event_ids,
+        auth_event_ids=auth_event_ids,
+        state_event_ids=state_event_ids,
+        depth=depth,
     )
 
     # Copy over writable internal_metadata, if set

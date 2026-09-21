@@ -96,6 +96,21 @@ Run the complement test suite on Synapse.
         This is occasionally useful if the built-in rebuild detection with
         --editable fails, e.g. when changing configure_workers_and_start.py.
 
+Environment variables:
+  COMPLEMENT_ENABLE_DIRTY_RUNS=0
+        Disable reuse of containers between runs (recommended when debugging).
+
+  COMPLEMENT_CLEANUP_STALE_RESOURCES=0
+        Disable the startup sweep when sharing a container daemon with other
+        Complement runners. Current-run cleanup remains enabled.
+
+Only one complement.sh run may execute at a time. If the lock message appears,
+inspect the holder on the host with:
+  lslocks -o PID,COMMAND,PATH | grep synapse-complement
+or:
+  fuser -v "${TMPDIR:-/tmp}/synapse-complement.lock"
+The lock is descriptor-based; deleting the lock file does not release it.
+
 For help on arguments to 'go test', run 'go help testflag'.
 EOF
 }
@@ -152,6 +167,12 @@ main() {
   else
     export CONTAINER_RUNTIME=docker
   fi
+
+  # Complement deployments use a shared container daemon. Serialize this
+  # script so one invocation cannot clean up resources belonging to another
+  # invocation between deployment and container attachment. `flock` releases
+  # the lock automatically if the shell is killed.
+  acquire_complement_run_lock
 
   # Change to the repository root. Resolve it once, here, to an absolute
   # path and reuse that below -- $0 is never re-anchored after this cd, so
@@ -362,7 +383,17 @@ main() {
 
   # Enable dirty runs, so tests will reuse the same container where possible.
   # This significantly speeds up tests, but increases the possibility of test pollution.
-  export COMPLEMENT_ENABLE_DIRTY_RUNS=1
+  export COMPLEMENT_ENABLE_DIRTY_RUNS="${COMPLEMENT_ENABLE_DIRTY_RUNS:-1}"
+
+  # Reclaim resources left by older failed runs. The sweep can be disabled
+  # when this daemon is shared with Complement runners outside this script;
+  # current-run, token-scoped cleanup remains enabled in either case.
+  if [ "${COMPLEMENT_CLEANUP_STALE_RESOURCES:-1}" != "0" ]; then
+    cleanup_stale_complement_containers
+    # The grace period prevents a freshly-created, not-yet-attached network
+    # from being mistaken for stale state.
+    cleanup_stale_complement_networks
+  fi
 
   # All environment variables starting with PASS_ will be shared.
   # (The prefix is stripped off before reaching the container.)
@@ -395,12 +426,15 @@ main() {
 
     # And provide some more configuration to complement.
 
-    # It can take quite a while to spin up a worker-mode Synapse for the first
-    # time (the main problem is that we start 14 python processes for each test,
-    # and complement likes to do two of them in parallel).
-    export COMPLEMENT_SPAWN_HS_TIMEOUT_SECS=120
+    # Fail unhealthy worker deployments promptly rather than spending up to
+    # three minutes retrying each one. Callers can raise this when diagnosing
+    # a genuinely slow host.
+    export COMPLEMENT_SPAWN_HS_TIMEOUT_SECS=${COMPLEMENT_SPAWN_HS_TIMEOUT_SECS:-30}
   else
     export PASS_SYNAPSE_COMPLEMENT_USE_WORKERS=
+    # Prefer the SYNAPSE_TEST_POSTGRES name used by tests/utils.py's
+    # in-process trial runner, falling back to the bare POSTGRES on-switch.
+    POSTGRES="${SYNAPSE_TEST_POSTGRES:-${SYNAPSE_POSTGRES:-${POSTGRES:-}}}"
     if [[ -n "$POSTGRES" ]]; then
       export PASS_SYNAPSE_COMPLEMENT_DATABASE=postgres
     else
@@ -433,27 +467,89 @@ main() {
   # particularly tricky.
   export PASS_SYNAPSE_LOG_TESTING=1
 
-  # SYNAPSE_MDBX=1 is the concise production on-switch (see
-  # config/database.py) but was never actually forwarded into the
-  # container here -- treat it the same as SYNAPSE_EMBEDDED_HAMT_ENGINE=mdbx
-  # so it does something locally too.
-  if [[ -n "${SYNAPSE_MDBX:-}" && -z "$SYNAPSE_EMBEDDED_HAMT_ENGINE" ]]; then
-    SYNAPSE_EMBEDDED_HAMT_ENGINE="mdbx"
-    SYNAPSE_EMBEDDED_HAMT_PATH="${SYNAPSE_EMBEDDED_HAMT_PATH:-${SYNAPSE_MDBX_PATH:-}}"
+  # Only TEST-scoped controls may enter Complement containers. In particular,
+  # never inherit a developer's production embedded-HAMT path: a path without
+  # its engine is an invalid Synapse config, and a path with its engine could
+  # mutate a real local store.
+  SYNAPSE_MTXDB="${SYNAPSE_TEST_MTXDB:-}"
+  SYNAPSE_EMBEDDED_HAMT_ENGINE="${SYNAPSE_TEST_EMBEDDED_HAMT_ENGINE:-}"
+  SYNAPSE_EMBEDDED_HAMT_PATH="${SYNAPSE_TEST_EMBEDDED_HAMT_PATH:-}"
+
+  if [[ -n "${SYNAPSE_MTXDB:-}" && -z "$SYNAPSE_EMBEDDED_HAMT_ENGINE" ]]; then
+    SYNAPSE_EMBEDDED_HAMT_ENGINE="mtxdb"
   fi
 
   if [[ -n "$SYNAPSE_EMBEDDED_HAMT_ENGINE" ]]; then
     export PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE="$SYNAPSE_EMBEDDED_HAMT_ENGINE"
     # SYNAPSE_EMBEDDED_HAMT_PATH is read inside the Complement container, not
-    # on the host -- a caller who just wants to turn mdbx on shouldn't have
+    # on the host -- a caller who just wants to turn mtxdb on shouldn't have
     # to know or care about that. Default it to a path that's always
     # writable there (the image's WORKDIR) rather than making them supply an
     # in-container path themselves.
     SYNAPSE_EMBEDDED_HAMT_PATH="${SYNAPSE_EMBEDDED_HAMT_PATH:-/data/embedded_hamt}"
-  fi
-  if [[ -n "$SYNAPSE_EMBEDDED_HAMT_PATH" ]]; then
     export PASS_SYNAPSE_EMBEDDED_HAMT_PATH="$SYNAPSE_EMBEDDED_HAMT_PATH"
   fi
+
+  # Record the exact checkout that produced the image alongside the effective
+  # test configuration. `--dirty` makes a locally modified build explicit,
+  # which is essential when comparing Complement timings or failures later.
+  local synapse_revision
+  synapse_revision="$(git -C "$repo_root" describe --tags --always --dirty 2>/dev/null || echo '<unknown>')"
+  echo "Synapse revision: ${synapse_revision}" >&2
+  echo "Database: ${PASS_SYNAPSE_COMPLEMENT_DATABASE} (workers: ${PASS_SYNAPSE_COMPLEMENT_USE_WORKERS:-false}) | Embedded HAMT engine: ${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:-<none>}${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:+ at ${PASS_SYNAPSE_EMBEDDED_HAMT_PATH:-<not set>}}" >&2
+
+  # Complement's Destroy() force-removes every homeserver container
+  # unconditionally, pass or fail -- there is no "keep failed containers"
+  # option, so this hook (which runs while the container is still up,
+  # per executePostScript in complement's deployer.go) is the only place
+  # that can save anything from a failing run for later inspection, and
+  # it also dumps Postgres stats test-to-test along the way. Don't clobber
+  # a caller who has already set their own COMPLEMENT_POST_TEST_SCRIPT.
+  export COMPLEMENT_POST_TEST_SCRIPT="${COMPLEMENT_POST_TEST_SCRIPT:-${repo_root}/scripts-dev/_complement_post_test.sh}"
+
+  if [[ -n "${SYNAPSE_PG_TIMINGS:-}" ]]; then
+    export PASS_SYNAPSE_PG_TIMINGS=1
+    # Pass setup_timings_path="-" into the container so each Synapse process
+    # prints its Databases.__init__ breakdown to stderr immediately after
+    # setup() completes -- before any SIGTERM, so timing output is never lost
+    # to an instant SIGKILL.  "-" is the sentinel meaning stderr-only (no file
+    # write inside the container, which would be destroyed before retrieval).
+    export PASS_SYNAPSE_DB_SETUP_TIMINGS_PATH=-
+    # NOTE: we do NOT force COMPLEMENT_ALWAYS_PRINT_SERVER_LOGS /
+    # COMPLEMENT_STOP_TIMEOUT_SECS here. Doing so forces every container in
+    # the run through a graceful SIGTERM stop (Postgres runs a full shutdown
+    # CHECKPOINT, flushing every dirty page) instead of an instant SIGKILL.
+    # That's fine for a single targeted `-run TestFoo` invocation, but it is
+    # actively harmful across a full/parallel suite run: hundreds of
+    # containers all doing a graceful multi-second shutdown at once causes
+    # real disk/CPU contention that measurably slows down and destabilizes
+    # unrelated, timing-sensitive tests -- confirmed against a full
+    # `make complement` run producing new failures and heavy sustained
+    # containerd disk writes, while still not reliably producing any timing
+    # output (the docker-log-watcher's start/scan race gets worse, not
+    # better, at that container-count scale). If you want a timing report,
+    # set these two vars yourself for a narrow `-run` invocation rather than
+    # enabling them here unconditionally for every run.
+  fi
+
+  # Complement's blueprint cache key is only (package namespace, blueprint
+  # name). A blueprint is a committed container image, so it also captures the
+  # base-image contents and every PASS_* variable passed into its homeservers.
+  # Without varying the namespace, a later SQLite/no-mtxdb run can reuse a
+  # blueprint built by an earlier Postgres/mtxdb run and silently boot with
+  # that old environment. Include the immutable base-image ID and effective
+  # forwarded configuration in the namespace to make such reuse impossible.
+  local _base_image_id _cache_config_hash _namespace_prefix
+  _base_image_id="$($CONTAINER_RUNTIME image inspect --format '{{.Id}}' "$COMPLEMENT_BASE_IMAGE")"
+  _cache_config_hash="$(
+    {
+      printf '%s\n' "$_base_image_id"
+      env | LC_ALL=C sort | sed -n '/^PASS_/p'
+    } | sha256sum | cut -c1-16
+  )"
+  _namespace_prefix="${COMPLEMENT_PACKAGE_NAMESPACE_PREFIX:-synapse}"
+  export COMPLEMENT_PACKAGE_NAMESPACE_PREFIX="${_namespace_prefix}_cfg_${_cache_config_hash}"
+  echo "Complement blueprint cache namespace: ${COMPLEMENT_PACKAGE_NAMESPACE_PREFIX}" >&2
 
   # ── Run-filter and extra-tags from remaining args ───────────────────────────
   # RUN_TESTS=. means "run everything" (the default).
@@ -466,11 +562,11 @@ main() {
   local _i=1
   while [ $_i -le $# ]; do
     local _arg="${!_i}"
-    if [[ "$_arg" == "-run" ]]; then
+    if [[ "$_arg" == "-run" || "$_arg" == "--run" ]]; then
       local _next=$((_i+1))
       RUN_TESTS="${!_next}"
       _i=$((_i+2))
-    elif [[ "$_arg" =~ ^-run=(.+) ]]; then
+    elif [[ "$_arg" =~ ^--?run=(.+) ]]; then
       RUN_TESTS="${BASH_REMATCH[1]}"
       _i=$((_i+1))
     elif [[ "$_arg" == "-tags" ]]; then
@@ -563,7 +659,13 @@ main() {
   export COMPLEMENT_WRAPPER_TOKEN="${COMPLEMENT_WRAPPER_TOKEN:-"complement-$$-$(date +%s%N)"}"
   export PASS_COMPLEMENT_WRAPPER_TOKEN="$COMPLEMENT_WRAPPER_TOKEN"
   export COMPLEMENT_SHARE_ENV_PREFIX=PASS_
-  export COMPLEMENT_SPAWN_HS_TIMEOUT_SECS=${COMPLEMENT_SPAWN_HS_TIMEOUT_SECS:-120}
+  # Complement retries a homeserver deploy up to 3x. Keep the default
+  # per-attempt startup timeout short so an unhealthy deployment fails
+  # promptly (about 90s worst-case), while allowing callers to override it.
+  export COMPLEMENT_SPAWN_HS_TIMEOUT_SECS=${COMPLEMENT_SPAWN_HS_TIMEOUT_SECS:-30}
+  # Keep genuinely stalled requests from consuming a minute and a half of a
+  # test run. Callers can still raise this for intentionally slow scenarios.
+  export COMPLEMENT_CLIENT_TIMEOUT_SECS=${COMPLEMENT_CLIENT_TIMEOUT_SECS:-30}
   # Placeholder until merge_and_report exists below; replaced with the real
   # combined EXIT trap once it's defined, so merging is never optional --
   # it happens on literal end-of-script, an explicit `exit`, a `set -e`
@@ -574,24 +676,178 @@ main() {
   return 0
 }
 
+# Keep only one local complement.sh deployment active at a time. This is
+# deliberately process-scoped rather than runtime-scoped: Docker/Podman do
+# not provide a transaction covering resource discovery and deployment.
+acquire_complement_run_lock() {
+  local lock_file="${TMPDIR:-/tmp}/synapse-complement.lock"
+  if ! command -v flock &>/dev/null; then
+    echo "ERROR: flock is required to safely clean up stale Complement resources" >&2
+    return 1
+  fi
+
+  exec {COMPLEMENT_RUN_LOCK_FD}>"$lock_file"
+  if ! flock -n "$COMPLEMENT_RUN_LOCK_FD"; then
+    echo "Another complement.sh run is active; refusing to clean up shared resources" >&2
+    return 1
+  fi
+}
+
 # Invoked by the EXIT trap installed in main.
 # shellcheck disable=SC2329
 cleanup_complement_containers() {
+  local runtime="${CONTAINER_RUNTIME:-docker}"
   local container_label="COMPLEMENT_WRAPPER_TOKEN=$COMPLEMENT_WRAPPER_TOKEN"
-  local containers container ours=()
-  if command -v docker &>/dev/null; then
-    mapfile -t containers < <(docker ps -aq --filter "name=complement" 2>/dev/null || true)
+  local containers container network
+  local -a ours=() networks=()
+  if command -v "$runtime" &>/dev/null; then
+    mapfile -t containers < <("$runtime" ps -aq --filter "name=complement" 2>/dev/null || true)
     for container in "${containers[@]:-}"; do
-      if docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$container" 2>/dev/null \
+      if "$runtime" inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$container" 2>/dev/null \
           | grep -Fxq "$container_label"; then
         ours+=("$container")
+        while IFS= read -r network; do
+          [ -n "$network" ] || continue
+          if [[ ! " ${networks[*]} " == *" $network "* ]]; then
+            networks+=("$network")
+          fi
+        done < <(
+          # shellcheck disable=SC2016 # Docker/Podman expands this Go template.
+          "$runtime" inspect --format '{{range $name, $config := .NetworkSettings.Networks}}{{println $name}}{{end}}' \
+            "$container" 2>/dev/null || true
+        )
       fi
     done
     if [ "${#ours[@]}" -gt 0 ]; then
       echo "Cleaning up Complement containers spawned by this run..." >&2
-      printf '%s\n' "${ours[@]}" | xargs -r docker rm -f
+      printf '%s\n' "${ours[@]}" | xargs -r "$runtime" rm -f
     fi
+
+    # Only remove networks which were attached to containers carrying this
+    # run's token. An unscoped name-based sweep can delete a network another
+    # Complement invocation has just created but not attached yet.
+    for network in "${networks[@]:-}"; do
+      echo "Cleaning up Complement network $network..." >&2
+      "$runtime" network rm "$network" >/dev/null 2>&1 || true
+    done
   fi
+}
+
+# Stop the PostgreSQL timing watcher and every process it spawned. The watcher
+# contains `docker events`, a tail pipeline, and one `docker logs -f` process
+# per container; process-group membership is not reliable when this script is
+# launched from an interactive shell, so walk the actual child tree instead.
+cleanup_pg_log_watcher() {
+  local pid="${_pg_log_watcher_pid:-}"
+  local timing_dir="${_pg_timing_dir:-}"
+  local child
+
+  if [ -n "$pid" ]; then
+    for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+      _kill_process_tree "$child"
+    done
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  fi
+
+  # The watcher contains a pipeline.  Its tail and log followers can become
+  # reparented when the pipeline is torn down, so they are no longer visible
+  # below _pg_log_watcher_pid.  The timing directory is unique to this run;
+  # use it to reap those otherwise-detached processes without matching another
+  # Complement invocation.
+  if [ -n "$timing_dir" ]; then
+    while IFS= read -r child; do
+      [ -n "$child" ] || continue
+      _kill_process_tree "$child"
+    done < <(pgrep -f -- "$timing_dir" 2>/dev/null || true)
+  fi
+
+  _pg_log_watcher_pid=""
+  _pg_timing_dir=""
+}
+
+_kill_process_tree() {
+  local pid="$1"
+  local child
+  for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+    _kill_process_tree "$child"
+  done
+  kill "$pid" 2>/dev/null || true
+}
+
+# A crashed Complement process can leave running containers or pods behind.
+# They have no reliable token we can recover after the shell dies, so this
+# startup sweep is protected by the run lock and removes only Complement-named
+# resources carrying Complement's ownership labels from this runtime.
+cleanup_stale_complement_containers() {
+  local runtime="${CONTAINER_RUNTIME:-docker}"
+  local container pod
+  local -a containers=() pods=()
+
+  if ! command -v "$runtime" &>/dev/null; then
+    return 0
+  fi
+
+  mapfile -t containers < <("$runtime" ps -aq --filter "label=complement_pkg" 2>/dev/null || true)
+  if [ "${#containers[@]}" -gt 0 ]; then
+    echo "Cleaning up stale Complement containers..." >&2
+    printf '%s\n' "${containers[@]}" | xargs -r "$runtime" rm -f
+  fi
+
+  if [ "$runtime" = "podman" ]; then
+    mapfile -t pods < <("$runtime" pod ps -aq --filter "label=complement_pkg" 2>/dev/null || true)
+    for pod in "${pods[@]:-}"; do
+      [ -n "$pod" ] || continue
+      echo "Cleaning up stale Complement pod $pod..." >&2
+      "$runtime" pod rm -f "$pod" >/dev/null 2>&1 || true
+    done
+  fi
+}
+
+# Remove only old, empty Complement networks. This handles deployments which
+# died after creating a network but before creating a token-labelled container.
+# The age check is intentional: network creation and container attachment are
+# separate daemon operations, so an unscoped zero-container check alone has a
+# startup race with another Complement invocation.
+cleanup_stale_complement_networks() {
+  local runtime="${CONTAINER_RUNTIME:-docker}"
+  local network created created_epoch now age attached
+  local stale_after="${COMPLEMENT_STALE_NETWORK_AGE_SECS:-600}"
+  local -a networks=()
+
+  if ! command -v "$runtime" &>/dev/null; then
+    return 0
+  fi
+
+  # Docker exposes network membership in `network inspect`. Podman does not,
+  # so do not run this stale-resource sweep there until its membership query
+  # is implemented using `podman ps --filter network=...` and verified.
+  if [ "$runtime" != "docker" ]; then
+    return 0
+  fi
+
+  now=$(date +%s)
+  mapfile -t networks < <("$runtime" network ls -q --filter "label=complement_pkg" 2>/dev/null || true)
+  for network in "${networks[@]:-}"; do
+    [ -n "$network" ] || continue
+
+    # Do not remove a network if the runtime cannot describe its age.
+    created=$("$runtime" network inspect --format '{{.Created}}' "$network" 2>/dev/null || true)
+    created_epoch=$(date -d "$created" +%s 2>/dev/null || true)
+    [[ "$created_epoch" =~ ^[0-9]+$ ]] || continue
+    age=$((now - created_epoch))
+    [ "$age" -ge "$stale_after" ] || continue
+
+    # Docker exposes Containers as a map. A failure deliberately keeps the
+    # network rather than risking deletion.
+    attached=$("$runtime" network inspect "$network" 2>/dev/null \
+      | jq -r '.[0].Containers // {} | length' 2>/dev/null || echo 1)
+    [[ "$attached" =~ ^[0-9]+$ ]] || continue
+    [ "$attached" -eq 0 ] || continue
+
+    echo "Cleaning up stale Complement network $network (${age}s old)..." >&2
+    "$runtime" network rm "$network" >/dev/null 2>&1 || true
+  done
 }
 
 # ── record_result: one summary line + append to staged results ───────────────
@@ -607,7 +863,13 @@ record_result() {
     if [ "${#_display_name}" -gt 80 ]; then
       _display_name="${_display_name:0:79}…"
     fi
-    printf '%s\t%s\t%s\n' "${action^^}" "$_display_name" "$elapsed" >&2
+    # `printf %-80s` measures UTF-8 bytes, not terminal characters. A name
+    # containing `§` (as in the MSC4499 tests) would therefore make the
+    # duration appear one column early. Bash's `${#var}` is character-based
+    # under the UTF-8 locale used by the test runner, so pad explicitly.
+    local _name_padding=$((80 - ${#_display_name}))
+    printf '%-6s  %s%*s  %8s\n' \
+      "${action^^}" "$_display_name" "$_name_padding" "" "$elapsed" >&2
   fi
 }
 
@@ -657,6 +919,59 @@ run_one_pattern() {
   local _events_fifo="${_events_dir}/events"
   mkfifo "$_events_fifo"
 
+  # ── Real-time docker log capture for PG timings ────────────────────────────
+  # Complement removes containers during test teardown, so we cannot docker-cp
+  # files after go test exits.  Instead, watch for container starts via
+  # docker-events and follow their logs; timing sections land in the captured
+  # files when the SIGTERM/exit handlers in Synapse flush them to stderr.
+  _pg_timing_dir=""
+  _pg_log_watcher_pid=""
+  if [[ -n "${SYNAPSE_PG_TIMINGS:-}" ]]; then
+    # Use whichever runtime the harness was configured with (podman under
+    # `PODMAN=1`); plain `docker` may not even be installed there, and the
+    # podman CLI talks to the podman socket directly.
+    local _rt="${CONTAINER_RUNTIME:-docker}"
+    _pg_timing_dir="$(mktemp -d "${staged_results_file}.pgtimings.XXXXXX")"
+    local _container_label="COMPLEMENT_WRAPPER_TOKEN=$COMPLEMENT_WRAPPER_TOKEN"
+    # Follow logs from complement containers as they start.  Subscribe to
+    # container-events *before* scanning already-running containers, then feed
+    # both container-id sources through one loop body; a `seen` set stops a
+    # container appearing in both from being followed twice. This narrows
+    # the start/scan race but does not fully close it: the background
+    # `events` process below is not guaranteed to be connected to
+    # the daemon before the scan runs, so a container starting in that
+    # small window could still be missed by both paths.
+    #
+    # Every process here -- the `events` reader, the merge/dedupe
+    # pipeline, and each `logs -f` follower it forks -- is a
+    # grandchild (or deeper) of this function, so plain `wait` on their
+    # pids cannot reap them. Instead, `set -m` gives this whole subshell
+    # its own process group, so it can be torn down as a unit with
+    # `kill -- -PGID` below (same technique as the go-test launch further
+    # down this function).
+    (
+      # Do not let the watcher keep the process-wide flock alive if the
+      # parent is interrupted. In particular, `tail -f` can outlive this
+      # subshell and would otherwise retain the inherited lock FD.
+      if [ -n "${COMPLEMENT_RUN_LOCK_FD:-}" ]; then
+        eval "exec ${COMPLEMENT_RUN_LOCK_FD}>&-"
+      fi
+      set -m
+      "$_rt" events --filter 'event=start' --format '{{.ID}}' 2>/dev/null >"${_pg_timing_dir}/.events_stream" &
+      declare -A _seen
+      { "$_rt" ps -q 2>/dev/null; tail -n +1 -f "${_pg_timing_dir}/.events_stream" 2>/dev/null; } \
+        | while IFS= read -r _cid; do
+        [[ -n "${_seen[$_cid]:-}" ]] && continue
+        _seen[$_cid]=1
+        if "$_rt" inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$_cid" 2>/dev/null \
+            | grep -Fxq "$_container_label"; then
+          "$_rt" logs -f "$_cid" >>"${_pg_timing_dir}/${_cid}.log" 2>&1 &
+        fi
+      done
+    ) &
+    _pg_log_watcher_pid=$!
+  fi
+
   local _go_exit=0
   set +e
   # Enable job control just for this launch so the subshell (and the
@@ -666,6 +981,11 @@ run_one_pattern() {
   # go test/tee/jq running as orphans past container cleanup.
   set -m
   (
+    # Background test processes must not inherit the run lock either. The
+    # parent shell remains responsible for holding and releasing it.
+    if [ -n "${COMPLEMENT_RUN_LOCK_FD:-}" ]; then
+      eval "exec ${COMPLEMENT_RUN_LOCK_FD}>&-"
+    fi
     set -o pipefail
     if [ -n "$use_in_repo_tests" ]; then
       cd "${repo_root}/complement"
@@ -697,6 +1017,14 @@ run_one_pattern() {
   _active_producer=""
   set -e
   rm -rf "$_events_dir"
+
+  cleanup_pg_log_watcher
+  # Accumulate every pattern invocation's timing dir instead of overwriting,
+  # so `finish` extracts timings from *all* -run patterns, not just the last.
+  if [[ -n "${_pg_timing_dir:-}" ]]; then
+    _PG_TIMING_DIRS="${_PG_TIMING_DIRS:+$_PG_TIMING_DIRS }$_pg_timing_dir"
+  fi
+
   return "$_go_exit"
 }
 
@@ -705,6 +1033,9 @@ main "$@"
 test_start_seconds=$SECONDS
 TEST_EXIT_CODE=0
 _active_producer=""
+# Accrued PG-timing capture dirs, one per `run_one_pattern` invocation
+# (only populated under `SYNAPSE_PG_TIMINGS=1`); see `finish` below.
+_PG_TIMING_DIRS=""
 
 # Merges staged results into the main ledger and prints a summary. Called
 # from the EXIT trap below so it runs no matter how the script stops --
@@ -715,6 +1046,8 @@ _reported=""
 finish() {
   [ -n "$_reported" ] && return 0
   _reported=1
+
+  cleanup_pg_log_watcher
 
   merge_script="${repo_root}/scripts-dev/merge_complement_results.py"
   if [ -f "$staged_results_file" ] && [ -s "$staged_results_file" ]; then
@@ -771,6 +1104,63 @@ finish() {
   echo "complement results merged into $main_results_file" >&2
   echo "" >&2
 
+  # ── Stats: slowest tests + time by suite ───────────────────────────────────
+  if [ -f "$staged_log_file" ] && [ -s "$staged_log_file" ]; then
+    python3 -c "
+import json, sys
+from collections import defaultdict
+
+results = []
+for line in open(sys.argv[1]):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        r = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if r.get('Action') not in ('pass', 'fail'):
+        continue
+    if not r.get('Test'):
+        continue
+    elapsed = r.get('Elapsed', 0) or 0
+    results.append((r['Test'], r['Action'], elapsed))
+
+if not results:
+    sys.exit(0)
+
+# go test reports both a parent aggregate event and each of its subtests'
+# events (e.g. TestX plus TestX/foo). Summing both would double-count the
+# parent's elapsed time (which already includes its subtests), so keep only
+# leaf results: a result is a leaf unless some other reported test name is
+# <name> + '/'.
+names = {test for test, _, _ in results}
+def is_leaf(name):
+    return not any(other.startswith(name + '/') for other in names)
+
+leaf_results = [r for r in results if is_leaf(r[0])]
+
+# Slowest 10 tests
+print('--- Slowest tests ---')
+for test, action, elapsed in sorted(leaf_results, key=lambda x: -x[2])[:10]:
+    print(f'  {elapsed:7.2f}s  {action.upper():6s}  {test}')
+
+# Time by suite (first path component after Test)
+suite_times = defaultdict(float)
+suite_counts = defaultdict(int)
+for test, action, elapsed in leaf_results:
+    suite = test.split('/')[0]
+    suite_times[suite] += elapsed
+    suite_counts[suite] += 1
+
+print()
+print('--- Time by suite ---')
+for suite, total in sorted(suite_times.items(), key=lambda x: -x[1]):
+    print(f'  {total:8.2f}s  {suite_counts[suite]:4d} tests  {suite}')
+" "$staged_log_file" >&2
+    echo "" >&2
+  fi
+
   if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     {
       echo "### Complement results"
@@ -780,7 +1170,49 @@ finish() {
     } >> "$GITHUB_STEP_SUMMARY"
   fi
 
+  # ── Extract timing from captured docker logs ─────────────────────────────
+  if [[ -n "${SYNAPSE_PG_TIMINGS:-}" ]] && [[ -n "${_PG_TIMING_DIRS:-}" ]]; then
+    local _found_timing=0
+    for _pg_dir in $_PG_TIMING_DIRS; do
+      if [[ ! -d "$_pg_dir" ]]; then
+        continue
+      fi
+      for _f in "${_pg_dir}"/*.log; do
+        [ -f "$_f" ] || continue
+        # Extract the timing sections from the captured log.
+        local _sections
+        _sections=$(awk '
+          /^=== Per-table SQL timing/ { p=1 }
+          /^=== State store mtxdb-vs-SQL timings/ { p=1 }
+          /^=== Postgres test-DB lifecycle timings/ { p=1 }
+          /^=== END SYNAPSE PG TIMINGS ===/ { p=0 }
+          /^================================/ { if(p) { print; p=0; next } }
+          { if(p) print }
+        ' "$_f" 2>/dev/null)
+        if [[ -n "$_sections" ]]; then
+          if [ "$_found_timing" -eq 0 ]; then
+            echo "" >&2
+            echo "=== SYNAPSE PG TIMINGS (from containers) ===" >&2
+            _found_timing=1
+          fi
+          echo "--- ${_f##*/} ---" >&2
+          echo "$_sections" >&2
+        fi
+      done
+    done
+    if [ "$_found_timing" -eq 1 ]; then
+      echo "=== END SYNAPSE PG TIMINGS ===" >&2
+    fi
+  fi
+
   cleanup_complement_containers
+  # Also sweep resources left by an older interrupted invocation. Keep this
+  # on the EXIT path as well as startup so an invocation which is interrupted
+  # before Complement's normal teardown still gets cleaned up immediately.
+  if [ "${COMPLEMENT_CLEANUP_STALE_RESOURCES:-1}" != "0" ]; then
+    cleanup_stale_complement_containers
+    cleanup_stale_complement_networks
+  fi
 }
 trap finish EXIT
 
@@ -792,6 +1224,7 @@ trap finish EXIT
 # Terminate any active go-test pipeline so it does not outlive container
 # cleanup. Clear _active_producer after a successful wait to avoid
 # signaling a recycled PID later.
+# shellcheck disable=SC2329 # invoked indirectly by the signal traps below.
 _kill_active_producer() {
   if [ -n "$_active_producer" ]; then
     # Negative PID targets the whole process group (see `set -m` above),
@@ -801,9 +1234,9 @@ _kill_active_producer() {
     _active_producer=""
   fi
 }
-trap '_kill_active_producer; exit 130' INT
-trap '_kill_active_producer; exit 143' TERM
-trap '_kill_active_producer; exit 129' HUP
+trap '_kill_active_producer; cleanup_pg_log_watcher; exit 130' INT
+trap '_kill_active_producer; cleanup_pg_log_watcher; exit 143' TERM
+trap '_kill_active_producer; cleanup_pg_log_watcher; exit 129' HUP
 
 # ── Run all patterns ──────────────────────────────────────────────────────────
 for _pattern in "${ALT_PATTERNS[@]}"; do

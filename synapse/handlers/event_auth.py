@@ -224,6 +224,13 @@ class EventAuthHandler:
         if prev_membership in (Membership.JOIN, Membership.INVITE):
             return
 
+        logger.warning(
+            "[mtxdb-restricted] CALL user=%s prev_membership=%s state_keys=%s",
+            user_id,
+            prev_membership,
+            sorted(str(k) for k in state_ids),
+        )
+
         # This is not a room with a restricted join rule, so we don't need to do the
         # restricted room specific checks.
         #
@@ -236,6 +243,20 @@ class EventAuthHandler:
         # in any of them.
         allowed_rooms = await self.get_rooms_that_allow_join(state_ids)
         if not await self.is_user_in_rooms(allowed_rooms, user_id):
+            jr_event_id = state_ids.get((EventTypes.JoinRules, ""))
+            jr_event = None
+            if jr_event_id:
+                jr_event = await self._store.get_event(jr_event_id, allow_none=True)
+            logger.warning(
+                "[mtxdb-restricted] DENY user=%s prev_membership=%s join_rules_event_id=%s join_rules_content=%s state_ids_count=%d allowed_rooms=%s",
+                user_id,
+                prev_membership,
+                jr_event_id,
+                jr_event.content if jr_event else None,
+                len(state_ids),
+                allowed_rooms,
+            )
+
             # If this is a remote request, the user might be in an allowed room
             # that we do not know about.
             if not self._is_mine_id(user_id):
@@ -251,6 +272,14 @@ class EventAuthHandler:
                 403,
                 "You do not belong to any of the required rooms/spaces to join this room.",
             )
+
+        logger.warning(
+            "[mtxdb-restricted] ALLOW user=%s prev_membership=%s state_ids_count=%d allowed_rooms=%s",
+            user_id,
+            prev_membership,
+            len(state_ids),
+            allowed_rooms,
+        )
 
     async def has_restricted_join_rules(
         self, partial_state_ids: StateMap[str], room_version: RoomVersion

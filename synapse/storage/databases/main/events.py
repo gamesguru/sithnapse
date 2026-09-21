@@ -66,6 +66,12 @@ from synapse.storage.database import (
     LoggingTransaction,
     make_tuple_in_list_sql_clause,
 )
+from synapse.storage.databases.main.embedded_common import Pool, mark_dirty
+from synapse.storage.databases.main.embedded_event_edges import (
+    embedded_event_edges_is_writable,
+    open_embedded_event_edges_engine,
+    queue_edge_write,
+)
 from synapse.storage.databases.main.embedded_event_json import (
     open_embedded_event_json_engine,
     put_event_json_batch,
@@ -284,6 +290,8 @@ class PersistEventsStore:
         self.is_mine_id = hs.is_mine_id
 
         self._embedded_event_json_enabled = open_embedded_event_json_engine(hs)
+        self._embedded_event_edges_enabled = open_embedded_event_edges_engine(hs)
+        self._embedded_event_edges_writable = embedded_event_edges_is_writable(hs)
         self._embedded_hamt_engine = hs.config.database.embedded_hamt_engine
         self._embedded_hamt_namespace = (
             hs.config.database.embedded_hamt_namespace or hs.hostname
@@ -404,6 +412,7 @@ class PersistEventsStore:
                 sliding_sync_table_changes=sliding_sync_table_changes,
                 new_state_dag_forward_extremities=new_state_dag_forward_extremities,
             )
+
             persist_event_counter.labels(**{SERVER_NAME_LABEL: self.server_name}).inc(
                 len(events_and_contexts)
             )
@@ -503,6 +512,9 @@ class PersistEventsStore:
                             "redact_end_ordering": None,
                         },
                     )
+                    # `simple_upsert` has committed by the time it returns, so it
+                    # is safe to invalidate the emptiness cache here.
+                    self.db_pool.note_table_write("room_ban_redactions")
 
                     # normally the cache entry for a redacted event would be invalidated
                     # by an arriving redaction event, but since we are not creating redaction
@@ -950,6 +962,7 @@ class PersistEventsStore:
             event_to_types,
             event_to_auth_chain,
             resolve_namespace(self),
+            self._embedded_hamt_engine,
         )
 
     async def _get_events_which_are_prevs(self, event_ids: Iterable[str]) -> list[str]:
@@ -1236,6 +1249,13 @@ class PersistEventsStore:
             txn, room_id, events_and_contexts
         )
 
+        # Mark pools dirty after SQL commit via txn.call_after, so the
+        # coalescer flushes only committed writes.  Gated on the embedded
+        # engine being configured (same guard as the writes above).
+        if self._embedded_hamt_engine:
+            txn.call_after(mark_dirty, Pool.STATE)
+            txn.call_after(mark_dirty, Pool.AUTH_CHAIN)
+
     def _persist_event_auth_chain_txn(
         self,
         txn: LoggingTransaction,
@@ -1252,6 +1272,8 @@ class PersistEventsStore:
                 self.db_pool,
                 new_event_links,
                 resolve_namespace(self),
+                self._embedded_hamt_engine,
+                sync=False,
             )
 
         # We only care about state events, so this if there are no state events.
@@ -1286,6 +1308,7 @@ class PersistEventsStore:
         event_to_types: dict[str, tuple[str, str]],
         event_to_auth_chain: dict[str, StrCollection],
         embedded_hamt_namespace: str | None,
+        embedded_hamt_engine: str | None,
     ) -> None:
         """Calculate and persist the chain cover index for the given events.
 
@@ -1298,6 +1321,8 @@ class PersistEventsStore:
                 embedded engine is configured, `None` when it isn't -- a
                 `@classmethod` has no `self` of its own, so this can't be
                 recomputed here; see `embedded_event_auth_chain_links.py`.
+            embedded_hamt_engine: the engine name threaded alongside
+                `embedded_hamt_namespace` (same `@classmethod` constraint).
         """
 
         new_event_links = cls._calculate_chain_cover_index(
@@ -1308,9 +1333,10 @@ class PersistEventsStore:
             event_to_types,
             event_to_auth_chain,
             embedded_hamt_namespace,
+            embedded_hamt_engine,
         )
         cls._persist_chain_cover_index(
-            txn, db_pool, new_event_links, embedded_hamt_namespace
+            txn, db_pool, new_event_links, embedded_hamt_namespace, embedded_hamt_engine
         )
 
     @classmethod
@@ -1323,6 +1349,7 @@ class PersistEventsStore:
         event_to_types: dict[str, tuple[str, str]],
         event_to_auth_chain: dict[str, StrCollection],
         embedded_hamt_namespace: str | None,
+        embedded_hamt_engine: str | None,
     ) -> dict[str, NewEventChainLinks]:
         """Calculate the chain cover index for the given events.
 
@@ -1517,6 +1544,7 @@ class PersistEventsStore:
             txn,
             {chain_id for chain_id, _ in chain_map.values()},
             embedded_hamt_namespace,
+            embedded_hamt_engine,
         ):
             for origin_chain_id, inner_links in links.items():
                 for (
@@ -1573,6 +1601,8 @@ class PersistEventsStore:
         db_pool: DatabasePool,
         new_event_links: dict[str, NewEventChainLinks],
         embedded_hamt_namespace: str | None,
+        embedded_hamt_engine: str | None,
+        sync: bool = True,
     ) -> None:
         db_pool.simple_insert_many_txn(
             txn,
@@ -1610,7 +1640,9 @@ class PersistEventsStore:
                 put_chain_links_batch,
             )
 
-            put_chain_links_batch(embedded_hamt_namespace, chain_links)
+            put_chain_links_batch(
+                embedded_hamt_engine, embedded_hamt_namespace, chain_links, sync=sync
+            )
             return
 
         db_pool.simple_insert_many_txn(
@@ -1995,10 +2027,10 @@ class PersistEventsStore:
 
                 args: list[Any] = [
                     room_id,
-                    room_id,
                     sliding_sync_table_changes.joined_room_bump_stamp_to_fully_insert,
                 ]
                 args.extend(iter(sliding_sync_updates_values))
+                args.append(room_id)
 
                 # XXX: We use a sub-query for `stream_ordering` because it's unreliable to
                 # pre-calculate from `events_and_contexts` at the time when
@@ -2022,12 +2054,15 @@ class PersistEventsStore:
                     f"""
                     INSERT INTO sliding_sync_joined_rooms
                         (room_id, event_stream_ordering, bump_stamp, {", ".join(sliding_sync_updates_keys)})
-                    VALUES (
+                    SELECT
                         ?,
-                        (SELECT stream_ordering FROM events WHERE room_id = ? ORDER BY stream_ordering DESC LIMIT 1),
+                        e.stream_ordering,
                         ?,
                         {", ".join("?" for _ in sliding_sync_updates_values)}
-                    )
+                    FROM events AS e
+                    WHERE e.room_id = ? AND e.stream_ordering IS NOT NULL
+                    ORDER BY e.stream_ordering DESC
+                    LIMIT 1
                     ON CONFLICT (room_id)
                     DO UPDATE SET
                         {", ".join(f"{key} = EXCLUDED.{key}" for key in sliding_sync_updates_keys)}
@@ -2921,10 +2956,12 @@ class PersistEventsStore:
         # Postgres stays authoritative, this is a read fast path.
         if self._embedded_event_json_enabled:
             put_event_json_batch(
+                self._embedded_hamt_engine,
+                self._embedded_hamt_namespace,
                 [
-                    (event_id, internal_metadata, json, format_version)
-                    for event_id, _room_id, internal_metadata, json, format_version in event_json_rows
-                ]
+                    (event_id, room_id, internal_metadata, json, format_version)
+                    for event_id, room_id, internal_metadata, json, format_version in event_json_rows
+                ],
             )
 
         self.db_pool.simple_insert_many_txn(
@@ -3213,6 +3250,9 @@ class PersistEventsStore:
                 "recheck": event.internal_metadata.need_to_check_redaction(),
             },
         )
+        # The `redactions` emptiness cache is only ever invalidated by writes,
+        # so make sure this one is reported once the transaction commits.
+        self.db_pool.note_table_write_after(txn, "redactions")
 
     def insert_labels_for_event_txn(
         self,
@@ -3728,6 +3768,14 @@ class PersistEventsStore:
             # state dag rooms allow outliers to have state, as `/get_missing_events` state dag events are nominally
             # outliers (not present in the timeline) but do need state persisted so we can calculate
             # what the auth_events are for the event.
+            # if the event was rejected, just give it the same state as its
+            # predecessor. This must come first: `context.state_group` raises
+            # for rejected events, so the outlier check below must never
+            # dereference it for one.
+            if context.rejected:
+                state_groups[event.event_id] = context.state_group_before_event
+                continue
+
             if (
                 not event.room_version.msc4242_state_dags
                 and event.internal_metadata.is_outlier()
@@ -3740,13 +3788,11 @@ class PersistEventsStore:
                         "Outlier event %s claims to have partial state", event.event_id
                     )
 
-                continue
-
-            # if the event was rejected, just give it the same state as its
-            # predecessor.
-            if context.rejected:
-                state_groups[event.event_id] = context.state_group_before_event
-                continue
+                # Out-of-band invites can be persisted as outliers while
+                # still carrying a usable state group. Keep their mapping so
+                # later local join/leave state resolution can find it.
+                if context.state_group is None:
+                    continue
 
             state_groups[event.event_id] = context.state_group
 
@@ -3785,6 +3831,15 @@ class PersistEventsStore:
             )
             raise PartialStateConflictError()
 
+        # Partial and outlier events can legitimately have no state group.
+        # `event_to_state_groups.state_group` is NOT NULL, so exclude those
+        # mappings from the SQL safety copy as well as from the embedded map.
+        non_null_state_groups: dict[str, int] = {
+            event_id: state_group_id
+            for event_id, state_group_id in state_groups.items()
+            if state_group_id is not None
+        }
+
         if getattr(self, "_embedded_event_json_enabled", False):
             # Exclusive by configured engine, not a dual-write -- see
             # embedded_event_to_state_group.py. This is an upsert (a retried
@@ -3794,20 +3849,35 @@ class PersistEventsStore:
             # event_ids are genuinely new before deciding what to
             # increment.
             existing = get_state_group_for_events_batch(
-                self._embedded_hamt_namespace, list(state_groups.keys())
+                self._embedded_hamt_engine,
+                self._embedded_hamt_namespace,
+                list(state_groups.keys()),
+                purpose="persist_existence_check",
             )
             new_event_ids = [
                 event_id for event_id in state_groups if event_id not in existing
             ]
-            non_null_state_groups: dict[str, int] = {
-                event_id: state_group_id
-                for event_id, state_group_id in state_groups.items()
-                if state_group_id is not None
-            }
             put_event_to_state_group_batch(
-                self._embedded_hamt_namespace, list(non_null_state_groups.items())
+                self._embedded_hamt_engine,
+                self._embedded_hamt_namespace,
+                list(non_null_state_groups.items()),
+            )
+            # Keep SQL as the committed safety copy while embedded mapping
+            # publication remains coalesced. Readers can fall back to this
+            # row if a worker observes the event before mtxdb has refreshed.
+            self.db_pool.simple_upsert_many_txn(
+                txn,
+                table="event_to_state_groups",
+                key_names=["event_id"],
+                key_values=[[event_id] for event_id in non_null_state_groups],
+                value_names=["state_group"],
+                value_values=[
+                    [state_group_id]
+                    for state_group_id in non_null_state_groups.values()
+                ],
             )
             increment_state_group_refcounts_batch(
+                self._embedded_hamt_engine,
                 self._embedded_hamt_namespace,
                 [
                     non_null_state_groups[event_id]
@@ -3815,21 +3885,27 @@ class PersistEventsStore:
                     if event_id in non_null_state_groups
                 ],
             )
+            # No sync here: both call sites of this method are within
+            # `_persist_events_txn`'s scope, which does one combined sync
+            # at the very end covering this write plus the chain-links
+            # batch -- see the comment there and
+            # put_event_to_state_group_batch's docstring.
         else:
             self.db_pool.simple_upsert_many_txn(
                 txn,
                 table="event_to_state_groups",
                 key_names=["event_id"],
-                key_values=[[event_id] for event_id, _ in state_groups.items()],
+                key_values=[[event_id] for event_id in non_null_state_groups],
                 value_names=["state_group"],
                 value_values=[
-                    [state_group_id] for _, state_group_id in state_groups.items()
+                    [state_group_id]
+                    for state_group_id in non_null_state_groups.values()
                 ],
             )
 
         for event_id, state_group_id in state_groups.items():
             txn.call_after(
-                self.store._get_state_group_for_event.prefill,
+                self.store._get_state_group_for_event_sql.prefill,
                 (event_id,),
                 state_group_id,
             )
@@ -3864,6 +3940,20 @@ class PersistEventsStore:
                 (ev.event_id, e_id) for ev in events for e_id in ev.prev_event_ids()
             ],
         )
+
+        if self._embedded_event_edges_writable:
+            edge_rows = [
+                (ev.room_id, ev.event_id, e_id, False)
+                for ev in events
+                for e_id in ev.prev_event_ids()
+            ]
+            if edge_rows:
+                txn.call_after(
+                    queue_edge_write,
+                    self._embedded_hamt_namespace,
+                    edge_rows,
+                )
+                txn.call_after(mark_dirty, Pool.EVENT_DAG)
 
         self._update_backward_extremeties(txn, events)
 

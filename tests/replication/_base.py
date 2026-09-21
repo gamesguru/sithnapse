@@ -275,6 +275,19 @@ class BaseMultiWorkerStreamTestCase(unittest.HomeserverTestCase):
     def setUp(self) -> None:
         super().setUp()
 
+        # Worker homeservers created via `make_worker_hs` are otherwise only
+        # ever referenced by whatever local variable the test body assigns
+        # them to. That local's frame is torn down the instant the test
+        # method returns -- before Trial invokes any `addCleanup` callback --
+        # so without an independent strong reference here, the worker's own
+        # shutdown cleanup can find it already garbage collected and skip
+        # calling `shutdown()` (leaking its DB connection pool). A plain
+        # instance attribute on `self` keeps it alive for exactly the test's
+        # duration without reintroducing that problem for the *primary* `hs`
+        # object -- see tests/app/test_homeserver_shutdown.py, which relies
+        # on nothing but a weakref keeping it alive past explicit shutdown.
+        self._worker_homeservers: list[HomeServer] = []
+
         # build a replication server
         self.streamer = self.hs.get_replication_streamer()
 
@@ -354,6 +367,9 @@ class BaseMultiWorkerStreamTestCase(unittest.HomeserverTestCase):
             reactor=self.reactor,
             **kwargs,
         )
+        # Keep this worker HS alive for the duration of the test -- see the
+        # comment on `self._worker_homeservers` in `setUp`.
+        self._worker_homeservers.append(worker_hs)
 
         # If the instance is in the `instance_map` config then workers may try
         # and send HTTP requests to it, so we register it with

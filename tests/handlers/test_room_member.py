@@ -729,3 +729,111 @@ class TestMSC4380InviteBlocking(FederatingHomeserverTestCase):
         ).value
         self.assertEqual(f.code, 403)
         self.assertEqual(f.errcode, "M_INVITE_BLOCKED")
+
+
+class TestOutOfBandInviteWhenAlreadyParticipating(FederatingHomeserverTestCase):
+    """
+    Regression tests for an already-participating homeserver receiving an
+    out-of-band invite, then joining or rejecting it.
+    Verifies that the resulting join/leave event correctly includes the
+    outlier invite in both prev_event_ids and auth_event_ids without
+    failing state calculation.
+    """
+
+    servlets = [
+        synapse.rest.admin.register_servlets,
+        synapse.rest.client.login.register_servlets,
+        synapse.rest.client.room.register_servlets,
+    ]
+
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
+        self.handler = hs.get_room_member_handler()
+        self.fed_handler = hs.get_federation_handler()
+        self.store = hs.get_datastores().main
+
+        # Create two local users: alice (already in room) and bob (invitee)
+        self.alice = self.register_user("alice", "pass")
+        self.alice_token = self.login("alice", "pass")
+        self.bob = self.register_user("bob", "pass")
+        self.bob_token = self.login("bob", "pass")
+
+    def test_out_of_band_invite_then_join(self) -> None:
+        room_id = self.helper.create_room_as(self.alice, tok=self.alice_token)
+        room_version = self.get_success(self.store.get_room_version(room_id))
+
+        remote_user = f"@remote:{self.OTHER_SERVER_NAME}"
+        invite_event = make_test_pdu_event(
+            {
+                "type": EventTypes.Member,
+                "content": {"membership": Membership.INVITE},
+                "room_id": room_id,
+                "sender": remote_user,
+                "state_key": self.bob,
+                "depth": 32,
+                "prev_events": [],
+                "auth_events": [],
+                "origin_server_ts": self.clock.time_msec(),
+            },
+            room_version,
+        )
+
+        persisted_invite = self.get_success(
+            self.fed_handler.on_invite_request(
+                self.OTHER_SERVER_NAME,
+                invite_event,
+                invite_event.room_version,
+            )
+        )
+        self.assertTrue(persisted_invite.internal_metadata.is_outlier())
+        # Confirm it has no state group assigned
+        sg = self.get_success(
+            self.store._get_state_group_for_event(persisted_invite.event_id)
+        )
+        self.assertIsNone(sg)
+
+        # Bob accepts the invite by joining
+        join_res = self.helper.join(room_id, self.bob, tok=self.bob_token)
+        join_event = self.get_success(self.store.get_event(join_res["event_id"]))
+
+        # Must have the invite in both prev_events and auth_events
+        self.assertIn(persisted_invite.event_id, join_event.prev_event_ids())
+        self.assertIn(persisted_invite.event_id, join_event.auth_event_ids())
+        self.assertEqual(join_event.membership, Membership.JOIN)
+
+    def test_out_of_band_invite_then_reject(self) -> None:
+        room_id = self.helper.create_room_as(self.alice, tok=self.alice_token)
+        room_version = self.get_success(self.store.get_room_version(room_id))
+
+        remote_user = f"@remote:{self.OTHER_SERVER_NAME}"
+        invite_event = make_test_pdu_event(
+            {
+                "type": EventTypes.Member,
+                "content": {"membership": Membership.INVITE},
+                "room_id": room_id,
+                "sender": remote_user,
+                "state_key": self.bob,
+                "depth": 32,
+                "prev_events": [],
+                "auth_events": [],
+                "origin_server_ts": self.clock.time_msec(),
+            },
+            room_version,
+        )
+
+        persisted_invite = self.get_success(
+            self.fed_handler.on_invite_request(
+                self.OTHER_SERVER_NAME,
+                invite_event,
+                invite_event.room_version,
+            )
+        )
+        self.assertTrue(persisted_invite.internal_metadata.is_outlier())
+
+        # Bob rejects the invite by leaving
+        leave_res = self.helper.leave(room_id, self.bob, tok=self.bob_token)
+        leave_event = self.get_success(self.store.get_event(leave_res["event_id"]))
+
+        # Must have the invite in both prev_events and auth_events
+        self.assertIn(persisted_invite.event_id, leave_event.prev_event_ids())
+        self.assertIn(persisted_invite.event_id, leave_event.auth_event_ids())
+        self.assertEqual(leave_event.membership, Membership.LEAVE)

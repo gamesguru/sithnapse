@@ -19,13 +19,20 @@
 # [This file includes modifications made by New Vector Limited]
 #
 #
+import atexit
 import inspect
+import json
 import logging
+import os
+import re
+import sys
+import threading
 import time
 import types
-from collections import defaultdict
+from collections import defaultdict, deque
 from time import monotonic as monotonic_time
 from typing import (
+    IO,
     TYPE_CHECKING,
     Any,
     Awaitable,
@@ -101,6 +108,267 @@ sql_txn_duration = Counter(
     "sec",
     labelnames=["desc", SERVER_NAME_LABEL],
 )
+
+# ── per-table SQL ops timing (opt-in via SYNAPSE_PG_TIMINGS=1) ──────────
+# Read once at import time. The call sites below (`LoggingTransaction`'s
+# per-query hook and the pool-checkout scheduling hook) are the hottest
+# paths in the whole codebase -- re-running `os.environ.get(...)` on every
+# single query/checkout to discover "timings are off" is itself a real,
+# measurable per-query cost when multiplied across a full test suite or
+# a busy homeserver, even though the timing functions themselves no-op.
+_PG_TIMINGS_ENABLED = bool(os.environ.get("SYNAPSE_PG_TIMINGS"))
+
+_TABLE_OPS: dict[str, float] = defaultdict(float)
+_TABLE_OPS_COUNTS: dict[str, int] = defaultdict(int)
+_TABLE_OPS_ROWS: dict[str, int] = defaultdict(int)
+
+# Guards the three dicts above: writes happen from whatever thread executes
+# the query, while the SIGTERM/atexit flushers run on what may be a
+# different thread (and the SIGTERM handler can fire mid-query). Without a
+# lock, `_print_table_ops`' `sorted(_TABLE_OPS.items(), ...)` can hit
+# "dictionary changed size during iteration" and lose the flush it exists
+# to produce.
+_TABLE_OPS_LOCK = threading.Lock()
+_SQL_SCHEDULING_LOCK = threading.Lock()
+_SQL_SCHEDULING_TOTAL: float = 0.0
+_SQL_SCHEDULING_COUNT: int = 0
+_SQL_SCHEDULING_LATENCIES: deque[float] = deque(maxlen=4096)
+
+_TABLE_RE = re.compile(
+    r"(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM|FROM|JOIN)\s+(\w+)",
+    re.IGNORECASE,
+)
+
+_SQL_COMMENT_RE = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
+
+
+def _timings_print(*args: object) -> None:
+    """Print to stderr and optionally to SYNAPSE_PG_TIMINGS_FILE."""
+    print(*args, file=sys.stderr)
+    if _timings_file is not None:
+        print(*args, file=_timings_file)
+        _timings_file.flush()
+
+
+_timings_file: IO[str] | None = None
+if _PG_TIMINGS_ENABLED:
+    _timings_path = os.environ.get("SYNAPSE_PG_TIMINGS_FILE")
+    if _timings_path:
+        try:
+            _timings_file = open(_timings_path, "a")
+        except OSError:
+            pass
+
+
+_DIRTY_TABLES: set[str] = set()
+_HAD_DDL: bool = False
+_DIRTY_TABLES_LOCK = threading.Lock()
+_DDL_TRIGGERS: list[str] = []  # debug: first few DDL SQLs that set _HAD_DDL
+
+_MUTATING_TABLE_RE = re.compile(
+    r"^\s*(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM|TRUNCATE(?:\s+TABLE)?)\s+(\w+)",
+    re.IGNORECASE,
+)
+_DISRUPTIVE_DDL_RE = re.compile(
+    r"^\s*(?:CREATE\s+(?!TEMPORARY|TEMP|UNLOGGED)\s*TABLE\s+(?!IF\s+NOT\s+EXISTS)|DROP\s+TABLE\s+(?!IF\s+EXISTS\s+(?:temp_|tmp_|_extremities|events_to_purge)|_extremities)|DROP\s+SCHEMA|ALTER\s+TABLE\s+\w+\s+(?:DROP|RENAME))",
+    re.IGNORECASE,
+)
+
+_DEBUG_DDL_TRIGGERS = os.environ.get("SYNAPSE_DEBUG_DDL_TRIGGERS") == "1"
+
+
+def track_dirty_table_from_sql(sql: str) -> None:
+    global _HAD_DDL
+    if "--" in sql or "/*" in sql:
+        sql = _SQL_COMMENT_RE.sub(" ", sql)
+    if _DISRUPTIVE_DDL_RE.search(sql):
+        with _DIRTY_TABLES_LOCK:
+            _HAD_DDL = True
+            if _DEBUG_DDL_TRIGGERS and len(_DDL_TRIGGERS) < 10:
+                _DDL_TRIGGERS.append(sql[:200])
+        return
+    m = _MUTATING_TABLE_RE.search(sql)
+    if m:
+        table = m.group(1).lower()
+        with _DIRTY_TABLES_LOCK:
+            _DIRTY_TABLES.add(table)
+
+
+def pop_dirty_tables() -> tuple[set[str], bool, list[str]]:
+    global _HAD_DDL
+    with _DIRTY_TABLES_LOCK:
+        dirty = set(_DIRTY_TABLES)
+        had_ddl = _HAD_DDL
+        triggers = list(_DDL_TRIGGERS)
+        _DIRTY_TABLES.clear()
+        _HAD_DDL = False
+        _DDL_TRIGGERS.clear()
+        return dirty, had_ddl, triggers
+
+
+def _track_table_op(sql: str, elapsed: float, rowcount: int = 0) -> None:
+    if "--" in sql or "/*" in sql:
+        sql = _SQL_COMMENT_RE.sub(" ", sql)
+    m = _TABLE_RE.search(sql)
+    if not m:
+        return
+    table = m.group(1).lower()
+    with _TABLE_OPS_LOCK:
+        _TABLE_OPS[table] += elapsed
+        _TABLE_OPS_COUNTS[table] += 1
+        # rowcount is instrumentation, not correctness -- a test's mock cursor
+        # (e.g. tests.storage.test_base's Mock() txn, when a test doesn't set
+        # .rowcount explicitly) can hand back a non-int Mock attribute instead
+        # of a real DB-API rowcount. This must never turn on-by-default timing
+        # instrumentation into a hard crash of the actual query it's timing.
+        if isinstance(rowcount, int):
+            _TABLE_OPS_ROWS[table] += max(rowcount, 0)
+
+
+def _track_sql_scheduling(elapsed: float) -> None:
+    """Record pool checkout/thread scheduling delay for the opt-in report."""
+    global _SQL_SCHEDULING_TOTAL, _SQL_SCHEDULING_COUNT
+    with _SQL_SCHEDULING_LOCK:
+        _SQL_SCHEDULING_TOTAL += elapsed
+        _SQL_SCHEDULING_COUNT += 1
+        _SQL_SCHEDULING_LATENCIES.append(elapsed)
+
+
+def _print_table_ops() -> None:
+    if not _PG_TIMINGS_ENABLED:
+        return
+    with _TABLE_OPS_LOCK:
+        # Snapshot under the lock so the SIGTERM/atexit flusher never races a
+        # concurrent `_track_table_op` on `_TABLE_OPS` (see _TABLE_OPS_LOCK).
+        table_ops = dict(_TABLE_OPS)
+        table_counts = dict(_TABLE_OPS_COUNTS)
+        table_rows = dict(_TABLE_OPS_ROWS)
+
+    with _SQL_SCHEDULING_LOCK:
+        scheduling_total = _SQL_SCHEDULING_TOTAL
+        scheduling_count = _SQL_SCHEDULING_COUNT
+        scheduling_samples = sorted(_SQL_SCHEDULING_LATENCIES)
+
+    if not table_ops and not scheduling_count:
+        return
+
+    scheduling = {
+        "total": scheduling_total,
+        "count": scheduling_count,
+        "latencies": scheduling_samples,
+    }
+
+    run_dir = os.environ.get("SYNAPSE_TIMINGS_RUN_DIR")
+    if run_dir:
+        tmp_path = os.path.join(run_dir, f"sql_{os.getpid()}.tmp")
+        final_path = os.path.join(run_dir, f"sql_{os.getpid()}.json")
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "ops": table_ops,
+                        "counts": table_counts,
+                        "rows": table_rows,
+                        "scheduling": scheduling,
+                    },
+                    f,
+                )
+            os.replace(tmp_path, final_path)
+        except OSError:
+            pass
+        return
+
+    # Sort by total time descending
+    ranked = sorted(table_ops.items(), key=lambda kv: kv[1], reverse=True)
+    rendered = []
+    for table, total_s in ranked[:30]:
+        count = table_counts.get(table, 0)
+        rows = table_rows.get(table, 0)
+        rendered.append(
+            (
+                table,
+                f"{total_s * 1000:.1f}ms",
+                f"{count:d}",
+                f"{rows:d}",
+                f"{(total_s / count) * 1000 if count else 0.0:.3f}ms",
+            )
+        )
+    total_time_s = sum(table_ops.values())
+    total_count = sum(table_counts.values())
+    total_rows = sum(table_rows.values())
+    total_row = (
+        "TOTAL",
+        f"{total_time_s * 1000:.1f}ms",
+        f"{total_count:d}",
+        f"{total_rows:d}",
+        f"{(total_time_s / total_count) * 1000 if total_count else 0.0:.3f}ms",
+    )
+    table_width = max(40, *(len(row[0]) for row in rendered), len("TOTAL"))
+    total_width = max(
+        len("total"), *(len(row[1]) for row in rendered), len(total_row[1])
+    )
+    calls_width = max(
+        len("calls"), *(len(row[2]) for row in rendered), len(total_row[2])
+    )
+    rows_width = max(len("rows"), *(len(row[3]) for row in rendered), len(total_row[3]))
+    avg_width = max(len("avg"), *(len(row[4]) for row in rendered), len(total_row[4]))
+    _timings_print("\n=== Per-table SQL timing (top 30) ===")
+    _timings_print(
+        f"  {'table':{table_width}s}  {'total':>{total_width}s}  {'calls':>{calls_width}s}  {'rows':>{rows_width}s}  {'avg':>{avg_width}s}",
+    )
+    for table, total_text, count_text, rows_text, avg_text in rendered:
+        _timings_print(
+            f"  {table:{table_width}s}  {total_text:>{total_width}s}  {count_text:>{calls_width}s}  {rows_text:>{rows_width}s}  {avg_text:>{avg_width}s}",
+        )
+    _timings_print("")
+    _timings_print(
+        f"  {total_row[0]:{table_width}s}  {total_row[1]:>{total_width}s}  "
+        f"{total_row[2]:>{calls_width}s}  {total_row[3]:>{rows_width}s}  {total_row[4]:>{avg_width}s}",
+    )
+    _timings_print("=====================================")
+    _timings_print("")
+
+    if scheduling_count and scheduling_samples:
+        samples = scheduling_samples
+
+        def percentile(p: float) -> float:
+            return samples[min(int(len(samples) * p), len(samples) - 1)]
+
+        _timings_print("=== SQL pool scheduling delay (not query execution) ===")
+        _timings_print(
+            f"  total={scheduling_total * 1000:.1f}ms  "
+            f"calls={scheduling_count:,}  "
+            f"avg={scheduling_total * 1000 / scheduling_count:.3f}ms  "
+            f"p50={percentile(0.50) * 1000:.3f}ms  "
+            f"p95={percentile(0.95) * 1000:.3f}ms  "
+            f"p99={percentile(0.99) * 1000:.3f}ms  "
+            f"max={samples[-1] * 1000:.3f}ms"
+        )
+        _timings_print("======================================================")
+        _timings_print("")
+
+
+if _PG_TIMINGS_ENABLED:
+
+    def flush_table_ops() -> None:
+        _print_table_ops()
+
+    atexit.register(flush_table_ops)
+
+    import signal as _signal
+    from types import FrameType as _FrameType
+
+    _original_sigterm_table_ops = _signal.getsignal(_signal.SIGTERM)
+
+    def _flush_table_ops_on_sigterm(signum: int, frame: _FrameType | None) -> None:
+        _print_table_ops()
+        if callable(_original_sigterm_table_ops):
+            _original_sigterm_table_ops(signum, frame)
+        elif _original_sigterm_table_ops == _signal.SIG_DFL:
+            _signal.signal(_signal.SIGTERM, _signal.SIG_DFL)
+            _signal.raise_signal(_signal.SIGTERM)
+
+    _signal.signal(_signal.SIGTERM, _flush_table_ops_on_sigterm)
 
 
 # Unique indexes which have been added in background updates. Maps from table name
@@ -540,6 +808,13 @@ class LoggingTransaction:
             sql_query_timer.labels(
                 verb=sql.split()[0], **{SERVER_NAME_LABEL: self.server_name}
             ).observe(secs)
+            track_dirty_table_from_sql(sql)
+            if _PG_TIMINGS_ENABLED:
+                try:
+                    rowcount = self.txn.rowcount
+                except Exception:
+                    rowcount = 0
+                _track_table_op(sql, secs, rowcount)
 
     def close(self) -> None:
         self.txn.close()
@@ -591,6 +866,50 @@ class PerformanceCounters:
         return top_n_counters
 
 
+class TableEmptyCache:
+    """A conservative "is this table empty?" cache.
+
+    Some reads only care about matches against a set of keys (e.g. "are any of
+    these events redacted?"). If we have positively observed that the table is
+    empty, and no write to it has happened since, the read cannot match
+    anything and can be skipped entirely.
+
+    The cache is only consulted on the process that performs *every* write to
+    the table, so "no write happened since" is a reliable, local statement (see
+    `DatabasePool.table_empty_cache`). Deletes deliberately do not invalidate
+    the cache: wrongly believing a table is non-empty only costs a redundant
+    query, whereas wrongly believing it is empty would return stale results.
+    """
+
+    __slots__ = ("_generation", "_probed_generation", "_empty")
+
+    def __init__(self) -> None:
+        self._generation = 0
+        self._probed_generation = -1
+        self._empty = False
+
+    def note_write(self) -> None:
+        """Record that the table has been written to.
+
+        Must be called *after* the write has committed (e.g. via
+        `LoggingTransaction.call_after`): bumping before commit would let a
+        concurrent reader observe the table as still empty and then cache that
+        stale observation.
+        """
+        self._generation += 1
+
+    def should_query(self, txn: LoggingTransaction, table: str) -> bool:
+        """Whether a read of `table` must actually hit the database.
+
+        `table` is always a hard-coded literal at the call site.
+        """
+        if self._probed_generation != self._generation:
+            txn.execute(f"SELECT 1 FROM {table} LIMIT 1")
+            self._empty = txn.fetchone() is None
+            self._probed_generation = self._generation
+        return not self._empty
+
+
 class DatabasePool:
     """Wraps a single physical database and connection pool.
 
@@ -635,6 +954,29 @@ class DatabasePool:
 
         self.engine = engine
 
+        # Lazily-created per-table emptiness caches (see `TableEmptyCache`).
+        self._table_empty_caches: dict[str, TableEmptyCache] = {}
+        # The cache assumes that *every* write to a cached table happens on
+        # this process and is reported via `note_table_write`. That is only
+        # true for the process that persists events, so only enable it there.
+        writers = getattr(
+            getattr(getattr(hs, "config", None), "worker", None), "writers", None
+        )
+        events_writers = getattr(writers, "events", ()) if writers is not None else ()
+        self._table_empty_caching_enabled = (
+            isinstance(events_writers, (list, tuple, set, frozenset))
+            and hs.get_instance_name() in events_writers
+        )
+
+        # True when the database is a freshly-created empty clone (set by the
+        # test harness via _TEST_DB_IS_FRESH in the config dict).  When set,
+        # sequence generators and id_generators skip their startup consistency
+        # queries because all tables are guaranteed to be empty and all
+        # sequences are at their initial values.
+        self.is_fresh: bool = bool(
+            database_config.config.get("_TEST_DB_IS_FRESH", False)
+        )
+
         # A set of tables that are not safe to use native upserts in.
         self._unsafe_to_upsert_tables = set(UNIQUE_INDEX_BACKGROUND_UPDATES.keys())
 
@@ -651,6 +993,43 @@ class DatabasePool:
             "upsert_safety_check",
             self._check_safe_to_upsert,
         )
+
+    def table_empty_cache(self, table: str) -> TableEmptyCache | None:
+        """Return the emptiness cache for `table`, if it is safe to use one.
+
+        Returns `None` on instances that don't perform every write to the
+        table, where the cache's invalidation guarantee doesn't hold.
+        """
+        if not self._table_empty_caching_enabled:
+            return None
+        cache = self._table_empty_caches.get(table)
+        if cache is None:
+            cache = TableEmptyCache()
+            self._table_empty_caches[table] = cache
+        return cache
+
+    def note_table_write(self, table: str) -> None:
+        """Invalidate the emptiness cache for `table`.
+
+        Must be called *after* the write commits, never from inside the
+        transaction: a concurrent reader must not be able to observe the
+        pre-write (empty) state and cache it.
+        """
+        cache = self._table_empty_caches.get(table)
+        if cache is not None:
+            cache.note_write()
+
+    def note_table_write_after(self, txn: LoggingTransaction, table: str) -> None:
+        """Schedule `note_table_write` for `table` once `txn` commits.
+
+        Safe to call even when caching is disabled or the transaction doesn't
+        accept after-callbacks.
+        """
+        if not self._table_empty_caching_enabled:
+            return
+        if txn.after_callbacks is None:
+            return
+        txn.call_after(self.note_table_write, table)
 
     def stop_background_updates(self) -> None:
         """
@@ -1084,6 +1463,8 @@ class DatabasePool:
                     sql_scheduling_timer.labels(
                         **{SERVER_NAME_LABEL: self.server_name}
                     ).observe(sched_duration_sec)
+                    if _PG_TIMINGS_ENABLED:
+                        _track_sql_scheduling(sched_duration_sec)
                     context.add_database_scheduled(sched_duration_sec)
 
                     if self._txn_limit > 0:

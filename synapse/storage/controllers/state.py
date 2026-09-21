@@ -64,6 +64,7 @@ class StateStorageController:
 
     def __init__(self, hs: "HomeServer", stores: "Databases"):
         self.server_name = hs.hostname  # nb must be called this for @cached
+        self._instance_name = hs.get_instance_name()
         self.clock = hs.get_clock()
         self._is_mine_id = hs.is_mine_id
         self.stores = stores
@@ -112,6 +113,12 @@ class StateStorageController:
         event_to_groups = await self.get_state_group_for_events(
             event_ids, await_full_state=await_full_state
         )
+
+        missing = set(event_ids).difference(event_to_groups)
+        if missing:
+            raise RuntimeError(
+                f"State mapping disappeared in get_state_for_events: {missing}"
+            )
 
         groups = set(event_to_groups.values())
         group_to_state = await self.stores.state._get_state_for_groups(groups)
