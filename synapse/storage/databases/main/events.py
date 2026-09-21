@@ -3926,11 +3926,10 @@ class PersistEventsStore:
                     if event_id in non_null_state_groups
                 ],
             )
-            # No sync here: both call sites of this method are within
-            # `_persist_events_txn`'s scope, which does one combined sync
-            # at the very end covering this write plus the chain-links
-            # batch -- see the comment there and
-            # put_event_to_state_group_batch's docstring.
+            # No immediate sync here. `_persist_events_txn` marks STATE dirty
+            # after SQL commit and the coalescer syncs it later; the SQL upsert
+            # above remains the committed safety copy while that durability
+            # sync is deferred. See put_event_to_state_group_batch's docstring.
         else:
             self.db_pool.simple_upsert_many_txn(
                 txn,

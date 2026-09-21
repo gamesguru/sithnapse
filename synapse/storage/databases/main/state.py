@@ -803,11 +803,12 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
         assert state_group is not None
 
         if getattr(self, "_embedded_event_json_enabled", False):
-            # Exclusive by configured engine, not a dual-write. Unlike
-            # put_event_to_state_group_batch's initial-insert callers, this
-            # is a genuine rewrite of which state_group this event
-            # references -- the old one loses a reference and the new one
-            # gains one, so the refcount must move with it, not just get
+            # Dual-write when the embedded engine is configured: update the
+            # mtxdb mapping and refcounts, then keep SQL in step as the safety
+            # copy/read fallback. Unlike put_event_to_state_group_batch's
+            # initial-insert callers, this is a genuine rewrite of the state
+            # group for this event: the old one loses a reference and the new
+            # one gains one, so the refcount must move with it, not just get
             # incremented again (that would double-count the old group's
             # reference forever, since a partial-state event's placeholder
             # group is never otherwise decremented).
