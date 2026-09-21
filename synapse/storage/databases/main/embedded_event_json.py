@@ -82,6 +82,7 @@ keeps multiple homeservers sharing one mtxdb file from colliding on event_id.
 from __future__ import annotations
 
 import logging
+import os
 import struct
 import time
 from typing import TYPE_CHECKING
@@ -97,6 +98,18 @@ if TYPE_CHECKING:
     from synapse.server import HomeServer
 
 logger = logging.getLogger(__name__)
+
+# THROWAWAY DIAGNOSTIC -- remove once the publication-timing question is
+# settled. Forces a synchronous EVENT_DAG fsync after every `event_json`
+# write, i.e. the write becomes durable before the persist transaction
+# returns instead of waiting for the flush coalescer. Wired from
+# `SYNAPSE_TEST_MTXDB_FORCE_SYNC_EVENT_JSON` in scripts-dev/complement.sh so
+# the forced-sync half of the experiment matrix needs no rebuild. Never
+# enable outside a diagnostic run: it is a whole-device cache flush per
+# persisted event.
+_FORCE_SYNC_EVENT_JSON = os.environ.get(
+    "SYNAPSE_MTXDB_FORCE_SYNC_EVENT_JSON", ""
+).strip().lower() not in ("", "0", "false", "no", "off")
 
 
 def open_embedded_event_json_engine(hs: "HomeServer") -> bool:
@@ -198,7 +211,7 @@ def put_event_json_batch(
         event_json_put(namespace, tuples)
         ffi_timing("ffi_event_json_put", time.monotonic() - _et)
 
-        if sync:
+        if sync or _FORCE_SYNC_EVENT_JSON:
             sync_now(pools=[Pool.EVENT_DAG])
 
 

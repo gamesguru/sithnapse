@@ -512,6 +512,16 @@ main() {
     *) export PASS_SYNAPSE_MTXDB_WAL=1 ;;
   esac
 
+  # THROWAWAY DIAGNOSTIC: force a synchronous EVENT_DAG fsync after every
+  # event_json write (see embedded_event_json._FORCE_SYNC_EVENT_JSON). This is
+  # the "forced sync" arm of the publication-timing experiment matrix; it
+  # answers whether the cross-process miss is a writer publication race or a
+  # persistent reader-refresh miss. Remove with the flag it forwards.
+  case "${SYNAPSE_TEST_MTXDB_FORCE_SYNC_EVENT_JSON:-}" in
+    "" | 0 | false | False | no | No | off | Off) ;;
+    *) export PASS_SYNAPSE_MTXDB_FORCE_SYNC_EVENT_JSON=1 ;;
+  esac
+
   # Forward the diagnostic stats switch into the containers: with sync
   # disabled the report is empty, so this is only useful on a sync-on lane,
   # but it must reach the container or there is no way to size a sync's
@@ -526,7 +536,7 @@ main() {
   local synapse_revision
   synapse_revision="$(git -C "$repo_root" describe --tags --always --dirty 2>/dev/null || echo '<unknown>')"
   echo "Synapse revision: ${synapse_revision}" >&2
-  echo "Database: ${PASS_SYNAPSE_COMPLEMENT_DATABASE} (workers: ${PASS_SYNAPSE_COMPLEMENT_USE_WORKERS:-false}) | Embedded HAMT engine: ${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:-<none>}${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:+ at ${PASS_SYNAPSE_EMBEDDED_HAMT_PATH:-<not set>}}${PASS_SYNAPSE_MTXDB_NO_SYNC:+ (no_sync)}${PASS_SYNAPSE_MTXDB_WAL:+ (wal)}${PASS_SYNAPSE_MTXDB_STATS:+ (stats)}" >&2
+  echo "Database: ${PASS_SYNAPSE_COMPLEMENT_DATABASE} (workers: ${PASS_SYNAPSE_COMPLEMENT_USE_WORKERS:-false}) | Embedded HAMT engine: ${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:-<none>}${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:+ at ${PASS_SYNAPSE_EMBEDDED_HAMT_PATH:-<not set>}}${PASS_SYNAPSE_MTXDB_NO_SYNC:+ (no_sync)}${PASS_SYNAPSE_MTXDB_WAL:+ (wal)}${PASS_SYNAPSE_MTXDB_STATS:+ (stats)}${PASS_SYNAPSE_MTXDB_FORCE_SYNC_EVENT_JSON:+ (force-sync-event-json)}" >&2
 
   # Complement's Destroy() force-removes every homeserver container
   # unconditionally, pass or fail -- there is no "keep failed containers"
