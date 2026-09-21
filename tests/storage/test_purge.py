@@ -64,6 +64,78 @@ class PurgeTests(HomeserverTestCase):
         self.state_deletion_store = hs.get_datastores().state_deletion
         self._storage_controllers = self.hs.get_storage_controllers()
 
+    def _enable_embedded_engine(self) -> tuple[str, str]:
+        """Force-enable the embedded mtxdb path for a single test.
+
+        Opens a per-test client and enables both the main and persister
+        stores *before* the room under test is created: the room's create
+        event must be persisted through the mirror, or events_worker.py's
+        unconditional `_embedded_event_json_enabled` read check
+        (events_worker.py:1666) routes its auth-chain lookup through a mirror
+        that never saw it, 403ing with "No create event in auth events".
+
+        Returns the configured (engine, namespace).
+        """
+        import shutil
+        import tempfile
+
+        from synapse.synapse_rust import mtxdb_engine
+
+        tmpdir = tempfile.mkdtemp(prefix="test-purge-embedded-")
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        mtxdb_engine.open_client(tmpdir)
+
+        persist_store = self.hs.get_datastores().persist_events
+        assert persist_store is not None
+        for store in (self.store, persist_store):
+            store._embedded_event_json_enabled = True
+            store._embedded_hamt_engine = "mtxdb"
+
+        engine = self.store._embedded_hamt_engine
+        assert engine is not None
+        return engine, self.store._embedded_hamt_namespace
+
+    def _seed_redaction_and_rejection_mirror(
+        self, engine: str, namespace: str, target_id: str, redaction_id: str
+    ) -> None:
+        """Seed the SQL rows and matching mirror entries for a redaction
+        (keyed by its target) and a rejection (keyed by the event id)."""
+        self.get_success(
+            self.store.db_pool.simple_insert(
+                table="redactions",
+                values={
+                    "event_id": redaction_id,
+                    "redacts": target_id,
+                    "received_ts": 1,
+                    "recheck": False,
+                },
+            )
+        )
+        self.get_success(
+            self.store.db_pool.simple_insert(
+                table="rejections",
+                values={
+                    "event_id": target_id,
+                    "reason": "test rejection",
+                    "last_check": "1",
+                },
+            )
+        )
+        put_redaction_batch(engine, namespace, [(target_id, redaction_id, True)])
+        put_rejection_batch(engine, namespace, [(target_id, "test rejection", "1")])
+
+    def _assert_mirrors(
+        self, engine: str, namespace: str, target_id: str, present: bool
+    ) -> None:
+        redactions = get_redactions_batch(engine, namespace, [target_id])
+        rejections = get_rejections_batch(engine, namespace, [target_id])
+        if present:
+            self.assertIn(target_id, redactions)
+            self.assertIn(target_id, rejections)
+        else:
+            self.assertNotIn(target_id, redactions)
+            self.assertNotIn(target_id, rejections)
+
     def test_purge_history(self) -> None:
         """
         Purging a room history will delete everything before the topological point.
@@ -152,75 +224,47 @@ class PurgeTests(HomeserverTestCase):
         self.get_failure(self.store.get_event(first["event_id"]), NotFoundError)
 
     def test_purge_room_clears_embedded_redaction_and_rejection_mirrors(self) -> None:
-        if not getattr(self.store, "_embedded_event_json_enabled", False):
-            self.skipTest(
-                "embedded mtxdb engine is not configured -- run under the "
-                "trial-mtxdb CI job, or locally with SYNAPSE_TEST_MTXDB=1 "
-                "(see tests/utils.py's EMBEDDED_HAMT_ENGINE handling), so a "
-                "real per-homeserver mtxdb engine is opened during startup. "
-                "Monkeypatching these flags mid-test instead is unsound: the "
-                "room's own create event would have already been persisted "
-                "through the SQL-only path in `prepare()`, and "
-                "events_worker.py's unconditional `_embedded_event_json_enabled` "
-                "check on the read path (events_worker.py:1666) would then "
-                "route its auth-chain lookup through a mirror that never saw "
-                "it written, 403ing with 'No create event in auth events'."
-            )
+        engine, namespace = self._enable_embedded_engine()
 
-        target = self.helper.send(self.room_id, body="target")
-        redaction = self.helper.send(self.room_id, body="redaction event")
-        namespace = self.store._embedded_hamt_namespace
-        engine = self.store._embedded_hamt_engine
+        room_id = self.helper.create_room_as(self.user_id)
+        target = self.helper.send(room_id, body="target")
+        redaction = self.helper.send(room_id, body="redaction event")
 
-        self.get_success(
-            self.store.db_pool.simple_insert(
-                table="redactions",
-                values={
-                    "event_id": redaction["event_id"],
-                    "redacts": target["event_id"],
-                    "received_ts": 1,
-                    "recheck": False,
-                },
-            )
+        self._seed_redaction_and_rejection_mirror(
+            engine, namespace, target["event_id"], redaction["event_id"]
         )
+        self._assert_mirrors(engine, namespace, target["event_id"], present=True)
+
+        self.get_success(self._storage_controllers.purge_events.purge_room(room_id))
+
+        self._assert_mirrors(engine, namespace, target["event_id"], present=False)
+
+    def test_purge_history_clears_embedded_redaction_and_rejection_mirrors(
+        self,
+    ) -> None:
+        engine, namespace = self._enable_embedded_engine()
+
+        room_id = self.helper.create_room_as(self.user_id)
+        target = self.helper.send(room_id, body="target")
+        redaction = self.helper.send(room_id, body="redaction event")
+        last = self.helper.send(room_id, body="last")
+
+        self._seed_redaction_and_rejection_mirror(
+            engine, namespace, target["event_id"], redaction["event_id"]
+        )
+        self._assert_mirrors(engine, namespace, target["event_id"], present=True)
+
+        token = self.get_success(
+            self.store.get_topological_token_for_event(last["event_id"])
+        )
+        token_str = self.get_success(token.to_string(self.hs.get_datastores().main))
         self.get_success(
-            self.store.db_pool.simple_insert(
-                table="rejections",
-                values={
-                    "event_id": target["event_id"],
-                    "reason": "test rejection",
-                    "last_check": "1",
-                },
+            self._storage_controllers.purge_events.purge_history(
+                room_id, token_str, True
             )
         )
-        put_redaction_batch(
-            engine, namespace, [(target["event_id"], redaction["event_id"], True)]
-        )
-        put_rejection_batch(
-            engine, namespace, [(target["event_id"], "test rejection", "1")]
-        )
 
-        self.assertIn(
-            target["event_id"],
-            get_redactions_batch(engine, namespace, [target["event_id"]]),
-        )
-        self.assertIn(
-            target["event_id"],
-            get_rejections_batch(engine, namespace, [target["event_id"]]),
-        )
-
-        self.get_success(
-            self._storage_controllers.purge_events.purge_room(self.room_id)
-        )
-
-        self.assertNotIn(
-            target["event_id"],
-            get_redactions_batch(engine, namespace, [target["event_id"]]),
-        )
-        self.assertNotIn(
-            target["event_id"],
-            get_rejections_batch(engine, namespace, [target["event_id"]]),
-        )
+        self._assert_mirrors(engine, namespace, target["event_id"], present=False)
 
     def test_purge_history_deletes_state_groups(self) -> None:
         """Test that unreferenced state groups get cleaned up after purge"""
