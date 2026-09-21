@@ -488,6 +488,9 @@ main() {
     # in-container path themselves.
     SYNAPSE_EMBEDDED_HAMT_PATH="${SYNAPSE_EMBEDDED_HAMT_PATH:-/data/embedded_hamt}"
     export PASS_SYNAPSE_EMBEDDED_HAMT_PATH="$SYNAPSE_EMBEDDED_HAMT_PATH"
+    if [[ -n "${SYNAPSE_TEST_MTXDB_NO_SYNC:-${SYNAPSE_MTXDB_NO_SYNC:-}}" ]]; then
+      export PASS_SYNAPSE_MTXDB_NO_SYNC="${SYNAPSE_TEST_MTXDB_NO_SYNC:-${SYNAPSE_MTXDB_NO_SYNC}}"
+    fi
   fi
 
   # Record the exact checkout that produced the image alongside the effective
