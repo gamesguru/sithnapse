@@ -1187,6 +1187,20 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
                 e
             ))
         })?);
+        let min_interval_secs = std::env::var("SYNAPSE_MTXDB_CHECKPOINT_MIN_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(30);
+        let max_bytes = std::env::var("SYNAPSE_MTXDB_CHECKPOINT_MAX_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(32 * 1024 * 1024);
+        if min_interval_secs > 0 || max_bytes > 0 {
+            let interval = std::time::Duration::from_secs(min_interval_secs);
+            state.set_checkpoint_rewrite_budget(interval, max_bytes);
+            event_dag.set_checkpoint_rewrite_budget(interval, max_bytes);
+            auth_chain.set_checkpoint_rewrite_budget(interval, max_bytes);
+        }
         let _ = DBS.set(MtxdbPools {
             state,
             event_dag,

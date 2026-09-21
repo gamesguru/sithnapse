@@ -581,7 +581,7 @@ def _print_mtxdb_stats() -> None:
         sc = ps.get("sync_calls", 0)
         if sc:
             print(
-                f"    sync: {sc} calls  checkpoint_writes={ps.get('checkpoint_writes', 0)}  delta_appends={ps.get('delta_appends', 0)}  invalidations={ps.get('delta_invalidations', 0)}",
+                f"    sync: {sc} calls  checkpoint_writes={ps.get('checkpoint_writes', 0)}  checkpoint_skips={ps.get('checkpoint_skips', 0)}  delta_appends={ps.get('delta_appends', 0)}  invalidations={ps.get('delta_invalidations', 0)}",
                 file=out,
             )
 
@@ -648,6 +648,13 @@ def _print_mtxdb_stats() -> None:
             )
 
         # Sync timings.
+        st_tot = ps.get("sync_totals")
+        if st_tot and st_tot.get("calls", 0) > 0:
+            calls = st_tot.get("calls", 0)
+            print(
+                f"    sync totals ({calls} calls): {_fmt_us(st_tot.get('total_us', 0))} (flush={_fmt_us(st_tot.get('pack_flush_us', 0))} fsync={_fmt_us(st_tot.get('pack_fsync_us', 0))} sidecar={_fmt_us(st_tot.get('sidecar_us', 0))} delta={_fmt_us(st_tot.get('delta_log_us', 0))} checkpoint={_fmt_us(st_tot.get('checkpoint_us', 0))})",
+                file=out,
+            )
         st = ps.get("last_sync_timings")
         if st:
             print(
