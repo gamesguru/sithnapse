@@ -1209,6 +1209,15 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
                 e
             ))
         })?);
+        // A single writer's in-memory index is authoritative for every key it
+        // has written, so a negative lookup is a true miss: refreshing would
+        // only spend a durable-fingerprint probe (and, after each checkpoint,
+        // a full rescan) to rediscover nothing. Read-only workers keep the
+        // default (refresh on) to observe records this writer appends. See
+        // mtxdb-core's `PackfileStorage::set_refresh_on_miss`.
+        for store in [&state, &event_dag, &auth_chain] {
+            store.set_refresh_on_miss(false);
+        }
         // Durability routes through the write-ahead journal by default: each
         // pool's `sync` becomes one sequential WAL fsync, and the packfiles
         // plus index checkpoint fall back to acceleration-only, replayed from
