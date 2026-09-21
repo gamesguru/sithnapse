@@ -4,6 +4,7 @@ use std::sync::{
     Arc, Mutex,
 };
 
+use mtxdb_core::journal::Journal;
 use mtxdb_core::{DatabaseLayout, NodeData, NodeId, PackfileStorage, ShardType, StorageEngine};
 use once_cell::sync::OnceCell;
 use pyo3::prelude::*;
@@ -289,10 +290,10 @@ pub fn get_state_hamt_roots_for_room(
         // miss so a state group root the writer appended after this worker
         // opened is visible (same pattern as `auth_chain_edges_get`).
         let results = engine
-            .get_many_with_refresh(&room_id, &node_ids)
+            .get_read_committed(&room_id, &node_ids)
             .map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "mtxdb get_many_with_refresh error: {}",
+                    "mtxdb get_read_committed error: {}",
                     e
                 ))
             })?;
@@ -391,14 +392,13 @@ pub fn get_state_hamt_roots_bulk(
                 .collect();
             // Refresh on a miss so roots for state groups the writer appended
             // after this worker opened are resolved instead of reported absent.
-            let response_records =
-                engine
-                    .get_many_with_refresh(&room_id, &node_ids)
-                    .map_err(|e| {
-                        pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "mtxdb get_many_with_refresh error: {e}"
-                        ))
-                    })?;
+            let response_records = engine
+                .get_read_committed(&room_id, &node_ids)
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "mtxdb get_read_committed error: {e}"
+                    ))
+                })?;
 
             for ((index, _), record) in room_groups.into_iter().zip(response_records) {
                 if let Some(record) = record.filter(|record| !record.bytes.is_empty()) {
@@ -953,8 +953,11 @@ impl NodeStore for MtxdbStore {
 
             let result = self
                 .engine
-                .get(&room_id, &node_id)
-                .map_err(|e| e.to_string())?;
+                .get_read_committed(&room_id, &[node_id])
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .next()
+                .flatten();
             // Treat empty-byte tombstones (from batch_delete) as absent.
             Ok(result.and_then(|data| {
                 if data.bytes.is_empty() {
@@ -969,8 +972,11 @@ impl NodeStore for MtxdbStore {
             let node_id = kv_node_id(key);
             let result = self
                 .engine
-                .get(&room_id, &node_id)
-                .map_err(|e| e.to_string())?;
+                .get_read_committed(&room_id, &[node_id])
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .next()
+                .flatten();
             match result {
                 None => Ok(None),
                 Some(data) if data.bytes.is_empty() => Ok(None),
@@ -1172,29 +1178,28 @@ fn decode_auth_edges(bytes: &[u8]) -> PyResult<Vec<u32>> {
 
 /// Whether the write-ahead journal is enabled for writable opens.
 ///
-/// Off by default. The journal changes only which target receives the sync
-/// fsync (the WAL segment instead of the packfile shards); it does not change
-/// when a `put`'s frame reaches the packfile (eager under the default append
-/// policy) or when the index checkpoint/delta is persisted. Read-only workers
-/// have no journal replay/overlay path, so the journal does not by itself make
-/// its committed entries visible to them. Enabling it by default was unmeasured
-/// on the writer + read-only-worker topology, so it stays opt-in until that
-/// lane is A/B-verified.
+/// On by default. The journal changes which target receives the sync fsync
+/// (the WAL segment instead of the packfile shards); it does not change when a
+/// `put`'s frame reaches the packfile (eager under the default append policy)
+/// or when the index checkpoint/delta is persisted. It is on by default
+/// because the read-committed overlay reads a writer's journal to make
+/// committed-but-unflushed groups visible to read-only workers: without it the
+/// overlay is inert and a cross-process read-after-write inside the flush
+/// coalescer window is a hard miss (there is no SQL fallback in exclusive
+/// mode).
 ///
-/// `SYNAPSE_MTXDB_WAL` set to a truthy value (anything but 0/false/no/off/empty)
-/// opts in to the journal for controlled testing; unset or falsey leaves it
-/// off. Deliberately a positive opt-in (not `SYNAPSE_MTXDB_NO_WAL`) -- unlike
-/// `SYNAPSE_MTXDB_NO_SYNC`, where the safe default is "on" and the variable
-/// opts *out*, the safe default here is "off", so the variable name matches
-/// its own polarity instead of reading backwards (`NO_WAL=0` enabling WAL).
+/// `SYNAPSE_MTXDB_NO_WAL` set to a truthy value (anything but 0/false/no/off/
+/// empty) opts out, e.g. to A/B the packfile-only sync path. Same polarity as
+/// `SYNAPSE_MTXDB_NO_SYNC`: the safe default is "on" and the variable opts
+/// *out*.
 fn wal_enabled() -> bool {
-    wal_enabled_from(std::env::var("SYNAPSE_MTXDB_WAL").ok().as_deref())
+    wal_enabled_from(std::env::var("SYNAPSE_MTXDB_NO_WAL").ok().as_deref())
 }
 
 /// Pure form of [`wal_enabled`] over an already-read value, so the parsing is
 /// unit-testable without mutating the process environment.
-fn wal_enabled_from(wal: Option<&str>) -> bool {
-    wal.is_some_and(|value| {
+fn wal_enabled_from(no_wal: Option<&str>) -> bool {
+    !no_wal.is_some_and(|value| {
         !matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "" | "0" | "false" | "no" | "off"
@@ -1207,16 +1212,19 @@ mod wal_env_tests {
     use super::wal_enabled_from;
 
     #[test]
-    fn wal_defaults_off_and_only_opts_in_on_a_truthy() {
-        assert!(!wal_enabled_from(None));
+    fn wal_defaults_on_and_only_opts_out_on_a_truthy() {
+        assert!(wal_enabled_from(None));
         for falsey in ["", "0", "false", "no", "off", " OFF "] {
             assert!(
-                !wal_enabled_from(Some(falsey)),
-                "{falsey:?} must not enable WAL"
+                wal_enabled_from(Some(falsey)),
+                "{falsey:?} must not disable WAL"
             );
         }
         for truthy in ["1", "true", "yes", "on", "enabled"] {
-            assert!(wal_enabled_from(Some(truthy)), "{truthy:?} must enable WAL");
+            assert!(
+                !wal_enabled_from(Some(truthy)),
+                "{truthy:?} must disable WAL"
+            );
         }
     }
 }
@@ -1268,25 +1276,47 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
         for store in [&state, &event_dag, &auth_chain] {
             store.set_refresh_on_miss(false);
         }
-        // The journal is opt-in pending an A/B on the writer + read-only-worker
-        // topology: it changes only the sync fsync target, and read-only workers
-        // have no journal replay/overlay path, so its read-visibility effect is
-        // unverified. Set SYNAPSE_MTXDB_WAL=1 for controlled testing.
-        // See mtxdb-core's `PackfileStorage::enable_journal`.
+        // The journal is the read-committed overlay's source of truth for
+        // read-only workers: a committed group is visible to a worker's
+        // `get_read_committed` before the coalescer fsyncs it, which is the
+        // cross-process read-after-write path. Its group sequence is drawn
+        // from one counter shared by all three pools so the per-pool overlays
+        // agree on a global order; seed it above every segment's recovered
+        // next sequence. See mtxdb-core's `enable_journal_with_sequence`.
+        //
+        // Still gated on `wal_enabled()`: enabling it by default moves the
+        // sync fsync target onto the journal, which has not been
+        // A/B-verified on the writer + read-only-worker lane. Set
+        // SYNAPSE_MTXDB_WAL=1 to exercise the overlay.
         if wal_enabled() {
+            let mut next_sequence = 1u64;
+            for dir in [&state_dir, &event_dag_dir, &auth_chain_dir] {
+                let wal_path = dir.join("wal.bin");
+                let (journal, _scan) = Journal::open(&wal_path).map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "failed to open mtxdb WAL at {}: {}",
+                        wal_path.display(),
+                        e
+                    ))
+                })?;
+                next_sequence = next_sequence.max(journal.next_sequence());
+            }
+            let sequence = Arc::new(AtomicU64::new(next_sequence));
             for (store, dir) in [
                 (&state, &state_dir),
                 (&event_dag, &event_dag_dir),
                 (&auth_chain, &auth_chain_dir),
             ] {
                 let wal_path = dir.join("wal.bin");
-                store.enable_journal(&wal_path).map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "failed to enable mtxdb WAL at {}: {}",
-                        wal_path.display(),
-                        e
-                    ))
-                })?;
+                store
+                    .enable_journal_with_sequence(&wal_path, Arc::clone(&sequence))
+                    .map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "failed to enable mtxdb WAL at {}: {}",
+                            wal_path.display(),
+                            e
+                        ))
+                    })?;
                 store.replay_journal().map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
                         "failed to replay mtxdb WAL at {}: {}",
@@ -1329,12 +1359,10 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
 /// read-only worker processes in a multi-worker deployment, paired with
 /// exactly one process opening the store writable via `open_client`.
 ///
-/// A read-only-opened store's in-memory index is a snapshot from open
-/// time (or the last `refresh_state_hamt_collections_for_groups` call) --
-/// it does not see the writer's subsequent writes automatically. Callers
-/// on this path must rely on the existing corruption-detected
-/// retry-via-`refresh_collection` wiring (see that function's call site)
-/// to catch up, not assume live visibility.
+/// A read-only-opened store's packfile index is a snapshot from open time
+/// (or the last `refresh_state_hamt_collections_for_groups` call). FFI reads
+/// use `get_read_committed`, which overlays complete groups from the writer's
+/// journal; direct durable reads retain snapshot semantics.
 ///
 /// Any write attempted through a read-only-opened `PackfileStorage`
 /// fails at the OS level (the underlying files are opened without write
@@ -1349,28 +1377,29 @@ pub fn open_client_read_only(py: Python<'_>, path: String) -> PyResult<()> {
         let layout = DatabaseLayout::open(std::path::PathBuf::from(&path)).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("failed to open mtxdb layout: {}", e))
         })?;
-        let open_pool = |pool| {
-            let path = layout.pool_dir(pool)?;
-            PackfileStorage::open_read_only(path)
+        let open_pool = |pool, name: &str| -> PyResult<Arc<PackfileStorage>> {
+            let pool_dir = layout.pool_dir(pool).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "failed to resolve mtxdb {name} pool directory: {e}"
+                ))
+            })?;
+            let store = PackfileStorage::open_read_only(pool_dir.clone()).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "failed to open mtxdb {name} pool read-only: {e}"
+                ))
+            })?;
+            store
+                .enable_read_journal(pool_dir.join("wal.bin"))
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "failed to attach mtxdb {name} read journal: {e}"
+                    ))
+                })?;
+            Ok(Arc::new(store))
         };
-        let state = Arc::new(open_pool(ShardType::State).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "failed to open mtxdb state pool read-only: {}",
-                e
-            ))
-        })?);
-        let event_dag = Arc::new(open_pool(ShardType::EventDag).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "failed to open mtxdb event-dag pool read-only: {}",
-                e
-            ))
-        })?);
-        let auth_chain = Arc::new(open_pool(ShardType::AuthChain).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "failed to open mtxdb auth-chain pool read-only: {}",
-                e
-            ))
-        })?);
+        let state = open_pool(ShardType::State, "state")?;
+        let event_dag = open_pool(ShardType::EventDag, "event-dag")?;
+        let auth_chain = open_pool(ShardType::AuthChain, "auth-chain")?;
         let _ = DBS.set(MtxdbPools {
             state,
             event_dag,
@@ -1455,10 +1484,10 @@ pub fn get_auth_chain_links_batch(
         // miss so auth-chain links the writer appended after this worker
         // opened are visible (same pattern as `auth_chain_edges_get`).
         let results = engine
-            .get_many_with_refresh(&room_id, &node_ids)
+            .get_read_committed(&room_id, &node_ids)
             .map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "mtxdb get_many_with_refresh error: {}",
+                    "mtxdb get_read_committed error: {}",
                     e
                 ))
             })?;
@@ -1762,10 +1791,10 @@ pub fn resolve_short_ids_to_event_ids(
         // Refresh on a miss so ids the writer appended after this worker
         // opened are resolved instead of reported absent.
         let results = engine
-            .get_many_with_refresh(&collection, &node_ids)
+            .get_read_committed(&collection, &node_ids)
             .map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "mtxdb get_many_with_refresh error: {}",
+                    "mtxdb get_read_committed error: {}",
                     e
                 ))
             })?;
@@ -1804,10 +1833,10 @@ pub fn auth_chain_edges_get(
             .map(|&s| auth_chain_edge_node_id(s))
             .collect();
         let results = engine
-            .get_many_with_refresh(&collection, &node_ids)
+            .get_read_committed(&collection, &node_ids)
             .map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "mtxdb get_many_with_refresh error: {}",
+                    "mtxdb get_read_committed error: {}",
                     e
                 ))
             })?;
@@ -1878,10 +1907,10 @@ pub fn auth_chain_children_get(
         // Refresh on a miss so auth-chain children the writer appended after
         // this worker opened are visible (see `auth_chain_edges_get`).
         let results = engine
-            .get_many_with_refresh(&collection, &node_ids)
+            .get_read_committed(&collection, &node_ids)
             .map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "mtxdb get_many_with_refresh error: {}",
+                    "mtxdb get_read_committed error: {}",
                     e
                 ))
             })?;
@@ -2034,15 +2063,15 @@ pub fn batch_get(py: Python<'_>, keys: Vec<Vec<u8>>) -> PyResult<Vec<(Vec<u8>, V
             let room_id = kv_room_id();
             // Read-only workers keep an in-process collection index. If the
             // writer published a mapping after this worker opened the store,
-            // `get_many_with_refresh` retries the *missing* keys once after
+            // `get_read_committed` retries the *missing* keys once after
             // refreshing the generic-KV collection, and suppresses repeat
             // refreshes for confirmed negatives against an unchanged
-            // collection (see mtxdb-core's `get_many_with_refresh`).
+            // collection (see mtxdb-core's `get_read_committed`).
             let found = engine
-                .get_many_with_refresh(&room_id, &node_ids)
+                .get_read_committed(&room_id, &node_ids)
                 .map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "mtxdb get_many_with_refresh error: {e}"
+                        "mtxdb get_read_committed error: {e}"
                     ))
                 })?;
             for ((position, _), value) in ids.into_iter().zip(found) {
@@ -2325,10 +2354,10 @@ pub fn event_json_get(
             // locators for events the writer appended after this worker opened
             // resolve instead of reporting the event absent.
             let found = engine
-                .get_many_with_refresh(&collection, &node_ids_only)
+                .get_read_committed(&collection, &node_ids_only)
                 .map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "mtxdb get_many_with_refresh error: {e}"
+                        "mtxdb get_read_committed error: {e}"
                     ))
                 })?;
             for ((position, _), value) in ids.into_iter().zip(found) {
@@ -2370,10 +2399,10 @@ pub fn event_json_get(
             // Refresh on a miss so event bodies/metadata the writer appended
             // after this worker opened are visible to the read.
             let found = engine
-                .get_many_with_refresh(&collection, &node_ids_only)
+                .get_read_committed(&collection, &node_ids_only)
                 .map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "mtxdb get_many_with_refresh error: {e}"
+                        "mtxdb get_read_committed error: {e}"
                     ))
                 })?;
             for ((position, kind, _), value) in ids.into_iter().zip(found) {
@@ -2711,10 +2740,10 @@ pub fn get_state_hamt_nodes_batch(
         // Refresh on a miss so HAMT nodes the writer appended after this
         // worker opened are visible to the read.
         let results = engine
-            .get_many_with_refresh(&room_id, &node_ids)
+            .get_read_committed(&room_id, &node_ids)
             .map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "mtxdb get_many_with_refresh error: {}",
+                    "mtxdb get_read_committed error: {}",
                     e
                 ))
             })?;
