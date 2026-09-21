@@ -249,9 +249,11 @@ pub fn event_edges_put(
             let mut existing_children = forward_cache
                 .remove(&(room_collection, forward_node))
                 .ok_or_else(|| {
-                    pyo3::exceptions::PyRuntimeError::new_err(
-                        "forward-edge node id collision while batching parent reads",
-                    )
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "forward-edge node id collision while batching parent reads \
+                         (collection {:02x?}, node {:02x?})",
+                        room_collection, forward_node
+                    ))
                 })?;
 
             let mut seen: HashSet<String> = existing_children.iter().cloned().collect();
