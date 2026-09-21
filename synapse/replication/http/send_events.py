@@ -20,6 +20,7 @@
 #
 
 import logging
+from collections import defaultdict
 from typing import TYPE_CHECKING, Any
 
 from twisted.web.server import Request
@@ -134,10 +135,11 @@ class ReplicationSendEventsRestServlet(ReplicationEndpoint):
         ):
             events_and_context = []
             events = payload["events"]
+            rooms: set[str] = set()
             # Collect and deduplicate pending HAMT mirror replays across the entire
             # batch of events so they execute in a single database interaction per room.
             replays_by_room: dict[tuple[str, Any], dict[int, dict[str, Any]]] = (
-                collections.defaultdict(dict)
+                defaultdict(dict)
             )
 
             for event_payload in events:

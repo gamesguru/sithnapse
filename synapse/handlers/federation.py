@@ -2137,7 +2137,6 @@ class FederationHandler:
             )
             for event in events:
                 for attempt in itertools.count():
-                    # We try a new destination on every iteration.
                     try:
                         while True:
                             try:
@@ -2146,20 +2145,12 @@ class FederationHandler:
                                 )
                                 break
                             except FederationPullAttemptBackoffError as e:
-                                # If other destinations are available to try for this event,
-                                # try the next destination rather than sleeping out the backoff here.
-                                if attempt < len(destinations) - 1:
-                                    logger.info(
-                                        "Backing off pulling %s from %s (%s); trying next destination",
-                                        event.event_id,
-                                        destination,
-                                        e,
-                                    )
-                                    destination = next(destination_iter)
-                                    break
-
-                                # If this was our only/last destination, wait out the backoff (capped
-                                # to a reasonable polling interval) and retry.
+                                # The backoff is keyed on (room_id, event_id), not on
+                                # destination -- switching destinations doesn't get us
+                                # out of it, and would otherwise put us in a hot loop
+                                # re-hitting the backoff every batch pass with no sleep.
+                                # Wait out the backoff (capped to a reasonable polling
+                                # interval) against the same destination and retry.
                                 sleep_ms = min(e.retry_after_ms, 5000)
                                 logger.warning("%s; waiting for %d ms...", e, sleep_ms)
                                 await self.clock.sleep(Duration(milliseconds=sleep_ms))
