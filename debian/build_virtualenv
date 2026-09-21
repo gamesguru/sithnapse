@@ -58,8 +58,7 @@ deactivate
 
 # Use --no-deps to only install pinned versions in exported_requirements.txt,
 # and to avoid https://github.com/pypa/pip/issues/9644
-# mtxdb uses #![feature(...)] which requires RUSTC_BOOTSTRAP on stable --
-# scoped to this one command rather than exported for the whole build.
+# mtxdb uses #![feature(...)] which requires RUSTC_BOOTSTRAP on stable.
 RUSTC_BOOTSTRAP=1 dh_virtualenv \
     --install-suffix "matrix-synapse" \
     --builtin-venv \
@@ -71,6 +70,7 @@ RUSTC_BOOTSTRAP=1 dh_virtualenv \
     --extra-pip-arg="--no-deps" \
     --extra-pip-arg="--no-cache-dir" \
     --extra-pip-arg="--compile" \
+    --verbose \
     --extras="all,test" \
     --requirements="exported_requirements.txt"
 
