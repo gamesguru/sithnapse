@@ -2662,17 +2662,35 @@ class RoomBackgroundUpdateStore(RoomWorkerStore):
             txn: LoggingTransaction,
         ) -> bool:
             sql = """
-                SELECT room_id, json FROM current_state_events
-                INNER JOIN event_json USING (room_id, event_id)
+                SELECT room_id, event_id, json FROM current_state_events
+                LEFT JOIN event_json USING (room_id, event_id)
                 WHERE room_id > ? AND type = 'm.room.create' AND state_key = ''
                 ORDER BY room_id
                 LIMIT ?
             """
 
             txn.execute(sql, (last_room_id, batch_size))
+            rows = txn.fetchall()
+            if not rows:
+                return True
+
+            missing_ids = [event_id for _, event_id, json in rows if json is None]
+            json_by_id = {}
+            if missing_ids and getattr(self, "_embedded_event_json_enabled", False):
+                found = get_event_json_batch(
+                    self._embedded_hamt_engine,
+                    self._embedded_hamt_namespace,
+                    missing_ids,
+                )
+                for eid, (_, j, _) in found.items():
+                    json_by_id[eid] = j
 
             updates = []
-            for room_id, event_json in txn:
+            for room_id, event_id, event_json in rows:
+                if event_json is None:
+                    event_json = json_by_id.get(event_id)
+                if not event_json:
+                    continue
                 event_dict = db_to_json(event_json)
                 room_version_id = event_dict.get("content", {}).get(
                     "room_version", RoomVersions.V1.identifier
@@ -2846,9 +2864,9 @@ class RoomBackgroundUpdateStore(RoomWorkerStore):
             txn: LoggingTransaction,
         ) -> bool:
             sql = """
-                SELECT room_id, json FROM event_json
-                INNER JOIN rooms AS room USING (room_id)
-                INNER JOIN current_state_events AS state_event USING (room_id, event_id)
+                SELECT room_id, event_id, event_json.json FROM rooms AS room
+                INNER JOIN current_state_events AS state_event USING (room_id)
+                LEFT JOIN event_json USING (room_id, event_id)
                 WHERE room_id > ? AND (room.creator IS NULL OR room.creator = '') AND state_event.type = 'm.room.create' AND state_event.state_key = ''
                 ORDER BY room_id
                 LIMIT ?
@@ -2856,9 +2874,31 @@ class RoomBackgroundUpdateStore(RoomWorkerStore):
 
             txn.execute(sql, (last_room_id, batch_size))
             room_id_to_create_event_results = txn.fetchall()
+            if not room_id_to_create_event_results:
+                return True
+
+            missing_ids = [
+                event_id
+                for _, event_id, json in room_id_to_create_event_results
+                if json is None
+            ]
+            json_by_id = {}
+            if missing_ids and getattr(self, "_embedded_event_json_enabled", False):
+                found = get_event_json_batch(
+                    self._embedded_hamt_engine,
+                    self._embedded_hamt_namespace,
+                    missing_ids,
+                )
+                for eid, (_, j, _) in found.items():
+                    json_by_id[eid] = j
 
             new_last_room_id = ""
-            for room_id, event_json in room_id_to_create_event_results:
+            for room_id, event_id, event_json in room_id_to_create_event_results:
+                if event_json is None:
+                    event_json = json_by_id.get(event_id)
+                if not event_json:
+                    new_last_room_id = room_id
+                    continue
                 event_dict = db_to_json(event_json)
 
                 # The creator property might not exist in newer room versions, but
@@ -2910,8 +2950,8 @@ class RoomBackgroundUpdateStore(RoomWorkerStore):
             txn: LoggingTransaction,
         ) -> bool:
             sql = """
-                SELECT state.room_id, json FROM event_json
-                INNER JOIN current_state_events AS state USING (event_id)
+                SELECT state.room_id, state.event_id, event_json.json FROM current_state_events AS state
+                LEFT JOIN event_json USING (event_id)
                 WHERE state.room_id > ? AND type = 'm.room.create'
                 ORDER BY state.room_id
                 LIMIT ?
@@ -2919,9 +2959,31 @@ class RoomBackgroundUpdateStore(RoomWorkerStore):
 
             txn.execute(sql, (last_room_id, batch_size))
             room_id_to_create_event_results = txn.fetchall()
+            if not room_id_to_create_event_results:
+                return True
+
+            missing_ids = [
+                event_id
+                for _, event_id, json in room_id_to_create_event_results
+                if json is None
+            ]
+            json_by_id = {}
+            if missing_ids and getattr(self, "_embedded_event_json_enabled", False):
+                found = get_event_json_batch(
+                    self._embedded_hamt_engine,
+                    self._embedded_hamt_namespace,
+                    missing_ids,
+                )
+                for eid, (_, j, _) in found.items():
+                    json_by_id[eid] = j
 
             new_last_room_id = None
-            for room_id, event_json in room_id_to_create_event_results:
+            for room_id, event_id, event_json in room_id_to_create_event_results:
+                if event_json is None:
+                    event_json = json_by_id.get(event_id)
+                if not event_json:
+                    new_last_room_id = room_id
+                    continue
                 event_dict = db_to_json(event_json)
 
                 room_type = event_dict.get("content", {}).get(
