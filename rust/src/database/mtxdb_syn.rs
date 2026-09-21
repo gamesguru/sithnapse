@@ -1185,12 +1185,36 @@ fn decode_auth_edges(bytes: &[u8]) -> PyResult<Vec<u32>> {
 /// opts *out*, the safe default here is "off", so the variable name matches
 /// its own polarity instead of reading backwards (`NO_WAL=0` enabling WAL).
 fn wal_enabled() -> bool {
-    match std::env::var("SYNAPSE_MTXDB_WAL") {
-        Ok(value) => !matches!(
+    wal_enabled_from(std::env::var("SYNAPSE_MTXDB_WAL").ok().as_deref())
+}
+
+/// Pure form of [`wal_enabled`] over an already-read value, so the parsing is
+/// unit-testable without mutating the process environment.
+fn wal_enabled_from(wal: Option<&str>) -> bool {
+    wal.is_some_and(|value| {
+        !matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "" | "0" | "false" | "no" | "off"
-        ),
-        Err(_) => false,
+        )
+    })
+}
+
+#[cfg(test)]
+mod wal_env_tests {
+    use super::wal_enabled_from;
+
+    #[test]
+    fn wal_defaults_off_and_only_opts_in_on_a_truthy() {
+        assert!(!wal_enabled_from(None));
+        for falsey in ["", "0", "false", "no", "off", " OFF "] {
+            assert!(
+                !wal_enabled_from(Some(falsey)),
+                "{falsey:?} must not enable WAL"
+            );
+        }
+        for truthy in ["1", "true", "yes", "on", "enabled"] {
+            assert!(wal_enabled_from(Some(truthy)), "{truthy:?} must enable WAL");
+        }
     }
 }
 
