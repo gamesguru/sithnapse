@@ -178,6 +178,15 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         # handoff helper is shared by both configurations.
         self._pending_embedded_hamt_mirrors: dict[int, dict[str, Any]] = {}
 
+        # Always assign these, even when the embedded engine is disabled:
+        # `_assert_embedded_hamt_writer` and the mirror-redo path read them
+        # unconditionally, and tests (and the replication handoff helper)
+        # may enable the engine on the store after construction.
+        self._embedded_hamt_is_writer = (
+            hs.get_instance_name() in hs.config.worker.writers.events
+        )
+        self._instance_name = hs.get_instance_name()
+
         if self._embedded_hamt_engine and self._embedded_hamt_path:
             # mtxdb is the embedded engine for HAMT state offload.
             # benchmark (point reads, batch reads) and needs no worker-
@@ -201,10 +210,6 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             # a point-in-time snapshot -- see
             # `refresh_state_hamt_collections_for_groups`'s call site for
             # how a stale read there catches up.
-            self._embedded_hamt_is_writer = (
-                hs.get_instance_name() in hs.config.worker.writers.events
-            )
-            self._instance_name = hs.get_instance_name()
             # state_group -> root_structural_hash for groups created on
             # this (non-writer) instance whose mtxdb mirror write was
             # skipped -- see `store_state_group`'s skip_mirror_write and

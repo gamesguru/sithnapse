@@ -2795,8 +2795,7 @@ pub fn set_stats_enabled(py: Python<'_>, enabled: bool) -> PyResult<()> {
     })
 }
 
-#[pyfunction]
-pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(open_client, m)?)?;
     m.add_function(wrap_pyfunction!(open_client_read_only, m)?)?;
     m.add_function(wrap_pyfunction!(put_state_hamt_nodes, m)?)?;
@@ -2840,9 +2839,6 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     m.add_function(wrap_pyfunction!(reset_stats, m)?)?;
     m.add_function(wrap_pyfunction!(set_stats_enabled, m)?)?;
 
-    py.import("sys")?
-        .getattr("modules")?
-        .set_item("synapse.synapse_rust.mtxdb_engine", m)?;
     Ok(())
 }
 

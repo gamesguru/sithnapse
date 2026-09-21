@@ -735,7 +735,7 @@ jobs:
       - name: Install clang (for mtxdb-sys bindgen)
         run: |
           apt-get update
-          apt-get install -y clang libclang-dev
+          apt-get install -y clang libclang-dev pkg-config libzstd-dev
 
       - name: Install dependencies using uv
         run: |

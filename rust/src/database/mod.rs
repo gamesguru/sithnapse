@@ -10,7 +10,17 @@ pub mod mtxdb;
 use pyo3::prelude::*;
 
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    mtxdb::register_module(py, m)?;
-    embedded_edges::register_module(m)?;
+    let child_module = PyModule::new(py, "mtxdb_engine")?;
+    mtxdb::register_module(&child_module)?;
+    embedded_edges::register_module(&child_module)?;
+
+    m.add_submodule(&child_module)?;
+
+    // We need to manually add the module to sys.modules to make `from
+    // synapse.synapse_rust import mtxdb_engine` work.
+    py.import("sys")?
+        .getattr("modules")?
+        .set_item("synapse.synapse_rust.mtxdb_engine", child_module)?;
+
     Ok(())
 }
