@@ -103,13 +103,6 @@ dependencies = [
     # This is used for parsing multipart responses
     "python-multipart>=0.0.9",
 
-    # Postgres driver. Mandatory here (not just the `postgres` extra) so that
-    # `make test`/CI never trip over "psycopg2 module is not installed" after a
-    # plain `uv sync`. PyPy uses psycopg2cffi.
-    "psycopg2>=2.8;platform_python_implementation != 'PyPy'",
-    "psycopg2cffi>=2.8;platform_python_implementation == 'PyPy'",
-    "psycopg2cffi-compat==1.1;platform_python_implementation == 'PyPy'",
-
     # Transitive dependency constraints
     # These dependencies aren't directly required by Synapse.
     # However, in order for Synapse to build, Synapse requires a higher minimum version
@@ -296,6 +289,15 @@ dev = [
     "types-PyYAML>=5.4.10",
     "types-requests>=2.26.0",
     "types-setuptools>=57.4.0",
+
+    # Postgres driver, installed in dev so that a plain `uv sync`/`make sync`
+    # doesn't leave `make test` failing with "Cannot create PostgresEngine --
+    # psycopg2 module is not installed". Kept out of the runtime dependencies
+    # (it lives in the `postgres` extra) so wheels don't require building
+    # psycopg2 from source. PyPy uses psycopg2cffi.
+    "psycopg2>=2.8;platform_python_implementation != 'PyPy'",
+    "psycopg2cffi>=2.8;platform_python_implementation == 'PyPy'",
+    "psycopg2cffi-compat==1.1;platform_python_implementation == 'PyPy'",
 
     # Dependencies which are exclusively required by unit test code. This is
     # NOT a list of all modules that are necessary to run the unit tests.
