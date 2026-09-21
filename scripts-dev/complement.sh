@@ -502,6 +502,14 @@ main() {
     *) export PASS_SYNAPSE_MTXDB_NO_SYNC=1 ;;
   esac
 
+  # The write-ahead journal is on by default in production; this is its
+  # matching test escape hatch for A/B captures that want the historical
+  # packfile-as-sync-point path. Same truthy/falsey semantics as above.
+  case "${SYNAPSE_TEST_MTXDB_NO_WAL:-}" in
+    "" | 0 | false | False | no | No | off | Off) ;;
+    *) export PASS_SYNAPSE_MTXDB_NO_WAL=1 ;;
+  esac
+
   # Forward the diagnostic stats switch into the containers: with sync
   # disabled the report is empty, so this is only useful on a sync-on lane,
   # but it must reach the container or there is no way to size a sync's
@@ -516,7 +524,7 @@ main() {
   local synapse_revision
   synapse_revision="$(git -C "$repo_root" describe --tags --always --dirty 2>/dev/null || echo '<unknown>')"
   echo "Synapse revision: ${synapse_revision}" >&2
-  echo "Database: ${PASS_SYNAPSE_COMPLEMENT_DATABASE} (workers: ${PASS_SYNAPSE_COMPLEMENT_USE_WORKERS:-false}) | Embedded HAMT engine: ${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:-<none>}${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:+ at ${PASS_SYNAPSE_EMBEDDED_HAMT_PATH:-<not set>}}${PASS_SYNAPSE_MTXDB_NO_SYNC:+ (no_sync)}${PASS_SYNAPSE_MTXDB_STATS:+ (stats)}" >&2
+  echo "Database: ${PASS_SYNAPSE_COMPLEMENT_DATABASE} (workers: ${PASS_SYNAPSE_COMPLEMENT_USE_WORKERS:-false}) | Embedded HAMT engine: ${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:-<none>}${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:+ at ${PASS_SYNAPSE_EMBEDDED_HAMT_PATH:-<not set>}}${PASS_SYNAPSE_MTXDB_NO_SYNC:+ (no_sync)}${PASS_SYNAPSE_MTXDB_NO_WAL:+ (no_wal)}${PASS_SYNAPSE_MTXDB_STATS:+ (stats)}" >&2
 
   # Complement's Destroy() force-removes every homeserver container
   # unconditionally, pass or fail -- there is no "keep failed containers"

@@ -1155,6 +1155,22 @@ fn decode_auth_edges(bytes: &[u8]) -> PyResult<Vec<u32>> {
 // PyO3 Bindings
 // -----------------------------------------------------------------------------
 
+/// Whether the write-ahead journal is enabled for writable opens.
+///
+/// On by default; `SYNAPSE_MTXDB_NO_WAL` set to a truthy value reverts to the
+/// historical behavior where packfile shard fsyncs are the sync point. Falsey
+/// values (0/false/no/off/empty) keep the journal on, matching the trial and
+/// Complement env semantics for `SYNAPSE_MTXDB_NO_SYNC`.
+fn wal_enabled() -> bool {
+    match std::env::var("SYNAPSE_MTXDB_NO_WAL") {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no" | "off"
+        ),
+        Err(_) => true,
+    }
+}
+
 #[pyfunction]
 pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
     py.detach(|| {
@@ -1164,38 +1180,64 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
         let layout = DatabaseLayout::open(std::path::PathBuf::from(&path)).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("failed to open mtxdb layout: {}", e))
         })?;
-        let open_pool = |pool| {
-            let path = layout.pool_dir(pool)?;
-            PackfileStorage::open(path)
-        };
+        let state_dir = layout.pool_dir(ShardType::State)?;
+        let event_dag_dir = layout.pool_dir(ShardType::EventDag)?;
+        let auth_chain_dir = layout.pool_dir(ShardType::AuthChain)?;
         // State pool holds HAMT nodes, roots, and state-group sidecars --
         // dense structural hashes, not text. zstd never shrinks them (see
         // mtxdb's own compression bench), so every write there was still
         // paying the compressor's full match-finding pass for nothing.
         // open_with_compression(.., false) skips the attempt entirely; the
         // event-dag/auth-chain pools (JSON-ish payloads) keep compression on.
-        let open_state_pool = || {
-            let path = layout.pool_dir(ShardType::State)?;
-            PackfileStorage::open_with_compression(path, false)
-        };
-        let state = Arc::new(open_state_pool().map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "failed to open mtxdb state pool: {}",
-                e
-            ))
-        })?);
-        let event_dag = Arc::new(open_pool(ShardType::EventDag).map_err(|e| {
+        let state = Arc::new(
+            PackfileStorage::open_with_compression(state_dir.clone(), false).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "failed to open mtxdb state pool: {}",
+                    e
+                ))
+            })?,
+        );
+        let event_dag = Arc::new(PackfileStorage::open(event_dag_dir.clone()).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!(
                 "failed to open mtxdb event-dag pool: {}",
                 e
             ))
         })?);
-        let auth_chain = Arc::new(open_pool(ShardType::AuthChain).map_err(|e| {
+        let auth_chain = Arc::new(PackfileStorage::open(auth_chain_dir.clone()).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!(
                 "failed to open mtxdb auth-chain pool: {}",
                 e
             ))
         })?);
+        // Durability routes through the write-ahead journal by default: each
+        // pool's `sync` becomes one sequential WAL fsync, and the packfiles
+        // plus index checkpoint fall back to acceleration-only, replayed from
+        // the journal on reopen. Opt out (historical packfile-as-sync-point)
+        // with a truthy SYNAPSE_MTXDB_NO_WAL, mirroring SYNAPSE_MTXDB_NO_SYNC.
+        // See mtxdb-core's `PackfileStorage::enable_journal`.
+        if wal_enabled() {
+            for (store, dir) in [
+                (&state, &state_dir),
+                (&event_dag, &event_dag_dir),
+                (&auth_chain, &auth_chain_dir),
+            ] {
+                let wal_path = dir.join("wal.bin");
+                store.enable_journal(&wal_path).map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "failed to enable mtxdb WAL at {}: {}",
+                        wal_path.display(),
+                        e
+                    ))
+                })?;
+                store.replay_journal().map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "failed to replay mtxdb WAL at {}: {}",
+                        wal_path.display(),
+                        e
+                    ))
+                })?;
+            }
+        }
         let min_interval_secs = std::env::var("SYNAPSE_MTXDB_CHECKPOINT_MIN_INTERVAL_SECS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
