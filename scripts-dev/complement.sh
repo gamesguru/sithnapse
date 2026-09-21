@@ -495,10 +495,12 @@ main() {
   # durable fsync path buys nothing, but the engine deliberately defaults
   # durability ON for production. Only the TEST_-scoped variable is
   # honoured, so a developer's production SYNAPSE_MTXDB_NO_SYNC cannot leak
-  # into containers.
-  if [[ -n "${SYNAPSE_TEST_MTXDB_NO_SYNC:-}" ]]; then
-    export PASS_SYNAPSE_MTXDB_NO_SYNC=1
-  fi
+  # into containers. Same value semantics as tests/utils.py: falsey
+  # (0/false/no/off/empty) leaves sync on, a truthy value disables it.
+  case "${SYNAPSE_TEST_MTXDB_NO_SYNC:-}" in
+    "" | 0 | false | False | no | No | off | Off) ;;
+    *) export PASS_SYNAPSE_MTXDB_NO_SYNC=1 ;;
+  esac
 
   # Forward the diagnostic stats switch into the containers: with sync
   # disabled the report is empty, so this is only useful on a sync-on lane,

@@ -1342,7 +1342,7 @@ dependencies = [
 [[package]]
 name = "rezzy"
 version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#963141059ad856e28dbe7800f60b438ae9197252"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#a9dffeb72e3d798bca7056ad1026f2cb357b6ad8"
 dependencies = [
  "base64",
  "imbl",
@@ -1460,7 +1460,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "rz-core"
 version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#963141059ad856e28dbe7800f60b438ae9197252"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#a9dffeb72e3d798bca7056ad1026f2cb357b6ad8"
 dependencies = [
  "base64",
  "blake2",
@@ -1476,7 +1476,7 @@ dependencies = [
 [[package]]
 name = "rz-json"
 version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#963141059ad856e28dbe7800f60b438ae9197252"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#a9dffeb72e3d798bca7056ad1026f2cb357b6ad8"
 dependencies = [
  "ryu",
 ]
@@ -1484,7 +1484,7 @@ dependencies = [
 [[package]]
 name = "rz-reconcile"
 version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#963141059ad856e28dbe7800f60b438ae9197252"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#a9dffeb72e3d798bca7056ad1026f2cb357b6ad8"
 dependencies = [
  "base64",
  "sha2",

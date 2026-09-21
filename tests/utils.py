@@ -172,15 +172,22 @@ elif EMBEDDED_HAMT_PATH is not None:
 # Durability (fsync) is pointless for the throwaway store trial gives each
 # test homeserver: it is created fresh and torn down on exit, so there is no
 # crash to recover from. Default `no_sync` on so tests don't pay thousands of
-# synchronous fsyncs; set SYNAPSE_TEST_MTXDB_NO_SYNC=0 when specifically
-# exercising the durable path (or writing a crash-recovery test). This is the
-# same variable name (and "NO_SYNC is the affirmative" polarity) that
-# scripts-dev/complement.sh forwards into Complement containers, so one
-# mental model covers both harnesses -- only the *unset* default differs,
-# because trial's stores are torn down instantly and Complement's more
-# closely approximate a real deployment.
+# synchronous fsyncs. A truthy SYNAPSE_TEST_MTXDB_NO_SYNC keeps that on; a
+# falsey value (0/false/no/off/empty) turns it off when specifically exercising
+# the durable path (or writing a crash-recovery test). This is the same
+# variable and value semantics scripts-dev/complement.sh forwards into
+# Complement containers, so one rule covers both harnesses -- only the *unset*
+# default differs: trial defaults no_sync on (stores are torn down instantly),
+# Complement/production defaults sync on (it approximates a real deployment).
 _no_sync_env = os.environ.get("SYNAPSE_TEST_MTXDB_NO_SYNC")
-EMBEDDED_HAMT_NO_SYNC = _no_sync_env not in ("0", "")
+_no_sync_off = _no_sync_env is not None and _no_sync_env.strip().lower() in (
+    "",
+    "0",
+    "false",
+    "no",
+    "off",
+)
+EMBEDDED_HAMT_NO_SYNC = not _no_sync_off
 
 if EMBEDDED_HAMT_ENGINE:
     print(
