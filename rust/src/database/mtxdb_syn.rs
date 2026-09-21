@@ -1178,28 +1178,33 @@ fn decode_auth_edges(bytes: &[u8]) -> PyResult<Vec<u32>> {
 
 /// Whether the write-ahead journal is enabled for writable opens.
 ///
-/// On by default. The journal changes which target receives the sync fsync
+/// Off by default. The journal changes which target receives the sync fsync
 /// (the WAL segment instead of the packfile shards); it does not change when a
 /// `put`'s frame reaches the packfile (eager under the default append policy)
-/// or when the index checkpoint/delta is persisted. It is on by default
-/// because the read-committed overlay reads a writer's journal to make
-/// committed-but-unflushed groups visible to read-only workers: without it the
-/// overlay is inert and a cross-process read-after-write inside the flush
-/// coalescer window is a hard miss (there is no SQL fallback in exclusive
-/// mode).
+/// or when the index checkpoint/delta is persisted. It stays opt-in because its
+/// read-committed overlay only helps once the writer publishes committed
+/// mutations at the transaction boundary, which is not wired yet; until then
+/// the overlay would only see groups at the same sync that advances the durable
+/// fingerprint.
 ///
-/// `SYNAPSE_MTXDB_NO_WAL` set to a truthy value (anything but 0/false/no/off/
-/// empty) opts out, e.g. to A/B the packfile-only sync path. Same polarity as
-/// `SYNAPSE_MTXDB_NO_SYNC`: the safe default is "on" and the variable opts
-/// *out*.
+/// `SYNAPSE_MTXDB_WAL` set to a truthy value (anything but 0/false/no/off/
+/// empty) opts in, e.g. to exercise the overlay lane. Positive polarity: the
+/// default is "off", so the name matches the variable's own meaning (unlike
+/// `SYNAPSE_MTXDB_NO_SYNC`, whose safe default is "on"). When the default is
+/// flipped on later it should become `SYNAPSE_MTXDB_NO_WAL`.
 fn wal_enabled() -> bool {
-    wal_enabled_from(std::env::var("SYNAPSE_MTXDB_NO_WAL").ok().as_deref())
+    wal_enabled_from(std::env::var("SYNAPSE_MTXDB_WAL").ok().as_deref())
 }
 
 /// Pure form of [`wal_enabled`] over an already-read value, so the parsing is
 /// unit-testable without mutating the process environment.
-fn wal_enabled_from(no_wal: Option<&str>) -> bool {
-    !no_wal.is_some_and(|value| {
+///
+/// Default-off: the journal only moves the sync fsync target, and its reader
+/// overlay has no benefit until the writer publishes at the transaction
+/// boundary. A positive variable keeps the name matching its polarity; when
+/// the default is flipped on later it should become `SYNAPSE_MTXDB_NO_WAL`.
+fn wal_enabled_from(wal: Option<&str>) -> bool {
+    wal.is_some_and(|value| {
         !matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "" | "0" | "false" | "no" | "off"
@@ -1212,19 +1217,16 @@ mod wal_env_tests {
     use super::wal_enabled_from;
 
     #[test]
-    fn wal_defaults_on_and_only_opts_out_on_a_truthy() {
-        assert!(wal_enabled_from(None));
+    fn wal_defaults_off_and_only_opts_in_on_a_truthy() {
+        assert!(!wal_enabled_from(None));
         for falsey in ["", "0", "false", "no", "off", " OFF "] {
             assert!(
-                wal_enabled_from(Some(falsey)),
-                "{falsey:?} must not disable WAL"
+                !wal_enabled_from(Some(falsey)),
+                "{falsey:?} must not enable WAL"
             );
         }
         for truthy in ["1", "true", "yes", "on", "enabled"] {
-            assert!(
-                !wal_enabled_from(Some(truthy)),
-                "{truthy:?} must disable WAL"
-            );
+            assert!(wal_enabled_from(Some(truthy)), "{truthy:?} must enable WAL");
         }
     }
 }

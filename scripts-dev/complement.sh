@@ -502,15 +502,14 @@ main() {
     *) export PASS_SYNAPSE_MTXDB_NO_SYNC=1 ;;
   esac
 
-  # The write-ahead journal is on by default: the read-committed overlay reads a
-  # writer's journal to make committed-but-unflushed groups visible to read-only
-  # workers, so without it a cross-process read-after-write inside the flush
-  # coalescer window is a hard miss. This forwards an explicit opt-out for
-  # controlled A/B captures against the packfile-only sync path. Same
-  # truthy/falsey semantics as above, negative (opt-out) like NO_SYNC.
-  case "${SYNAPSE_TEST_MTXDB_NO_WAL:-}" in
+  # The write-ahead journal is opt-in. Its read-committed overlay can only help
+  # once the writer publishes committed mutations at the transaction boundary,
+  # which is not wired yet, so the default stays on the packfile-only sync path.
+  # This forwards an explicit opt-in for controlled A/B captures against the
+  # journal lane. Same truthy/falsey semantics as above, positive (opt-in).
+  case "${SYNAPSE_TEST_MTXDB_WAL:-}" in
     "" | 0 | false | False | no | No | off | Off) ;;
-    *) export PASS_SYNAPSE_MTXDB_NO_WAL=1 ;;
+    *) export PASS_SYNAPSE_MTXDB_WAL=1 ;;
   esac
 
   # Forward the diagnostic stats switch into the containers: with sync
@@ -527,7 +526,7 @@ main() {
   local synapse_revision
   synapse_revision="$(git -C "$repo_root" describe --tags --always --dirty 2>/dev/null || echo '<unknown>')"
   echo "Synapse revision: ${synapse_revision}" >&2
-  echo "Database: ${PASS_SYNAPSE_COMPLEMENT_DATABASE} (workers: ${PASS_SYNAPSE_COMPLEMENT_USE_WORKERS:-false}) | Embedded HAMT engine: ${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:-<none>}${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:+ at ${PASS_SYNAPSE_EMBEDDED_HAMT_PATH:-<not set>}}${PASS_SYNAPSE_MTXDB_NO_SYNC:+ (no_sync)}${PASS_SYNAPSE_MTXDB_NO_WAL:+ (no-wal)}${PASS_SYNAPSE_MTXDB_STATS:+ (stats)}" >&2
+  echo "Database: ${PASS_SYNAPSE_COMPLEMENT_DATABASE} (workers: ${PASS_SYNAPSE_COMPLEMENT_USE_WORKERS:-false}) | Embedded HAMT engine: ${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:-<none>}${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:+ at ${PASS_SYNAPSE_EMBEDDED_HAMT_PATH:-<not set>}}${PASS_SYNAPSE_MTXDB_NO_SYNC:+ (no_sync)}${PASS_SYNAPSE_MTXDB_WAL:+ (wal)}${PASS_SYNAPSE_MTXDB_STATS:+ (stats)}" >&2
 
   # Complement's Destroy() force-removes every homeserver container
   # unconditionally, pass or fail -- there is no "keep failed containers"
