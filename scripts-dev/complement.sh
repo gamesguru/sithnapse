@@ -502,12 +502,13 @@ main() {
     *) export PASS_SYNAPSE_MTXDB_NO_SYNC=1 ;;
   esac
 
-  # The write-ahead journal is off by default everywhere (production included):
-  # read-only workers only scan packfiles, so a WAL-committed-but-unflushed
-  # write is invisible to them until mtxdb-core grows a read-only journal-apply
-  # path. This forwards an explicit opt-in for controlled A/B captures against
-  # the journal path. Same truthy/falsey semantics as above, but positive
-  # (opt-in) rather than negative, since the safe default here is "off".
+  # The write-ahead journal is off by default everywhere (production included).
+  # It changes only which target receives the sync fsync (the WAL segment vs the
+  # packfile shards), and read-only workers have no journal replay/overlay path,
+  # so its cross-process visibility is unverified. This forwards an explicit
+  # opt-in for controlled A/B captures against the journal path. Same
+  # truthy/falsey semantics as above, but positive (opt-in) rather than
+  # negative, since the safe default here is "off".
   case "${SYNAPSE_TEST_MTXDB_WAL:-}" in
     "" | 0 | false | False | no | No | off | Off) ;;
     *) export PASS_SYNAPSE_MTXDB_WAL=1 ;;
