@@ -502,12 +502,15 @@ main() {
     *) export PASS_SYNAPSE_MTXDB_NO_SYNC=1 ;;
   esac
 
-  # The write-ahead journal is on by default in production; this is its
-  # matching test escape hatch for A/B captures that want the historical
-  # packfile-as-sync-point path. Same truthy/falsey semantics as above.
-  case "${SYNAPSE_TEST_MTXDB_NO_WAL:-}" in
+  # The write-ahead journal is off by default everywhere (production included):
+  # read-only workers only scan packfiles, so a WAL-committed-but-unflushed
+  # write is invisible to them until mtxdb-core grows a read-only journal-apply
+  # path. This forwards an explicit opt-in for controlled A/B captures against
+  # the journal path. Same truthy/falsey semantics as above, but positive
+  # (opt-in) rather than negative, since the safe default here is "off".
+  case "${SYNAPSE_TEST_MTXDB_WAL:-}" in
     "" | 0 | false | False | no | No | off | Off) ;;
-    *) export PASS_SYNAPSE_MTXDB_NO_WAL=1 ;;
+    *) export PASS_SYNAPSE_MTXDB_WAL=1 ;;
   esac
 
   # Forward the diagnostic stats switch into the containers: with sync
@@ -524,7 +527,7 @@ main() {
   local synapse_revision
   synapse_revision="$(git -C "$repo_root" describe --tags --always --dirty 2>/dev/null || echo '<unknown>')"
   echo "Synapse revision: ${synapse_revision}" >&2
-  echo "Database: ${PASS_SYNAPSE_COMPLEMENT_DATABASE} (workers: ${PASS_SYNAPSE_COMPLEMENT_USE_WORKERS:-false}) | Embedded HAMT engine: ${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:-<none>}${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:+ at ${PASS_SYNAPSE_EMBEDDED_HAMT_PATH:-<not set>}}${PASS_SYNAPSE_MTXDB_NO_SYNC:+ (no_sync)}${PASS_SYNAPSE_MTXDB_NO_WAL:+ (no_wal)}${PASS_SYNAPSE_MTXDB_STATS:+ (stats)}" >&2
+  echo "Database: ${PASS_SYNAPSE_COMPLEMENT_DATABASE} (workers: ${PASS_SYNAPSE_COMPLEMENT_USE_WORKERS:-false}) | Embedded HAMT engine: ${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:-<none>}${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:+ at ${PASS_SYNAPSE_EMBEDDED_HAMT_PATH:-<not set>}}${PASS_SYNAPSE_MTXDB_NO_SYNC:+ (no_sync)}${PASS_SYNAPSE_MTXDB_WAL:+ (wal)}${PASS_SYNAPSE_MTXDB_STATS:+ (stats)}" >&2
 
   # Complement's Destroy() force-removes every homeserver container
   # unconditionally, pass or fail -- there is no "keep failed containers"

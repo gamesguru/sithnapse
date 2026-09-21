@@ -1178,12 +1178,15 @@ fn decode_auth_edges(bytes: &[u8]) -> PyResult<Vec<u32>> {
 /// invisible to them; enabling the journal before mtxdb-core grows a read-only
 /// journal-apply path would make those readers silently miss recent writes.
 ///
-/// `SYNAPSE_MTXDB_NO_WAL` set to a falsey value (0/false/no/off/empty) opts in
-/// to the journal for controlled testing; a truthy value (or unset) leaves it
-/// off. The falsey/truthy parsing matches `SYNAPSE_MTXDB_NO_SYNC`.
+/// `SYNAPSE_MTXDB_WAL` set to a truthy value (anything but 0/false/no/off/empty)
+/// opts in to the journal for controlled testing; unset or falsey leaves it
+/// off. Deliberately a positive opt-in (not `SYNAPSE_MTXDB_NO_WAL`) -- unlike
+/// `SYNAPSE_MTXDB_NO_SYNC`, where the safe default is "on" and the variable
+/// opts *out*, the safe default here is "off", so the variable name matches
+/// its own polarity instead of reading backwards (`NO_WAL=0` enabling WAL).
 fn wal_enabled() -> bool {
-    match std::env::var("SYNAPSE_MTXDB_NO_WAL") {
-        Ok(value) => matches!(
+    match std::env::var("SYNAPSE_MTXDB_WAL") {
+        Ok(value) => !matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "" | "0" | "false" | "no" | "off"
         ),
@@ -1240,7 +1243,7 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
         }
         // The journal remains opt-in until read-only workers can observe
         // committed journal entries before packfile materialization. Set
-        // SYNAPSE_MTXDB_NO_WAL=0 to enable it for controlled testing.
+        // SYNAPSE_MTXDB_WAL=1 to enable it for controlled testing.
         // See mtxdb-core's `PackfileStorage::enable_journal`.
         if wal_enabled() {
             for (store, dir) in [
