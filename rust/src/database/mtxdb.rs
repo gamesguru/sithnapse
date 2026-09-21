@@ -2650,6 +2650,7 @@ fn stats_to_dict(
     d.set_item("index_rebuild_count", s.index_rebuild_count)?;
     d.set_item("sync_calls", s.sync_calls)?;
     d.set_item("checkpoint_writes", s.checkpoint_writes)?;
+    d.set_item("checkpoint_skips", s.checkpoint_skips)?;
     d.set_item("delta_appends", s.delta_appends)?;
     d.set_item("delta_invalidations", s.delta_invalidations)?;
     d.set_item("cache_hits", s.cache.hits)?;
@@ -2748,6 +2749,16 @@ fn stats_to_dict(
         sd.set_item("total_us", st.total.as_micros() as u64)?;
         d.set_item("last_sync_timings", sd)?;
     }
+    let st = s.sync_totals;
+    let sd = PyDict::new(py);
+    sd.set_item("calls", st.calls)?;
+    sd.set_item("pack_flush_us", st.pack_flush.as_micros() as u64)?;
+    sd.set_item("pack_fsync_us", st.pack_fsync.as_micros() as u64)?;
+    sd.set_item("sidecar_us", st.sidecar.as_micros() as u64)?;
+    sd.set_item("delta_log_us", st.delta_log.as_micros() as u64)?;
+    sd.set_item("checkpoint_us", st.checkpoint.as_micros() as u64)?;
+    sd.set_item("total_us", st.total.as_micros() as u64)?;
+    d.set_item("sync_totals", sd)?;
     Ok(d.unbind())
 }
 
@@ -2801,6 +2812,30 @@ pub fn set_stats_enabled(py: Python<'_>, enabled: bool) -> PyResult<()> {
     })
 }
 
+/// Bound how often a structurally-needed full checkpoint rewrite (the delta
+/// log being invalidated) may run, across all pools. Both budgets are
+/// unlimited at zero and the pair is disabled when both are zero (the
+/// default). A deferred rewrite is write-neutral: packfiles are still synced
+/// first, so only the index acceleration file stays stale, costing the next
+/// open a rescan. See `mtxdb_core`'s `set_checkpoint_rewrite_budget` and the
+/// `checkpoint_skips` stat.
+#[pyfunction]
+pub fn set_checkpoint_rewrite_budget(
+    py: Python<'_>,
+    min_interval_secs: f64,
+    max_bytes: u64,
+) -> PyResult<()> {
+    let interval = std::time::Duration::try_from_secs_f64(min_interval_secs)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("invalid interval: {e}")))?;
+    py.detach(|| {
+        let pools = pools()?;
+        for store in [&pools.state, &pools.event_dag, &pools.auth_chain] {
+            store.set_checkpoint_rewrite_budget(interval, max_bytes);
+        }
+        Ok(())
+    })
+}
+
 pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(open_client, m)?)?;
     m.add_function(wrap_pyfunction!(open_client_read_only, m)?)?;
@@ -2844,6 +2879,7 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(stats, m)?)?;
     m.add_function(wrap_pyfunction!(reset_stats, m)?)?;
     m.add_function(wrap_pyfunction!(set_stats_enabled, m)?)?;
+    m.add_function(wrap_pyfunction!(set_checkpoint_rewrite_budget, m)?)?;
 
     Ok(())
 }
