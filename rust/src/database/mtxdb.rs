@@ -786,14 +786,23 @@ mod room_index {
     /// gap rather than being the only thing standing between a crash and
     /// data loss.
     pub fn sync() -> PyResult<()> {
-        let dirty: HashSet<u8> = DIRTY
+        let mut dirty: Vec<u8> = DIRTY
             .lock()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}")))?
             .take()
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
         if dirty.is_empty() {
             return Ok(());
         }
+        // Sync in ascending shard order. The index files are `index-00`..
+        // `index-3f`, but `DIRTY` is a `HashSet` (and `std`'s hasher is
+        // randomly seeded per process), so iterating it directly makes a
+        // rotational disk seek across the platter on every `sync_data` in an
+        // unpredictable order. mtxdb-core's pack-shard sync sorts by `pack_id`
+        // for exactly this reason.
+        dirty.sort_unstable();
         let guard = HANDLES
             .lock()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}")))?;
