@@ -482,7 +482,13 @@ fn py_to_lean_event(py_ev: &Bound<'_, PyAny>) -> PyResult<LeanEvent<String, Reso
         .extract()?;
 
     let py_content = py_ev.getattr("content")?;
-    let content: Value = depythonize(&py_content)?;
+    // `EventBase` is the Rust `Event` pyclass, so the primary call site takes the
+    // shared-`JsonObject` branch above. When it does not, share the content
+    // object if it already is a `JsonObject` and only depythonize a real mapping.
+    let content = match py_content.extract::<JsonObject>() {
+        Ok(object) => ResolverContent::SharedObject(object),
+        Err(_) => ResolverContent::SharedValue(Arc::new(depythonize(&py_content)?)),
+    };
 
     let power_level: i64 = 0;
 
@@ -493,7 +499,7 @@ fn py_to_lean_event(py_ev: &Bound<'_, PyAny>) -> PyResult<LeanEvent<String, Reso
         power_level,
         origin_server_ts,
         sender,
-        content: ResolverContent::SharedValue(Arc::new(content)),
+        content,
         prev_events,
         auth_events,
         depth,

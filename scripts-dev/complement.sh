@@ -500,13 +500,21 @@ main() {
     export PASS_SYNAPSE_MTXDB_NO_SYNC=1
   fi
 
+  # Forward the diagnostic stats switch into the containers: with sync
+  # disabled the report is empty, so this is only useful on a sync-on lane,
+  # but it must reach the container or there is no way to size a sync's
+  # fsync/checkpoint split from a Complement run.
+  if [[ -n "${SYNAPSE_TEST_MTXDB_STATS:-}" ]]; then
+    export PASS_SYNAPSE_MTXDB_STATS=1
+  fi
+
   # Record the exact checkout that produced the image alongside the effective
   # test configuration. `--dirty` makes a locally modified build explicit,
   # which is essential when comparing Complement timings or failures later.
   local synapse_revision
   synapse_revision="$(git -C "$repo_root" describe --tags --always --dirty 2>/dev/null || echo '<unknown>')"
   echo "Synapse revision: ${synapse_revision}" >&2
-  echo "Database: ${PASS_SYNAPSE_COMPLEMENT_DATABASE} (workers: ${PASS_SYNAPSE_COMPLEMENT_USE_WORKERS:-false}) | Embedded HAMT engine: ${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:-<none>}${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:+ at ${PASS_SYNAPSE_EMBEDDED_HAMT_PATH:-<not set>}}${PASS_SYNAPSE_MTXDB_NO_SYNC:+ (no_sync)}" >&2
+  echo "Database: ${PASS_SYNAPSE_COMPLEMENT_DATABASE} (workers: ${PASS_SYNAPSE_COMPLEMENT_USE_WORKERS:-false}) | Embedded HAMT engine: ${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:-<none>}${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:+ at ${PASS_SYNAPSE_EMBEDDED_HAMT_PATH:-<not set>}}${PASS_SYNAPSE_MTXDB_NO_SYNC:+ (no_sync)}${PASS_SYNAPSE_MTXDB_STATS:+ (stats)}" >&2
 
   # Complement's Destroy() force-removes every homeserver container
   # unconditionally, pass or fail -- there is no "keep failed containers"
