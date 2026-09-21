@@ -58,6 +58,7 @@ from synapse.storage.database import (
     make_tuple_in_list_sql_clause,
 )
 from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
+from synapse.storage.databases.main.embedded_event_json import get_event_json_batch
 from synapse.storage.types import Cursor
 from synapse.storage.util.id_generators import IdGenerator, MultiWriterIdGenerator
 from synapse.types import (
@@ -1204,8 +1205,8 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
             the hostname and the value is the media ID.
         """
         sql = """
-            SELECT stream_ordering, json FROM events
-            JOIN event_json USING (room_id, event_id)
+            SELECT stream_ordering, events.event_id, event_json.json FROM events
+            LEFT JOIN event_json USING (room_id, event_id)
             WHERE room_id = ?
                 %(where_clause)s
                 AND contains_url = TRUE AND outlier = FALSE
@@ -1219,8 +1220,31 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
 
         while True:
             next_token = None
-            for stream_ordering, content_json in txn:
+            rows = txn.fetchall()
+            if not rows:
+                break
+
+            missing_json_ids = [
+                event_id for _, event_id, content_json in rows if content_json is None
+            ]
+            json_by_id = {}
+            if missing_json_ids and getattr(
+                self, "_embedded_event_json_enabled", False
+            ):
+                found = get_event_json_batch(
+                    self._embedded_hamt_engine,
+                    self._embedded_hamt_namespace,
+                    missing_json_ids,
+                )
+                for eid, (_, j, _) in found.items():
+                    json_by_id[eid] = j
+
+            for stream_ordering, event_id, content_json in rows:
                 next_token = stream_ordering
+                if content_json is None:
+                    content_json = json_by_id.get(event_id)
+                if not content_json:
+                    continue
                 event_json = db_to_json(content_json)
                 content = event_json["content"]
                 content_url = content.get("url")
@@ -2067,7 +2091,7 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
                 FROM event_reports AS er
                 LEFT JOIN events
                     ON events.event_id = er.event_id
-                JOIN event_json
+                LEFT JOIN event_json
                     ON event_json.event_id = er.event_id
                 JOIN room_stats_state
                     ON room_stats_state.room_id = er.room_id
@@ -2080,6 +2104,19 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
             if not row:
                 return None
 
+            event_id = row[3]
+            raw_event_json = row[9]
+            if raw_event_json is None and getattr(
+                self, "_embedded_event_json_enabled", False
+            ):
+                found = get_event_json_batch(
+                    self._embedded_hamt_engine,
+                    self._embedded_hamt_namespace,
+                    [event_id],
+                )
+                if event_id in found:
+                    raw_event_json = found[event_id][1]
+
             event_report = {
                 "id": row[0],
                 "received_ts": row[1],
@@ -2091,7 +2128,7 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
                 "sender": row[6],
                 "canonical_alias": row[7],
                 "name": row[8],
-                "event_json": db_to_json(row[9]),
+                "event_json": db_to_json(raw_event_json) if raw_event_json else None,
             }
 
             return event_report

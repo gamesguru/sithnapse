@@ -47,7 +47,10 @@ from synapse.storage.database import (
 )
 from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
 from synapse.storage.databases.main.embedded_common import Pool, SyncTier, maybe_sync
-from synapse.storage.databases.main.embedded_event_json import put_event_json_batch
+from synapse.storage.databases.main.embedded_event_json import (
+    get_event_json_batch,
+    put_event_json_batch,
+)
 from synapse.storage.databases.main.embedded_event_to_state_group import (
     get_state_group_for_events_batch,
     increment_state_group_refcounts_batch,
@@ -629,7 +632,7 @@ class EventsBackgroundUpdatesStore(
         def reindex_txn(txn: LoggingTransaction) -> int:
             sql = (
                 "SELECT stream_ordering, event_id, json FROM events"
-                " INNER JOIN event_json USING (event_id)"
+                " LEFT JOIN event_json USING (event_id)"
                 " WHERE ? <= stream_ordering AND stream_ordering < ?"
                 " ORDER BY stream_ordering DESC"
                 " LIMIT ?"
@@ -643,11 +646,29 @@ class EventsBackgroundUpdatesStore(
 
             min_stream_id = rows[-1][0]
 
+            missing_json_ids = [event_id for _, event_id, json in rows if json is None]
+            json_by_id = {}
+            if missing_json_ids and getattr(
+                self, "_embedded_event_json_enabled", False
+            ):
+                found = get_event_json_batch(
+                    self._embedded_hamt_engine,
+                    self._embedded_hamt_namespace,
+                    missing_json_ids,
+                )
+                for eid, (_, j, _) in found.items():
+                    json_by_id[eid] = j
+
             update_rows = []
             for row in rows:
                 try:
                     event_id = row[1]
-                    event_json = db_to_json(row[2])
+                    raw_json = row[2]
+                    if raw_json is None:
+                        raw_json = json_by_id.get(event_id)
+                    if not raw_json:
+                        continue
+                    event_json = db_to_json(raw_json)
                     sender = event_json["sender"]
                     content = event_json["content"]
 
@@ -858,7 +879,7 @@ class EventsBackgroundUpdatesStore(
                     rejections.event_id IS NOT NULL
                     FROM event_edges
                     INNER JOIN events USING (event_id)
-                    INNER JOIN event_json USING (event_id)
+                    LEFT JOIN event_json USING (event_id)
                     LEFT JOIN rejections USING (event_id)
                     WHERE
                         NOT events.outlier
@@ -868,8 +889,24 @@ class EventsBackgroundUpdatesStore(
                     self.database_engine, "prev_event_id", to_check
                 )
                 txn.execute(sql + clause, list(args))
+                rows = txn.fetchall()
 
-                for prev_event_id, event_id, metadata, rejected in txn:
+                missing_meta_ids = [
+                    event_id for _, event_id, metadata, _ in rows if metadata is None
+                ]
+                meta_by_id = {}
+                if missing_meta_ids and getattr(
+                    self, "_embedded_event_json_enabled", False
+                ):
+                    found = get_event_json_batch(
+                        self._embedded_hamt_engine,
+                        self._embedded_hamt_namespace,
+                        missing_meta_ids,
+                    )
+                    for eid, (m, _, _) in found.items():
+                        meta_by_id[eid] = m
+
+                for prev_event_id, event_id, metadata, rejected in rows:
                     if event_id in graph:
                         # Already handled this event previously, but we still
                         # want to record the edge.
@@ -878,7 +915,11 @@ class EventsBackgroundUpdatesStore(
 
                     graph[event_id] = {prev_event_id}
 
-                    soft_failed = db_to_json(metadata).get("soft_failed")
+                    if metadata is None:
+                        metadata = meta_by_id.get(event_id)
+                    soft_failed = (
+                        db_to_json(metadata).get("soft_failed") if metadata else False
+                    )
                     if soft_failed or rejected:
                         soft_failed_events_to_lookup.add(event_id)
                     else:
@@ -1191,7 +1232,7 @@ class EventsBackgroundUpdatesStore(
                     state_events.event_id IS NOT NULL,
                     event_auth.event_id IS NOT NULL
                 FROM rejections
-                INNER JOIN event_json USING (event_id)
+                LEFT JOIN event_json USING (event_id)
                 LEFT JOIN rooms USING (room_id)
                 LEFT JOIN state_events USING (event_id)
                 LEFT JOIN event_auth USING (event_id)
@@ -1208,10 +1249,35 @@ class EventsBackgroundUpdatesStore(
                 ),
             )
 
-            return cast(
-                list[tuple[str, str, JsonDict, bool, bool]],
-                [(row[0], row[1], db_to_json(row[2]), row[3], row[4]) for row in txn],
-            )
+            rows = txn.fetchall()
+            if not rows:
+                return []
+
+            missing_json_ids = [row[0] for row in rows if row[2] is None]
+            json_by_id = {}
+            if missing_json_ids and getattr(
+                self, "_embedded_event_json_enabled", False
+            ):
+                found = get_event_json_batch(
+                    self._embedded_hamt_engine,
+                    self._embedded_hamt_namespace,
+                    missing_json_ids,
+                )
+                for eid, (_, j, _) in found.items():
+                    json_by_id[eid] = j
+
+            results_list = []
+            for row in rows:
+                raw_json = row[2]
+                if raw_json is None:
+                    raw_json = json_by_id.get(row[0])
+                if not raw_json:
+                    continue
+                results_list.append(
+                    (row[0], row[1], db_to_json(raw_json), row[3], row[4])
+                )
+
+            return results_list
 
         results = await self.db_pool.runInteraction(
             desc="_rejected_events_metadata_get", func=get_rejected_events

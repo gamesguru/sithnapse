@@ -13,12 +13,13 @@
 import logging
 import random
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Collection, cast
+from typing import TYPE_CHECKING, Collection
 
 from twisted.internet.defer import Deferred
 
 from synapse.events import EventBase
 from synapse.replication.tcp.streams._base import StickyEventsStream
+from synapse.storage._base import db_to_json
 from synapse.storage.database import (
     DatabasePool,
     LoggingDatabaseConnection,
@@ -26,6 +27,7 @@ from synapse.storage.database import (
     make_in_list_sql_clause,
 )
 from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
+from synapse.storage.databases.main.embedded_event_json import get_event_json_batch
 from synapse.storage.databases.main.state import StateGroupWorkerStore
 from synapse.storage.engines import PostgresEngine, Sqlite3Engine
 from synapse.storage.util.id_generators import MultiWriterIdGenerator
@@ -213,9 +215,9 @@ class StickyEventsWorkerStore(StateGroupWorkerStore, CacheInvalidationWorkerStor
 
         txn.execute(
             f"""
-            SELECT se.stream_id, se.room_id, event_id
+            SELECT se.stream_id, se.room_id, se.event_id, {expr_soft_failed} AS "soft_failed"
             FROM sticky_events se
-            INNER JOIN event_json ej USING (event_id)
+            LEFT JOIN event_json ej USING (event_id)
             WHERE
                 NOT {expr_soft_failed}
                 AND ? < expires_at
@@ -227,7 +229,32 @@ class StickyEventsWorkerStore(StateGroupWorkerStore, CacheInvalidationWorkerStor
             """,
             (now, from_id, to_id, *room_id_in_list_values, *limit_params),
         )
-        return cast(list[tuple[int, str, str]], txn.fetchall())
+        rows = txn.fetchall()
+        if not rows:
+            return []
+
+        missing_meta_ids = [
+            event_id for _, _, event_id, soft_failed in rows if not soft_failed
+        ]
+        meta_by_id = {}
+        if missing_meta_ids and getattr(self, "_embedded_event_json_enabled", False):
+            found = get_event_json_batch(
+                self._embedded_hamt_engine,
+                self._embedded_hamt_namespace,
+                missing_meta_ids,
+            )
+            for eid, (m, _, _) in found.items():
+                meta_by_id[eid] = (
+                    db_to_json(m).get("soft_failed", False) if m else False
+                )
+
+        result = []
+        for stream_id, room_id, event_id, soft_failed in rows:
+            if event_id in meta_by_id:
+                soft_failed = meta_by_id[event_id]
+            if not soft_failed:
+                result.append((stream_id, room_id, event_id))
+        return result
 
     async def get_updated_sticky_events(
         self, *, from_id: int, to_id: int, limit: int
@@ -274,21 +301,39 @@ class StickyEventsWorkerStore(StateGroupWorkerStore, CacheInvalidationWorkerStor
             SELECT se.stream_id, se.room_id, se.event_id,
             {expr_soft_failed} AS "soft_failed"
             FROM sticky_events se
-            INNER JOIN event_json ej USING (event_id)
+            LEFT JOIN event_json ej USING (event_id)
             WHERE ? < stream_id AND stream_id <= ?
             LIMIT ?
             """,
             (from_id, to_id, limit),
         )
+        rows = txn.fetchall()
+        if not rows:
+            return []
+
+        missing_ids = [
+            event_id for _, _, event_id, soft_failed in rows if not soft_failed
+        ]
+        meta_by_id = {}
+        if missing_ids and getattr(self, "_embedded_event_json_enabled", False):
+            found = get_event_json_batch(
+                self._embedded_hamt_engine,
+                self._embedded_hamt_namespace,
+                missing_ids,
+            )
+            for eid, (m, _, _) in found.items():
+                meta_by_id[eid] = (
+                    db_to_json(m).get("soft_failed", False) if m else False
+                )
 
         return [
             StickyEventUpdate(
                 stream_id=stream_id,
                 room_id=room_id,
                 event_id=event_id,
-                soft_failed=bool(soft_failed),
+                soft_failed=meta_by_id.get(event_id, bool(soft_failed)),
             )
-            for stream_id, room_id, event_id, soft_failed in txn
+            for stream_id, room_id, event_id, soft_failed in rows
         ]
 
     def insert_sticky_events_txn(

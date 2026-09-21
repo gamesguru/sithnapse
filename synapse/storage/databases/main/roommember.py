@@ -46,6 +46,7 @@ from synapse.storage.database import (
     LoggingTransaction,
 )
 from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
+from synapse.storage.databases.main.embedded_event_json import get_event_json_batch
 from synapse.storage.databases.main.events_worker import EventsWorkerStore
 from synapse.storage.databases.main.stream import _filter_results_by_stream
 from synapse.storage.engines import Sqlite3Engine
@@ -2044,7 +2045,7 @@ class RoomMemberBackgroundUpdateStore(SQLBaseStore):
             sql = """
                 SELECT stream_ordering, event_id, events.room_id, event_json.json
                 FROM events
-                INNER JOIN event_json USING (event_id)
+                LEFT JOIN event_json USING (event_id)
                 WHERE ? <= stream_ordering AND stream_ordering < ?
                 AND type = 'm.room.member'
                 ORDER BY stream_ordering DESC
@@ -2059,9 +2060,28 @@ class RoomMemberBackgroundUpdateStore(SQLBaseStore):
 
             min_stream_id = rows[-1][0]
 
+            missing_json_ids = [
+                event_id for _, event_id, _, json in rows if json is None
+            ]
+            json_by_id = {}
+            if missing_json_ids and getattr(
+                self, "_embedded_event_json_enabled", False
+            ):
+                found = get_event_json_batch(
+                    self._embedded_hamt_engine,
+                    self._embedded_hamt_namespace,
+                    missing_json_ids,
+                )
+                for eid, (_, j, _) in found.items():
+                    json_by_id[eid] = j
+
             to_update = []
             for _, event_id, room_id, json in rows:
                 try:
+                    if json is None:
+                        json = json_by_id.get(event_id)
+                    if not json:
+                        continue
                     event_json = db_to_json(json)
                     content = event_json["content"]
                 except Exception:
