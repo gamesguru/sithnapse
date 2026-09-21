@@ -1328,19 +1328,14 @@ class PersistEventsStore:
         # than deferring them. Backfilled events are skipped -- no live request
         # waits on them.
         if self._embedded_hamt_engine:
-            is_backfilled = any(
-                ev.internal_metadata.stream_ordering is not None
-                and ev.internal_metadata.stream_ordering < 0
+            needs_durable_barrier = any(
+                ev.type in AUTH_CHAIN_EVENT_TYPES
+                and not ev.internal_metadata.is_outlier()
+                and ev.internal_metadata.stream_ordering is not None
+                and ev.internal_metadata.stream_ordering >= 0
                 for ev, _ in events_and_contexts
             )
-            auth_relevant = any(
-                ev.type in AUTH_CHAIN_EVENT_TYPES for ev, _ in events_and_contexts
-            )
-            if (
-                self._embedded_event_json_enabled
-                and auth_relevant
-                and not is_backfilled
-            ):
+            if self._embedded_event_json_enabled and needs_durable_barrier:
                 txn.call_after(sync_now, [Pool.STATE, Pool.AUTH_CHAIN, Pool.EVENT_DAG])
             else:
                 txn.call_after(mark_dirty, Pool.STATE)
