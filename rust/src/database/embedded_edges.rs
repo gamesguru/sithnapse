@@ -437,54 +437,96 @@ pub fn event_edges_delete(
         }
 
         let mut dag_updates: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
-        let mut forward_cache: HashMap<([u8; 16], NodeId), Vec<String>> = HashMap::new();
 
+        // 1. Batch-read backward edges for every purged event to find parents.
+        let mut backward_ids: HashMap<[u8; 16], Vec<(usize, NodeId)>> = HashMap::new();
         for (position, room_collection) in room_collections.iter().enumerate() {
             if let Some(room_collection) = room_collection {
-                let event_id = &event_ids[position];
-                let backward_node = event_edges_backward_node_id(&namespace, event_id);
-
-                // 1. Read backward edges to find parents
-                let backward_data = engine.get(room_collection, &backward_node).map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get error: {e}"))
-                })?;
-
-                if let Some(data) = backward_data {
-                    if !data.bytes.is_empty() {
-                        let preds = decode_backward_edges(&data.bytes)?;
-                        for (parent_id, _) in preds {
-                            let forward_node = event_edges_forward_node_id(&namespace, &parent_id);
-                            let key = (*room_collection, forward_node);
-
-                            if let std::collections::hash_map::Entry::Vacant(e) =
-                                forward_cache.entry(key)
-                            {
-                                let existing = match engine.get(room_collection, &forward_node) {
-                                    Ok(Some(d)) if !d.bytes.is_empty() => {
-                                        decode_forward_edges(&d.bytes)?
-                                    }
-                                    _ => Vec::new(),
-                                };
-                                e.insert(existing);
-                            }
-
-                            if let Some(children) = forward_cache.get_mut(&key) {
-                                children.retain(|c| c != event_id);
-                            }
-                        }
-                    }
-                }
-
-                // 2. Tombstone backward edge
-                dag_updates
+                let backward_node = event_edges_backward_node_id(&namespace, &event_ids[position]);
+                backward_ids
                     .entry(*room_collection)
                     .or_default()
-                    .push((backward_node, NodeData::new(bytes::Bytes::new())));
-                // NOTE: locators are owned by event_json_put; do not tombstone here.
+                    .push((position, backward_node));
             }
         }
 
-        // 3. Write updated or tombstoned forward edges
+        let mut backward_preds: Vec<Option<Vec<(String, bool)>>> = vec![None; event_ids.len()];
+        for (collection, ids) in &backward_ids {
+            let node_ids_only: Vec<NodeId> = ids.iter().map(|(_, id)| *id).collect();
+            let found = engine.get_many(collection, &node_ids_only).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {e}"))
+            })?;
+            for ((position, _), value) in ids.iter().zip(found) {
+                if let Some(data) = value {
+                    if !data.bytes.is_empty() {
+                        backward_preds[*position] = Some(decode_backward_edges(&data.bytes)?);
+                    }
+                }
+            }
+        }
+
+        // 2. Collect the distinct (room, parent) forward nodes touched by
+        // those backward edges and batch-read them in one pass per room
+        // collection.
+        let mut forward_positions: HashMap<([u8; 16], NodeId), Vec<usize>> = HashMap::new();
+        for (position, room_collection) in room_collections.iter().enumerate() {
+            let (Some(room_collection), Some(preds)) = (room_collection, &backward_preds[position])
+            else {
+                continue;
+            };
+            for (parent_id, _) in preds {
+                let forward_node = event_edges_forward_node_id(&namespace, parent_id);
+                forward_positions
+                    .entry((*room_collection, forward_node))
+                    .or_default()
+                    .push(position);
+            }
+        }
+
+        let mut forward_by_collection: HashMap<[u8; 16], Vec<NodeId>> = HashMap::new();
+        for (room_collection, forward_node) in forward_positions.keys() {
+            forward_by_collection
+                .entry(*room_collection)
+                .or_default()
+                .push(*forward_node);
+        }
+
+        let mut forward_cache: HashMap<([u8; 16], NodeId), Vec<String>> = HashMap::new();
+        for (collection, node_ids_only) in &forward_by_collection {
+            let found = engine.get_many(collection, node_ids_only).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {e}"))
+            })?;
+            for (forward_node, value) in node_ids_only.iter().zip(found) {
+                let children = match value {
+                    Some(d) if !d.bytes.is_empty() => decode_forward_edges(&d.bytes)?,
+                    _ => Vec::new(),
+                };
+                forward_cache.insert((*collection, *forward_node), children);
+            }
+        }
+
+        // 3. Remove the purged events from their parents' cached forward lists.
+        for ((room_collection, forward_node), positions) in &forward_positions {
+            if let Some(children) = forward_cache.get_mut(&(*room_collection, *forward_node)) {
+                for &position in positions {
+                    let event_id = &event_ids[position];
+                    children.retain(|c| c != event_id);
+                }
+            }
+        }
+
+        // 4. Tombstone backward edges for the purged events.
+        // NOTE: locators are owned by event_json_put; do not tombstone here.
+        for (collection, ids) in &backward_ids {
+            for (_, backward_node) in ids {
+                dag_updates
+                    .entry(*collection)
+                    .or_default()
+                    .push((*backward_node, NodeData::new(bytes::Bytes::new())));
+            }
+        }
+
+        // 5. Write updated or tombstoned forward edges.
         for ((room_col, forward_node), children) in forward_cache {
             let data = if children.is_empty() {
                 NodeData::new(bytes::Bytes::new())
