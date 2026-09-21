@@ -2760,6 +2760,7 @@ fn stats_to_dict(
         sd.set_item("sidecar_us", st.sidecar.as_micros() as u64)?;
         sd.set_item("delta_log_us", st.delta_log.as_micros() as u64)?;
         sd.set_item("checkpoint_us", st.checkpoint.as_micros() as u64)?;
+        sd.set_item("wal_us", st.wal.as_micros() as u64)?;
         sd.set_item("total_us", st.total.as_micros() as u64)?;
         d.set_item("last_sync_timings", sd)?;
     }
@@ -2771,6 +2772,7 @@ fn stats_to_dict(
     sd.set_item("sidecar_us", st.sidecar.as_micros() as u64)?;
     sd.set_item("delta_log_us", st.delta_log.as_micros() as u64)?;
     sd.set_item("checkpoint_us", st.checkpoint.as_micros() as u64)?;
+    sd.set_item("wal_us", st.wal.as_micros() as u64)?;
     sd.set_item("total_us", st.total.as_micros() as u64)?;
     d.set_item("sync_totals", sd)?;
     Ok(d.unbind())
