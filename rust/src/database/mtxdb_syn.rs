@@ -1172,11 +1172,14 @@ fn decode_auth_edges(bytes: &[u8]) -> PyResult<Vec<u32>> {
 
 /// Whether the write-ahead journal is enabled for writable opens.
 ///
-/// Off by default: the historical packfile-shard fsync remains the sync point,
-/// which is the invariant multi-process read-only workers depend on. Read-only
-/// workers only scan packfiles, so WAL-committed-but-unflushed writes are
-/// invisible to them; enabling the journal before mtxdb-core grows a read-only
-/// journal-apply path would make those readers silently miss recent writes.
+/// Off by default. The journal changes only which target receives the sync
+/// fsync (the WAL segment instead of the packfile shards); it does not change
+/// when a `put`'s frame reaches the packfile (eager under the default append
+/// policy) or when the index checkpoint/delta is persisted. Read-only workers
+/// have no journal replay/overlay path, so the journal does not by itself make
+/// its committed entries visible to them. Enabling it by default was unmeasured
+/// on the writer + read-only-worker topology, so it stays opt-in until that
+/// lane is A/B-verified.
 ///
 /// `SYNAPSE_MTXDB_WAL` set to a truthy value (anything but 0/false/no/off/empty)
 /// opts in to the journal for controlled testing; unset or falsey leaves it
@@ -1265,9 +1268,10 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
         for store in [&state, &event_dag, &auth_chain] {
             store.set_refresh_on_miss(false);
         }
-        // The journal remains opt-in until read-only workers can observe
-        // committed journal entries before packfile materialization. Set
-        // SYNAPSE_MTXDB_WAL=1 to enable it for controlled testing.
+        // The journal is opt-in pending an A/B on the writer + read-only-worker
+        // topology: it changes only the sync fsync target, and read-only workers
+        // have no journal replay/overlay path, so its read-visibility effect is
+        // unverified. Set SYNAPSE_MTXDB_WAL=1 for controlled testing.
         // See mtxdb-core's `PackfileStorage::enable_journal`.
         if wal_enabled() {
             for (store, dir) in [
