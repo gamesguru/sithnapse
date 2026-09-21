@@ -66,7 +66,7 @@ from synapse.storage.database import (
     LoggingTransaction,
     make_tuple_in_list_sql_clause,
 )
-from synapse.storage.databases.main.embedded_common import Pool, mark_dirty
+from synapse.storage.databases.main.embedded_common import Pool, mark_dirty, sync_now
 from synapse.storage.databases.main.embedded_event_edges import (
     embedded_event_edges_is_writable,
     open_embedded_event_edges_engine,
@@ -153,6 +153,23 @@ SLIDING_SYNC_RELEVANT_STATE_SET = (
     (EventTypes.Name, ""),
     # So we can fill in the `tombstone_successor_room_id` column
     (EventTypes.Tombstone, ""),
+)
+
+# Event types that participate in a room's auth chain (see
+# `synapse.event_auth.auth_types_for_event`). A state change to any of these
+# can be read back by a subsequent, non-retrying request from another worker
+# process -- make_join/make_knock fetch auth events, /sync and /join read the
+# membership -- so in the exclusive engine an unsynced write here is a hard
+# 404 rather than a slow SQL-fallback read. `_persist_events_txn` uses this to
+# decide which writes must be made durable before their response is returned.
+AUTH_CHAIN_EVENT_TYPES = frozenset(
+    {
+        EventTypes.Create,
+        EventTypes.Member,
+        EventTypes.JoinRules,
+        EventTypes.PowerLevels,
+        EventTypes.ThirdPartyInvite,
+    }
 )
 
 
@@ -1299,9 +1316,35 @@ class PersistEventsStore:
         # Mark pools dirty after SQL commit via txn.call_after, so the
         # coalescer flushes only committed writes.  Gated on the embedded
         # engine being configured (same guard as the writes above).
+        #
+        # Exception: an auth-chain state change (membership, join rules, power
+        # levels, create, third-party invite) is read back by a subsequent,
+        # non-retrying request from another worker process -- make_join and
+        # make_knock fetch auth events, /sync and /join read the membership. In
+        # the exclusive engine there is no SQL fallback, so the coalescer's
+        # 250-500ms window is a hard 404 there: the reader's durable-fingerprint
+        # gate stays closed until this write is synced. Make those writes
+        # durable before the response that depends on them is returned rather
+        # than deferring them. Backfilled events are skipped -- no live request
+        # waits on them.
         if self._embedded_hamt_engine:
-            txn.call_after(mark_dirty, Pool.STATE)
-            txn.call_after(mark_dirty, Pool.AUTH_CHAIN)
+            is_backfilled = any(
+                ev.internal_metadata.stream_ordering is not None
+                and ev.internal_metadata.stream_ordering < 0
+                for ev, _ in events_and_contexts
+            )
+            auth_relevant = any(
+                ev.type in AUTH_CHAIN_EVENT_TYPES for ev, _ in events_and_contexts
+            )
+            if (
+                self._embedded_event_json_enabled
+                and auth_relevant
+                and not is_backfilled
+            ):
+                txn.call_after(sync_now, [Pool.STATE, Pool.AUTH_CHAIN, Pool.EVENT_DAG])
+            else:
+                txn.call_after(mark_dirty, Pool.STATE)
+                txn.call_after(mark_dirty, Pool.AUTH_CHAIN)
 
     def _persist_event_auth_chain_txn(
         self,
