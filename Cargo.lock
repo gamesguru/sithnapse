@@ -753,7 +753,6 @@ dependencies = [
  "imbl-sized-chunks",
  "rand_core 0.6.4",
  "rand_xoshiro",
- "serde",
  "version_check",
 ]
 
@@ -1343,17 +1342,12 @@ dependencies = [
 [[package]]
 name = "rezzy"
 version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=dev#b22a83ff3c7818ba49e2ea08629d64338c76e602"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#5da2d34d8d70e5b2b9aacc3db1e5f68c6032ab0a"
 dependencies = [
  "base64",
- "blake2",
- "hashbrown 0.15.5",
  "imbl",
- "roaring",
- "serde",
- "serde_json",
+ "rz-core",
  "sha2",
- "sha3",
 ]
 
 [[package]]
@@ -1462,6 +1456,39 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
+name = "rz-core"
+version = "0.6.0-rc.0"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#5da2d34d8d70e5b2b9aacc3db1e5f68c6032ab0a"
+dependencies = [
+ "base64",
+ "blake2",
+ "hashbrown 0.15.5",
+ "imbl",
+ "roaring",
+ "rz-json",
+ "rz-reconcile",
+ "sha2",
+ "sha3",
+]
+
+[[package]]
+name = "rz-json"
+version = "0.6.0-rc.0"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#5da2d34d8d70e5b2b9aacc3db1e5f68c6032ab0a"
+dependencies = [
+ "ryu",
+]
+
+[[package]]
+name = "rz-reconcile"
+version = "0.6.0-rc.0"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#5da2d34d8d70e5b2b9aacc3db1e5f68c6032ab0a"
+dependencies = [
+ "base64",
+ "sha2",
+]
 
 [[package]]
 name = "schannel"

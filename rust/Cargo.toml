@@ -76,7 +76,7 @@ futures = "0.3.31"
 tokio = { version = "1.44.2", features = ["rt", "rt-multi-thread"] }
 once_cell = "1.18.0"
 lru = "0.12"
-rezzy = { git = "https://gitlab.com/gamesguru/rezzy.git", branch = "dev" }
+rezzy = { git = "https://gitlab.com/gamesguru/rezzy.git", branch = "alpha" }
 mtxdb-core = { git = "https://gitlab.com/wombat-foundation/mtxdb.git", branch = "dev" }
 mtxdb-ffi = { git = "https://gitlab.com/wombat-foundation/mtxdb.git", branch = "dev" }
 

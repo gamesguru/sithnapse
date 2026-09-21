@@ -14,12 +14,13 @@
 
 use std::collections::{HashMap, HashSet};
 
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PySet, PyTuple};
 use pythonize::depythonize;
 use rezzy::{
     auth::roaring::AuthGraph, basespec::event_types::EventType, resolve_semilattice_fold,
-    LeanEvent, RoomId, SharedState, StateResVersion,
+    JsonValue, LeanEvent, RoomId, SharedState, StateResVersion,
 };
 use serde_json::Value;
 
@@ -97,7 +98,17 @@ pub fn get_auth_chain_difference_from_event_graph<'py>(
     PySet::new(py, result)
 }
 
-fn resolver_data_to_lean_event(data: EventResolverData) -> LeanEvent<String, Value> {
+/// rezzy's resolver bounds content on `EventContent`, which it only implements
+/// for its own alloc-only `JsonValue` -- not `serde_json::Value`. Bridge the two
+/// through JSON text, matching the lean-event adapters in rezzy's own tests.
+fn to_rezzy_content(content: &Value) -> PyResult<JsonValue> {
+    let encoded = serde_json::to_string(content)
+        .map_err(|err| PyValueError::new_err(format!("failed to encode event content: {err}")))?;
+    JsonValue::parse(&encoded)
+        .map_err(|err| PyValueError::new_err(format!("failed to parse event content: {err}")))
+}
+
+fn resolver_data_to_lean_event(data: EventResolverData) -> PyResult<LeanEvent<String, JsonValue>> {
     // For MSC4242 (room version 2.2), events carry `prev_state_events` instead
     // of `auth_events`. rezzy's LeanEvent folds both into a single `auth_events`
     // field and exposes them via `prev_state_events()` returning `&self.auth_events`.
@@ -111,24 +122,24 @@ fn resolver_data_to_lean_event(data: EventResolverData) -> LeanEvent<String, Val
     } else {
         data.auth_events
     };
-    LeanEvent {
+    Ok(LeanEvent {
         event_id: data.event_id,
         event_type: data.event_type,
         state_key: data.state_key,
         power_level: 0,
         origin_server_ts: data.origin_server_ts,
         sender: data.sender,
-        content: data.content,
+        content: to_rezzy_content(&data.content)?,
         prev_events: data.prev_events,
         auth_events,
         depth: data.depth,
         rejected: data.rejected,
         soft_fail: data.soft_failed,
         room_id: Some(RoomId::new(data.room_id)),
-    }
+    })
 }
 
-fn py_to_lean_event(py_ev: &Bound<'_, PyAny>) -> PyResult<LeanEvent<String, Value>> {
+fn py_to_lean_event(py_ev: &Bound<'_, PyAny>) -> PyResult<LeanEvent<String, JsonValue>> {
     let event_id: String = py_ev.getattr("event_id")?.extract()?;
     let room_id: String = py_ev.getattr("room_id")?.extract()?;
     let event_type: String = py_ev.getattr("type")?.extract()?;
@@ -177,7 +188,7 @@ fn py_to_lean_event(py_ev: &Bound<'_, PyAny>) -> PyResult<LeanEvent<String, Valu
         power_level,
         origin_server_ts,
         sender,
-        content,
+        content: to_rezzy_content(&content)?,
         prev_events,
         auth_events,
         depth,
@@ -201,12 +212,12 @@ pub fn resolve_v2_via_lattice_fold<'py>(
 
 fn parse_event_map(
     event_map: Bound<'_, PyDict>,
-) -> PyResult<HashMap<String, LeanEvent<String, Value>>> {
+) -> PyResult<HashMap<String, LeanEvent<String, JsonValue>>> {
     let mut parsed_events = HashMap::with_capacity(event_map.len());
     for (k, v) in event_map.iter() {
         let event_id: String = k.extract()?;
         let lean_ev = if let Ok(event) = v.extract::<PyRef<Event>>() {
-            resolver_data_to_lean_event(event.resolver_data()?)
+            resolver_data_to_lean_event(event.resolver_data()?)?
         } else {
             py_to_lean_event(&v)?
         };
@@ -219,7 +230,7 @@ fn resolve_v2_from_parsed_events<'py>(
     py: Python<'py>,
     unconflicted_state: Bound<'py, PyDict>,
     conflicted_event_ids: Bound<'py, PyAny>,
-    parsed_events: &HashMap<String, LeanEvent<String, Value>>,
+    parsed_events: &HashMap<String, LeanEvent<String, JsonValue>>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let mut unconf_state = SharedState::new();
     for (k, v) in unconflicted_state.iter() {
@@ -301,7 +312,7 @@ mod tests {
     #[test]
     fn non_msc4242_room_always_uses_auth_events() {
         let data = resolver_data(false, vec!["$auth1".to_owned()], Vec::new());
-        let lean = resolver_data_to_lean_event(data);
+        let lean = resolver_data_to_lean_event(data).expect("lean event conversion");
         assert_eq!(lean.auth_events, vec!["$auth1".to_owned()]);
     }
 
@@ -312,14 +323,14 @@ mod tests {
         // silently fall back to `auth_events` just because
         // `prev_state_events` happens to be empty.
         let data = resolver_data(true, vec!["$auth1".to_owned()], Vec::new());
-        let lean = resolver_data_to_lean_event(data);
+        let lean = resolver_data_to_lean_event(data).expect("lean event conversion");
         assert_eq!(lean.auth_events, Vec::<String>::new());
     }
 
     #[test]
     fn msc4242_room_uses_prev_state_events_when_populated() {
         let data = resolver_data(true, vec!["$auth1".to_owned()], vec!["$pstate1".to_owned()]);
-        let lean = resolver_data_to_lean_event(data);
+        let lean = resolver_data_to_lean_event(data).expect("lean event conversion");
         assert_eq!(lean.auth_events, vec!["$pstate1".to_owned()]);
     }
 }
