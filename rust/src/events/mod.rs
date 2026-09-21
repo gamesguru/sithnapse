@@ -114,6 +114,8 @@ pub(crate) struct EventResolverData {
     /// field to trust explicitly, rather than guessing from which one happens
     /// to be non-empty.
     pub(crate) msc4242_state_dags: bool,
+    /// Cloning this Arc-backed object shares the content tree with the event;
+    /// state resolution does not serialize or rebuild JSON for typed events.
     pub(crate) content: JsonObject,
     pub(crate) rejected: bool,
     pub(crate) soft_failed: bool,
@@ -655,6 +657,10 @@ impl Event {
 }
 
 impl Event {
+    /// Extract the fields needed by state resolution.
+    ///
+    /// `content` is shared through `JsonObject`'s `Arc`; the event metadata and
+    /// event-reference lists are converted to owned strings for `LeanEvent`.
     pub(crate) fn resolver_data(&self) -> PyResult<EventResolverData> {
         let origin_server_ts = u64::try_from(self.origin_server_ts()).map_err(|_| {
             PyValueError::new_err(format!(

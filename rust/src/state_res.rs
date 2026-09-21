@@ -103,8 +103,11 @@ pub fn get_auth_chain_difference_from_event_graph<'py>(
 }
 
 /// The resolver keeps the source JSON tree and reads the fields it needs in place.
-/// Typed events share their existing JsonObject; Python events own the depythonized
-/// serde_json tree behind an Arc so event clones stay cheap.
+/// The normal `state/v2.py` event map contains Rust `Event` objects, which flow
+/// through `resolver_data()` as a shared `JsonObject`; cloning it only clones
+/// its `Arc`, with no JSON serialization or second content tree. The Python
+/// fallback shares an existing `JsonObject` too; other JSON-compatible values
+/// are depythonized once and shared behind an `Arc`.
 #[derive(Clone)]
 enum ResolverContent {
     SharedObject(JsonObject),
