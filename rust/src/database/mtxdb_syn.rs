@@ -1402,9 +1402,17 @@ pub fn get_auth_chain_links_batch(
         let room_id = namespace_room_id(&namespace);
         let node_ids: Vec<NodeId> = chain_ids.iter().map(|&c| chain_node_id(c)).collect();
 
-        let results = engine.get_many(&room_id, &node_ids).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {}", e))
-        })?;
+        // Read-only workers hold an open-time collection index; refresh on a
+        // miss so auth-chain links the writer appended after this worker
+        // opened are visible (same pattern as `auth_chain_edges_get`).
+        let results = engine
+            .get_many_with_refresh(&room_id, &node_ids)
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "mtxdb get_many_with_refresh error: {}",
+                    e
+                ))
+            })?;
 
         let mut out = Vec::with_capacity(node_ids.len());
         for (chain_id, res) in chain_ids.into_iter().zip(results) {
@@ -1702,9 +1710,16 @@ pub fn resolve_short_ids_to_event_ids(
             .iter()
             .map(|&s| short_id_reverse_node_id(s))
             .collect();
-        let results = engine.get_many(&collection, &node_ids).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {}", e))
-        })?;
+        // Refresh on a miss so ids the writer appended after this worker
+        // opened are resolved instead of reported absent.
+        let results = engine
+            .get_many_with_refresh(&collection, &node_ids)
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "mtxdb get_many_with_refresh error: {}",
+                    e
+                ))
+            })?;
         results
             .into_iter()
             .map(|opt| match opt {
@@ -1811,9 +1826,16 @@ pub fn auth_chain_children_get(
             .iter()
             .map(|&s| auth_chain_child_node_id(s))
             .collect();
-        let results = engine.get_many(&collection, &node_ids).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {}", e))
-        })?;
+        // Refresh on a miss so auth-chain children the writer appended after
+        // this worker opened are visible (see `auth_chain_edges_get`).
+        let results = engine
+            .get_many_with_refresh(&collection, &node_ids)
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "mtxdb get_many_with_refresh error: {}",
+                    e
+                ))
+            })?;
         results
             .into_iter()
             .map(|opt| match opt {
@@ -2250,9 +2272,16 @@ pub fn event_json_get(
         let mut room_collections: Vec<Option<[u8; 16]>> = vec![None; event_ids.len()];
         for (collection, ids) in locator_ids {
             let node_ids_only: Vec<NodeId> = ids.iter().map(|(_, id)| *id).collect();
-            let found = engine.get_many(&collection, &node_ids_only).map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {e}"))
-            })?;
+            // Read-only workers hold an open-time index; refresh on a miss so
+            // locators for events the writer appended after this worker opened
+            // resolve instead of reporting the event absent.
+            let found = engine
+                .get_many_with_refresh(&collection, &node_ids_only)
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "mtxdb get_many_with_refresh error: {e}"
+                    ))
+                })?;
             for ((position, _), value) in ids.into_iter().zip(found) {
                 if let Some(data) = value {
                     if !data.bytes.is_empty() {
@@ -2289,9 +2318,15 @@ pub fn event_json_get(
         let mut metadatas: Vec<Option<Vec<u8>>> = vec![None; event_ids.len()];
         for (collection, ids) in dag_ids {
             let node_ids_only: Vec<NodeId> = ids.iter().map(|(_, _, id)| *id).collect();
-            let found = engine.get_many(&collection, &node_ids_only).map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {e}"))
-            })?;
+            // Refresh on a miss so event bodies/metadata the writer appended
+            // after this worker opened are visible to the read.
+            let found = engine
+                .get_many_with_refresh(&collection, &node_ids_only)
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "mtxdb get_many_with_refresh error: {e}"
+                    ))
+                })?;
             for ((position, kind, _), value) in ids.into_iter().zip(found) {
                 if let Some(data) = value {
                     if !data.bytes.is_empty() {
