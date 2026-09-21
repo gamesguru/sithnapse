@@ -285,9 +285,17 @@ pub fn get_state_hamt_roots_for_room(
         .collect();
     py.detach(|| {
         let engine = state_db()?;
-        let results = engine.get_many(&room_id, &node_ids).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {}", e))
-        })?;
+        // Read-only workers hold an open-time collection index; refresh on a
+        // miss so a state group root the writer appended after this worker
+        // opened is visible (same pattern as `auth_chain_edges_get`).
+        let results = engine
+            .get_many_with_refresh(&room_id, &node_ids)
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "mtxdb get_many_with_refresh error: {}",
+                    e
+                ))
+            })?;
         Ok(results
             .into_iter()
             .map(|res| {
@@ -381,9 +389,16 @@ pub fn get_state_hamt_roots_bulk(
                 .iter()
                 .map(|(_, state_group)| root_node_id(&namespace, *state_group))
                 .collect();
-            let response_records = engine.get_many(&room_id, &node_ids).map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {e}"))
-            })?;
+            // Refresh on a miss so roots for state groups the writer appended
+            // after this worker opened are resolved instead of reported absent.
+            let response_records =
+                engine
+                    .get_many_with_refresh(&room_id, &node_ids)
+                    .map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "mtxdb get_many_with_refresh error: {e}"
+                        ))
+                    })?;
 
             for ((index, _), record) in room_groups.into_iter().zip(response_records) {
                 if let Some(record) = record.filter(|record| !record.bytes.is_empty()) {
@@ -2659,9 +2674,16 @@ pub fn get_state_hamt_nodes_batch(
 
     py.detach(|| {
         let engine = state_db()?;
-        let results = engine.get_many(&room_id, &node_ids).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get error: {}", e))
-        })?;
+        // Refresh on a miss so HAMT nodes the writer appended after this
+        // worker opened are visible to the read.
+        let results = engine
+            .get_many_with_refresh(&room_id, &node_ids)
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "mtxdb get_many_with_refresh error: {}",
+                    e
+                ))
+            })?;
         Ok(results
             .into_iter()
             .map(|opt| opt.map(|d| d.bytes.to_vec()))
