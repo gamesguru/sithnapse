@@ -32,6 +32,14 @@ from synapse.api.room_versions import (
 from synapse.events import EventBase
 from synapse.rest.client import room
 from synapse.server import HomeServer
+from synapse.storage.databases.main.embedded_redactions import (
+    get_redactions_batch,
+    put_redaction_batch,
+)
+from synapse.storage.databases.main.embedded_rejections import (
+    get_rejections_batch,
+    put_rejection_batch,
+)
 from synapse.types.state import StateFilter
 from synapse.types.storage import _BackgroundUpdates
 from synapse.util.clock import Clock
@@ -142,6 +150,77 @@ class PurgeTests(HomeserverTestCase):
         self.store._invalidate_local_get_event_cache(create_event.event_id)
         self.get_failure(self.store.get_event(create_event.event_id), NotFoundError)
         self.get_failure(self.store.get_event(first["event_id"]), NotFoundError)
+
+    def test_purge_room_clears_embedded_redaction_and_rejection_mirrors(self) -> None:
+        if not getattr(self.store, "_embedded_event_json_enabled", False):
+            self.skipTest(
+                "embedded mtxdb engine is not configured -- run under the "
+                "trial-mtxdb CI job, or locally with SYNAPSE_TEST_MTXDB=1 "
+                "(see tests/utils.py's EMBEDDED_HAMT_ENGINE handling), so a "
+                "real per-homeserver mtxdb engine is opened during startup. "
+                "Monkeypatching these flags mid-test instead is unsound: the "
+                "room's own create event would have already been persisted "
+                "through the SQL-only path in `prepare()`, and "
+                "events_worker.py's unconditional `_embedded_event_json_enabled` "
+                "check on the read path (events_worker.py:1666) would then "
+                "route its auth-chain lookup through a mirror that never saw "
+                "it written, 403ing with 'No create event in auth events'."
+            )
+
+        target = self.helper.send(self.room_id, body="target")
+        redaction = self.helper.send(self.room_id, body="redaction event")
+        namespace = self.store._embedded_hamt_namespace
+        engine = self.store._embedded_hamt_engine
+
+        self.get_success(
+            self.store.db_pool.simple_insert(
+                table="redactions",
+                values={
+                    "event_id": redaction["event_id"],
+                    "redacts": target["event_id"],
+                    "received_ts": 1,
+                    "recheck": False,
+                },
+            )
+        )
+        self.get_success(
+            self.store.db_pool.simple_insert(
+                table="rejections",
+                values={
+                    "event_id": target["event_id"],
+                    "reason": "test rejection",
+                    "last_check": "1",
+                },
+            )
+        )
+        put_redaction_batch(
+            engine, namespace, [(target["event_id"], redaction["event_id"], True)]
+        )
+        put_rejection_batch(
+            engine, namespace, [(target["event_id"], "test rejection", "1")]
+        )
+
+        self.assertIn(
+            target["event_id"],
+            get_redactions_batch(engine, namespace, [target["event_id"]]),
+        )
+        self.assertIn(
+            target["event_id"],
+            get_rejections_batch(engine, namespace, [target["event_id"]]),
+        )
+
+        self.get_success(
+            self._storage_controllers.purge_events.purge_room(self.room_id)
+        )
+
+        self.assertNotIn(
+            target["event_id"],
+            get_redactions_batch(engine, namespace, [target["event_id"]]),
+        )
+        self.assertNotIn(
+            target["event_id"],
+            get_rejections_batch(engine, namespace, [target["event_id"]]),
+        )
 
     def test_purge_history_deletes_state_groups(self) -> None:
         """Test that unreferenced state groups get cleaned up after purge"""

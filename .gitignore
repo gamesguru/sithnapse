@@ -73,6 +73,7 @@ book/
 *.crt
 *.csr
 *.cnf
+*.srl
 
 # complement
 /complement-*

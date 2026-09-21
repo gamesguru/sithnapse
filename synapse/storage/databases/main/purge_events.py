@@ -33,6 +33,8 @@ from synapse.storage.databases.main.embedded_event_to_state_group import (
     delete_event_to_state_group_batch,
     get_state_group_for_events_batch,
 )
+from synapse.storage.databases.main.embedded_redactions import delete_redactions_batch
+from synapse.storage.databases.main.embedded_rejections import delete_rejections_batch
 from synapse.storage.databases.main.state import StateGroupWorkerStore
 from synapse.storage.engines import PostgresEngine
 from synapse.storage.engines._base import IsolationLevel
@@ -348,6 +350,20 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
                 "WHERE event_id IN (SELECT event_id from events_to_purge)"
             )
 
+        # Capture redaction targets before deleting the redactions rows by their
+        # own event IDs. The embedded redaction mirror is keyed by `redacts`.
+        purged_event_ids = [
+            event_id for event_id, should_delete in event_rows if should_delete
+        ]
+        redacted_event_ids: list[str] = []
+        if getattr(self, "_embedded_event_json_enabled", False):
+            txn.execute(
+                "SELECT redacts FROM redactions WHERE event_id IN ("
+                "    SELECT event_id FROM events_to_purge WHERE should_delete"
+                ")"
+            )
+            redacted_event_ids = [redacts for (redacts,) in txn if redacts is not None]
+
         # Delete all remote non-state events
         for table in (
             "event_edges",
@@ -366,6 +382,21 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
                 "DELETE FROM %s WHERE event_id IN ("
                 "    SELECT event_id FROM events_to_purge WHERE should_delete"
                 ")" % (table,)
+            )
+
+        # Remove the corresponding flat-KV entries after the SQL rows have
+        # been deleted. Redactions use their target (`redacts`) as the key;
+        # rejections use the purged event ID.
+        if getattr(self, "_embedded_event_json_enabled", False):
+            delete_redactions_batch(
+                self._embedded_hamt_engine,
+                self._embedded_hamt_namespace,
+                redacted_event_ids,
+            )
+            delete_rejections_batch(
+                self._embedded_hamt_engine,
+                self._embedded_hamt_namespace,
+                purged_event_ids,
             )
 
         # The `event_json` DELETE above only removed the SQL rows; the
@@ -593,9 +624,19 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
         referenced_chain_id_tuples = list(txn)
 
         room_event_ids: list[str] = []
+        room_redacted_event_ids: list[str] = []
         if getattr(self, "_embedded_event_json_enabled", False):
             txn.execute("SELECT event_id FROM events WHERE room_id=?", (room_id,))
             room_event_ids = [event_id for (event_id,) in txn]
+            txn.execute(
+                "SELECT redactions.redacts FROM redactions "
+                "INNER JOIN events ON redactions.event_id = events.event_id "
+                "WHERE events.room_id = ?",
+                (room_id,),
+            )
+            room_redacted_event_ids = [
+                redacts for (redacts,) in txn if redacts is not None
+            ]
 
         logger.info("[purge] removing from event_auth_chain_links")
         if getattr(self, "_embedded_event_json_enabled", False):
@@ -647,6 +688,18 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
         for table in purge_room_tables_with_room_id_column:
             logger.info("[purge] removing from %s", table)
             txn.execute("DELETE FROM %s WHERE room_id=?" % (table,), (room_id,))
+
+        if room_event_ids:
+            delete_redactions_batch(
+                self._embedded_hamt_engine,
+                self._embedded_hamt_namespace,
+                room_redacted_event_ids,
+            )
+            delete_rejections_batch(
+                self._embedded_hamt_engine,
+                self._embedded_hamt_namespace,
+                room_event_ids,
+            )
 
         # As in _purge_history_txn: the event_json DELETE above only cleared
         # SQL, the embedded mirror needs its own delete pass.
