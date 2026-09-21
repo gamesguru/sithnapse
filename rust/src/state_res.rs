@@ -24,7 +24,7 @@ use rezzy::{
 };
 use serde_json::Value;
 
-use crate::events::{Event, EventResolverData};
+use crate::events::{json_object::JsonObject, Event, EventResolverData};
 
 #[pyfunction]
 #[pyo3(text_signature = "(state_sets, event_map, /)")]
@@ -98,52 +98,105 @@ pub fn get_auth_chain_difference_from_event_graph<'py>(
     PySet::new(py, result)
 }
 
-/// rezzy's resolver bounds content on `EventContent`, which it only implements
-/// for its own alloc-only `JsonValue` -- not `serde_json::Value`. Convert the owned
-/// serde value structurally so strings and object keys can move without a text round trip.
-fn to_rezzy_content(content: Value) -> PyResult<JsonValue> {
-    fn convert(value: Value) -> Result<JsonValue, String> {
-        Ok(match value {
-            Value::Null => JsonValue::Null,
-            Value::Bool(value) => JsonValue::Bool(value),
-            Value::Number(number) => {
-                // Preserve negative zero, including serde_json's integer-shaped `-0`.
-                if number
-                    .as_f64()
-                    .is_some_and(|value| value == 0.0 && value.is_sign_negative())
-                {
-                    JsonValue::from(-0.0)
-                } else if let Some(value) = number.as_i64() {
-                    JsonValue::from(value)
-                } else if let Some(value) = number.as_u64() {
-                    JsonValue::from(value)
-                } else if let Some(value) = number.as_f64().filter(|value| value.is_finite()) {
-                    JsonValue::from(value)
-                } else {
-                    return Err(format!(
-                        "JSON number cannot be represented by rezzy: {number}"
-                    ));
-                }
-            }
-            Value::String(value) => JsonValue::String(value),
-            Value::Array(values) => JsonValue::Array(
-                values
-                    .into_iter()
-                    .map(convert)
-                    .collect::<Result<Vec<_>, _>>()?,
-            ),
-            Value::Object(values) => JsonValue::Object(
-                values
-                    .into_iter()
-                    .map(|(key, value)| convert(value).map(|value| (key, value)))
-                    .collect::<Result<_, _>>()?,
-            ),
-        })
-    }
+/// Resolver-only adapter; do not use this for canonical JSON or event hashing.
+///
+/// Typed events retain their shared JsonObject until this boundary, avoiding
+/// an intermediate serde_json::Value. The conversion is bounded because values
+/// can also arrive through Python's depythonize path.
+const MAX_RESOLVER_JSON_DEPTH: usize = 128;
 
-    convert(content).map_err(PyValueError::new_err)
+fn convert_number(number: &serde_json::Number) -> PyResult<JsonValue> {
+    // Preserve negative zero, including serde_json's integer-shaped -0.
+    if ((number.as_i64() == Some(0) || number.as_u64() == Some(0)) && number.to_string() == "-0")
+        || number
+            .as_f64()
+            .is_some_and(|value| value == 0.0 && value.is_sign_negative())
+    {
+        Ok(JsonValue::from(-0.0))
+    } else if let Some(value) = number.as_i64() {
+        Ok(JsonValue::from(value))
+    } else if let Some(value) = number.as_u64() {
+        Ok(JsonValue::from(value))
+    } else if let Some(value) = number.as_f64().filter(|value| value.is_finite()) {
+        Ok(JsonValue::from(value))
+    } else {
+        Err(PyValueError::new_err(format!(
+            "JSON number cannot be represented by rezzy: {number}"
+        )))
+    }
 }
 
+fn check_resolver_json_depth(depth: usize) -> PyResult<()> {
+    if depth > MAX_RESOLVER_JSON_DEPTH {
+        return Err(PyValueError::new_err(format!(
+            "event content exceeds the maximum nesting depth of {MAX_RESOLVER_JSON_DEPTH}"
+        )));
+    }
+    Ok(())
+}
+
+fn convert_json_value_ref(value: &Value, depth: usize) -> PyResult<JsonValue> {
+    check_resolver_json_depth(depth)?;
+    Ok(match value {
+        Value::Null => JsonValue::Null,
+        Value::Bool(value) => JsonValue::Bool(*value),
+        Value::Number(number) => convert_number(number)?,
+        Value::String(value) => JsonValue::String(value.clone()),
+        Value::Array(values) => JsonValue::Array(
+            values
+                .iter()
+                .map(|value| convert_json_value_ref(value, depth.saturating_add(1)))
+                .collect::<PyResult<Vec<_>>>()?,
+        ),
+        Value::Object(values) => JsonValue::Object(
+            values
+                .iter()
+                .map(|(key, value)| {
+                    convert_json_value_ref(value, depth.saturating_add(1))
+                        .map(|value| (key.clone(), value))
+                })
+                .collect::<PyResult<_>>()?,
+        ),
+    })
+}
+
+fn convert_json_value_owned(value: Value, depth: usize) -> PyResult<JsonValue> {
+    check_resolver_json_depth(depth)?;
+    Ok(match value {
+        Value::Null => JsonValue::Null,
+        Value::Bool(value) => JsonValue::Bool(value),
+        Value::Number(number) => convert_number(&number)?,
+        Value::String(value) => JsonValue::String(value),
+        Value::Array(values) => JsonValue::Array(
+            values
+                .into_iter()
+                .map(|value| convert_json_value_owned(value, depth.saturating_add(1)))
+                .collect::<PyResult<Vec<_>>>()?,
+        ),
+        Value::Object(values) => JsonValue::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| {
+                    convert_json_value_owned(value, depth.saturating_add(1))
+                        .map(|value| (key, value))
+                })
+                .collect::<PyResult<_>>()?,
+        ),
+    })
+}
+
+fn to_rezzy_content(content: &JsonObject) -> PyResult<JsonValue> {
+    content
+        .as_map()
+        .iter()
+        .map(|(key, value)| convert_json_value_ref(value, 1).map(|value| (key.to_string(), value)))
+        .collect::<PyResult<_>>()
+        .map(JsonValue::Object)
+}
+
+fn to_rezzy_content_owned(content: Value) -> PyResult<JsonValue> {
+    convert_json_value_owned(content, 0)
+}
 fn resolver_data_to_lean_event(data: EventResolverData) -> PyResult<LeanEvent<String, JsonValue>> {
     // For MSC4242 (room version 2.2), events carry `prev_state_events` instead
     // of `auth_events`. rezzy's LeanEvent folds both into a single `auth_events`
@@ -165,7 +218,7 @@ fn resolver_data_to_lean_event(data: EventResolverData) -> PyResult<LeanEvent<St
         power_level: 0,
         origin_server_ts: data.origin_server_ts,
         sender: data.sender,
-        content: to_rezzy_content(data.content)?,
+        content: to_rezzy_content(&data.content)?,
         prev_events: data.prev_events,
         auth_events,
         depth: data.depth,
@@ -224,7 +277,7 @@ fn py_to_lean_event(py_ev: &Bound<'_, PyAny>) -> PyResult<LeanEvent<String, Json
         power_level,
         origin_server_ts,
         sender,
-        content: to_rezzy_content(content)?,
+        content: to_rezzy_content_owned(content)?,
         prev_events,
         auth_events,
         depth,
@@ -339,7 +392,7 @@ mod tests {
             auth_events,
             prev_state_events,
             msc4242_state_dags,
-            content: Value::Null,
+            content: JsonObject::default(),
             rejected: false,
             soft_failed: false,
         }
@@ -368,5 +421,39 @@ mod tests {
         let data = resolver_data(true, vec!["$auth1".to_owned()], vec!["$pstate1".to_owned()]);
         let lean = resolver_data_to_lean_event(data).expect("lean event conversion");
         assert_eq!(lean.auth_events, vec!["$pstate1".to_owned()]);
+    }
+
+    #[test]
+    fn content_conversion_preserves_resolver_number_semantics() {
+        for (source, expected) in [
+            ("-0", "0"), // serde_json normalizes integer-shaped negative zero to zero.
+            ("-0.0", "-0.0"),
+            ("9007199254740993", "9007199254740993"),
+            ("18446744073709551616", "18446744073709551616"),
+            ("1.25", "1.25"),
+        ] {
+            let value: Value = serde_json::from_str(source).expect("valid JSON number");
+            let actual = to_rezzy_content_owned(value).expect("number conversion");
+            let expected = JsonValue::parse(expected).expect("valid rezzy number");
+            assert_eq!(actual, expected, "source number {source}");
+        }
+
+        let too_large: Value = serde_json::from_str("1e999").expect("arbitrary precision number");
+        assert!(to_rezzy_content_owned(too_large).is_err());
+    }
+
+    #[test]
+    fn content_conversion_handles_nested_objects_and_depth_limit() {
+        let source = r#"{"users":{"@a:test":100},"nested":[true,null,{"x":"y"}]}"#;
+        let content: JsonObject = serde_json::from_str(source).expect("valid event content");
+        let actual = to_rezzy_content(&content).expect("content conversion");
+        let expected = JsonValue::parse(source).expect("valid rezzy content");
+        assert_eq!(actual, expected);
+
+        let mut nested = Value::Null;
+        for _ in 0..=MAX_RESOLVER_JSON_DEPTH {
+            nested = Value::Array(vec![nested]);
+        }
+        assert!(to_rezzy_content_owned(nested).is_err());
     }
 }

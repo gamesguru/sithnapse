@@ -114,7 +114,7 @@ pub(crate) struct EventResolverData {
     /// field to trust explicitly, rather than guessing from which one happens
     /// to be non-empty.
     pub(crate) msc4242_state_dags: bool,
-    pub(crate) content: Value,
+    pub(crate) content: JsonObject,
     pub(crate) rejected: bool,
     pub(crate) soft_failed: bool,
 }
@@ -665,10 +665,7 @@ impl Event {
         let depth = u64::try_from(self.depth()).map_err(|_| {
             PyValueError::new_err(format!("event {} has a negative depth", self.event_id))
         })?;
-        let content =
-            serde_json::to_value(&self.parsed_event.common_fields.content).map_err(|err| {
-                PyValueError::new_err(format!("Failed to serialize event content: {err}"))
-            })?;
+        let content = self.parsed_event.common_fields.content.clone();
 
         Ok(EventResolverData {
             event_id: self.event_id.to_string(),

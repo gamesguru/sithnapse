@@ -138,6 +138,14 @@ class ReplicationFederationSendEventsRestServlet(ReplicationEndpoint):
             event_payloads = content["events"]
 
             event_and_contexts = []
+            # All events in this request are for the same room (`room_id` above), so
+            # pending mirror replays across every event are collected here and
+            # replayed in a single `redo_embedded_hamt_mirror_writes_batch` call
+            # after the loop, rather than once per event -- each call is its own
+            # `runInteraction`/DB transaction, and this room may see many events
+            # (e.g. a backfill/outlier burst) in one replication request.
+            replays: list[dict[str, Any]] = []
+            room_ver: RoomVersion | None = None
             for event_payload in event_payloads:
                 event_dict = event_payload["event"]
                 room_ver = KNOWN_ROOM_VERSIONS[event_payload["room_version"]]
@@ -160,7 +168,6 @@ class ReplicationFederationSendEventsRestServlet(ReplicationEndpoint):
                     # visible to readers, just as the normal send_events endpoint does.
                     # Sort by state group so that the predecessor is always
                     # mirror-written before the child group that depends on it.
-                    replays: list[dict[str, Any]] = []
                     for sg, payload in sorted(
                         context.pending_embedded_hamt_mirror_roots.items()
                     ):
@@ -303,20 +310,32 @@ class ReplicationFederationSendEventsRestServlet(ReplicationEndpoint):
                             }
                         )
 
-                    if replays:
-                        if len(replays) > 1 and any(
-                            replay["version"] == 0 for replay in replays
-                        ):
-                            raise RuntimeError(
-                                "Cannot replay multiple legacy HAMT payloads"
-                            )
-                        await self._state_store.redo_embedded_hamt_mirror_writes_batch(
-                            event.room_id,
-                            event.room_version,
-                            replays,
-                        )
-
                 event_and_contexts.append((event, context))
+
+            if replays:
+                if len(replays) > 1 and any(
+                    replay["version"] == 0 for replay in replays
+                ):
+                    raise RuntimeError("Cannot replay multiple legacy HAMT payloads")
+                assert room_ver is not None
+                # Different events may share a predecessor state group (e.g. two
+                # sibling state events both replaying their common parent) --
+                # de-dupe by state group, keeping the first (predecessors always
+                # sort before their children, so the first occurrence carries the
+                # correct predecessor/delta pairing).
+                seen_groups: set[int] = set()
+                deduped_replays = []
+                for replay in replays:
+                    sg = replay["state_group"]
+                    if sg in seen_groups:
+                        continue
+                    seen_groups.add(sg)
+                    deduped_replays.append(replay)
+                await self._state_store.redo_embedded_hamt_mirror_writes_batch(
+                    room_id,
+                    room_ver,
+                    deduped_replays,
+                )
 
         logger.info(
             "Got batch of %i events to persist to room %s",
