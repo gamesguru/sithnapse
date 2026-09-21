@@ -181,7 +181,14 @@ class DatabaseConfig(Config):
         env_path = os.environ.get("SYNAPSE_EMBEDDED_HAMT_PATH")
         if env_path:
             self.embedded_hamt_path = env_path
-        if os.environ.get("SYNAPSE_MTXDB_NO_SYNC"):
+        env_no_sync = os.environ.get("SYNAPSE_MTXDB_NO_SYNC")
+        if env_no_sync is not None and env_no_sync.strip().lower() not in (
+            "",
+            "0",
+            "false",
+            "no",
+            "off",
+        ):
             self.embedded_hamt_no_sync = True
 
         env_flush_delay = os.environ.get("SYNAPSE_MTXDB_FLUSH_DELAY_SECS")
