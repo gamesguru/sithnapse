@@ -105,6 +105,7 @@ clean: ##H Clean the virtual environment and caches
 	find . -type f -name '*.pyc' -delete
 	find . -type d -name '__pycache__' -exec rm -rf {} +
 	rm -rf .mypy_cache
+	cargo clean
 
 
 .PHONY: _help
