@@ -2146,14 +2146,23 @@ class FederationHandler:
                                 )
                                 break
                             except FederationPullAttemptBackoffError as e:
-                                # We are in the backoff period for one of the event's
-                                # prev_events. Wait it out and try again after.
-                                logger.warning(
-                                    "%s; waiting for %d ms...", e, e.retry_after_ms
-                                )
-                                await self.clock.sleep(
-                                    Duration(milliseconds=e.retry_after_ms)
-                                )
+                                # If other destinations are available to try for this event,
+                                # try the next destination rather than sleeping out the backoff here.
+                                if attempt < len(destinations) - 1:
+                                    logger.info(
+                                        "Backing off pulling %s from %s (%s); trying next destination",
+                                        event.event_id,
+                                        destination,
+                                        e,
+                                    )
+                                    destination = next(destination_iter)
+                                    break
+
+                                # If this was our only/last destination, wait out the backoff (capped
+                                # to a reasonable polling interval) and retry.
+                                sleep_ms = min(e.retry_after_ms, 5000)
+                                logger.warning("%s; waiting for %d ms...", e, sleep_ms)
+                                await self.clock.sleep(Duration(milliseconds=sleep_ms))
 
                         # Success, no need to try the rest of the destinations.
                         break

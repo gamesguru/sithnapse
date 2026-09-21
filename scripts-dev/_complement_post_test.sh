@@ -42,6 +42,16 @@ stats_dir="${repo_root}/.tmp/complement"
 stats_log="${stats_dir}/pg_stats.log"
 mkdir -p "$stats_dir"
 
+# The container-logs dump, Postgres stats, and event_auth dump below are
+# diagnostics for a failing test -- on a clean run they're 4+ serial
+# `docker exec`/`docker logs` calls per homeserver teardown for data nobody
+# looks at, which adds up fast in worker-mode runs with many containers.
+# Skip them unless the test failed or a human asked for them explicitly.
+debug="${failed}"
+[[ -n "${SYNAPSE_COMPLEMENT_DEBUG:-}" ]] && debug="true"
+
+if [[ "$debug" == "true" ]]; then
+
 # Synapse's own application log (not the Go test's output) -- the only
 # place the closure-cache's diagnostic logger.warning() calls end up.
 # Not captured anywhere else: Complement's own logs.jsonl is the *test*
@@ -71,6 +81,8 @@ mkdir -p "$stats_dir"
 	fi
 } >>"$stats_log" 2>&1
 
+fi
+
 safe_name="$(printf '%s' "$test_name" | tr -c 'A-Za-z0-9_.-' '_')"
 
 # With dirty runs, Complement invokes this once at package teardown with
@@ -91,7 +103,7 @@ fi
 # at persist time", and "event_auth rows are missing outright": every
 # m.room.member event's own direct one-hop auth edges, across every room
 # in this run, in order. Postgres-only; harmless no-op on SQLite.
-if "$runtime" exec -u postgres "$container_id" pg_isready -q 2>/dev/null; then
+if [[ "$debug" == "true" ]] && "$runtime" exec -u postgres "$container_id" pg_isready -q 2>/dev/null; then
 	"$runtime" exec -u postgres "$container_id" psql -X -q -At -d synapse -c "
       SELECT e.room_id, e.type, e.state_key, e.stream_ordering, ea.event_id, ea.auth_id
       FROM event_auth ea JOIN events e ON e.event_id = ea.event_id

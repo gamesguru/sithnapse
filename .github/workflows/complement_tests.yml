@@ -100,10 +100,8 @@ jobs:
 
       - name: Run Complement Tests
         id: run_complement_tests
-        # -p=1: We're using `-p 1` to force the test packages to run serially as GHA boxes
-        #     are underpowered and don't like running tons of Synapse instances at once.
         run: |
-          COMPLEMENT_DIR=`pwd`/complement synapse/scripts-dev/complement.sh -p 1
+          COMPLEMENT_DIR=`pwd`/complement synapse/scripts-dev/complement.sh
         shell: bash
         env:
           POSTGRES: ${{ (startsWith(matrix.database, 'Postgres')) && 1 || '' }}
@@ -121,12 +119,10 @@ jobs:
 
       - name: Run in-repo Complement Tests
         id: run_in_repo_complement_tests
-        # -p=1: We're using `-p 1` to force the test packages to run serially as GHA boxes
-        #     are underpowered and don't like running tons of Synapse instances at once.
         # -f: reuse the image built by the main run above (same checkout, same
         #     PASS_* env) instead of rebuilding 3 images a second time.
         run: |
-          COMPLEMENT_DIR=`pwd`/complement synapse/scripts-dev/complement.sh --in-repo -f -p 1
+          COMPLEMENT_DIR=`pwd`/complement synapse/scripts-dev/complement.sh --in-repo -f
         shell: bash
         env:
           POSTGRES: ${{ (startsWith(matrix.database, 'Postgres')) && 1 || '' }}

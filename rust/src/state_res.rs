@@ -99,13 +99,49 @@ pub fn get_auth_chain_difference_from_event_graph<'py>(
 }
 
 /// rezzy's resolver bounds content on `EventContent`, which it only implements
-/// for its own alloc-only `JsonValue` -- not `serde_json::Value`. Bridge the two
-/// through JSON text, matching the lean-event adapters in rezzy's own tests.
-fn to_rezzy_content(content: &Value) -> PyResult<JsonValue> {
-    let encoded = serde_json::to_string(content)
-        .map_err(|err| PyValueError::new_err(format!("failed to encode event content: {err}")))?;
-    JsonValue::parse(&encoded)
-        .map_err(|err| PyValueError::new_err(format!("failed to parse event content: {err}")))
+/// for its own alloc-only `JsonValue` -- not `serde_json::Value`. Convert the owned
+/// serde value structurally so strings and object keys can move without a text round trip.
+fn to_rezzy_content(content: Value) -> PyResult<JsonValue> {
+    fn convert(value: Value) -> Result<JsonValue, String> {
+        Ok(match value {
+            Value::Null => JsonValue::Null,
+            Value::Bool(value) => JsonValue::Bool(value),
+            Value::Number(number) => {
+                // Preserve negative zero, including serde_json's integer-shaped `-0`.
+                if number
+                    .as_f64()
+                    .is_some_and(|value| value == 0.0 && value.is_sign_negative())
+                {
+                    JsonValue::from(-0.0)
+                } else if let Some(value) = number.as_i64() {
+                    JsonValue::from(value)
+                } else if let Some(value) = number.as_u64() {
+                    JsonValue::from(value)
+                } else if let Some(value) = number.as_f64().filter(|value| value.is_finite()) {
+                    JsonValue::from(value)
+                } else {
+                    return Err(format!(
+                        "JSON number cannot be represented by rezzy: {number}"
+                    ));
+                }
+            }
+            Value::String(value) => JsonValue::String(value),
+            Value::Array(values) => JsonValue::Array(
+                values
+                    .into_iter()
+                    .map(convert)
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            Value::Object(values) => JsonValue::Object(
+                values
+                    .into_iter()
+                    .map(|(key, value)| convert(value).map(|value| (key, value)))
+                    .collect::<Result<_, _>>()?,
+            ),
+        })
+    }
+
+    convert(content).map_err(PyValueError::new_err)
 }
 
 fn resolver_data_to_lean_event(data: EventResolverData) -> PyResult<LeanEvent<String, JsonValue>> {
@@ -129,7 +165,7 @@ fn resolver_data_to_lean_event(data: EventResolverData) -> PyResult<LeanEvent<St
         power_level: 0,
         origin_server_ts: data.origin_server_ts,
         sender: data.sender,
-        content: to_rezzy_content(&data.content)?,
+        content: to_rezzy_content(data.content)?,
         prev_events: data.prev_events,
         auth_events,
         depth: data.depth,
@@ -188,7 +224,7 @@ fn py_to_lean_event(py_ev: &Bound<'_, PyAny>) -> PyResult<LeanEvent<String, Json
         power_level,
         origin_server_ts,
         sender,
-        content: to_rezzy_content(&content)?,
+        content: to_rezzy_content(content)?,
         prev_events,
         auth_events,
         depth,
