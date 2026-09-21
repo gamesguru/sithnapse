@@ -48,6 +48,7 @@ from synapse.storage.database import (
 )
 from synapse.storage.databases.embedded_engine import get_embedded_engine
 from synapse.storage.databases.main.embedded_common import (
+    FLUSH_DELAY_SECS,
     Pool,
     _clear_coalescer,
     _FlushCoalescer,
@@ -262,9 +263,15 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 # Every write path into the embedded engine above was
                 # changed to *not* fsync per write/per batch -- an fsync
                 # Commit-aware flush coalescer: dirty marking happens via
-                # txn.call_after (after SQL commit), debounced 250-500ms.
+                # txn.call_after (after SQL commit), debounced 250-500ms (or 2.0s on HDD).
                 # Replaces the former 1-second periodic sync timer.
-                self._flush_coalescer = _FlushCoalescer(hs.get_clock())
+                flush_delay = (
+                    hs.config.database.embedded_hamt_flush_delay_secs
+                    or FLUSH_DELAY_SECS
+                )
+                self._flush_coalescer = _FlushCoalescer(
+                    hs.get_clock(), flush_delay_secs=flush_delay
+                )
                 _set_coalescer(self._flush_coalescer)
                 hs.register_sync_shutdown_handler(
                     phase="during",

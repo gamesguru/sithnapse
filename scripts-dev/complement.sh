@@ -488,9 +488,16 @@ main() {
     # in-container path themselves.
     SYNAPSE_EMBEDDED_HAMT_PATH="${SYNAPSE_EMBEDDED_HAMT_PATH:-/data/embedded_hamt}"
     export PASS_SYNAPSE_EMBEDDED_HAMT_PATH="$SYNAPSE_EMBEDDED_HAMT_PATH"
-    if [[ -n "${SYNAPSE_TEST_MTXDB_NO_SYNC:-${SYNAPSE_MTXDB_NO_SYNC:-}}" ]]; then
-      export PASS_SYNAPSE_MTXDB_NO_SYNC="${SYNAPSE_TEST_MTXDB_NO_SYNC:-${SYNAPSE_MTXDB_NO_SYNC}}"
-    fi
+  fi
+
+  # Test-only durability escape hatch, matching the engine/path controls
+  # above: Complement containers are destroyed after every test, so the
+  # durable fsync path buys nothing, but the engine deliberately defaults
+  # durability ON for production. Only the TEST_-scoped variable is
+  # honoured, so a developer's production SYNAPSE_MTXDB_NO_SYNC cannot leak
+  # into containers.
+  if [[ -n "${SYNAPSE_TEST_MTXDB_NO_SYNC:-}" ]]; then
+    export PASS_SYNAPSE_MTXDB_NO_SYNC=1
   fi
 
   # Record the exact checkout that produced the image alongside the effective
@@ -499,7 +506,7 @@ main() {
   local synapse_revision
   synapse_revision="$(git -C "$repo_root" describe --tags --always --dirty 2>/dev/null || echo '<unknown>')"
   echo "Synapse revision: ${synapse_revision}" >&2
-  echo "Database: ${PASS_SYNAPSE_COMPLEMENT_DATABASE} (workers: ${PASS_SYNAPSE_COMPLEMENT_USE_WORKERS:-false}) | Embedded HAMT engine: ${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:-<none>}${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:+ at ${PASS_SYNAPSE_EMBEDDED_HAMT_PATH:-<not set>}}" >&2
+  echo "Database: ${PASS_SYNAPSE_COMPLEMENT_DATABASE} (workers: ${PASS_SYNAPSE_COMPLEMENT_USE_WORKERS:-false}) | Embedded HAMT engine: ${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:-<none>}${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:+ at ${PASS_SYNAPSE_EMBEDDED_HAMT_PATH:-<not set>}}${PASS_SYNAPSE_MTXDB_NO_SYNC:+ (no_sync)}" >&2
 
   # Complement's Destroy() force-removes every homeserver container
   # unconditionally, pass or fail -- there is no "keep failed containers"

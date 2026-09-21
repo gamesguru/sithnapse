@@ -30,7 +30,11 @@ from synapse.storage.database import (
     LoggingTransaction,
 )
 from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
-from synapse.storage.databases.main.embedded_common import Pool, sync_now
+from synapse.storage.databases.main.embedded_common import (
+    Pool,
+    mark_dirty,
+    sync_now,
+)
 from synapse.storage.databases.main.embedded_event_json import (
     get_event_json_batch,
     put_event_json_batch,
@@ -177,7 +181,7 @@ class CensorEventsStore(EventsWorkerStore, CacheInvalidationWorkerStore, SQLBase
         event_id: str,
         pruned_json: str,
         *,
-        sync: bool = True,
+        sync: bool = False,
     ) -> bool:
         """Censor an event by replacing its JSON in the event_json table or embedded
         store with the provided pruned JSON.
@@ -186,6 +190,11 @@ class CensorEventsStore(EventsWorkerStore, CacheInvalidationWorkerStore, SQLBase
             txn: The database transaction.
             event_id: The ID of the event to censor.
             pruned_json: The pruned JSON
+            sync: Whether to fsync the embedded mirror immediately. Defaults to
+                False: this is called once per event from censoring/expiry loops,
+                so callers that need a barrier should pass ``True`` (a whole batch)
+                or mark the pool dirty once after the loop instead of paying an
+                fsync per event.
         """
         # Under exclusive mtxdb mode, event_json may not exist in SQL.
         # Check and update mtxdb first if enabled.
@@ -267,7 +276,7 @@ class CensorEventsStore(EventsWorkerStore, CacheInvalidationWorkerStore, SQLBase
         # Try to retrieve the event's content from the database or the event cache.
         event = await self.get_event(event_id)
 
-        def delete_expired_event_txn(txn: LoggingTransaction) -> None:
+        def delete_expired_event_txn(txn: LoggingTransaction) -> bool:
             # Delete the expiry timestamp associated with this event from the database.
             self._delete_event_expiry_txn(txn, event_id)
 
@@ -278,14 +287,18 @@ class CensorEventsStore(EventsWorkerStore, CacheInvalidationWorkerStore, SQLBase
                 logger.warning(
                     "Can't expire event %s because we don't have it.", event_id
                 )
-                return
+                return False
 
             # Prune the event's dict then convert it to JSON.
             pruned_json = json_encoder.encode(redact_event(event).get_pdu_json())
 
             # Update the event_json table to replace the event's JSON with the pruned
-            # JSON.
-            self._censor_event_txn(txn, event.event_id, pruned_json)
+            # JSON. Expiry runs once per expired event, so defers its fsync to the
+            # coalescer (`sync=False`) instead of paying a whole-device cache flush
+            # per event -- matching the batch censor path in `_update_censor_txn`.
+            mirrored = self._censor_event_txn(
+                txn, event.event_id, pruned_json, sync=False
+            )
 
             # We need to invalidate the event cache entry for this event because we
             # changed its content in the database. We can't call
@@ -297,10 +310,13 @@ class CensorEventsStore(EventsWorkerStore, CacheInvalidationWorkerStore, SQLBase
             self._send_invalidation_to_replication(
                 txn, "_get_event_cache", (event.event_id,)
             )
+            return mirrored
 
-        await self.db_pool.runInteraction(
+        mirrored = await self.db_pool.runInteraction(
             "delete_expired_event", delete_expired_event_txn
         )
+        if mirrored:
+            mark_dirty(Pool.EVENT_DAG)
 
     def _delete_event_expiry_txn(self, txn: LoggingTransaction, event_id: str) -> None:
         """Delete the expiry timestamp associated with an event ID without deleting the

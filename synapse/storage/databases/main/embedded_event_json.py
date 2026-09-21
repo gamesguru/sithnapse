@@ -170,9 +170,11 @@ def put_event_json_batch(
     data loss -- not worth paying a synchronous fsync on this hot a path
     for every persisted event.
 
-    For censorship/expiry operations, pass `sync=True` to ensure the
-    replacement is durable before returning, preventing a crash from
-    leaving stale pre-censor content in the mirror.
+    Pass `sync=True` only at standalone barrier call sites (e.g. a purge
+    that must be durable before returning). Censoring/expiry loops that
+    replace one event's JSON per iteration should pass `sync=False` and
+    let the flush coalescer fsync the EVENT_DAG pool once they finish;
+    fsyncing per event is a whole-device cache flush each time.
     """
     with mirror_timing("event_json_put"):
         from synapse.synapse_rust.mtxdb_engine import event_json_put

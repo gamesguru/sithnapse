@@ -168,9 +168,17 @@ elif EMBEDDED_HAMT_PATH is not None:
     if _reaped:
         print(f"Reaped {_reaped} stale pid-* dirs from {_parent_dir}", file=sys.stderr)
 
+# Durability (fsync) is pointless for the throwaway store trial gives each
+# test homeserver: it is created fresh and torn down on exit, so there is no
+# crash to recover from. Default `no_sync` on so tests don't pay thousands of
+# synchronous fsyncs; set SYNAPSE_TEST_MTXDB_SYNC=1 when specifically
+# exercising the durable path (or writing a crash-recovery test).
+EMBEDDED_HAMT_NO_SYNC = not os.environ.get("SYNAPSE_TEST_MTXDB_SYNC")
+
 if EMBEDDED_HAMT_ENGINE:
     print(
-        f"Embedded HAMT engine: {EMBEDDED_HAMT_ENGINE} at {EMBEDDED_HAMT_PATH}",
+        f"Embedded HAMT engine: {EMBEDDED_HAMT_ENGINE} at {EMBEDDED_HAMT_PATH}"
+        f"{' (no_sync)' if EMBEDDED_HAMT_NO_SYNC else ''}",
         file=sys.stderr,
     )
 
@@ -498,6 +506,7 @@ def default_config(
             "engine": EMBEDDED_HAMT_ENGINE,
             "path": EMBEDDED_HAMT_PATH,
             "namespace": f"trial-{os.getpid()}-{uuid.uuid4().hex}",
+            "no_sync": EMBEDDED_HAMT_NO_SYNC,
         }
 
     if parse:

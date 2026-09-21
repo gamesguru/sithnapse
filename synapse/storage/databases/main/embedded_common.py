@@ -831,14 +831,16 @@ class _FlushCoalescer:
     with backoff.
     """
 
-    def __init__(self, clock: Clock) -> None:
+    def __init__(
+        self, clock: Clock, flush_delay_secs: float = FLUSH_DELAY_SECS
+    ) -> None:
         from synapse.util.duration import Duration
 
         self._clock = clock
         self._dirty: set[Pool] = set()
         self._delayed_call: DelayedCallWrapper | None = None
         self._closed: bool = False
-        self._FLUSH_DELAY = Duration(seconds=FLUSH_DELAY_SECS)
+        self._FLUSH_DELAY = Duration(seconds=flush_delay_secs)
         self._RETRY_DELAY = Duration(seconds=1.0)
 
     def mark_dirty(self, pool: Pool) -> None:
