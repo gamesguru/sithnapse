@@ -172,9 +172,15 @@ elif EMBEDDED_HAMT_PATH is not None:
 # Durability (fsync) is pointless for the throwaway store trial gives each
 # test homeserver: it is created fresh and torn down on exit, so there is no
 # crash to recover from. Default `no_sync` on so tests don't pay thousands of
-# synchronous fsyncs; set SYNAPSE_TEST_MTXDB_SYNC=1 when specifically
-# exercising the durable path (or writing a crash-recovery test).
-EMBEDDED_HAMT_NO_SYNC = not os.environ.get("SYNAPSE_TEST_MTXDB_SYNC")
+# synchronous fsyncs; set SYNAPSE_TEST_MTXDB_NO_SYNC=0 when specifically
+# exercising the durable path (or writing a crash-recovery test). This is the
+# same variable name (and "NO_SYNC is the affirmative" polarity) that
+# scripts-dev/complement.sh forwards into Complement containers, so one
+# mental model covers both harnesses -- only the *unset* default differs,
+# because trial's stores are torn down instantly and Complement's more
+# closely approximate a real deployment.
+_no_sync_env = os.environ.get("SYNAPSE_TEST_MTXDB_NO_SYNC")
+EMBEDDED_HAMT_NO_SYNC = _no_sync_env not in ("0", "")
 
 if EMBEDDED_HAMT_ENGINE:
     print(
