@@ -163,12 +163,18 @@ def put_event_json_batch(
     `_store_state_hamt_root_embedded_txn`: an mtxdb call is local, no
     network round-trip to justify deferring past commit.
 
-    By default, does not call sync() after the write: unlike every other
-    embedded sidecar, get_event_json_batch's caller falls back to SQL on a
-    miss (see its docstring), so an unflushed write lost to a crash before
-    the next fsync just means a slower read via that fallback, not silent
-    data loss -- not worth paying a synchronous fsync on this hot a path
-    for every persisted event.
+    By default, does not call sync() after the write: this is the hottest
+    embedded write path (one call per persisted event) and a synchronous
+    fsync per event is a whole-device cache flush each time. The write
+    becomes durable when the flush coalescer next syncs the EVENT_DAG pool
+    (see `embedded_common._FlushCoalescer`).
+
+    Note: the earlier rationale here -- "get_event_json_batch's caller falls
+    back to SQL on a miss" -- does not hold in embedded-exclusive mode.
+    `_persist_events_txn` skips the SQL `event_json` insert when
+    `_embedded_event_json_enabled`, so a miss has no SQL copy to fall back
+    to: it stays a miss until the writer's coalescer flush lands. Don't
+    treat that fallback as covering the coalescer window.
 
     Pass `sync=True` only at standalone barrier call sites (e.g. a purge
     that must be durable before returning). Censoring/expiry loops that

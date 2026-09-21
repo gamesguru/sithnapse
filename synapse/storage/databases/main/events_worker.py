@@ -1644,7 +1644,10 @@ class EventsWorkerStore(SQLBaseStore):
         """Returns `event_id -> (internal_metadata, json, format_version)`
         for `event_ids`, preferring the embedded engine (a local point
         lookup, no SQL) and falling back to `event_json` in SQL for any id
-        it doesn't have.
+        it doesn't have. In embedded-exclusive mode the SQL `event_json`
+        table is never populated (see `_persist_events_txn`), so that
+        fallback finds nothing: a miss there means the id is absent from the
+        embedded engine, not that SQL will supply it.
 
         Deliberately does NOT write the SQL-fallback result back into mtxdb:
         `event_json` is mutable (censoring, expiry -- see
