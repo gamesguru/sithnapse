@@ -11,20 +11,26 @@ STYLE_RESET := $(shell tput sgr0 2>/dev/null || echo -e "\033[0m")
 
 .PHONY: format
 format: ##H Format with ruff
-	uv run ruff format .
-	uv run ruff check --fix .
+	uv run --no-sync ruff format .
+	uv run --no-sync ruff check --fix .
 	cargo +nightly fmt
 
 .PHONY: lint
 lint: ##H Lint the code with mypy
-	uv run mypy
+	uv run --no-sync mypy
 	cargo +nightly clippy --all-targets --all-features
 
 
 .PHONY: sync
-sync:	##H Runs: uv run maturin develop
+sync:	##H Sync deps (uv) then build the Rust extension (maturin develop)
+	# Install/refresh dependencies without touching the project package: uv
+	# and `maturin develop` otherwise fight over who owns the editable
+	# `matrix-synapse` install, so every subsequent `uv run` would uninstall
+	# and reinstall it. `--no-install-project` leaves the package to maturin;
+	# `--inexact` keeps it from being treated as extraneous and removed.
+	uv sync --no-install-project --inexact
 	@rm -f target/maturin/libsynapse.so target/release/libsynapse.so
-	@RUSTC_WRAPPER= uv run maturin develop --release
+	@RUSTC_WRAPPER= uv run --no-sync maturin develop --release
 	@test -s target/maturin/libsynapse.so || { \
 		echo "maturin produced an empty libsynapse.so" >&2; \
 		exit 1; \
@@ -64,7 +70,7 @@ TRIAL_JOBS := $(shell if [ -n "$(TRIAL_JOBS_REQUESTED)" ]; then \
 test: ##H Run tests, e.g., on tests/storage/
 	cargo +nightly test
 	if [ -n "$$SYNAPSE_POSTGRES" ] && [ -z "$$SYNAPSE_POSTGRES_HOST" ]; then eval "$$(scripts-dev/start_test_postgres.sh)" || exit 1; fi; \
-	uv run python scripts-dev/trial_ctrlc.py $(if $(TRIAL_JOBS),-j $(TRIAL_JOBS),) $(p)
+	uv run --no-sync python scripts-dev/trial_ctrlc.py $(if $(TRIAL_JOBS),-j $(TRIAL_JOBS),) $(p)
 
 # Match Complement's package and in-package parallelism to an explicit GNU
 # Make -jN value for monolith runs. Worker-mode Complement deployments start
@@ -85,7 +91,7 @@ build: ##H Build the package
 
 .PHONY: all
 all:	##H Run the main targets
-all: format lint sync test
+all: sync format lint test
 
 
 .PHONY: publish

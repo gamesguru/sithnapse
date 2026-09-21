@@ -103,6 +103,13 @@ dependencies = [
     # This is used for parsing multipart responses
     "python-multipart>=0.0.9",
 
+    # Postgres driver. Mandatory here (not just the `postgres` extra) so that
+    # `make test`/CI never trip over "psycopg2 module is not installed" after a
+    # plain `uv sync`. PyPy uses psycopg2cffi.
+    "psycopg2>=2.8;platform_python_implementation != 'PyPy'",
+    "psycopg2cffi>=2.8;platform_python_implementation == 'PyPy'",
+    "psycopg2cffi-compat==1.1;platform_python_implementation == 'PyPy'",
+
     # Transitive dependency constraints
     # These dependencies aren't directly required by Synapse.
     # However, in order for Synapse to build, Synapse requires a higher minimum version
