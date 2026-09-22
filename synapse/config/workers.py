@@ -22,6 +22,7 @@
 
 import argparse
 import logging
+import os
 from typing import Any
 
 import attr
@@ -536,6 +537,55 @@ class WorkerConfig(Config):
                     "rows with no cross-instance coordination. Leave "
                     "run_background_tasks_on unset (or set it to the main "
                     "process), or remove embedded_hamt.engine."
+                )
+
+            # A third, independent constraint: with no SQL fallback for the
+            # data the embedded engine owns (event_json/state/auth-chain),
+            # a read-only worker's get_many_with_refresh gate can, under a
+            # deferred index checkpoint rewrite, keep reporting a committed
+            # write as absent for up to the checkpoint rewrite budget --
+            # far longer than any client-facing retry/timeout. The write-
+            # ahead journal's get_read_committed overlay is the only read
+            # path that closes that window independently of the checkpoint
+            # rewrite, because its journal group is appended by the
+            # writer's sync whether or not the index checkpoint rewrite is
+            # deferred. This is a *visibility* requirement, not a
+            # durability one -- the journal changes which file receives
+            # the sync fsync (the journal segment instead of the packfile
+            # shards), not when it happens, so a write that hasn't reached
+            # the flush coalescer's periodic sync is still lost on crash
+            # either way, and durable acknowledgment still needs an
+            # explicit sync regardless of WAL. It's required only in a
+            # worker deployment because a single process never goes
+            # through this cross-process gate at all: the writer always
+            # sees its own live in-memory state directly.
+            #
+            # SYNAPSE_MTXDB_WAL is also what
+            # rust/src/database/mtxdb_syn.rs's wal_enabled()/
+            # wal_enabled_from() reads to decide whether the Rust engine
+            # actually attaches the journal on open -- this check exists
+            # so a misconfigured process fails loudly at startup instead
+            # of the Rust side silently opening without the journal it
+            # was told to require. The truthy/falsey parsing below must
+            # stay in sync with that function's (same set: ""/0/false/
+            # no/off, case-insensitive, trimmed); if that set ever
+            # changes on the Rust side, update it here too, or this
+            # validation can pass while the Rust driver doesn't actually
+            # attach a journal.
+            wal_env = os.environ.get("SYNAPSE_MTXDB_WAL", "").strip()
+            wal_enabled = wal_env.lower() not in ("", "0", "false", "no", "off")
+            if not wal_enabled:
+                raise ConfigError(
+                    f"embedded_hamt.engine is set to {embedded_hamt_engine!r} in "
+                    "a worker deployment, but SYNAPSE_MTXDB_WAL is not set. "
+                    "Without the write-ahead journal, a committed write can be "
+                    "reported absent by another worker until a checkpoint "
+                    "rewrite refreshes that worker's index (and that rewrite "
+                    "can be deferred for the checkpoint rewrite budget). The "
+                    "journal's read-committed overlay is the only read path "
+                    "that closes that window independently of the checkpoint "
+                    "rewrite. Set SYNAPSE_MTXDB_WAL=1 to enable it, or remove "
+                    "the worker deployment (worker_app / instance_map)."
                 )
 
         self.events_shard_config = RoutableShardedWorkerHandlingConfig(

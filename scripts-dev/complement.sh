@@ -502,16 +502,23 @@ main() {
     *) export PASS_SYNAPSE_MTXDB_NO_SYNC=1 ;;
   esac
 
-  # The embedded engine requires the write-ahead journal (see the
-  # embedded_hamt_engine validation in synapse/config/database.py): with no
-  # SQL fallback for the data it owns, a write that hasn't reached the flush
-  # coalescer's periodic sync is both unrecoverable on crash and invisible to
-  # other readers -- the WAL's read-committed overlay is the only read path
-  # that closes both, independent of whether an index checkpoint rewrite is
-  # deferred. So default WAL on whenever the engine is on; there is no
-  # supported WAL-off shape left to A/B against. SYNAPSE_TEST_MTXDB_WAL can
-  # still force it off, which now only serves to exercise that startup
-  # validation itself (the container will refuse to start). Same
+  # synapse/config/workers.py requires the write-ahead journal whenever the
+  # embedded engine is on *and* the deployment is multi-process (worker_app
+  # set or a non-empty instance_map -- i.e. WORKERS=1 runs, not every
+  # Complement run): with no SQL fallback for the data it owns, a committed
+  # write can be reported absent by a read-only worker until a checkpoint
+  # rewrite refreshes that worker's index, and that rewrite can be deferred.
+  # The WAL's read-committed overlay is the only read path that closes that
+  # window independently of the checkpoint rewrite. This is a visibility
+  # requirement, not a durability one -- neither mode fsyncs a write before
+  # the coalescer's next sync -- so a single-process run never actually needs
+  # it. Default WAL on whenever the engine is on anyway (single-process
+  # included), purely so every embedded-engine Complement run exercises the
+  # same journal path production uses by default. SYNAPSE_TEST_MTXDB_WAL can
+  # still force it off; under WORKERS=1 that now makes the container refuse
+  # to start (exercising the workers.py validation), but a non-worker run
+  # with it forced off is a legitimately supported single-process WAL-off
+  # configuration, not just a way to trigger the rejection. Same
   # truthy/falsey semantics as above.
   _default_mtxdb_wal=""
   if [[ -n "$SYNAPSE_EMBEDDED_HAMT_ENGINE" ]]; then

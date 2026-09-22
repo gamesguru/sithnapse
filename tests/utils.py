@@ -189,6 +189,41 @@ _no_sync_off = _no_sync_env is not None and _no_sync_env.strip().lower() in (
 )
 EMBEDDED_HAMT_NO_SYNC = not _no_sync_off
 
+# synapse/config/workers.py requires the write-ahead journal
+# (SYNAPSE_MTXDB_WAL) whenever the embedded engine is on *and* the
+# deployment is multi-process (worker_app set or a non-empty instance_map --
+# see WorkerConfig.read_config's embedded_hamt_engine guards): with no SQL
+# fallback for the data it owns, a committed write can be reported absent by
+# a read-only worker until a checkpoint rewrite refreshes its index (and
+# that rewrite can be deferred), and the WAL's get_read_committed overlay is
+# the only read path that closes that window independently of the
+# checkpoint rewrite. This is a visibility requirement, not a durability
+# one -- a single process never goes through that cross-process gate at
+# all, so the check is worker-conditional, not blanket.
+#
+# Trial's test homeservers are single-process, so that check never actually
+# requires this. Default WAL on anyway, the same rule
+# scripts-dev/complement.sh applies to containers, purely so every
+# embedded-engine trial run exercises the WAL path Complement and
+# production both use by default, not because leaving it off would fail
+# validation here. Only the TEST_-scoped variable is honoured; an explicit
+# falsey override clears any SYNAPSE_MTXDB_WAL this process inherited
+# (rather than merely skipping the on-default), so it's still possible to
+# exercise the single-process WAL-off path deterministically regardless of
+# the shell's own environment.
+_wal_env = os.environ.get("SYNAPSE_TEST_MTXDB_WAL")
+_wal_off = _wal_env is not None and _wal_env.strip().lower() in (
+    "",
+    "0",
+    "false",
+    "no",
+    "off",
+)
+if _wal_off:
+    os.environ.pop("SYNAPSE_MTXDB_WAL", None)
+elif EMBEDDED_HAMT_ENGINE:
+    os.environ["SYNAPSE_MTXDB_WAL"] = "1"
+
 if EMBEDDED_HAMT_ENGINE:
     print(
         f"Embedded HAMT engine: {EMBEDDED_HAMT_ENGINE} at {EMBEDDED_HAMT_PATH}"

@@ -244,34 +244,17 @@ class DatabaseConfig(Config):
                 "but only 'mtxdb' is supported."
             )
 
-        # With the embedded engine on, event_json/state/auth-chain data has
-        # no SQL copy to fall back to (see embedded_event_json.py's module
-        # docstring): the flush coalescer's debounce window is therefore both
-        # a crash-loss window (an unflushed write is not yet durable) and a
-        # cross-process visibility window (a reader's get_many_with_refresh
-        # gate can, under a deferred checkpoint rewrite, keep reporting a
-        # committed write as absent for up to the checkpoint rewrite budget --
-        # far longer than any client-facing retry/timeout). The WAL's
-        # get_read_committed overlay is the only read path that closes both:
-        # its journal group is the durability boundary, independent of
-        # whether the index checkpoint rewrite itself is deferred. So the
-        # embedded engine requires the WAL turned on, in every deployment
-        # shape (single-process included -- the crash-loss half of this
-        # applies with or without workers).
-        if self.embedded_hamt_engine:
-            wal_env = os.environ.get("SYNAPSE_MTXDB_WAL", "").strip()
-            wal_enabled = wal_env.lower() not in ("", "0", "false", "no", "off")
-            if not wal_enabled:
-                raise ConfigError(
-                    "embedded_hamt.engine is configured but SYNAPSE_MTXDB_WAL "
-                    "is not set. The embedded engine has no SQL fallback for "
-                    "the data it owns, so without the write-ahead journal, a "
-                    "write that hasn't reached the flush coalescer's periodic "
-                    "sync is both unrecoverable on crash and invisible to "
-                    "other readers (including other worker processes) for up "
-                    "to the index checkpoint rewrite budget. Set "
-                    "SYNAPSE_MTXDB_WAL=1 to enable the journal."
-                )
+        # Whether the embedded engine requires the write-ahead journal
+        # (SYNAPSE_MTXDB_WAL) is a *worker-deployment* question, not a
+        # database-section one: WAL only buys a read-only worker's
+        # get_many_with_refresh gate a visibility path (get_read_committed's
+        # overlay) that closes independently of a deferred checkpoint
+        # rewrite -- it is not a durability improvement (the coalescer's sync
+        # cadence is unchanged either way) and it does nothing for a single
+        # process, which never goes through that cross-process gate at all.
+        # So that check lives in synapse/config/workers.py, gated on the same
+        # "is this a multi-process deployment" predicate as the other
+        # embedded_hamt_engine worker guards there, not here.
 
         if multi_database_config and database_config:
             raise ConfigError("Can't specify both 'database' and 'databases' in config")
