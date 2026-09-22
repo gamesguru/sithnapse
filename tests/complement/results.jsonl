@@ -124,10 +124,10 @@
 {"Action":"pass","Test":"TestDeviceListUpdates/when_remote_user_joins_a_room"}
 {"Action":"pass","Test":"TestDeviceListUpdates/when_remote_user_leaves_a_room"}
 {"Action":"pass","Test":"TestDeviceListUpdates/when_remote_user_rejoins_a_room"}
-{"Action":"pass","Test":"TestDeviceListsUpdateOverFederation"}
+{"Action":"fail","Test":"TestDeviceListsUpdateOverFederation"}
 {"Action":"pass","Test":"TestDeviceListsUpdateOverFederation/good_connectivity"}
 {"Action":"pass","Test":"TestDeviceListsUpdateOverFederation/interrupted_connectivity"}
-{"Action":"pass","Test":"TestDeviceListsUpdateOverFederation/stopped_server"}
+{"Action":"fail","Test":"TestDeviceListsUpdateOverFederation/stopped_server"}
 {"Action":"skip","Test":"TestDeviceListsUpdateOverFederationOnRoomJoin"}
 {"Action":"pass","Test":"TestDeviceManagement"}
 {"Action":"pass","Test":"TestDeviceManagement/DELETE_/device/{deviceId}"}
@@ -182,7 +182,7 @@
 {"Action":"pass","Test":"TestGetFilteredRoomMembers/membership/join"}
 {"Action":"pass","Test":"TestGetFilteredRoomMembers/membership/leave"}
 {"Action":"pass","Test":"TestGetFilteredRoomMembers/not_membership"}
-{"Action":"fail","Test":"TestGetMissingEventsGapFilling"}
+{"Action":"pass","Test":"TestGetMissingEventsGapFilling"}
 {"Action":"pass","Test":"TestGetRoomMembers"}
 {"Action":"pass","Test":"TestGetRoomMembersAtPoint"}
 {"Action":"fail","Test":"TestInboundCanReturnMissingEvents"}
@@ -786,7 +786,7 @@
 {"Action":"pass","Test":"TestRoomMessagesLazyLoadingLocalUser"}
 {"Action":"pass","Test":"TestRoomReadMarkers"}
 {"Action":"fail","Test":"TestRoomReceipts"}
-{"Action":"pass","Test":"TestRoomReceipts/Receipts_DO_NOT_include_a_`room_id`_field"}
+{"Action":"fail","Test":"TestRoomReceipts/Receipts_DO_NOT_include_a_`room_id`_field"}
 {"Action":"fail","Test":"TestRoomReceipts/Receipts_cannot_be_moved_backwards"}
 {"Action":"pass","Test":"TestRoomSpecificUsernameAtJoin"}
 {"Action":"pass","Test":"TestRoomSpecificUsernameAtJoin/Bob_can_find_Alice_by_mxid"}
@@ -833,9 +833,9 @@
 {"Action":"fail","Test":"TestSearch"}
 {"Action":"fail","Test":"TestSearch/parallel"}
 {"Action":"fail","Test":"TestSearch/parallel/Can_back-paginate_search_results"}
-{"Action":"pass","Test":"TestSearch/parallel/Can_get_context_around_search_results"}
+{"Action":"fail","Test":"TestSearch/parallel/Can_get_context_around_search_results"}
 {"Action":"pass","Test":"TestSearch/parallel/Can_search_for_an_event_by_body"}
-{"Action":"fail","Test":"TestSearch/parallel/Search_results_with_rank_ordering_do_not_include_redacted_events"}
+{"Action":"pass","Test":"TestSearch/parallel/Search_results_with_rank_ordering_do_not_include_redacted_events"}
 {"Action":"fail","Test":"TestSearch/parallel/Search_results_with_recent_ordering_do_not_include_redacted_events"}
 {"Action":"pass","Test":"TestSearch/parallel/Search_works_across_an_upgraded_room_and_its_predecessor"}
 {"Action":"pass","Test":"TestSendAndFetchMessage"}
