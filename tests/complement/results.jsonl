@@ -187,7 +187,7 @@
 {"Action":"pass","Test":"TestGetRoomMembersAtPoint"}
 {"Action":"fail","Test":"TestInboundCanReturnMissingEvents"}
 {"Action":"fail","Test":"TestInboundCanReturnMissingEvents/Inbound_federation_can_return_missing_events_for_invited_visibility"}
-{"Action":"fail","Test":"TestInboundCanReturnMissingEvents/Inbound_federation_can_return_missing_events_for_joined_visibility"}
+{"Action":"pass","Test":"TestInboundCanReturnMissingEvents/Inbound_federation_can_return_missing_events_for_joined_visibility"}
 {"Action":"pass","Test":"TestInboundCanReturnMissingEvents/Inbound_federation_can_return_missing_events_for_shared_visibility"}
 {"Action":"fail","Test":"TestInboundCanReturnMissingEvents/Inbound_federation_can_return_missing_events_for_world_readable_visibility"}
 {"Action":"pass","Test":"TestInboundFederationKeys"}
@@ -784,10 +784,10 @@
 {"Action":"pass","Test":"TestRoomMembers/Parallel/Test_that_we_can_be_reinvited_to_a_room_we_created"}
 {"Action":"pass","Test":"TestRoomMessagesLazyLoading"}
 {"Action":"pass","Test":"TestRoomMessagesLazyLoadingLocalUser"}
-{"Action":"fail","Test":"TestRoomReadMarkers"}
+{"Action":"pass","Test":"TestRoomReadMarkers"}
 {"Action":"fail","Test":"TestRoomReceipts"}
-{"Action":"pass","Test":"TestRoomReceipts/Receipts_DO_NOT_include_a_`room_id`_field"}
-{"Action":"pass","Test":"TestRoomReceipts/Receipts_cannot_be_moved_backwards"}
+{"Action":"fail","Test":"TestRoomReceipts/Receipts_DO_NOT_include_a_`room_id`_field"}
+{"Action":"fail","Test":"TestRoomReceipts/Receipts_cannot_be_moved_backwards"}
 {"Action":"pass","Test":"TestRoomSpecificUsernameAtJoin"}
 {"Action":"pass","Test":"TestRoomSpecificUsernameAtJoin/Bob_can_find_Alice_by_mxid"}
 {"Action":"pass","Test":"TestRoomSpecificUsernameAtJoin/Bob_can_find_Alice_by_profile_display_name"}
@@ -833,10 +833,10 @@
 {"Action":"fail","Test":"TestSearch"}
 {"Action":"fail","Test":"TestSearch/parallel"}
 {"Action":"fail","Test":"TestSearch/parallel/Can_back-paginate_search_results"}
-{"Action":"fail","Test":"TestSearch/parallel/Can_get_context_around_search_results"}
+{"Action":"pass","Test":"TestSearch/parallel/Can_get_context_around_search_results"}
 {"Action":"pass","Test":"TestSearch/parallel/Can_search_for_an_event_by_body"}
-{"Action":"pass","Test":"TestSearch/parallel/Search_results_with_rank_ordering_do_not_include_redacted_events"}
-{"Action":"pass","Test":"TestSearch/parallel/Search_results_with_recent_ordering_do_not_include_redacted_events"}
+{"Action":"fail","Test":"TestSearch/parallel/Search_results_with_rank_ordering_do_not_include_redacted_events"}
+{"Action":"fail","Test":"TestSearch/parallel/Search_results_with_recent_ordering_do_not_include_redacted_events"}
 {"Action":"pass","Test":"TestSearch/parallel/Search_works_across_an_upgraded_room_and_its_predecessor"}
 {"Action":"pass","Test":"TestSendAndFetchMessage"}
 {"Action":"pass","Test":"TestSendJoinPartialStateResponse"}
