@@ -240,6 +240,12 @@ def get_event_json_batch(
             internal_metadata = _decode_event_json_metadata(metadata_record)
             json_str, format_version = _decode_event_json_body(body_record)
             result[event_id] = (internal_metadata, json_str, format_version)
+    logger.info(
+        "[mtxdb-trace] event-json read requested=%d returned=%d missing=%s",
+        len(event_ids),
+        len(result),
+        [event_id for event_id in event_ids if event_id not in result],
+    )
     return result
 
 

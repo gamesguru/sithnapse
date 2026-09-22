@@ -1415,7 +1415,17 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         )
         ffi_timing("ffi_get_hamt_root", time.monotonic() - _et)
         if raw is None:
+            logger.info(
+                "[mtxdb-trace] state-hamt root miss state_group=%d room_prefix=%s",
+                state_group,
+                room_prefix.hex(),
+            )
             return None
+        logger.info(
+            "[mtxdb-trace] state-hamt root hit state_group=%d room_prefix=%s",
+            state_group,
+            room_prefix.hex(),
+        )
         _room_prefix, root_hash, lattice, _room_id = _decode_state_hamt_root(bytes(raw))
         if not lattice:
             # A root written before the lattice column existed -- no usable

@@ -1684,6 +1684,14 @@ class EventsWorkerStore(SQLBaseStore):
             for event_id, internal_metadata, json_str, format_version in txn:
                 found[event_id] = (internal_metadata, json_str, format_version)
 
+        logger.info(
+            "[mtxdb-trace] event-json fetch requested=%d final=%d sql_fallback=%s missing=%s",
+            len(event_ids),
+            len(found),
+            still_missing,
+            [event_id for event_id in event_ids if event_id not in found],
+        )
+
         return found
 
     def _fetch_event_rows(
