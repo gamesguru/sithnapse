@@ -1384,10 +1384,10 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
 
 /// Opens the mtxdb store read-only: no exclusive write lock is taken, so
 /// this can coexist with a concurrent writer process on the same
-/// directory (see `PackfileStorage::open_read_only`'s doc comment and
-/// `ShardPool::open_read_only`'s locking contract). Intended for
-/// read-only worker processes in a multi-worker deployment, paired with
-/// exactly one process opening the store writable via `open_client`.
+/// directory (see `PackfileStorage::open_read_committed`'s doc comment and
+/// `ShardPool::open_read_only`'s locking contract). Intended for read-only
+/// worker processes in a multi-worker deployment, paired with exactly one
+/// process opening the store writable via `open_client`.
 ///
 /// A read-only-opened store's packfile index is a snapshot from open time
 /// (or the last `refresh_state_hamt_collections_for_groups` call). FFI reads
@@ -1413,18 +1413,13 @@ pub fn open_client_read_only(py: Python<'_>, path: String) -> PyResult<()> {
                     "failed to resolve mtxdb {name} pool directory: {e}"
                 ))
             })?;
-            let store = PackfileStorage::open_read_only(pool_dir.clone()).map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "failed to open mtxdb {name} pool read-only: {e}"
-                ))
-            })?;
-            store
-                .enable_read_journal(pool_dir.join("wal.bin"))
-                .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "failed to attach mtxdb {name} read journal: {e}"
-                    ))
-                })?;
+            let store =
+                PackfileStorage::open_read_committed(pool_dir.clone(), pool_dir.join("wal.bin"))
+                    .map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "failed to open mtxdb {name} pool read-only: {e}"
+                        ))
+                    })?;
             Ok(Arc::new(store))
         };
         let state = open_pool(ShardType::State, "state")?;
@@ -2843,6 +2838,8 @@ fn stats_to_dict(
     d.set_item("checkpoint_writes", s.checkpoint_writes)?;
     d.set_item("checkpoint_skips", s.checkpoint_skips)?;
     d.set_item("delta_appends", s.delta_appends)?;
+    d.set_item("read_reloads", s.read_reloads)?;
+    d.set_item("read_reload_failures", s.read_reload_failures)?;
     d.set_item("delta_invalidations", s.delta_invalidations)?;
     d.set_item("cache_hits", s.cache.hits)?;
     d.set_item("cache_misses", s.cache.misses)?;
