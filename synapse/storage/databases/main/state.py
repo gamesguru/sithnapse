@@ -657,11 +657,23 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
                 eid for eid in event_ids if eid in self._un_partial_stated_event_ids
             }
             embedded_event_ids = [e for e in event_ids if e not in un_partial_stated]
+            logger.info(
+                "[mtxdb-trace] worker=%s state-group read purpose=read_batch requested=%d embedded=%d",
+                self._instance_name,
+                len(event_ids),
+                len(embedded_event_ids),
+            )
             res = get_state_group_for_events_batch(
                 self._embedded_hamt_engine,
                 self._embedded_hamt_namespace,
                 embedded_event_ids,
                 purpose="read_batch",
+            )
+            logger.info(
+                "[mtxdb-trace] worker=%s state-group read result purpose=read_batch hits=%d misses=%d",
+                self._instance_name,
+                len(res),
+                len(embedded_event_ids) - len(res),
             )
             missing_event_ids = [
                 event_id for event_id in embedded_event_ids if event_id not in res
