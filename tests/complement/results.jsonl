@@ -124,10 +124,10 @@
 {"Action":"pass","Test":"TestDeviceListUpdates/when_remote_user_joins_a_room"}
 {"Action":"pass","Test":"TestDeviceListUpdates/when_remote_user_leaves_a_room"}
 {"Action":"pass","Test":"TestDeviceListUpdates/when_remote_user_rejoins_a_room"}
-{"Action":"fail","Test":"TestDeviceListsUpdateOverFederation"}
+{"Action":"pass","Test":"TestDeviceListsUpdateOverFederation"}
 {"Action":"pass","Test":"TestDeviceListsUpdateOverFederation/good_connectivity"}
 {"Action":"pass","Test":"TestDeviceListsUpdateOverFederation/interrupted_connectivity"}
-{"Action":"fail","Test":"TestDeviceListsUpdateOverFederation/stopped_server"}
+{"Action":"pass","Test":"TestDeviceListsUpdateOverFederation/stopped_server"}
 {"Action":"skip","Test":"TestDeviceListsUpdateOverFederationOnRoomJoin"}
 {"Action":"pass","Test":"TestDeviceManagement"}
 {"Action":"pass","Test":"TestDeviceManagement/DELETE_/device/{deviceId}"}
@@ -182,12 +182,12 @@
 {"Action":"pass","Test":"TestGetFilteredRoomMembers/membership/join"}
 {"Action":"pass","Test":"TestGetFilteredRoomMembers/membership/leave"}
 {"Action":"pass","Test":"TestGetFilteredRoomMembers/not_membership"}
-{"Action":"pass","Test":"TestGetMissingEventsGapFilling"}
+{"Action":"fail","Test":"TestGetMissingEventsGapFilling"}
 {"Action":"pass","Test":"TestGetRoomMembers"}
 {"Action":"pass","Test":"TestGetRoomMembersAtPoint"}
 {"Action":"fail","Test":"TestInboundCanReturnMissingEvents"}
 {"Action":"fail","Test":"TestInboundCanReturnMissingEvents/Inbound_federation_can_return_missing_events_for_invited_visibility"}
-{"Action":"pass","Test":"TestInboundCanReturnMissingEvents/Inbound_federation_can_return_missing_events_for_joined_visibility"}
+{"Action":"fail","Test":"TestInboundCanReturnMissingEvents/Inbound_federation_can_return_missing_events_for_joined_visibility"}
 {"Action":"pass","Test":"TestInboundCanReturnMissingEvents/Inbound_federation_can_return_missing_events_for_shared_visibility"}
 {"Action":"fail","Test":"TestInboundCanReturnMissingEvents/Inbound_federation_can_return_missing_events_for_world_readable_visibility"}
 {"Action":"pass","Test":"TestInboundFederationKeys"}
@@ -786,7 +786,7 @@
 {"Action":"pass","Test":"TestRoomMessagesLazyLoadingLocalUser"}
 {"Action":"pass","Test":"TestRoomReadMarkers"}
 {"Action":"fail","Test":"TestRoomReceipts"}
-{"Action":"fail","Test":"TestRoomReceipts/Receipts_DO_NOT_include_a_`room_id`_field"}
+{"Action":"pass","Test":"TestRoomReceipts/Receipts_DO_NOT_include_a_`room_id`_field"}
 {"Action":"fail","Test":"TestRoomReceipts/Receipts_cannot_be_moved_backwards"}
 {"Action":"pass","Test":"TestRoomSpecificUsernameAtJoin"}
 {"Action":"pass","Test":"TestRoomSpecificUsernameAtJoin/Bob_can_find_Alice_by_mxid"}
