@@ -314,6 +314,7 @@ class SyncResult:
 class SyncHandler:
     def __init__(self, hs: "HomeServer"):
         self.server_name = hs.hostname
+        self._instance_name = hs.get_instance_name()
         self.hs_config = hs.config
         self.store = hs.get_datastores().main
         self._is_mine_id = hs.is_mine_id
@@ -1931,16 +1932,27 @@ class SyncHandler:
             )
 
         num_events = 0
+        trace_timeline: dict[str, list[str]] = {}
 
         # debug for https://github.com/matrix-org/synapse/issues/9424
         for joined_room in sync_result_builder.joined:
-            num_events += len(joined_room.timeline.events)
+            event_ids = [event.event.event_id for event in joined_room.timeline.events]
+            num_events += len(event_ids)
+            if event_ids:
+                trace_timeline[joined_room.room_id] = event_ids
 
         log_kv(
             {
                 "joined_rooms_in_result": len(sync_result_builder.joined),
                 "events_in_result": num_events,
             }
+        )
+        logger.info(
+            "[sync-trace] worker=%s response timeline rooms=%s events=%d event_ids=%s",
+            self._instance_name,
+            sorted(trace_timeline),
+            num_events,
+            trace_timeline,
         )
 
         # Note, this needs to be after we collect `joined`, `invited`, `knocked` and

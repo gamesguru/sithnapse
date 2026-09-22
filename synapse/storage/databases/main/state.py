@@ -658,10 +658,11 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             }
             embedded_event_ids = [e for e in event_ids if e not in un_partial_stated]
             logger.info(
-                "[mtxdb-trace] worker=%s state-group read purpose=read_batch requested=%d embedded=%d",
+                "[mtxdb-trace] worker=%s state-group read purpose=read_batch requested=%d embedded=%d event_ids=%s",
                 self._instance_name,
                 len(event_ids),
                 len(embedded_event_ids),
+                list(event_ids),
             )
             res = get_state_group_for_events_batch(
                 self._embedded_hamt_engine,
@@ -670,10 +671,11 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
                 purpose="read_batch",
             )
             logger.info(
-                "[mtxdb-trace] worker=%s state-group read result purpose=read_batch hits=%d misses=%d",
+                "[mtxdb-trace] worker=%s state-group read result purpose=read_batch hits=%d misses=%d hit_event_ids=%s",
                 self._instance_name,
                 len(res),
                 len(embedded_event_ids) - len(res),
+                sorted(res),
             )
             missing_event_ids = [
                 event_id for event_id in embedded_event_ids if event_id not in res
@@ -692,6 +694,12 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
                     ),
                 )
                 res.update(dict(rows))
+                logger.info(
+                    "[mtxdb-trace] worker=%s state-group SQL fallback requested=%s returned=%s",
+                    self._instance_name,
+                    missing_event_ids,
+                    [event_id for event_id, _state_group in rows],
+                )
         else:
             rows = cast(
                 list[tuple[str, int]],
