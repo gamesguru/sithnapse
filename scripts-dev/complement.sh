@@ -539,6 +539,15 @@ main() {
     *) export PASS_SYNAPSE_MTXDB_FORCE_SYNC_EVENT_JSON=1 ;;
   esac
 
+  # Keep the test-only repack setting visible in Complement containers. The
+  # Trial harness consumes it between HomeserverTestCases; Complement itself
+  # has no Python test teardown hook, so this is inert there unless a
+  # container-side test harness explicitly uses it.
+  case "${SYNAPSE_TEST_MTXDB_REPACK_BETWEEN_TESTS:-}" in
+    "" | 0 | false | False | no | No | off | Off) ;;
+    *) export PASS_SYNAPSE_TEST_MTXDB_REPACK_BETWEEN_TESTS=1 ;;
+  esac
+
   # Forward the diagnostic stats switch into the containers: with sync
   # disabled the report is empty, so this is only useful on a sync-on lane,
   # but it must reach the container or there is no way to size a sync's

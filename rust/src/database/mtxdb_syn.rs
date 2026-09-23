@@ -3026,6 +3026,50 @@ pub fn set_checkpoint_rewrite_budget(
     })
 }
 
+/// Repack every collection in every pool, retaining every indexed record.
+///
+/// This is exposed for test diagnostics: it removes physical garbage and
+/// rewrites live indexes without applying application-level reachability rules.
+#[pyfunction]
+pub fn repack(py: Python<'_>) -> PyResult<Py<PyDict>> {
+    let summaries = py.detach(|| -> PyResult<Vec<(&'static str, usize, usize, usize)>> {
+        let Some(pools) = DBS.get() else {
+            return Ok(Vec::new());
+        };
+        assert_writable()?;
+
+        let mut out = Vec::new();
+        for (name, store) in [
+            ("state", &pools.state),
+            ("event_dag", &pools.event_dag),
+            ("auth_chain", &pools.auth_chain),
+        ] {
+            let collection_ids = store.collection_ids();
+            let results = store
+                .repack_collections_reachable(&collection_ids, |_hash, _data| Vec::new())
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "mtxdb repack error for {name} pool: {e}"
+                    ))
+                })?;
+            let kept = results.iter().map(|(_, kept, _)| *kept).sum();
+            let dropped = results.iter().map(|(_, _, dropped)| *dropped).sum();
+            out.push((name, results.len(), kept, dropped));
+        }
+        Ok(out)
+    })?;
+
+    let out = PyDict::new(py);
+    for (name, collections, kept, dropped) in summaries {
+        let pool = PyDict::new(py);
+        pool.set_item("collections", collections)?;
+        pool.set_item("kept", kept)?;
+        pool.set_item("dropped", dropped)?;
+        out.set_item(name, pool)?;
+    }
+    Ok(out.unbind())
+}
+
 pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(open_client, m)?)?;
     m.add_function(wrap_pyfunction!(open_client_read_only, m)?)?;
@@ -3070,6 +3114,7 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(reset_stats, m)?)?;
     m.add_function(wrap_pyfunction!(set_stats_enabled, m)?)?;
     m.add_function(wrap_pyfunction!(set_checkpoint_rewrite_budget, m)?)?;
+    m.add_function(wrap_pyfunction!(repack, m)?)?;
 
     Ok(())
 }
