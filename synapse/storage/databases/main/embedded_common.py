@@ -930,7 +930,7 @@ class _FlushCoalescer:
             return
         try:
             _do_sync_pools(to_flush)
-            if Pool.EVENT_DAG in to_flush:
+            if Pool.EVENT_DAG in to_flush and not _sync_disabled:
                 # This is a successful delayed/coalesced flush. The native
                 # sync counters above record the actual pool call; this
                 # counter identifies the coalescer's contribution.
@@ -938,6 +938,8 @@ class _FlushCoalescer:
             self._dirty.difference_update(to_flush)
         except Exception:
             if Pool.EVENT_DAG in to_flush:
+                # This coarse batch signal is a subset of the native
+                # event_dag_sync_errors counter, not an independent error.
                 ffi_count("event_dag_sync_coalesced_errors", 1)
             logger.warning(
                 "Flush coalescer sync failed for %s, will retry",
@@ -952,7 +954,8 @@ class _FlushCoalescer:
         """Immediate barrier for destructive ops and shutdown.
 
         Cancels any pending delayed flush, syncs the requested pools
-        (or all dirty pools if None), and reschedules if still dirty.
+        (or all dirty pools if None), draining queued EVENT_DAG edge writes
+        first. Reschedules dirty pools even when draining or syncing raises.
         """
         if self._closed:
             return
@@ -961,22 +964,52 @@ class _FlushCoalescer:
             self._delayed_call = None
         pool_set = set(pools) if pools is not None else None
 
-        # EVENT_DAG also owns coalesced forward-edge writes. An explicit
-        # EVENT_DAG barrier must include those queued records before syncing.
-        if pool_set is None or Pool.EVENT_DAG in pool_set:
-            try:
+        try:
+            # EVENT_DAG also owns coalesced forward-edge writes. An explicit
+            # EVENT_DAG barrier must include those queued records before syncing.
+            if pool_set is None or Pool.EVENT_DAG in pool_set:
                 if _drain_edge_writes():
                     self._dirty.add(Pool.EVENT_DAG)
-            except Exception:
-                self._dirty.add(Pool.EVENT_DAG)
-                raise
 
-        to_flush = pool_set if pool_set is not None else set(self._dirty)
-        if to_flush:
-            _do_sync_pools(to_flush)
-            self._dirty.difference_update(to_flush)
-        if self._dirty and self._delayed_call is None:
-            self._delayed_call = self._clock.call_later(self._FLUSH_DELAY, self._flush)
+            to_flush = pool_set if pool_set is not None else set(self._dirty)
+            if to_flush:
+                _do_sync_pools(to_flush)
+                self._dirty.difference_update(to_flush)
+        except Exception:
+            if pool_set is None or Pool.EVENT_DAG in pool_set:
+                self._dirty.add(Pool.EVENT_DAG)
+            raise
+        finally:
+            if self._dirty and self._delayed_call is None:
+                self._delayed_call = self._clock.call_later(
+                    self._RETRY_DELAY, self._flush
+                )
+
+    def sync_event_dag_now(self) -> None:
+        """Sync EVENT_DAG without draining the coalesced edge queues.
+
+        Event JSON publication uses this narrower barrier because edge writes
+        are independently coalesced and should not be forced out once per
+        event. Full barriers continue to use ``sync_now``.
+        """
+        if self._closed:
+            return
+        if self._delayed_call is not None:
+            # This also resets the debounce window for unrelated dirty pools;
+            # the event-JSON barrier shares the coalescer's single timer.
+            self._delayed_call.cancel()
+            self._delayed_call = None
+        try:
+            _do_sync_pools({Pool.EVENT_DAG})
+            self._dirty.discard(Pool.EVENT_DAG)
+        except Exception:
+            self._dirty.add(Pool.EVENT_DAG)
+            raise
+        finally:
+            if self._dirty and self._delayed_call is None:
+                self._delayed_call = self._clock.call_later(
+                    self._RETRY_DELAY, self._flush
+                )
 
     def close(self) -> None:
         """Flush outstanding dirty pools and shut down."""
@@ -1087,6 +1120,16 @@ def sync_now(pools: Iterable[Pool] | None = None) -> None:
         _coalescer.sync_now(pool_set)
     elif pool_set is not None:
         maybe_sync(SyncTier.DURABLE, pools=pool_set)
+
+
+def sync_event_dag_now() -> None:
+    """Sync event JSON's EVENT_DAG records without draining edge queues."""
+    if not _engine_configured:
+        return
+    if _coalescer is not None:
+        _coalescer.sync_event_dag_now()
+    else:
+        maybe_sync(SyncTier.DURABLE, pools=[Pool.EVENT_DAG])
 
 
 def close_coalescer() -> None:

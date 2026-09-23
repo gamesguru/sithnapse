@@ -91,6 +91,7 @@ from synapse.storage.databases.main.embedded_common import (
     Pool,
     ffi_timing,
     mirror_timing,
+    sync_event_dag_now,
     sync_now,
 )
 
@@ -212,7 +213,7 @@ def put_event_json_batch(
         ffi_timing("ffi_event_json_put", time.monotonic() - _et)
 
         if sync or _FORCE_SYNC_EVENT_JSON:
-            sync_now(pools=[Pool.EVENT_DAG])
+            sync_event_dag_now()
 
 
 def get_event_json_batch(

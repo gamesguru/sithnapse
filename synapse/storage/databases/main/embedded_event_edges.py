@@ -52,6 +52,7 @@ from synapse.storage.databases.main.embedded_common import (
     lock_wait_timing,
     mark_dirty,
     mirror_timing,
+    sync_event_dag_now,
     sync_now,
 )
 
@@ -323,14 +324,15 @@ def delete_event_edges_batch(
     or threshold flush interleaves, and drops any queued row that writes an
     edge FOR a purged event (those mirror the SQL `event_edges` rows the purge
     is deleting).  Rows queued for events that are merely referencing the
-    purged ids are kept and flushed before the tombstone.
+    purged ids remain queued for the normal coalescer.
 
     The purged ids are marked as "purging" for the duration of the barrier and
     promoted to permanent tombstones only after the FFI delete succeeds:
     `queue_edge_write` takes the same flush lock and drops rows matching either
     marker, so a transaction whose post-commit enqueue lands after the cancel
     step cannot resurrect the event, while a failed delete still lets repair
-    writes through.
+    writes through. `event_edges_put` appends against the post-delete forward
+    list, so leaving unrelated rows queued cannot resurrect a purged child.
     """
     if not event_ids:
         return
@@ -361,20 +363,7 @@ def delete_event_edges_batch(
                 else:
                     _edge_write_queues.pop(namespace, None)
 
-        # 2. Drain the remaining queue under the same lock so the delete below
-        #    observes a settled forward-edge state.
-        try:
-            _flush_namespace_locked(namespace)
-        except Exception:
-            # Non-purged rows stay queued for the coalescer retry; the
-            # destructive delete below must still run.
-            logger.warning(
-                "Failed to flush queued edge writes before purge of %d events",
-                len(event_ids),
-                exc_info=True,
-            )
-
-        # 3. Delete the purged events' edges.  Only promote the purging marker
+        # 2. Delete the purged events' edges. Only promote the purging marker
         #    to a permanent tombstone once the delete has actually returned:
         #    if it fails, the stale edges are still there and a tombstone would
         #    suppress the repair writes that recover from the failure.
@@ -444,7 +433,9 @@ def delete_event_edges_batch(
             for event_id in purged:
                 tombstones[event_id] = deadline
 
-        sync_now(pools=[Pool.EVENT_DAG])
+        # Sync the deletion itself without forcing unrelated queued edge rows
+        # through the FFI. The coalescer will drain those rows later.
+        sync_event_dag_now()
 
 
 def get_event_edges_backward_batch(

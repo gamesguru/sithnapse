@@ -84,6 +84,48 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
         # coalescer driving a timer) do not leak into the next test.
         flush_edge_writes()
 
+    def test_event_dag_barrier_does_not_drain_edges(self) -> None:
+        """The per-event JSON barrier must leave edge batching untouched."""
+        reactor = ThreadedMemoryReactorClock()
+        clock = Clock(reactor, server_name="test_server")  # type: ignore[multiple-internal-clocks]
+        coalescer = _FlushCoalescer(clock)
+        _set_coalescer(coalescer)
+        try:
+            with (
+                mock.patch(
+                    "synapse.storage.databases.main.embedded_common._drain_edge_writes"
+                ) as drain,
+                mock.patch(
+                    "synapse.storage.databases.main.embedded_common._do_sync_pools"
+                ) as sync,
+            ):
+                coalescer.sync_event_dag_now()
+                drain.assert_not_called()
+                sync.assert_called_once_with({embedded_common.Pool.EVENT_DAG})
+        finally:
+            _clear_coalescer(coalescer)
+            coalescer.close()
+
+    def test_event_dag_barrier_failure_reschedules(self) -> None:
+        """A failed narrow barrier retains dirty state and schedules retry."""
+        reactor = ThreadedMemoryReactorClock()
+        clock = Clock(reactor, server_name="test_server")  # type: ignore[multiple-internal-clocks]
+        coalescer = _FlushCoalescer(clock)
+        _set_coalescer(coalescer)
+        try:
+            coalescer.mark_dirty(embedded_common.Pool.EVENT_DAG)
+            with mock.patch(
+                "synapse.storage.databases.main.embedded_common._do_sync_pools",
+                side_effect=RuntimeError("simulated sync failure"),
+            ):
+                with self.assertRaises(RuntimeError):
+                    coalescer.sync_event_dag_now()
+            self.assertIn(embedded_common.Pool.EVENT_DAG, coalescer._dirty)
+            self.assertIsNotNone(coalescer._delayed_call)
+        finally:
+            _clear_coalescer(coalescer)
+            coalescer.close()
+
     def test_put_get_backward_and_forward(self) -> None:
         # No locator seeding: `event_edges_put` publishes locators for the
         # events it touches, so an edge written with no preceding
@@ -226,9 +268,9 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
         self.assertEqual(queued_edge_write_count(ns), 2)
 
         # Purge races the queue: $victim's row is cancelled (not written then
-        # erased), $live's row is flushed harmlessly before the tombstone.
+        # erased), while the unrelated $live row remains queued.
         delete_event_edges_batch(ns, ["$victim"])
-        self.assertEqual(queued_edge_write_count(ns), 0)
+        self.assertEqual(queued_edge_write_count(ns), 1)
 
         back = get_event_edges_backward_batch(ns, ["$victim"])
         self.assertIsNone(back["$victim"])
@@ -289,8 +331,9 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
             delete_event_edges_batch(ns, [parent])
 
             # The forward row (child → parent) was NOT cancelled — child
-            # (row[1]) is live — and was flushed during the purge's drain.
-            self.assertEqual(queued_edge_write_count(ns), 0)
+            # (row[1]) is live — and remains queued for the coalescer.
+            self.assertEqual(queued_edge_write_count(ns), 1)
+            flush_edge_writes(ns)
 
             # The edge exists in mtxdb: backward and forward both present.
             back = get_event_edges_backward_batch(ns, [child])
@@ -533,8 +576,9 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
 
             delete_event_edges_batch(ns, [victim1])
             # The row-owned-by-victim1 was cancelled; the extremity was
-            # flushed during the purge's drain step (queue now empty).
-            self.assertEqual(queued_edge_write_count(ns), 0)
+            # remains queued for the normal coalescer.
+            self.assertEqual(queued_edge_write_count(ns), 1)
+            flush_edge_writes(ns)
             back_ext = get_event_edges_backward_batch(ns, [extremity1])
             self.assertEqual(back_ext[extremity1], [(victim1, False)])
 
