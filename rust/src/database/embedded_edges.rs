@@ -452,7 +452,23 @@ pub fn event_edges_get_forward(
                 .extend(children.iter().cloned());
         }
 
-        let mut live: HashMap<([u8; 16], String), bool> = HashMap::new();
+        // Three states, not two: `Some(true)` -- a present, non-empty
+        // backward record -- means the child is live and is kept.
+        // `Some(false)` -- present but empty -- is `event_edges_delete`'s
+        // explicit tombstone, and the child is dropped. `None` -- no record
+        // at all -- is NOT the same as a tombstone: it is a legacy or
+        // partially-mirrored event whose backward edge was never written
+        // (see the module doc comment on repair and backfill). Silently
+        // keeping or dropping that child either hides it or fabricates
+        // certainty this code doesn't have, so instead the child's *parent*
+        // is treated as an incomplete lookup and returned as `None` --
+        // exactly the same "embedded miss" signal `event_edges_get_forward`
+        // already returns when the forward node itself doesn't exist.
+        // Callers (e.g. `get_successor_events` in event_federation.py)
+        // already handle that `None` by falling back to SQL and re-queuing
+        // a repair write for the gap via `queue_edge_write`, so this reuses
+        // existing self-healing rather than inventing a new contract.
+        let mut live: HashMap<([u8; 16], String), Option<bool>> = HashMap::new();
         for (collection, children) in &mut child_lookup {
             children.sort_unstable();
             children.dedup();
@@ -466,20 +482,8 @@ pub fn event_edges_get_forward(
                     pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {e}"))
                 })?;
             for (child, value) in children.iter().zip(found) {
-                // Three states, not two: a present-but-empty record is an
-                // explicit tombstone from `event_edges_delete` and the child
-                // is dropped; a missing record is NOT the same thing -- it
-                // is a legacy/partially-mirrored event whose backward edge
-                // was never written (see the module doc comment on repair
-                // and backfill). Filtering those out would silently hide a
-                // legitimate child instead of leaving it for the caller's
-                // own SQL fallback to resolve, so a missing record fails
-                // open (kept) rather than closed (dropped).
-                let is_live = match &value {
-                    Some(data) => !data.bytes.is_empty(),
-                    None => true,
-                };
-                live.insert((*collection, child.clone()), is_live);
+                let status = value.map(|data| !data.bytes.is_empty());
+                live.insert((*collection, child.clone()), status);
             }
         }
 
@@ -487,26 +491,33 @@ pub fn event_edges_get_forward(
             let Some(room_collection) = room_collection else {
                 continue;
             };
-            // Every purged child is filtered out here, same as a genuinely
-            // empty stored list: both collapse to `None`, matching the
-            // pre-lazy-tombstone contract where an all-children-removed
-            // parent read back as absent rather than `Some(vec![])`.
-            if let Some(children) = results[position].as_mut() {
-                children.retain(|child| {
-                    live.get(&(*room_collection, child.clone()))
-                        .copied()
-                        // Not found in `live` only happens if the batched
-                        // lookup above never ran for this child, which
-                        // cannot occur given `child_lookup` is built from
-                        // the same `results` this retain pass reads. Fail
-                        // open regardless, for the same missing-record
-                        // reason as above.
-                        .unwrap_or(true)
-                });
-                if children.is_empty() {
-                    results[position] = None;
+            let Some(children) = results[position].as_ref() else {
+                continue;
+            };
+            // Every status is required to be present, since `child_lookup`
+            // (and so `live`) was built from these same `results` above.
+            let mut incomplete = false;
+            let mut kept = Vec::with_capacity(children.len());
+            for child in children {
+                match live.get(&(*room_collection, child.clone())) {
+                    Some(Some(true)) => kept.push(child.clone()),
+                    Some(Some(false)) => {}
+                    Some(None) | None => {
+                        incomplete = true;
+                        break;
+                    }
                 }
             }
+            // Every purged-only or incomplete parent collapses to `None`,
+            // matching the pre-lazy-tombstone contract where an
+            // all-children-removed (or now, not-fully-resolvable) parent
+            // read back as absent rather than `Some(vec![])` or a
+            // partially-trustworthy list.
+            results[position] = if incomplete || kept.is_empty() {
+                None
+            } else {
+                Some(kept)
+            };
         }
 
         Ok(prev_event_ids.into_iter().zip(results).collect())
@@ -616,7 +627,12 @@ pub fn event_edges_delete(
             // Distinct room collections this purge resolved a locator into.
             let room_count = backward_ids.len();
 
-            Ok((lock_wait, locator_read, backward_tombstone_write, room_count))
+            Ok((
+                lock_wait,
+                locator_read,
+                backward_tombstone_write,
+                room_count,
+            ))
         })?;
     let timings = PyDict::new(py);
     timings.set_item("lock_wait", lock_wait)?;
