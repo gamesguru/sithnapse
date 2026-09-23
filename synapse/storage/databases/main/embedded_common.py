@@ -751,6 +751,11 @@ def _mtxdb_snapshot_metrics(ps: dict[str, Any]) -> dict[str, float]:
         "sync_calls": float(sync_totals.get("calls", 0) or 0),
         "sync_us": float(sync_totals.get("total_us", 0) or 0),
         "fsync_us": float(sync_totals.get("pack_fsync_us", 0) or 0),
+        "flush_us": float(sync_totals.get("pack_flush_us", 0) or 0),
+        "sidecar_us": float(sync_totals.get("sidecar_us", 0) or 0),
+        "delta_log_us": float(sync_totals.get("delta_log_us", 0) or 0),
+        "sync_checkpoint_us": float(sync_totals.get("checkpoint_us", 0) or 0),
+        "wal_us": float(sync_totals.get("wal_us", 0) or 0),
     }
 
 
@@ -789,7 +794,10 @@ def _mtxdb_snapshot_once() -> None:
             f"grow=+{int(d['index_grow_count'])} rebuild=+{int(d['index_rebuild_count'])} "
             f"ckpt=+{int(d['checkpoint_writes'])} "
             f"sync=+{int(d['sync_calls'])}/+{d['sync_us'] / 1000:.1f}ms "
-            f"fsync=+{d['fsync_us'] / 1000:.1f}ms]"
+            f"fsync=+{d['fsync_us'] / 1000:.1f}ms "
+            f"phases(ms)=flush+{d['flush_us'] / 1000:.1f}/side+{d['sidecar_us'] / 1000:.1f}"
+            f"/delta+{d['delta_log_us'] / 1000:.1f}/ckpt+{d['sync_checkpoint_us'] / 1000:.1f}"
+            f"/wal+{d['wal_us'] / 1000:.1f}]"
         )
 
     # FFI forward-edge cost, only recorded when SYNAPSE_PG_TIMINGS is set.
