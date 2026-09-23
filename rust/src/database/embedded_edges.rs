@@ -552,7 +552,6 @@ pub fn event_edges_delete(
     // Phase timings returned as a named dict (not a positional tuple) so the
     // Python diagnostics layer can't silently misread a field if one is added
     // or reordered. See `embedded_event_edges.delete_event_edges_batch`.
-    let detach_started = std::time::Instant::now();
     let (lock_wait, locator_read, backward_tombstone_write, room_count) =
         py.detach(|| -> PyResult<(f64, f64, f64, usize)> {
             // Keep lock acquisition outside the GIL, otherwise a purge waiting
@@ -635,7 +634,6 @@ pub fn event_edges_delete(
                 room_count,
             ))
         })?;
-    let detached_duration = detach_started.elapsed().as_secs_f64();
     let timings = PyDict::new(py);
     timings.set_item("lock_wait", lock_wait)?;
     timings.set_item("locator_read", locator_read)?;
@@ -645,12 +643,6 @@ pub fn event_edges_delete(
     // replaces the old `backward_read` key -- this phase is a write
     // (tombstoning), not a read.
     timings.set_item("backward_tombstone_write", backward_tombstone_write)?;
-    // The detached duration includes the Rust closure and the transition
-    // back to Python. The phase timings above cover only named work inside
-    // the closure; the difference is useful for identifying GIL reacquisition,
-    // PyO3 conversion, and scheduler stalls without attributing them to
-    // mtxdb itself.
-    timings.set_item("detached_duration", detached_duration)?;
     timings.set_item("rooms", room_count)?;
     Ok(timings.unbind())
 }

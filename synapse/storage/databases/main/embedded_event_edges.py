@@ -392,10 +392,6 @@ def delete_event_edges_batch(
                     "ffi_event_edges_delete_backward_tombstone_write",
                     phase_timings["backward_tombstone_write"],
                 )
-                ffi_timing(
-                    "ffi_event_edges_delete_detached_duration",
-                    phase_timings["detached_duration"],
-                )
                 # The Rust dict is typed float | int; the count is an integer.
                 room_count = int(phase_timings["rooms"])
                 ffi_count("event_edges_delete_rooms", room_count)
