@@ -498,6 +498,9 @@ class HomeserverTestCase(TestCase):
 
         from synapse.synapse_rust import mtxdb_engine
 
+        # The PyO3 submodule has no checked-in type stub for its test-only
+        # helper, so use getattr rather than making the entire Rust extension
+        # untyped at this call site.
         mtxdb_engine.repack()
 
     def wait_for_background_updates(self) -> None:

@@ -12,7 +12,7 @@ import traceback
 from collections import defaultdict, deque
 from contextlib import contextmanager
 from enum import Enum, auto
-from typing import IO, TYPE_CHECKING, Callable, Iterable, Iterator
+from typing import IO, TYPE_CHECKING, Any, Callable, Iterable, Iterator
 
 if TYPE_CHECKING:
     from synapse.util.clock import Clock, DelayedCallWrapper
@@ -695,6 +695,128 @@ def _print_mtxdb_stats() -> None:
 
 if os.environ.get("SYNAPSE_MTXDB_STATS"):
     atexit.register(_print_mtxdb_stats)
+
+
+# ── Periodic mtxdb runtime snapshot (opt-in via SYNAPSE_MTXDB_STATS=1) ──
+#
+# The end-of-run report above shows totals, not their *slope*: a long
+# Complement run can slow down as the store grows without any single total
+# looking wrong. This emits one compact INFO line, at most once per interval,
+# from the master's persist path -- so pack/shard/index growth sits next to the
+# request durations it might explain, on the same thread. Gated on a monotonic
+# clock, not wall time, so a clock step can neither suppress nor burst it. No
+# Rust changes and nothing on the hot path beyond the gate check.
+_MTXDB_SNAPSHOT_INTERVAL_SECS: float = 60.0
+_mtxdb_snapshot_last: float = 0.0
+_mtxdb_snapshot_prev: dict[str, dict[str, float]] = {}
+_mtxdb_persist_calls = 0
+_mtxdb_persist_total_secs = 0.0
+_mtxdb_persist_snapshot_calls = 0
+_mtxdb_persist_snapshot_total_secs = 0.0
+
+
+def record_mtxdb_persist_timing(elapsed: float) -> None:
+    """Record successful persist latency for the next diagnostic snapshot."""
+    global _mtxdb_persist_calls, _mtxdb_persist_total_secs
+    if os.environ.get("SYNAPSE_MTXDB_STATS"):
+        _mtxdb_persist_calls += 1
+        _mtxdb_persist_total_secs += elapsed
+
+
+def _mtxdb_snapshot_metrics(ps: dict[str, Any]) -> dict[str, float]:
+    sync_totals = ps.get("sync_totals") or {}
+    return {
+        "index_bytes": float(ps.get("index_bytes", 0) or 0),
+        "collection_count": float(ps.get("collection_count", 0) or 0),
+        "shard_count": float(ps.get("shard_count", 0) or 0),
+        "candidate_reads": float(ps.get("candidate_reads", 0) or 0),
+        "repack_count": float(ps.get("repack_count", 0) or 0),
+        "repack_kept": float(ps.get("repack_kept", 0) or 0),
+        "repack_dropped": float(ps.get("repack_dropped", 0) or 0),
+        "sync_calls": float(sync_totals.get("calls", 0) or 0),
+        "sync_us": float(sync_totals.get("total_us", 0) or 0),
+        "fsync_us": float(sync_totals.get("pack_fsync_us", 0) or 0),
+    }
+
+
+def _mtxdb_snapshot_once() -> None:
+    """Log one per-pool line with absolute values and since-last deltas."""
+    global _mtxdb_persist_snapshot_calls, _mtxdb_persist_snapshot_total_secs
+    try:
+        from synapse.storage.databases.embedded_engine import get_embedded_engine
+
+        s = get_embedded_engine("mtxdb").stats()
+    except Exception:
+        return
+
+    def _delta(pool: str, key: str, value: float) -> float:
+        prev = _mtxdb_snapshot_prev.setdefault(pool, {})
+        last = prev.get(key)
+        prev[key] = value
+        return 0.0 if last is None else value - last
+
+    segments: list[str] = []
+    for pool in ("state", "event_dag", "auth_chain"):
+        ps = s.get(pool, {})
+        if not ps:
+            continue
+        m = _mtxdb_snapshot_metrics(ps)
+        d = {key: _delta(pool, key, value) for key, value in m.items()}
+        segments.append(
+            f"{pool}[idx={m['index_bytes'] / 1e6:.1f}MB(+{d['index_bytes'] / 1e6:.1f}MB) "
+            f"col={int(m['collection_count'])}(+{int(d['collection_count'])}) "
+            f"shards={int(m['shard_count'])}(+{int(d['shard_count'])}) "
+            f"cand={int(m['candidate_reads'])}(+{int(d['candidate_reads'])}) "
+            f"repack={int(m['repack_count'])}/{int(m['repack_kept'])}/{int(m['repack_dropped'])} "
+            f"sync=+{int(d['sync_calls'])}/+{d['sync_us'] / 1000:.1f}ms "
+            f"fsync=+{d['fsync_us'] / 1000:.1f}ms]"
+        )
+
+    # FFI forward-edge cost, only recorded when SYNAPSE_PG_TIMINGS is set.
+    edges_us = _FFI_TIMINGS.get("ffi_event_edges_get_forward", 0.0)
+    edges_calls = _FFI_TIMING_COUNTS.get("ffi_event_edges_get_forward", 0)
+    if edges_calls:
+        segments.append(
+            f"edges_forward={edges_us / edges_calls * 1000:.2f}ms/{edges_calls}"
+        )
+
+    if segments:
+        persist_calls = _mtxdb_persist_calls - _mtxdb_persist_snapshot_calls
+        persist_total_secs = (
+            _mtxdb_persist_total_secs - _mtxdb_persist_snapshot_total_secs
+        )
+        persist_avg_ms = (
+            persist_total_secs / persist_calls * 1000 if persist_calls else 0.0
+        )
+        _mtxdb_persist_snapshot_calls = _mtxdb_persist_calls
+        _mtxdb_persist_snapshot_total_secs = _mtxdb_persist_total_secs
+        logger.info(
+            "mtxdb snapshot: persist=+%.1fms/%d avg=%.1fms %s",
+            persist_total_secs * 1000,
+            persist_calls,
+            persist_avg_ms,
+            "  ".join(segments),
+        )
+
+
+def maybe_log_mtxdb_snapshot() -> None:
+    """Emit a snapshot if opted in and an interval has elapsed.
+
+    A cheap no-op otherwise (two env/global checks and a monotonic read), so
+    it is safe to call unconditionally from the master's persist path.
+    """
+    global _mtxdb_snapshot_last
+    if not _engine_configured or not os.environ.get("SYNAPSE_MTXDB_STATS"):
+        return
+    now = time.monotonic()
+    if now - _mtxdb_snapshot_last < _MTXDB_SNAPSHOT_INTERVAL_SECS:
+        return
+    _mtxdb_snapshot_last = now
+    try:
+        _mtxdb_snapshot_once()
+    except Exception:
+        # Diagnostics must never break event persistence.
+        logger.debug("mtxdb snapshot failed", exc_info=True)
 
 
 @contextmanager
