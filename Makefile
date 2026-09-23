@@ -84,6 +84,26 @@ COMPLEMENT_DEFAULT_PARALLEL := $(if $(WORKERS),2,$(if $(COMPLEMENT_MAKE_JOBS),$(
 complement: ##H Run Complement tests (use -jN to set Complement parallelism)
 	COMPLEMENT_PARALLEL=$${COMPLEMENT_PARALLEL:-$(COMPLEMENT_DEFAULT_PARALLEL)} ./scripts-dev/complement.sh $(COMPLEMENT_ARGS)
 
+.PHONY: _complement/cleanup
+_complement/cleanup: ##H Stop Complement and remove its labeled containers/networks
+	@set -euo pipefail; \
+	lock_file="$${TMPDIR:-/tmp}/synapse-complement.lock"; \
+	if command -v fuser >/dev/null 2>&1 && [ -e "$$lock_file" ]; then \
+		fuser -TERM "$$lock_file" 2>/dev/null || true; \
+		for _ in 1 2 3 4 5; do \
+			if ! fuser "$$lock_file" >/dev/null 2>&1; then break; fi; \
+			sleep 1; \
+		done; \
+		fuser -KILL "$$lock_file" 2>/dev/null || true; \
+	fi; \
+	exec 9>"$$lock_file"; \
+	flock -n 9 || { echo "Complement lock is still owned; refusing cleanup" >&2; exit 1; }; \
+	runtime="$${CONTAINER_RUNTIME:-docker}"; \
+	if command -v "$$runtime" >/dev/null 2>&1; then \
+		"$$runtime" ps -aq --filter label=complement_pkg | xargs -r "$$runtime" rm -f; \
+		"$$runtime" network ls -q --filter label=complement_pkg | xargs -r "$$runtime" network rm || true; \
+	fi
+
 
 .PHONY: build
 build: ##H Build the package

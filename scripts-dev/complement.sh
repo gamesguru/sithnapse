@@ -542,8 +542,10 @@ main() {
   # Forward the diagnostic stats switch into the containers: with sync
   # disabled the report is empty, so this is only useful on a sync-on lane,
   # but it must reach the container or there is no way to size a sync's
-  # fsync/checkpoint split from a Complement run.
-  if [[ -n "${SYNAPSE_TEST_MTXDB_STATS:-}" ]]; then
+  # fsync/checkpoint split from a Complement run. Accept the normal local
+  # variable as well as the test-scoped alias; unlike database paths and
+  # durability controls, stats collection is read-only and safe to forward.
+  if [[ -n "${SYNAPSE_MTXDB_STATS:-${SYNAPSE_TEST_MTXDB_STATS:-}}" ]]; then
     export PASS_SYNAPSE_MTXDB_STATS=1
   fi
 
