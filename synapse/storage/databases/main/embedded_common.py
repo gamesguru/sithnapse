@@ -955,35 +955,55 @@ class _FlushCoalescer:
 
         Cancels any pending delayed flush, syncs the requested pools
         (or all dirty pools if None), draining queued EVENT_DAG edge writes
-        first. Reschedules dirty pools even when draining or syncing raises.
+        first. Each pool is synced independently so a failure syncing one
+        pool neither masks nor is blamed on another: only the pool(s) whose
+        sync actually raised are re-marked dirty and cause a raise.
         """
         if self._closed:
             return
         if self._delayed_call is not None:
             self._delayed_call.cancel()
             self._delayed_call = None
-        pool_set = set(pools) if pools is not None else None
 
+        to_flush = set(pools) if pools is not None else set(self._dirty)
+
+        first_exc: Exception | None = None
         try:
             # EVENT_DAG also owns coalesced forward-edge writes. An explicit
-            # EVENT_DAG barrier must include those queued records before syncing.
-            if pool_set is None or Pool.EVENT_DAG in pool_set:
-                if _drain_edge_writes():
-                    self._dirty.add(Pool.EVENT_DAG)
-
-            to_flush = pool_set if pool_set is not None else set(self._dirty)
-            if to_flush:
-                _do_sync_pools(to_flush)
-                self._dirty.difference_update(to_flush)
-        except Exception:
-            if pool_set is None or Pool.EVENT_DAG in pool_set:
+            # EVENT_DAG barrier must include those queued records before
+            # syncing. A raise here must still hit the `finally` below, or
+            # EVENT_DAG can be left dirty with the timer we just cancelled
+            # never rearmed -- the same stranded-work bug fixed earlier.
+            if Pool.EVENT_DAG in to_flush:
                 self._dirty.add(Pool.EVENT_DAG)
-            raise
+                if not _drain_edge_writes():
+                    self._dirty.discard(Pool.EVENT_DAG)
+
+            for pool in to_flush:
+                try:
+                    _do_sync_pools({pool})
+                    self._dirty.discard(pool)
+                except Exception as exc:
+                    self._dirty.add(pool)
+                    if first_exc is None:
+                        first_exc = exc
+        except Exception as exc:
+            if Pool.EVENT_DAG in to_flush:
+                self._dirty.add(Pool.EVENT_DAG)
+            first_exc = first_exc or exc
         finally:
             if self._dirty and self._delayed_call is None:
-                self._delayed_call = self._clock.call_later(
-                    self._RETRY_DELAY, self._flush
+                # A pool left dirty by an unrelated write during this call
+                # (not one of our own failures) should rejoin the normal
+                # debounce cadence, not be punished with the failure
+                # backoff delay.
+                delay = (
+                    self._RETRY_DELAY if first_exc is not None else self._FLUSH_DELAY
                 )
+                self._delayed_call = self._clock.call_later(delay, self._flush)
+
+        if first_exc is not None:
+            raise first_exc
 
     def sync_event_dag_now(self) -> None:
         """Sync EVENT_DAG without draining the coalesced edge queues.
