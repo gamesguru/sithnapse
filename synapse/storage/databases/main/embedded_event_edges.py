@@ -382,27 +382,22 @@ def delete_event_edges_batch(
                     "ffi_event_edges_delete_locator_read",
                     phase_timings["locator_read"],
                 )
+                # Delete no longer reads or rewrites any parent's forward
+                # list (see embedded_edges.rs's `event_edges_delete` doc
+                # comment) -- there is no forward_read/mutate_write/
+                # forward_nodes phase left to report. backward_read was
+                # renamed to backward_tombstone_write: it always was a
+                # write, never a read.
                 ffi_timing(
-                    "ffi_event_edges_delete_backward_read",
-                    phase_timings["backward_read"],
+                    "ffi_event_edges_delete_backward_tombstone_write",
+                    phase_timings["backward_tombstone_write"],
                 )
-                ffi_timing(
-                    "ffi_event_edges_delete_forward_read",
-                    phase_timings["forward_read"],
-                )
-                ffi_timing(
-                    "ffi_event_edges_delete_mutate_write",
-                    phase_timings["mutate_write"],
-                )
-                # The Rust dict is typed float | int; the counts are integers.
-                forward_count = int(phase_timings["forward_nodes"])
+                # The Rust dict is typed float | int; the count is an integer.
                 room_count = int(phase_timings["rooms"])
-                ffi_count("event_edges_delete_forward_nodes", forward_count)
                 ffi_count("event_edges_delete_rooms", room_count)
                 # Per-call batch shape, so a slow delete can be matched to the
-                # event/parent/room counts that produced it.
+                # event/room counts that produced it.
                 ffi_batch_size("event_edges_delete_events", len(event_ids))
-                ffi_batch_size("event_edges_delete_forward_nodes", forward_count)
                 ffi_batch_size("event_edges_delete_rooms", room_count)
                 ffi_count("event_edges_deleted", len(event_ids))
         except Exception:

@@ -541,7 +541,7 @@ pub fn event_edges_delete(
     // Phase timings returned as a named dict (not a positional tuple) so the
     // Python diagnostics layer can't silently misread a field if one is added
     // or reordered. See `embedded_event_edges.delete_event_edges_batch`.
-    let (lock_wait, locator_read, backward_read, room_count) =
+    let (lock_wait, locator_read, backward_tombstone_write, room_count) =
         py.detach(|| -> PyResult<(f64, f64, f64, usize)> {
             // Keep lock acquisition outside the GIL, otherwise a purge waiting
             // behind another read/modify/write operation stalls unrelated Python
@@ -597,7 +597,7 @@ pub fn event_edges_delete(
                 }
             }
 
-            let backward_started = std::time::Instant::now();
+            let tombstone_started = std::time::Instant::now();
             let mut dag_updates: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
             for (collection, ids) in &backward_ids {
                 let pairs: Vec<(NodeId, NodeData)> = ids
@@ -611,20 +611,22 @@ pub fn event_edges_delete(
                     pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {e}"))
                 })?;
             }
-            let backward_read = backward_started.elapsed().as_secs_f64();
+            let backward_tombstone_write = tombstone_started.elapsed().as_secs_f64();
 
             // Distinct room collections this purge resolved a locator into.
             let room_count = backward_ids.len();
 
-            Ok((lock_wait, locator_read, backward_read, room_count))
+            Ok((lock_wait, locator_read, backward_tombstone_write, room_count))
         })?;
     let timings = PyDict::new(py);
     timings.set_item("lock_wait", lock_wait)?;
     timings.set_item("locator_read", locator_read)?;
-    timings.set_item("backward_read", backward_read)?;
-    timings.set_item("forward_read", 0.0_f64)?;
-    timings.set_item("mutate_write", 0.0_f64)?;
-    timings.set_item("forward_nodes", 0_usize)?;
+    // No forward node is read or written by delete any more (see the doc
+    // comment above): there is no `forward_read`/`mutate_write`/
+    // `forward_nodes` phase left to report. `backward_tombstone_write`
+    // replaces the old `backward_read` key -- this phase is a write
+    // (tombstoning), not a read.
+    timings.set_item("backward_tombstone_write", backward_tombstone_write)?;
     timings.set_item("rooms", room_count)?;
     Ok(timings.unbind())
 }
