@@ -392,6 +392,21 @@ def delete_event_edges_batch(
                     "ffi_event_edges_delete_backward_tombstone_write",
                     phase_timings["backward_tombstone_write"],
                 )
+                # closure_duration times all work inside py.detach (the three
+                # phases above plus untimed glue between them); detached_duration
+                # times py.detach itself from outside. Their difference isolates
+                # GIL-reacquisition/return overhead from mtxdb/Rust work, and
+                # comparing detached_duration to `elapsed` above isolates
+                # anything left in the FFI boundary itself -- see
+                # embedded_edges.rs's `event_edges_delete` doc comment.
+                ffi_timing(
+                    "ffi_event_edges_delete_closure_duration",
+                    phase_timings["closure_duration"],
+                )
+                ffi_timing(
+                    "ffi_event_edges_delete_detached_duration",
+                    phase_timings["detached_duration"],
+                )
                 # The Rust dict is typed float | int; the count is an integer.
                 room_count = int(phase_timings["rooms"])
                 ffi_count("event_edges_delete_rooms", room_count)

@@ -552,8 +552,15 @@ pub fn event_edges_delete(
     // Phase timings returned as a named dict (not a positional tuple) so the
     // Python diagnostics layer can't silently misread a field if one is added
     // or reordered. See `embedded_event_edges.delete_event_edges_batch`.
-    let (lock_wait, locator_read, backward_tombstone_write, room_count) =
-        py.detach(|| -> PyResult<(f64, f64, f64, usize)> {
+    let detach_started = std::time::Instant::now();
+    let (lock_wait, locator_read, backward_tombstone_write, room_count, closure_duration) = py
+        .detach(|| -> PyResult<(f64, f64, f64, usize, f64)> {
+            // Timed from inside the closure, under the GIL-released section,
+            // so it can be diffed against `detach_started` outside to isolate
+            // py.detach's own GIL-reacquisition/return overhead from real
+            // work done here -- without that split, a slow call can't be
+            // attributed to mtxdb vs. the FFI boundary.
+            let closure_started = std::time::Instant::now();
             // Keep lock acquisition outside the GIL, otherwise a purge waiting
             // behind another read/modify/write operation stalls unrelated Python
             // work as well. The caller consumes the returned phase timings.
@@ -626,14 +633,17 @@ pub fn event_edges_delete(
 
             // Distinct room collections this purge resolved a locator into.
             let room_count = backward_ids.len();
+            let closure_duration = closure_started.elapsed().as_secs_f64();
 
             Ok((
                 lock_wait,
                 locator_read,
                 backward_tombstone_write,
                 room_count,
+                closure_duration,
             ))
         })?;
+    let detached_duration = detach_started.elapsed().as_secs_f64();
     let timings = PyDict::new(py);
     timings.set_item("lock_wait", lock_wait)?;
     timings.set_item("locator_read", locator_read)?;
@@ -643,6 +653,16 @@ pub fn event_edges_delete(
     // replaces the old `backward_read` key -- this phase is a write
     // (tombstoning), not a read.
     timings.set_item("backward_tombstone_write", backward_tombstone_write)?;
+    // `closure_duration` covers all work done inside `py.detach`, including
+    // the three named phases above plus the untimed glue between them (id
+    // mapping, HashMap construction). `detached_duration` wraps `py.detach`
+    // itself from the outside: `detached_duration - closure_duration` is
+    // GIL-reacquisition/return overhead, not mtxdb work. Comparing both to
+    // the caller's own wall-clock timing around this whole call isolates a
+    // slow delete to mtxdb, to untimed Rust glue, or to the FFI boundary --
+    // rather than guessing.
+    timings.set_item("closure_duration", closure_duration)?;
+    timings.set_item("detached_duration", detached_duration)?;
     timings.set_item("rooms", room_count)?;
     Ok(timings.unbind())
 }
