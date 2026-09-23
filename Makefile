@@ -73,12 +73,10 @@ test: ##H Run tests, e.g., on tests/storage/
 	uv run --no-sync python scripts-dev/trial_ctrlc.py $(if $(TRIAL_JOBS),-j $(TRIAL_JOBS),) $(p)
 
 # Match Complement's package and in-package parallelism to an explicit GNU
-# Make -jN value for monolith runs. Worker-mode Complement deployments start
-# many Synapse processes per homeserver, so keep their default at 2 even when
-# make is invoked with -jN; callers can explicitly override this with
-# COMPLEMENT_PARALLEL.
+# Make -jN value. A plain `make complement` keeps the script's conservative
+# default of 2; callers can also override COMPLEMENT_PARALLEL directly.
 COMPLEMENT_MAKE_JOBS := $(shell printf '%s\n' "$(MAKEFLAGS)" | sed -n 's/.*-j\([0-9][0-9]*\).*/\1/p')
-COMPLEMENT_DEFAULT_PARALLEL := $(if $(WORKERS),2,$(if $(COMPLEMENT_MAKE_JOBS),$(COMPLEMENT_MAKE_JOBS),2))
+COMPLEMENT_DEFAULT_PARALLEL := $(if $(COMPLEMENT_MAKE_JOBS),$(COMPLEMENT_MAKE_JOBS),2)
 
 .PHONY: complement
 complement: ##H Run Complement tests (use -jN to set Complement parallelism)
