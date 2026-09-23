@@ -994,18 +994,19 @@ class _FlushCoalescer:
         """
         if self._closed:
             return
-        if self._delayed_call is not None:
-            # This also resets the debounce window for unrelated dirty pools;
-            # the event-JSON barrier shares the coalescer's single timer.
-            self._delayed_call.cancel()
-            self._delayed_call = None
         try:
             _do_sync_pools({Pool.EVENT_DAG})
-            self._dirty.discard(Pool.EVENT_DAG)
+            # Do not clear EVENT_DAG here: the dirty bit may represent
+            # coalesced edge writes, which this narrow barrier deliberately
+            # leaves queued for the shared timer.
         except Exception:
             self._dirty.add(Pool.EVENT_DAG)
             raise
         finally:
+            # Do not cancel an already-armed timer: this barrier runs per
+            # persisted event, and cancel-then-reschedule on every call would
+            # perpetually push out the coalescer's flush under sustained
+            # traffic, starving the actual edge drain indefinitely.
             if self._dirty and self._delayed_call is None:
                 self._delayed_call = self._clock.call_later(
                     self._RETRY_DELAY, self._flush

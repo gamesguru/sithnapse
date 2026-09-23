@@ -343,6 +343,46 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
         finally:
             flush_edge_writes(ns)
 
+    def test_unrelated_queued_write_does_not_resurrect_deleted_sibling(self) -> None:
+        """The queue-drain-free purge (delete_event_edges_batch no longer
+        flushes the whole namespace first) leaves unrelated queued rows in
+        place. This only stays correct if a later coalescer flush of that row
+        appends against the *post-delete* forward list rather than replaying
+        a stale snapshot taken when it was enqueued. Regression guard for
+        that invariant: delete a sibling that is already durable in mtxdb,
+        then flush an unrelated queued write to the same parent, and confirm
+        the deleted sibling is not resurrected while the new child lands."""
+        ns = "test-edges-no-resurrection-on-drainless-purge"
+        parent = "$shared_parent"
+        victim = "$purged_sibling"
+        sibling = "$new_sibling"
+        try:
+            # Seed victim's edge as already-durable mtxdb state (not queued).
+            queue_edge_write(ns, [(self.room_id, victim, parent, False)])
+            flush_edge_writes(ns)
+            fwd = get_event_edges_forward_batch(ns, [parent])
+            self.assertIn(victim, fwd.get(parent) or [])
+
+            # Queue an unrelated write to the same parent's forward list.
+            # It must stay queued across the purge below (drain-free purge).
+            queue_edge_write(ns, [(self.room_id, sibling, parent, False)])
+            self.assertEqual(queued_edge_write_count(ns), 1)
+
+            delete_event_edges_batch(ns, [victim])
+
+            # Unrelated row was not touched by the drain-free delete.
+            self.assertEqual(queued_edge_write_count(ns), 1)
+
+            # Now let the coalescer apply the queued row.
+            flush_edge_writes(ns)
+
+            fwd = get_event_edges_forward_batch(ns, [parent])
+            children = fwd.get(parent) or []
+            self.assertIn(sibling, children)
+            self.assertNotIn(victim, children)
+        finally:
+            flush_edge_writes(ns)
+
     def test_purge_enqueue_race_is_serialized(self) -> None:
         """Force the dangerous ordering: an enqueue arriving while the purge is
         paused between its cancel step and its FFI delete.  The namespace flush
