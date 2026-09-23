@@ -126,6 +126,41 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
             _clear_coalescer(coalescer)
             coalescer.close()
 
+    def test_event_dag_barrier_failure_backs_off_existing_timer(self) -> None:
+        """A failed narrow barrier must not ride out whatever debounce delay
+        happened to already be pending (armed at ``_FLUSH_DELAY`` by
+        ``mark_dirty``) -- it should cancel that timer and re-arm at the
+        shorter ``_RETRY_DELAY``, so a failure always backs off consistently
+        regardless of when it lands relative to the shared timer."""
+        reactor = ThreadedMemoryReactorClock()
+        clock = Clock(reactor, server_name="test_server")  # type: ignore[multiple-internal-clocks]
+        coalescer = _FlushCoalescer(clock)
+        _set_coalescer(coalescer)
+        try:
+            coalescer.mark_dirty(embedded_common.Pool.EVENT_DAG)
+            assert coalescer._delayed_call is not None
+            pending_at_flush_delay = coalescer._delayed_call.getTime()
+            self.assertAlmostEqual(
+                pending_at_flush_delay, reactor.seconds() + 0.5, places=3
+            )
+
+            with mock.patch(
+                "synapse.storage.databases.main.embedded_common._do_sync_pools",
+                side_effect=RuntimeError("simulated sync failure"),
+            ):
+                with self.assertRaises(RuntimeError):
+                    coalescer.sync_event_dag_now()
+
+            self.assertIsNotNone(coalescer._delayed_call)
+            assert coalescer._delayed_call is not None
+            rearmed_at_retry_delay = coalescer._delayed_call.getTime()
+            self.assertAlmostEqual(
+                rearmed_at_retry_delay, reactor.seconds() + 1.0, places=3
+            )
+        finally:
+            _clear_coalescer(coalescer)
+            coalescer.close()
+
     def test_put_get_backward_and_forward(self) -> None:
         # No locator seeding: `event_edges_put` publishes locators for the
         # events it touches, so an edge written with no preceding
