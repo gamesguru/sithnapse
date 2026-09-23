@@ -16,7 +16,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use mtxdb_core::{NodeData, NodeId, StorageEngine};
+use mtxdb::{NodeData, NodeId, StorageEngine};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use sha2::{Digest, Sha256};

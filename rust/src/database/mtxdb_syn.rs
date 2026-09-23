@@ -4,9 +4,9 @@ use std::sync::{
     Arc, Mutex,
 };
 
-use mtxdb_core::journal::Journal;
-use mtxdb_core::storage::StorageError;
-use mtxdb_core::{DatabaseLayout, NodeData, NodeId, PackfileStorage, ShardType, StorageEngine};
+use mtxdb::journal::Journal;
+use mtxdb::storage::StorageError;
+use mtxdb::{DatabaseLayout, NodeData, NodeId, PackfileStorage, ShardType, StorageEngine};
 use once_cell::sync::OnceCell;
 use pyo3::prelude::*;
 use sha2::{Digest, Sha256};
@@ -2806,7 +2806,7 @@ use pyo3::types::PyDict;
 fn stats_to_dict(
     py: Python<'_>,
     name: &str,
-    s: &mtxdb_core::packfile::storage::RuntimeStats,
+    s: &mtxdb::packfile::storage::RuntimeStats,
 ) -> PyResult<Py<PyDict>> {
     let d = PyDict::new(py);
     d.set_item("pool", name)?;
@@ -2959,7 +2959,7 @@ fn stats_to_dict(
 #[pyfunction]
 pub fn stats(py: Python<'_>) -> PyResult<Py<PyDict>> {
     let snapshots = py.detach(
-        || -> Result<Vec<(&str, mtxdb_core::packfile::storage::RuntimeStats)>, pyo3::PyErr> {
+        || -> Result<Vec<(&str, mtxdb::packfile::storage::RuntimeStats)>, pyo3::PyErr> {
             let pools = pools()?;
             Ok(vec![
                 ("state", pools.state.stats()),
@@ -3007,7 +3007,7 @@ pub fn set_stats_enabled(py: Python<'_>, enabled: bool) -> PyResult<()> {
 /// unlimited at zero and the pair is disabled when both are zero (the
 /// default). A deferred rewrite is write-neutral: packfiles are still synced
 /// first, so only the index acceleration file stays stale, costing the next
-/// open a rescan. See `mtxdb_core`'s `set_checkpoint_rewrite_budget` and the
+/// open a rescan. See `mtxdb`'s `set_checkpoint_rewrite_budget` and the
 /// `checkpoint_skips` stat.
 #[pyfunction]
 pub fn set_checkpoint_rewrite_budget(
