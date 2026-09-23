@@ -165,6 +165,115 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
             _clear_coalescer(coalescer)
             coalescer.close()
 
+    def test_sync_now_drain_failure_reschedules_and_raises(self) -> None:
+        """A failing ``_drain_edge_writes()`` inside ``sync_now`` must not
+        strand EVENT_DAG: the timer is cancelled at the top of the method, so
+        a raise from the drain has to still reach the retry-scheduling
+        ``finally`` (via the outer try/except) or nothing would ever retry
+        it -- the same stranded-work shape as the narrow-barrier livelock
+        fixed earlier, just via the drain instead of the sync call itself."""
+        reactor = ThreadedMemoryReactorClock()
+        clock = Clock(reactor, server_name="test_server")  # type: ignore[multiple-internal-clocks]
+        coalescer = _FlushCoalescer(clock)
+        _set_coalescer(coalescer)
+        try:
+            with (
+                mock.patch(
+                    "synapse.storage.databases.main.embedded_common._drain_edge_writes",
+                    side_effect=RuntimeError("simulated drain failure"),
+                ),
+                mock.patch(
+                    "synapse.storage.databases.main.embedded_common._do_sync_pools"
+                ) as sync,
+            ):
+                with self.assertRaises(RuntimeError):
+                    coalescer.sync_now(pools=[embedded_common.Pool.EVENT_DAG])
+                # The sync call must never be reached: the drain failed first.
+                sync.assert_not_called()
+            self.assertIn(embedded_common.Pool.EVENT_DAG, coalescer._dirty)
+            self.assertIsNotNone(coalescer._delayed_call)
+            assert coalescer._delayed_call is not None
+            self.assertAlmostEqual(
+                coalescer._delayed_call.getTime(), reactor.seconds() + 1.0, places=3
+            )
+        finally:
+            _clear_coalescer(coalescer)
+            coalescer.close()
+
+    def test_sync_now_attributes_failure_to_failing_pool_only(self) -> None:
+        """Per-pool sync failures must not cross-contaminate: if EVENT_DAG
+        syncs cleanly but STATE fails, only STATE should end up re-dirtied,
+        and the retry timer should use the failure backoff since the call
+        did not fully succeed."""
+        reactor = ThreadedMemoryReactorClock()
+        clock = Clock(reactor, server_name="test_server")  # type: ignore[multiple-internal-clocks]
+        coalescer = _FlushCoalescer(clock)
+        _set_coalescer(coalescer)
+        try:
+
+            def fake_sync(pools: set) -> None:
+                if embedded_common.Pool.STATE in pools:
+                    raise RuntimeError("simulated state sync failure")
+
+            with (
+                mock.patch(
+                    "synapse.storage.databases.main.embedded_common._drain_edge_writes",
+                    return_value=False,
+                ),
+                mock.patch(
+                    "synapse.storage.databases.main.embedded_common._do_sync_pools",
+                    side_effect=fake_sync,
+                ),
+            ):
+                with self.assertRaises(RuntimeError):
+                    coalescer.sync_now(
+                        pools=[
+                            embedded_common.Pool.EVENT_DAG,
+                            embedded_common.Pool.STATE,
+                        ]
+                    )
+            self.assertNotIn(embedded_common.Pool.EVENT_DAG, coalescer._dirty)
+            self.assertIn(embedded_common.Pool.STATE, coalescer._dirty)
+            self.assertIsNotNone(coalescer._delayed_call)
+            assert coalescer._delayed_call is not None
+            self.assertAlmostEqual(
+                coalescer._delayed_call.getTime(), reactor.seconds() + 1.0, places=3
+            )
+        finally:
+            _clear_coalescer(coalescer)
+            coalescer.close()
+
+    def test_sync_now_success_with_leftover_dirty_uses_flush_delay(self) -> None:
+        """When ``sync_now`` fully succeeds but an unrelated pool is left
+        dirty (e.g. a concurrent write raced in), the rearmed timer should
+        use the normal debounce delay, not the failure backoff -- that pool
+        never failed anything this call."""
+        reactor = ThreadedMemoryReactorClock()
+        clock = Clock(reactor, server_name="test_server")  # type: ignore[multiple-internal-clocks]
+        coalescer = _FlushCoalescer(clock)
+        _set_coalescer(coalescer)
+        try:
+            coalescer._dirty.add(embedded_common.Pool.AUTH_CHAIN)
+            with (
+                mock.patch(
+                    "synapse.storage.databases.main.embedded_common._drain_edge_writes",
+                    return_value=False,
+                ),
+                mock.patch(
+                    "synapse.storage.databases.main.embedded_common._do_sync_pools"
+                ),
+            ):
+                coalescer.sync_now(pools=[embedded_common.Pool.EVENT_DAG])
+            self.assertIn(embedded_common.Pool.AUTH_CHAIN, coalescer._dirty)
+            self.assertIsNotNone(coalescer._delayed_call)
+            assert coalescer._delayed_call is not None
+            self.assertAlmostEqual(
+                coalescer._delayed_call.getTime(), reactor.seconds() + 0.5, places=3
+            )
+        finally:
+            _clear_coalescer(coalescer)
+            coalescer.close()
+
     def test_put_get_backward_and_forward(self) -> None:
         # No locator seeding: `event_edges_put` publishes locators for the
         # events it touches, so an edge written with no preceding
