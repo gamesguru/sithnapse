@@ -126,12 +126,17 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
             _clear_coalescer(coalescer)
             coalescer.close()
 
-    def test_event_dag_barrier_failure_backs_off_existing_timer(self) -> None:
-        """A failed narrow barrier must not ride out whatever debounce delay
-        happened to already be pending (armed at ``_FLUSH_DELAY`` by
-        ``mark_dirty``) -- it should cancel that timer and re-arm at the
-        shorter ``_RETRY_DELAY``, so a failure always backs off consistently
-        regardless of when it lands relative to the shared timer."""
+    def test_event_dag_barrier_failure_does_not_reset_existing_timer(self) -> None:
+        """A failed narrow barrier must not cancel-and-reschedule an
+        already-pending debounce timer (armed at ``_FLUSH_DELAY`` by
+        ``mark_dirty``). Doing so under sustained failures -- e.g. calls
+        arriving faster than ``_RETRY_DELAY`` apart, plausible since this
+        barrier runs per persisted event -- would perpetually push the timer
+        out and starve ``_flush`` forever: the same livelock shape the
+        success path avoids, just triggered by errors instead of successes.
+        An existing timer, whatever its delay, must be left to fire on its
+        own; only the absence of any timer should cause a new one to be
+        armed at ``_RETRY_DELAY``."""
         reactor = ThreadedMemoryReactorClock()
         clock = Clock(reactor, server_name="test_server")  # type: ignore[multiple-internal-clocks]
         coalescer = _FlushCoalescer(clock)
@@ -153,10 +158,9 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
 
             self.assertIsNotNone(coalescer._delayed_call)
             assert coalescer._delayed_call is not None
-            rearmed_at_retry_delay = coalescer._delayed_call.getTime()
-            self.assertAlmostEqual(
-                rearmed_at_retry_delay, reactor.seconds() + 1.0, places=3
-            )
+            # Unchanged: the pre-existing _FLUSH_DELAY timer was left alone,
+            # not cancelled and re-armed at _RETRY_DELAY.
+            self.assertEqual(coalescer._delayed_call.getTime(), pending_at_flush_delay)
         finally:
             _clear_coalescer(coalescer)
             coalescer.close()

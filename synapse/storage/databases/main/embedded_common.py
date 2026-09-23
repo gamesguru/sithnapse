@@ -1001,14 +1001,14 @@ class _FlushCoalescer:
             # leaves queued for the shared timer.
         except Exception:
             self._dirty.add(Pool.EVENT_DAG)
-            # Unlike the success path, a failed barrier must not ride out
-            # whatever debounce delay happened to be pending -- cancel and
-            # let `finally` re-arm at `_RETRY_DELAY` so a failure always
-            # backs off consistently, regardless of when it landed relative
-            # to the shared timer.
-            if self._delayed_call is not None:
-                self._delayed_call.cancel()
-                self._delayed_call = None
+            # Do not cancel an already-armed timer here either: this runs
+            # per persisted event, and under sustained failures (e.g. the
+            # store unreachable) cancel-then-reschedule on every call would
+            # perpetually push out the retry and starve `_flush` forever --
+            # the same livelock shape as the success path, just triggered by
+            # errors instead. `finally` below already guarantees a retry
+            # gets scheduled if none exists; an existing timer, whatever its
+            # delay, is left to fire on its own.
             raise
         finally:
             # Do not cancel an already-armed timer: this barrier runs per
