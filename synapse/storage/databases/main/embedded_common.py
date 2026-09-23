@@ -828,8 +828,18 @@ def maybe_sync(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
         ffi_timing("ffi_sync_state", time.monotonic() - _st)
     if Pool.EVENT_DAG in pool_set:
         _st = time.monotonic()
-        engine.sync_event_dag()
-        ffi_timing("ffi_sync_event_dag", time.monotonic() - _st)
+        ffi_count("event_dag_sync_requests", 1)
+        try:
+            engine.sync_event_dag()
+        except Exception:
+            ffi_count("event_dag_sync_errors", 1)
+            raise
+        else:
+            ffi_count("event_dag_sync_completed", 1)
+        finally:
+            elapsed = time.monotonic() - _st
+            ffi_timing("ffi_sync_event_dag", elapsed)
+            ffi_timing("event_dag_sync_duration", elapsed)
     if Pool.AUTH_CHAIN in pool_set:
         _st = time.monotonic()
         engine.sync_auth_chain()
@@ -919,11 +929,16 @@ class _FlushCoalescer:
         if not to_flush:
             return
         try:
-            if Pool.EVENT_DAG in to_flush:
-                ffi_count("event_dag_sync_coalesced", 1)
             _do_sync_pools(to_flush)
+            if Pool.EVENT_DAG in to_flush:
+                # This is a successful delayed/coalesced flush. The native
+                # sync counters above record the actual pool call; this
+                # counter identifies the coalescer's contribution.
+                ffi_count("event_dag_sync_coalesced", 1)
             self._dirty.difference_update(to_flush)
         except Exception:
+            if Pool.EVENT_DAG in to_flush:
+                ffi_count("event_dag_sync_coalesced_errors", 1)
             logger.warning(
                 "Flush coalescer sync failed for %s, will retry",
                 to_flush,
@@ -944,7 +959,19 @@ class _FlushCoalescer:
         if self._delayed_call is not None:
             self._delayed_call.cancel()
             self._delayed_call = None
-        to_flush = set(pools) if pools is not None else set(self._dirty)
+        pool_set = set(pools) if pools is not None else None
+
+        # EVENT_DAG also owns coalesced forward-edge writes. An explicit
+        # EVENT_DAG barrier must include those queued records before syncing.
+        if pool_set is None or Pool.EVENT_DAG in pool_set:
+            try:
+                if _drain_edge_writes():
+                    self._dirty.add(Pool.EVENT_DAG)
+            except Exception:
+                self._dirty.add(Pool.EVENT_DAG)
+                raise
+
+        to_flush = pool_set if pool_set is not None else set(self._dirty)
         if to_flush:
             _do_sync_pools(to_flush)
             self._dirty.difference_update(to_flush)
@@ -1056,19 +1083,10 @@ def sync_now(pools: Iterable[Pool] | None = None) -> None:
         return
 
     pool_set = set(pools) if pools is not None else None
-    includes_event_dag = pool_set is None or Pool.EVENT_DAG in pool_set
-    started = time.monotonic() if includes_event_dag else None
-    if includes_event_dag:
-        ffi_count("event_dag_sync_requests", 1)
-
-    try:
-        if _coalescer is not None:
-            _coalescer.sync_now(pool_set)
-        elif pool_set is not None:
-            maybe_sync(SyncTier.DURABLE, pools=pool_set)
-    finally:
-        if started is not None:
-            ffi_timing("event_dag_sync_ack_latency", time.monotonic() - started)
+    if _coalescer is not None:
+        _coalescer.sync_now(pool_set)
+    elif pool_set is not None:
+        maybe_sync(SyncTier.DURABLE, pools=pool_set)
 
 
 def close_coalescer() -> None:

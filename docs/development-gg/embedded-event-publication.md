@@ -9,7 +9,9 @@ fallback if a worker reads the event before the embedded record is visible.
 The current short-term fix is in `events.py`: the event JSON batch calls
 `put_event_json_batch(..., sync=True)`. This synchronously syncs the `EVENT_DAG`
 pool before the persistence path can advertise the event through the replication
-stream. It fixes the worker read-after-write failure observed by Complement.
+stream. The focused Complement worker read-after-write failure no longer
+reproduces with this change. The exact cross-process visibility guarantee of
+`mdb_sync` remains a separate mtxdb contract to verify.
 
 Synapse remains pinned to mtxdb commit
 `e939711faf2ab15fa031449f3bad2ae37302c482e`. The fix uses the sync API already
@@ -58,3 +60,6 @@ avoiding an unconditional fsync for every event.
 - Benchmark throughput and p95/p99 persistence latency on the target HDD.
 - Verify that `mdb_sync` guarantees the cross-process read visibility required
   by `open_read_committed`, not only local durability.
+- Use `event_dag_sync_requests`, `event_dag_sync_completed`,
+  `event_dag_sync_errors`, `event_dag_sync_duration`, and the coalescer success
+  and error counters to separate actual sync work from no-op calls.
