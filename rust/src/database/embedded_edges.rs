@@ -466,7 +466,19 @@ pub fn event_edges_get_forward(
                     pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {e}"))
                 })?;
             for (child, value) in children.iter().zip(found) {
-                let is_live = matches!(&value, Some(data) if !data.bytes.is_empty());
+                // Three states, not two: a present-but-empty record is an
+                // explicit tombstone from `event_edges_delete` and the child
+                // is dropped; a missing record is NOT the same thing -- it
+                // is a legacy/partially-mirrored event whose backward edge
+                // was never written (see the module doc comment on repair
+                // and backfill). Filtering those out would silently hide a
+                // legitimate child instead of leaving it for the caller's
+                // own SQL fallback to resolve, so a missing record fails
+                // open (kept) rather than closed (dropped).
+                let is_live = match &value {
+                    Some(data) => !data.bytes.is_empty(),
+                    None => true,
+                };
                 live.insert((*collection, child.clone()), is_live);
             }
         }
@@ -483,7 +495,13 @@ pub fn event_edges_get_forward(
                 children.retain(|child| {
                     live.get(&(*room_collection, child.clone()))
                         .copied()
-                        .unwrap_or(false)
+                        // Not found in `live` only happens if the batched
+                        // lookup above never ran for this child, which
+                        // cannot occur given `child_lookup` is built from
+                        // the same `results` this retain pass reads. Fail
+                        // open regardless, for the same missing-record
+                        // reason as above.
+                        .unwrap_or(true)
                 });
                 if children.is_empty() {
                     results[position] = None;
