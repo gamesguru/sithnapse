@@ -70,6 +70,7 @@ from synapse.storage.controllers.state import StateStorageController
 from synapse.storage.databases import Databases
 from synapse.storage.databases.main.embedded_common import (
     maybe_log_mtxdb_snapshot,
+    record_mtxdb_persist_batch_timing,
     record_mtxdb_persist_timing,
 )
 from synapse.storage.databases.main.events import DeltaState
@@ -397,7 +398,12 @@ class EventsPersistenceStorageController:
             NEW_EVENT_DURING_PURGE_LOCK_NAME, room_id, write=False
         ):
             if isinstance(task, _PersistEventsTask):
-                return await self._persist_event_batch(room_id, task)
+                batch_started = time.monotonic()
+                try:
+                    return await self._persist_event_batch(room_id, task)
+                finally:
+                    # Diagnostic: work time only, excluding queue wait.
+                    record_mtxdb_persist_batch_timing(time.monotonic() - batch_started)
             elif isinstance(task, _UpdateCurrentStateTask):
                 await self._update_current_state(room_id, task)
                 return {}

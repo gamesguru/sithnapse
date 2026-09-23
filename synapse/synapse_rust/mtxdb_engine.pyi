@@ -2,6 +2,9 @@ from collections.abc import Iterable
 
 def open_client(path: str) -> None: ...
 def open_client_read_only(path: str) -> None: ...
+
+# Test-only diagnostic: repack every open pool; returns per-pool summaries.
+def repack() -> dict[str, dict[str, int]]: ...
 def put_state_hamt_nodes(
     namespace: str,
     room_prefix: bytes,

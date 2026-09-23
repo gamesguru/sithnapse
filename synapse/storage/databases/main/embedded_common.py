@@ -713,6 +713,10 @@ _mtxdb_persist_calls = 0
 _mtxdb_persist_total_secs = 0.0
 _mtxdb_persist_snapshot_calls = 0
 _mtxdb_persist_snapshot_total_secs = 0.0
+_mtxdb_batch_calls = 0
+_mtxdb_batch_total_secs = 0.0
+_mtxdb_batch_snapshot_calls = 0
+_mtxdb_batch_snapshot_total_secs = 0.0
 
 
 def record_mtxdb_persist_timing(elapsed: float) -> None:
@@ -721,6 +725,14 @@ def record_mtxdb_persist_timing(elapsed: float) -> None:
     if os.environ.get("SYNAPSE_MTXDB_STATS"):
         _mtxdb_persist_calls += 1
         _mtxdb_persist_total_secs += elapsed
+
+
+def record_mtxdb_persist_batch_timing(elapsed: float) -> None:
+    """Record `_persist_event_batch` work time (queue wait excluded)."""
+    global _mtxdb_batch_calls, _mtxdb_batch_total_secs
+    if os.environ.get("SYNAPSE_MTXDB_STATS"):
+        _mtxdb_batch_calls += 1
+        _mtxdb_batch_total_secs += elapsed
 
 
 def _mtxdb_snapshot_metrics(ps: dict[str, Any]) -> dict[str, float]:
@@ -733,6 +745,9 @@ def _mtxdb_snapshot_metrics(ps: dict[str, Any]) -> dict[str, float]:
         "repack_count": float(ps.get("repack_count", 0) or 0),
         "repack_kept": float(ps.get("repack_kept", 0) or 0),
         "repack_dropped": float(ps.get("repack_dropped", 0) or 0),
+        "index_grow_count": float(ps.get("index_grow_count", 0) or 0),
+        "index_rebuild_count": float(ps.get("index_rebuild_count", 0) or 0),
+        "checkpoint_writes": float(ps.get("checkpoint_writes", 0) or 0),
         "sync_calls": float(sync_totals.get("calls", 0) or 0),
         "sync_us": float(sync_totals.get("total_us", 0) or 0),
         "fsync_us": float(sync_totals.get("pack_fsync_us", 0) or 0),
@@ -742,6 +757,7 @@ def _mtxdb_snapshot_metrics(ps: dict[str, Any]) -> dict[str, float]:
 def _mtxdb_snapshot_once() -> None:
     """Log one per-pool line with absolute values and since-last deltas."""
     global _mtxdb_persist_snapshot_calls, _mtxdb_persist_snapshot_total_secs
+    global _mtxdb_batch_snapshot_calls, _mtxdb_batch_snapshot_total_secs
     try:
         from synapse.storage.databases.embedded_engine import get_embedded_engine
 
@@ -767,7 +783,11 @@ def _mtxdb_snapshot_once() -> None:
             f"col={int(m['collection_count'])}(+{int(d['collection_count'])}) "
             f"shards={int(m['shard_count'])}(+{int(d['shard_count'])}) "
             f"cand={int(m['candidate_reads'])}(+{int(d['candidate_reads'])}) "
+            f"index=+{int(d['index_grow_count'])}/+{int(d['index_rebuild_count'])} "
+            f"checkpoint=+{int(d['checkpoint_writes'])} "
             f"repack={int(m['repack_count'])}/{int(m['repack_kept'])}/{int(m['repack_dropped'])} "
+            f"grow=+{int(d['index_grow_count'])} rebuild=+{int(d['index_rebuild_count'])} "
+            f"ckpt=+{int(d['checkpoint_writes'])} "
             f"sync=+{int(d['sync_calls'])}/+{d['sync_us'] / 1000:.1f}ms "
             f"fsync=+{d['fsync_us'] / 1000:.1f}ms]"
         )
@@ -785,16 +805,29 @@ def _mtxdb_snapshot_once() -> None:
         persist_total_secs = (
             _mtxdb_persist_total_secs - _mtxdb_persist_snapshot_total_secs
         )
-        persist_avg_ms = (
-            persist_total_secs / persist_calls * 1000 if persist_calls else 0.0
+        persist_avg = (
+            f"{persist_total_secs / persist_calls * 1000:.1f}ms"
+            if persist_calls
+            else "n/a"
+        )
+        batch_calls = _mtxdb_batch_calls - _mtxdb_batch_snapshot_calls
+        batch_total_secs = _mtxdb_batch_total_secs - _mtxdb_batch_snapshot_total_secs
+        batch_avg = (
+            f"{batch_total_secs / batch_calls * 1000:.1f}ms" if batch_calls else "n/a"
         )
         _mtxdb_persist_snapshot_calls = _mtxdb_persist_calls
         _mtxdb_persist_snapshot_total_secs = _mtxdb_persist_total_secs
+        _mtxdb_batch_snapshot_calls = _mtxdb_batch_calls
+        _mtxdb_batch_snapshot_total_secs = _mtxdb_batch_total_secs
         logger.info(
-            "mtxdb snapshot: persist=+%.1fms/%d avg=%.1fms %s",
+            "mtxdb snapshot: persist_total=+%.1fms/%d avg=%s "
+            "persist_batch=+%.1fms/%d avg=%s %s",
             persist_total_secs * 1000,
             persist_calls,
-            persist_avg_ms,
+            persist_avg,
+            batch_total_secs * 1000,
+            batch_calls,
+            batch_avg,
             "  ".join(segments),
         )
 
