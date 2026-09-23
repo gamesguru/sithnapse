@@ -3066,6 +3066,11 @@ class PersistEventsStore:
                     (event_id, room_id, internal_metadata, json, format_version)
                     for event_id, room_id, internal_metadata, json, format_version in event_json_rows
                 ],
+                # The event is about to become visible through the
+                # replication stream. Publish the EVENT_DAG pack/index state
+                # before the surrounding transaction can advertise it to
+                # other workers.
+                sync=True,
             )
 
         self.db_pool.simple_insert_many_txn(
