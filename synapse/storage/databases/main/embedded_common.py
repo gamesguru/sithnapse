@@ -919,6 +919,8 @@ class _FlushCoalescer:
         if not to_flush:
             return
         try:
+            if Pool.EVENT_DAG in to_flush:
+                ffi_count("event_dag_sync_coalesced", 1)
             _do_sync_pools(to_flush)
             self._dirty.difference_update(to_flush)
         except Exception:
@@ -1053,10 +1055,20 @@ def sync_now(pools: Iterable[Pool] | None = None) -> None:
     if not _engine_configured:
         return
 
-    if _coalescer is not None:
-        _coalescer.sync_now(pools)
-    elif pools is not None:
-        maybe_sync(SyncTier.DURABLE, pools=pools)
+    pool_set = set(pools) if pools is not None else None
+    includes_event_dag = pool_set is None or Pool.EVENT_DAG in pool_set
+    started = time.monotonic() if includes_event_dag else None
+    if includes_event_dag:
+        ffi_count("event_dag_sync_requests", 1)
+
+    try:
+        if _coalescer is not None:
+            _coalescer.sync_now(pool_set)
+        elif pool_set is not None:
+            maybe_sync(SyncTier.DURABLE, pools=pool_set)
+    finally:
+        if started is not None:
+            ffi_timing("event_dag_sync_ack_latency", time.monotonic() - started)
 
 
 def close_coalescer() -> None:
