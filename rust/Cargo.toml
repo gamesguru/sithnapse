@@ -75,6 +75,9 @@ futures = "0.3.31"
 tokio = { version = "1.44.2", features = ["rt", "rt-multi-thread"] }
 once_cell = "1.18.0"
 lru = "0.12"
+# Keep the transitive indexing graph compatible with Cargo 1.82.
+indexmap = "=2.7.1"
+encoding_rs = "=0.8.35"
 rezzy = { git = "https://github.com/gamesguru/rezzy.git", branch = "alpha" }
 mtxdb = { git = "https://github.com/wombat-foundation/mtxdb.git", branch = "alpha", features = ["multi-reader"] }
 
@@ -89,7 +92,7 @@ path = "benches/state_hamt.rs"
 harness = false
 
 [package.metadata.cargo-machete]
-ignored = ["icu_provider", "icu_locale_core"]
+ignored = ["icu_provider", "icu_locale_core", "indexmap", "encoding_rs"]
 
 [dev-dependencies]
 itertools = "0.14.0"
