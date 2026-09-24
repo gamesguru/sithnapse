@@ -14,12 +14,11 @@
 
 """Mirrors `event_to_state_groups` (event_id -> state_group, a pure point
 lookup with no aggregation/joins needed against the forward mapping -- see
-`_get_state_group_for_event(s)` in `state.py`) into the same embedded mtxdb
+`_get_state_group_for_event(s)` in `state.py`) into the embedded mtxdb
 keyspace `event_json` and the state HAMT use. When the embedded engine is
-configured, reads try mtxdb first and fall back to SQL on misses; persistence
-also keeps a SQL safety copy while mtxdb durability sync is deferred. See
-`_store_event_state_mappings_txn` in `events.py` and the partial-state rewrite
-in `state.py`.
+configured, new writes are mtxdb-exclusive; SQL rows are only legacy input
+for the one-time migration. See `_store_event_state_mappings_txn` in
+`events.py` and the partial-state rewrite in `state.py`.
 
 Every key here is namespaced (see `namespace` on each function, and
 `hamt_namespace` on the state datastore) for the same reason the HAMT

@@ -823,9 +823,8 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
         assert state_group is not None
 
         if getattr(self, "_embedded_event_json_enabled", False):
-            # Dual-write when the embedded engine is configured: update the
-            # mtxdb mapping and refcounts, then keep SQL in step as the safety
-            # copy/read fallback. Unlike put_event_to_state_group_batch's
+            # Update the mtxdb mapping and refcounts. Unlike
+            # put_event_to_state_group_batch's
             # initial-insert callers, this is a genuine rewrite of the state
             # group for this event: the old one loses a reference and the new
             # one gains one, so the refcount must move with it, not just get
@@ -855,12 +854,6 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
                     self._embedded_hamt_namespace,
                     [state_group],
                 )
-            self.db_pool.simple_update_txn(
-                txn,
-                table="event_to_state_groups",
-                keyvalues={"event_id": event.event_id},
-                updatevalues={"state_group": state_group},
-            )
             # Immediately sync STATE pool to mtxdb after SQL commit so reader workers
             # see the updated state group without waiting for debounce.
             txn.call_after(sync_now, [Pool.STATE])

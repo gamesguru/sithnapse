@@ -4007,20 +4007,6 @@ class PersistEventsStore:
                 self._embedded_hamt_namespace,
                 list(non_null_state_groups.items()),
             )
-            # Keep SQL as the committed safety copy while embedded mapping
-            # publication remains coalesced. Readers can fall back to this
-            # row if a worker observes the event before mtxdb has refreshed.
-            self.db_pool.simple_upsert_many_txn(
-                txn,
-                table="event_to_state_groups",
-                key_names=["event_id"],
-                key_values=[[event_id] for event_id in non_null_state_groups],
-                value_names=["state_group"],
-                value_values=[
-                    [state_group_id]
-                    for state_group_id in non_null_state_groups.values()
-                ],
-            )
             increment_state_group_refcounts_batch(
                 self._embedded_hamt_engine,
                 self._embedded_hamt_namespace,
@@ -4031,9 +4017,7 @@ class PersistEventsStore:
                 ],
             )
             # No immediate sync here. `_persist_events_txn` marks STATE dirty
-            # after SQL commit and the coalescer syncs it later; the SQL upsert
-            # above remains the committed safety copy while that durability
-            # sync is deferred. See put_event_to_state_group_batch's docstring.
+            # after the transaction and the coalescer syncs it later.
         else:
             self.db_pool.simple_upsert_many_txn(
                 txn,
@@ -4047,12 +4031,13 @@ class PersistEventsStore:
                 ],
             )
 
-        for event_id, state_group_id in state_groups.items():
-            txn.call_after(
-                self.store._get_state_group_for_event_sql.prefill,
-                (event_id,),
-                state_group_id,
-            )
+        if not getattr(self, "_embedded_event_json_enabled", False):
+            for event_id, state_group_id in state_groups.items():
+                txn.call_after(
+                    self.store._get_state_group_for_event_sql.prefill,
+                    (event_id,),
+                    state_group_id,
+                )
 
     def _update_min_depth_for_room_txn(
         self, txn: LoggingTransaction, room_id: str, depth: int
