@@ -1225,6 +1225,17 @@ fn wal_enabled() -> bool {
     wal_enabled_from(std::env::var("SYNAPSE_MTXDB_WAL").ok().as_deref())
 }
 
+/// Explicitly allow a read-only worker to use a durable snapshot when the
+/// database has a shared WAL. Without this override, a worker whose WAL mode
+/// differs from the writer fails closed instead of silently serving stale data.
+fn snapshot_workers_enabled() -> bool {
+    wal_enabled_from(
+        std::env::var("SYNAPSE_TEST_MTXDB_SNAPSHOT_WORKERS")
+            .ok()
+            .as_deref(),
+    )
+}
+
 /// Pure form of [`wal_enabled`] over an already-read value, so the parsing is
 /// unit-testable without mutating the process environment.
 ///
@@ -1394,6 +1405,14 @@ pub fn open_client_read_only(py: Python<'_>, path: String) -> PyResult<()> {
         let layout = DatabaseLayout::open(std::path::PathBuf::from(&path)).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("failed to open mtxdb layout: {}", e))
         })?;
+        if !wal_enabled()
+            && layout.shared_wal_path().is_file()
+            && !snapshot_workers_enabled()
+        {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "mtxdb WAL mode mismatch: shared wal.bin exists but this read-only worker has SYNAPSE_MTXDB_WAL disabled; set SYNAPSE_MTXDB_WAL=1 to use read-committed mode, or explicitly opt into a stale snapshot with SYNAPSE_TEST_MTXDB_SNAPSHOT_WORKERS=1",
+            ));
+        }
         let open_pool = |pool, name: &str| -> PyResult<Arc<PackfileStorage>> {
             let pool_dir = layout.pool_dir(pool).map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
