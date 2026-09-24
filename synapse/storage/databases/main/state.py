@@ -638,6 +638,7 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
              RuntimeError if the state is unknown at any of the given events
         """
         if getattr(self, "_embedded_event_json_enabled", False):
+            event_ids = list(event_ids)
             logger.info(
                 "[mtxdb-trace] worker=%s state-group read purpose=read_batch requested=%d event_ids=%s",
                 self._instance_name,
