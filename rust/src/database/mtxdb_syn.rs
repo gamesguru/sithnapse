@@ -7,9 +7,9 @@ use std::sync::{
 use mtxdb::storage::{DigestAlgorithm, StorageError};
 use mtxdb::SharedDatabase;
 use mtxdb::{
-    derive_collection_id, CollectionMetadata, DatabaseLayout, FrameIdPolicy, NodeData, NodeId,
-    PackfileStorage, PayloadPolicy, RecordIdentityRule, ShardType, StorageEngine,
-    MEMBER_NAMESPACE_INTL,
+    derive_collection_id, derive_group_full_id, derive_member_collection_id_from_group,
+    CollectionMetadata, DatabaseLayout, FrameIdPolicy, NodeData, NodeId, PackfileStorage,
+    PayloadPolicy, RecordIdentityRule, ShardType, StorageEngine, MEMBER_NAMESPACE_INTL,
 };
 use once_cell::sync::OnceCell;
 use pyo3::prelude::*;
@@ -251,24 +251,15 @@ pub const MEMBER_DOMAIN_PREFIX: &[u8] = b"mtxdb/member/v1";
 /// `BLAKE3-256("mtxdb/group/v1" || group_canonical_id)`
 #[must_use]
 pub fn group_full_logical_id(group_canonical_id: &[u8]) -> [u8; 32] {
-    let mut hasher = DigestAlgorithm::Blake3.hasher();
-    hasher.update(GROUP_DOMAIN_PREFIX);
-    hasher.update(group_canonical_id);
-    hasher.finalize()
+    derive_group_full_id(group_canonical_id)
 }
 
 /// Derive the 128-bit physical collection ID for a member collection within its pool:
 /// `BLAKE3-256("mtxdb/member/v1" || member_namespace || group_full_logical_id)[0..16]`
 #[must_use]
 pub fn member_collection_id(tag: [u8; 4], group_full_logical_id: &[u8; 32]) -> [u8; 16] {
-    let mut hasher = DigestAlgorithm::Blake3.hasher();
-    hasher.update(MEMBER_DOMAIN_PREFIX);
-    hasher.update(&tag);
-    hasher.update(group_full_logical_id);
-    let digest = hasher.finalize();
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&digest[..16]);
-    out
+    derive_member_collection_id_from_group(tag, *group_full_logical_id)
+        .expect("member namespace is one of the mtxdb-defined namespaces")
 }
 
 /// Derive the State HAMT room collection ID from its room entity canonical ID (`!room:server`).
@@ -1044,8 +1035,10 @@ pub struct MtxdbStore {
 impl NodeStore for MtxdbStore {
     fn get_raw(&self, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
         if let Some((room_prefix, structural_hash)) = parse_node_key(key) {
-            let mut room_id = [0u8; 16];
-            room_id[..ROOM_PREFIX_LEN].copy_from_slice(&room_prefix);
+            // The writer routes nodes through the canonical room/member
+            // collection derived by room_id_from_prefix.  The prefix is only
+            // part of the logical node key; it is not the pack collection ID.
+            let room_id = room_id_from_prefix(&room_prefix);
 
             let mut node_id = [0u8; 16];
             node_id.copy_from_slice(&structural_hash[..16]);
