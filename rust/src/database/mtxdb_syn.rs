@@ -117,7 +117,7 @@ pub(crate) fn event_dag_db() -> PyResult<&'static Arc<PackfileStorage>> {
     Ok(&pools()?.event_dag)
 }
 
-fn auth_chain_db() -> PyResult<&'static Arc<PackfileStorage>> {
+pub(crate) fn auth_chain_db() -> PyResult<&'static Arc<PackfileStorage>> {
     Ok(&pools()?.auth_chain)
 }
 

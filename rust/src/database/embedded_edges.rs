@@ -1,4 +1,4 @@
-//! Embedded Event Edges storage in the `event_dag` mtxdb packfile storage pool.
+//! Embedded Event Edges storage in the `edges` mtxdb packfile storage pool.
 //!
 //! Stores the DAG edges connecting Matrix events:
 //! - Backward edges: `event_id -> [(prev_event_id, is_state)]` (immutable, write-once).
@@ -22,7 +22,7 @@ use pyo3::types::PyDict;
 use sha2::{Digest, Sha256};
 
 use super::mtxdb_syn::{
-    assert_writable, event_dag_db, event_dag_room_id, event_locator_collection_id, event_node_id,
+    assert_writable, auth_chain_db, event_locator_collection_id, event_node_id, prev_edges_room_id,
     RMW_LOCK,
 };
 
@@ -139,7 +139,7 @@ fn insert_event_locator(
     room_id: &str,
     event_id: &str,
 ) {
-    let room_collection = event_dag_room_id(namespace, room_id);
+    let room_collection = prev_edges_room_id(namespace, room_id);
     let identity = event_node_id(namespace, event_id);
     let locator_collection = event_locator_collection_id(namespace, &identity);
     locators.entry(locator_collection).or_default().insert(
@@ -148,7 +148,7 @@ fn insert_event_locator(
     );
 }
 
-/// Batch put event edges into the room-aware event_dag pool:
+/// Batch put event edges into the room-aware PREV collection in the Edges pool:
 /// 1. Backward edges: `event_id -> [(prev_event_id, is_state)]`
 /// 2. Forward edges: `prev_event_id -> [child_event_id]` (appended and deduplicated)
 ///
@@ -172,7 +172,7 @@ pub fn event_edges_put(
         let _guard = RMW_LOCK
             .lock()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}")))?;
-        let engine = event_dag_db()?;
+        let engine = auth_chain_db()?;
 
         let mut backward_map: HashMap<(String, String), Vec<(String, bool)>> = HashMap::new();
         let mut forward_map: HashMap<(String, String), Vec<String>> = HashMap::new();
@@ -193,7 +193,7 @@ pub fn event_edges_put(
         let mut locator_puts: HashMap<[u8; 16], HashMap<NodeId, NodeData>> = HashMap::new();
 
         for ((room_id, event_id), edges) in backward_map {
-            let room_collection = event_dag_room_id(&namespace, &room_id);
+            let room_collection = prev_edges_room_id(&namespace, &room_id);
             let edge_node = event_edges_backward_node_id(&namespace, &event_id);
 
             let encoded = encode_backward_edges(&edges);
@@ -210,7 +210,7 @@ pub fn event_edges_put(
         // touching many parents costs one round trip per room collection.
         let mut forward_by_collection: HashMap<[u8; 16], Vec<NodeId>> = HashMap::new();
         for (room_id, prev_event_id) in forward_map.keys() {
-            let room_collection = event_dag_room_id(&namespace, room_id);
+            let room_collection = prev_edges_room_id(&namespace, room_id);
             let forward_node = event_edges_forward_node_id(&namespace, prev_event_id);
             forward_by_collection
                 .entry(room_collection)
@@ -237,7 +237,7 @@ pub fn event_edges_put(
         }
 
         for ((room_id, prev_event_id), new_children) in forward_map {
-            let room_collection = event_dag_room_id(&namespace, &room_id);
+            let room_collection = prev_edges_room_id(&namespace, &room_id);
             let forward_node = event_edges_forward_node_id(&namespace, &prev_event_id);
 
             // Every (room, parent) key was read above, so the cached list can
@@ -303,7 +303,7 @@ pub fn event_edges_get_backward(
     event_ids: Vec<String>,
 ) -> PyResult<Vec<(String, Option<Vec<(String, bool)>>)>> {
     py.detach(|| {
-        let engine = event_dag_db()?;
+        let engine = auth_chain_db()?;
         let node_ids: Vec<NodeId> = event_ids
             .iter()
             .map(|id| event_node_id(&namespace, id))
@@ -374,7 +374,7 @@ pub fn event_edges_get_forward(
     prev_event_ids: Vec<String>,
 ) -> PyResult<Vec<(String, Option<Vec<String>>)>> {
     py.detach(|| {
-        let engine = event_dag_db()?;
+        let engine = auth_chain_db()?;
         let node_ids: Vec<NodeId> = prev_event_ids
             .iter()
             .map(|id| event_node_id(&namespace, id))
@@ -567,7 +567,7 @@ pub fn event_edges_delete(
             let lock_started = std::time::Instant::now();
             let _guard = RMW_LOCK.lock().unwrap();
             let lock_wait = lock_started.elapsed().as_secs_f64();
-            let engine = event_dag_db()?;
+            let engine = auth_chain_db()?;
             let locator_started = std::time::Instant::now();
             let node_ids: Vec<NodeId> = event_ids
                 .iter()
