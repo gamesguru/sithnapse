@@ -280,18 +280,19 @@ pub(crate) fn state_hamt_room_id(room_id: &str) -> [u8; 16] {
 
 fn room_id_from_prefix(room_prefix: &[u8]) -> [u8; 16] {
     if !room_prefix.is_empty() && room_prefix[0] == b'!' {
-        let group_digest = group_full_logical_id(room_prefix);
-        member_collection_id(*b"STAT", &group_digest)
-    } else {
-        let mut hasher = DigestAlgorithm::Blake3.hasher();
-        hasher.update(MEMBER_DOMAIN_PREFIX);
-        hasher.update(b"STAT");
-        hasher.update(room_prefix);
-        let digest = hasher.finalize();
-        let mut out = [0u8; 16];
-        out.copy_from_slice(&digest[..16]);
-        out
+        if let Ok(room_id) = std::str::from_utf8(room_prefix) {
+            return state_hamt_room_id(room_id);
+        }
     }
+
+    let mut hasher = DigestAlgorithm::Blake3.hasher();
+    hasher.update(MEMBER_DOMAIN_PREFIX);
+    hasher.update(b"STAT");
+    hasher.update(room_prefix);
+    let digest = hasher.finalize();
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest[..16]);
+    out
 }
 
 /// Store HAMT root records in their room's own State collection, rather
@@ -2916,9 +2917,11 @@ pub fn get_state_hamt_nodes_batch(
     room_prefix: Vec<u8>,
     hashes: Vec<Vec<u8>>,
 ) -> PyResult<Vec<Option<Vec<u8>>>> {
-    let mut room_id = [0u8; 16];
-    let prefix_len = std::cmp::min(room_prefix.len(), 16);
-    room_id[..prefix_len].copy_from_slice(&room_prefix[..prefix_len]);
+    // Keep reads on the same room-scoped collection as put_state_hamt_nodes.
+    // The old reader truncated room_prefix directly while the writer derived
+    // the collection ID, so every node written by the new path became
+    // invisible to incremental state persistence.
+    let room_id = room_id_from_prefix(&room_prefix);
 
     let node_ids: Vec<NodeId> = hashes
         .iter()
