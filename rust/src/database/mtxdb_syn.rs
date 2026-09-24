@@ -2950,6 +2950,12 @@ fn stats_to_dict(
         sd.set_item("journal_records", st.journal_records)?;
         sd.set_item("journal_waiters", st.journal_waiters)?;
         sd.set_item("journal_coalesced", st.journal_coalesced)?;
+        sd.set_item("journal_in_flight", st.journal_in_flight)?;
+        sd.set_item("dirty_lock_wait_us", st.dirty_lock_wait.as_micros() as u64)?;
+        sd.set_item(
+            "pending_publish_age_us",
+            st.pending_publish_age.as_micros() as u64,
+        )?;
         sd.set_item("total_us", st.total.as_micros() as u64)?;
         d.set_item("last_sync_timings", sd)?;
     }
@@ -2977,6 +2983,11 @@ fn stats_to_dict(
     sd.set_item("journal_records", st.journal_records)?;
     sd.set_item("journal_waiters", st.journal_waiters)?;
     sd.set_item("journal_coalesced", st.journal_coalesced)?;
+    sd.set_item("dirty_lock_wait_us", st.dirty_lock_wait.as_micros() as u64)?;
+    sd.set_item(
+        "pending_publish_age_us",
+        st.pending_publish_age.as_micros() as u64,
+    )?;
     sd.set_item(
         "max_journal_lock_wait_us",
         st.max_journal_lock_wait.as_micros() as u64,

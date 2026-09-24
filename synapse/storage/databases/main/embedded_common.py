@@ -737,6 +737,7 @@ def record_mtxdb_persist_batch_timing(elapsed: float) -> None:
 
 def _mtxdb_snapshot_metrics(ps: dict[str, Any]) -> dict[str, float]:
     sync_totals = ps.get("sync_totals") or {}
+    last_sync = ps.get("last_sync_timings") or {}
     return {
         "index_bytes": float(ps.get("index_bytes", 0) or 0),
         "collection_count": float(ps.get("collection_count", 0) or 0),
@@ -767,6 +768,11 @@ def _mtxdb_snapshot_metrics(ps: dict[str, Any]) -> dict[str, float]:
         "journal_records": float(sync_totals.get("journal_records", 0) or 0),
         "journal_waiters": float(sync_totals.get("journal_waiters", 0) or 0),
         "journal_coalesced": float(sync_totals.get("journal_coalesced", 0) or 0),
+        "journal_in_flight": float(last_sync.get("journal_in_flight", 0) or 0),
+        "dirty_lock_wait_us": float(sync_totals.get("dirty_lock_wait_us", 0) or 0),
+        "pending_publish_age_us": float(
+            sync_totals.get("pending_publish_age_us", 0) or 0
+        ),
     }
 
 
@@ -817,7 +823,10 @@ def _mtxdb_snapshot_once() -> None:
             f" bytes=+{int(d['journal_bytes'])}"
             f" records=+{int(d['journal_records'])}"
             f" waiters=+{int(d['journal_waiters'])}"
-            f" coalesced=+{int(d['journal_coalesced'])}]"
+            f" coalesced=+{int(d['journal_coalesced'])}"
+            f" inflight={int(m['journal_in_flight'])}"
+            f" dirty_lock+{d['dirty_lock_wait_us'] / 1000:.1f}ms"
+            f" pending_age+{d['pending_publish_age_us'] / 1000:.1f}ms]"
         )
 
     # FFI forward-edge cost, only recorded when SYNAPSE_PG_TIMINGS is set.
