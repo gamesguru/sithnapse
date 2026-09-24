@@ -756,6 +756,17 @@ def _mtxdb_snapshot_metrics(ps: dict[str, Any]) -> dict[str, float]:
         "delta_log_us": float(sync_totals.get("delta_log_us", 0) or 0),
         "sync_checkpoint_us": float(sync_totals.get("checkpoint_us", 0) or 0),
         "wal_us": float(sync_totals.get("wal_us", 0) or 0),
+        "journal_lock_wait_us": float(sync_totals.get("journal_lock_wait_us", 0) or 0),
+        "journal_pending_wait_us": float(
+            sync_totals.get("journal_pending_wait_us", 0) or 0
+        ),
+        "journal_append_us": float(sync_totals.get("journal_append_us", 0) or 0),
+        "journal_fsync_us": float(sync_totals.get("journal_fsync_us", 0) or 0),
+        "journal_sync_calls": float(sync_totals.get("journal_sync_calls", 0) or 0),
+        "journal_bytes": float(sync_totals.get("journal_bytes", 0) or 0),
+        "journal_records": float(sync_totals.get("journal_records", 0) or 0),
+        "journal_waiters": float(sync_totals.get("journal_waiters", 0) or 0),
+        "journal_coalesced": float(sync_totals.get("journal_coalesced", 0) or 0),
     }
 
 
@@ -797,7 +808,16 @@ def _mtxdb_snapshot_once() -> None:
             f"fsync=+{d['fsync_us'] / 1000:.1f}ms "
             f"phases(ms)=flush+{d['flush_us'] / 1000:.1f}/side+{d['sidecar_us'] / 1000:.1f}"
             f"/delta+{d['delta_log_us'] / 1000:.1f}/ckpt+{d['sync_checkpoint_us'] / 1000:.1f}"
-            f"/wal+{d['wal_us'] / 1000:.1f}]"
+            f"/wal+{d['wal_us'] / 1000:.1f} "
+            f"journal(ms)=lock+{d['journal_lock_wait_us'] / 1000:.1f}"
+            f"/pending+{d['journal_pending_wait_us'] / 1000:.1f}"
+            f"/append+{d['journal_append_us'] / 1000:.1f}"
+            f"/fsync+{d['journal_fsync_us'] / 1000:.1f}"
+            f" calls=+{int(d['journal_sync_calls'])}"
+            f" bytes=+{int(d['journal_bytes'])}"
+            f" records=+{int(d['journal_records'])}"
+            f" waiters=+{int(d['journal_waiters'])}"
+            f" coalesced=+{int(d['journal_coalesced'])}]"
         )
 
     # FFI forward-edge cost, only recorded when SYNAPSE_PG_TIMINGS is set.
