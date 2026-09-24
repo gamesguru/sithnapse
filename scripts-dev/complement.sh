@@ -488,17 +488,17 @@ main() {
     # in-container path themselves.
     SYNAPSE_EMBEDDED_HAMT_PATH="${SYNAPSE_EMBEDDED_HAMT_PATH:-/data/embedded_hamt}"
 
-    # Optional: keep every homeserver's mtxdb store on a host directory (e.g. a
-    # large, slow disk) instead of Docker's overlay. Each homeserver writes to
-    # its own subdirectory named after its logical server name
-    # (@SERVER_NAME@ is expanded by start_for_complement.sh). All workers for
-    # one homeserver must share this directory and WAL; hs1, hs2, etc. remain
-    # isolated from one another. Nothing here deletes old directories; prune
+    # Optional: keep every container's mtxdb store on a host directory (e.g. a
+    # large, slow disk) instead of Docker's overlay. Each container writes to
+    # its own subdirectory named after its hostname (@HOSTNAME@ is expanded
+    # by start_for_complement.sh), because hs1, hs2, etc. are separate logical
+    # Synapse databases. A shared directory would mix their data and leak one
+    # test's state into another. Nothing here deletes those directories; prune
     # the host directory yourself.
     if [[ -n "${COMPLEMENT_MTXDB_HOST_DIR:-}" ]]; then
       mkdir -p "$COMPLEMENT_MTXDB_HOST_DIR"
       export COMPLEMENT_HOST_MOUNTS="${COMPLEMENT_HOST_MOUNTS:+$COMPLEMENT_HOST_MOUNTS;}$COMPLEMENT_MTXDB_HOST_DIR:/mtxdb-host"
-      SYNAPSE_EMBEDDED_HAMT_PATH="/mtxdb-host/@SERVER_NAME@"
+      SYNAPSE_EMBEDDED_HAMT_PATH="/mtxdb-host/@HOSTNAME@"
 
       # The Complement image starts as root and uses UID/GID to drop Synapse
       # privileges. Pass through the invoking user's numeric identity so
@@ -590,7 +590,7 @@ main() {
   if [[ -n "${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:-}" ]]; then
     mtxdb_location=" at ${PASS_SYNAPSE_EMBEDDED_HAMT_PATH:-<not set>}"
     if [[ -n "${COMPLEMENT_MTXDB_HOST_DIR:-}" ]]; then
-      mtxdb_location+=" (host: ${COMPLEMENT_MTXDB_HOST_DIR%/}/<server-name>)"
+      mtxdb_location+=" (host: ${COMPLEMENT_MTXDB_HOST_DIR%/}/<container-hostname>)"
     fi
   fi
   echo "Database: ${PASS_SYNAPSE_COMPLEMENT_DATABASE} (workers: ${PASS_SYNAPSE_COMPLEMENT_USE_WORKERS:-false}) | Embedded HAMT engine: ${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:-<none>}${mtxdb_location}${PASS_SYNAPSE_MTXDB_NO_SYNC:+ (no_sync)}${PASS_SYNAPSE_MTXDB_WAL:+ (wal)}${PASS_SYNAPSE_MTXDB_STATS:+ (stats)}${PASS_SYNAPSE_MTXDB_FORCE_SYNC_EVENT_JSON:+ (force-sync-event-json)}" >&2
