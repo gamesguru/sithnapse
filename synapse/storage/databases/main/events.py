@@ -68,9 +68,8 @@ from synapse.storage.database import (
 )
 from synapse.storage.databases.main.embedded_common import (
     Pool,
-    SyncTier,
     mark_dirty,
-    maybe_publish,
+    sync_now,
 )
 from synapse.storage.databases.main.embedded_event_edges import (
     embedded_event_edges_is_writable,
@@ -1329,10 +1328,9 @@ class PersistEventsStore:
         # non-retrying request from another worker process -- make_join and
         # make_knock fetch auth events, /sync and /join read the membership. In
         # the exclusive engine there is no SQL fallback, so the coalescer's
-        # 250-500ms window is a hard 404 there. Publish those writes before the
-        # response that depends on them is returned; the coalescer will make
-        # them durable later. Backfilled events are skipped -- no live request
-        # waits on them.
+        # 250-500ms window is a hard 404 there. Make those writes durable before
+        # the response that depends on them is returned. Backfilled events are
+        # skipped -- no live request waits on them.
         if self._embedded_hamt_engine:
             needs_auth_chain_barrier = any(
                 ev.type in AUTH_CHAIN_EVENT_TYPES
@@ -1343,10 +1341,10 @@ class PersistEventsStore:
             )
             # Every live event with a state group can be read immediately by
             # another worker (for example, when it becomes a prev event for a
-            # subsequent send).  Publishing the mapping through the
-            # coalescer is therefore racy: the event can be visible in SQL
-            # before its embedded state-group mapping is visible to the
-            # reader. Do the cheap targeted STATE publication for all such
+            # subsequent send). Deferring the mapping through the coalescer is
+            # therefore racy: the event can be visible in SQL before its
+            # embedded state-group mapping is visible to the reader. Do the
+            # targeted STATE durability barrier for all such
             # events. Rejected events use state_group_before_event as their
             # mapping, rather than ctx.state_group, so include those too.
             # Auth-chain state changes still need the broader barrier
@@ -1379,13 +1377,9 @@ class PersistEventsStore:
                 for ev, ctx in de_outliered_events
             )
             if self._embedded_event_json_enabled and needs_auth_chain_barrier:
-                txn.call_after(
-                    maybe_publish,
-                    SyncTier.DURABLE,
-                    [Pool.STATE, Pool.AUTH_CHAIN, Pool.EVENT_DAG],
-                )
+                txn.call_after(sync_now, [Pool.STATE, Pool.AUTH_CHAIN, Pool.EVENT_DAG])
             elif self._embedded_event_json_enabled and needs_state_barrier:
-                txn.call_after(maybe_publish, SyncTier.DURABLE, [Pool.STATE])
+                txn.call_after(sync_now, [Pool.STATE])
                 # A live state event can also have written chain-cover links
                 # (see `calculate_chain_cover_index_for_events`) even when its
                 # type is not in `AUTH_CHAIN_EVENT_TYPES`. Those links have no
