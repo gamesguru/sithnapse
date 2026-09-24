@@ -789,7 +789,7 @@ def _mtxdb_snapshot_once() -> None:
     try:
         from synapse.storage.databases.embedded_engine import get_embedded_engine
 
-        s = get_embedded_engine("mtxdb").stats()
+        s = get_embedded_engine("mtxdb").stats_snapshot()
     except Exception:
         return
 

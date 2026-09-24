@@ -3014,6 +3014,16 @@ fn stats_to_dict(
 /// called; write/batch/sync counters are always-on.
 #[pyfunction]
 pub fn stats(py: Python<'_>) -> PyResult<Py<PyDict>> {
+    stats_impl(py, false)
+}
+
+/// Return runtime stats and atomically take/reset per-interval diagnostics.
+#[pyfunction]
+pub fn stats_snapshot(py: Python<'_>) -> PyResult<Py<PyDict>> {
+    stats_impl(py, true)
+}
+
+fn stats_impl(py: Python<'_>, take_diagnostics: bool) -> PyResult<Py<PyDict>> {
     let snapshots = py.detach(
         || -> Result<
             Vec<(
@@ -3024,21 +3034,36 @@ pub fn stats(py: Python<'_>) -> PyResult<Py<PyDict>> {
             pyo3::PyErr,
         > {
             let pools = pools()?;
+            let state_stats = pools.state.stats();
+            let event_dag_stats = pools.event_dag.stats();
+            let auth_chain_stats = pools.auth_chain.stats();
             Ok(vec![
                 (
                     "state",
-                    pools.state.stats(),
-                    pools.state.take_sync_diagnostics(),
+                    state_stats.clone(),
+                    if take_diagnostics {
+                        pools.state.take_sync_diagnostics()
+                    } else {
+                        state_stats.sync_diagnostics.clone()
+                    },
                 ),
                 (
                     "event_dag",
-                    pools.event_dag.stats(),
-                    pools.event_dag.take_sync_diagnostics(),
+                    event_dag_stats.clone(),
+                    if take_diagnostics {
+                        pools.event_dag.take_sync_diagnostics()
+                    } else {
+                        event_dag_stats.sync_diagnostics.clone()
+                    },
                 ),
                 (
                     "auth_chain",
-                    pools.auth_chain.stats(),
-                    pools.auth_chain.take_sync_diagnostics(),
+                    auth_chain_stats.clone(),
+                    if take_diagnostics {
+                        pools.auth_chain.take_sync_diagnostics()
+                    } else {
+                        auth_chain_stats.sync_diagnostics.clone()
+                    },
                 ),
             ])
         },
@@ -3186,6 +3211,7 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(sync_event_dag, m)?)?;
     m.add_function(wrap_pyfunction!(sync_auth_chain, m)?)?;
     m.add_function(wrap_pyfunction!(stats, m)?)?;
+    m.add_function(wrap_pyfunction!(stats_snapshot, m)?)?;
     m.add_function(wrap_pyfunction!(reset_stats, m)?)?;
     m.add_function(wrap_pyfunction!(set_stats_enabled, m)?)?;
     m.add_function(wrap_pyfunction!(set_checkpoint_rewrite_budget, m)?)?;
