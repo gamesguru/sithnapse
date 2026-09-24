@@ -4,9 +4,13 @@ use std::sync::{
     Arc, Mutex,
 };
 
-use mtxdb::storage::StorageError;
+use mtxdb::storage::{DigestAlgorithm, StorageError};
 use mtxdb::SharedDatabase;
-use mtxdb::{DatabaseLayout, NodeData, NodeId, PackfileStorage, ShardType, StorageEngine};
+use mtxdb::{
+    derive_collection_id, CollectionMetadata, DatabaseLayout, FrameIdPolicy, NodeData, NodeId,
+    PackfileStorage, PayloadPolicy, RecordIdentityRule, ShardType, StorageEngine,
+    POOL_DST_INTERNAL,
+};
 use once_cell::sync::OnceCell;
 use pyo3::prelude::*;
 use sha2::{Digest, Sha256};
@@ -218,11 +222,76 @@ fn root_node_id(namespace: &str, state_group: i64) -> [u8; 16] {
     id
 }
 
+// -----------------------------------------------------------------------------
+// Collection Group & Member Identity Derivations
+// -----------------------------------------------------------------------------
+// Ownership & Contract Division:
+// - `mtxdb` owns derivation, wire encoding, and validation (recomputing the
+//   128-bit member collection key from group canonical ID and member namespace,
+//   and detecting 128-bit truncation collisions when an existing collection's
+//   stored full identity/namespace disagrees with requested metadata).
+// - `sithnapse` supplies the Matrix-specific canonical ID (`!room:server`),
+//   member namespace (`STAT`, `EVNT`, `PREV`, `AUTH`), role, and schema.
+//
+// Metadata & Hierarchy Distinctions:
+// - Physical pool:      State / Events / Edges (known from layout handle)
+// - Member namespace:   STAT / EVNT / PREV / AUTH
+// - Group canonical ID: !room:server
+// - Group full logical: derived 256-bit BLAKE3 digest
+// - Member collection:  derived 128-bit routing key (the collection key itself;
+//                       not stored as a redundant metadata field)
+
+/// Domain separation prefix for collection group full logical ID derivation.
+pub const GROUP_DOMAIN_PREFIX: &[u8] = b"mtxdb/group/v1";
+
+/// Domain separation prefix for member collection ID derivation.
+pub const MEMBER_DOMAIN_PREFIX: &[u8] = b"mtxdb/member/v1";
+
+/// Derive the full 256-bit logical identity for a collection group / entity (e.g. `!room:server`):
+/// `BLAKE3-256("mtxdb/group/v1" || group_canonical_id)`
+#[must_use]
+pub fn group_full_logical_id(group_canonical_id: &[u8]) -> [u8; 32] {
+    let mut hasher = DigestAlgorithm::Blake3.hasher();
+    hasher.update(GROUP_DOMAIN_PREFIX);
+    hasher.update(group_canonical_id);
+    hasher.finalize()
+}
+
+/// Derive the 128-bit physical collection ID for a member collection within its pool:
+/// `BLAKE3-256("mtxdb/member/v1" || member_namespace || group_full_logical_id)[0..16]`
+#[must_use]
+pub fn member_collection_id(tag: [u8; 4], group_full_logical_id: &[u8; 32]) -> [u8; 16] {
+    let mut hasher = DigestAlgorithm::Blake3.hasher();
+    hasher.update(MEMBER_DOMAIN_PREFIX);
+    hasher.update(&tag);
+    hasher.update(group_full_logical_id);
+    let digest = hasher.finalize();
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest[..16]);
+    out
+}
+
+/// Derive the State HAMT room collection ID from its room entity canonical ID (`!room:server`).
+#[must_use]
+pub(crate) fn state_hamt_room_id(room_id: &str) -> [u8; 16] {
+    let group_digest = group_full_logical_id(room_id.as_bytes());
+    member_collection_id(*b"STAT", &group_digest)
+}
+
 fn room_id_from_prefix(room_prefix: &[u8]) -> [u8; 16] {
-    let mut room_id = [0u8; 16];
-    let prefix_len = std::cmp::min(room_prefix.len(), 16);
-    room_id[..prefix_len].copy_from_slice(&room_prefix[..prefix_len]);
-    room_id
+    if !room_prefix.is_empty() && room_prefix[0] == b'!' {
+        let group_digest = group_full_logical_id(room_prefix);
+        member_collection_id(*b"STAT", &group_digest)
+    } else {
+        let mut hasher = DigestAlgorithm::Blake3.hasher();
+        hasher.update(MEMBER_DOMAIN_PREFIX);
+        hasher.update(b"STAT");
+        hasher.update(room_prefix);
+        let digest = hasher.finalize();
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&digest[..16]);
+        out
+    }
 }
 
 /// Store HAMT root records in their room's own State collection, rather
@@ -1077,17 +1146,18 @@ fn deserialize_manifest(bytes: &[u8]) -> Vec<(i64, i64, i64)> {
 // room's data with a single `delete_collection` call.
 
 /// A room-scoped collection id for the short-id/edge closure skeleton,
-/// distinct from `namespace_room_id`'s namespace-only derivation.
-fn auth_chain_closure_room_id(namespace: &str, room_id: &str) -> [u8; 16] {
-    let mut hasher = Sha256::new();
-    hasher.update(b"authchain_closure_room:");
-    hasher.update(namespace.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(room_id.as_bytes());
-    let hash = hasher.finalize();
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&hash[..16]);
-    out
+/// derived as the member collection with the `AUTH` tag under the room's group identity.
+pub(crate) fn auth_chain_closure_room_id(_namespace: &str, room_id: &str) -> [u8; 16] {
+    let group_digest = group_full_logical_id(room_id.as_bytes());
+    member_collection_id(*b"AUTH", &group_digest)
+}
+
+/// A room-scoped collection id for previous edges (DAG topology),
+/// derived as the member collection with the `PREV` tag under the room's group identity.
+#[must_use]
+pub(crate) fn prev_edges_room_id(_namespace: &str, room_id: &str) -> [u8; 16] {
+    let group_digest = group_full_logical_id(room_id.as_bytes());
+    member_collection_id(*b"PREV", &group_digest)
 }
 
 /// Distinct tag prefixes keep the counter, forward mapping, reverse
@@ -2046,10 +2116,14 @@ pub fn auth_chain_purge_room(py: Python<'_>, namespace: String, room_id: String)
 // Generic KV (Event JSON / Event-to-State-Group)
 // -----------------------------------------------------------------------------
 
-fn kv_room_id() -> [u8; 16] {
-    let mut id = [0u8; 16];
-    id[0] = 1; // Dedicated room_id for global flat KV data
-    id
+pub(crate) fn kv_room_id() -> [u8; 16] {
+    derive_collection_id(Some(POOL_DST_INTERNAL), b"sys:flat-kv")
+}
+
+#[allow(dead_code)]
+#[must_use]
+pub(crate) fn state_group_aux_collection_id() -> [u8; 16] {
+    derive_collection_id(Some(POOL_DST_INTERNAL), b"sys:matrix-state-groups")
 }
 
 fn kv_node_id(key: &[u8]) -> [u8; 16] {
@@ -2223,37 +2297,133 @@ fn event_meta_node_id(namespace: &str, event_id: &str) -> NodeId {
 
 /// Deterministic locator collection for `node_id`: one of
 /// `EVENT_LOCATOR_BUCKETS` collections, picked from low bits of the event's
-/// own node id so a server's event ids spread evenly. Domain-separated from
-/// every other collection derivation -- deliberately NOT State's 8-byte
-/// room-prefix scheme, whose fixed-width zero-extension semantics are tuned
-/// for 8-byte prefixes, not arbitrary room_ids.
-pub(crate) fn event_locator_collection_id(namespace: &str, node_id: &NodeId) -> [u8; 16] {
+/// own node id so a server's event ids spread evenly across canonical locator collections
+/// (`sys:event-locator:{bucket}`).
+pub(crate) fn event_locator_collection_id(_namespace: &str, node_id: &NodeId) -> [u8; 16] {
     let bucket = u32::from_le_bytes([node_id[0], node_id[1], node_id[2], node_id[3]])
         % EVENT_LOCATOR_BUCKETS;
-    let mut hasher = Sha256::new();
-    hasher.update(b"event_json:locator:");
-    hasher.update(namespace.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(bucket.to_be_bytes());
-    let hash = hasher.finalize();
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&hash[..16]);
-    out
+    let canonical = format!("sys:event-locator:{bucket}");
+    derive_collection_id(Some(*b"EVNT"), canonical.as_bytes())
 }
 
-/// Room-scoped EventDag collection id: a domain-separated 128-bit derivation
-/// from `(namespace, room_id)`, the same shape `auth_chain_closure_room_id`
-/// uses. Not a copy of State's room-prefix scheme.
-pub(crate) fn event_dag_room_id(namespace: &str, room_id: &str) -> [u8; 16] {
-    let mut hasher = Sha256::new();
-    hasher.update(b"event_json:dag:");
-    hasher.update(namespace.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(room_id.as_bytes());
-    let hash = hasher.finalize();
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&hash[..16]);
-    out
+/// Room-scoped EventDag collection id: derived as the member collection
+/// with the `EVNT` tag under the room's group identity (`!room:server`).
+pub(crate) fn event_dag_room_id(_namespace: &str, room_id: &str) -> [u8; 16] {
+    let group_digest = group_full_logical_id(room_id.as_bytes());
+    member_collection_id(*b"EVNT", &group_digest)
+}
+
+// -----------------------------------------------------------------------------
+// Driver-Owned Collection Metadata Constructors
+// -----------------------------------------------------------------------------
+// Sithnapse supplies the Matrix-specific group canonical ID (`!room:server` or
+// `sys:*`), the member namespace (`STAT`, `EVNT`, `PREV`, `AUTH`), and the
+// schema/role for each collection family. mtxdb recomputes the 128-bit member
+// ID and cross-checks the metadata to detect 128-bit truncation collisions.
+
+#[allow(dead_code)]
+#[must_use]
+pub(crate) fn flat_kv_metadata() -> CollectionMetadata {
+    CollectionMetadata {
+        pool_dst: Some(POOL_DST_INTERNAL),
+        collection_canonical_id: b"sys:flat-kv".to_vec(),
+        record_id_rule: RecordIdentityRule {
+            policy: FrameIdPolicy::ExternalCanonicalIdToCrosscheck,
+            digest_algorithm: DigestAlgorithm::Sha256,
+        },
+        payload: PayloadPolicy::Source,
+        extension: None,
+    }
+}
+
+#[allow(dead_code)]
+#[must_use]
+pub(crate) fn state_group_aux_metadata() -> CollectionMetadata {
+    CollectionMetadata {
+        pool_dst: Some(POOL_DST_INTERNAL),
+        collection_canonical_id: b"sys:matrix-state-groups".to_vec(),
+        record_id_rule: RecordIdentityRule {
+            policy: FrameIdPolicy::ExternalCanonicalIdToCrosscheck,
+            digest_algorithm: DigestAlgorithm::Sha256,
+        },
+        payload: PayloadPolicy::Source,
+        extension: None,
+    }
+}
+
+#[allow(dead_code)]
+#[must_use]
+pub(crate) fn event_locator_metadata(bucket: u32) -> CollectionMetadata {
+    CollectionMetadata {
+        pool_dst: Some(*b"EVNT"),
+        collection_canonical_id: format!("sys:event-locator:{bucket}").into_bytes(),
+        record_id_rule: RecordIdentityRule {
+            policy: FrameIdPolicy::ExternalCanonicalIdToCrosscheck,
+            digest_algorithm: DigestAlgorithm::Sha256,
+        },
+        payload: PayloadPolicy::Source,
+        extension: None,
+    }
+}
+
+#[allow(dead_code)]
+#[must_use]
+pub(crate) fn event_dag_metadata(room_id: &str) -> CollectionMetadata {
+    CollectionMetadata {
+        pool_dst: Some(*b"EVNT"),
+        collection_canonical_id: room_id.as_bytes().to_vec(),
+        record_id_rule: RecordIdentityRule {
+            policy: FrameIdPolicy::ExternalCanonicalIdToCrosscheck,
+            digest_algorithm: DigestAlgorithm::Sha256,
+        },
+        payload: PayloadPolicy::Source,
+        extension: None,
+    }
+}
+
+#[allow(dead_code)]
+#[must_use]
+pub(crate) fn auth_chain_metadata(room_id: &str) -> CollectionMetadata {
+    CollectionMetadata {
+        pool_dst: Some(*b"AUTH"),
+        collection_canonical_id: room_id.as_bytes().to_vec(),
+        record_id_rule: RecordIdentityRule {
+            policy: FrameIdPolicy::ExternalCanonicalIdToCrosscheck,
+            digest_algorithm: DigestAlgorithm::Sha256,
+        },
+        payload: PayloadPolicy::Source,
+        extension: None,
+    }
+}
+
+#[allow(dead_code)]
+#[must_use]
+pub(crate) fn prev_edges_metadata(room_id: &str) -> CollectionMetadata {
+    CollectionMetadata {
+        pool_dst: Some(*b"PREV"),
+        collection_canonical_id: room_id.as_bytes().to_vec(),
+        record_id_rule: RecordIdentityRule {
+            policy: FrameIdPolicy::ExternalCanonicalIdToCrosscheck,
+            digest_algorithm: DigestAlgorithm::Sha256,
+        },
+        payload: PayloadPolicy::Source,
+        extension: None,
+    }
+}
+
+#[allow(dead_code)]
+#[must_use]
+pub(crate) fn state_hamt_metadata(room_id: &str) -> CollectionMetadata {
+    CollectionMetadata {
+        pool_dst: Some(*b"STAT"),
+        collection_canonical_id: room_id.as_bytes().to_vec(),
+        record_id_rule: RecordIdentityRule {
+            policy: FrameIdPolicy::ExternalCanonicalIdToCrosscheck,
+            digest_algorithm: DigestAlgorithm::Sha256,
+        },
+        payload: PayloadPolicy::Source,
+        extension: None,
+    }
 }
 
 /// Put split event_json records into the room-aware mirror: a locator entry
@@ -3275,9 +3445,20 @@ pub(crate) mod auth_chain_closure_tests {
         let a = auth_chain_closure_room_id("ns-collision", "!roomA:example.org");
         let b = auth_chain_closure_room_id("ns-collision", "!roomB:example.org");
         let c = auth_chain_closure_room_id("other-ns", "!roomA:example.org");
+        // Distinct rooms produce distinct member collection IDs (probabilistic domain separation).
         assert_ne!(a, b);
-        assert_ne!(a, c);
-        assert_ne!(b, c);
+        // The authoritative entity canonical ID is the room ID itself:
+        assert_eq!(a, c);
+        // Member collections within the same room are domain-separated by their tags:
+        let ev = event_dag_room_id("ns-collision", "!roomA:example.org");
+        let prev = prev_edges_room_id("ns-collision", "!roomA:example.org");
+        let stat = state_hamt_room_id("!roomA:example.org");
+        assert_ne!(a, ev);
+        assert_ne!(a, prev);
+        assert_ne!(a, stat);
+        assert_ne!(ev, prev);
+        assert_ne!(ev, stat);
+        assert_ne!(prev, stat);
     }
 
     #[test]
@@ -3544,9 +3725,45 @@ mod event_json_mirror_tests {
         let a = event_dag_room_id("ns-ev", "!ra:example.org");
         let b = event_dag_room_id("ns-ev", "!rb:example.org");
         let c = event_dag_room_id("other-ns", "!ra:example.org");
+        // Distinct room canonical IDs produce distinct member collection IDs:
         assert_ne!(a, b);
-        assert_ne!(a, c);
-        assert_ne!(b, c);
+        // Room ID is the authoritative entity canonical identity:
+        assert_eq!(a, c);
+
+        // Cross-domain tags within the same room entity produce distinct physical collection IDs:
+        let prev = prev_edges_room_id("ns-ev", "!ra:example.org");
+        let auth = auth_chain_closure_room_id("ns-ev", "!ra:example.org");
+        let stat = state_hamt_room_id("!ra:example.org");
+        assert_ne!(a, prev);
+        assert_ne!(a, auth);
+        assert_ne!(a, stat);
+        assert_ne!(prev, auth);
+    }
+
+    #[test]
+    fn group_and_member_derivations_are_deterministic() {
+        let room = "!canonical-room:example.org";
+        let group_id_1 = group_full_logical_id(room.as_bytes());
+        let group_id_2 = group_full_logical_id(room.as_bytes());
+        assert_eq!(group_id_1, group_id_2);
+
+        let evnt_col = member_collection_id(*b"EVNT", &group_id_1);
+        let prev_col = member_collection_id(*b"PREV", &group_id_1);
+        let auth_col = member_collection_id(*b"AUTH", &group_id_1);
+        let stat_col = member_collection_id(*b"STAT", &group_id_1);
+
+        assert_ne!(evnt_col, prev_col);
+        assert_ne!(evnt_col, auth_col);
+        assert_ne!(evnt_col, stat_col);
+        assert_ne!(prev_col, auth_col);
+        assert_ne!(prev_col, stat_col);
+        assert_ne!(auth_col, stat_col);
+
+        // Verification against constructor helpers:
+        assert_eq!(evnt_col, event_dag_room_id("", room));
+        assert_eq!(prev_col, prev_edges_room_id("", room));
+        assert_eq!(auth_col, auth_chain_closure_room_id("", room));
+        assert_eq!(stat_col, state_hamt_room_id(room));
     }
 
     #[test]
