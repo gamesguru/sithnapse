@@ -1355,6 +1355,12 @@ class PersistEventsStore:
                 txn.call_after(sync_now, [Pool.STATE, Pool.AUTH_CHAIN, Pool.EVENT_DAG])
             elif self._embedded_event_json_enabled and needs_state_barrier:
                 txn.call_after(sync_now, [Pool.STATE])
+                # A live state event can also have written chain-cover links
+                # (see `calculate_chain_cover_index_for_events`) even when its
+                # type is not in `AUTH_CHAIN_EVENT_TYPES`. Those links have no
+                # SQL fallback, so keep them on the coalescer rather than
+                # dropping the AUTH_CHAIN dirty mark entirely.
+                txn.call_after(mark_dirty, Pool.AUTH_CHAIN)
             else:
                 txn.call_after(mark_dirty, Pool.STATE)
                 txn.call_after(mark_dirty, Pool.AUTH_CHAIN)
