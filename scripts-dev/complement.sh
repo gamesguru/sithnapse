@@ -487,6 +487,20 @@ main() {
     # writable there (the image's WORKDIR) rather than making them supply an
     # in-container path themselves.
     SYNAPSE_EMBEDDED_HAMT_PATH="${SYNAPSE_EMBEDDED_HAMT_PATH:-/data/embedded_hamt}"
+
+    # Optional: keep every container's mtxdb store on a host directory (e.g. a
+    # large, slow disk) instead of Docker's overlay. Each container writes to
+    # its own subdirectory named after its hostname (@HOSTNAME@ is expanded
+    # by start_for_complement.sh), because the engine keys its files by pid and
+    # pids repeat across containers -- a shared flat directory would collide
+    # and leak one test's state into another. Nothing here deletes those
+    # directories; prune the host directory yourself.
+    if [[ -n "${COMPLEMENT_MTXDB_HOST_DIR:-}" ]]; then
+      mkdir -p "$COMPLEMENT_MTXDB_HOST_DIR"
+      export COMPLEMENT_HOST_MOUNTS="${COMPLEMENT_HOST_MOUNTS:+$COMPLEMENT_HOST_MOUNTS;}$COMPLEMENT_MTXDB_HOST_DIR:/mtxdb-host"
+      SYNAPSE_EMBEDDED_HAMT_PATH="/mtxdb-host/@HOSTNAME@"
+    fi
+
     export PASS_SYNAPSE_EMBEDDED_HAMT_PATH="$SYNAPSE_EMBEDDED_HAMT_PATH"
   fi
 

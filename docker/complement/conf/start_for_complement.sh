@@ -4,6 +4,16 @@
 
 set -e
 
+# scripts-dev/complement.sh points the mtxdb store at a per-container
+# subdirectory of a host-mounted directory by passing a path containing
+# @HOSTNAME@. Expand it here (the container hostname is unique per container)
+# and hand the directory to whichever user owns /data, so Synapse can write it.
+if [[ "${SYNAPSE_EMBEDDED_HAMT_PATH:-}" == *@HOSTNAME@* ]]; then
+  export SYNAPSE_EMBEDDED_HAMT_PATH="${SYNAPSE_EMBEDDED_HAMT_PATH//@HOSTNAME@/$(hostname)}"
+  mkdir -p "$SYNAPSE_EMBEDDED_HAMT_PATH"
+  chown -R --reference=/data "$SYNAPSE_EMBEDDED_HAMT_PATH"
+fi
+
 echo "Complement Synapse launcher"
 echo "  Args: $*"
 echo "  Env: SYNAPSE_COMPLEMENT_DATABASE=$SYNAPSE_COMPLEMENT_DATABASE SYNAPSE_COMPLEMENT_USE_WORKERS=$SYNAPSE_COMPLEMENT_USE_WORKERS SYNAPSE_COMPLEMENT_USE_ASYNCIO_REACTOR=$SYNAPSE_COMPLEMENT_USE_ASYNCIO_REACTOR"
