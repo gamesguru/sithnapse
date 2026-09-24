@@ -1240,8 +1240,10 @@ class PersistEventsStore:
         )
 
         # _update_outliers_txn filters out any events which have already been
-        # persisted, and returns the filtered list.
-        events_and_contexts = self._update_outliers_txn(
+        # persisted, and returns the filtered list. It also returns the events it
+        # de-outliered: those are removed from the list but still wrote embedded
+        # state-group mappings, so the barrier below must consider them too.
+        events_and_contexts, de_outliered_events = self._update_outliers_txn(
             txn, events_and_contexts=events_and_contexts
         )
 
@@ -1341,15 +1343,36 @@ class PersistEventsStore:
             # coalescer is therefore racy: the event can be visible in SQL
             # before its embedded state-group mapping is visible to the
             # reader.  Do the cheap targeted STATE barrier for all such
-            # events.  Auth-chain state changes still need the broader barrier
+            # events. Rejected events use state_group_before_event as their
+            # mapping, rather than ctx.state_group, so include those too.
+            # Auth-chain state changes still need the broader barrier
             # below because their event-DAG and auth-chain records are also
             # read by non-retrying worker requests.
             needs_state_barrier = any(
-                ctx.state_group is not None
+                (
+                    ctx.state_group is not None
+                    or (ctx.rejected and ctx.state_group_before_event is not None)
+                )
                 and not ev.internal_metadata.is_outlier()
                 and ev.internal_metadata.stream_ordering is not None
                 and ev.internal_metadata.stream_ordering >= 0
                 for ev, ctx in events_and_contexts
+            )
+            # A de-outliered event is excluded from `events_and_contexts` above (it
+            # was already in the events table) but its ex-outlier pass just wrote an
+            # event->state-group mapping on this writer (the referenced state group's
+            # HAMT root normally already exists). The next event in the same /send
+            # transaction reads that mapping back as a prev. `_update_outliers_txn`
+            # keeps the outlier's (often backfilled, negative) stream ordering, so the
+            # live-event filter above would skip it; a de-outlier is always a live
+            # operation, so it needs the STATE barrier regardless of stream ordering.
+            needs_state_barrier = needs_state_barrier or any(
+                (
+                    ctx.state_group is not None
+                    or (ctx.rejected and ctx.state_group_before_event is not None)
+                )
+                and not ev.internal_metadata.is_outlier()
+                for ev, ctx in de_outliered_events
             )
             if self._embedded_event_json_enabled and needs_auth_chain_barrier:
                 txn.call_after(sync_now, [Pool.STATE, Pool.AUTH_CHAIN, Pool.EVENT_DAG])
@@ -2928,7 +2951,7 @@ class PersistEventsStore:
         self,
         txn: LoggingTransaction,
         events_and_contexts: list[EventPersistencePair],
-    ) -> list[EventPersistencePair]:
+    ) -> tuple[list[EventPersistencePair], list[EventPersistencePair]]:
         """Update any outliers with new event info.
 
         This turns outliers into ex-outliers (unless the new event was rejected), and
@@ -2939,7 +2962,11 @@ class PersistEventsStore:
             events_and_contexts: events we are persisting
 
         Returns:
-            new list, without events which are already in the events table.
+            A pair of lists: the events which are not already in the events table, and
+            the events which were de-outliered by this call. The latter are removed
+            from the first list but still need their embedded event->state-group
+            mapping made visible to other worker processes -- see the STATE barrier
+            in `_persist_events_txn`.
 
         Raises:
             PartialStateConflictError: if attempting to persist a partial state event in
@@ -2966,6 +2993,7 @@ class PersistEventsStore:
         )
 
         to_remove = set()
+        de_outliered: list[EventPersistencePair] = []
         for event, context in events_and_contexts:
             outlier_persisted = have_persisted.get(event.event_id)
             logger.debug(
@@ -3035,7 +3063,11 @@ class PersistEventsStore:
                     # we deliver this down /sync.
                     self.store.insert_sticky_events_txn(txn, [event])
 
-        return [ec for ec in events_and_contexts if ec[0] not in to_remove]
+                de_outliered.append((event, context))
+
+        return [
+            ec for ec in events_and_contexts if ec[0] not in to_remove
+        ], de_outliered
 
     def _store_event_txn(
         self,
