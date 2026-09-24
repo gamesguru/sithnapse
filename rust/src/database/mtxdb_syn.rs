@@ -4,9 +4,13 @@ use std::sync::{
     Arc, Mutex,
 };
 
-use mtxdb::journal::Journal;
+use mtxdb::journal::{Journal, JournalCoordinator};
 use mtxdb::storage::StorageError;
-use mtxdb::{DatabaseLayout, NodeData, NodeId, PackfileStorage, ShardType, StorageEngine};
+#[cfg(not(target_arch = "wasm32"))]
+use mtxdb::SharedWalLock;
+use mtxdb::{
+    DatabaseLayout, NodeData, NodeId, PackfileStorage, ShardType, StorageEngine, WalLayout,
+};
 use once_cell::sync::OnceCell;
 use pyo3::prelude::*;
 use sha2::{Digest, Sha256};
@@ -17,6 +21,8 @@ struct MtxdbPools {
     state: Arc<PackfileStorage>,
     event_dag: Arc<PackfileStorage>,
     auth_chain: Arc<PackfileStorage>,
+    #[cfg(not(target_arch = "wasm32"))]
+    _shared_wal_lock: Option<SharedWalLock>,
 }
 
 /// Base directory for the state_group -> room_prefix room-index file (see
@@ -1309,51 +1315,100 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
         // The journal is the read-committed overlay's source of truth for
         // read-only workers: a committed group is visible to a worker's
         // `get_read_committed` before the coalescer fsyncs it, which is the
-        // cross-process read-after-write path. Its group sequence is drawn
-        // from one counter shared by all three pools so the per-pool overlays
-        // agree on a global order; seed it above every segment's recovered
-        // next sequence. See mtxdb-core's `enable_journal_with_sequence`.
+        // cross-process read-after-write path. Shared roots use one tagged
+        // segment and coordinator; legacy roots retain the old per-pool
+        // segments and shared sequence allocator.
         //
         // Still gated on `wal_enabled()`: enabling it by default moves the
         // sync fsync target onto the journal, which has not been
         // A/B-verified on the writer + read-only-worker lane. Set
         // SYNAPSE_MTXDB_WAL=1 to exercise the overlay.
+        #[cfg(not(target_arch = "wasm32"))]
+        let shared_wal_lock = if wal_enabled() && layout.wal_layout() == WalLayout::Shared {
+            Some(SharedWalLock::acquire(&path).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "failed to acquire mtxdb shared-WAL lock at {}: {}",
+                    path, e
+                ))
+            })?)
+        } else {
+            None
+        };
+
         if wal_enabled() {
-            let mut next_sequence = 1u64;
-            for dir in [&state_dir, &event_dag_dir, &auth_chain_dir] {
-                let wal_path = dir.join("wal.bin");
-                let (journal, _scan) = Journal::open(&wal_path).map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "failed to open mtxdb WAL at {}: {}",
-                        wal_path.display(),
-                        e
-                    ))
-                })?;
-                next_sequence = next_sequence.max(journal.next_sequence());
-            }
-            let sequence = Arc::new(AtomicU64::new(next_sequence));
-            for (store, dir) in [
-                (&state, &state_dir),
-                (&event_dag, &event_dag_dir),
-                (&auth_chain, &auth_chain_dir),
-            ] {
-                let wal_path = dir.join("wal.bin");
-                store
-                    .enable_journal_with_sequence(&wal_path, Arc::clone(&sequence))
-                    .map_err(|e| {
+            match layout.wal_layout() {
+                WalLayout::Shared => {
+                    let wal_path = layout.shared_wal_path().map_err(|e| {
                         pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "failed to enable mtxdb WAL at {}: {}",
+                            "failed to resolve mtxdb shared WAL: {}",
+                            e
+                        ))
+                    })?;
+                    let (journal, scan) = Journal::open_shared(&wal_path).map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "failed to open shared mtxdb WAL at {}: {}",
                             wal_path.display(),
                             e
                         ))
                     })?;
-                store.replay_journal().map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "failed to replay mtxdb WAL at {}: {}",
-                        wal_path.display(),
-                        e
-                    ))
-                })?;
+                    let coordinator = Arc::new(JournalCoordinator::new(journal, &scan));
+                    for (store, pool) in [
+                        (&state, ShardType::State),
+                        (&event_dag, ShardType::EventDag),
+                        (&auth_chain, ShardType::AuthChain),
+                    ] {
+                        store
+                            .enable_shared_journal(Arc::clone(&coordinator), pool)
+                            .map_err(|e| {
+                                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                                    "failed to attach {pool:?} pool to shared mtxdb WAL: {e}"
+                                ))
+                            })?;
+                        store.replay_journal().map_err(|e| {
+                            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                                "failed to replay shared mtxdb WAL for {pool:?}: {e}"
+                            ))
+                        })?;
+                    }
+                }
+                WalLayout::PerPool => {
+                    let mut next_sequence = 1u64;
+                    for dir in [&state_dir, &event_dag_dir, &auth_chain_dir] {
+                        let wal_path = dir.join("wal.bin");
+                        let (journal, _scan) = Journal::open(&wal_path).map_err(|e| {
+                            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                                "failed to open mtxdb WAL at {}: {}",
+                                wal_path.display(),
+                                e
+                            ))
+                        })?;
+                        next_sequence = next_sequence.max(journal.next_sequence());
+                    }
+                    let sequence = Arc::new(AtomicU64::new(next_sequence));
+                    for (store, dir) in [
+                        (&state, &state_dir),
+                        (&event_dag, &event_dag_dir),
+                        (&auth_chain, &auth_chain_dir),
+                    ] {
+                        let wal_path = dir.join("wal.bin");
+                        store
+                            .enable_journal_with_sequence(&wal_path, Arc::clone(&sequence))
+                            .map_err(|e| {
+                                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                                    "failed to enable mtxdb WAL at {}: {}",
+                                    wal_path.display(),
+                                    e
+                                ))
+                            })?;
+                        store.replay_journal().map_err(|e| {
+                            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                                "failed to replay mtxdb WAL at {}: {}",
+                                wal_path.display(),
+                                e
+                            ))
+                        })?;
+                    }
+                }
             }
         }
         let min_interval_secs = std::env::var("SYNAPSE_MTXDB_CHECKPOINT_MIN_INTERVAL_SECS")
@@ -1374,6 +1429,8 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
             state,
             event_dag,
             auth_chain,
+            #[cfg(not(target_arch = "wasm32"))]
+            _shared_wal_lock: shared_wal_lock,
         });
         let _ = OPENER_PID.set(std::process::id());
         let _ = WRITE_MODE.set(true);
@@ -1413,13 +1470,25 @@ pub fn open_client_read_only(py: Python<'_>, path: String) -> PyResult<()> {
                     "failed to resolve mtxdb {name} pool directory: {e}"
                 ))
             })?;
-            let store =
-                PackfileStorage::open_read_committed(pool_dir.clone(), pool_dir.join("wal.bin"))
-                    .map_err(|e| {
+            let store = match layout.wal_layout() {
+                WalLayout::Shared => PackfileStorage::open_read_committed_shared(
+                    pool_dir.clone(),
+                    layout.shared_wal_path().map_err(|e| {
                         pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "failed to open mtxdb {name} pool read-only: {e}"
+                            "failed to resolve mtxdb shared WAL: {e}"
                         ))
-                    })?;
+                    })?,
+                    pool,
+                ),
+                WalLayout::PerPool => {
+                    PackfileStorage::open_read_committed(pool_dir.clone(), pool_dir.join("wal.bin"))
+                }
+            }
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "failed to open mtxdb {name} pool read-only: {e}"
+                ))
+            })?;
             Ok(Arc::new(store))
         };
         let state = open_pool(ShardType::State, "state")?;
@@ -1429,6 +1498,8 @@ pub fn open_client_read_only(py: Python<'_>, path: String) -> PyResult<()> {
             state,
             event_dag,
             auth_chain,
+            #[cfg(not(target_arch = "wasm32"))]
+            _shared_wal_lock: None,
         });
         let _ = OPENER_PID.set(std::process::id());
         let _ = WRITE_MODE.set(false);
