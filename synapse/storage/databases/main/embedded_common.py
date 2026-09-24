@@ -955,14 +955,13 @@ def namespace_hash(namespace: str) -> bytes:
 
 
 class SyncTier(Enum):
-    """Classification for embedded-sidecar write durability.
+    """Classification for embedded-sidecar write visibility and durability.
 
     DURABLE: No SQL fallback exists, or the write uses accumulating/delta
-    semantics (counters, auth-chain links, HAMT roots).  A lost unflushed
-    write here means silent data loss or incorrect state, so sync() is
-    called after every batch.
+    semantics (counters, auth-chain links, HAMT roots). Such writes need
+    immediate cross-process publication and eventual durability.
 
-    CACHE: A SQL fallback exists on the read path.  A lost unflushed write
+    CACHE: A SQL fallback exists on the read path. A lost unflushed write
     just means a slower read via that fallback, not data loss.  sync() is
     skipped to avoid per-event fsync cost on the hottest write path.
     """
@@ -994,9 +993,9 @@ def maybe_sync(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
     """Sync mtxdb for DURABLE writes; no-op for CACHE writes.
 
     A DURABLE write has no SQL fallback, or uses accumulating/delta
-    semantics (counters, auth-chain links, HAMT roots). A lost unflushed
-    write here means silent data loss or incorrect state, so sync() is
-    called after every batch.
+    semantics (counters, auth-chain links, HAMT roots). This function is the
+    durability path; request-path visibility barriers should use
+    ``maybe_publish`` so they do not pay an fsync per transaction.
 
     A CACHE write has a SQL fallback on the read path. A lost unflushed
     write just means a slower read via that fallback, not data loss.
@@ -1049,6 +1048,48 @@ def maybe_sync(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
         _st = time.monotonic()
         engine.sync_auth_chain()
         ffi_timing("ffi_sync_auth_chain", time.monotonic() - _st)
+
+
+def maybe_publish(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
+    """Publish mtxdb mutations for cross-process visibility without fsync.
+
+    This advances the journal's read-committed boundary, but deliberately does
+    not make the mutations durable. The coalesced ``maybe_sync`` path remains
+    responsible for durability. This is useful for request-path barriers where
+    another worker must see a committed SQL transaction immediately, but paying
+    an HDD fsync for every transaction would be excessive.
+    """
+    if not _engine_configured or tier is not SyncTier.DURABLE or _sync_disabled:
+        return
+
+    from synapse.storage.databases.embedded_engine import get_embedded_engine
+
+    engine = get_embedded_engine("mtxdb")
+    if pools is None:
+        _st = time.monotonic()
+        engine.publish_state()
+        ffi_timing("ffi_publish_state", time.monotonic() - _st)
+        _st = time.monotonic()
+        engine.publish_event_dag()
+        ffi_timing("ffi_publish_event_dag", time.monotonic() - _st)
+        _st = time.monotonic()
+        engine.publish_auth_chain()
+        ffi_timing("ffi_publish_auth_chain", time.monotonic() - _st)
+        return
+
+    pool_set = set(pools)
+    if Pool.STATE in pool_set:
+        _st = time.monotonic()
+        engine.publish_state()
+        ffi_timing("ffi_publish_state", time.monotonic() - _st)
+    if Pool.EVENT_DAG in pool_set:
+        _st = time.monotonic()
+        engine.publish_event_dag()
+        ffi_timing("ffi_publish_event_dag", time.monotonic() - _st)
+    if Pool.AUTH_CHAIN in pool_set:
+        _st = time.monotonic()
+        engine.publish_auth_chain()
+        ffi_timing("ffi_publish_auth_chain", time.monotonic() - _st)
 
 
 # ── Commit-aware flush coalescer ──────────────────────────────────────

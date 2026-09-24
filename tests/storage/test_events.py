@@ -31,7 +31,7 @@ from synapse.events.snapshot import EventContext
 from synapse.rest import admin
 from synapse.rest.client import login, room
 from synapse.server import HomeServer
-from synapse.storage.databases.main.embedded_common import Pool
+from synapse.storage.databases.main.embedded_common import Pool, SyncTier
 from synapse.types import StateMap
 from synapse.util.clock import Clock
 
@@ -162,9 +162,9 @@ class EventsTestCase(HomeserverTestCase):
         event.internal_metadata.outlier = True
 
         # Persist it as an outlier first: the shape a partial-state resync pull
-        # leaves behind. This only coalesces STATE, so it must not sync.
+        # leaves behind. This only coalesces STATE, so it must not publish.
         with mock.patch(
-            "synapse.storage.databases.main.events.sync_now"
+            "synapse.storage.databases.main.events.maybe_publish"
         ) as outlier_sync:
             self.get_success(
                 persistence.persist_event(
@@ -187,11 +187,11 @@ class EventsTestCase(HomeserverTestCase):
         )
 
         with mock.patch(
-            "synapse.storage.databases.main.events.sync_now"
-        ) as de_outlier_sync:
+            "synapse.storage.databases.main.events.maybe_publish"
+        ) as de_outlier_publish:
             self.get_success(persistence.persist_event(event, live_context))
 
-        de_outlier_sync.assert_called_once_with([Pool.STATE])
+        de_outlier_publish.assert_called_once_with(SyncTier.DURABLE, [Pool.STATE])
 
     def test_get_senders_for_event_ids(self) -> None:
         """Tests the `get_senders_for_event_ids` storage function."""

@@ -1333,6 +1333,14 @@ mod wal_env_tests {
             assert!(wal_enabled_from(Some(truthy)), "{truthy:?} must enable WAL");
         }
     }
+
+    #[test]
+    fn wal_matrix_pool_policies_disables_state_compression() {
+        let policies = mtxdb::matrix_pool_policies();
+        assert!(!policies.state.compress);
+        assert!(policies.event_dag.compress);
+        assert!(policies.edges.compress);
+    }
 }
 
 #[pyfunction]
@@ -1355,7 +1363,11 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
         // event-dag/auth-chain pools (JSON-ish payloads) keep compression on.
         let shared_database = if wal_enabled() {
             Some(
-                SharedDatabase::open(std::path::PathBuf::from(&path)).map_err(|e| {
+                SharedDatabase::open_with_policies(
+                    std::path::PathBuf::from(&path),
+                    mtxdb::matrix_pool_policies(),
+                )
+                .map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
                         "failed to open shared mtxdb database: {}",
                         e
@@ -2989,10 +3001,49 @@ pub fn sync_auth_chain(py: Python<'_>) -> PyResult<()> {
     py.detach(|| sync_one("auth-chain", auth_chain_db()?))
 }
 
+/// Publish queued mutations for the `state` pool without fsyncing them.
+///
+/// This advances the read-committed WAL boundary so read-only workers can see
+/// the mapping immediately. Durability is provided separately by the
+/// coalesced `sync_state` path.
+#[pyfunction]
+pub fn publish_state(py: Python<'_>) -> PyResult<()> {
+    assert_writable()?;
+    py.detach(|| publish_one("state", state_db()?))
+}
+
+/// Publish queued mutations for the `event_dag` pool without fsyncing them.
+#[pyfunction]
+pub fn publish_event_dag(py: Python<'_>) -> PyResult<()> {
+    assert_writable()?;
+    py.detach(|| publish_one("event-dag", event_dag_db()?))
+}
+
+/// Publish queued mutations for the `auth_chain` pool without fsyncing them.
+#[pyfunction]
+pub fn publish_auth_chain(py: Python<'_>) -> PyResult<()> {
+    assert_writable()?;
+    py.detach(|| publish_one("auth-chain", auth_chain_db()?))
+}
+
 fn sync_one(name: &str, engine: &Arc<PackfileStorage>) -> PyResult<()> {
     engine.sync().map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb sync error for {name} pool: {e}"))
     })
+}
+
+fn publish_one(name: &str, engine: &Arc<PackfileStorage>) -> PyResult<()> {
+    let journal = engine.journal().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "mtxdb publish error for {name} pool: journal is unavailable"
+        ))
+    })?;
+    journal.publish_pending().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "mtxdb publish error for {name} pool: {e}"
+        ))
+    })?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -3408,6 +3459,9 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(sync_state, m)?)?;
     m.add_function(wrap_pyfunction!(sync_event_dag, m)?)?;
     m.add_function(wrap_pyfunction!(sync_auth_chain, m)?)?;
+    m.add_function(wrap_pyfunction!(publish_state, m)?)?;
+    m.add_function(wrap_pyfunction!(publish_event_dag, m)?)?;
+    m.add_function(wrap_pyfunction!(publish_auth_chain, m)?)?;
     m.add_function(wrap_pyfunction!(stats, m)?)?;
     m.add_function(wrap_pyfunction!(stats_snapshot, m)?)?;
     m.add_function(wrap_pyfunction!(reset_stats, m)?)?;
