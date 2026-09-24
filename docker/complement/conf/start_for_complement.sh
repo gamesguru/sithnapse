@@ -4,14 +4,14 @@
 
 set -e
 
-# scripts-dev/complement.sh points the mtxdb store at a per-container
+# scripts-dev/complement.sh points the mtxdb store at a per-homeserver
 # subdirectory of a host-mounted directory by passing a path containing
-# @HOSTNAME@. Expand it here (the container hostname is unique per container)
-# and hand the directory to whichever user owns /data, so Synapse can write it.
-if [[ "${SYNAPSE_EMBEDDED_HAMT_PATH:-}" == *@HOSTNAME@* ]]; then
-  export SYNAPSE_EMBEDDED_HAMT_PATH="${SYNAPSE_EMBEDDED_HAMT_PATH//@HOSTNAME@/$(hostname)}"
-  mkdir -p "$SYNAPSE_EMBEDDED_HAMT_PATH"
-  chown -R --reference=/data "$SYNAPSE_EMBEDDED_HAMT_PATH"
+# @SERVER_NAME@. Expand it here. Workers for one homeserver therefore share
+# the same store and WAL, while different homeservers remain isolated.
+if [[ "${SYNAPSE_EMBEDDED_HAMT_PATH:-}" == *@SERVER_NAME@* ]]; then
+	export SYNAPSE_EMBEDDED_HAMT_PATH="${SYNAPSE_EMBEDDED_HAMT_PATH//@SERVER_NAME@/${SERVER_NAME}}"
+	mkdir -p "$SYNAPSE_EMBEDDED_HAMT_PATH"
+	chown -R --reference=/data "$SYNAPSE_EMBEDDED_HAMT_PATH"
 fi
 
 echo "Complement Synapse launcher"
@@ -19,8 +19,8 @@ echo "  Args: $*"
 echo "  Env: SYNAPSE_COMPLEMENT_DATABASE=$SYNAPSE_COMPLEMENT_DATABASE SYNAPSE_COMPLEMENT_USE_WORKERS=$SYNAPSE_COMPLEMENT_USE_WORKERS SYNAPSE_COMPLEMENT_USE_ASYNCIO_REACTOR=$SYNAPSE_COMPLEMENT_USE_ASYNCIO_REACTOR"
 
 function log {
-    d=$(printf '%(%Y-%m-%d %H:%M:%S)T,%.3s\n' ${EPOCHREALTIME/./ })
-    echo "$d $*"
+	d=$(printf '%(%Y-%m-%d %H:%M:%S)T,%.3s\n' ${EPOCHREALTIME/./ })
+	echo "$d $*"
 }
 
 # Set the server name of the homeserver
@@ -29,62 +29,60 @@ export SYNAPSE_SERVER_NAME=${SERVER_NAME}
 # No need to report stats here
 export SYNAPSE_REPORT_STATS=no
 
-
 case "$SYNAPSE_COMPLEMENT_DATABASE" in
-  postgres)
-    # Set postgres authentication details which will be placed in the homeserver config file
-    export POSTGRES_PASSWORD=somesecret
-    export POSTGRES_USER=postgres
-    export POSTGRES_HOST=localhost
+postgres)
+	# Set postgres authentication details which will be placed in the homeserver config file
+	export POSTGRES_PASSWORD=somesecret
+	export POSTGRES_USER=postgres
+	export POSTGRES_HOST=localhost
 
-    # configure supervisord to start postgres
-    export START_POSTGRES=true
-    ;;
+	# configure supervisord to start postgres
+	export START_POSTGRES=true
+	;;
 
-  sqlite|"")
-    # Set START_POSTGRES to false unless it has already been set
-    # (i.e. by another container image inheriting our own).
-    export START_POSTGRES=${START_POSTGRES:-false}
-    ;;
+sqlite | "")
+	# Set START_POSTGRES to false unless it has already been set
+	# (i.e. by another container image inheriting our own).
+	export START_POSTGRES=${START_POSTGRES:-false}
+	;;
 
-  *)
-    echo "Unknown Synapse database: SYNAPSE_COMPLEMENT_DATABASE=$SYNAPSE_COMPLEMENT_DATABASE" >&2
-    exit 1
-    ;;
+*)
+	echo "Unknown Synapse database: SYNAPSE_COMPLEMENT_DATABASE=$SYNAPSE_COMPLEMENT_DATABASE" >&2
+	exit 1
+	;;
 esac
 
-
 if [[ -n "$SYNAPSE_COMPLEMENT_USE_WORKERS" ]]; then
-  # Specify the workers to test with
-  # Allow overriding by explicitly setting SYNAPSE_WORKER_TYPES outside, while still
-  # utilizing WORKERS=1 for backwards compatibility.
-  # -n True if the length of string is non-zero.
-  # -z True if the length of string is zero.
-  if [[ -z "$SYNAPSE_WORKER_TYPES" ]]; then
-    # Under mtxdb, event persistence must stay on the main process, so no
-    # dedicated event_persister workers are spawned at all. workers.py's
-    # embedded_hamt_engine validation requires BOTH that there is exactly
-    # one events writer (a second persister would hit mtxdb's exclusive-lock
-    # rejection at startup) AND that the sole writer is main itself (the
-    # embedded-HAMT background migration only ever runs on main, and would
-    # crash writing through a read-only-opened store otherwise). Omitting
-    # event_persister leaves stream_writers.events unset, which defaults to
-    # ["main"] (see WriterLocations) and satisfies both checks; a single
-    # event_persister would pass the first but fail the second.
-    #
-    # The background_worker goes for the same reason: its generated config
-    # sets run_background_tasks_on to itself, but the third embedded_hamt
-    # check requires background tasks to run on main (main's own
-    # background-updates poll loop runs unconditionally, and mtxdb writes
-    # have no cross-instance coordination to survive a second concurrent
-    # loop). Without it, the setting defaults back to main.
-    event_persister_entry="event_persister:2, "
-    background_worker_entry="background_worker, "
-    if [[ -n "$SYNAPSE_EMBEDDED_HAMT_ENGINE" ]]; then
-      event_persister_entry=""
-      background_worker_entry=""
-    fi
-    export SYNAPSE_WORKER_TYPES="\
+	# Specify the workers to test with
+	# Allow overriding by explicitly setting SYNAPSE_WORKER_TYPES outside, while still
+	# utilizing WORKERS=1 for backwards compatibility.
+	# -n True if the length of string is non-zero.
+	# -z True if the length of string is zero.
+	if [[ -z "$SYNAPSE_WORKER_TYPES" ]]; then
+		# Under mtxdb, event persistence must stay on the main process, so no
+		# dedicated event_persister workers are spawned at all. workers.py's
+		# embedded_hamt_engine validation requires BOTH that there is exactly
+		# one events writer (a second persister would hit mtxdb's exclusive-lock
+		# rejection at startup) AND that the sole writer is main itself (the
+		# embedded-HAMT background migration only ever runs on main, and would
+		# crash writing through a read-only-opened store otherwise). Omitting
+		# event_persister leaves stream_writers.events unset, which defaults to
+		# ["main"] (see WriterLocations) and satisfies both checks; a single
+		# event_persister would pass the first but fail the second.
+		#
+		# The background_worker goes for the same reason: its generated config
+		# sets run_background_tasks_on to itself, but the third embedded_hamt
+		# check requires background tasks to run on main (main's own
+		# background-updates poll loop runs unconditionally, and mtxdb writes
+		# have no cross-instance coordination to survive a second concurrent
+		# loop). Without it, the setting defaults back to main.
+		event_persister_entry="event_persister:2, "
+		background_worker_entry="background_worker, "
+		if [[ -n "$SYNAPSE_EMBEDDED_HAMT_ENGINE" ]]; then
+			event_persister_entry=""
+			background_worker_entry=""
+		fi
+		export SYNAPSE_WORKER_TYPES="\
       ${event_persister_entry}\
       ${background_worker_entry}\
       event_creator, \
@@ -97,36 +95,34 @@ if [[ -n "$SYNAPSE_COMPLEMENT_USE_WORKERS" ]]; then
       device_lists:2, \
       stream_writers=account_data+presence+receipts+to_device+typing"
 
-  fi
-  log "Workers requested: $SYNAPSE_WORKER_TYPES"
-  # adjust connection pool limits on worker mode as otherwise running lots of worker synapses
-  # can make docker unhappy (in GHA)
-  export POSTGRES_CP_MIN=1
-  export POSTGRES_CP_MAX=3
-  echo "using reduced connection pool limits for worker mode"
-  # Improve startup times by using a launcher based on fork()
-  export SYNAPSE_USE_EXPERIMENTAL_FORKING_LAUNCHER=1
+	fi
+	log "Workers requested: $SYNAPSE_WORKER_TYPES"
+	# adjust connection pool limits on worker mode as otherwise running lots of worker synapses
+	# can make docker unhappy (in GHA)
+	export POSTGRES_CP_MIN=1
+	export POSTGRES_CP_MAX=3
+	echo "using reduced connection pool limits for worker mode"
+	# Improve startup times by using a launcher based on fork()
+	export SYNAPSE_USE_EXPERIMENTAL_FORKING_LAUNCHER=1
 else
-  # Empty string here means 'main process only'
-  export SYNAPSE_WORKER_TYPES=""
+	# Empty string here means 'main process only'
+	export SYNAPSE_WORKER_TYPES=""
 fi
-
 
 if [[ -n "$SYNAPSE_COMPLEMENT_USE_ASYNCIO_REACTOR" ]]; then
-  if [[ -n "$SYNAPSE_USE_EXPERIMENTAL_FORKING_LAUNCHER" ]]; then
-    export SYNAPSE_COMPLEMENT_FORKING_LAUNCHER_ASYNC_IO_REACTOR="1"
-  else
-    export SYNAPSE_ASYNC_IO_REACTOR="1"
-  fi
+	if [[ -n "$SYNAPSE_USE_EXPERIMENTAL_FORKING_LAUNCHER" ]]; then
+		export SYNAPSE_COMPLEMENT_FORKING_LAUNCHER_ASYNC_IO_REACTOR="1"
+	else
+		export SYNAPSE_ASYNC_IO_REACTOR="1"
+	fi
 else
-  export SYNAPSE_ASYNC_IO_REACTOR="0"
+	export SYNAPSE_ASYNC_IO_REACTOR="0"
 fi
-
 
 # Add Complement's appservice registration directory, if there is one
 # (It can be absent when there are no application services in this test!)
 if [ -d /complement/appservice ]; then
-    export SYNAPSE_AS_REGISTRATION_DIR=/complement/appservice
+	export SYNAPSE_AS_REGISTRATION_DIR=/complement/appservice
 fi
 
 # Generate a TLS key, then generate a certificate by having Complement's CA sign it
@@ -137,19 +133,19 @@ echo "\
 .include /etc/ssl/openssl.cnf
 
 [SAN]
-subjectAltName=DNS:${SERVER_NAME}" > /conf/server.tls.conf
+subjectAltName=DNS:${SERVER_NAME}" >/conf/server.tls.conf
 
 # Generate an RSA key
 openssl genrsa -out /conf/server.tls.key 2048
 
 # Generate a certificate signing request
 openssl req -new -config /conf/server.tls.conf -key /conf/server.tls.key -out /conf/server.tls.csr \
-  -subj "/CN=${SERVER_NAME}" -reqexts SAN
+	-subj "/CN=${SERVER_NAME}" -reqexts SAN
 
 # Make the Complement Certificate Authority sign and generate a certificate.
 openssl x509 -req -in /conf/server.tls.csr \
-  -CA /complement/ca/ca.crt -CAkey /complement/ca/ca.key -set_serial 1 \
-  -out /conf/server.tls.crt -extfile /conf/server.tls.conf -extensions SAN
+	-CA /complement/ca/ca.crt -CAkey /complement/ca/ca.key -set_serial 1 \
+	-out /conf/server.tls.crt -extfile /conf/server.tls.conf -extensions SAN
 
 # Assert that we have a Subject Alternative Name in the certificate.
 # (the test will exit with 1 here if there isn't a SAN in the certificate.)
