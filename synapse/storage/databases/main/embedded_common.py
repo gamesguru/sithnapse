@@ -1053,12 +1053,20 @@ def maybe_sync(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
 def maybe_publish(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
     """Publish queued mtxdb mutations for cross-process visibility.
 
-    Publication is global because all mtxdb pools share one journal
-    coordinator. ``pools`` only identifies whether this call site has anything
-    requiring publication; it does not scope the journal operation. The
-    operation advances the read-committed boundary but deliberately does not
-    make mutations durable. The coalesced ``maybe_sync`` path remains
-    responsible for durability.
+    The operation publishes every pool journal: WAL mode shares one journal
+    coordinator, while non-WAL mode has one journal per pool. ``pools`` only
+    identifies whether this call site has anything requiring publication; it
+    does not scope the journal operation. Publication advances the
+    read-committed boundary but deliberately does not make mutations durable.
+    The coalesced ``maybe_sync`` path remains responsible for durability.
+
+    Known limitation: this publication is not transaction-scoped. A concurrent
+    SQL transaction may have mtxdb mutations in the same pending journal queue,
+    and this call may publish them before that SQL transaction commits. In
+    non-WAL mode, the three independent journal publications are also
+    sequential rather than atomic. Production-safe transaction ordering
+    requires transaction-scoped publication in mtxdb or serialization of
+    embedded writes across the SQL commit boundary.
     """
     if not _engine_configured or tier is not SyncTier.DURABLE or _sync_disabled:
         return

@@ -3003,22 +3003,40 @@ pub fn sync_auth_chain(py: Python<'_>) -> PyResult<()> {
 
 /// Publish all queued mutations without fsyncing them.
 ///
-/// All mtxdb pools share one JournalCoordinator, so publication is necessarily
-/// global. This advances the read-committed WAL boundary so read-only workers
-/// can see committed mappings immediately. Durability is provided separately
-/// by the coalesced sync path.
+/// In WAL mode the pools share one JournalCoordinator, so the first call drains
+/// the shared queue and the remaining calls are no-ops. In non-WAL mode each
+/// pool has its own journal, so all three must be published. Durability is
+/// provided separately by the coalesced sync path.
+///
+/// This is not transaction-scoped: a pending mutation from another concurrent
+/// SQL transaction can be published by this call. Non-WAL publication is also
+/// sequential across the three journals, not atomic. Callers must treat this
+/// as a visibility optimization until the storage layer provides transaction-
+/// scoped publication or the caller serializes embedded writes through SQL
+/// commit.
 #[pyfunction]
 pub fn publish_pending(py: Python<'_>) -> PyResult<()> {
     assert_writable()?;
     py.detach(|| {
-        let journal = state_db()?.journal().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("mtxdb publish error: journal is unavailable")
-        })?;
-        journal.publish_pending().map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb publish error: {e}"))
-        })?;
+        publish_journal("state", state_db()?)?;
+        publish_journal("event-dag", event_dag_db()?)?;
+        publish_journal("auth-chain", auth_chain_db()?)?;
         Ok(())
     })
+}
+
+fn publish_journal(name: &str, engine: &Arc<PackfileStorage>) -> PyResult<()> {
+    let journal = engine.journal().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "mtxdb publish error for {name} pool: journal is unavailable"
+        ))
+    })?;
+    journal.publish_pending().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "mtxdb publish error for {name} pool: {e}"
+        ))
+    })?;
+    Ok(())
 }
 
 fn sync_one(name: &str, engine: &Arc<PackfileStorage>) -> PyResult<()> {
