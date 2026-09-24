@@ -66,8 +66,7 @@ icu_segmenter = "=2.2.0"
 # NOTE: pinned to match icu_segmenter; transitive-only but must not drift past 2.2.0 (MSRV 1.87)
 icu_provider = "=2.2.0"
 icu_locale_core = "=2.2.0"
-reqwest = { version = "0.12.15", default-features = false, features = [
-    "http2",
+reqwest = { version = "=0.11.27", default-features = false, features = [
     "stream",
     "rustls-tls-native-roots",
 ] }
@@ -76,12 +75,8 @@ futures = "0.3.31"
 tokio = { version = "1.44.2", features = ["rt", "rt-multi-thread"] }
 once_cell = "1.18.0"
 lru = "0.12"
-rezzy = { git = "https://gitlab.com/gamesguru/rezzy.git", branch = "alpha" }
-mtxdb = {
-    git = "https://gitlab.com/wombat-foundation/mtxdb.git",
-    branch = "alpha",
-    features = ["multi-reader"],
-}
+rezzy = { git = "https://github.com/gamesguru/rezzy.git", branch = "alpha" }
+mtxdb = { git = "https://github.com/wombat-foundation/mtxdb.git", branch = "alpha", features = ["multi-reader"] }
 
 [build-dependencies]
 blake2 = "0.10.4"
@@ -98,4 +93,4 @@ ignored = ["icu_provider", "icu_locale_core"]
 
 [dev-dependencies]
 itertools = "0.14.0"
-tempfile = "3.27.0"
+tempfile = "=3.14.0"
