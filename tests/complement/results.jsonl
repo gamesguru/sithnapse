@@ -365,7 +365,7 @@
 {"Action":"pass","Test":"TestMSC4291RoomIDAsHashOfCreateEvent_CannotSendCreateEvent"}
 {"Action":"pass","Test":"TestMSC4291RoomIDAsHashOfCreateEvent_RoomIDIsOnCreateEvent"}
 {"Action":"pass","Test":"TestMSC4291RoomIDAsHashOfCreateEvent_UpgradedRooms"}
-{"Action":"fail","Test":"TestMSC4297StateResolutionV2_1_includes_conflicted_subgraph"}
+{"Action":"pass","Test":"TestMSC4297StateResolutionV2_1_includes_conflicted_subgraph"}
 {"Action":"fail","Test":"TestMSC4297StateResolutionV2_1_starts_from_empty_set"}
 {"Action":"pass","Test":"TestMSC4308ThreadSubscriptionsSlidingSync"}
 {"Action":"pass","Test":"TestMSC4308ThreadSubscriptionsSlidingSync/Receives_thread_subscriptions_over_incremental_sliding_sync"}
@@ -378,7 +378,7 @@
 {"Action":"pass","Test":"TestMSC4429ProfileUpdates/Initial_sync_includes_requested_profile_fields_and_filters_others"}
 {"Action":"pass","Test":"TestMSC4429ProfileUpdates/No_updates_without_profile_fields_filter"}
 {"Action":"pass","Test":"TestMSC4429ProfileUpdates/Widening_profile_fields_filter_does_not_return_old_filtered_updates"}
-{"Action":"fail","Test":"TestMSC4499Key"}
+{"Action":"pass","Test":"TestMSC4499Key"}
 {"Action":"pass","Test":"TestMSC4499Key/FederationRequestAuthentication"}
 {"Action":"pass","Test":"TestMSC4499Key/FederationRequestAuthentication/current_key_id_with_wrong_private_key"}
 {"Action":"pass","Test":"TestMSC4499Key/FederationRequestAuthentication/current_verify_key"}
@@ -394,7 +394,7 @@
 {"Action":"pass","Test":"TestMSC4499Key/Resolution/\u00a74"}
 {"Action":"pass","Test":"TestMSC4499Key/Resolution/\u00a74/FirstSeenWinsEventPath"}
 {"Action":"pass","Test":"TestMSC4499Key/Resolution/\u00a74/IDFirstSeenWinsDirect"}
-{"Action":"fail","Test":"TestMSC4499Key/System"}
+{"Action":"pass","Test":"TestMSC4499Key/System"}
 {"Action":"pass","Test":"TestMSC4499Key/System/\u00a73"}
 {"Action":"skip","Test":"TestMSC4499Key/System/\u00a73/BackoffClearedOnSuccess"}
 {"Action":"pass","Test":"TestMSC4499Key/System/\u00a73/FetchCoalescing"}
@@ -405,8 +405,8 @@
 {"Action":"skip","Test":"TestMSC4499Key/System/\u00a76/AdminStartupGuardrails"}
 {"Action":"pass","Test":"TestMSC4499Key/System/\u00a77"}
 {"Action":"skip","Test":"TestMSC4499Key/System/\u00a77/LocalRecoveryFromKeyLoss"}
-{"Action":"fail","Test":"TestMSC4499Key/System/\u00a79"}
-{"Action":"fail","Test":"TestMSC4499Key/System/\u00a79/CorroborationTierRetention"}
+{"Action":"pass","Test":"TestMSC4499Key/System/\u00a79"}
+{"Action":"skip","Test":"TestMSC4499Key/System/\u00a79/CorroborationTierRetention"}
 {"Action":"skip","Test":"TestMSC4499Key/System/\u00a79/StorageQuotaResilience"}
 {"Action":"pass","Test":"TestMSC4499Key/Temporal"}
 {"Action":"pass","Test":"TestMSC4499Key/Temporal/\u00a75"}
@@ -908,7 +908,7 @@
 {"Action":"pass","Test":"TestUnknownEndpoints/Media_endpoints"}
 {"Action":"pass","Test":"TestUnknownEndpoints/Server-server_endpoints"}
 {"Action":"pass","Test":"TestUnknownEndpoints/Unknown_prefix"}
-{"Action":"fail","Test":"TestUnrejectRejectedEvents"}
+{"Action":"pass","Test":"TestUnrejectRejectedEvents"}
 {"Action":"pass","Test":"TestUploadKey"}
 {"Action":"pass","Test":"TestUploadKey/Parallel"}
 {"Action":"pass","Test":"TestUploadKey/Parallel/Can_claim_one_time_key_using_POST"}
