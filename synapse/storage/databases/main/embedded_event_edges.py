@@ -277,8 +277,14 @@ def open_embedded_event_edges_engine(hs: HomeServer) -> bool:
 
 def embedded_event_edges_is_writable(hs: HomeServer) -> bool:
     """Return whether this process is permitted to write to embedded event-edges."""
-    return open_embedded_event_edges_engine(hs) and not getattr(
-        hs.config.database, "read_only", False
+    # The embedded event DAG has a single writer: the events stream writer.
+    # ``database.read_only`` is not sufficient here. Worker processes can have
+    # a normal SQL connection while opening mtxdb read-only, and attempting a
+    # repair write from one of those workers raises in the Rust binding.
+    return (
+        open_embedded_event_edges_engine(hs)
+        and not getattr(hs.config.database, "read_only", False)
+        and hs.get_instance_name() in hs.config.worker.writers.events
     )
 
 
