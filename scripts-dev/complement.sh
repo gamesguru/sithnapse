@@ -578,7 +578,14 @@ main() {
   local synapse_revision
   synapse_revision="$(git -C "$repo_root" describe --tags --always --dirty 2>/dev/null || echo '<unknown>')"
   echo "Synapse revision: ${synapse_revision}" >&2
-  echo "Database: ${PASS_SYNAPSE_COMPLEMENT_DATABASE} (workers: ${PASS_SYNAPSE_COMPLEMENT_USE_WORKERS:-false}) | Embedded HAMT engine: ${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:-<none>}${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:+ at ${PASS_SYNAPSE_EMBEDDED_HAMT_PATH:-<not set>}}${PASS_SYNAPSE_MTXDB_NO_SYNC:+ (no_sync)}${PASS_SYNAPSE_MTXDB_WAL:+ (wal)}${PASS_SYNAPSE_MTXDB_STATS:+ (stats)}${PASS_SYNAPSE_MTXDB_FORCE_SYNC_EVENT_JSON:+ (force-sync-event-json)}" >&2
+  mtxdb_location=""
+  if [[ -n "${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:-}" ]]; then
+    mtxdb_location=" container=${PASS_SYNAPSE_EMBEDDED_HAMT_PATH:-<not set>}"
+    if [[ -n "${COMPLEMENT_MTXDB_HOST_DIR:-}" ]]; then
+      mtxdb_location+=" host=${COMPLEMENT_MTXDB_HOST_DIR}/<container-hostname>"
+    fi
+  fi
+  echo "Database: ${PASS_SYNAPSE_COMPLEMENT_DATABASE} (workers: ${PASS_SYNAPSE_COMPLEMENT_USE_WORKERS:-false}) | Embedded HAMT engine: ${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:-<none>}${mtxdb_location}${PASS_SYNAPSE_MTXDB_NO_SYNC:+ (no_sync)}${PASS_SYNAPSE_MTXDB_WAL:+ (wal)}${PASS_SYNAPSE_MTXDB_STATS:+ (stats)}${PASS_SYNAPSE_MTXDB_FORCE_SYNC_EVENT_JSON:+ (force-sync-event-json)}" >&2
 
   # Complement's Destroy() force-removes every homeserver container
   # unconditionally, pass or fail -- there is no "keep failed containers"
