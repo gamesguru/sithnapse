@@ -1338,12 +1338,7 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
         if wal_enabled() {
             match layout.wal_layout() {
                 WalLayout::Shared => {
-                    let wal_path = layout.shared_wal_path().map_err(|e| {
-                        pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "failed to resolve mtxdb shared WAL: {}",
-                            e
-                        ))
-                    })?;
+                    let wal_path = layout.shared_wal_path();
                     let (journal, scan) = Journal::open_shared(&wal_path).map_err(|e| {
                         pyo3::exceptions::PyRuntimeError::new_err(format!(
                             "failed to open shared mtxdb WAL at {}: {}",
@@ -1473,11 +1468,7 @@ pub fn open_client_read_only(py: Python<'_>, path: String) -> PyResult<()> {
             let store = match layout.wal_layout() {
                 WalLayout::Shared => PackfileStorage::open_read_committed_shared(
                     pool_dir.clone(),
-                    layout.shared_wal_path().map_err(|e| {
-                        pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "failed to resolve mtxdb shared WAL: {e}"
-                        ))
-                    })?,
+                    layout.shared_wal_path(),
                     pool,
                 ),
                 WalLayout::PerPool => {
