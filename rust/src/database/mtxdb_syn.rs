@@ -9,7 +9,7 @@ use mtxdb::SharedDatabase;
 use mtxdb::{
     derive_collection_id, CollectionMetadata, DatabaseLayout, FrameIdPolicy, NodeData, NodeId,
     PackfileStorage, PayloadPolicy, RecordIdentityRule, ShardType, StorageEngine,
-    POOL_DST_INTERNAL,
+    MEMBER_NAMESPACE_INTL,
 };
 use once_cell::sync::OnceCell;
 use pyo3::prelude::*;
@@ -169,7 +169,7 @@ fn db_for_shard_type(shard_type: ShardType) -> PyResult<&'static Arc<PackfileSto
     match shard_type {
         ShardType::State => state_db(),
         ShardType::EventDag => event_dag_db(),
-        ShardType::AuthChain => auth_chain_db(),
+        ShardType::Edges => auth_chain_db(),
     }
 }
 
@@ -1352,7 +1352,7 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
         })?;
         let state_dir = layout.pool_dir(ShardType::State)?;
         let event_dag_dir = layout.pool_dir(ShardType::EventDag)?;
-        let auth_chain_dir = layout.pool_dir(ShardType::AuthChain)?;
+        let auth_chain_dir = layout.pool_dir(ShardType::Edges)?;
         // State pool holds HAMT nodes, roots, and state-group sidecars --
         // dense structural hashes, not text. zstd never shrinks them (see
         // mtxdb's own compression bench), so every write there was still
@@ -1376,7 +1376,7 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
             (
                 database.pool(ShardType::State).clone(),
                 database.pool(ShardType::EventDag).clone(),
-                database.pool(ShardType::AuthChain).clone(),
+                database.pool(ShardType::Edges).clone(),
             )
         } else {
             (
@@ -1511,7 +1511,7 @@ pub fn open_client_read_only(py: Python<'_>, path: String) -> PyResult<()> {
         };
         let state = open_pool(ShardType::State, "state")?;
         let event_dag = open_pool(ShardType::EventDag, "event-dag")?;
-        let auth_chain = open_pool(ShardType::AuthChain, "auth-chain")?;
+        let auth_chain = open_pool(ShardType::Edges, "edges")?;
         let _ = DBS.set(MtxdbPools {
             state,
             event_dag,
@@ -1751,7 +1751,7 @@ pub fn get_or_create_short_ids(
             let _guard = RMW_LOCK.lock().map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {}", e))
             })?;
-            let engine = db_for_shard_type(ShardType::AuthChain)?;
+            let engine = db_for_shard_type(ShardType::Edges)?;
             let collection = auth_chain_closure_room_id(&namespace, &room_id);
 
             let mut out = Vec::with_capacity(event_ids.len());
@@ -1890,7 +1890,7 @@ pub fn resolve_short_ids_to_event_ids(
     short_ids: Vec<u32>,
 ) -> PyResult<Vec<Option<String>>> {
     py.detach(|| {
-        let engine = db_for_shard_type(ShardType::AuthChain)?;
+        let engine = db_for_shard_type(ShardType::Edges)?;
         let collection = auth_chain_closure_room_id(&namespace, &room_id);
         let node_ids: Vec<NodeId> = short_ids
             .iter()
@@ -1929,7 +1929,7 @@ pub fn auth_chain_edges_get(
     short_ids: Vec<u32>,
 ) -> PyResult<Vec<Option<Vec<u32>>>> {
     py.detach(|| {
-        let engine = db_for_shard_type(ShardType::AuthChain)?;
+        let engine = db_for_shard_type(ShardType::Edges)?;
         let collection = auth_chain_closure_room_id(&namespace, &room_id);
         let node_ids: Vec<NodeId> = short_ids
             .iter()
@@ -1962,7 +1962,7 @@ pub fn auth_chain_edges_put(
 ) -> PyResult<()> {
     assert_writable()?;
     py.detach(|| {
-        let engine = db_for_shard_type(ShardType::AuthChain)?;
+        let engine = db_for_shard_type(ShardType::Edges)?;
         let collection = auth_chain_closure_room_id(&namespace, &room_id);
         let pairs: Vec<(NodeId, NodeData)> = rows
             .into_iter()
@@ -1996,7 +1996,7 @@ pub fn auth_chain_children_get(
     short_ids: Vec<u32>,
 ) -> PyResult<Vec<Option<Vec<u32>>>> {
     py.detach(|| {
-        let engine = db_for_shard_type(ShardType::AuthChain)?;
+        let engine = db_for_shard_type(ShardType::Edges)?;
         let collection = auth_chain_closure_room_id(&namespace, &room_id);
         let node_ids: Vec<NodeId> = short_ids
             .iter()
@@ -2036,7 +2036,7 @@ pub fn auth_chain_children_append(
             let _guard = RMW_LOCK.lock().map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {}", e))
             })?;
-            let engine = db_for_shard_type(ShardType::AuthChain)?;
+            let engine = db_for_shard_type(ShardType::Edges)?;
             let collection = auth_chain_closure_room_id(&namespace, &room_id);
 
             // Aggregate by parent first: the batched put below only applies at the
@@ -2101,7 +2101,7 @@ pub fn auth_chain_children_append(
 pub fn auth_chain_purge_room(py: Python<'_>, namespace: String, room_id: String) -> PyResult<()> {
     assert_writable()?;
     py.detach(|| {
-        let engine = db_for_shard_type(ShardType::AuthChain)?;
+        let engine = db_for_shard_type(ShardType::Edges)?;
         let collection = auth_chain_closure_room_id(&namespace, &room_id);
         engine.delete_collection(&collection).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -2117,13 +2117,13 @@ pub fn auth_chain_purge_room(py: Python<'_>, namespace: String, room_id: String)
 // -----------------------------------------------------------------------------
 
 pub(crate) fn kv_room_id() -> [u8; 16] {
-    derive_collection_id(Some(POOL_DST_INTERNAL), b"sys:flat-kv")
+    derive_collection_id(Some(MEMBER_NAMESPACE_INTL), b"sys:flat-kv")
 }
 
 #[allow(dead_code)]
 #[must_use]
 pub(crate) fn state_group_aux_collection_id() -> [u8; 16] {
-    derive_collection_id(Some(POOL_DST_INTERNAL), b"sys:matrix-state-groups")
+    derive_collection_id(Some(MEMBER_NAMESPACE_INTL), b"sys:matrix-state-groups")
 }
 
 fn kv_node_id(key: &[u8]) -> [u8; 16] {
@@ -2144,7 +2144,7 @@ pub fn batch_get(py: Python<'_>, keys: Vec<Vec<u8>>) -> PyResult<Vec<(Vec<u8>, V
             match shard_type_for_key(key) {
                 ShardType::State => state_ids.push(entry),
                 ShardType::EventDag => event_ids.push(entry),
-                ShardType::AuthChain => unreachable!("flat KV never routes to auth-chain"),
+                ShardType::Edges => unreachable!("flat KV never routes to edges"),
             }
         }
         let mut values = vec![None; keys.len()];
@@ -2197,7 +2197,7 @@ fn batch_put_impl(pairs: Vec<(Vec<u8>, Vec<u8>)>) -> PyResult<()> {
         match shard_type_for_key(&key) {
             ShardType::State => state_puts.push(entry),
             ShardType::EventDag => event_puts.push(entry),
-            ShardType::AuthChain => unreachable!("flat KV never routes to auth-chain"),
+            ShardType::Edges => unreachable!("flat KV never routes to edges"),
         }
     }
     for (shard_type, puts) in [
@@ -2325,7 +2325,7 @@ pub(crate) fn event_dag_room_id(_namespace: &str, room_id: &str) -> [u8; 16] {
 #[must_use]
 pub(crate) fn flat_kv_metadata() -> CollectionMetadata {
     CollectionMetadata {
-        pool_dst: Some(POOL_DST_INTERNAL),
+        member_namespace: Some(MEMBER_NAMESPACE_INTL),
         collection_canonical_id: b"sys:flat-kv".to_vec(),
         record_id_rule: RecordIdentityRule {
             policy: FrameIdPolicy::ExternalCanonicalIdToCrosscheck,
@@ -2333,6 +2333,8 @@ pub(crate) fn flat_kv_metadata() -> CollectionMetadata {
         },
         payload: PayloadPolicy::Source,
         extension: None,
+        role: Some("system_auxiliary".to_owned()),
+        schema: Some("sithnapse.flat-kv.v1".to_owned()),
     }
 }
 
@@ -2340,7 +2342,7 @@ pub(crate) fn flat_kv_metadata() -> CollectionMetadata {
 #[must_use]
 pub(crate) fn state_group_aux_metadata() -> CollectionMetadata {
     CollectionMetadata {
-        pool_dst: Some(POOL_DST_INTERNAL),
+        member_namespace: Some(MEMBER_NAMESPACE_INTL),
         collection_canonical_id: b"sys:matrix-state-groups".to_vec(),
         record_id_rule: RecordIdentityRule {
             policy: FrameIdPolicy::ExternalCanonicalIdToCrosscheck,
@@ -2348,6 +2350,8 @@ pub(crate) fn state_group_aux_metadata() -> CollectionMetadata {
         },
         payload: PayloadPolicy::Source,
         extension: None,
+        role: Some("system_auxiliary".to_owned()),
+        schema: Some("sithnapse.state-groups.v1".to_owned()),
     }
 }
 
@@ -2355,7 +2359,7 @@ pub(crate) fn state_group_aux_metadata() -> CollectionMetadata {
 #[must_use]
 pub(crate) fn event_locator_metadata(bucket: u32) -> CollectionMetadata {
     CollectionMetadata {
-        pool_dst: Some(*b"EVNT"),
+        member_namespace: Some(*b"EVNT"),
         collection_canonical_id: format!("sys:event-locator:{bucket}").into_bytes(),
         record_id_rule: RecordIdentityRule {
             policy: FrameIdPolicy::ExternalCanonicalIdToCrosscheck,
@@ -2363,6 +2367,8 @@ pub(crate) fn event_locator_metadata(bucket: u32) -> CollectionMetadata {
         },
         payload: PayloadPolicy::Source,
         extension: None,
+        role: Some("event_locator".to_owned()),
+        schema: Some("sithnapse.event-locator.v1".to_owned()),
     }
 }
 
@@ -2370,7 +2376,7 @@ pub(crate) fn event_locator_metadata(bucket: u32) -> CollectionMetadata {
 #[must_use]
 pub(crate) fn event_dag_metadata(room_id: &str) -> CollectionMetadata {
     CollectionMetadata {
-        pool_dst: Some(*b"EVNT"),
+        member_namespace: Some(*b"EVNT"),
         collection_canonical_id: room_id.as_bytes().to_vec(),
         record_id_rule: RecordIdentityRule {
             policy: FrameIdPolicy::ExternalCanonicalIdToCrosscheck,
@@ -2378,6 +2384,8 @@ pub(crate) fn event_dag_metadata(room_id: &str) -> CollectionMetadata {
         },
         payload: PayloadPolicy::Source,
         extension: None,
+        role: Some("event_dag".to_owned()),
+        schema: Some("sithnapse.event-dag.v1".to_owned()),
     }
 }
 
@@ -2385,7 +2393,7 @@ pub(crate) fn event_dag_metadata(room_id: &str) -> CollectionMetadata {
 #[must_use]
 pub(crate) fn auth_chain_metadata(room_id: &str) -> CollectionMetadata {
     CollectionMetadata {
-        pool_dst: Some(*b"AUTH"),
+        member_namespace: Some(*b"AUTH"),
         collection_canonical_id: room_id.as_bytes().to_vec(),
         record_id_rule: RecordIdentityRule {
             policy: FrameIdPolicy::ExternalCanonicalIdToCrosscheck,
@@ -2393,6 +2401,8 @@ pub(crate) fn auth_chain_metadata(room_id: &str) -> CollectionMetadata {
         },
         payload: PayloadPolicy::Source,
         extension: None,
+        role: Some("auth_chain".to_owned()),
+        schema: Some("sithnapse.auth-chain.v1".to_owned()),
     }
 }
 
@@ -2400,7 +2410,7 @@ pub(crate) fn auth_chain_metadata(room_id: &str) -> CollectionMetadata {
 #[must_use]
 pub(crate) fn prev_edges_metadata(room_id: &str) -> CollectionMetadata {
     CollectionMetadata {
-        pool_dst: Some(*b"PREV"),
+        member_namespace: Some(*b"PREV"),
         collection_canonical_id: room_id.as_bytes().to_vec(),
         record_id_rule: RecordIdentityRule {
             policy: FrameIdPolicy::ExternalCanonicalIdToCrosscheck,
@@ -2408,6 +2418,8 @@ pub(crate) fn prev_edges_metadata(room_id: &str) -> CollectionMetadata {
         },
         payload: PayloadPolicy::Source,
         extension: None,
+        role: Some("previous_edges".to_owned()),
+        schema: Some("sithnapse.previous-edges.v1".to_owned()),
     }
 }
 
@@ -2415,7 +2427,7 @@ pub(crate) fn prev_edges_metadata(room_id: &str) -> CollectionMetadata {
 #[must_use]
 pub(crate) fn state_hamt_metadata(room_id: &str) -> CollectionMetadata {
     CollectionMetadata {
-        pool_dst: Some(*b"STAT"),
+        member_namespace: Some(*b"STAT"),
         collection_canonical_id: room_id.as_bytes().to_vec(),
         record_id_rule: RecordIdentityRule {
             policy: FrameIdPolicy::ExternalCanonicalIdToCrosscheck,
@@ -2423,6 +2435,8 @@ pub(crate) fn state_hamt_metadata(room_id: &str) -> CollectionMetadata {
         },
         payload: PayloadPolicy::Source,
         extension: None,
+        role: Some("state_hamt".to_owned()),
+        schema: Some("sithnapse.state-hamt.v1".to_owned()),
     }
 }
 
