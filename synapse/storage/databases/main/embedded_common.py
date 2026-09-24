@@ -830,7 +830,7 @@ def _mtxdb_snapshot_once() -> None:
             f" records=+{int(d['journal_records'])}"
             f" waiters=+{int(d['journal_waiters'])}"
             f" coalesced=+{int(d['journal_coalesced'])}"
-            f" lifetime_peak_inflight={int(m['peak_journal_in_flight'])}"
+            f" peak_inflight={int(m['peak_journal_in_flight'])}"
             f" lifetime_max_lock={m['max_journal_lock_wait_us'] / 1000:.1f}ms"
             f" lifetime_max_fsync={m['max_journal_fsync_us'] / 1000:.1f}ms"
             f" dirty_lock+{d['dirty_lock_wait_us'] / 1000:.1f}ms"

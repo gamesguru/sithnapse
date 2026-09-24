@@ -2807,6 +2807,7 @@ fn stats_to_dict(
     py: Python<'_>,
     name: &str,
     s: &mtxdb::packfile::storage::RuntimeStats,
+    sync_diagnostics: &mtxdb::packfile::storage::SyncDiagnosticsSnapshot,
 ) -> PyResult<Py<PyDict>> {
     let d = PyDict::new(py);
     d.set_item("pool", name)?;
@@ -3001,7 +3002,7 @@ fn stats_to_dict(
     let diagnostics = PyDict::new(py);
     diagnostics.set_item(
         "peak_journal_in_flight",
-        s.sync_diagnostics.peak_journal_in_flight,
+        sync_diagnostics.peak_journal_in_flight,
     )?;
     d.set_item("sync_diagnostics", diagnostics)?;
     Ok(d.unbind())
@@ -3014,18 +3015,37 @@ fn stats_to_dict(
 #[pyfunction]
 pub fn stats(py: Python<'_>) -> PyResult<Py<PyDict>> {
     let snapshots = py.detach(
-        || -> Result<Vec<(&str, mtxdb::packfile::storage::RuntimeStats)>, pyo3::PyErr> {
+        || -> Result<
+            Vec<(
+                &str,
+                mtxdb::packfile::storage::RuntimeStats,
+                mtxdb::packfile::storage::SyncDiagnosticsSnapshot,
+            )>,
+            pyo3::PyErr,
+        > {
             let pools = pools()?;
             Ok(vec![
-                ("state", pools.state.stats()),
-                ("event_dag", pools.event_dag.stats()),
-                ("auth_chain", pools.auth_chain.stats()),
+                (
+                    "state",
+                    pools.state.stats(),
+                    pools.state.take_sync_diagnostics(),
+                ),
+                (
+                    "event_dag",
+                    pools.event_dag.stats(),
+                    pools.event_dag.take_sync_diagnostics(),
+                ),
+                (
+                    "auth_chain",
+                    pools.auth_chain.stats(),
+                    pools.auth_chain.take_sync_diagnostics(),
+                ),
             ])
         },
     )?;
     let out = PyDict::new(py);
-    for (name, s) in &snapshots {
-        out.set_item(*name, stats_to_dict(py, name, s)?)?;
+    for (name, s, diagnostics) in &snapshots {
+        out.set_item(*name, stats_to_dict(py, name, s, diagnostics)?)?;
     }
     Ok(out.unbind())
 }
