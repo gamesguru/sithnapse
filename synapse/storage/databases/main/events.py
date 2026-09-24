@@ -1328,15 +1328,33 @@ class PersistEventsStore:
         # than deferring them. Backfilled events are skipped -- no live request
         # waits on them.
         if self._embedded_hamt_engine:
-            needs_durable_barrier = any(
+            needs_auth_chain_barrier = any(
                 ev.type in AUTH_CHAIN_EVENT_TYPES
                 and not ev.internal_metadata.is_outlier()
                 and ev.internal_metadata.stream_ordering is not None
                 and ev.internal_metadata.stream_ordering >= 0
                 for ev, _ in events_and_contexts
             )
-            if self._embedded_event_json_enabled and needs_durable_barrier:
+            # Every live event with a state group can be read immediately by
+            # another worker (for example, when it becomes a prev event for a
+            # subsequent send).  Publishing the mapping through the
+            # coalescer is therefore racy: the event can be visible in SQL
+            # before its embedded state-group mapping is visible to the
+            # reader.  Do the cheap targeted STATE barrier for all such
+            # events.  Auth-chain state changes still need the broader barrier
+            # below because their event-DAG and auth-chain records are also
+            # read by non-retrying worker requests.
+            needs_state_barrier = any(
+                ctx.state_group is not None
+                and not ev.internal_metadata.is_outlier()
+                and ev.internal_metadata.stream_ordering is not None
+                and ev.internal_metadata.stream_ordering >= 0
+                for ev, ctx in events_and_contexts
+            )
+            if self._embedded_event_json_enabled and needs_auth_chain_barrier:
                 txn.call_after(sync_now, [Pool.STATE, Pool.AUTH_CHAIN, Pool.EVENT_DAG])
+            elif self._embedded_event_json_enabled and needs_state_barrier:
+                txn.call_after(sync_now, [Pool.STATE])
             else:
                 txn.call_after(mark_dirty, Pool.STATE)
                 txn.call_after(mark_dirty, Pool.AUTH_CHAIN)
@@ -4016,8 +4034,8 @@ class PersistEventsStore:
                     if event_id in non_null_state_groups
                 ],
             )
-            # No immediate sync here. `_persist_events_txn` marks STATE dirty
-            # after the transaction and the coalescer syncs it later.
+            # `_persist_events_txn` publishes STATE immediately for live events
+            # with mappings, and otherwise marks it dirty for coalescing.
         else:
             self.db_pool.simple_upsert_many_txn(
                 txn,
