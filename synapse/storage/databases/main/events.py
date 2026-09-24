@@ -445,7 +445,7 @@ class PersistEventsStore:
                 # stream_ordering.
                 synapse.metrics.event_persisted_position.labels(
                     **{SERVER_NAME_LABEL: self.server_name}
-                ).set(stream)
+                ).set(stream_orderings[-1])
 
             for event, context in events_and_contexts:
                 if context.app_service:
