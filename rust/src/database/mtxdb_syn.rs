@@ -2998,6 +2998,12 @@ fn stats_to_dict(
     )?;
     sd.set_item("total_us", st.total.as_micros() as u64)?;
     d.set_item("sync_totals", sd)?;
+    let diagnostics = PyDict::new(py);
+    diagnostics.set_item(
+        "peak_journal_in_flight",
+        s.sync_diagnostics.peak_journal_in_flight,
+    )?;
+    d.set_item("sync_diagnostics", diagnostics)?;
     Ok(d.unbind())
 }
 
