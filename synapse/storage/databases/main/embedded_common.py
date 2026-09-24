@@ -831,7 +831,7 @@ def _mtxdb_snapshot_once() -> None:
             f" wait=+{int(d['journal_waiters'])}"
             f" coal=+{int(d['journal_coalesced'])}"
             f" peak={int(m['peak_journal_in_flight'])}"
-            f" max={m['max_journal_lock_wait_us'] / 1000:.1f}/{m['max_journal_fsync_us'] / 1000:.1f}ms"
+            f" lmax={m['max_journal_lock_wait_us'] / 1000:.1f}/{m['max_journal_fsync_us'] / 1000:.1f}ms"
             f" dirty+{d['dirty_lock_wait_us'] / 1000:.1f}ms"
             f" age_avg={d['pending_publish_age_us'] / max(d['sync_calls'], 1) / 1000:.1f}ms]"
         )
