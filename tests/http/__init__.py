@@ -18,7 +18,9 @@
 #
 #
 import os.path
+import shutil
 import subprocess
+import tempfile
 from functools import lru_cache
 
 from incremental import Version
@@ -75,8 +77,6 @@ def get_test_key_file() -> str:
     return os.path.join(os.path.dirname(__file__), "server.key")
 
 
-cert_file_count = 0
-
 CONFIG_TEMPLATE = b"""\
 [default]
 basicConstraints = CA:FALSE
@@ -104,11 +104,13 @@ def create_test_cert_file(sanlist: list[bytes]) -> str:
     Returns:
         The path to the file
     """
-    global cert_file_count
-    csr_filename = "server.csr"
-    cnf_filename = "server.%i.cnf" % (cert_file_count,)
-    cert_filename = "server.%i.crt" % (cert_file_count,)
-    cert_file_count += 1
+    # Each disttrial worker shares the repository working directory. Keep all
+    # generated files isolated: in particular, openssl x509 uses a sibling
+    # ``ca.srl`` file when -set_serial is unavailable (as with AWS-LC).
+    cert_dir = tempfile.mkdtemp(prefix="synapse-test-cert-")
+    csr_filename = os.path.join(cert_dir, "server.csr")
+    cnf_filename = os.path.join(cert_dir, "server.cnf")
+    cert_filename = os.path.join(cert_dir, "server.crt")
 
     # first build a CSR
     subprocess.check_call(
@@ -132,7 +134,11 @@ def create_test_cert_file(sanlist: list[bytes]) -> str:
 
     # finally the cert
     ca_key_filename = os.path.join(os.path.dirname(__file__), "ca.key")
-    ca_cert_filename = get_test_ca_cert_file()
+    # The x509 command derives the serial-file path from -CA. Copying the
+    # certificate into this private directory prevents workers from sharing
+    # tests/http/ca.srl.
+    ca_cert_filename = os.path.join(cert_dir, "ca.crt")
+    shutil.copyfile(get_test_ca_cert_file(), ca_cert_filename)
     cert_command = [
         "openssl",
         "x509",
