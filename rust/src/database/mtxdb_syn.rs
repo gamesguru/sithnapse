@@ -3001,49 +3001,30 @@ pub fn sync_auth_chain(py: Python<'_>) -> PyResult<()> {
     py.detach(|| sync_one("auth-chain", auth_chain_db()?))
 }
 
-/// Publish queued mutations for the `state` pool without fsyncing them.
+/// Publish all queued mutations without fsyncing them.
 ///
-/// This advances the read-committed WAL boundary so read-only workers can see
-/// the mapping immediately. Durability is provided separately by the
-/// coalesced `sync_state` path.
+/// All mtxdb pools share one JournalCoordinator, so publication is necessarily
+/// global. This advances the read-committed WAL boundary so read-only workers
+/// can see committed mappings immediately. Durability is provided separately
+/// by the coalesced sync path.
 #[pyfunction]
-pub fn publish_state(py: Python<'_>) -> PyResult<()> {
+pub fn publish_pending(py: Python<'_>) -> PyResult<()> {
     assert_writable()?;
-    py.detach(|| publish_one("state", state_db()?))
-}
-
-/// Publish queued mutations for the `event_dag` pool without fsyncing them.
-#[pyfunction]
-pub fn publish_event_dag(py: Python<'_>) -> PyResult<()> {
-    assert_writable()?;
-    py.detach(|| publish_one("event-dag", event_dag_db()?))
-}
-
-/// Publish queued mutations for the `auth_chain` pool without fsyncing them.
-#[pyfunction]
-pub fn publish_auth_chain(py: Python<'_>) -> PyResult<()> {
-    assert_writable()?;
-    py.detach(|| publish_one("auth-chain", auth_chain_db()?))
+    py.detach(|| {
+        let journal = state_db()?.journal().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("mtxdb publish error: journal is unavailable")
+        })?;
+        journal.publish_pending().map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb publish error: {e}"))
+        })?;
+        Ok(())
+    })
 }
 
 fn sync_one(name: &str, engine: &Arc<PackfileStorage>) -> PyResult<()> {
     engine.sync().map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb sync error for {name} pool: {e}"))
     })
-}
-
-fn publish_one(name: &str, engine: &Arc<PackfileStorage>) -> PyResult<()> {
-    let journal = engine.journal().ok_or_else(|| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "mtxdb publish error for {name} pool: journal is unavailable"
-        ))
-    })?;
-    journal.publish_pending().map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "mtxdb publish error for {name} pool: {e}"
-        ))
-    })?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -3459,9 +3440,7 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(sync_state, m)?)?;
     m.add_function(wrap_pyfunction!(sync_event_dag, m)?)?;
     m.add_function(wrap_pyfunction!(sync_auth_chain, m)?)?;
-    m.add_function(wrap_pyfunction!(publish_state, m)?)?;
-    m.add_function(wrap_pyfunction!(publish_event_dag, m)?)?;
-    m.add_function(wrap_pyfunction!(publish_auth_chain, m)?)?;
+    m.add_function(wrap_pyfunction!(publish_pending, m)?)?;
     m.add_function(wrap_pyfunction!(stats, m)?)?;
     m.add_function(wrap_pyfunction!(stats_snapshot, m)?)?;
     m.add_function(wrap_pyfunction!(reset_stats, m)?)?;

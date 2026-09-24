@@ -1051,13 +1051,14 @@ def maybe_sync(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
 
 
 def maybe_publish(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
-    """Publish mtxdb mutations for cross-process visibility without fsync.
+    """Publish queued mtxdb mutations for cross-process visibility.
 
-    This advances the journal's read-committed boundary, but deliberately does
-    not make the mutations durable. The coalesced ``maybe_sync`` path remains
-    responsible for durability. This is useful for request-path barriers where
-    another worker must see a committed SQL transaction immediately, but paying
-    an HDD fsync for every transaction would be excessive.
+    Publication is global because all mtxdb pools share one journal
+    coordinator. ``pools`` only identifies whether this call site has anything
+    requiring publication; it does not scope the journal operation. The
+    operation advances the read-committed boundary but deliberately does not
+    make mutations durable. The coalesced ``maybe_sync`` path remains
+    responsible for durability.
     """
     if not _engine_configured or tier is not SyncTier.DURABLE or _sync_disabled:
         return
@@ -1065,31 +1066,12 @@ def maybe_publish(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
     from synapse.storage.databases.embedded_engine import get_embedded_engine
 
     engine = get_embedded_engine("mtxdb")
-    if pools is None:
-        _st = time.monotonic()
-        engine.publish_state()
-        ffi_timing("ffi_publish_state", time.monotonic() - _st)
-        _st = time.monotonic()
-        engine.publish_event_dag()
-        ffi_timing("ffi_publish_event_dag", time.monotonic() - _st)
-        _st = time.monotonic()
-        engine.publish_auth_chain()
-        ffi_timing("ffi_publish_auth_chain", time.monotonic() - _st)
+    if pools is not None and not set(pools):
         return
 
-    pool_set = set(pools)
-    if Pool.STATE in pool_set:
-        _st = time.monotonic()
-        engine.publish_state()
-        ffi_timing("ffi_publish_state", time.monotonic() - _st)
-    if Pool.EVENT_DAG in pool_set:
-        _st = time.monotonic()
-        engine.publish_event_dag()
-        ffi_timing("ffi_publish_event_dag", time.monotonic() - _st)
-    if Pool.AUTH_CHAIN in pool_set:
-        _st = time.monotonic()
-        engine.publish_auth_chain()
-        ffi_timing("ffi_publish_auth_chain", time.monotonic() - _st)
+    _st = time.monotonic()
+    engine.publish_pending()
+    ffi_timing("ffi_publish_pending", time.monotonic() - _st)
 
 
 # ── Commit-aware flush coalescer ──────────────────────────────────────
