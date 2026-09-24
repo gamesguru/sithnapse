@@ -491,14 +491,22 @@ main() {
     # Optional: keep every container's mtxdb store on a host directory (e.g. a
     # large, slow disk) instead of Docker's overlay. Each container writes to
     # its own subdirectory named after its hostname (@HOSTNAME@ is expanded
-    # by start_for_complement.sh), because the engine keys its files by pid and
-    # pids repeat across containers -- a shared flat directory would collide
-    # and leak one test's state into another. Nothing here deletes those
-    # directories; prune the host directory yourself.
+    # by start_for_complement.sh), because hs1, hs2, etc. are separate logical
+    # Synapse databases. A shared directory would mix their data and leak one
+    # test's state into another. Nothing here deletes those directories; prune
+    # the host directory yourself.
     if [[ -n "${COMPLEMENT_MTXDB_HOST_DIR:-}" ]]; then
       mkdir -p "$COMPLEMENT_MTXDB_HOST_DIR"
       export COMPLEMENT_HOST_MOUNTS="${COMPLEMENT_HOST_MOUNTS:+$COMPLEMENT_HOST_MOUNTS;}$COMPLEMENT_MTXDB_HOST_DIR:/mtxdb-host"
       SYNAPSE_EMBEDDED_HAMT_PATH="/mtxdb-host/@HOSTNAME@"
+
+      # The Complement image starts as root and uses UID/GID to drop Synapse
+      # privileges. Pass through the invoking user's numeric identity so
+      # files created in the host-backed mtxdb mount belong to that user,
+      # rather than root. Allow explicit values for callers using a mapped
+      # container identity.
+      export PASS_UID="${PASS_UID:-$(id -u)}"
+      export PASS_GID="${PASS_GID:-$(id -g)}"
     fi
 
     export PASS_SYNAPSE_EMBEDDED_HAMT_PATH="$SYNAPSE_EMBEDDED_HAMT_PATH"
