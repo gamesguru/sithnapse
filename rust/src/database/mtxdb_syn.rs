@@ -1400,11 +1400,19 @@ pub fn open_client_read_only(py: Python<'_>, path: String) -> PyResult<()> {
                     "failed to resolve mtxdb {name} pool directory: {e}"
                 ))
             })?;
-            let store = PackfileStorage::open_read_committed_shared(
-                pool_dir.clone(),
-                layout.shared_wal_path(),
-                pool,
-            )
+            let store = if wal_enabled() {
+                PackfileStorage::open_read_committed_shared(
+                    pool_dir.clone(),
+                    layout.shared_wal_path(),
+                    pool,
+                )
+            } else {
+                // Without WAL, workers read the durable pack/index snapshot.
+                // They intentionally do not observe uncheckpointed writer
+                // mutations; this keeps WAL-disabled operation independent of
+                // a root wal.bin file.
+                PackfileStorage::open_read_only(pool_dir.clone()).map_err(StorageError::Io)
+            }
             .map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
                     "failed to open mtxdb {name} pool read-only: {e}"
