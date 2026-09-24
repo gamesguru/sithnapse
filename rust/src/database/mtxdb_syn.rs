@@ -3017,7 +3017,7 @@ pub fn stats(py: Python<'_>) -> PyResult<Py<PyDict>> {
     stats_impl(py, false)
 }
 
-/// Return runtime stats and atomically take/reset per-interval diagnostics.
+/// Return runtime stats and take/reset per-interval diagnostics for each pool.
 #[pyfunction]
 pub fn stats_snapshot(py: Python<'_>) -> PyResult<Py<PyDict>> {
     stats_impl(py, true)

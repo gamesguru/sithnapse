@@ -782,6 +782,40 @@ def _mtxdb_snapshot_metrics(ps: dict[str, Any]) -> dict[str, float]:
     }
 
 
+def _format_mtxdb_snapshot_segment(
+    pool: str, m: dict[str, float], d: dict[str, float]
+) -> str:
+    return (
+        f"{pool}[idx={m['index_bytes'] / 1e6:.1f}MB(+{d['index_bytes'] / 1e6:.1f}MB) "
+        f"col={int(m['collection_count'])}(+{int(d['collection_count'])}) "
+        f"shards={int(m['shard_count'])}(+{int(d['shard_count'])}) "
+        f"cand={int(m['candidate_reads'])}(+{int(d['candidate_reads'])}) "
+        f"index=+{int(d['index_grow_count'])}/+{int(d['index_rebuild_count'])} "
+        f"checkpoint=+{int(d['checkpoint_writes'])} "
+        f"repack={int(m['repack_count'])}/{int(m['repack_kept'])}/{int(m['repack_dropped'])} "
+        f"grow=+{int(d['index_grow_count'])} rebuild=+{int(d['index_rebuild_count'])} "
+        f"ckpt=+{int(d['checkpoint_writes'])} "
+        f"sync=+{int(d['sync_calls'])}/+{d['sync_us'] / 1000:.1f}ms "
+        f"fsync=+{d['fsync_us'] / 1000:.1f}ms "
+        f"phases(ms)=flush+{d['flush_us'] / 1000:.1f}/side+{d['sidecar_us'] / 1000:.1f}"
+        f"/delta+{d['delta_log_us'] / 1000:.1f}/ckpt+{d['sync_checkpoint_us'] / 1000:.1f}"
+        f"/wal+{d['wal_us'] / 1000:.1f} "
+        f"j=lock+{d['journal_lock_wait_us'] / 1000:.1f}"
+        f"/pend+{d['journal_pending_wait_us'] / 1000:.1f}"
+        f"/append+{d['journal_append_us'] / 1000:.1f}"
+        f"/fsync+{d['journal_fsync_us'] / 1000:.1f}ms"
+        f" c=+{int(d['journal_sync_calls'])}"
+        f" b=+{int(d['journal_bytes'])}"
+        f" r=+{int(d['journal_records'])}"
+        f" wait=+{int(d['journal_waiters'])}"
+        f" coal=+{int(d['journal_coalesced'])}"
+        f" peak={int(m['peak_journal_in_flight'])}"
+        f" lmax={m['max_journal_lock_wait_us'] / 1000:.1f}/{m['max_journal_fsync_us'] / 1000:.1f}ms"
+        f" dirty+{d['dirty_lock_wait_us'] / 1000:.1f}ms"
+        f" age_avg={d['pending_publish_age_us'] / max(d['sync_calls'], 1) / 1000:.1f}ms]"
+    )
+
+
 def _mtxdb_snapshot_once() -> None:
     """Log one per-pool line with absolute values and since-last deltas."""
     global _mtxdb_persist_snapshot_calls, _mtxdb_persist_snapshot_total_secs
@@ -806,35 +840,7 @@ def _mtxdb_snapshot_once() -> None:
             continue
         m = _mtxdb_snapshot_metrics(ps)
         d = {key: _delta(pool, key, value) for key, value in m.items()}
-        segments.append(
-            f"{pool}[idx={m['index_bytes'] / 1e6:.1f}MB(+{d['index_bytes'] / 1e6:.1f}MB) "
-            f"col={int(m['collection_count'])}(+{int(d['collection_count'])}) "
-            f"shards={int(m['shard_count'])}(+{int(d['shard_count'])}) "
-            f"cand={int(m['candidate_reads'])}(+{int(d['candidate_reads'])}) "
-            f"index=+{int(d['index_grow_count'])}/+{int(d['index_rebuild_count'])} "
-            f"checkpoint=+{int(d['checkpoint_writes'])} "
-            f"repack={int(m['repack_count'])}/{int(m['repack_kept'])}/{int(m['repack_dropped'])} "
-            f"grow=+{int(d['index_grow_count'])} rebuild=+{int(d['index_rebuild_count'])} "
-            f"ckpt=+{int(d['checkpoint_writes'])} "
-            f"sync=+{int(d['sync_calls'])}/+{d['sync_us'] / 1000:.1f}ms "
-            f"fsync=+{d['fsync_us'] / 1000:.1f}ms "
-            f"phases(ms)=flush+{d['flush_us'] / 1000:.1f}/side+{d['sidecar_us'] / 1000:.1f}"
-            f"/delta+{d['delta_log_us'] / 1000:.1f}/ckpt+{d['sync_checkpoint_us'] / 1000:.1f}"
-            f"/wal+{d['wal_us'] / 1000:.1f} "
-            f"j=lock+{d['journal_lock_wait_us'] / 1000:.1f}"
-            f"/pend+{d['journal_pending_wait_us'] / 1000:.1f}"
-            f"/append+{d['journal_append_us'] / 1000:.1f}"
-            f"/fsync+{d['journal_fsync_us'] / 1000:.1f}ms"
-            f" c=+{int(d['journal_sync_calls'])}"
-            f" b=+{int(d['journal_bytes'])}"
-            f" r=+{int(d['journal_records'])}"
-            f" wait=+{int(d['journal_waiters'])}"
-            f" coal=+{int(d['journal_coalesced'])}"
-            f" peak={int(m['peak_journal_in_flight'])}"
-            f" lmax={m['max_journal_lock_wait_us'] / 1000:.1f}/{m['max_journal_fsync_us'] / 1000:.1f}ms"
-            f" dirty+{d['dirty_lock_wait_us'] / 1000:.1f}ms"
-            f" age_avg={d['pending_publish_age_us'] / max(d['sync_calls'], 1) / 1000:.1f}ms]"
-        )
+        segments.append(_format_mtxdb_snapshot_segment(pool, m, d))
 
     # FFI forward-edge cost, only recorded when SYNAPSE_PG_TIMINGS is set.
     edges_us = _FFI_TIMINGS.get("ffi_event_edges_get_forward", 0.0)
