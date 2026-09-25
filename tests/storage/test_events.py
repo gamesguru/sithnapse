@@ -39,6 +39,7 @@ from synapse.storage.databases.main import (
     embedded_common,
     embedded_event_json,
     events as events_module,
+    state as state_module,
 )
 from synapse.storage.databases.main.embedded_common import Pool, SyncTier
 from synapse.types import StateMap
@@ -378,6 +379,88 @@ class EventsTestCase(HomeserverTestCase):
             [("sync", (Pool.STATE, Pool.AUTH_CHAIN, Pool.EVENT_DAG))],
         )
         self.assertFalse([call for call in calls if call[0] == "call_after_sync_now"])
+
+    def _rewrite_partial_state_mapping(
+        self, *, publish_at_commit: bool
+    ) -> tuple[mock.Mock, mock.Mock, mock.Mock]:
+        """Run the partial-state rewrite of an event's state group.
+
+        Returns the `(publish, sync_now, mark_dirty)` mocks it used.
+        """
+        user = self.register_user("partial_state_user", "pass")
+        token = self.login("partial_state_user", "pass")
+        room_id = self.helper.create_room_as(user, tok=token)
+        event_id = self.helper.send(room_id, "rewrite me", tok=token)["event_id"]
+        event = self.get_success(self._store.get_event(event_id))
+        state_group = self.get_success(
+            self.hs.get_storage_controllers().state.get_state_group_for_events(
+                [event_id]
+            )
+        )[event_id]
+        context = EventContext.with_state(
+            storage=self.hs.get_storage_controllers(),
+            state_group=state_group,
+            state_group_before_event=state_group,
+            state_delta_due_to_event=None,
+            partial_state=False,
+            state_group_deltas={},
+        )
+        # The rewrite un-partial-states the event, so it has to be recorded as
+        # one first (the function deletes its `partial_state_events` row, which
+        # references a partial-state room).
+        self.get_success(
+            self._store.store_partial_state_room(
+                room_id=room_id,
+                servers={"remote.example.org"},
+                device_lists_stream_id=0,
+                joined_via="remote.example.org",
+            )
+        )
+        self.get_success(
+            self._store.db_pool.simple_insert(
+                table="partial_state_events",
+                values={"room_id": room_id, "event_id": event_id},
+                desc="test_mark_event_partial_state",
+            )
+        )
+
+        with (
+            mock.patch.object(
+                state_module, "publishes_at_commit", return_value=publish_at_commit
+            ),
+            mock.patch.object(state_module, "maybe_publish") as publish,
+            mock.patch.object(state_module, "sync_now") as sync,
+            mock.patch.object(state_module, "mark_dirty") as dirty,
+        ):
+            self.get_success(
+                self._store.update_state_for_partial_state_event(event, context)
+            )
+        return publish, sync, dirty
+
+    @skip_unless(bool(EMBEDDED_HAMT_ENGINE), "requires embedded HAMT engine")
+    def test_partial_state_rewrite_publishes_when_publishing_at_commit(self) -> None:
+        """`interval`/`off`: publish the rewritten mapping and leave fsync to the
+        coalescer. A `sync_now` here fsyncs on the reactor thread under
+        `interval` and does nothing at all under `off`, so workers never saw the
+        rewrite (the resync tests then fail to find the event)."""
+        publish, sync, dirty = self._rewrite_partial_state_mapping(
+            publish_at_commit=True
+        )
+
+        publish.assert_called_once_with(SyncTier.DURABLE, [Pool.STATE])
+        dirty.assert_called_once_with(Pool.STATE)
+        sync.assert_not_called()
+
+    @skip_unless(bool(EMBEDDED_HAMT_ENGINE), "requires embedded HAMT engine")
+    def test_partial_state_rewrite_syncs_by_default(self) -> None:
+        """`always` keeps the strict barrier and does not publish separately."""
+        publish, sync, dirty = self._rewrite_partial_state_mapping(
+            publish_at_commit=False
+        )
+
+        sync.assert_called_once_with([Pool.STATE])
+        publish.assert_not_called()
+        dirty.assert_not_called()
 
     @skip_unless(bool(EMBEDDED_HAMT_ENGINE), "requires embedded HAMT engine")
     def test_event_json_publish_precedes_commit_when_publishing_at_commit(
