@@ -14,6 +14,8 @@ from contextlib import contextmanager
 from enum import Enum, auto
 from typing import IO, TYPE_CHECKING, Any, Callable, Iterable, Iterator
 
+from synapse.util.timings_flush import register_periodic_flush
+
 if TYPE_CHECKING:
     from synapse.util.clock import Clock, DelayedCallWrapper
 
@@ -305,7 +307,9 @@ def _print_ffi_timings() -> None:
 
     run_dir = os.environ.get("SYNAPSE_TIMINGS_RUN_DIR")
     if run_dir:
-        tmp_path = os.path.join(run_dir, f"ffi_{os.getpid()}.tmp")
+        tmp_path = os.path.join(
+            run_dir, f"ffi_{os.getpid()}.{threading.get_ident()}.tmp"
+        )
         final_path = os.path.join(run_dir, f"ffi_{os.getpid()}.json")
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
@@ -494,6 +498,7 @@ if os.environ.get("SYNAPSE_PG_TIMINGS"):
         _print_ffi_timings()
 
     atexit.register(flush_ffi_timings)
+    register_periodic_flush(flush_ffi_timings)
 
 
 # ── mtxdb runtime stats (opt-in via SYNAPSE_MTXDB_STATS=1) ──────────────
@@ -509,6 +514,20 @@ def _print_mtxdb_stats() -> None:
         engine = get_embedded_engine("mtxdb")
         s = engine.stats()
     except Exception:
+        return
+
+    run_dir = os.environ.get("SYNAPSE_TIMINGS_RUN_DIR")
+    if run_dir:
+        tmp_path = os.path.join(
+            run_dir, f"mtxdb_{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        final_path = os.path.join(run_dir, f"mtxdb_{os.getpid()}.json")
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(s, f, default=str)
+            os.replace(tmp_path, final_path)
+        except OSError:
+            pass
         return
 
     import sys
@@ -695,6 +714,7 @@ def _print_mtxdb_stats() -> None:
 
 if os.environ.get("SYNAPSE_MTXDB_STATS"):
     atexit.register(_print_mtxdb_stats)
+    register_periodic_flush(_print_mtxdb_stats)
 
 
 # ── Periodic mtxdb runtime snapshot (opt-in via SYNAPSE_MTXDB_STATS=1) ──
