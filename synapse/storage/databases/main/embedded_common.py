@@ -549,8 +549,10 @@ if os.environ.get("SYNAPSE_PG_TIMINGS"):
 # ── mtxdb runtime stats (opt-in via SYNAPSE_MTXDB_STATS=1) ──────────────
 
 
-# Display names for the stats keys, matching mtxdb's own `ShardType` names.
-_POOL_LABELS: dict[str, str] = {"auth_chain": "edges"}
+# Display names for the stats keys. The keys keep their older names
+# (`event_dag`, `auth_chain`); the report says `event` (event JSON) and `edges`
+# (previous-event and auth-chain edges, mtxdb's `ShardType::Edges`).
+_POOL_LABELS: dict[str, str] = {"event_dag": "event", "auth_chain": "edges"}
 
 
 def _print_mtxdb_stats() -> None:

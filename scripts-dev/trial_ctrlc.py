@@ -778,8 +778,9 @@ def _print_mtxdb_engine_stats(timings_dir: str) -> None:
         pool_totals = totals.get(pool)
         if not pool_totals:
             continue
-        # mtxdb calls the third pool `Edges`; the stats key kept `auth_chain`.
-        print(f"\n  [{'edges' if pool == 'auth_chain' else pool}]", file=err)
+        # The stats keys keep their older names; the report says `event`/`edges`.
+        label = {"event_dag": "event", "auth_chain": "edges"}.get(pool, pool)
+        print(f"\n  [{label}]", file=err)
         print(
             f"    get: {pool_totals['get_calls']:,.0f} calls, {pool_totals['get_misses']:,.0f} misses"
             f" | cache: {pool_totals['cache_hits']:,.0f} hits, {pool_totals['cache_misses']:,.0f} misses",
