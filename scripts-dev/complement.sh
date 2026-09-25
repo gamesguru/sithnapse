@@ -521,7 +521,13 @@ main() {
   # (0/false/no/off/empty) leaves sync on, a truthy value disables it.
   case "${SYNAPSE_TEST_MTXDB_NO_SYNC:-}" in
     "" | 0 | false | False | no | No | off | Off) ;;
-    *) export PASS_SYNAPSE_MTXDB_NO_SYNC=1 ;;
+    *)
+      export PASS_SYNAPSE_MTXDB_NO_SYNC=1
+      # Complement runs workers, and durability off is rejected for a worker
+      # deployment unless explicitly allowed. These containers are destroyed
+      # after every test, so a crash loses nothing that matters.
+      export PASS_SYNAPSE_TEST_MTXDB_ALLOW_UNSAFE_OFF=1
+      ;;
   esac
 
   # Persist sync mode for the containers: always | interval | off. Unset keeps
@@ -531,7 +537,11 @@ main() {
   # honoured, for the same reason as the no-sync switch above.
   case "${SYNAPSE_TEST_MTXDB_SYNC_MODE:-}" in
     "") ;;
-    always | interval | off) export PASS_SYNAPSE_MTXDB_SYNC="$SYNAPSE_TEST_MTXDB_SYNC_MODE" ;;
+    always | interval) export PASS_SYNAPSE_MTXDB_SYNC="$SYNAPSE_TEST_MTXDB_SYNC_MODE" ;;
+    off)
+      export PASS_SYNAPSE_MTXDB_SYNC=off
+      export PASS_SYNAPSE_TEST_MTXDB_ALLOW_UNSAFE_OFF=1
+      ;;
     *)
       echo "SYNAPSE_TEST_MTXDB_SYNC_MODE must be one of: always, interval, off" >&2
       exit 1

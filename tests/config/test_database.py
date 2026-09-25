@@ -19,6 +19,7 @@
 #
 
 import os
+from typing import Any
 
 import yaml
 
@@ -185,6 +186,9 @@ class EmbeddedHamtWorkerGuardTestCase(unittest.TestCase):
         run_background_tasks_on: str | None = None,
         embedded_hamt_engine: str | None = "mtxdb",
         wal_env: str | None = "1",
+        sync_mode: str = "interval",
+        no_sync: bool = False,
+        unsafe_off_env: str | None = None,
     ) -> None:
         """Build a WorkerConfig and call read_config, triggering the guard.
 
@@ -198,6 +202,8 @@ class EmbeddedHamtWorkerGuardTestCase(unittest.TestCase):
 
         root = Mock()
         root.database.embedded_hamt_engine = embedded_hamt_engine
+        root.database.embedded_hamt_sync_mode = sync_mode
+        root.database.embedded_hamt_no_sync = no_sync
 
         worker_config = WorkerConfig(root)
         config: dict = {}
@@ -214,6 +220,9 @@ class EmbeddedHamtWorkerGuardTestCase(unittest.TestCase):
         os.environ.pop("SYNAPSE_MTXDB_WAL", None)
         if wal_env is not None:
             os.environ["SYNAPSE_MTXDB_WAL"] = wal_env
+        os.environ.pop("SYNAPSE_TEST_MTXDB_ALLOW_UNSAFE_OFF", None)
+        if unsafe_off_env is not None:
+            os.environ["SYNAPSE_TEST_MTXDB_ALLOW_UNSAFE_OFF"] = unsafe_off_env
         try:
             worker_config.read_config(config, allow_secrets_in_config=True)
         finally:
@@ -300,6 +309,41 @@ class EmbeddedHamtWorkerGuardTestCase(unittest.TestCase):
             instance_map={"main": {"host": "127.0.0.1", "port": 8008}},
             run_background_tasks_on="master",
         )
+
+    @staticmethod
+    def _workers() -> dict[str, Any]:
+        # A fresh dict every time: `read_config` renames `main` to `master` in
+        # the instance_map it is given, so it cannot be reused across calls.
+        return {
+            "worker_app": "synapse.app.generic_worker",
+            "instance_map": {"main": {"host": "127.0.0.1", "port": 8008}},
+        }
+
+    def test_worker_deployment_sync_off_raises(self) -> None:
+        """A worker deployment with durability off is rejected: other workers
+        can read what a crash then loses, and there is no SQL copy to repair it."""
+        with self.assertRaises(ConfigError):
+            self._make_worker_config(**self._workers(), sync_mode="off")
+        with self.assertRaises(ConfigError):
+            self._make_worker_config(**self._workers(), no_sync=True)
+
+    def test_worker_deployment_sync_off_needs_the_explicit_override(self) -> None:
+        self._make_worker_config(**self._workers(), sync_mode="off", unsafe_off_env="1")
+        self._make_worker_config(**self._workers(), no_sync=True, unsafe_off_env="true")
+        # A falsey override is not an override.
+        with self.assertRaises(ConfigError):
+            self._make_worker_config(
+                **self._workers(), sync_mode="off", unsafe_off_env="0"
+            )
+
+    def test_worker_deployment_interval_and_always_are_allowed(self) -> None:
+        for mode in ("interval", "always"):
+            self._make_worker_config(**self._workers(), sync_mode=mode)
+
+    def test_single_process_sync_off_is_allowed(self) -> None:
+        """Off is fine without workers: nothing else can read what is lost."""
+        self._make_worker_config(sync_mode="off")
+        self._make_worker_config(no_sync=True)
 
     def test_single_process_ok(self) -> None:
         """embedded_hamt alone (no worker_app, no instance_map) → no error."""

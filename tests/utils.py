@@ -188,6 +188,12 @@ _no_sync_off = _no_sync_env is not None and _no_sync_env.strip().lower() in (
     "off",
 )
 EMBEDDED_HAMT_NO_SYNC = not _no_sync_off
+if EMBEDDED_HAMT_NO_SYNC:
+    # The test harness turns durability off on purpose (see above), which
+    # WorkerConfig otherwise rejects for a worker deployment because a crash
+    # could lose data that another worker already read. Trial's stores are
+    # thrown away, so opt in explicitly, exactly as a test-only run must.
+    os.environ.setdefault("SYNAPSE_TEST_MTXDB_ALLOW_UNSAFE_OFF", "1")
 
 # synapse/config/workers.py requires the write-ahead journal
 # (SYNAPSE_MTXDB_WAL) whenever the embedded engine is on *and* the

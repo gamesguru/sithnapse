@@ -213,6 +213,13 @@ class OutboundFederationRestrictedTo:
         return self.instances is None or instance in self.instances
 
 
+def _unsafe_mtxdb_off_allowed() -> bool:
+    """Whether this process has explicitly opted into `off` for a test or
+    diagnostic run (SYNAPSE_TEST_MTXDB_ALLOW_UNSAFE_OFF)."""
+    value = os.environ.get("SYNAPSE_TEST_MTXDB_ALLOW_UNSAFE_OFF", "").strip().lower()
+    return value not in ("", "0", "false", "no", "off")
+
+
 class WorkerConfig(Config):
     """The workers are processes run separately to the main synapse process.
     They have their own pid_file and listener configuration. They use the
@@ -586,6 +593,25 @@ class WorkerConfig(Config):
                     "that closes that window independently of the checkpoint "
                     "rewrite. Set SYNAPSE_MTXDB_WAL=1 to enable it, or remove "
                     "the worker deployment (worker_app / instance_map)."
+                )
+
+            database = self.root.database
+            if (
+                database.embedded_hamt_sync_mode == "off"
+                or database.embedded_hamt_no_sync
+            ) and not _unsafe_mtxdb_off_allowed():
+                raise ConfigError(
+                    f"embedded_hamt.engine is set to {embedded_hamt_engine!r} in "
+                    "a worker deployment with durability turned off "
+                    "(embedded_hamt.sync_mode: off, no_sync, SYNAPSE_MTXDB_SYNC=off "
+                    "or SYNAPSE_MTXDB_NO_SYNC). With durability off nothing bounds "
+                    "how much a crash can lose, while other workers may already "
+                    "have read what the writer then loses: the event JSON and "
+                    "state mappings have no SQL copy, so a committed SQL row can "
+                    "be left permanently without its embedded record. Use "
+                    "sync_mode: interval (a bounded crash window) or always. "
+                    "For a test or diagnostic run only, set "
+                    "SYNAPSE_TEST_MTXDB_ALLOW_UNSAFE_OFF=1 to allow it."
                 )
 
         self.events_shard_config = RoutableShardedWorkerHandlingConfig(
