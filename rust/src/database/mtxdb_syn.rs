@@ -3521,6 +3521,25 @@ pub fn stop_background_commit(py: Python<'_>) -> PyResult<()> {
     })
 }
 
+/// Return a terminal background-committer failure without consuming it.
+///
+/// The Python coalescer uses this non-blocking probe to keep its dirty flags
+/// set and schedule the existing retry path after a journal I/O failure.
+#[pyfunction]
+pub fn background_commit_error(py: Python<'_>) -> PyResult<Option<String>> {
+    assert_writable()?;
+    py.detach(|| {
+        for engine in [state_db()?, event_dag_db()?, auth_chain_db()?] {
+            if let Some(journal) = engine.journal() {
+                if let Some(message) = journal.background_failure_message() {
+                    return Ok(Some(message));
+                }
+            }
+        }
+        Ok(None)
+    })
+}
+
 /// Request durability through the current published boundary of every pool.
 ///
 /// The fixed three-entry result keeps the pool mapping stable even when a
@@ -4075,6 +4094,7 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(publish_pending, m)?)?;
     m.add_function(wrap_pyfunction!(start_background_commit, m)?)?;
     m.add_function(wrap_pyfunction!(stop_background_commit, m)?)?;
+    m.add_function(wrap_pyfunction!(background_commit_error, m)?)?;
     m.add_function(wrap_pyfunction!(request_durable, m)?)?;
     m.add_function(wrap_pyfunction!(wait_durable, m)?)?;
     m.add_function(wrap_pyfunction!(stats, m)?)?;
