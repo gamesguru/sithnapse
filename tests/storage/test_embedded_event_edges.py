@@ -24,7 +24,10 @@ from twisted.test.proto_helpers import MemoryReactor
 from synapse.rest import admin
 from synapse.rest.client import login, room
 from synapse.server import HomeServer
-from synapse.storage.databases.main import embedded_common
+from synapse.storage.databases.main import (
+    embedded_common,
+    embedded_event_edges as embedded_event_edges_module,
+)
 from synapse.storage.databases.main.embedded_common import (
     FLUSH_DELAY_SECS,
     _clear_coalescer,
@@ -544,7 +547,33 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
         delete_entered = threading.Event()
         delete_release = threading.Event()
         enqueue_started = threading.Event()
+        enqueue_lock_attempted = threading.Event()
         enqueue_finished = threading.Event()
+        thread_role = threading.local()
+
+        real_namespace_flush_lock = embedded_event_edges_module._namespace_flush_lock
+
+        class TrackingLock:
+            def __init__(self, lock: threading.Lock) -> None:
+                self._lock = lock
+
+            def acquire(self, *args: Any, **kwargs: Any) -> Any:
+                if getattr(thread_role, "is_enqueue", False):
+                    enqueue_lock_attempted.set()
+                return self._lock.acquire(*args, **kwargs)
+
+            def release(self) -> None:
+                self._lock.release()
+
+            def __enter__(self) -> "TrackingLock":
+                self.acquire()
+                return self
+
+            def __exit__(self, *args: Any) -> None:
+                self.release()
+
+        def tracking_namespace_flush_lock(namespace: str) -> TrackingLock:
+            return TrackingLock(real_namespace_flush_lock(namespace))
 
         def slow_delete(*args: Any, **kwargs: Any) -> Any:
             delete_entered.set()
@@ -557,13 +586,24 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
 
         def enqueue() -> None:
             enqueue_started.set()
-            queue_edge_write(ns, [(self.room_id, victim, parent, False)])
-            enqueue_finished.set()
+            thread_role.is_enqueue = True
+            try:
+                queue_edge_write(ns, [(self.room_id, victim, parent, False)])
+                enqueue_finished.set()
+            finally:
+                thread_role.is_enqueue = False
 
         try:
-            with mock.patch(
-                "synapse.synapse_rust.mtxdb_engine.event_edges_delete",
-                side_effect=slow_delete,
+            with (
+                mock.patch(
+                    "synapse.synapse_rust.mtxdb_engine.event_edges_delete",
+                    side_effect=slow_delete,
+                ),
+                mock.patch.object(
+                    embedded_event_edges_module,
+                    "_namespace_flush_lock",
+                    side_effect=tracking_namespace_flush_lock,
+                ),
             ):
                 purge_thread = threading.Thread(target=purge)
                 purge_thread.start()
@@ -576,8 +616,12 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
                 self.assertTrue(enqueue_started.wait(timeout=5))
                 # The enqueue must be parked on the namespace flush lock for
                 # the whole cancel -> delete window.
+                self.assertTrue(
+                    enqueue_lock_attempted.wait(timeout=5),
+                    "enqueue never attempted the namespace flush lock",
+                )
                 self.assertFalse(
-                    enqueue_finished.wait(timeout=0.2),
+                    enqueue_finished.is_set(),
                     "enqueue landed between the purge cancel and delete",
                 )
 
