@@ -493,7 +493,10 @@ pub fn put_state_hamt_roots(
         let existing = engine
             .get_read_committed(&room_id, &semantic_node_ids)
             .map_err(map_read_storage_error)?;
+        let mut semantic_exists = HashMap::with_capacity(semantic_ids.len());
         for (existing, expected_id) in existing.into_iter().zip(semantic_ids.iter()) {
+            let exists = existing.as_ref().is_some_and(|data| !data.bytes.is_empty());
+            semantic_exists.insert(*expected_id, exists);
             if let Some(existing) = existing.as_ref().filter(|data| !data.bytes.is_empty()) {
                 let actual_id =
                     state_group_id_from_root_value_for_room(&existing.bytes, &room_prefix)
@@ -528,7 +531,7 @@ pub fn put_state_hamt_roots(
         let refcounts = engine
             .get_read_committed(&room_id, &refcount_node_ids)
             .map_err(map_read_storage_error)?;
-        let mut refcounts_by_id: HashMap<[u8; 32], u64> = semantic_ids
+        let mut refcounts_by_id: HashMap<[u8; 32], Option<u64>> = semantic_ids
             .iter()
             .copied()
             .zip(refcounts)
@@ -544,7 +547,7 @@ pub fn put_state_hamt_roots(
                         Ok::<u64, PyErr>(u64::from_be_bytes(bytes))
                     })
                     .transpose()?;
-                Ok::<([u8; 32], u64), PyErr>((id, count.unwrap_or(0)))
+                Ok::<([u8; 32], Option<u64>), PyErr>((id, count))
             })
             .collect::<PyResult<_>>()?;
         let mut pairs = pairs;
@@ -555,14 +558,26 @@ pub fn put_state_hamt_roots(
                 .is_none()
             {
                 let count = refcounts_by_id.entry(*state_group_id).or_default();
-                *count = count.checked_add(1).ok_or_else(|| {
-                    pyo3::exceptions::PyOverflowError::new_err(
-                        "StateGroupId reference count overflow",
-                    )
-                })?;
+                match count {
+                    Some(count) => {
+                        *count = count.checked_add(1).ok_or_else(|| {
+                            pyo3::exceptions::PyOverflowError::new_err(
+                                "StateGroupId reference count overflow",
+                            )
+                        })?;
+                    }
+                    None if semantic_exists.get(state_group_id).copied().unwrap_or(false) => {
+                        return Err(pyo3::exceptions::PyValueError::new_err(
+                            "cannot add alias for a semantic root with an uninitialized reference count",
+                        ));
+                    }
+                    None => *count = Some(1),
+                }
             }
         }
-        for (state_group_id, count) in refcounts_by_id {
+        for (state_group_id, count) in refcounts_by_id.into_iter().filter_map(|(id, count)| {
+            count.map(|count| (id, count))
+        }) {
             pairs.push((
                 state_group_refcount_node_id(&namespace, &state_group_id),
                 NodeData::from_slice(&count.to_be_bytes()),
@@ -600,6 +615,11 @@ pub fn delete_state_hamt_roots_for_room(
     state_groups: Vec<i64>,
 ) -> PyResult<()> {
     assert_writable()?;
+    let mut seen_state_groups = HashSet::with_capacity(state_groups.len());
+    let state_groups: Vec<i64> = state_groups
+        .into_iter()
+        .filter(|state_group| seen_state_groups.insert(*state_group))
+        .collect();
     let room_id = room_id_from_prefix(&room_prefix);
     py.detach(|| {
         let _write_guard = STATE_HAMT_ROOT_WRITE_LOCK
@@ -4066,7 +4086,7 @@ pub(crate) mod auth_chain_closure_tests {
                 py,
                 namespace.to_owned(),
                 room.as_bytes().to_vec(),
-                vec![41],
+                vec![41, 41],
             )
             .expect("first alias deletion");
             assert_eq!(
@@ -4107,6 +4127,37 @@ pub(crate) mod auth_chain_closure_tests {
                 vec![None]
             );
         });
+    }
+
+    #[test]
+    fn state_root_rejects_new_alias_when_refcount_is_uninitialized() {
+        ensure_open();
+        let namespace = "ns-root-uninitialized-refcount";
+        let room = "!root-uninitialized-refcount:example.org";
+        let value = test_root_value(room, 1, 2);
+        test_put_root(namespace, room, 61, value.clone());
+        let id = test_root_id(&value);
+        state_db()
+            .expect("state db")
+            .put_many(
+                &room_id_from_prefix(room.as_bytes()),
+                &[(
+                    state_group_refcount_node_id(namespace, &id),
+                    NodeData::new(bytes::Bytes::new()),
+                )],
+            )
+            .expect("remove reference count");
+
+        let error = pyo3::Python::attach(|py| {
+            put_state_hamt_roots(
+                py,
+                namespace.to_owned(),
+                room.as_bytes().to_vec(),
+                vec![(62, value)],
+            )
+            .expect_err("mixed pre-refcount aliases must not be guessed")
+        });
+        assert!(error.to_string().contains("uninitialized reference count"));
     }
 
     #[test]
