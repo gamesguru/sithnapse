@@ -112,17 +112,30 @@ build: ##H Build the package
 # Install
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-# Defaults for `make install/gen-config` / `make install/server`. Override them
-# in .env (sourced below) or in the environment, e.g.
-# `make install/server INSTALL_USER=deploy`. The virtualenv is expected at
-# INSTALL_DIR, with its interpreter at INSTALL_DIR/bin/python.
+# Defaults for the `install/*` targets. Override them in .env (sourced below)
+# or in the environment, e.g. `make install/server INSTALL_USER=deploy`.
+# INSTALL_DIR is the virtualenv; INSTALL_SRC is the source checkout to build
+# and install from; INSTALL_EXTRAS is an optional comma-separated extra list.
 INSTALL_USER ?= sith
 INSTALL_DIR ?= /opt/sithnapse
+INSTALL_SRC ?= $(CURDIR)
+INSTALL_EXTRAS ?=
 
 # Defaults for `make install/gen-config` / `make install/server`.
 SERVER_NAME ?= sith.nutra.tk
 CONFIG_PATH ?= /etc/sithnapse/homeserver.yaml
 REPORT_STATS ?= no
+
+.PHONY: install/build
+install/build: ##H Build and pip-install INSTALL_SRC into INSTALL_DIR
+	set -euo pipefail; \
+	if [ -f .env ]; then set -a; . ./.env; set +a; fi; \
+	install_dir="$${INSTALL_DIR:-$(INSTALL_DIR)}"; \
+	install_src="$${INSTALL_SRC:-$(INSTALL_SRC)}"; \
+	install_extras="$${INSTALL_EXTRAS:-$(INSTALL_EXTRAS)}"; \
+	if [ -n "$$install_extras" ]; then spec="$$install_src[$$install_extras]"; else spec="$$install_src"; fi; \
+	echo "Installing $$spec into $$install_dir"; \
+	sudo "$$install_dir/bin/pip" install "$$spec"
 
 .PHONY: install/gen-config
 install/gen-config: ##H Generate the homeserver config as INSTALL_USER
@@ -134,7 +147,9 @@ install/gen-config: ##H Generate the homeserver config as INSTALL_USER
 	config_path="$${CONFIG_PATH:-$(CONFIG_PATH)}"; \
 	report_stats="$${REPORT_STATS:-$(REPORT_STATS)}"; \
 	echo "Generating $$config_path for $$server_name"; \
-	sudo -u "$$install_user" -H "$$install_dir/bin/synapse_homeserver" \
+	cd /; \
+	sudo -u "$$install_user" -H "$$install_dir/bin/python" \
+		-m synapse.app.homeserver \
 		--server-name "$$server_name" \
 		--config-path "$$config_path" \
 		--generate-config \
@@ -148,7 +163,9 @@ install/server: ##H Run the homeserver as INSTALL_USER with CONFIG_PATH
 	install_dir="$${INSTALL_DIR:-$(INSTALL_DIR)}"; \
 	config_path="$${CONFIG_PATH:-$(CONFIG_PATH)}"; \
 	echo "Starting homeserver from $$config_path as $$install_user"; \
-	sudo -u "$$install_user" -H "$$install_dir/bin/synapse_homeserver" \
+	cd /; \
+	sudo -u "$$install_user" -H "$$install_dir/bin/python" \
+		-m synapse.app.homeserver \
 		--config-path "$$config_path"
 
 .PHONY: all
