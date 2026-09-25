@@ -12,9 +12,11 @@ even though the writer has never fsynced it. Existing tests run reader and
 writer in one process, so they cannot show that. Here each role is its own
 process, because mtxdb's Python binding holds process-global pools.
 
-The test drives the shim directly, not through ``events.py``: production does
-not call ``publish_pending`` yet, so this pins the primitive the rewiring
-will depend on.
+Most cases drive the shim directly, pinning the primitive ``events.py`` now
+depends on (it publishes through ``maybe_publish``). The event-JSON cases use
+the production ``embedded_event_json`` read/write helpers instead, so the same
+published-but-unfsynced visibility is exercised through the real event-JSON
+path a worker uses.
 """
 
 import json
@@ -36,10 +38,10 @@ _EVENT_DAG_KEY = "event_json:vis"
 
 
 class _Process:
-    def __init__(self, role: str, store_dir: str) -> None:
+    def __init__(self, role: str, store_dir: str, namespace: str = "vis") -> None:
         env = dict(os.environ, SYNAPSE_MTXDB_WAL="1")
         self._proc = subprocess.Popen(
-            [sys.executable, _WORKER, role, store_dir],
+            [sys.executable, _WORKER, role, store_dir, namespace],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -69,6 +71,13 @@ class _Process:
 
     def get(self, key: str) -> str | None:
         value: str | None = json.loads(self.call(f"get {key}"))
+        return value
+
+    def event_json_put(self, room_id: str, event_id: str, body: str) -> None:
+        self.call(f"event_json_put {room_id} {event_id} {body}")
+
+    def event_json_get(self, event_id: str) -> str | None:
+        value: str | None = json.loads(self.call(f"event_json_get {event_id}"))
         return value
 
     def close(self) -> None:
@@ -161,4 +170,63 @@ class MtxdbPublishVisibilityTestCase(unittest.TestCase):
 
         self.writer.call("publish")
         self.assertEqual(reader.get(f"{_STATE_KEY}:2"), "two")
+        self.assertEqual(self.writer.call("fsyncs"), "0")
+
+
+_EVENT_JSON_ROOM = "!vis:test"
+_EVENT_JSON_NS = "vis-event-json"
+
+
+class MtxdbEventJsonPublishVisibilityTestCase(unittest.TestCase):
+    """The real event-JSON read path sees a committed-but-unfsynced write.
+
+    In exclusive mode event JSON has no SQL copy, so a stale worker whose view
+    is not refreshed at the commit boundary would report a committed event as
+    absent. The writer models the persister's commit boundary with the
+    production helpers: ``event_json_put`` (``put_event_json_batch(sync=False)``)
+    then ``publish``. The reader is opened *before* both, so it can only see
+    the record through publication, never through an open-time rescan.
+    """
+
+    def setUp(self) -> None:
+        self.store_dir = tempfile.mkdtemp(prefix="test-mtxdb-event-json-vis-")
+        self.addCleanup(shutil.rmtree, self.store_dir, ignore_errors=True)
+        self.writer = _Process("writer", self.store_dir, _EVENT_JSON_NS)
+        self.addCleanup(self.writer.close)
+
+    def _reader(self) -> _Process:
+        reader = _Process("reader", self.store_dir, _EVENT_JSON_NS)
+        self.addCleanup(reader.close)
+        return reader
+
+    def test_committed_event_json_is_visible_to_stale_worker(self) -> None:
+        reader = self._reader()
+
+        # Control: before publish the record is invisible, so the assertion
+        # below is about the commit-boundary publish, not about the worker
+        # happening to see everything.
+        self.writer.event_json_put(_EVENT_JSON_ROOM, "$ej1:test", "unpublished")
+        self.assertIsNone(reader.event_json_get("$ej1:test"))
+
+        # The writer commits: put + publish, with no fsync.
+        self.writer.call("publish")
+        self.assertEqual(reader.event_json_get("$ej1:test"), "unpublished")
+
+        # Publish is a boundary, not a mode switch: a later write needs its own.
+        self.writer.event_json_put(_EVENT_JSON_ROOM, "$ej2:test", "second")
+        self.assertIsNone(reader.event_json_get("$ej2:test"))
+        self.writer.call("publish")
+        self.assertEqual(reader.event_json_get("$ej2:test"), "second")
+
+        self.assertEqual(self.writer.call("fsyncs"), "0")
+
+    def test_event_json_without_publish_is_invisible_to_stale_worker(self) -> None:
+        reader = self._reader()
+
+        self.writer.event_json_put(_EVENT_JSON_ROOM, "$ej3:test", "never")
+
+        # Without publication the read fails: this is precisely the
+        # committed-row/missing-JSON window the writer must not open, and why
+        # event JSON publishes at the commit boundary.
+        self.assertIsNone(reader.event_json_get("$ej3:test"))
         self.assertEqual(self.writer.call("fsyncs"), "0")

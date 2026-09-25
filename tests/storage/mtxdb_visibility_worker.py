@@ -6,17 +6,33 @@
 #
 """Line-driven mtxdb process for `test_mtxdb_publish_visibility.py`.
 
-    python mtxdb_visibility_worker.py {writer|reader} <store dir>
+    python mtxdb_visibility_worker.py {writer|reader} <store dir> [namespace]
 
 mtxdb's Python binding owns process-global pools, so a writer and a read-only
 worker cannot share an interpreter: the test drives each in its own process.
 Commands arrive on stdin, one per line, and each is answered with one line.
+
+`event_json_put`/`event_json_get` go through the production
+`embedded_event_json` helpers (not raw `batch_put`/`batch_get`): the point of
+those cases is that the real event-JSON read path -- the one a worker uses --
+sees a write the writer published but never fsynced.
 """
 
 import json
+import logging
 import sys
 
+from synapse.storage.databases.main.embedded_event_json import (
+    get_event_json_batch,
+    put_event_json_batch,
+)
 from synapse.synapse_rust import mtxdb_engine
+
+# The worker's stdout is a line protocol; `get_event_json_batch` logs an INFO
+# trace that must not land between replies.
+logging.getLogger("synapse.storage.databases.main.embedded_event_json").setLevel(
+    logging.WARNING
+)
 
 
 def _fsyncs() -> int:
@@ -30,6 +46,7 @@ def _fsyncs() -> int:
 
 def main() -> None:
     role, path = sys.argv[1], sys.argv[2]
+    namespace = sys.argv[3] if len(sys.argv) > 3 else "vis"
     if role == "writer":
         mtxdb_engine.open_client(path)
     else:
@@ -54,6 +71,21 @@ def main() -> None:
                     found[args[0].encode()].decode()
                     if args[0].encode() in found
                     else None
+                )
+            elif command == "event_json_put":
+                # event_json_put <room_id> <event_id> <json> (no spaces in json)
+                room_id, event_id, body = args
+                put_event_json_batch(
+                    "mtxdb",
+                    namespace,
+                    [(event_id, room_id, "{}", body, 1)],
+                    sync=False,
+                )
+                reply = "ok"
+            elif command == "event_json_get":
+                found_json = get_event_json_batch("mtxdb", namespace, [args[0]])
+                reply = json.dumps(
+                    found_json[args[0]][1] if args[0] in found_json else None
                 )
             elif command == "fsyncs":
                 reply = str(_fsyncs())
