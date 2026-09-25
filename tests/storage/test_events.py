@@ -27,6 +27,7 @@ from unittest import mock
 from twisted.internet.testing import MemoryReactor
 
 from synapse.api.constants import EventTypes, Membership
+from synapse.api.errors import NotFoundError
 from synapse.api.room_versions import RoomVersions
 from synapse.events import EventBase
 from synapse.events.snapshot import EventContext
@@ -34,7 +35,11 @@ from synapse.rest import admin
 from synapse.rest.client import login, room
 from synapse.server import HomeServer
 from synapse.storage.database import LoggingTransaction
-from synapse.storage.databases.main import embedded_event_json, events as events_module
+from synapse.storage.databases.main import (
+    embedded_common,
+    embedded_event_json,
+    events as events_module,
+)
 from synapse.storage.databases.main.embedded_common import Pool, SyncTier
 from synapse.types import StateMap
 from synapse.util.clock import Clock
@@ -166,17 +171,27 @@ class EventsTestCase(HomeserverTestCase):
         event.internal_metadata.outlier = True
 
         # Persist it as an outlier first: the shape a partial-state resync pull
-        # leaves behind. This only coalesces STATE, so it must not sync.
-        with mock.patch(
-            "synapse.storage.databases.main.events.sync_now"
-        ) as outlier_sync:
+        # leaves behind. This only coalesces STATE, so it must not sync or
+        # publish that pool (its event JSON may still get a barrier of its own).
+        with (
+            mock.patch.object(
+                events_module,
+                "publishes_at_commit",
+                return_value=publish_at_commit,
+            ),
+            mock.patch.object(events_module, "maybe_sync") as outlier_barrier,
+            mock.patch.object(events_module, "maybe_publish") as outlier_publish,
+        ):
             self.get_success(
                 persistence.persist_event(
                     event,
                     EventContext.for_outlier(self.hs.get_storage_controllers()),
                 )
             )
-        outlier_sync.assert_not_called()
+        for call in outlier_barrier.call_args_list:
+            self.assertNotIn(Pool.STATE, call.kwargs.get("pools", []))
+        for call in outlier_publish.call_args_list:
+            self.assertNotIn(Pool.STATE, call.args[1] if len(call.args) > 1 else [])
 
         # Now the live copy arrives and de-outliers it. Its embedded mapping
         # must be visible before this returns.
@@ -198,13 +213,9 @@ class EventsTestCase(HomeserverTestCase):
             ),
             mock.patch.object(events_module, "maybe_publish") as de_outlier_publish,
             mock.patch.object(events_module, "maybe_sync") as de_outlier_barrier,
-            mock.patch.object(events_module, "sync_now") as de_outlier_sync,
         ):
             self.get_success(persistence.persist_event(event, live_context))
 
-        # Neither mode may leave the mapping to the reactor thread: the old
-        # post-commit `sync_now` barrier is gone.
-        de_outlier_sync.assert_not_called()
         if publish_at_commit:
             de_outlier_publish.assert_called_once_with(SyncTier.DURABLE, [Pool.STATE])
             de_outlier_barrier.assert_not_called()
@@ -227,7 +238,7 @@ class EventsTestCase(HomeserverTestCase):
         self._check_de_outlier_state_barrier(publish_at_commit=True)
 
     def _persist_message_recording_event_json_sync(
-        self, *, publish_at_commit: bool
+        self, *, publish_at_commit: bool, action: str = "message"
     ) -> tuple[list[tuple[str, tuple[object, ...]]], list[object]]:
         """Persist one message, recording what the EVENT_DAG write path does.
 
@@ -238,6 +249,8 @@ class EventsTestCase(HomeserverTestCase):
         user = self.register_user("json_sync_user", "pass")
         token = self.login("json_sync_user", "pass")
         room_id = self.helper.create_room_as(user, tok=token)
+        joiner = self.register_user("json_sync_joiner", "pass")
+        joiner_token = self.login("json_sync_joiner", "pass")
 
         calls: list[tuple[str, tuple[object, ...]]] = []
         put_kwargs: list[object] = []
@@ -261,7 +274,7 @@ class EventsTestCase(HomeserverTestCase):
                 calls.append(("call_after_publish", args))
             elif callback is events_module.mark_dirty:
                 calls.append(("call_after_mark_dirty", args))
-            elif callback is events_module.sync_now:
+            elif callback is embedded_common.sync_now:
                 calls.append(("call_after_sync_now", args))
             real_call_after(txn, callback, *args, **kwargs)  # type: ignore[arg-type]
 
@@ -282,7 +295,12 @@ class EventsTestCase(HomeserverTestCase):
                 side_effect=recording_call_after,
             ),
         ):
-            self.helper.send(room_id, "event json sync mode", tok=token)
+            if action == "join":
+                # A membership event is an auth-chain event: it takes the
+                # auth barrier, which other workers read back immediately.
+                self.helper.join(room_id, joiner, tok=joiner_token)
+            else:
+                self.helper.send(room_id, "event json sync mode", tok=token)
         return calls, put_kwargs
 
     @skip_unless(bool(EMBEDDED_HAMT_ENGINE), "requires embedded HAMT engine")
@@ -322,6 +340,44 @@ class EventsTestCase(HomeserverTestCase):
             calls.index(barriers[0]),
             calls.index(("call_after_mark_dirty", (Pool.AUTH_CHAIN,))),
         )
+
+    @skip_unless(bool(EMBEDDED_HAMT_ENGINE), "requires embedded HAMT engine")
+    def test_auth_event_is_published_in_txn_when_publishing_at_commit(self) -> None:
+        """`interval`/`off` publish an auth event's writes; they must not `sync_now`.
+
+        Auth-chain events (create, membership, power levels) are read back by
+        another worker straight away. Under `off`, `sync_now` is a no-op, so
+        routing this barrier through it published nothing at all and workers
+        failed with "State mapping disappeared". It has to be a publish, made
+        in the transaction, with durability left to the coalescer.
+        """
+        calls, _ = self._persist_message_recording_event_json_sync(
+            publish_at_commit=True, action="join"
+        )
+
+        self.assertIn(
+            ("publish", (Pool.STATE, Pool.AUTH_CHAIN, Pool.EVENT_DAG)),
+            calls,
+            "an auth event's writes were never published to workers",
+        )
+        self.assertFalse(
+            [call for call in calls if call[0] == "call_after_sync_now"],
+            "auth barrier is still a reactor-thread sync_now, a no-op under `off`",
+        )
+        self.assertFalse([call for call in calls if call[0] == "sync"])
+
+    @skip_unless(bool(EMBEDDED_HAMT_ENGINE), "requires embedded HAMT engine")
+    def test_auth_event_takes_one_in_txn_barrier_by_default(self) -> None:
+        """`always` covers an auth event with one barrier over all three pools."""
+        calls, _ = self._persist_message_recording_event_json_sync(
+            publish_at_commit=False, action="join"
+        )
+
+        self.assertEqual(
+            [call for call in calls if call[0] == "sync"],
+            [("sync", (Pool.STATE, Pool.AUTH_CHAIN, Pool.EVENT_DAG))],
+        )
+        self.assertFalse([call for call in calls if call[0] == "call_after_sync_now"])
 
     @skip_unless(bool(EMBEDDED_HAMT_ENGINE), "requires embedded HAMT engine")
     def test_event_json_publish_precedes_commit_when_publishing_at_commit(
@@ -412,8 +468,9 @@ class EventsTestCase(HomeserverTestCase):
         self.assertEqual(found[event_id][1], body)
 
         # ... but is unreachable: with no committed row there is no id for a
-        # reader to discover, and `get_event` is how a reader learns one.
-        self.assertIsNone(self.get_success(self._store.get_event(event_id)))
+        # reader to discover, and `get_event` is how a reader learns one. It
+        # reports a missing event by raising, not by returning None.
+        self.get_failure(self._store.get_event(event_id), NotFoundError)
 
     def test_get_senders_for_event_ids(self) -> None:
         """Tests the `get_senders_for_event_ids` storage function."""

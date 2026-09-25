@@ -73,7 +73,6 @@ from synapse.storage.databases.main.embedded_common import (
     maybe_publish,
     maybe_sync,
     publishes_at_commit,
-    sync_now,
 )
 from synapse.storage.databases.main.embedded_event_edges import (
     embedded_event_edges_is_writable,
@@ -1258,6 +1257,14 @@ class PersistEventsStore:
         # From this point onwards the events are only events that we haven't
         # seen before.
 
+        # `_store_event_txn` writes the events and their JSON for every event,
+        # rejected ones included; `_store_rejected_events_txn` below then drops
+        # them from the list. Remember what was written *now*, or a persist in
+        # which every event is rejected would look as though it wrote no JSON
+        # and skip the durability barrier for it.
+        wrote_event_json = self._embedded_event_json_enabled and bool(
+            events_and_contexts
+        )
         self._store_event_txn(txn, events_and_contexts=events_and_contexts)
 
         if new_forward_extremities:
@@ -1402,16 +1409,26 @@ class PersistEventsStore:
                         pools=[Pool.STATE, Pool.AUTH_CHAIN, Pool.EVENT_DAG],
                     )
                 else:
-                    txn.call_after(
-                        sync_now, [Pool.STATE, Pool.AUTH_CHAIN, Pool.EVENT_DAG]
+                    # `interval`/`off`: the reason for this barrier is that
+                    # another worker reads these writes back in a non-retrying
+                    # request, which is a visibility need, so publish them in
+                    # the transaction like the event JSON. Durability lands
+                    # through the coalescer, as the mode says. (A `sync_now`
+                    # from `call_after` would fsync on the reactor thread.)
+                    maybe_publish(
+                        SyncTier.DURABLE,
+                        [Pool.STATE, Pool.AUTH_CHAIN, Pool.EVENT_DAG],
                     )
+                    txn.call_after(mark_dirty, Pool.STATE)
+                    txn.call_after(mark_dirty, Pool.AUTH_CHAIN)
+                    txn.call_after(mark_dirty, Pool.EVENT_DAG)
             elif self._embedded_event_json_enabled and needs_state_barrier:
                 if barrier_in_txn:
                     # A de-outlier writes only a state mapping: no event JSON.
                     maybe_sync(
                         SyncTier.DURABLE,
                         pools=[Pool.STATE]
-                        + ([Pool.EVENT_DAG] if events_and_contexts else []),
+                        + ([Pool.EVENT_DAG] if wrote_event_json else []),
                     )
                 elif publishes_at_commit():
                     # `sync_mode` is interval/off: publish the state-group
@@ -1429,7 +1446,7 @@ class PersistEventsStore:
                 # dropping the AUTH_CHAIN dirty mark entirely.
                 txn.call_after(mark_dirty, Pool.AUTH_CHAIN)
             else:
-                if barrier_in_txn and events_and_contexts:
+                if barrier_in_txn and wrote_event_json:
                     # Outliers and the like have no state barrier, but their
                     # event JSON has no SQL copy, so it is still durable before
                     # the row it belongs to commits.
