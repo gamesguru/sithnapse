@@ -624,7 +624,7 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
         )
 
     async def _get_state_group_for_events(
-        self, event_ids: Collection[str]
+        self, event_ids: Collection[str], raise_on_missing: bool = True
     ) -> Mapping[str, int]:
         """Returns mapping event_id -> state_group.
 
@@ -634,8 +634,18 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
         another worker is persisting the mapping; reusing that negative would
         prevent the refresh-aware mtxdb lookup from running.
 
+        Args:
+            event_ids: the events to look up.
+            raise_on_missing: if ``True`` (the default), raise ``RuntimeError``
+                if any event has no state group. Callers that deliberately
+                want to skip stateless outliers (whose absence is expected)
+                pass ``False`` and receive a partial mapping. This also skips
+                the scalar-cache recovery below, so a lagging batch view is
+                indistinguishable from a genuine outlier.
+
         Raises:
              RuntimeError if the state is unknown at any of the given events
+                and ``raise_on_missing`` is true.
         """
         if getattr(self, "_embedded_event_json_enabled", False):
             event_ids = list(event_ids)
@@ -673,7 +683,24 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             res = dict(rows)
 
         missing = set(event_ids).difference(res)
-        if missing:
+        if missing and raise_on_missing:
+            # A scalar read can already have populated the per-event cache
+            # while the batch view is briefly behind it.  Recover those
+            # from completed cache entries before treating the batch miss as
+            # a real disappearance. Do not invoke the cached method here:
+            # that would issue one scalar query per miss and could cache a
+            # negative result, defeating the refresh-aware embedded lookup.
+            for event_id in missing:
+                cached = self._get_state_group_for_event_sql.cache.get_immediate(
+                    # The single-argument cache key is the bare event ID.
+                    event_id,
+                    None,
+                )
+                if cached is not None:
+                    res[event_id] = cached
+
+        missing = set(event_ids).difference(res)
+        if missing and raise_on_missing:
             raise RuntimeError(
                 "State mapping disappeared before _get_state_group_for_events "
                 f"returned: {missing}"

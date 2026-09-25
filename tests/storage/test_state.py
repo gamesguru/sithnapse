@@ -2313,22 +2313,20 @@ class HAMTStructuralKeyRegressionTest(HomeserverTestCase):
         # would pass regardless of what fed the hash, so pin the exact bytes.
         self.assertEqual(
             hash_a.hex(),
-            "fb95526dd1daa672eb9aeeae34b27de638a69a2ddc8ee5350eae79e944fcd56b",
+            "8007374b8f714311deb78b78d87ef540541f464f0607b6cfeb1c92e62e246c13",
         )
         self.assertEqual(
             sg_a.hex(),
             "8b94bfad590b925e09f0a9b22ce4aadffd205d82948671760e0ad52ed129e332",
         )
 
-    def test_room_structural_key_is_sha256_of_room_id(self) -> None:
-        import hashlib
-
+    def test_room_structural_key_is_room_id_bytes(self) -> None:
         from synapse.synapse_rust import state_hamt
 
         room_id = "!test:example.com"
         self.assertEqual(
             state_hamt.room_structural_key(room_id),
-            hashlib.sha256(room_id.encode()).digest(),
+            room_id.encode(),
         )
 
     def test_hamt_root_depends_on_room_id(self) -> None:
@@ -2427,14 +2425,19 @@ class RejectedEventStateGroupTestCase(HomeserverTestCase):
             self.store.db_pool.runInteraction("test_rejected_state_group", _persist_txn)
         )
 
-        state_group = self.get_success(
-            self.store.db_pool.simple_select_one_onecol(
-                table="event_to_state_groups",
-                keyvalues={"event_id": rejected.event_id},
-                retcol="state_group",
-                allow_none=True,
+        if getattr(self.store, "_embedded_event_json_enabled", False):
+            state_group = self.get_success(
+                self.store._get_state_group_for_event(rejected.event_id)
             )
-        )
+        else:
+            state_group = self.get_success(
+                self.store.db_pool.simple_select_one_onecol(
+                    table="event_to_state_groups",
+                    keyvalues={"event_id": rejected.event_id},
+                    retcol="state_group",
+                    allow_none=True,
+                )
+            )
         self.assertEqual(
             state_group,
             42,
@@ -2473,6 +2476,20 @@ class GetStateGroupForEventsCacheFallbackTestCase(HomeserverTestCase):
             99,
             "a mapping already in the scalar cache must be used instead of raising",
         )
+
+    def test_partial_batch_read_returns_only_mappings_with_state(self) -> None:
+        with patch.object(
+            self.store.db_pool,
+            "simple_select_many_batch",
+            return_value=[],
+        ):
+            result = self.get_success(
+                self.store._get_state_group_for_events(
+                    ["$stateless-outlier:test"], raise_on_missing=False
+                )
+            )
+
+        self.assertEqual(result, {})
 
     def test_missing_everywhere_still_raises(self) -> None:
         with patch.object(
