@@ -127,6 +127,12 @@ class DatabaseConfig(Config):
         # NOT for production use.  Set via embedded_hamt.no_sync or
         # SYNAPSE_MTXDB_NO_SYNC env var.
         self.embedded_hamt_no_sync: bool = False
+        # How persists make embedded writes visible and durable: "always"
+        # (fsync before a persist returns; the default), "interval" (publish at
+        # the commit boundary, fsync via the flush coalescer; needs the WAL) or
+        # "off" (as interval but never fsync). Set via embedded_hamt.sync_mode
+        # or SYNAPSE_MTXDB_SYNC. `no_sync` above is the older spelling of "off".
+        self.embedded_hamt_sync_mode: str = "always"
         # Flush coalescer window for mtxdb in seconds.
         # If unset (None), automatically tunes based on whether the database path
         # resides on a rotational drive (HDD -> 2.0s) or non-rotational drive (SSD/NVMe -> 0.5s).
@@ -138,6 +144,16 @@ class DatabaseConfig(Config):
         # database.setup_timings_path in config or SYNAPSE_DB_SETUP_TIMINGS_PATH
         # env var.
         self.setup_timings_path: str | None = None
+
+    @staticmethod
+    def _parse_sync_mode(value: object, name: str) -> str:
+        if not isinstance(value, str) or value.strip().lower() not in (
+            "always",
+            "interval",
+            "off",
+        ):
+            raise ConfigError(f"{name} must be one of: always, interval, off")
+        return value.strip().lower()
 
     def read_config(self, config: JsonDict, **kwargs: Any) -> None:
         # We *experimentally* support specifying multiple databases via the
@@ -168,6 +184,11 @@ class DatabaseConfig(Config):
             if not isinstance(no_sync, bool):
                 raise ConfigError("embedded_hamt.no_sync must be a boolean")
             self.embedded_hamt_no_sync = no_sync
+            sync_mode = embedded_config.get("sync_mode")
+            if sync_mode is not None:
+                self.embedded_hamt_sync_mode = self._parse_sync_mode(
+                    sync_mode, "embedded_hamt.sync_mode"
+                )
             flush_delay = embedded_config.get("flush_delay_secs")
             if flush_delay is not None:
                 try:
@@ -190,6 +211,12 @@ class DatabaseConfig(Config):
             "off",
         ):
             self.embedded_hamt_no_sync = True
+
+        env_sync_mode = os.environ.get("SYNAPSE_MTXDB_SYNC")
+        if env_sync_mode is not None and env_sync_mode.strip():
+            self.embedded_hamt_sync_mode = self._parse_sync_mode(
+                env_sync_mode, "SYNAPSE_MTXDB_SYNC"
+            )
 
         env_flush_delay = os.environ.get("SYNAPSE_MTXDB_FLUSH_DELAY_SECS")
         if env_flush_delay:

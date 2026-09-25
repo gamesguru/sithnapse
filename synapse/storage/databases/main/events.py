@@ -71,6 +71,7 @@ from synapse.storage.databases.main.embedded_common import (
     SyncTier,
     mark_dirty,
     maybe_publish,
+    publishes_at_commit,
     sync_now,
 )
 from synapse.storage.databases.main.embedded_event_edges import (
@@ -1381,14 +1382,17 @@ class PersistEventsStore:
             if self._embedded_event_json_enabled and needs_auth_chain_barrier:
                 txn.call_after(sync_now, [Pool.STATE, Pool.AUTH_CHAIN, Pool.EVENT_DAG])
             elif self._embedded_event_json_enabled and needs_state_barrier:
-                # Publish the state-group mapping at the commit boundary so a
-                # co-located read-only worker sees it immediately, instead of
-                # waiting out the coalescer's 250-500ms flush. Durability still
-                # lands through the coalescer (`mark_dirty`) and, for
-                # acknowledged auth writes, the barrier above. Visibility is
-                # not durability.
-                txn.call_after(maybe_publish, SyncTier.DURABLE, [Pool.STATE])
-                txn.call_after(mark_dirty, Pool.STATE)
+                if publishes_at_commit():
+                    # `sync_mode` is interval/off: publish the state-group
+                    # mapping at the commit boundary so a co-located read-only
+                    # worker sees it immediately, instead of waiting out the
+                    # coalescer's 250-500ms flush. Durability lands through the
+                    # coalescer (`mark_dirty`) and, for acknowledged auth
+                    # writes, the barrier above. Visibility is not durability.
+                    txn.call_after(maybe_publish, SyncTier.DURABLE, [Pool.STATE])
+                    txn.call_after(mark_dirty, Pool.STATE)
+                else:
+                    txn.call_after(sync_now, [Pool.STATE])
                 # A live state event can also have written chain-cover links
                 # (see `calculate_chain_cover_index_for_events`) even when its
                 # type is not in `AUTH_CHAIN_EVENT_TYPES`. Those links have no
@@ -3133,14 +3137,21 @@ class PersistEventsStore:
                     (event_id, room_id, internal_metadata, json, format_version)
                     for event_id, room_id, internal_metadata, json, format_version in event_json_rows
                 ],
+                # The event is about to become visible through the replication
+                # stream, and with no SQL copy a reader that finds the row but
+                # not the JSON has nothing to fall back to. `always` therefore
+                # syncs EVENT_DAG here, inside the transaction.
+                sync=not publishes_at_commit(),
             )
-            # The event is about to become visible through the replication
-            # stream. Publish the EVENT_DAG state at the commit boundary so
-            # another worker can read it immediately, without the per-event
-            # fsync the old `sync=True` paid; the coalescer owns durability for
-            # these writes (`mark_dirty`). Visibility is not durability.
-            txn.call_after(maybe_publish, SyncTier.DURABLE, [Pool.EVENT_DAG])
-            txn.call_after(mark_dirty, Pool.EVENT_DAG)
+            if publishes_at_commit():
+                # `sync_mode` is interval/off: publish EVENT_DAG before the
+                # transaction can commit (not from `call_after`, which would
+                # leave a window in which the SQL row is visible but the JSON
+                # is not), without the per-event fsync. A rolled-back
+                # transaction leaves an unreferenced record, as `sync=True`
+                # did. Durability lands through the coalescer (`mark_dirty`).
+                maybe_publish(SyncTier.DURABLE, [Pool.EVENT_DAG])
+                txn.call_after(mark_dirty, Pool.EVENT_DAG)
 
         self.db_pool.simple_insert_many_txn(
             txn,

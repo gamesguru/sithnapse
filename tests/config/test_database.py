@@ -65,6 +65,7 @@ class DatabaseConfigTestCase(unittest.TestCase):
             "SYNAPSE_MTXDB_PATH",
             "SYNAPSE_MTXDB_WAL",
             "SYNAPSE_MTXDB_NO_SYNC",
+            "SYNAPSE_MTXDB_SYNC",
         ):
             os.environ.pop(var, None)
         if env:
@@ -76,6 +77,30 @@ class DatabaseConfigTestCase(unittest.TestCase):
         finally:
             os.environ.clear()
             os.environ.update(old_env)
+
+    def test_sync_mode_defaults_to_always(self) -> None:
+        """Publishing at commit and interval fsync are opt-in."""
+        dc = self._read_config()
+        self.assertEqual(dc.embedded_hamt_sync_mode, "always")
+
+    def test_sync_mode_from_config_and_env(self) -> None:
+        dc = self._read_config(embedded_hamt={"sync_mode": "Interval"})
+        self.assertEqual(dc.embedded_hamt_sync_mode, "interval")
+
+        # The environment overrides the config file, as for the other switches.
+        dc = self._read_config(
+            embedded_hamt={"sync_mode": "interval"},
+            env={"SYNAPSE_MTXDB_SYNC": "off"},
+        )
+        self.assertEqual(dc.embedded_hamt_sync_mode, "off")
+
+    def test_invalid_sync_mode_raises(self) -> None:
+        from synapse.config._base import ConfigError
+
+        with self.assertRaises(ConfigError):
+            self._read_config(embedded_hamt={"sync_mode": "sometimes"})
+        with self.assertRaises(ConfigError):
+            self._read_config(env={"SYNAPSE_MTXDB_SYNC": "sometimes"})
 
     def test_engine_without_path_raises(self) -> None:
         """engine set + path missing → ConfigError."""

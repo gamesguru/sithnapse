@@ -2,11 +2,13 @@
 # This file is licensed under the Affero General Public License (AGPL) version 3.
 #
 
+import os
 from unittest import TestCase, mock
 
 from synapse.storage.databases.main import embedded_common
 from synapse.storage.databases.main.embedded_common import (
     Pool,
+    SyncMode,
     SyncTier,
     _format_mtxdb_snapshot_segment,
     _mtxdb_snapshot_metrics,
@@ -75,6 +77,7 @@ class SyncDisabledPublicationTestCase(TestCase):
         """
         engine = mock.Mock()
         with (
+            mock.patch.dict(os.environ, {"SYNAPSE_MTXDB_WAL": "1"}),
             mock.patch.object(embedded_common, "_engine_configured", True),
             mock.patch.object(embedded_common, "_sync_disabled", True),
             mock.patch(
@@ -90,3 +93,61 @@ class SyncDisabledPublicationTestCase(TestCase):
 
             embedded_common.maybe_publish(SyncTier.DURABLE, pools=[Pool.EVENT_DAG])
             engine.publish_pending.assert_called_once_with()
+
+    def test_publication_is_a_noop_without_the_wal(self) -> None:
+        """Without the WAL there is no journal: publishing must not be attempted.
+
+        The engine raises "journal is unavailable" from ``publish_pending``
+        when the WAL is off, and no read-committed worker can exist to see a
+        published write, so ``maybe_publish`` has to leave it alone.
+        """
+        engine = mock.Mock()
+        with (
+            mock.patch.dict(os.environ, {"SYNAPSE_MTXDB_WAL": ""}),
+            mock.patch.object(embedded_common, "_engine_configured", True),
+            mock.patch(
+                "synapse.storage.databases.embedded_engine.get_embedded_engine",
+                return_value=engine,
+            ),
+        ):
+            embedded_common.maybe_publish(SyncTier.DURABLE, pools=[Pool.EVENT_DAG])
+
+        engine.publish_pending.assert_not_called()
+
+
+class SyncModeTestCase(TestCase):
+    def setUp(self) -> None:
+        self.addCleanup(
+            embedded_common.configure_sync,
+            no_sync=embedded_common._sync_disabled,
+            mode=embedded_common._sync_mode,
+        )
+
+    def _publishes(self, mode: SyncMode | None, *, no_sync: bool, wal: str) -> bool:
+        embedded_common.configure_sync(no_sync=no_sync, mode=mode)
+        with mock.patch.dict(os.environ, {"SYNAPSE_MTXDB_WAL": wal}):
+            return embedded_common.publishes_at_commit()
+
+    def test_default_mode_syncs_per_persist(self) -> None:
+        """Unset/`always` keeps the per-persist barriers, with or without the WAL."""
+        for wal in ("", "1"):
+            self.assertFalse(self._publishes(None, no_sync=False, wal=wal))
+            self.assertFalse(self._publishes(SyncMode.ALWAYS, no_sync=False, wal=wal))
+
+    def test_interval_and_off_publish_only_with_the_wal(self) -> None:
+        for mode in (SyncMode.INTERVAL, SyncMode.OFF):
+            self.assertTrue(self._publishes(mode, no_sync=False, wal="1"))
+            # No WAL, no journal to publish to: fall back to the barriers.
+            self.assertFalse(self._publishes(mode, no_sync=False, wal=""))
+
+    def test_no_sync_means_off(self) -> None:
+        """The older boolean switch still disables fsync, and now publishes too."""
+        self.assertTrue(self._publishes(None, no_sync=True, wal="1"))
+        self.assertTrue(embedded_common._sync_disabled)
+        self.assertIs(embedded_common._sync_mode, SyncMode.OFF)
+
+    def test_only_off_disables_fsync(self) -> None:
+        embedded_common.configure_sync(no_sync=False, mode=SyncMode.INTERVAL)
+        self.assertFalse(embedded_common._sync_disabled)
+        embedded_common.configure_sync(no_sync=False, mode=SyncMode.OFF)
+        self.assertTrue(embedded_common._sync_disabled)

@@ -20,6 +20,7 @@
 #
 
 import logging
+from collections.abc import Iterable
 from unittest import mock
 
 from twisted.internet.testing import MemoryReactor
@@ -31,6 +32,8 @@ from synapse.events.snapshot import EventContext
 from synapse.rest import admin
 from synapse.rest.client import login, room
 from synapse.server import HomeServer
+from synapse.storage.database import LoggingTransaction
+from synapse.storage.databases.main import events as events_module
 from synapse.storage.databases.main.embedded_common import Pool, SyncTier
 from synapse.types import StateMap
 from synapse.util.clock import Clock
@@ -110,10 +113,10 @@ class EventsTestCase(HomeserverTestCase):
         self.assertEqual(event.event_id, event_id)
         self.assertEqual(event.content.get("body"), "hello embedded mtxdb")
 
-    @skip_unless(bool(EMBEDDED_HAMT_ENGINE), "requires embedded HAMT engine")
-    def test_de_outlier_publishes_state_barrier(self) -> None:
+    def _check_de_outlier_state_barrier(self, *, publish_at_commit: bool) -> None:
         """De-outliering an already-persisted outlier must schedule an immediate
-        STATE barrier.
+        STATE barrier: a publish when `sync_mode` publishes at commit, else a
+        synchronous `sync_now`.
 
         The ex-outlier pass writes the event's embedded event->state-group
         mapping on this writer; the HAMT root for the referenced state group
@@ -186,12 +189,121 @@ class EventsTestCase(HomeserverTestCase):
             state_group_deltas={},
         )
 
-        with mock.patch(
-            "synapse.storage.databases.main.events.maybe_publish"
-        ) as de_outlier_publish:
+        with (
+            mock.patch.object(
+                events_module,
+                "publishes_at_commit",
+                return_value=publish_at_commit,
+            ),
+            mock.patch.object(events_module, "maybe_publish") as de_outlier_publish,
+            mock.patch.object(events_module, "sync_now") as de_outlier_sync,
+        ):
             self.get_success(persistence.persist_event(event, live_context))
 
-        de_outlier_publish.assert_called_once_with(SyncTier.DURABLE, [Pool.STATE])
+        if publish_at_commit:
+            de_outlier_publish.assert_called_once_with(SyncTier.DURABLE, [Pool.STATE])
+            de_outlier_sync.assert_not_called()
+        else:
+            de_outlier_sync.assert_called_once_with([Pool.STATE])
+            de_outlier_publish.assert_not_called()
+
+    @skip_unless(bool(EMBEDDED_HAMT_ENGINE), "requires embedded HAMT engine")
+    def test_de_outlier_syncs_state_barrier_by_default(self) -> None:
+        self._check_de_outlier_state_barrier(publish_at_commit=False)
+
+    @skip_unless(bool(EMBEDDED_HAMT_ENGINE), "requires embedded HAMT engine")
+    def test_de_outlier_publishes_state_barrier_when_publishing_at_commit(
+        self,
+    ) -> None:
+        self._check_de_outlier_state_barrier(publish_at_commit=True)
+
+    def _persist_message_recording_event_json_sync(
+        self, *, publish_at_commit: bool
+    ) -> tuple[list[object], list[object]]:
+        """Persist one message, recording what the EVENT_DAG write path does.
+
+        Returns `(calls, put_kwargs)`: an ordered log of publishes and of
+        `call_after` registrations, and the keyword arguments each
+        `put_event_json_batch` call received.
+        """
+        user = self.register_user("json_sync_user", "pass")
+        token = self.login("json_sync_user", "pass")
+        room_id = self.helper.create_room_as(user, tok=token)
+
+        calls: list[object] = []
+        put_kwargs: list[object] = []
+        real_put = events_module.put_event_json_batch
+        real_call_after = LoggingTransaction.call_after
+
+        def fake_publish(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
+            calls.append(("publish", tuple(pools or ())))
+
+        def recording_put(*args: object, **kwargs: object) -> None:
+            put_kwargs.append(kwargs.get("sync"))
+            real_put(*args, **kwargs)  # type: ignore[arg-type]
+
+        def recording_call_after(
+            txn: LoggingTransaction, callback: object, *args: object, **kwargs: object
+        ) -> None:
+            if callback is fake_publish_mock:
+                calls.append(("call_after_publish", args))
+            elif callback is events_module.mark_dirty:
+                calls.append(("call_after_mark_dirty", args))
+            real_call_after(txn, callback, *args, **kwargs)  # type: ignore[arg-type]
+
+        fake_publish_mock = mock.Mock(side_effect=fake_publish)
+        with (
+            mock.patch.object(
+                events_module, "publishes_at_commit", return_value=publish_at_commit
+            ),
+            mock.patch.object(events_module, "maybe_publish", fake_publish_mock),
+            mock.patch.object(events_module, "put_event_json_batch", recording_put),
+            mock.patch.object(
+                LoggingTransaction,
+                "call_after",
+                autospec=True,
+                side_effect=recording_call_after,
+            ),
+        ):
+            self.helper.send(room_id, "event json sync mode", tok=token)
+        return calls, put_kwargs
+
+    @skip_unless(bool(EMBEDDED_HAMT_ENGINE), "requires embedded HAMT engine")
+    def test_event_json_is_synced_in_txn_by_default(self) -> None:
+        """`always` keeps the pre-commit EVENT_DAG sync and never publishes it."""
+        calls, put_kwargs = self._persist_message_recording_event_json_sync(
+            publish_at_commit=False
+        )
+
+        self.assertTrue(put_kwargs)
+        self.assertTrue(all(sync is True for sync in put_kwargs), put_kwargs)
+        self.assertNotIn(("publish", (Pool.EVENT_DAG,)), calls)
+
+    @skip_unless(bool(EMBEDDED_HAMT_ENGINE), "requires embedded HAMT engine")
+    def test_event_json_publish_precedes_commit_when_publishing_at_commit(
+        self,
+    ) -> None:
+        """`interval`/`off` publish EVENT_DAG inside the transaction, not after it.
+
+        A `call_after` runs only once the SQL row is committed and visible, so
+        publishing from one would leave a window in which a worker finds the
+        event but not its JSON (there is no SQL copy to fall back to).
+        """
+        calls, put_kwargs = self._persist_message_recording_event_json_sync(
+            publish_at_commit=True
+        )
+
+        self.assertTrue(put_kwargs)
+        self.assertTrue(all(sync is False for sync in put_kwargs), put_kwargs)
+        publish = ("publish", (Pool.EVENT_DAG,))
+        self.assertIn(publish, calls)
+        self.assertNotIn(
+            ("call_after_publish", (SyncTier.DURABLE, [Pool.EVENT_DAG])), calls
+        )
+        # Each in-transaction publish is followed by that transaction's
+        # durability mark, so the publish came first.
+        mark = ("call_after_mark_dirty", (Pool.EVENT_DAG,))
+        self.assertLess(calls.index(publish), calls.index(mark))
 
     def test_get_senders_for_event_ids(self) -> None:
         """Tests the `get_senders_for_event_ids` storage function."""

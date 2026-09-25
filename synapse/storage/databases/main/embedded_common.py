@@ -975,10 +975,58 @@ def mirror_timing(tag: str) -> Iterator[None]:
         ffi_timing(f"mirror_{tag}", time.monotonic() - start)
 
 
-def configure_sync(*, no_sync: bool) -> None:
-    """Set the module-level sync-disable flag.  Call once during init."""
-    global _sync_disabled
-    _sync_disabled = no_sync
+class SyncMode(Enum):
+    """How the persister makes embedded writes visible and durable.
+
+    ALWAYS: fsync at each durable barrier before a persist returns. Every
+        persisted event pays a whole-device flush. This is the default.
+    INTERVAL: publish at the commit boundary for cross-process visibility and
+        leave durability to the flush coalescer, so a crash can lose the writes
+        made in the last coalescer window (and, with no SQL copy of the data,
+        leave a committed SQL row without its mtxdb record). Needs the WAL.
+    OFF: as INTERVAL, but nothing is ever fsynced (test/diagnostic only).
+    """
+
+    ALWAYS = "always"
+    INTERVAL = "interval"
+    OFF = "off"
+
+
+_sync_mode: SyncMode = SyncMode.ALWAYS
+
+
+def wal_enabled() -> bool:
+    """Whether the mtxdb write-ahead journal is on for this process.
+
+    Same rule as the Rust side's ``wal_enabled_from``: ``SYNAPSE_MTXDB_WAL``
+    is on unless it is empty, ``0``, ``false``, ``no`` or ``off``.
+    """
+    value = os.environ.get("SYNAPSE_MTXDB_WAL", "").strip().lower()
+    return value not in ("", "0", "false", "no", "off")
+
+
+def configure_sync(*, no_sync: bool, mode: SyncMode | None = None) -> None:
+    """Set the module-level sync mode.  Call once during init.
+
+    ``no_sync`` is the older boolean switch and means ``SyncMode.OFF``.
+    """
+    global _sync_disabled, _sync_mode
+    if no_sync:
+        mode = SyncMode.OFF
+    elif mode is None:
+        mode = SyncMode.ALWAYS
+    _sync_mode = mode
+    _sync_disabled = mode is SyncMode.OFF
+
+
+def publishes_at_commit() -> bool:
+    """Whether persists publish at the commit boundary instead of fsyncing.
+
+    Publishing only exists with the WAL: without it there is no journal to
+    publish and a read-only worker only sees the durable snapshot, so the
+    per-persist barriers stay the only way to make a write visible.
+    """
+    return _sync_mode is not SyncMode.ALWAYS and wal_enabled()
 
 
 def _set_engine_configured() -> None:
@@ -1125,6 +1173,10 @@ def maybe_publish(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
     embedded writes across the SQL commit boundary.
     """
     if not _engine_configured or tier is not SyncTier.DURABLE:
+        return
+    if not wal_enabled():
+        # No journal to publish to (the engine raises "journal is unavailable"),
+        # and no read-committed worker that could see a published write.
         return
 
     from synapse.storage.databases.embedded_engine import get_embedded_engine
