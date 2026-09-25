@@ -115,9 +115,12 @@ build: ##H Build the package
 # Defaults for `make install` / `make install/gen-config` / `make install/server`.
 # Override them in .env (sourced below) or in the environment, e.g.
 # `make install INSTALL_USER=deploy`. The virtualenv lives at INSTALL_DIR/.venv.
+# INSTALL_EXTRAS is an optional comma-separated list of extras to install,
+# e.g. `postgres` -> pip install "INSTALL_DIR[postgres]".
 INSTALL_USER ?= sith
 INSTALL_DIR ?= /opt/sithnapse
 INSTALL_PYTHON ?= python3
+INSTALL_EXTRAS ?=
 
 # Defaults for `make install/gen-config` / `make install/server`.
 SERVER_NAME ?= sith.nutra.tk
@@ -131,11 +134,13 @@ install: ##H Create the venv and pip-install the package as INSTALL_USER
 	install_user="$${INSTALL_USER:-$(INSTALL_USER)}"; \
 	install_dir="$${INSTALL_DIR:-$(INSTALL_DIR)}"; \
 	install_python="$${INSTALL_PYTHON:-$(INSTALL_PYTHON)}"; \
+	install_extras="$${INSTALL_EXTRAS:-$(INSTALL_EXTRAS)}"; \
 	venv="$$install_dir/.venv"; \
+	if [ -n "$$install_extras" ]; then spec="$$install_dir[$$install_extras]"; else spec="$$install_dir"; fi; \
 	echo "Creating venv at $$venv as $$install_user"; \
 	sudo -u "$$install_user" -H "$$install_python" -m venv "$$venv"; \
-	echo "Installing $$install_dir into $$venv"; \
-	sudo -u "$$install_user" -H "$$venv/bin/pip" install "$$install_dir"
+	echo "Installing $$spec into $$venv"; \
+	sudo -u "$$install_user" -H "$$venv/bin/pip" install "$$spec"
 
 .PHONY: install/gen-config
 install/gen-config: ##H Generate the homeserver config as INSTALL_USER
