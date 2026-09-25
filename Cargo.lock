@@ -969,7 +969,7 @@ dependencies = [
 [[package]]
 name = "mtxdb"
 version = "0.1.0-beta.1"
-source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=alpha#6d834956f647d64e820dde20a4ba24eae9ccaa91"
+source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=alpha#7b0ed65aa98ce97ede17502ec43f442f4d68f8c0"
 dependencies = [
  "arc-swap",
  "blake3",
@@ -1794,7 +1794,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

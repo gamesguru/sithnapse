@@ -737,9 +737,37 @@ def _flatten_container_timings(root: str) -> str:
     return flat
 
 
+# mtxdb's OperationLatency: fixed, non-cumulative buckets (upper bounds).
+_LATENCY_BUCKETS = ("<50us", "<100us", "<250us", "<1ms", "<10ms", ">=10ms")
+_LATENCY_OPS = ("get", "get_many", "get_many_with_refresh", "put", "put_many")
+
+
+def _latency_percentile(buckets: list[int], quantile: float) -> str:
+    """The upper bound of the bucket the given quantile falls in."""
+    total = sum(buckets)
+    if not total:
+        return "-"
+    seen = 0
+    for count, bound in zip(buckets, _LATENCY_BUCKETS):
+        seen += count
+        if seen >= total * quantile:
+            return bound
+    return _LATENCY_BUCKETS[-1]
+
+
 def _print_mtxdb_engine_stats(timings_dir: str) -> None:
     """Sum the per-process mtxdb engine stats (``mtxdb_<pid>.json``)."""
     totals: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    latencies: dict[str, dict[str, Any]] = defaultdict(
+        lambda: defaultdict(
+            lambda: {
+                "calls": 0,
+                "total_us": 0,
+                "max_us": 0,
+                "buckets": [0] * len(_LATENCY_BUCKETS),
+            }
+        )
+    )
     processes = 0
     for fname in sorted(os.listdir(timings_dir)):
         if not (fname.startswith("mtxdb_") and fname.endswith(".json")):
@@ -754,6 +782,15 @@ def _print_mtxdb_engine_stats(timings_dir: str) -> None:
         for pool, ps in data.items():
             if not isinstance(ps, dict):
                 continue
+            for op in _LATENCY_OPS:
+                lat = ps.get(f"{op}_latency")
+                if isinstance(lat, dict) and lat.get("calls"):
+                    into = latencies[pool][op]
+                    into["calls"] += lat["calls"]
+                    into["total_us"] += lat.get("total_us", 0)
+                    into["max_us"] = max(into["max_us"], lat.get("max_us", 0))
+                    for i, count in enumerate(lat.get("buckets", [])):
+                        into["buckets"][i] += count
             acc = totals[pool]
             for key in ("get_calls", "get_misses", "cache_hits", "cache_misses"):
                 acc[key] += ps.get(key, 0) or 0
@@ -805,6 +842,26 @@ def _print_mtxdb_engine_stats(timings_dir: str) -> None:
                 f" | records/commit={records / commits if commits else 0:,.1f}",
                 file=err,
             )
+        pool_latencies = latencies.get(pool)
+        if pool_latencies:
+            print(
+                "    latency  (calls, avg, max | counts per "
+                + " ".join(_LATENCY_BUCKETS)
+                + " | p50/p95/p99 upper bound)",
+                file=err,
+            )
+            for op in _LATENCY_OPS:
+                lat = pool_latencies.get(op)
+                if not lat or not lat["calls"]:
+                    continue
+                print(
+                    f"      {op:<22s}{lat['calls']:>9,d} calls"
+                    f"  avg={fmt(lat['total_us'] / lat['calls'])}"
+                    f"  max={fmt(lat['max_us'])}"
+                    f" | {' '.join(f'{c:,d}' for c in lat['buckets'])}"
+                    f" | {'/'.join(_latency_percentile(lat['buckets'], q) for q in (0.5, 0.95, 0.99))}",
+                    file=err,
+                )
         calls = pool_totals.get("sync_calls", 0)
         if calls:
             print(

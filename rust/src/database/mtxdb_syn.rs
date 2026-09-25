@@ -3496,6 +3496,21 @@ fn sync_one(name: &str, engine: &Arc<PackfileStorage>) -> PyResult<()> {
 
 use pyo3::types::PyDict;
 
+/// One operation's latency as `{calls, total_us, max_us, buckets}`. The bucket
+/// upper bounds are `<50us`, `<100us`, `<250us`, `<1ms`, `<10ms` and `>=10ms`,
+/// counted non-cumulatively; they are mtxdb's `OperationLatency` buckets.
+fn latency_to_dict<'py>(
+    py: Python<'py>,
+    latency: &mtxdb::OperationLatency,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("calls", latency.calls)?;
+    d.set_item("total_us", latency.total.as_micros() as u64)?;
+    d.set_item("max_us", latency.max.as_micros() as u64)?;
+    d.set_item("buckets", latency.buckets.to_vec())?;
+    Ok(d)
+}
+
 fn stats_to_dict(
     py: Python<'_>,
     name: &str,
@@ -3529,6 +3544,22 @@ fn stats_to_dict(
     d.set_item("index_grow_count", s.index_grow_count)?;
     d.set_item("index_rebuild_count", s.index_rebuild_count)?;
     d.set_item("sync_calls", s.sync_calls)?;
+    // Opt-in per-operation wall time (needs stats enabled): calls, total, max
+    // and a fixed bucket histogram, so tails are visible and not just means.
+    d.set_item("get_latency", latency_to_dict(py, &s.get_latency)?)?;
+    d.set_item(
+        "get_many_latency",
+        latency_to_dict(py, &s.get_many_latency)?,
+    )?;
+    d.set_item(
+        "get_many_with_refresh_latency",
+        latency_to_dict(py, &s.get_many_with_refresh_latency)?,
+    )?;
+    d.set_item("put_latency", latency_to_dict(py, &s.put_latency)?)?;
+    d.set_item(
+        "put_many_latency",
+        latency_to_dict(py, &s.put_many_latency)?,
+    )?;
     d.set_item("checkpoint_writes", s.checkpoint_writes)?;
     d.set_item("checkpoint_skips", s.checkpoint_skips)?;
     d.set_item("delta_appends", s.delta_appends)?;
