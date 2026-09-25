@@ -127,12 +127,20 @@ class DatabaseConfig(Config):
         # NOT for production use.  Set via embedded_hamt.no_sync or
         # SYNAPSE_MTXDB_NO_SYNC env var.
         self.embedded_hamt_no_sync: bool = False
-        # How persists make embedded writes visible and durable: "always"
-        # (fsync before a persist returns; the default), "interval" (publish at
-        # the commit boundary, fsync via the flush coalescer; needs the WAL) or
-        # "off" (as interval but never fsync). Set via embedded_hamt.sync_mode
-        # or SYNAPSE_MTXDB_SYNC. `no_sync` above is the older spelling of "off".
-        self.embedded_hamt_sync_mode: str = "always"
+        # How persists make embedded writes visible and durable:
+        #   "interval" (the default): publish to other workers at the commit
+        #     boundary and let the flush coalescer group the fsyncs. A crash can
+        #     lose the writes of the last flush window (about 0.5s, 2s on a
+        #     rotational disk), and because the embedded event JSON and state
+        #     mappings have no SQL copy, a committed SQL row can then be left
+        #     without its mtxdb record. Needs the WAL; without it this behaves
+        #     as "always".
+        #   "always": fsync before a persist returns (one journal sync per
+        #     persisted event). Strict, and slow on a spinning disk.
+        #   "off": as interval but never fsync (tests and diagnostics only).
+        # Set via embedded_hamt.sync_mode or SYNAPSE_MTXDB_SYNC. `no_sync`
+        # above is the older spelling of "off".
+        self.embedded_hamt_sync_mode: str = "interval"
         # Flush coalescer window for mtxdb in seconds.
         # If unset (None), automatically tunes based on whether the database path
         # resides on a rotational drive (HDD -> 2.0s) or non-rotational drive (SSD/NVMe -> 0.5s).

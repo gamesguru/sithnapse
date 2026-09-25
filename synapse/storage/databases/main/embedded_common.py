@@ -1006,12 +1006,13 @@ def mirror_timing(tag: str) -> Iterator[None]:
 class SyncMode(Enum):
     """How the persister makes embedded writes visible and durable.
 
-    ALWAYS: fsync at each durable barrier before a persist returns. Every
-        persisted event pays a whole-device flush. This is the default.
-    INTERVAL: publish at the commit boundary for cross-process visibility and
-        leave durability to the flush coalescer, so a crash can lose the writes
-        made in the last coalescer window (and, with no SQL copy of the data,
-        leave a committed SQL row without its mtxdb record). Needs the WAL.
+    ALWAYS: one fsync barrier per persist, before it returns. Every persisted
+        event pays a whole-device flush.
+    INTERVAL (the configured default): publish at the commit boundary for
+        cross-process visibility and leave durability to the flush coalescer,
+        so a crash can lose the writes made in the last coalescer window (and,
+        with no SQL copy of the data, leave a committed SQL row without its
+        mtxdb record). Needs the WAL.
     OFF: as INTERVAL, but nothing is ever fsynced (test/diagnostic only).
     """
 

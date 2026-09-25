@@ -525,7 +525,7 @@ main() {
   esac
 
   # Persist sync mode for the containers: always | interval | off. Unset keeps
-  # the engine default (`always`: an fsync barrier per persisted event).
+  # the engine default (`interval`: publish at commit, coalesced fsyncs).
   # `interval` and `off` publish writes at the commit boundary so workers still
   # see them, and leave (or skip) fsync. Only the TEST_-scoped variable is
   # honoured, for the same reason as the no-sync switch above.

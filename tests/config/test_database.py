@@ -78,9 +78,13 @@ class DatabaseConfigTestCase(unittest.TestCase):
             os.environ.clear()
             os.environ.update(old_env)
 
-    def test_sync_mode_defaults_to_always(self) -> None:
-        """Publishing at commit and interval fsync are opt-in."""
+    def test_sync_mode_defaults_to_interval(self) -> None:
+        """Group fsyncs are the default; `always` is one setting away."""
         dc = self._read_config()
+        self.assertEqual(dc.embedded_hamt_sync_mode, "interval")
+
+    def test_sync_mode_always_is_still_selectable(self) -> None:
+        dc = self._read_config(embedded_hamt={"sync_mode": "always"})
         self.assertEqual(dc.embedded_hamt_sync_mode, "always")
 
     def test_sync_mode_from_config_and_env(self) -> None:
