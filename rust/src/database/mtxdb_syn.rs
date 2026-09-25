@@ -3864,6 +3864,14 @@ pub(crate) mod auth_chain_closure_tests {
                 vec![(9, value.clone()), (9, value.clone())],
             )
             .expect("identical duplicate writes are safe");
+            // `repack` rewrites every collection in the process-global test
+            // database. Hold both existing write guards so it cannot overlap
+            // the RMW or state-root tests running in other test threads.
+            let _root_guard = STATE_HAMT_ROOT_WRITE_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .expect("root write lock");
+            let _rmw_guard = RMW_LOCK.lock().expect("RMW lock");
             repack(py).expect("repack should preserve room-scoped root aliases");
             let operational = get_state_hamt_roots_for_room(
                 py,
