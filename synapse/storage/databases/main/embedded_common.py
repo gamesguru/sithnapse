@@ -1108,6 +1108,14 @@ def maybe_publish(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
     read-committed boundary but deliberately does not make mutations durable.
     The coalesced ``maybe_sync`` path remains responsible for durability.
 
+    ``_sync_disabled`` (test-only durability off) gates fsync, not visibility,
+    so it does not suppress publication here: turning durability off must not
+    also turn off the cross-process read path, or a worker would miss committed
+    writes that the writer deliberately never fsynced.
+
+    Call sites invoke this via ``txn.call_after``, i.e. only after the SQL
+    commit, so a transaction's own mutations are queued before publication.
+
     Known limitation: this publication is not transaction-scoped. A concurrent
     SQL transaction may have mtxdb mutations in the same pending journal queue,
     and this call may publish them before that SQL transaction commits. In
@@ -1116,7 +1124,7 @@ def maybe_publish(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
     requires transaction-scoped publication in mtxdb or serialization of
     embedded writes across the SQL commit boundary.
     """
-    if not _engine_configured or tier is not SyncTier.DURABLE or _sync_disabled:
+    if not _engine_configured or tier is not SyncTier.DURABLE:
         return
 
     from synapse.storage.databases.embedded_engine import get_embedded_engine
