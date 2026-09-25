@@ -119,7 +119,7 @@ build: ##H Build the package
 INSTALL_USER ?= sith
 INSTALL_DIR ?= /opt/sithnapse
 INSTALL_SRC ?= $(CURDIR)
-INSTALL_EXTRAS ?=
+INSTALL_EXTRAS ?= [postgres]
 
 # Defaults for `make install/gen-config` / `make install/server`.
 SERVER_NAME ?= sith.nutra.tk
@@ -127,55 +127,36 @@ CONFIG_PATH ?= /etc/sithnapse/homeserver.yaml
 REPORT_STATS ?= no
 
 .PHONY: install/build
-install/build: ##H Build and pip-install INSTALL_SRC into INSTALL_DIR
-	set -euo pipefail; \
-	if [ -f .env ]; then set -a; . ./.env; set +a; fi; \
-	install_dir="$${INSTALL_DIR:-$(INSTALL_DIR)}"; \
-	install_src="$${INSTALL_SRC:-$(INSTALL_SRC)}"; \
-	install_extras="$${INSTALL_EXTRAS:-$(INSTALL_EXTRAS)}"; \
-	if [ -n "$$install_extras" ]; then spec="$$install_src[$$install_extras]"; else spec="$$install_src"; fi; \
-	echo "Installing $$spec into $$install_dir"; \
-	sudo "$$install_dir/bin/pip" install "$$spec"
+install/build: ##H Build, pip-install $(INSTALL_SRC) to $(INSTALL_DIR)
+	# set -euo pipefail
+	# if [ -f .env ]; then set -a; . ./.env; set +a; fi
+	echo "Installing $(INSTALL_SRC)$(INSTALL_EXTRAS) into $(INSTALL_DIR)"
+	sudo "$(INSTALL_DIR)/bin/pip" install "$(INSTALL_SRC)$(INSTALL_EXTRAS)"
 
 .PHONY: install/gen-config
-install/gen-config: ##H Generate the homeserver config as INSTALL_USER
-	set -euo pipefail; \
-	if [ -f .env ]; then set -a; . ./.env; set +a; fi; \
-	install_user="$${INSTALL_USER:-$(INSTALL_USER)}"; \
-	install_dir="$${INSTALL_DIR:-$(INSTALL_DIR)}"; \
-	server_name="$${SERVER_NAME:-$(SERVER_NAME)}"; \
-	config_path="$${CONFIG_PATH:-$(CONFIG_PATH)}"; \
-	report_stats="$${REPORT_STATS:-$(REPORT_STATS)}"; \
-	echo "Generating $$config_path for $$server_name"; \
-	cd /; \
-	sudo -u "$$install_user" -H "$$install_dir/bin/python" \
+install/gen-config: ##H Generate homeserver config as $(INSTALL_USER)
+	# set -euo pipefail
+	# if [ -f .env ]; then set -a; . ./.env; set +a; fi
+	echo "Generating $(CONFIG_PATH) for $(SERVER_NAME)"
+	sudo -u "$(INSTALL_USER)" -H "$(INSTALL_DIR)/bin/python" \
 		-m synapse.app.homeserver \
-		--server-name "$$server_name" \
-		--config-path "$$config_path" \
+		--server-name "$(SERVER_NAME)" \
+		--config-path "$(CONFIG_PATH)" \
 		--generate-config \
-		--report-stats="$$report_stats"
+		--report-stats="$(REPORT_STATS)"
 
-.PHONY: install/server
-install/server: ##H Run the homeserver as INSTALL_USER with CONFIG_PATH
-	set -euo pipefail; \
-	if [ -f .env ]; then set -a; . ./.env; set +a; fi; \
-	install_user="$${INSTALL_USER:-$(INSTALL_USER)}"; \
-	install_dir="$${INSTALL_DIR:-$(INSTALL_DIR)}"; \
-	config_path="$${CONFIG_PATH:-$(CONFIG_PATH)}"; \
-	echo "Starting homeserver from $$config_path as $$install_user"; \
-	cd /; \
-	sudo -u "$$install_user" -H "$$install_dir/bin/python" \
-		-m synapse.app.homeserver \
-		--config-path "$$config_path"
+
+.PHONY: _publish
+_publish: build ##H Upload the package to PyPI using twine
+	uv run --with twine twine upload dist/*
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Others / Misc
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .PHONY: all
 all:	##H Run the main targets
 all: sync format lint test
-
-
-.PHONY: publish
-publish: build ##H Upload the package to PyPI using twine
-	uv run --with twine twine upload dist/*
 
 
 .PHONY: clean
