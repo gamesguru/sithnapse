@@ -103,6 +103,31 @@ def ffi_count(tag: str, count: int) -> None:
         _FFI_COUNTERS[tag] += count
 
 
+def _count_sync_origin(kind: str, pools: Iterable[Pool] | None = None) -> None:
+    """Count a durability-barrier request by who asked for it.
+
+    Diagnostic only (needs SYNAPSE_PG_TIMINGS): the ``sync_origin.*`` counters
+    show up in the "FFI batch counters" report, so a run reveals which call
+    site issues the barriers (coalescer flush vs an explicit ``sync_now`` vs a
+    direct ``maybe_sync``) and for which pools.
+    """
+    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+        return
+    frame = sys._getframe(2)
+    this_file = __file__
+    while frame is not None and frame.f_code.co_filename == this_file:
+        frame = frame.f_back  # type: ignore[assignment]
+    caller = (
+        f"{os.path.basename(frame.f_code.co_filename)[:-3]}.{frame.f_code.co_name}"
+        if frame is not None
+        else "?"
+    )
+    pool_tag = (
+        "all" if pools is None else "+".join(sorted(p.name.lower() for p in pools))
+    )
+    ffi_count(f"sync_origin.{kind}.{caller}.{pool_tag}", 1)
+
+
 def get_ffi_count(tag: str) -> int:
     """Return the current accumulated value of a named ffi_count counter.
 
@@ -1037,6 +1062,9 @@ def maybe_sync(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
     if _sync_disabled:
         return
 
+    if sys._getframe(1).f_code.co_filename != __file__:
+        _count_sync_origin("maybe_sync_direct", pools)
+
     from synapse.storage.databases.embedded_engine import get_embedded_engine
 
     engine = get_embedded_engine("mtxdb")
@@ -1184,6 +1212,11 @@ class _FlushCoalescer:
         to_flush = set(self._dirty)  # snapshot
         if not to_flush:
             return
+        ffi_count(
+            "sync_origin.coalescer_flush."
+            + "+".join(sorted(p.name.lower() for p in to_flush)),
+            1,
+        )
         try:
             _do_sync_pools(to_flush)
             if Pool.EVENT_DAG in to_flush and not _sync_disabled:
@@ -1401,6 +1434,7 @@ def sync_now(pools: Iterable[Pool] | None = None) -> None:
         return
 
     pool_set = set(pools) if pools is not None else None
+    _count_sync_origin("sync_now", pool_set)
     if _coalescer is not None:
         _coalescer.sync_now(pool_set)
     elif pool_set is not None:
@@ -1411,6 +1445,7 @@ def sync_event_dag_now() -> None:
     """Sync event JSON's EVENT_DAG records without draining edge queues."""
     if not _engine_configured:
         return
+    _count_sync_origin("sync_event_dag_now", [Pool.EVENT_DAG])
     if _coalescer is not None:
         _coalescer.sync_event_dag_now()
     else:
