@@ -90,9 +90,32 @@ class SyncDisabledPublicationTestCase(TestCase):
             engine.sync_state.assert_not_called()
             engine.sync_event_dag.assert_not_called()
             engine.sync_auth_chain.assert_not_called()
+            # A barrier with durability off still publishes: its callers need
+            # the write visible to other workers, and it was their only way to
+            # publish it.
+            engine.publish_pending.assert_called_once_with()
 
+            engine.publish_pending.reset_mock()
             embedded_common.maybe_publish(SyncTier.DURABLE, pools=[Pool.EVENT_DAG])
             engine.publish_pending.assert_called_once_with()
+
+    def test_sync_now_with_durability_off_publishes(self) -> None:
+        """`sync_now` (the barrier most call sites use) must not become a no-op."""
+        engine = mock.Mock()
+        with (
+            mock.patch.dict(os.environ, {"SYNAPSE_MTXDB_WAL": "1"}),
+            mock.patch.object(embedded_common, "_engine_configured", True),
+            mock.patch.object(embedded_common, "_sync_disabled", True),
+            mock.patch.object(embedded_common, "_coalescer", None),
+            mock.patch(
+                "synapse.storage.databases.embedded_engine.get_embedded_engine",
+                return_value=engine,
+            ),
+        ):
+            embedded_common.sync_now([Pool.STATE])
+
+        engine.sync_state.assert_not_called()
+        engine.publish_pending.assert_called_once_with()
 
     def test_publication_is_a_noop_without_the_wal(self) -> None:
         """Without the WAL there is no journal: publishing must not be attempted.

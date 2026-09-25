@@ -1136,6 +1136,13 @@ def maybe_sync(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
         return
 
     if _sync_disabled:
+        # Durability is off, but nearly every caller of a barrier also needs the
+        # write to be visible to other workers straight away (the barrier was
+        # its only way to publish it). Skipping the whole barrier would leave
+        # those writes queued in this process, unseen by readers, until some
+        # unrelated persist happened to publish them. Turn the barrier into a
+        # publish: no fsync, but nothing left invisible.
+        maybe_publish(tier, pools)
         return
 
     if sys._getframe(1).f_code.co_filename != __file__:
