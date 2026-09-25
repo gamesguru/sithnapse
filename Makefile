@@ -107,6 +107,30 @@ _complement/cleanup: ##H Stop Complement and remove its labeled containers/netwo
 build: ##H Build the package
 	uv build
 
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Install
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+# Defaults for `make install`. Override them in .env (sourced below) or in
+# the environment, e.g. `make install INSTALL_USER=deploy`.
+INSTALL_USER ?= sith
+INSTALL_DIR ?= /opt/sithnapse
+INSTALL_PYTHON ?= python3
+
+.PHONY: install
+install: ##H Create the venv and pip-install the package as INSTALL_USER
+	set -euo pipefail; \
+	if [ -f .env ]; then set -a; . ./.env; set +a; fi; \
+	install_user="$${INSTALL_USER:-$(INSTALL_USER)}"; \
+	install_dir="$${INSTALL_DIR:-$(INSTALL_DIR)}"; \
+	install_python="$${INSTALL_PYTHON:-$(INSTALL_PYTHON)}"; \
+	venv="$$install_dir/.venv"; \
+	echo "Creating venv at $$venv as $$install_user"; \
+	sudo -u "$$install_user" -H "$$install_python" -m venv "$$venv"; \
+	echo "Installing $$install_dir into $$venv"; \
+	sudo -u "$$install_user" -H "$$venv/bin/pip" install "$$install_dir"
+
 .PHONY: all
 all:	##H Run the main targets
 all: sync format lint test
