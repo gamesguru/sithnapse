@@ -349,6 +349,72 @@ class EventsTestCase(HomeserverTestCase):
         mark = ("call_after_mark_dirty", (Pool.EVENT_DAG,))
         self.assertLess(calls.index(publish), calls.index(mark))
 
+    @skip_unless(bool(EMBEDDED_HAMT_ENGINE), "requires embedded HAMT engine")
+    def test_rolled_back_event_json_publish_leaves_unreachable_orphan(self) -> None:
+        """A rolled-back persist can publish event JSON that no reader serves.
+
+        Exclusive event JSON publishes inside the transaction (to avoid a
+        committed-row/missing-JSON window), so the failure mode of a rollback
+        is a published-but-unreferenced JSON record rather than an invisible
+        write. That orphan is acceptable because it is unreachable: every
+        event-JSON read is driven by ids discovered from committed SQL
+        ``events`` rows, so a record whose row rolled back is never looked up.
+        This pins both halves -- the record really is in mtxdb, and the read
+        path that learns an id (``get_event``) cannot find it.
+        """
+        self.assertTrue(self._store._embedded_event_json_enabled)
+        namespace = self._store._embedded_hamt_namespace
+        engine = self._store._embedded_hamt_engine
+        user = self.register_user("orphan_json_user", "pass")
+        token = self.login("orphan_json_user", "pass")
+        room_id = self.helper.create_room_as(user, tok=token)
+        event_id = f"$orphan_json_{self.clock.time()}:test"
+        body = json.dumps({"body": "orphan"})
+
+        def bad_txn(txn: LoggingTransaction) -> None:
+            # Attempt the SQL row too: the `get_event` miss afterwards then
+            # proves the transaction rolled the row back, rather than the row
+            # never having been written.
+            self._store.db_pool.simple_insert_txn(
+                txn,
+                table="events",
+                values={
+                    "instance_name": "master",
+                    "stream_ordering": 999999,
+                    "topological_ordering": 1,
+                    "depth": 1,
+                    "event_id": event_id,
+                    "room_id": room_id,
+                    "type": "m.room.message",
+                    "processed": True,
+                    "outlier": False,
+                    "origin_server_ts": int(self.clock.time_msec()),
+                    "received_ts": int(self.clock.time_msec()),
+                    "sender": user,
+                    "contains_url": False,
+                },
+            )
+            embedded_event_json.put_event_json_batch(
+                engine, namespace, [(event_id, room_id, "{}", body, 1)], sync=False
+            )
+            # The commit-boundary publish the production path performs.
+            events_module.maybe_publish(SyncTier.DURABLE, [Pool.EVENT_DAG])
+            raise RuntimeError("simulated persist rollback")
+
+        failure = self.get_failure(
+            self._store.db_pool.runInteraction("test_orphan_json", bad_txn),
+            RuntimeError,
+        )
+        self.assertEqual(str(failure.value), "simulated persist rollback")
+
+        # The JSON record survives the rollback in mtxdb ...
+        found = embedded_event_json.get_event_json_batch(engine, namespace, [event_id])
+        self.assertEqual(found[event_id][1], body)
+
+        # ... but is unreachable: with no committed row there is no id for a
+        # reader to discover, and `get_event` is how a reader learns one.
+        self.assertIsNone(self.get_success(self._store.get_event(event_id)))
+
     def test_get_senders_for_event_ids(self) -> None:
         """Tests the `get_senders_for_event_ids` storage function."""
 
