@@ -3,13 +3,15 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex,
 };
+use std::time::Duration;
 
 use mtxdb::storage::{DigestAlgorithm, StorageError};
 use mtxdb::SharedDatabase;
 use mtxdb::{
     derive_collection_id, derive_group_full_id, derive_member_collection_id_from_group,
-    CollectionMetadata, DatabaseLayout, FrameIdPolicy, NodeData, NodeId, PackfileStorage,
-    PayloadPolicy, RecordIdentityRule, ShardType, StorageEngine, MEMBER_NAMESPACE_INTL,
+    CollectionMetadata, DatabaseLayout, FrameIdPolicy, GroupCommitConfig, NodeData, NodeId,
+    PackfileStorage, PayloadPolicy, RecordIdentityRule, ShardType, StorageEngine,
+    MEMBER_NAMESPACE_INTL,
 };
 use once_cell::sync::OnceCell;
 use pyo3::prelude::*;
@@ -3470,6 +3472,113 @@ pub fn publish_pending(py: Python<'_>) -> PyResult<()> {
     })
 }
 
+/// Start the WAL group committer for the writable pools.
+///
+/// The pools share a coordinator in WAL mode; starting it on each pool is
+/// intentional because the same code also supports the legacy per-pool WAL
+/// layout. `PackfileStorage` treats a repeated start on a shared coordinator
+/// as a no-op.
+#[pyfunction]
+pub fn start_background_commit(py: Python<'_>, interval_ms: u64, max_pending: u64) -> PyResult<()> {
+    assert_writable()?;
+    py.detach(|| {
+        let config = GroupCommitConfig {
+            interval: Duration::from_millis(interval_ms),
+            max_pending,
+        };
+        for (name, engine) in [
+            ("state", state_db()?),
+            ("event-dag", event_dag_db()?),
+            ("auth-chain", auth_chain_db()?),
+        ] {
+            engine.start_background_commit(config).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "mtxdb start background commit error for {name}: {e}"
+                ))
+            })?;
+        }
+        Ok(())
+    })
+}
+
+/// Stop the WAL group committer and durably flush its final pending group.
+#[pyfunction]
+pub fn stop_background_commit(py: Python<'_>) -> PyResult<()> {
+    assert_writable()?;
+    py.detach(|| {
+        for (name, engine) in [
+            ("state", state_db()?),
+            ("event-dag", event_dag_db()?),
+            ("auth-chain", auth_chain_db()?),
+        ] {
+            engine.stop_background_commit().map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "mtxdb stop background commit error for {name}: {e}"
+                ))
+            })?;
+        }
+        Ok(())
+    })
+}
+
+/// Request durability through the current published boundary of every pool.
+///
+/// The fixed three-entry result keeps the pool mapping stable even when a
+/// legacy per-pool WAL layout is used. A zero entry means that pool has no
+/// journal and needs no wait.
+#[pyfunction]
+pub fn request_durable(py: Python<'_>) -> PyResult<Vec<u64>> {
+    assert_writable()?;
+    py.detach(|| {
+        let mut targets = Vec::with_capacity(3);
+        for engine in [state_db()?, event_dag_db()?, auth_chain_db()?] {
+            let target = engine
+                .journal()
+                .map(|journal| {
+                    let target = journal.capture_sync_target();
+                    journal.request_durable(target);
+                    target
+                })
+                .unwrap_or(0);
+            targets.push(target);
+        }
+        Ok(targets)
+    })
+}
+
+/// Wait until the targets returned by `request_durable` are durable.
+#[pyfunction]
+pub fn wait_durable(py: Python<'_>, targets: Vec<u64>) -> PyResult<()> {
+    assert_writable()?;
+    if targets.len() != 3 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "mtxdb wait_durable expects three pool targets",
+        ));
+    }
+    py.detach(|| {
+        for (name, target, engine) in [
+            ("state", targets[0], state_db()?),
+            ("event-dag", targets[1], event_dag_db()?),
+            ("auth-chain", targets[2], auth_chain_db()?),
+        ] {
+            if target == 0 {
+                continue;
+            }
+            let token = engine.request_durable(target).ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "mtxdb durable target for {name} has no journal"
+                ))
+            })?;
+            engine.wait_durable(token).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "mtxdb wait durable error for {name}: {e}"
+                ))
+            })?;
+        }
+        Ok(())
+    })
+}
+
 fn publish_journal(name: &str, engine: &Arc<PackfileStorage>) -> PyResult<()> {
     let journal = engine.journal().ok_or_else(|| {
         pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -3511,6 +3620,33 @@ fn latency_to_dict<'py>(
     Ok(d)
 }
 
+fn durability_to_dict<'py>(
+    py: Python<'py>,
+    stats: &mtxdb::DurabilityStats,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("durable_requests", stats.durable_requests)?;
+    d.set_item(
+        "durable_waits_already_durable",
+        stats.durable_waits_already_durable,
+    )?;
+    let w = PyDict::new(py);
+    w.set_item("calls", stats.durable_wait.calls)?;
+    w.set_item("total_us", stats.durable_wait.total.as_micros() as u64)?;
+    w.set_item("max_us", stats.durable_wait.max.as_micros() as u64)?;
+    w.set_item("buckets", stats.durable_wait.buckets.to_vec())?;
+    d.set_item("durable_wait", w)?;
+    d.set_item("sync_requests", stats.sync_requests)?;
+    d.set_item("sync_waiters", stats.sync_waiters)?;
+    d.set_item("sync_coalesced", stats.sync_coalesced)?;
+    d.set_item("commits", stats.commits)?;
+    d.set_item("commit_records", stats.commit_records)?;
+    d.set_item("max_commit_records", stats.max_commit_records)?;
+    d.set_item("records_per_commit", stats.records_per_commit())?;
+    d.set_item("staged_publish_refused", stats.staged_publish_refused)?;
+    Ok(d)
+}
+
 fn stats_to_dict(
     py: Python<'_>,
     name: &str,
@@ -3544,6 +3680,7 @@ fn stats_to_dict(
     d.set_item("index_grow_count", s.index_grow_count)?;
     d.set_item("index_rebuild_count", s.index_rebuild_count)?;
     d.set_item("sync_calls", s.sync_calls)?;
+    d.set_item("durability", durability_to_dict(py, &s.durability)?)?;
     // Opt-in per-operation wall time (needs stats enabled): calls, total, max
     // and a fixed bucket histogram, so tails are visible and not just means.
     d.set_item("get_latency", latency_to_dict(py, &s.get_latency)?)?;
@@ -3936,6 +4073,10 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(sync_event_dag, m)?)?;
     m.add_function(wrap_pyfunction!(sync_auth_chain, m)?)?;
     m.add_function(wrap_pyfunction!(publish_pending, m)?)?;
+    m.add_function(wrap_pyfunction!(start_background_commit, m)?)?;
+    m.add_function(wrap_pyfunction!(stop_background_commit, m)?)?;
+    m.add_function(wrap_pyfunction!(request_durable, m)?)?;
+    m.add_function(wrap_pyfunction!(wait_durable, m)?)?;
     m.add_function(wrap_pyfunction!(stats, m)?)?;
     m.add_function(wrap_pyfunction!(stats_snapshot, m)?)?;
     m.add_function(wrap_pyfunction!(reset_stats, m)?)?;

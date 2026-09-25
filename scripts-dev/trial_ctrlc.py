@@ -768,6 +768,23 @@ def _print_mtxdb_engine_stats(timings_dir: str) -> None:
             }
         )
     )
+    durability: dict[str, Any] = {
+        "durable_requests": 0,
+        "durable_waits_already_durable": 0,
+        "durable_wait": {
+            "calls": 0,
+            "total_us": 0,
+            "max_us": 0,
+            "buckets": [],
+        },
+        "sync_requests": 0,
+        "sync_waiters": 0,
+        "sync_coalesced": 0,
+        "commits": 0,
+        "commit_records": 0,
+        "max_commit_records": 0,
+        "staged_publish_refused": 0,
+    }
     processes = 0
     for fname in sorted(os.listdir(timings_dir)):
         if not (fname.startswith("mtxdb_") and fname.endswith(".json")):
@@ -779,6 +796,43 @@ def _print_mtxdb_engine_stats(timings_dir: str) -> None:
             print(f"Warning: failed to read {fname}: {e}", file=sys.stderr)
             continue
         processes += 1
+        # RuntimeStats exposes the same JournalCoordinator through each pool
+        # when the pools share a WAL. Use one representative pool per process;
+        # summing all three would triple-count every journal-wide counter.
+        representative = data.get("event_dag") or data.get("state")
+        if isinstance(representative, dict):
+            src = representative.get("durability")
+            if isinstance(src, dict):
+                for key in (
+                    "durable_requests",
+                    "durable_waits_already_durable",
+                    "sync_requests",
+                    "sync_waiters",
+                    "sync_coalesced",
+                    "commits",
+                    "commit_records",
+                    "staged_publish_refused",
+                ):
+                    value = src.get(key, 0)
+                    if isinstance(value, (int, float)):
+                        durability[key] += value
+                durability["max_commit_records"] = max(
+                    durability["max_commit_records"],
+                    src.get("max_commit_records", 0) or 0,
+                )
+                wait = src.get("durable_wait")
+                if isinstance(wait, dict):
+                    into = durability["durable_wait"]
+                    into["calls"] += wait.get("calls", 0) or 0
+                    into["total_us"] += wait.get("total_us", 0) or 0
+                    into["max_us"] = max(into["max_us"], wait.get("max_us", 0) or 0)
+                    buckets = wait.get("buckets", [])
+                    if len(into["buckets"]) < len(buckets):
+                        into["buckets"].extend(
+                            [0] * (len(buckets) - len(into["buckets"]))
+                        )
+                    for i, count in enumerate(buckets):
+                        into["buckets"][i] += count
         for pool, ps in data.items():
             if not isinstance(ps, dict):
                 continue
@@ -873,6 +927,34 @@ def _print_mtxdb_engine_stats(timings_dir: str) -> None:
                 f" checkpoint={fmt(pool_totals.get('sync_checkpoint_us', 0))}",
                 file=err,
             )
+    if (
+        any(durability[key] for key in durability if key != "durable_wait")
+        or durability["durable_wait"]["calls"]
+    ):
+        wait = durability["durable_wait"]
+        buckets = wait["buckets"]
+        wait_shape = " ".join(f"{count:,d}" for count in buckets) if buckets else "-"
+        commits = durability["commits"]
+        print("\n  [journal durability; one shared coordinator per process]", file=err)
+        print(
+            f"    durable: {durability['durable_requests']:,.0f} requests"
+            f" | waits blocked={wait['calls']:,.0f} already-durable={durability['durable_waits_already_durable']:,.0f}"
+            f" | wait total={fmt(wait['total_us'])} max={fmt(wait['max_us'])}",
+            file=err,
+        )
+        print(
+            f"    sync: requests={durability['sync_requests']:,.0f}"
+            f" waiters={durability['sync_waiters']:,.0f} coalesced={durability['sync_coalesced']:,.0f}"
+            f" | real commits={commits:,.0f}"
+            f" | records/commit={durability['commit_records'] / commits if commits else 0:,.1f}"
+            f" max records/commit={durability['max_commit_records']:,.0f}",
+            file=err,
+        )
+        print(
+            f"    durable-wait buckets: {wait_shape}"
+            f" | staged publish refused (legacy pending): {durability['staged_publish_refused']:,.0f}",
+            file=err,
+        )
     print("===============================\n", file=err)
 
 
