@@ -1233,13 +1233,64 @@ def maybe_publish(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
     ffi_timing("ffi_publish_pending", time.monotonic() - _st)
 
 
+def request_durable() -> None:
+    """Request durability for the current published boundary of every pool.
+
+    This is deliberately separate from ``maybe_publish``: callers must first
+    publish the writes, then capture the boundary that the background
+    committer should cover. The request is non-blocking.
+    """
+    if not _engine_configured or _sync_disabled or not publishes_at_commit():
+        return
+
+    from synapse.storage.databases.embedded_engine import get_embedded_engine
+
+    _st = time.monotonic()
+    get_embedded_engine("mtxdb").request_durable()
+    ffi_timing("ffi_request_durable", time.monotonic() - _st)
+
+
+def start_background_commit(interval_secs: float, max_pending: int = 4096) -> None:
+    """Start the shared mtxdb group committer for interval-mode durability."""
+    if not _engine_configured or _sync_disabled or not publishes_at_commit():
+        return
+
+    from synapse.storage.databases.embedded_engine import get_embedded_engine
+
+    get_embedded_engine("mtxdb").start_background_commit(
+        max(1, round(interval_secs * 1000)), max_pending
+    )
+
+
+def stop_background_commit() -> None:
+    """Stop the group committer and flush its final pending durability group."""
+    if not _engine_configured or _sync_disabled or not publishes_at_commit():
+        return
+
+    from synapse.storage.databases.embedded_engine import get_embedded_engine
+
+    get_embedded_engine("mtxdb").stop_background_commit()
+
+
+def background_commit_error() -> str | None:
+    """Return a terminal group-committer error without blocking or consuming it."""
+    if not _engine_configured or _sync_disabled or not publishes_at_commit():
+        return None
+
+    from synapse.storage.databases.embedded_engine import get_embedded_engine
+
+    return get_embedded_engine("mtxdb").background_commit_error()
+
+
 # ── Commit-aware flush coalescer ──────────────────────────────────────
 #
 # Replaces the 1-second periodic timer with event-driven debounced
 # flushing.  Dirty marking happens via txn.call_after, which only fires
 # after successful SQL commit.  The coalescer debounces from the first
-# committed dirty write, flushes only dirty pools, clears a pool only
-# after its sync succeeds, and retries on failure with backoff.
+# committed dirty write, flushes only dirty pools, clears a pool after its
+# durability request succeeds, and retries on failure with backoff. In strict
+# mode the request is a synchronous sync; in interval mode the native
+# background committer owns the eventual fsync and reports terminal failures.
 #
 # Immediate barriers (maybe_sync) are retained for destructive ops
 # (purge, redaction) and shutdown.
@@ -1259,8 +1310,8 @@ class _FlushCoalescer:
 
     Debounces from the first committed dirty write (250-500ms) without
     resetting the timer on subsequent writes.  Flushes only dirty pools.
-    Clears a pool only after its sync succeeds.  Retries on failure
-    with backoff.
+    Clears a pool only after its sync or durability request succeeds. Retries
+    on a request or background-committer failure with backoff.
     """
 
     def __init__(
@@ -1321,7 +1372,18 @@ class _FlushCoalescer:
             1,
         )
         try:
-            _do_sync_pools(to_flush)
+            if publishes_at_commit():
+                # All pools share a WAL in the normal layout. Publish first,
+                # then capture one boundary covering every pool; the native
+                # background committer performs the eventual shared fsync.
+                maybe_publish(SyncTier.DURABLE, to_flush)
+                request_durable()
+                if error := background_commit_error():
+                    raise RuntimeError(
+                        f"mtxdb background committer failed: {error}"
+                    )
+            else:
+                _do_sync_pools(to_flush)
             if Pool.EVENT_DAG in to_flush and not _sync_disabled:
                 # This is a successful delayed/coalesced flush. The native
                 # sync counters above record the actual pool call; this

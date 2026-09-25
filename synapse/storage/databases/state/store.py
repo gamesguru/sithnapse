@@ -61,6 +61,8 @@ from synapse.storage.databases.main.embedded_common import (
     ffi_timing,
     mark_dirty,
     mirror_timing,
+    start_background_commit,
+    stop_background_commit,
 )
 from synapse.storage.databases.state.bg_updates import (
     StateBackgroundUpdateStore,
@@ -277,6 +279,16 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                     hs.get_clock(), flush_delay_secs=flush_delay
                 )
                 _set_coalescer(self._flush_coalescer)
+                # Interval mode publishes committed writes and leaves the
+                # actual fsync to mtxdb's shared group committer. Starting it
+                # once through the three-pool binding is idempotent for a
+                # shared WAL and also supports the legacy per-pool layout.
+                start_background_commit(flush_delay)
+                hs.register_sync_shutdown_handler(
+                    phase="during",
+                    eventType="shutdown",
+                    shutdown_func=stop_background_commit,
+                )
                 hs.register_sync_shutdown_handler(
                     phase="during",
                     eventType="shutdown",
@@ -2410,6 +2422,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
 
     async def stop(self) -> None:
         """Flush outstanding coalescer dirty pools on shutdown."""
+        stop_background_commit()
         if hasattr(self, "_flush_coalescer"):
             self._flush_coalescer.close()
             _clear_coalescer(self._flush_coalescer)

@@ -138,6 +138,86 @@ class SyncDisabledPublicationTestCase(TestCase):
         engine.publish_pending.assert_not_called()
 
 
+class GroupCommitWiringTestCase(TestCase):
+    def test_lifecycle_and_durability_request_are_forwarded(self) -> None:
+        engine = mock.Mock()
+        with (
+            mock.patch.object(embedded_common, "_engine_configured", True),
+            mock.patch.object(embedded_common, "_sync_disabled", False),
+            mock.patch.object(embedded_common, "publishes_at_commit", return_value=True),
+            mock.patch(
+                "synapse.storage.databases.embedded_engine.get_embedded_engine",
+                return_value=engine,
+            ),
+        ):
+            embedded_common.start_background_commit(0.25, max_pending=17)
+            embedded_common.request_durable()
+            embedded_common.stop_background_commit()
+
+        engine.start_background_commit.assert_called_once_with(250, 17)
+        engine.request_durable.assert_called_once_with()
+        engine.stop_background_commit.assert_called_once_with()
+
+    def test_interval_flush_publishes_before_requesting_durability(self) -> None:
+        coalescer = object.__new__(embedded_common._FlushCoalescer)
+        coalescer._delayed_call = None
+        coalescer._closed = False
+        coalescer._dirty = {Pool.STATE, Pool.EVENT_DAG}
+        calls: list[str] = []
+
+        with (
+            mock.patch.object(embedded_common, "publishes_at_commit", return_value=True),
+            mock.patch.object(
+                embedded_common,
+                "_drain_edge_writes",
+                return_value=False,
+            ),
+            mock.patch.object(
+                embedded_common,
+                "maybe_publish",
+                side_effect=lambda *args, **kwargs: calls.append("publish"),
+            ),
+            mock.patch.object(
+                embedded_common,
+                "request_durable",
+                side_effect=lambda: calls.append("request"),
+            ),
+            mock.patch.object(
+                embedded_common, "background_commit_error", return_value=None
+            ),
+        ):
+            coalescer._flush()
+
+        self.assertEqual(calls, ["publish", "request"])
+        self.assertFalse(coalescer._dirty)
+
+    def test_background_failure_keeps_dirty_pools_for_retry(self) -> None:
+        coalescer = object.__new__(embedded_common._FlushCoalescer)
+        coalescer._delayed_call = None
+        coalescer._closed = False
+        coalescer._dirty = {Pool.EVENT_DAG}
+        coalescer._clock = mock.Mock()
+        coalescer._RETRY_DELAY = object()
+
+        with (
+            mock.patch.object(embedded_common, "publishes_at_commit", return_value=True),
+            mock.patch.object(embedded_common, "_drain_edge_writes", return_value=False),
+            mock.patch.object(embedded_common, "maybe_publish"),
+            mock.patch.object(embedded_common, "request_durable"),
+            mock.patch.object(
+                embedded_common,
+                "background_commit_error",
+                return_value="disk full",
+            ),
+        ):
+            coalescer._flush()
+
+        self.assertEqual(coalescer._dirty, {Pool.EVENT_DAG})
+        coalescer._clock.call_later.assert_called_once_with(
+            coalescer._RETRY_DELAY, coalescer._flush
+        )
+
+
 class SyncModeTestCase(TestCase):
     def setUp(self) -> None:
         self.addCleanup(
