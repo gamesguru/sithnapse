@@ -1187,16 +1187,23 @@ def maybe_publish(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
     also turn off the cross-process read path, or a worker would miss committed
     writes that the writer deliberately never fsynced.
 
-    Call sites invoke this via ``txn.call_after``, i.e. only after the SQL
-    commit, so a transaction's own mutations are queued before publication.
+    Call sites are either direct calls or ``txn.call_after`` registrations,
+    and the difference is deliberate. Event JSON publishes *directly*, inside
+    the transaction, because it has no SQL copy to fall back to: a reader that
+    sees the committed row must already see the JSON, so the JSON has to be
+    published before the row can become visible. State/de-outlier publishes
+    via ``txn.call_after`` (after commit), as it always has. In the exclusive
+    engine the mapping has no SQL copy either, so that leaves a small pre-existing
+    window between the commit and this publish; it is not closed here.
 
-    Known limitation: this publication is not transaction-scoped. A concurrent
-    SQL transaction may have mtxdb mutations in the same pending journal queue,
-    and this call may publish them before that SQL transaction commits. In
-    non-WAL mode, the three independent journal publications are also
-    sequential rather than atomic. Production-safe transaction ordering
-    requires transaction-scoped publication in mtxdb or serialization of
-    embedded writes across the SQL commit boundary.
+    Known limitation: this publication is not transaction-scoped. It flushes
+    the engine's whole pending queue, so a concurrent SQL transaction's mtxdb
+    mutations may be published here before that SQL transaction commits. That
+    is an existing property of the shared journal, not something a particular
+    call site introduces. In non-WAL mode, the three independent journal
+    publications are also sequential rather than atomic. Production-safe
+    transaction ordering requires transaction-scoped publication in mtxdb or
+    serialization of embedded writes across the SQL commit boundary.
     """
     if not _engine_configured or tier is not SyncTier.DURABLE:
         return
