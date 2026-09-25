@@ -1335,7 +1335,11 @@ for suite, total in sorted(suite_times.items(), key=lambda x: -x[1]):
     if [ -z "$(find "$_TIMINGS_RUN_DIR" -name '*.json' -print -quit)" ]; then
       echo "warning: SYNAPSE_PG_TIMINGS is set but no timing snapshots were written under $_TIMINGS_RUN_DIR (containers not rebuilt, or the directory isn't writable by Synapse's user)" >&2
     else
-      uv run --no-sync python "${repo_root}/scripts-dev/trial_ctrlc.py" --aggregate-timings "$_TIMINGS_RUN_DIR" >&2 || true
+      # Keep a copy next to the results: the report is otherwise only in the
+      # terminal scrollback.
+      _timings_report="${staged_results_file%.jsonl}.timings.txt"
+      uv run --no-sync python "${repo_root}/scripts-dev/trial_ctrlc.py" --aggregate-timings "$_TIMINGS_RUN_DIR" 2>&1 | tee "$_timings_report" >&2 || true
+      echo "timings report saved at $_timings_report" >&2
     fi
     rm -rf "$_TIMINGS_RUN_DIR"
   fi

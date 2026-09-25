@@ -786,6 +786,25 @@ def _print_mtxdb_engine_stats(timings_dir: str) -> None:
             f" | cache: {pool_totals['cache_hits']:,.0f} hits, {pool_totals['cache_misses']:,.0f} misses",
             file=err,
         )
+        # The pools share one journal, so a physical commit is counted once, by
+        # whichever call performed it; the rest found their target already
+        # committed ("coalesced"). Real commits = calls that reached the journal
+        # minus the coalesced ones.
+        journal_calls = pool_totals.get("sync_journal_sync_calls", 0)
+        coalesced = pool_totals.get("sync_journal_coalesced", 0)
+        if journal_calls:
+            commits = max(journal_calls - coalesced, 0)
+            fsync_us = pool_totals.get("sync_journal_fsync_us", 0)
+            records = pool_totals.get("sync_journal_records", 0)
+            print(
+                f"    journal: {journal_calls:,.0f} sync calls -> {commits:,.0f} real commits,"
+                f" {coalesced:,.0f} coalesced"
+                f" | fsync total={fmt(fsync_us)}"
+                f" avg={fmt(fsync_us / commits) if commits else '-'}"
+                f" max={fmt(pool_totals.get('sync_max_journal_fsync_us', 0))}"
+                f" | records/commit={records / commits if commits else 0:,.1f}",
+                file=err,
+            )
         calls = pool_totals.get("sync_calls", 0)
         if calls:
             print(
