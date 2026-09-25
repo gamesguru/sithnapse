@@ -606,6 +606,20 @@ main() {
 
   if [[ -n "${SYNAPSE_PG_TIMINGS:-}" ]]; then
     export PASS_SYNAPSE_PG_TIMINGS=1
+    # Same mechanism as trial (scripts-dev/trial_ctrlc.py): a private temp dir
+    # that the Synapse timing writers fill with per-process JSON snapshots,
+    # which `finish` aggregates on the host. Each container gets its own
+    # subdirectory (@HOSTNAME@ is expanded by start_for_complement.sh) so the
+    # small PIDs that every container's supervisord children share can't
+    # collide. The container path is a fixed string on purpose: it feeds the
+    # PASS_* blueprint-cache hash below, and a per-run path would rebuild the
+    # blueprints on every run. Writers snapshot periodically while running, so
+    # containers that Complement SIGKILLs still leave data behind.
+    mkdir -p "${repo_root}/.tmp/complement"
+    _TIMINGS_RUN_DIR="$(mktemp -d "${repo_root}/.tmp/complement/synapse-timings.XXXXXX")"
+    chmod 777 "$_TIMINGS_RUN_DIR"
+    export COMPLEMENT_HOST_MOUNTS="${COMPLEMENT_HOST_MOUNTS:+$COMPLEMENT_HOST_MOUNTS;}$_TIMINGS_RUN_DIR:/synapse-timings"
+    export PASS_SYNAPSE_TIMINGS_RUN_DIR="/synapse-timings/@HOSTNAME@"
     # Pass setup_timings_path="-" into the container so each Synapse process
     # prints its Databases.__init__ breakdown to stderr immediately after
     # setup() completes -- before any SIGTERM, so timing output is never lost
@@ -1300,6 +1314,16 @@ for suite, total in sorted(suite_times.items(), key=lambda x: -x[1]):
       echo ""
       echo "Duration: \`${test_duration_seconds}s\` (in_repo=\`${use_in_repo_tests:-0}\`)"
     } >> "$GITHUB_STEP_SUMMARY"
+  fi
+
+  # ── Aggregate per-process timing snapshots from all containers ───────────
+  if [[ -n "${_TIMINGS_RUN_DIR:-}" ]] && [[ -d "$_TIMINGS_RUN_DIR" ]]; then
+    if [ -z "$(find "$_TIMINGS_RUN_DIR" -name '*.json' -print -quit)" ]; then
+      echo "warning: SYNAPSE_PG_TIMINGS is set but no timing snapshots were written under $_TIMINGS_RUN_DIR (containers not rebuilt, or the directory isn't writable by Synapse's user)" >&2
+    else
+      uv run --no-sync python "${repo_root}/scripts-dev/trial_ctrlc.py" --aggregate-timings "$_TIMINGS_RUN_DIR" >&2 || true
+    fi
+    rm -rf "$_TIMINGS_RUN_DIR"
   fi
 
   # ── Extract timing from captured docker logs ─────────────────────────────

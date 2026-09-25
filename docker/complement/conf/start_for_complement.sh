@@ -14,6 +14,15 @@ if [[ "${SYNAPSE_EMBEDDED_HAMT_PATH:-}" == *@HOSTNAME@* ]]; then
   chown -R --reference=/data "$SYNAPSE_EMBEDDED_HAMT_PATH"
 fi
 
+# Per-container directory for the periodic timing snapshots (see the
+# SYNAPSE_PG_TIMINGS block in scripts-dev/complement.sh).
+if [[ "${SYNAPSE_TIMINGS_RUN_DIR:-}" == *@HOSTNAME@* ]]; then
+  export SYNAPSE_TIMINGS_RUN_DIR="${SYNAPSE_TIMINGS_RUN_DIR//@HOSTNAME@/$(hostname)}"
+  mkdir -p "$SYNAPSE_TIMINGS_RUN_DIR"
+  # Synapse drops to an arbitrary UID (PASS_UID), so make this writable by any.
+  chmod 777 "$SYNAPSE_TIMINGS_RUN_DIR"
+fi
+
 echo "Complement Synapse launcher"
 echo "  Args: $*"
 echo "  Env: SYNAPSE_COMPLEMENT_DATABASE=$SYNAPSE_COMPLEMENT_DATABASE SYNAPSE_COMPLEMENT_USE_WORKERS=$SYNAPSE_COMPLEMENT_USE_WORKERS SYNAPSE_COMPLEMENT_USE_ASYNCIO_REACTOR=$SYNAPSE_COMPLEMENT_USE_ASYNCIO_REACTOR"
