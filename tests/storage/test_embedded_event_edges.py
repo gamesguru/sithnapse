@@ -35,6 +35,7 @@ from synapse.storage.databases.main.embedded_common import (
     _set_coalescer,
     enable_ffi_counting,
     get_ffi_count,
+    suppress_diagnostic_timings,
 )
 from synapse.storage.databases.main.embedded_event_edges import (
     delete_event_edges_batch,
@@ -595,6 +596,7 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
 
         try:
             with (
+                suppress_diagnostic_timings(),
                 mock.patch(
                     "synapse.synapse_rust.mtxdb_engine.event_edges_delete",
                     side_effect=slow_delete,

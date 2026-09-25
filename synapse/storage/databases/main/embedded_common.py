@@ -45,6 +45,7 @@ _FFI_LATENCY_LIMIT = 4096
 _FFI_LATENCIES: dict[str, deque[float]] = defaultdict(
     lambda: deque(maxlen=_FFI_LATENCY_LIMIT)
 )
+_DIAGNOSTIC_TIMINGS_SUPPRESSED = 0
 _FFI_TIMING_LOCK: "threading.Lock | None" = (
     threading.Lock() if os.environ.get("SYNAPSE_PG_TIMINGS") else None
 )
@@ -68,7 +69,7 @@ def _ffi_timings_print(*args: object) -> None:
 
 
 def ffi_timing(tag: str, elapsed: float) -> None:
-    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+    if not os.environ.get("SYNAPSE_PG_TIMINGS") or _DIAGNOSTIC_TIMINGS_SUPPRESSED:
         return
     lock = _FFI_TIMING_LOCK
     if lock is not None:
@@ -82,6 +83,23 @@ def ffi_timing(tag: str, elapsed: float) -> None:
         _FFI_LATENCIES[tag].append(elapsed)
 
 
+@contextmanager
+def suppress_diagnostic_timings() -> Iterator[None]:
+    """Temporarily exclude deliberately synthetic waits from diagnostics.
+
+    Tests may hold this context across worker threads while replacing an FFI
+    function with a blocking fake. This keeps the synchronization behavior
+    under test while preventing the fake wait from being reported as native
+    mtxdb latency.
+    """
+    global _DIAGNOSTIC_TIMINGS_SUPPRESSED
+    _DIAGNOSTIC_TIMINGS_SUPPRESSED += 1
+    try:
+        yield
+    finally:
+        _DIAGNOSTIC_TIMINGS_SUPPRESSED -= 1
+
+
 # When True, ffi_count() writes to _FFI_COUNTERS even without SYNAPSE_PG_TIMINGS.
 # Only set by enable_ffi_counting() in tests; never set in production.
 _ffi_counting_enabled: bool = False
@@ -93,7 +111,9 @@ def ffi_count(tag: str, count: int) -> None:
     In production, this is a no-op unless SYNAPSE_PG_TIMINGS is set.
     Tests may activate counting via the enable_ffi_counting() context manager.
     """
-    if not _ffi_counting_enabled and not os.environ.get("SYNAPSE_PG_TIMINGS"):
+    if _DIAGNOSTIC_TIMINGS_SUPPRESSED or (
+        not _ffi_counting_enabled and not os.environ.get("SYNAPSE_PG_TIMINGS")
+    ):
         return
     lock = _FFI_TIMING_LOCK
     if lock is not None:
@@ -162,7 +182,7 @@ def enable_ffi_counting() -> Iterator[None]:
 
 def ffi_batch_size(tag: str, size: int) -> None:
     """Record an opt-in batch-size sample for FFI diagnostics."""
-    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+    if not os.environ.get("SYNAPSE_PG_TIMINGS") or _DIAGNOSTIC_TIMINGS_SUPPRESSED:
         return
     lock = _FFI_TIMING_LOCK
     if lock is not None:
