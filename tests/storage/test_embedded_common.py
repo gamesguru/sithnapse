@@ -3,6 +3,7 @@
 #
 
 import os
+from typing import cast
 from unittest import TestCase, mock
 
 from synapse.storage.databases.main import embedded_common
@@ -13,6 +14,7 @@ from synapse.storage.databases.main.embedded_common import (
     _format_mtxdb_snapshot_segment,
     _mtxdb_snapshot_metrics,
 )
+from synapse.util.duration import Duration
 
 
 class MtxdbSnapshotMetricsTestCase(TestCase):
@@ -201,7 +203,7 @@ class GroupCommitWiringTestCase(TestCase):
         coalescer._closed = False
         coalescer._dirty = {Pool.EVENT_DAG}
         coalescer._clock = mock.Mock()
-        coalescer._RETRY_DELAY = object()
+        coalescer._RETRY_DELAY = Duration(seconds=1)
 
         with (
             mock.patch.object(
@@ -278,7 +280,8 @@ class GroupCommitWiringTestCase(TestCase):
 
         self.assertEqual(coalescer._dirty, set())
         self.assertEqual(calls[0:2], ["publish", "request"])
-        self.assertEqual(calls[2][0], "strict")
+        strict_call = cast(tuple[str, object], calls[2])
+        self.assertEqual(strict_call[0], "strict")
         self.assertEqual(calls[3:], ["stop", ("start", 0.5)])
 
 
