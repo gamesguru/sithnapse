@@ -130,14 +130,14 @@ REPORT_STATS ?= no
 install/build: ##H Build, pip-install $(INSTALL_SRC) to $(INSTALL_DIR)
 	# set -euo pipefail
 	# if [ -f .env ]; then set -a; . ./.env; set +a; fi
-	echo "Installing $(INSTALL_SRC)$(INSTALL_EXTRAS) into $(INSTALL_DIR)"
+	@echo "Installing $(INSTALL_SRC)$(INSTALL_EXTRAS) into $(INSTALL_DIR)"
 	sudo "$(INSTALL_DIR)/bin/pip" install "$(INSTALL_SRC)$(INSTALL_EXTRAS)"
 
 .PHONY: install/gen-config
 install/gen-config: ##H Generate homeserver config as $(INSTALL_USER)
 	# set -euo pipefail
 	# if [ -f .env ]; then set -a; . ./.env; set +a; fi
-	echo "Generating $(CONFIG_PATH) for $(SERVER_NAME)"
+	@echo "Generating $(CONFIG_PATH) for $(SERVER_NAME)"
 	sudo -u "$(INSTALL_USER)" -H "$(INSTALL_DIR)/bin/python" \
 		-m synapse.app.homeserver \
 		--server-name "$(SERVER_NAME)" \
