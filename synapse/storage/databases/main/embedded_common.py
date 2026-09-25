@@ -1379,9 +1379,24 @@ class _FlushCoalescer:
                 maybe_publish(SyncTier.DURABLE, to_flush)
                 request_durable()
                 if error := background_commit_error():
-                    raise RuntimeError(
-                        f"mtxdb background committer failed: {error}"
+                    # The native committer is terminal after an I/O error.
+                    # Recover by proving the same dirty set with the strict
+                    # synchronous path, then replace the failed committer.
+                    logger.warning(
+                        "mtxdb background committer failed; attempting strict recovery: %s",
+                        error,
                     )
+                    _do_sync_pools(to_flush)
+                    try:
+                        stop_background_commit()
+                    except Exception:
+                        # stop_background_commit reports the already-recorded
+                        # terminal error even after strict sync succeeded.
+                        logger.info(
+                            "mtxdb failed committer stopped after strict recovery",
+                            exc_info=True,
+                        )
+                    start_background_commit(self._FLUSH_DELAY.as_secs())
             else:
                 _do_sync_pools(to_flush)
             if Pool.EVENT_DAG in to_flush and not _sync_disabled:

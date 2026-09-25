@@ -3555,7 +3555,7 @@ pub fn request_durable(py: Python<'_>) -> PyResult<Vec<u64>> {
                 .journal()
                 .map(|journal| {
                     let target = journal.capture_sync_target();
-                    journal.request_durable(target);
+                    let _ = journal.request_durable(target);
                     target
                 })
                 .unwrap_or(0);

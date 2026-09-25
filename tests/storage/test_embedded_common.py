@@ -144,7 +144,9 @@ class GroupCommitWiringTestCase(TestCase):
         with (
             mock.patch.object(embedded_common, "_engine_configured", True),
             mock.patch.object(embedded_common, "_sync_disabled", False),
-            mock.patch.object(embedded_common, "publishes_at_commit", return_value=True),
+            mock.patch.object(
+                embedded_common, "publishes_at_commit", return_value=True
+            ),
             mock.patch(
                 "synapse.storage.databases.embedded_engine.get_embedded_engine",
                 return_value=engine,
@@ -166,7 +168,9 @@ class GroupCommitWiringTestCase(TestCase):
         calls: list[str] = []
 
         with (
-            mock.patch.object(embedded_common, "publishes_at_commit", return_value=True),
+            mock.patch.object(
+                embedded_common, "publishes_at_commit", return_value=True
+            ),
             mock.patch.object(
                 embedded_common,
                 "_drain_edge_writes",
@@ -200,8 +204,12 @@ class GroupCommitWiringTestCase(TestCase):
         coalescer._RETRY_DELAY = object()
 
         with (
-            mock.patch.object(embedded_common, "publishes_at_commit", return_value=True),
-            mock.patch.object(embedded_common, "_drain_edge_writes", return_value=False),
+            mock.patch.object(
+                embedded_common, "publishes_at_commit", return_value=True
+            ),
+            mock.patch.object(
+                embedded_common, "_drain_edge_writes", return_value=False
+            ),
             mock.patch.object(embedded_common, "maybe_publish"),
             mock.patch.object(embedded_common, "request_durable"),
             mock.patch.object(
@@ -216,6 +224,62 @@ class GroupCommitWiringTestCase(TestCase):
         coalescer._clock.call_later.assert_called_once_with(
             coalescer._RETRY_DELAY, coalescer._flush
         )
+
+    def test_background_failure_recovers_with_strict_sync_and_restart(self) -> None:
+        coalescer = object.__new__(embedded_common._FlushCoalescer)
+        coalescer._delayed_call = None
+        coalescer._closed = False
+        coalescer._dirty = {Pool.STATE, Pool.EVENT_DAG}
+        coalescer._FLUSH_DELAY = mock.Mock()
+        coalescer._FLUSH_DELAY.as_secs.return_value = 0.5
+        calls: list[object] = []
+
+        def failed_stop() -> None:
+            calls.append("stop")
+            raise RuntimeError("old failure")
+
+        with (
+            mock.patch.object(
+                embedded_common, "publishes_at_commit", return_value=True
+            ),
+            mock.patch.object(
+                embedded_common, "_drain_edge_writes", return_value=False
+            ),
+            mock.patch.object(
+                embedded_common,
+                "maybe_publish",
+                side_effect=lambda *args, **kwargs: calls.append("publish"),
+            ),
+            mock.patch.object(
+                embedded_common,
+                "request_durable",
+                side_effect=lambda: calls.append("request"),
+            ),
+            mock.patch.object(
+                embedded_common, "background_commit_error", return_value="disk full"
+            ),
+            mock.patch.object(
+                embedded_common,
+                "_do_sync_pools",
+                side_effect=lambda pools: calls.append(("strict", pools)),
+            ),
+            mock.patch.object(
+                embedded_common,
+                "stop_background_commit",
+                side_effect=failed_stop,
+            ),
+            mock.patch.object(
+                embedded_common,
+                "start_background_commit",
+                side_effect=lambda interval: calls.append(("start", interval)),
+            ),
+        ):
+            coalescer._flush()
+
+        self.assertEqual(coalescer._dirty, set())
+        self.assertEqual(calls[0:2], ["publish", "request"])
+        self.assertEqual(calls[2][0], "strict")
+        self.assertEqual(calls[3:], ["stop", ("start", 0.5)])
 
 
 class SyncModeTestCase(TestCase):
