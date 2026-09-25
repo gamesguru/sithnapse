@@ -148,14 +148,45 @@ class RoomBackgroundUpdateStoreTestCase(HomeserverTestCase):
             },
             "type": "m.room.create",
         }
+        event_json = json.dumps(event)
         self.get_success(
             self.store.db_pool.simple_update(
                 table="event_json",
                 keyvalues={"event_id": event_id},
-                updatevalues={"json": json.dumps(event)},
+                updatevalues={"json": event_json},
                 desc="test",
             )
         )
+        if getattr(self.store, "_embedded_event_json_enabled", False):
+            # With the embedded backend the read path is the mirror and the SQL
+            # `event_json` row may be absent, so the fake body must land there
+            # too or the background update's SQL join returns NULL and falls
+            # back to the untouched embedded create event.
+            from synapse.storage.databases.main.embedded_event_json import (
+                get_event_json_batch,
+                put_event_json_batch,
+            )
+
+            existing = get_event_json_batch(
+                self.store._embedded_hamt_engine,
+                self.store._embedded_hamt_namespace,
+                [event_id],
+            ).get(event_id)
+            internal_metadata = existing[0] if existing else "{}"
+            format_version = existing[2] if existing else None
+            put_event_json_batch(
+                self.store._embedded_hamt_engine,
+                self.store._embedded_hamt_namespace,
+                [
+                    (
+                        event_id,
+                        room_id,
+                        internal_metadata,
+                        event_json,
+                        format_version,
+                    )
+                ],
+            )
 
         self.run_background_updates(_BackgroundUpdates.ADD_ROOM_TYPE_COLUMN)
 

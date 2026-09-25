@@ -98,9 +98,9 @@ RUN mkdir /rust /cargo
 
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain stable --profile minimal
 
-# mtxdb uses #![feature(...)] which requires RUSTC_BOOTSTRAP on stable. It is
-# applied at the `dh_virtualenv` step (the only command that builds the
-# extension) in debian/build_virtualenv -- not exported into this image.
+# mtxdb uses #![feature(...)] which requires RUSTC_BOOTSTRAP on stable.
+ARG RUSTC_BOOTSTRAP=1
+ENV RUSTC_BOOTSTRAP=${RUSTC_BOOTSTRAP}
 
 
 COPY --from=builder /dh-virtualenv_1.2.2-1_all.deb /

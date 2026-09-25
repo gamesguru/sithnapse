@@ -77,6 +77,35 @@ class DatabaseConnectionConfig:
         self.databases = data_stores
 
 
+def is_path_on_rotational_disk(path: str) -> bool | None:
+    """Return True if path is on a rotational drive (HDD), False if non-rotational (SSD/NVMe), or None if unknown."""
+    try:
+        p = path
+        while p and not os.path.exists(p):
+            parent = os.path.dirname(p)
+            if parent == p:
+                break
+            p = parent
+        if not os.path.exists(p):
+            return None
+        st = os.stat(p)
+        major, minor = os.major(st.st_dev), os.minor(st.st_dev)
+        for candidate in (
+            f"/sys/dev/block/{major}:{minor}/queue/rotational",
+            f"/sys/dev/block/{major}:{minor}/../queue/rotational",
+        ):
+            if os.path.exists(candidate):
+                with open(candidate) as f:
+                    val = f.read().strip()
+                    if val == "1":
+                        return True
+                    elif val == "0":
+                        return False
+    except Exception:
+        pass
+    return None
+
+
 class DatabaseConfig(Config):
     section = "database"
 
@@ -98,6 +127,10 @@ class DatabaseConfig(Config):
         # NOT for production use.  Set via embedded_hamt.no_sync or
         # SYNAPSE_MTXDB_NO_SYNC env var.
         self.embedded_hamt_no_sync: bool = False
+        # Flush coalescer window for mtxdb in seconds.
+        # If unset (None), automatically tunes based on whether the database path
+        # resides on a rotational drive (HDD -> 2.0s) or non-rotational drive (SSD/NVMe -> 0.5s).
+        self.embedded_hamt_flush_delay_secs: float | None = None
         # If set, Databases.__init__ timing data (tag → total seconds + call
         # count) is written as JSON to this path after HomeServer.setup()
         # completes.  Intended for profiling production startup (e.g.
@@ -135,6 +168,12 @@ class DatabaseConfig(Config):
             if not isinstance(no_sync, bool):
                 raise ConfigError("embedded_hamt.no_sync must be a boolean")
             self.embedded_hamt_no_sync = no_sync
+            flush_delay = embedded_config.get("flush_delay_secs")
+            if flush_delay is not None:
+                try:
+                    self.embedded_hamt_flush_delay_secs = float(flush_delay)
+                except (ValueError, TypeError):
+                    raise ConfigError("embedded_hamt.flush_delay_secs must be a number")
 
         env_engine = os.environ.get("SYNAPSE_EMBEDDED_HAMT_ENGINE")
         if env_engine:
@@ -142,8 +181,22 @@ class DatabaseConfig(Config):
         env_path = os.environ.get("SYNAPSE_EMBEDDED_HAMT_PATH")
         if env_path:
             self.embedded_hamt_path = env_path
-        if os.environ.get("SYNAPSE_MTXDB_NO_SYNC"):
+        env_no_sync = os.environ.get("SYNAPSE_MTXDB_NO_SYNC")
+        if env_no_sync is not None and env_no_sync.strip().lower() not in (
+            "",
+            "0",
+            "false",
+            "no",
+            "off",
+        ):
             self.embedded_hamt_no_sync = True
+
+        env_flush_delay = os.environ.get("SYNAPSE_MTXDB_FLUSH_DELAY_SECS")
+        if env_flush_delay:
+            try:
+                self.embedded_hamt_flush_delay_secs = float(env_flush_delay)
+            except (ValueError, TypeError):
+                raise ConfigError("SYNAPSE_MTXDB_FLUSH_DELAY_SECS must be a number")
 
         # A concise production switch. The path is deliberately still
         # required: unlike tests, a production server must never silently put
@@ -157,6 +210,13 @@ class DatabaseConfig(Config):
                 raise ConfigError(
                     "SYNAPSE_MTXDB requires SYNAPSE_MTXDB_PATH or embedded_hamt.path"
                 )
+
+        if self.embedded_hamt_flush_delay_secs is None and self.embedded_hamt_path:
+            is_rotational = is_path_on_rotational_disk(self.embedded_hamt_path)
+            if is_rotational is True:
+                self.embedded_hamt_flush_delay_secs = 2.0
+            else:
+                self.embedded_hamt_flush_delay_secs = 0.5
 
         self.setup_timings_path = config.get("setup_timings_path") or os.environ.get(
             "SYNAPSE_DB_SETUP_TIMINGS_PATH"
@@ -183,6 +243,18 @@ class DatabaseConfig(Config):
                 f"embedded_hamt.engine is {self.embedded_hamt_engine!r}, "
                 "but only 'mtxdb' is supported."
             )
+
+        # Whether the embedded engine requires the write-ahead journal
+        # (SYNAPSE_MTXDB_WAL) is a *worker-deployment* question, not a
+        # database-section one: WAL only buys a read-only worker's
+        # get_many_with_refresh gate a visibility path (get_read_committed's
+        # overlay) that closes independently of a deferred checkpoint
+        # rewrite -- it is not a durability improvement (the coalescer's sync
+        # cadence is unchanged either way) and it does nothing for a single
+        # process, which never goes through that cross-process gate at all.
+        # So that check lives in synapse/config/workers.py, gated on the same
+        # "is this a multi-process deployment" predicate as the other
+        # embedded_hamt_engine worker guards there, not here.
 
         if multi_database_config and database_config:
             raise ConfigError("Can't specify both 'database' and 'databases' in config")

@@ -1,4 +1,4 @@
-//! Embedded Event Edges storage in the `event_dag` mtxdb packfile storage pool.
+//! Embedded Event Edges storage in the `edges` mtxdb packfile storage pool.
 //!
 //! Stores the DAG edges connecting Matrix events:
 //! - Backward edges: `event_id -> [(prev_event_id, is_state)]` (immutable, write-once).
@@ -16,12 +16,13 @@
 
 use std::collections::{HashMap, HashSet};
 
-use mtxdb_core::{NodeData, NodeId, StorageEngine};
+use mtxdb::{NodeData, NodeId, StorageEngine};
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use sha2::{Digest, Sha256};
 
-use super::mtxdb::{
-    assert_writable, event_dag_db, event_dag_room_id, event_locator_collection_id, event_node_id,
+use super::mtxdb_syn::{
+    assert_writable, auth_chain_db, event_locator_collection_id, event_node_id, prev_edges_room_id,
     RMW_LOCK,
 };
 
@@ -138,7 +139,7 @@ fn insert_event_locator(
     room_id: &str,
     event_id: &str,
 ) {
-    let room_collection = event_dag_room_id(namespace, room_id);
+    let room_collection = prev_edges_room_id(namespace, room_id);
     let identity = event_node_id(namespace, event_id);
     let locator_collection = event_locator_collection_id(namespace, &identity);
     locators.entry(locator_collection).or_default().insert(
@@ -147,7 +148,7 @@ fn insert_event_locator(
     );
 }
 
-/// Batch put event edges into the room-aware event_dag pool:
+/// Batch put event edges into the room-aware PREV collection in the Edges pool:
 /// 1. Backward edges: `event_id -> [(prev_event_id, is_state)]`
 /// 2. Forward edges: `prev_event_id -> [child_event_id]` (appended and deduplicated)
 ///
@@ -171,7 +172,7 @@ pub fn event_edges_put(
         let _guard = RMW_LOCK
             .lock()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}")))?;
-        let engine = event_dag_db()?;
+        let engine = auth_chain_db()?;
 
         let mut backward_map: HashMap<(String, String), Vec<(String, bool)>> = HashMap::new();
         let mut forward_map: HashMap<(String, String), Vec<String>> = HashMap::new();
@@ -192,7 +193,7 @@ pub fn event_edges_put(
         let mut locator_puts: HashMap<[u8; 16], HashMap<NodeId, NodeData>> = HashMap::new();
 
         for ((room_id, event_id), edges) in backward_map {
-            let room_collection = event_dag_room_id(&namespace, &room_id);
+            let room_collection = prev_edges_room_id(&namespace, &room_id);
             let edge_node = event_edges_backward_node_id(&namespace, &event_id);
 
             let encoded = encode_backward_edges(&edges);
@@ -203,15 +204,57 @@ pub fn event_edges_put(
             insert_event_locator(&mut locator_puts, &namespace, &room_id, &event_id);
         }
 
+        // Batch-read the existing forward child lists for every distinct
+        // (room, parent) this batch touches, instead of one `get` per parent.
+        // `get_many` groups by shard and orders by offset, so a persist batch
+        // touching many parents costs one round trip per room collection.
+        let mut forward_by_collection: HashMap<[u8; 16], Vec<NodeId>> = HashMap::new();
+        for (room_id, prev_event_id) in forward_map.keys() {
+            let room_collection = prev_edges_room_id(&namespace, room_id);
+            let forward_node = event_edges_forward_node_id(&namespace, prev_event_id);
+            forward_by_collection
+                .entry(room_collection)
+                .or_default()
+                .push(forward_node);
+        }
+        let mut forward_cache: HashMap<([u8; 16], NodeId), Vec<String>> = HashMap::new();
+        for (collection, node_ids) in forward_by_collection.iter_mut() {
+            // Distinct nodes only: two logical (room, parent) keys can in
+            // principle derive the same collection/node pair, and this makes
+            // "one read per distinct node" true.
+            node_ids.sort_unstable();
+            node_ids.dedup();
+            let found = engine.get_many(collection, node_ids).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {e}"))
+            })?;
+            for (forward_node, value) in node_ids.iter().zip(found) {
+                let children = match value {
+                    Some(data) if !data.bytes.is_empty() => decode_forward_edges(&data.bytes)?,
+                    _ => Vec::new(),
+                };
+                forward_cache.insert((*collection, *forward_node), children);
+            }
+        }
+
         for ((room_id, prev_event_id), new_children) in forward_map {
-            let room_collection = event_dag_room_id(&namespace, &room_id);
+            let room_collection = prev_edges_room_id(&namespace, &room_id);
             let forward_node = event_edges_forward_node_id(&namespace, &prev_event_id);
 
-            // Read existing children if any
-            let mut existing_children = match engine.get(&room_collection, &forward_node) {
-                Ok(Some(data)) if !data.bytes.is_empty() => decode_forward_edges(&data.bytes)?,
-                _ => Vec::new(),
-            };
+            // Every (room, parent) key was read above, so the cached list can
+            // be moved out rather than cloned. A miss means two logical keys
+            // derived the same collection/node pair (a node-id collision) or
+            // the cache was built inconsistently; fail loudly rather than
+            // write an empty list over existing children. Nothing has been
+            // written yet, so a failure here leaves the store untouched.
+            let mut existing_children = forward_cache
+                .remove(&(room_collection, forward_node))
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "forward-edge node id collision while batching parent reads \
+                         (collection {:02x?}, node {:02x?})",
+                        room_collection, forward_node
+                    ))
+                })?;
 
             let mut seen: HashSet<String> = existing_children.iter().cloned().collect();
             let mut changed = false;
@@ -260,7 +303,7 @@ pub fn event_edges_get_backward(
     event_ids: Vec<String>,
 ) -> PyResult<Vec<(String, Option<Vec<(String, bool)>>)>> {
     py.detach(|| {
-        let engine = event_dag_db()?;
+        let engine = auth_chain_db()?;
         let node_ids: Vec<NodeId> = event_ids
             .iter()
             .map(|id| event_node_id(&namespace, id))
@@ -331,7 +374,7 @@ pub fn event_edges_get_forward(
     prev_event_ids: Vec<String>,
 ) -> PyResult<Vec<(String, Option<Vec<String>>)>> {
     py.detach(|| {
-        let engine = event_dag_db()?;
+        let engine = auth_chain_db()?;
         let node_ids: Vec<NodeId> = prev_event_ids
             .iter()
             .map(|id| event_node_id(&namespace, id))
@@ -377,134 +420,251 @@ pub fn event_edges_get_forward(
         }
 
         let mut results: Vec<Option<Vec<String>>> = vec![None; prev_event_ids.len()];
-        for (collection, ids) in dag_ids {
+        for (collection, ids) in &dag_ids {
             let node_ids_only: Vec<NodeId> = ids.iter().map(|(_, id)| *id).collect();
-            let found = engine.get_many(&collection, &node_ids_only).map_err(|e| {
+            let found = engine.get_many(collection, &node_ids_only).map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {e}"))
             })?;
-            for ((position, _), value) in ids.into_iter().zip(found) {
+            for ((position, _), value) in ids.iter().zip(found) {
                 if let Some(data) = value {
                     if !data.bytes.is_empty() {
-                        results[position] = Some(decode_forward_edges(&data.bytes)?);
+                        results[*position] = Some(decode_forward_edges(&data.bytes)?);
                     }
                 }
             }
+        }
+
+        // Forward lists are a lossy cache: `event_edges_delete` tombstones a
+        // purged event's backward edge but never rewrites its parents'
+        // forward lists, so a returned child may no longer exist. Verify
+        // every returned child still has a live (non-tombstoned) backward
+        // edge in the same room collection before handing it back, batched
+        // per room collection rather than per child.
+        let mut child_lookup: HashMap<[u8; 16], Vec<String>> = HashMap::new();
+        for (position, room_collection) in room_collections.iter().enumerate() {
+            let (Some(room_collection), Some(children)) = (room_collection, &results[position])
+            else {
+                continue;
+            };
+            child_lookup
+                .entry(*room_collection)
+                .or_default()
+                .extend(children.iter().cloned());
+        }
+
+        // Three states, not two: `Some(true)` -- a present, non-empty
+        // backward record -- means the child is live and is kept.
+        // `Some(false)` -- present but empty -- is `event_edges_delete`'s
+        // explicit tombstone, and the child is dropped. `None` -- no record
+        // at all -- is NOT the same as a tombstone: it is a legacy or
+        // partially-mirrored event whose backward edge was never written
+        // (see the module doc comment on repair and backfill). Silently
+        // keeping or dropping that child either hides it or fabricates
+        // certainty this code doesn't have, so instead the child's *parent*
+        // is treated as an incomplete lookup and returned as `None` --
+        // exactly the same "embedded miss" signal `event_edges_get_forward`
+        // already returns when the forward node itself doesn't exist.
+        // Callers (e.g. `get_successor_events` in event_federation.py)
+        // already handle that `None` by falling back to SQL and re-queuing
+        // a repair write for the gap via `queue_edge_write`, so this reuses
+        // existing self-healing rather than inventing a new contract.
+        let mut live: HashMap<([u8; 16], String), Option<bool>> = HashMap::new();
+        for (collection, children) in &mut child_lookup {
+            children.sort_unstable();
+            children.dedup();
+            let backward_node_ids: Vec<NodeId> = children
+                .iter()
+                .map(|child| event_edges_backward_node_id(&namespace, child))
+                .collect();
+            let found = engine
+                .get_many(collection, &backward_node_ids)
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {e}"))
+                })?;
+            for (child, value) in children.iter().zip(found) {
+                let status = value.map(|data| !data.bytes.is_empty());
+                live.insert((*collection, child.clone()), status);
+            }
+        }
+
+        for (position, room_collection) in room_collections.iter().enumerate() {
+            let Some(room_collection) = room_collection else {
+                continue;
+            };
+            let Some(children) = results[position].as_ref() else {
+                continue;
+            };
+            // Every status is required to be present, since `child_lookup`
+            // (and so `live`) was built from these same `results` above.
+            let mut incomplete = false;
+            let mut kept = Vec::with_capacity(children.len());
+            for child in children {
+                match live.get(&(*room_collection, child.clone())) {
+                    Some(Some(true)) => kept.push(child.clone()),
+                    Some(Some(false)) => {}
+                    Some(None) | None => {
+                        incomplete = true;
+                        break;
+                    }
+                }
+            }
+            // Every purged-only or incomplete parent collapses to `None`,
+            // matching the pre-lazy-tombstone contract where an
+            // all-children-removed (or now, not-fully-resolvable) parent
+            // read back as absent rather than `Some(vec![])` or a
+            // partially-trustworthy list.
+            results[position] = if incomplete || kept.is_empty() {
+                None
+            } else {
+                Some(kept)
+            };
         }
 
         Ok(prev_event_ids.into_iter().zip(results).collect())
     })
 }
 
-/// Tombstone backward edges for purged events and remove them from parent forward lists
+/// Tombstone backward edges for purged events.
+///
+/// Deliberately does NOT touch parents' forward lists. Splicing a purged
+/// child out of every distinct parent's forward node used to require a
+/// read-modify-write per parent (`forward_read` + `mutate_write` phases,
+/// dominating delete latency under normal churn) purely to keep those lists
+/// exact. Instead, forward lists are left stale and `event_edges_get_forward`
+/// filters out any child whose backward edge is now tombstoned (or missing)
+/// before returning it — the same backward-edge lookup this function already
+/// pays for, just done at read time instead of write time. This trades
+/// forward-list exactness (and unbounded list growth until compaction) for a
+/// delete that no longer pays for other parents' list sizes.
+///
+/// NOTE: this makes forward lists a lossy cache that must always be read
+/// through the backward-edge filter in `event_edges_get_forward` — never
+/// consumed raw. A stale entry is silently dropped at read time, not
+/// resurrected; nothing about it can be relied on to reflect current state
+/// without that filter.
 #[pyfunction]
 pub fn event_edges_delete(
     py: Python<'_>,
     namespace: String,
     event_ids: Vec<String>,
-) -> PyResult<()> {
+) -> PyResult<Py<PyDict>> {
     assert_writable()?;
-    let _guard = RMW_LOCK.lock().unwrap();
-    py.detach(|| {
-        let engine = event_dag_db()?;
-        let node_ids: Vec<NodeId> = event_ids
-            .iter()
-            .map(|id| event_node_id(&namespace, id))
-            .collect();
+    // Phase timings returned as a named dict (not a positional tuple) so the
+    // Python diagnostics layer can't silently misread a field if one is added
+    // or reordered. See `embedded_event_edges.delete_event_edges_batch`.
+    let detach_started = std::time::Instant::now();
+    let (lock_wait, locator_read, backward_tombstone_write, room_count, closure_duration) = py
+        .detach(|| -> PyResult<(f64, f64, f64, usize, f64)> {
+            // Timed from inside the closure, under the GIL-released section,
+            // so it can be diffed against `detach_started` outside to isolate
+            // py.detach's own GIL-reacquisition/return overhead from real
+            // work done here -- without that split, a slow call can't be
+            // attributed to mtxdb vs. the FFI boundary.
+            let closure_started = std::time::Instant::now();
+            // Keep lock acquisition outside the GIL, otherwise a purge waiting
+            // behind another read/modify/write operation stalls unrelated Python
+            // work as well. The caller consumes the returned phase timings.
+            let lock_started = std::time::Instant::now();
+            let _guard = RMW_LOCK.lock().unwrap();
+            let lock_wait = lock_started.elapsed().as_secs_f64();
+            let engine = auth_chain_db()?;
+            let locator_started = std::time::Instant::now();
+            let node_ids: Vec<NodeId> = event_ids
+                .iter()
+                .map(|id| event_node_id(&namespace, id))
+                .collect();
 
-        let mut locator_ids: HashMap<[u8; 16], Vec<(usize, NodeId)>> = HashMap::new();
-        for (position, node_id) in node_ids.iter().enumerate() {
-            locator_ids
-                .entry(event_locator_collection_id(&namespace, node_id))
-                .or_default()
-                .push((position, *node_id));
-        }
-
-        let mut room_collections: Vec<Option<[u8; 16]>> = vec![None; event_ids.len()];
-        for (collection, ids) in locator_ids {
-            let node_ids_only: Vec<NodeId> = ids.iter().map(|(_, id)| *id).collect();
-            let found = engine.get_many(&collection, &node_ids_only).map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {e}"))
-            })?;
-            for ((position, _), value) in ids.into_iter().zip(found) {
-                if let Some(data) = value {
-                    if !data.bytes.is_empty() {
-                        if let Ok(room) = <[u8; 16]>::try_from(data.bytes.as_ref()) {
-                            room_collections[position] = Some(room);
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut dag_updates: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
-        let mut forward_cache: HashMap<([u8; 16], NodeId), Vec<String>> = HashMap::new();
-
-        for (position, room_collection) in room_collections.iter().enumerate() {
-            if let Some(room_collection) = room_collection {
-                let event_id = &event_ids[position];
-                let backward_node = event_edges_backward_node_id(&namespace, event_id);
-
-                // 1. Read backward edges to find parents
-                let backward_data = engine.get(room_collection, &backward_node).map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get error: {e}"))
-                })?;
-
-                if let Some(data) = backward_data {
-                    if !data.bytes.is_empty() {
-                        let preds = decode_backward_edges(&data.bytes)?;
-                        for (parent_id, _) in preds {
-                            let forward_node = event_edges_forward_node_id(&namespace, &parent_id);
-                            let key = (*room_collection, forward_node);
-
-                            if let std::collections::hash_map::Entry::Vacant(e) =
-                                forward_cache.entry(key)
-                            {
-                                let existing = match engine.get(room_collection, &forward_node) {
-                                    Ok(Some(d)) if !d.bytes.is_empty() => {
-                                        decode_forward_edges(&d.bytes)?
-                                    }
-                                    _ => Vec::new(),
-                                };
-                                e.insert(existing);
-                            }
-
-                            if let Some(children) = forward_cache.get_mut(&key) {
-                                children.retain(|c| c != event_id);
-                            }
-                        }
-                    }
-                }
-
-                // 2. Tombstone backward edge
-                dag_updates
-                    .entry(*room_collection)
+            let mut locator_ids: HashMap<[u8; 16], Vec<(usize, NodeId)>> = HashMap::new();
+            for (position, node_id) in node_ids.iter().enumerate() {
+                locator_ids
+                    .entry(event_locator_collection_id(&namespace, node_id))
                     .or_default()
-                    .push((backward_node, NodeData::new(bytes::Bytes::new())));
-                // NOTE: locators are owned by event_json_put; do not tombstone here.
+                    .push((position, *node_id));
             }
-        }
 
-        // 3. Write updated or tombstoned forward edges
-        for ((room_col, forward_node), children) in forward_cache {
-            let data = if children.is_empty() {
-                NodeData::new(bytes::Bytes::new())
-            } else {
-                NodeData::new(bytes::Bytes::from(encode_forward_edges(&children)))
-            };
-            dag_updates
-                .entry(room_col)
-                .or_default()
-                .push((forward_node, data));
-        }
+            let mut room_collections: Vec<Option<[u8; 16]>> = vec![None; event_ids.len()];
+            for (collection, ids) in locator_ids {
+                let node_ids_only: Vec<NodeId> = ids.iter().map(|(_, id)| *id).collect();
+                let found = engine.get_many(&collection, &node_ids_only).map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {e}"))
+                })?;
+                for ((position, _), value) in ids.into_iter().zip(found) {
+                    if let Some(data) = value {
+                        if !data.bytes.is_empty() {
+                            if let Ok(room) = <[u8; 16]>::try_from(data.bytes.as_ref()) {
+                                room_collections[position] = Some(room);
+                            }
+                        }
+                    }
+                }
+            }
+            let locator_read = locator_started.elapsed().as_secs_f64();
 
-        for (collection, pairs) in dag_updates {
-            engine.put_many(&collection, &pairs).map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {e}"))
-            })?;
-        }
+            // Tombstone the backward edge for every purged event. This alone
+            // is what `event_edges_get_forward` treats as "deleted" — no
+            // forward node is read or written here.
+            let mut backward_ids: HashMap<[u8; 16], Vec<NodeId>> = HashMap::new();
+            for (position, room_collection) in room_collections.iter().enumerate() {
+                if let Some(room_collection) = room_collection {
+                    let backward_node =
+                        event_edges_backward_node_id(&namespace, &event_ids[position]);
+                    backward_ids
+                        .entry(*room_collection)
+                        .or_default()
+                        .push(backward_node);
+                }
+            }
 
-        Ok(())
-    })
+            let tombstone_started = std::time::Instant::now();
+            let mut dag_updates: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
+            for (collection, ids) in &backward_ids {
+                let pairs: Vec<(NodeId, NodeData)> = ids
+                    .iter()
+                    .map(|id| (*id, NodeData::new(bytes::Bytes::new())))
+                    .collect();
+                dag_updates.insert(*collection, pairs);
+            }
+            for (collection, pairs) in &dag_updates {
+                engine.put_many(collection, pairs).map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {e}"))
+                })?;
+            }
+            let backward_tombstone_write = tombstone_started.elapsed().as_secs_f64();
+
+            // Distinct room collections this purge resolved a locator into.
+            let room_count = backward_ids.len();
+            let closure_duration = closure_started.elapsed().as_secs_f64();
+
+            Ok((
+                lock_wait,
+                locator_read,
+                backward_tombstone_write,
+                room_count,
+                closure_duration,
+            ))
+        })?;
+    let detached_duration = detach_started.elapsed().as_secs_f64();
+    let timings = PyDict::new(py);
+    timings.set_item("lock_wait", lock_wait)?;
+    timings.set_item("locator_read", locator_read)?;
+    // No forward node is read or written by delete any more (see the doc
+    // comment above): there is no `forward_read`/`mutate_write`/
+    // `forward_nodes` phase left to report. `backward_tombstone_write`
+    // replaces the old `backward_read` key -- this phase is a write
+    // (tombstoning), not a read.
+    timings.set_item("backward_tombstone_write", backward_tombstone_write)?;
+    // `closure_duration` covers all work done inside `py.detach`, including
+    // the three named phases above plus the untimed glue between them (id
+    // mapping, HashMap construction). `detached_duration` wraps `py.detach`
+    // itself from the outside: `detached_duration - closure_duration` is
+    // GIL-reacquisition/return overhead, not mtxdb work. Comparing both to
+    // the caller's own wall-clock timing around this whole call isolates a
+    // slow delete to mtxdb, to untimed Rust glue, or to the FFI boundary --
+    // rather than guessing.
+    timings.set_item("closure_duration", closure_duration)?;
+    timings.set_item("detached_duration", detached_duration)?;
+    timings.set_item("rooms", room_count)?;
+    Ok(timings.unbind())
 }
 
 pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -521,7 +681,7 @@ mod tests {
 
     #[test]
     fn put_get_backward_and_forward_round_trip() {
-        crate::database::mtxdb::auth_chain_closure_tests::ensure_open();
+        crate::database::mtxdb_syn::auth_chain_closure_tests::ensure_open();
         let ns = "ns-edges-roundtrip";
         let room = "!room-edges:example.org";
 

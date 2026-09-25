@@ -71,6 +71,7 @@ from synapse.types import StrCollection
 from synapse.util.async_helpers import delay_cancellation
 from synapse.util.duration import Duration
 from synapse.util.iterutils import batch_iter
+from synapse.util.timings_flush import register_periodic_flush
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
@@ -260,7 +261,9 @@ def _print_table_ops() -> None:
 
     run_dir = os.environ.get("SYNAPSE_TIMINGS_RUN_DIR")
     if run_dir:
-        tmp_path = os.path.join(run_dir, f"sql_{os.getpid()}.tmp")
+        tmp_path = os.path.join(
+            run_dir, f"sql_{os.getpid()}.{threading.get_ident()}.tmp"
+        )
         final_path = os.path.join(run_dir, f"sql_{os.getpid()}.json")
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
@@ -354,6 +357,7 @@ if _PG_TIMINGS_ENABLED:
         _print_table_ops()
 
     atexit.register(flush_table_ops)
+    register_periodic_flush(flush_table_ops)
 
     import signal as _signal
     from types import FrameType as _FrameType
@@ -1213,11 +1217,11 @@ class DatabasePool:
                         opentracing.log_kv({"message": "commit"})
                         conn.commit()
                         return r
-                except self.engine.module.OperationalError as e:
-                    # This can happen if the database disappears mid
-                    # transaction.
+                except (self.engine.module.OperationalError, BlockingIOError) as e:
+                    # A transient mtxdb journal/checkpoint race is surfaced as
+                    # BlockingIOError so this transaction attempt can be retried.
                     transaction_logger.warning(
-                        "[TXN OPERROR] {%s} %s %d/%d",
+                        "[TXN RETRYABLE ERROR] {%s} %s %d/%d",
                         name,
                         e,
                         attempt_number,

@@ -684,14 +684,31 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
             When Direction.BACKWARDS: from_key >= x > to_key, (descending order)
         """
         if direction == Direction.FORWARDS:
-            room_ids = self._events_stream_cache.get_entities_changed(
+            changed_room_ids = self._events_stream_cache.get_entities_changed(
                 room_ids, from_key.stream
             )
+            logger.info(
+                "[sync-trace] worker=%s event-cache direction=forward from=%s candidates=%d changed=%s",
+                self._instance_name,
+                from_key,
+                len(room_ids),
+                sorted(changed_room_ids),
+            )
+            room_ids = changed_room_ids
         elif direction == Direction.BACKWARDS:
             if to_key is not None:
-                room_ids = self._events_stream_cache.get_entities_changed(
+                changed_room_ids = self._events_stream_cache.get_entities_changed(
                     room_ids, to_key.stream
                 )
+                logger.info(
+                    "[sync-trace] worker=%s event-cache direction=backwards from=%s to=%s candidates=%d changed=%s",
+                    self._instance_name,
+                    from_key,
+                    to_key,
+                    len(room_ids),
+                    sorted(changed_room_ids),
+                )
+                room_ids = changed_room_ids
         else:
             assert_never(direction)
 

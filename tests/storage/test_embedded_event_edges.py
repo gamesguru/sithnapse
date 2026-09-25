@@ -84,6 +84,196 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
         # coalescer driving a timer) do not leak into the next test.
         flush_edge_writes()
 
+    def test_event_dag_barrier_does_not_drain_edges(self) -> None:
+        """The per-event JSON barrier must leave edge batching untouched."""
+        reactor = ThreadedMemoryReactorClock()
+        clock = Clock(reactor, server_name="test_server")  # type: ignore[multiple-internal-clocks]
+        coalescer = _FlushCoalescer(clock)
+        _set_coalescer(coalescer)
+        try:
+            with (
+                mock.patch(
+                    "synapse.storage.databases.main.embedded_common._drain_edge_writes"
+                ) as drain,
+                mock.patch(
+                    "synapse.storage.databases.main.embedded_common._do_sync_pools"
+                ) as sync,
+            ):
+                coalescer.sync_event_dag_now()
+                drain.assert_not_called()
+                sync.assert_called_once_with({embedded_common.Pool.EVENT_DAG})
+        finally:
+            _clear_coalescer(coalescer)
+            coalescer.close()
+
+    def test_event_dag_barrier_failure_reschedules(self) -> None:
+        """A failed narrow barrier retains dirty state and schedules retry."""
+        reactor = ThreadedMemoryReactorClock()
+        clock = Clock(reactor, server_name="test_server")  # type: ignore[multiple-internal-clocks]
+        coalescer = _FlushCoalescer(clock)
+        _set_coalescer(coalescer)
+        try:
+            coalescer.mark_dirty(embedded_common.Pool.EVENT_DAG)
+            with mock.patch(
+                "synapse.storage.databases.main.embedded_common._do_sync_pools",
+                side_effect=RuntimeError("simulated sync failure"),
+            ):
+                with self.assertRaises(RuntimeError):
+                    coalescer.sync_event_dag_now()
+            self.assertIn(embedded_common.Pool.EVENT_DAG, coalescer._dirty)
+            self.assertIsNotNone(coalescer._delayed_call)
+        finally:
+            _clear_coalescer(coalescer)
+            coalescer.close()
+
+    def test_event_dag_barrier_failure_does_not_reset_existing_timer(self) -> None:
+        """A failed narrow barrier must not cancel-and-reschedule an
+        already-pending debounce timer (armed at ``_FLUSH_DELAY`` by
+        ``mark_dirty``). Doing so under sustained failures -- e.g. calls
+        arriving faster than ``_RETRY_DELAY`` apart, plausible since this
+        barrier runs per persisted event -- would perpetually push the timer
+        out and starve ``_flush`` forever: the same livelock shape the
+        success path avoids, just triggered by errors instead of successes.
+        An existing timer, whatever its delay, must be left to fire on its
+        own; only the absence of any timer should cause a new one to be
+        armed at ``_RETRY_DELAY``."""
+        reactor = ThreadedMemoryReactorClock()
+        clock = Clock(reactor, server_name="test_server")  # type: ignore[multiple-internal-clocks]
+        coalescer = _FlushCoalescer(clock)
+        _set_coalescer(coalescer)
+        try:
+            coalescer.mark_dirty(embedded_common.Pool.EVENT_DAG)
+            assert coalescer._delayed_call is not None
+            pending_at_flush_delay = coalescer._delayed_call.getTime()
+            self.assertAlmostEqual(
+                pending_at_flush_delay, reactor.seconds() + 0.5, places=3
+            )
+
+            with mock.patch(
+                "synapse.storage.databases.main.embedded_common._do_sync_pools",
+                side_effect=RuntimeError("simulated sync failure"),
+            ):
+                with self.assertRaises(RuntimeError):
+                    coalescer.sync_event_dag_now()
+
+            self.assertIsNotNone(coalescer._delayed_call)
+            assert coalescer._delayed_call is not None
+            # Unchanged: the pre-existing _FLUSH_DELAY timer was left alone,
+            # not cancelled and re-armed at _RETRY_DELAY.
+            self.assertEqual(coalescer._delayed_call.getTime(), pending_at_flush_delay)
+        finally:
+            _clear_coalescer(coalescer)
+            coalescer.close()
+
+    def test_sync_now_drain_failure_reschedules_and_raises(self) -> None:
+        """A failing ``_drain_edge_writes()`` inside ``sync_now`` must not
+        strand EVENT_DAG: the timer is cancelled at the top of the method, so
+        a raise from the drain has to still reach the retry-scheduling
+        ``finally`` (via the outer try/except) or nothing would ever retry
+        it -- the same stranded-work shape as the narrow-barrier livelock
+        fixed earlier, just via the drain instead of the sync call itself."""
+        reactor = ThreadedMemoryReactorClock()
+        clock = Clock(reactor, server_name="test_server")  # type: ignore[multiple-internal-clocks]
+        coalescer = _FlushCoalescer(clock)
+        _set_coalescer(coalescer)
+        try:
+            with (
+                mock.patch(
+                    "synapse.storage.databases.main.embedded_common._drain_edge_writes",
+                    side_effect=RuntimeError("simulated drain failure"),
+                ),
+                mock.patch(
+                    "synapse.storage.databases.main.embedded_common._do_sync_pools"
+                ) as sync,
+            ):
+                with self.assertRaises(RuntimeError):
+                    coalescer.sync_now(pools=[embedded_common.Pool.EVENT_DAG])
+                # The sync call must never be reached: the drain failed first.
+                sync.assert_not_called()
+            self.assertIn(embedded_common.Pool.EVENT_DAG, coalescer._dirty)
+            self.assertIsNotNone(coalescer._delayed_call)
+            assert coalescer._delayed_call is not None
+            self.assertAlmostEqual(
+                coalescer._delayed_call.getTime(), reactor.seconds() + 1.0, places=3
+            )
+        finally:
+            _clear_coalescer(coalescer)
+            coalescer.close()
+
+    def test_sync_now_attributes_failure_to_failing_pool_only(self) -> None:
+        """Per-pool sync failures must not cross-contaminate: if EVENT_DAG
+        syncs cleanly but STATE fails, only STATE should end up re-dirtied,
+        and the retry timer should use the failure backoff since the call
+        did not fully succeed."""
+        reactor = ThreadedMemoryReactorClock()
+        clock = Clock(reactor, server_name="test_server")  # type: ignore[multiple-internal-clocks]
+        coalescer = _FlushCoalescer(clock)
+        _set_coalescer(coalescer)
+        try:
+
+            def fake_sync(pools: set) -> None:
+                if embedded_common.Pool.STATE in pools:
+                    raise RuntimeError("simulated state sync failure")
+
+            with (
+                mock.patch(
+                    "synapse.storage.databases.main.embedded_common._drain_edge_writes",
+                    return_value=False,
+                ),
+                mock.patch(
+                    "synapse.storage.databases.main.embedded_common._do_sync_pools",
+                    side_effect=fake_sync,
+                ),
+            ):
+                with self.assertRaises(RuntimeError):
+                    coalescer.sync_now(
+                        pools=[
+                            embedded_common.Pool.EVENT_DAG,
+                            embedded_common.Pool.STATE,
+                        ]
+                    )
+            self.assertNotIn(embedded_common.Pool.EVENT_DAG, coalescer._dirty)
+            self.assertIn(embedded_common.Pool.STATE, coalescer._dirty)
+            self.assertIsNotNone(coalescer._delayed_call)
+            assert coalescer._delayed_call is not None
+            self.assertAlmostEqual(
+                coalescer._delayed_call.getTime(), reactor.seconds() + 1.0, places=3
+            )
+        finally:
+            _clear_coalescer(coalescer)
+            coalescer.close()
+
+    def test_sync_now_success_with_leftover_dirty_uses_flush_delay(self) -> None:
+        """When ``sync_now`` fully succeeds but an unrelated pool is left
+        dirty (e.g. a concurrent write raced in), the rearmed timer should
+        use the normal debounce delay, not the failure backoff -- that pool
+        never failed anything this call."""
+        reactor = ThreadedMemoryReactorClock()
+        clock = Clock(reactor, server_name="test_server")  # type: ignore[multiple-internal-clocks]
+        coalescer = _FlushCoalescer(clock)
+        _set_coalescer(coalescer)
+        try:
+            coalescer._dirty.add(embedded_common.Pool.AUTH_CHAIN)
+            with (
+                mock.patch(
+                    "synapse.storage.databases.main.embedded_common._drain_edge_writes",
+                    return_value=False,
+                ),
+                mock.patch(
+                    "synapse.storage.databases.main.embedded_common._do_sync_pools"
+                ),
+            ):
+                coalescer.sync_now(pools=[embedded_common.Pool.EVENT_DAG])
+            self.assertIn(embedded_common.Pool.AUTH_CHAIN, coalescer._dirty)
+            self.assertIsNotNone(coalescer._delayed_call)
+            assert coalescer._delayed_call is not None
+            self.assertAlmostEqual(
+                coalescer._delayed_call.getTime(), reactor.seconds() + 0.5, places=3
+            )
+        finally:
+            _clear_coalescer(coalescer)
+            coalescer.close()
+
     def test_put_get_backward_and_forward(self) -> None:
         # No locator seeding: `event_edges_put` publishes locators for the
         # events it touches, so an edge written with no preceding
@@ -226,9 +416,9 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
         self.assertEqual(queued_edge_write_count(ns), 2)
 
         # Purge races the queue: $victim's row is cancelled (not written then
-        # erased), $live's row is flushed harmlessly before the tombstone.
+        # erased), while the unrelated $live row remains queued.
         delete_event_edges_batch(ns, ["$victim"])
-        self.assertEqual(queued_edge_write_count(ns), 0)
+        self.assertEqual(queued_edge_write_count(ns), 1)
 
         back = get_event_edges_backward_batch(ns, ["$victim"])
         self.assertIsNone(back["$victim"])
@@ -289,14 +479,55 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
             delete_event_edges_batch(ns, [parent])
 
             # The forward row (child → parent) was NOT cancelled — child
-            # (row[1]) is live — and was flushed during the purge's drain.
-            self.assertEqual(queued_edge_write_count(ns), 0)
+            # (row[1]) is live — and remains queued for the coalescer.
+            self.assertEqual(queued_edge_write_count(ns), 1)
+            flush_edge_writes(ns)
 
             # The edge exists in mtxdb: backward and forward both present.
             back = get_event_edges_backward_batch(ns, [child])
             self.assertEqual(back[child], [(parent, False)])
             fwd = get_event_edges_forward_batch(ns, [parent])
             self.assertIn(child, fwd.get(parent) or [])
+        finally:
+            flush_edge_writes(ns)
+
+    def test_unrelated_queued_write_does_not_resurrect_deleted_sibling(self) -> None:
+        """The queue-drain-free purge (delete_event_edges_batch no longer
+        flushes the whole namespace first) leaves unrelated queued rows in
+        place. This only stays correct if a later coalescer flush of that row
+        appends against the *post-delete* forward list rather than replaying
+        a stale snapshot taken when it was enqueued. Regression guard for
+        that invariant: delete a sibling that is already durable in mtxdb,
+        then flush an unrelated queued write to the same parent, and confirm
+        the deleted sibling is not resurrected while the new child lands."""
+        ns = "test-edges-no-resurrection-on-drainless-purge"
+        parent = "$shared_parent"
+        victim = "$purged_sibling"
+        sibling = "$new_sibling"
+        try:
+            # Seed victim's edge as already-durable mtxdb state (not queued).
+            queue_edge_write(ns, [(self.room_id, victim, parent, False)])
+            flush_edge_writes(ns)
+            fwd = get_event_edges_forward_batch(ns, [parent])
+            self.assertIn(victim, fwd.get(parent) or [])
+
+            # Queue an unrelated write to the same parent's forward list.
+            # It must stay queued across the purge below (drain-free purge).
+            queue_edge_write(ns, [(self.room_id, sibling, parent, False)])
+            self.assertEqual(queued_edge_write_count(ns), 1)
+
+            delete_event_edges_batch(ns, [victim])
+
+            # Unrelated row was not touched by the drain-free delete.
+            self.assertEqual(queued_edge_write_count(ns), 1)
+
+            # Now let the coalescer apply the queued row.
+            flush_edge_writes(ns)
+
+            fwd = get_event_edges_forward_batch(ns, [parent])
+            children = fwd.get(parent) or []
+            self.assertIn(sibling, children)
+            self.assertNotIn(victim, children)
         finally:
             flush_edge_writes(ns)
 
@@ -533,8 +764,9 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
 
             delete_event_edges_batch(ns, [victim1])
             # The row-owned-by-victim1 was cancelled; the extremity was
-            # flushed during the purge's drain step (queue now empty).
-            self.assertEqual(queued_edge_write_count(ns), 0)
+            # remains queued for the normal coalescer.
+            self.assertEqual(queued_edge_write_count(ns), 1)
+            flush_edge_writes(ns)
             back_ext = get_event_edges_backward_batch(ns, [extremity1])
             self.assertEqual(back_ext[extremity1], [(victim1, False)])
 
@@ -610,6 +842,13 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
 
     def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
         self.store = hs.get_datastores().main
+        # The coalescer window is auto-tuned to the store's backing disk
+        # (2.0s when rotational) unless the config pinned it, so advance the
+        # reactor by what this homeserver actually got instead of assuming
+        # the module constant matches the runtime value.
+        self._flush_delay_secs = (
+            hs.config.database.embedded_hamt_flush_delay_secs or FLUSH_DELAY_SECS
+        )
         self.user_id = self.register_user("alice", "test")
         self.tok = self.login("alice", "test")
         self.room_id = self.helper.create_room_as(
@@ -629,6 +868,10 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
             self.persist_store._embedded_hamt_engine = "mtxdb"
             if not getattr(self.persist_store, "_embedded_hamt_namespace", None):
                 self.persist_store._embedded_hamt_namespace = hs.hostname
+
+    def _advance_past_flush_window(self) -> None:
+        """Advance the reactor past the coalescer's actual debounce window."""
+        self.reactor.advance(self._flush_delay_secs + 0.1)
 
     def test_event_edges_mirrored_on_persistence(self) -> None:
         """When events are persisted, event_edges are dual-written to mtxdb."""
@@ -683,7 +926,7 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
 
                 # Advance the reactor past the flush window: the coalescer
                 # drains the queue and syncs EVENT_DAG of its own accord.
-                self.reactor.advance(FLUSH_DELAY_SECS + 0.1)
+                self._advance_past_flush_window()
                 self.assertEqual(
                     queued_edge_write_count(ns),
                     0,
@@ -851,7 +1094,7 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         # the queued repair (and syncs EVENT_DAG).  Use FLUSH_DELAY_SECS plus
         # a small margin so the test is not fragile to floating-point
         # boundaries or minor changes to the delay value.
-        self.reactor.advance(FLUSH_DELAY_SECS + 0.1)
+        self._advance_past_flush_window()
 
         # Now mtxdb has been repaired in-process.
         fwd_repaired = get_event_edges_forward_batch(ns, [p_id])
@@ -909,7 +1152,7 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         successors = self.get_success(self.store.get_successor_events(p_id))
         self.assertIn(c_id, successors)
 
-        self.reactor.advance(FLUSH_DELAY_SECS + 0.1)
+        self._advance_past_flush_window()
 
         # The preserved row[2] edge is repaired in mtxdb despite the tombstone.
         fwd_repaired = get_event_edges_forward_batch(ns, [p_id])

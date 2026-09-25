@@ -348,6 +348,15 @@ class CacheInvalidationWorkerStore(SQLBaseStore):
 
         data = row.data
 
+        logger.info(
+            "[replication-trace] worker=%s events-cache mutation token=%s row_type=%s room_id=%s event_id=%s",
+            self._instance_name,
+            token,
+            row.type,
+            getattr(data, "room_id", None),
+            getattr(data, "event_id", None),
+        )
+
         if row.type == EventsStreamEventRow.TypeId:
             assert isinstance(data, EventsStreamEventRow)
             self._invalidate_caches_for_event(

@@ -1,9 +1,9 @@
 //! Generic HAMT node-store logic backing the embedded single-process KV
-//! engine ([`crate::database::mtxdb`]). The backend implements only
+//! engine ([`crate::database::mtxdb_syn`]). The backend implements only
 //! [`NodeStore`] (a thin point-lookup/write surface over its own storage
 //! primitive) and owns its own process-global handle + node cache; the BFS
 //! materialize/selective-lookup walk, the node-cache verify-on-hit logic,
-//! and the key-encoding scheme live here. Kept separate from `mtxdb.rs`
+//! and the key-encoding scheme live here. Kept separate from `mtxdb_syn.rs`
 //! (rather than folded together) to keep the BFS logic engine-agnostic.
 
 use std::collections::{HashMap, HashSet};
@@ -35,11 +35,11 @@ pub const ROOM_PREFIX_LEN: usize = 8;
 /// One materialized state group: `(event_type, state_key, event_id)` triples.
 pub type StateEntries = Vec<(String, String, String)>;
 
-pub type NodeLocation = ([u8; ROOM_PREFIX_LEN], [u8; 32], StructuralHash);
+pub type NodeLocation = ([u8; ROOM_PREFIX_LEN], Vec<u8>, StructuralHash);
 pub type SelectiveQuery = (
     [u8; ROOM_PREFIX_LEN],
     StructuralHash,
-    [u8; 32],
+    Vec<u8>,
     Vec<(String, String)>,
 );
 
@@ -223,7 +223,7 @@ pub fn materialize_state_hamt(
     namespace: &str,
     room_prefix: &[u8; ROOM_PREFIX_LEN],
     root_structural_hash: StructuralHash,
-    structural_key: &[u8; 32],
+    structural_key: &[u8],
 ) -> Result<StateEntries, String> {
     let mut node_map: HashMap<StructuralHash, Arc<HamtNode<String, String>>> = HashMap::new();
     let mut seen: HashSet<StructuralHash> = HashSet::from([root_structural_hash]);
@@ -289,7 +289,7 @@ pub fn materialize_state_hamts(
     roots: Vec<NodeLocation>,
 ) -> Result<Vec<StateEntries>, String> {
     let mut node_map: HashMap<NodeLocation, Arc<HamtNode<String, String>>> = HashMap::new();
-    let mut seen: HashSet<NodeLocation> = roots.iter().copied().collect();
+    let mut seen: HashSet<NodeLocation> = roots.iter().cloned().collect();
     let mut to_fetch = seen.clone();
 
     while !to_fetch.is_empty() {
@@ -305,21 +305,30 @@ pub fn materialize_state_hamts(
                         Some(node) => {
                             if node.structural_hash != *hash {
                                 cache.pop(&key);
-                                still_missing.push((key, *room_prefix, *structural_key, *hash));
+                                still_missing.push((
+                                    key,
+                                    *room_prefix,
+                                    structural_key.clone(),
+                                    *hash,
+                                ));
                             } else {
                                 let node = node.clone();
                                 for child in &node.children {
-                                    let child_location =
-                                        (*room_prefix, *structural_key, child.structural_hash());
-                                    if seen.insert(child_location) {
+                                    let child_location = (
+                                        *room_prefix,
+                                        structural_key.clone(),
+                                        child.structural_hash(),
+                                    );
+                                    if seen.insert(child_location.clone()) {
                                         to_fetch.insert(child_location);
                                     }
                                 }
-                                node_map.insert((*room_prefix, *structural_key, *hash), node);
+                                node_map
+                                    .insert((*room_prefix, structural_key.clone(), *hash), node);
                             }
                         }
                         None => {
-                            still_missing.push((key, *room_prefix, *structural_key, *hash));
+                            still_missing.push((key, *room_prefix, structural_key.clone(), *hash));
                         }
                     }
                 }
@@ -333,8 +342,9 @@ pub fn materialize_state_hamts(
                     decode_persisted_node_verified(&node_bytes, &structural_key, expected_hash)?;
 
                 for child in &node.children {
-                    let child_location = (room_prefix, structural_key, child.structural_hash());
-                    if seen.insert(child_location) {
+                    let child_location =
+                        (room_prefix, structural_key.clone(), child.structural_hash());
+                    if seen.insert(child_location.clone()) {
                         to_fetch.insert(child_location);
                     }
                 }
@@ -375,7 +385,10 @@ pub fn lookup_state_hamts(
     queries: Vec<SelectiveQuery>,
 ) -> Result<Vec<StateEntries>, String> {
     let mut node_map: HashMap<NodeLocation, Arc<HamtNode<String, String>>> = HashMap::new();
-    let mut seen: HashSet<NodeLocation> = queries.iter().map(|(p, h, k, _)| (*p, *k, *h)).collect();
+    let mut seen: HashSet<NodeLocation> = queries
+        .iter()
+        .map(|(p, h, k, _)| (*p, k.clone(), *h))
+        .collect();
     let mut to_fetch: HashSet<NodeLocation> = seen.clone();
     let encoded_query_keys = queries
         .iter()
@@ -406,14 +419,21 @@ pub fn lookup_state_hamts(
                         Some(node) => {
                             if node.structural_hash != *hash {
                                 cache.pop(&key);
-                                still_missing.push((key, *room_prefix, *structural_key, *hash));
+                                still_missing.push((
+                                    key,
+                                    *room_prefix,
+                                    structural_key.clone(),
+                                    *hash,
+                                ));
                             } else {
-                                node_map
-                                    .insert((*room_prefix, *structural_key, *hash), node.clone());
+                                node_map.insert(
+                                    (*room_prefix, structural_key.clone(), *hash),
+                                    node.clone(),
+                                );
                             }
                         }
                         None => {
-                            still_missing.push((key, *room_prefix, *structural_key, *hash));
+                            still_missing.push((key, *room_prefix, structural_key.clone(), *hash));
                         }
                     }
                 }
@@ -452,8 +472,8 @@ pub fn lookup_state_hamts(
                     )?;
                     latest_entries[index] = Some(entries);
                     for missing_hash in missing {
-                        let child_loc = (*room_prefix, *structural_key, missing_hash);
-                        if seen.insert(child_loc) {
+                        let child_loc = (*room_prefix, structural_key.clone(), missing_hash);
+                        if seen.insert(child_loc.clone()) {
                             to_fetch.insert(child_loc);
                         }
                     }

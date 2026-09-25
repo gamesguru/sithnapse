@@ -12,7 +12,9 @@ import traceback
 from collections import defaultdict, deque
 from contextlib import contextmanager
 from enum import Enum, auto
-from typing import IO, TYPE_CHECKING, Callable, Iterable, Iterator
+from typing import IO, TYPE_CHECKING, Any, Callable, Iterable, Iterator
+
+from synapse.util.timings_flush import register_periodic_flush
 
 if TYPE_CHECKING:
     from synapse.util.clock import Clock, DelayedCallWrapper
@@ -99,6 +101,31 @@ def ffi_count(tag: str, count: int) -> None:
             _FFI_COUNTERS[tag] += count
     else:
         _FFI_COUNTERS[tag] += count
+
+
+def _count_sync_origin(kind: str, pools: Iterable[Pool] | None = None) -> None:
+    """Count a durability-barrier request by who asked for it.
+
+    Diagnostic only (needs SYNAPSE_PG_TIMINGS): the ``sync_origin.*`` counters
+    show up in the "FFI batch counters" report, so a run reveals which call
+    site issues the barriers (coalescer flush vs an explicit ``sync_now`` vs a
+    direct ``maybe_sync``) and for which pools.
+    """
+    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+        return
+    frame = sys._getframe(2)
+    this_file = __file__
+    while frame is not None and frame.f_code.co_filename == this_file:
+        frame = frame.f_back  # type: ignore[assignment]
+    caller = (
+        f"{os.path.basename(frame.f_code.co_filename)[:-3]}.{frame.f_code.co_name}"
+        if frame is not None
+        else "?"
+    )
+    pool_tag = (
+        "all" if pools is None else "+".join(sorted(p.name.lower() for p in pools))
+    )
+    ffi_count(f"sync_origin.{kind}.{caller}.{pool_tag}", 1)
 
 
 def get_ffi_count(tag: str) -> int:
@@ -305,7 +332,9 @@ def _print_ffi_timings() -> None:
 
     run_dir = os.environ.get("SYNAPSE_TIMINGS_RUN_DIR")
     if run_dir:
-        tmp_path = os.path.join(run_dir, f"ffi_{os.getpid()}.tmp")
+        tmp_path = os.path.join(
+            run_dir, f"ffi_{os.getpid()}.{threading.get_ident()}.tmp"
+        )
         final_path = os.path.join(run_dir, f"ffi_{os.getpid()}.json")
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
@@ -494,6 +523,7 @@ if os.environ.get("SYNAPSE_PG_TIMINGS"):
         _print_ffi_timings()
 
     atexit.register(flush_ffi_timings)
+    register_periodic_flush(flush_ffi_timings)
 
 
 # ── mtxdb runtime stats (opt-in via SYNAPSE_MTXDB_STATS=1) ──────────────
@@ -509,6 +539,20 @@ def _print_mtxdb_stats() -> None:
         engine = get_embedded_engine("mtxdb")
         s = engine.stats()
     except Exception:
+        return
+
+    run_dir = os.environ.get("SYNAPSE_TIMINGS_RUN_DIR")
+    if run_dir:
+        tmp_path = os.path.join(
+            run_dir, f"mtxdb_{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        final_path = os.path.join(run_dir, f"mtxdb_{os.getpid()}.json")
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(s, f, default=str)
+            os.replace(tmp_path, final_path)
+        except OSError:
+            pass
         return
 
     import sys
@@ -557,6 +601,34 @@ def _print_mtxdb_stats() -> None:
                 file=out,
             )
 
+        # Lossy-index candidate fan-out. The 16-bit slot tag is only a
+        # candidate filter: a tag match can admit a record that full-hash
+        # verification then rejects. A nonzero false_rate is extra packfile
+        # read work, never a wrong result. Tracked only while stats are on.
+        cr = ps.get("candidate_reads", 0)
+        if cr:
+            cm = ps.get("candidate_hash_mismatches", 0)
+            false_rate = cm / cr
+            print(
+                f"    candidates: index={ps.get('index_candidates', 0):,}  reads={cr:,}  "
+                f"hash_mismatches={cm:,}  false_rate={false_rate:.3f}  "
+                f"frame_bytes={ps.get('candidate_frame_bytes', 0):,}",
+                file=out,
+            )
+
+        # Read-miss refresh attribution, captured alongside the candidate
+        # counters above so one snapshot can tell them apart: recovered > 0
+        # means the tail is paying full rescans, not 16-bit tag collisions.
+        mr = ps.get("miss_refreshes", 0)
+        mrs = ps.get("miss_refresh_skips", 0)
+        mrr = ps.get("miss_refresh_recovered", 0)
+        if mr or mrs or mrr:
+            print(
+                f"    refreshes: rescans={mr:,}  skips={mrs:,}  recovered={mrr:,}  "
+                f"retry_ids={ps.get('miss_refresh_retry_ids', 0):,}",
+                file=out,
+            )
+
         # Write / batch counters.
         pc = ps.get("put_calls", 0)
         pmc = ps.get("put_many_calls", 0)
@@ -581,7 +653,7 @@ def _print_mtxdb_stats() -> None:
         sc = ps.get("sync_calls", 0)
         if sc:
             print(
-                f"    sync: {sc} calls  checkpoint_writes={ps.get('checkpoint_writes', 0)}  delta_appends={ps.get('delta_appends', 0)}  invalidations={ps.get('delta_invalidations', 0)}",
+                f"    sync: {sc} calls  checkpoint_writes={ps.get('checkpoint_writes', 0)}  checkpoint_skips={ps.get('checkpoint_skips', 0)}  delta_appends={ps.get('delta_appends', 0)}  invalidations={ps.get('delta_invalidations', 0)}",
                 file=out,
             )
 
@@ -648,6 +720,13 @@ def _print_mtxdb_stats() -> None:
             )
 
         # Sync timings.
+        st_tot = ps.get("sync_totals")
+        if st_tot and st_tot.get("calls", 0) > 0:
+            calls = st_tot.get("calls", 0)
+            print(
+                f"    sync totals ({calls} calls): {_fmt_us(st_tot.get('total_us', 0))} (flush={_fmt_us(st_tot.get('pack_flush_us', 0))} fsync={_fmt_us(st_tot.get('pack_fsync_us', 0))} sidecar={_fmt_us(st_tot.get('sidecar_us', 0))} delta={_fmt_us(st_tot.get('delta_log_us', 0))} checkpoint={_fmt_us(st_tot.get('checkpoint_us', 0))})",
+                file=out,
+            )
         st = ps.get("last_sync_timings")
         if st:
             print(
@@ -660,6 +739,212 @@ def _print_mtxdb_stats() -> None:
 
 if os.environ.get("SYNAPSE_MTXDB_STATS"):
     atexit.register(_print_mtxdb_stats)
+    register_periodic_flush(_print_mtxdb_stats)
+
+
+# ── Periodic mtxdb runtime snapshot (opt-in via SYNAPSE_MTXDB_STATS=1) ──
+#
+# The end-of-run report above shows totals, not their *slope*: a long
+# Complement run can slow down as the store grows without any single total
+# looking wrong. This emits one compact INFO line, at most once per interval,
+# from the master's persist path -- so pack/shard/index growth sits next to the
+# request durations it might explain, on the same thread. Gated on a monotonic
+# clock, not wall time, so a clock step can neither suppress nor burst it. No
+# Rust changes and nothing on the hot path beyond the gate check.
+_MTXDB_SNAPSHOT_INTERVAL_SECS: float = 60.0
+_mtxdb_snapshot_last: float = 0.0
+_mtxdb_snapshot_prev: dict[str, dict[str, float]] = {}
+_mtxdb_persist_calls = 0
+_mtxdb_persist_total_secs = 0.0
+_mtxdb_persist_snapshot_calls = 0
+_mtxdb_persist_snapshot_total_secs = 0.0
+_mtxdb_batch_calls = 0
+_mtxdb_batch_total_secs = 0.0
+_mtxdb_batch_snapshot_calls = 0
+_mtxdb_batch_snapshot_total_secs = 0.0
+
+
+def record_mtxdb_persist_timing(elapsed: float) -> None:
+    """Record successful persist latency for the next diagnostic snapshot."""
+    global _mtxdb_persist_calls, _mtxdb_persist_total_secs
+    if os.environ.get("SYNAPSE_MTXDB_STATS"):
+        _mtxdb_persist_calls += 1
+        _mtxdb_persist_total_secs += elapsed
+
+
+def record_mtxdb_persist_batch_timing(elapsed: float) -> None:
+    """Record `_persist_event_batch` work time (queue wait excluded)."""
+    global _mtxdb_batch_calls, _mtxdb_batch_total_secs
+    if os.environ.get("SYNAPSE_MTXDB_STATS"):
+        _mtxdb_batch_calls += 1
+        _mtxdb_batch_total_secs += elapsed
+
+
+def _mtxdb_snapshot_metrics(ps: dict[str, Any]) -> dict[str, float]:
+    sync_totals = ps.get("sync_totals") or {}
+    sync_diagnostics = ps.get("sync_diagnostics") or {}
+    return {
+        "index_bytes": float(ps.get("index_bytes", 0) or 0),
+        "collection_count": float(ps.get("collection_count", 0) or 0),
+        "shard_count": float(ps.get("shard_count", 0) or 0),
+        "candidate_reads": float(ps.get("candidate_reads", 0) or 0),
+        "repack_count": float(ps.get("repack_count", 0) or 0),
+        "repack_kept": float(ps.get("repack_kept", 0) or 0),
+        "repack_dropped": float(ps.get("repack_dropped", 0) or 0),
+        "index_grow_count": float(ps.get("index_grow_count", 0) or 0),
+        "index_rebuild_count": float(ps.get("index_rebuild_count", 0) or 0),
+        "checkpoint_writes": float(ps.get("checkpoint_writes", 0) or 0),
+        "sync_calls": float(sync_totals.get("calls", 0) or 0),
+        "sync_us": float(sync_totals.get("total_us", 0) or 0),
+        "fsync_us": float(sync_totals.get("pack_fsync_us", 0) or 0),
+        "flush_us": float(sync_totals.get("pack_flush_us", 0) or 0),
+        "sidecar_us": float(sync_totals.get("sidecar_us", 0) or 0),
+        "delta_log_us": float(sync_totals.get("delta_log_us", 0) or 0),
+        "sync_checkpoint_us": float(sync_totals.get("checkpoint_us", 0) or 0),
+        "wal_us": float(sync_totals.get("wal_us", 0) or 0),
+        "journal_lock_wait_us": float(sync_totals.get("journal_lock_wait_us", 0) or 0),
+        "journal_pending_wait_us": float(
+            sync_totals.get("journal_pending_wait_us", 0) or 0
+        ),
+        "journal_append_us": float(sync_totals.get("journal_append_us", 0) or 0),
+        "journal_fsync_us": float(sync_totals.get("journal_fsync_us", 0) or 0),
+        "journal_sync_calls": float(sync_totals.get("journal_sync_calls", 0) or 0),
+        "journal_bytes": float(sync_totals.get("journal_bytes", 0) or 0),
+        "journal_records": float(sync_totals.get("journal_records", 0) or 0),
+        "journal_waiters": float(sync_totals.get("journal_waiters", 0) or 0),
+        "journal_coalesced": float(sync_totals.get("journal_coalesced", 0) or 0),
+        "peak_journal_in_flight": float(
+            sync_diagnostics.get("peak_journal_in_flight", 0) or 0
+        ),
+        "max_journal_lock_wait_us": float(
+            sync_totals.get("max_journal_lock_wait_us", 0) or 0
+        ),
+        "max_journal_fsync_us": float(sync_totals.get("max_journal_fsync_us", 0) or 0),
+        "dirty_lock_wait_us": float(sync_totals.get("dirty_lock_wait_us", 0) or 0),
+        "pending_publish_age_us": float(
+            sync_totals.get("pending_publish_age_us", 0) or 0
+        ),
+    }
+
+
+def _format_mtxdb_snapshot_segment(
+    pool: str, m: dict[str, float], d: dict[str, float]
+) -> str:
+    return (
+        f"{pool}[idx={m['index_bytes'] / 1e6:.1f}MB(+{d['index_bytes'] / 1e6:.1f}MB) "
+        f"col={int(m['collection_count'])}(+{int(d['collection_count'])}) "
+        f"shards={int(m['shard_count'])}(+{int(d['shard_count'])}) "
+        f"cand={int(m['candidate_reads'])}(+{int(d['candidate_reads'])}) "
+        f"index=+{int(d['index_grow_count'])}/+{int(d['index_rebuild_count'])} "
+        f"checkpoint=+{int(d['checkpoint_writes'])} "
+        f"repack={int(m['repack_count'])}/{int(m['repack_kept'])}/{int(m['repack_dropped'])} "
+        f"grow=+{int(d['index_grow_count'])} rebuild=+{int(d['index_rebuild_count'])} "
+        f"ckpt=+{int(d['checkpoint_writes'])} "
+        f"sync=+{int(d['sync_calls'])}/+{d['sync_us'] / 1000:.1f}ms "
+        f"fsync=+{d['fsync_us'] / 1000:.1f}ms "
+        f"phases(ms)=flush+{d['flush_us'] / 1000:.1f}/side+{d['sidecar_us'] / 1000:.1f}"
+        f"/delta+{d['delta_log_us'] / 1000:.1f}/ckpt+{d['sync_checkpoint_us'] / 1000:.1f}"
+        f"/wal+{d['wal_us'] / 1000:.1f} "
+        f"j=lock+{d['journal_lock_wait_us'] / 1000:.1f}"
+        f"/pend+{d['journal_pending_wait_us'] / 1000:.1f}"
+        f"/append+{d['journal_append_us'] / 1000:.1f}"
+        f"/fsync+{d['journal_fsync_us'] / 1000:.1f}ms"
+        f" c=+{int(d['journal_sync_calls'])}"
+        f" b=+{int(d['journal_bytes'])}"
+        f" r=+{int(d['journal_records'])}"
+        f" wait=+{int(d['journal_waiters'])}"
+        f" coal=+{int(d['journal_coalesced'])}"
+        f" peak={int(m['peak_journal_in_flight'])}"
+        f" lmax={m['max_journal_lock_wait_us'] / 1000:.1f}/{m['max_journal_fsync_us'] / 1000:.1f}ms"
+        f" dirty+{d['dirty_lock_wait_us'] / 1000:.1f}ms"
+        f" age_avg={d['pending_publish_age_us'] / max(d['sync_calls'], 1) / 1000:.1f}ms]"
+    )
+
+
+def _mtxdb_snapshot_once() -> None:
+    """Log one per-pool line with absolute values and since-last deltas."""
+    global _mtxdb_persist_snapshot_calls, _mtxdb_persist_snapshot_total_secs
+    global _mtxdb_batch_snapshot_calls, _mtxdb_batch_snapshot_total_secs
+    try:
+        from synapse.storage.databases.embedded_engine import get_embedded_engine
+
+        s = get_embedded_engine("mtxdb").stats_snapshot()
+    except Exception:
+        return
+
+    def _delta(pool: str, key: str, value: float) -> float:
+        prev = _mtxdb_snapshot_prev.setdefault(pool, {})
+        last = prev.get(key)
+        prev[key] = value
+        return 0.0 if last is None else value - last
+
+    segments: list[str] = []
+    for pool in ("state", "event_dag", "auth_chain"):
+        ps = s.get(pool, {})
+        if not ps:
+            continue
+        m = _mtxdb_snapshot_metrics(ps)
+        d = {key: _delta(pool, key, value) for key, value in m.items()}
+        segments.append(_format_mtxdb_snapshot_segment(pool, m, d))
+
+    # FFI forward-edge cost, only recorded when SYNAPSE_PG_TIMINGS is set.
+    edges_us = _FFI_TIMINGS.get("ffi_event_edges_get_forward", 0.0)
+    edges_calls = _FFI_TIMING_COUNTS.get("ffi_event_edges_get_forward", 0)
+    if edges_calls:
+        segments.append(
+            f"edges_forward={edges_us / edges_calls * 1000:.2f}ms/{edges_calls}"
+        )
+
+    if segments:
+        persist_calls = _mtxdb_persist_calls - _mtxdb_persist_snapshot_calls
+        persist_total_secs = (
+            _mtxdb_persist_total_secs - _mtxdb_persist_snapshot_total_secs
+        )
+        persist_avg = (
+            f"{persist_total_secs / persist_calls * 1000:.1f}ms"
+            if persist_calls
+            else "n/a"
+        )
+        batch_calls = _mtxdb_batch_calls - _mtxdb_batch_snapshot_calls
+        batch_total_secs = _mtxdb_batch_total_secs - _mtxdb_batch_snapshot_total_secs
+        batch_avg = (
+            f"{batch_total_secs / batch_calls * 1000:.1f}ms" if batch_calls else "n/a"
+        )
+        _mtxdb_persist_snapshot_calls = _mtxdb_persist_calls
+        _mtxdb_persist_snapshot_total_secs = _mtxdb_persist_total_secs
+        _mtxdb_batch_snapshot_calls = _mtxdb_batch_calls
+        _mtxdb_batch_snapshot_total_secs = _mtxdb_batch_total_secs
+        logger.info(
+            "mtxdb snapshot: persist_total=+%.1fms/%d avg=%s "
+            "persist_batch=+%.1fms/%d avg=%s %s",
+            persist_total_secs * 1000,
+            persist_calls,
+            persist_avg,
+            batch_total_secs * 1000,
+            batch_calls,
+            batch_avg,
+            "  ".join(segments),
+        )
+
+
+def maybe_log_mtxdb_snapshot() -> None:
+    """Emit a snapshot if opted in and an interval has elapsed.
+
+    A cheap no-op otherwise (two env/global checks and a monotonic read), so
+    it is safe to call unconditionally from the master's persist path.
+    """
+    global _mtxdb_snapshot_last
+    if not _engine_configured or not os.environ.get("SYNAPSE_MTXDB_STATS"):
+        return
+    now = time.monotonic()
+    if now - _mtxdb_snapshot_last < _MTXDB_SNAPSHOT_INTERVAL_SECS:
+        return
+    _mtxdb_snapshot_last = now
+    try:
+        _mtxdb_snapshot_once()
+    except Exception:
+        # Diagnostics must never break event persistence.
+        logger.debug("mtxdb snapshot failed", exc_info=True)
 
 
 @contextmanager
@@ -715,14 +1000,13 @@ def namespace_hash(namespace: str) -> bytes:
 
 
 class SyncTier(Enum):
-    """Classification for embedded-sidecar write durability.
+    """Classification for embedded-sidecar write visibility and durability.
 
     DURABLE: No SQL fallback exists, or the write uses accumulating/delta
-    semantics (counters, auth-chain links, HAMT roots).  A lost unflushed
-    write here means silent data loss or incorrect state, so sync() is
-    called after every batch.
+    semantics (counters, auth-chain links, HAMT roots). Such writes need
+    immediate cross-process publication and eventual durability.
 
-    CACHE: A SQL fallback exists on the read path.  A lost unflushed write
+    CACHE: A SQL fallback exists on the read path. A lost unflushed write
     just means a slower read via that fallback, not data loss.  sync() is
     skipped to avoid per-event fsync cost on the hottest write path.
     """
@@ -754,9 +1038,9 @@ def maybe_sync(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
     """Sync mtxdb for DURABLE writes; no-op for CACHE writes.
 
     A DURABLE write has no SQL fallback, or uses accumulating/delta
-    semantics (counters, auth-chain links, HAMT roots). A lost unflushed
-    write here means silent data loss or incorrect state, so sync() is
-    called after every batch.
+    semantics (counters, auth-chain links, HAMT roots). This function is the
+    durability path; request-path visibility barriers should use
+    ``maybe_publish`` so they do not pay an fsync per transaction.
 
     A CACHE write has a SQL fallback on the read path. A lost unflushed
     write just means a slower read via that fallback, not data loss.
@@ -778,6 +1062,9 @@ def maybe_sync(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
     if _sync_disabled:
         return
 
+    if sys._getframe(1).f_code.co_filename != __file__:
+        _count_sync_origin("maybe_sync_direct", pools)
+
     from synapse.storage.databases.embedded_engine import get_embedded_engine
 
     engine = get_embedded_engine("mtxdb")
@@ -793,12 +1080,62 @@ def maybe_sync(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
         ffi_timing("ffi_sync_state", time.monotonic() - _st)
     if Pool.EVENT_DAG in pool_set:
         _st = time.monotonic()
-        engine.sync_event_dag()
-        ffi_timing("ffi_sync_event_dag", time.monotonic() - _st)
+        ffi_count("event_dag_sync_requests", 1)
+        try:
+            engine.sync_event_dag()
+        except Exception:
+            ffi_count("event_dag_sync_errors", 1)
+            raise
+        else:
+            ffi_count("event_dag_sync_completed", 1)
+        finally:
+            elapsed = time.monotonic() - _st
+            ffi_timing("ffi_sync_event_dag", elapsed)
+            ffi_timing("event_dag_sync_duration", elapsed)
     if Pool.AUTH_CHAIN in pool_set:
         _st = time.monotonic()
         engine.sync_auth_chain()
         ffi_timing("ffi_sync_auth_chain", time.monotonic() - _st)
+
+
+def maybe_publish(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
+    """Publish queued mtxdb mutations for cross-process visibility.
+
+    The operation publishes every pool journal: WAL mode shares one journal
+    coordinator, while non-WAL mode has one journal per pool. ``pools`` only
+    identifies whether this call site has anything requiring publication; it
+    does not scope the journal operation. Publication advances the
+    read-committed boundary but deliberately does not make mutations durable.
+    The coalesced ``maybe_sync`` path remains responsible for durability.
+
+    ``_sync_disabled`` (test-only durability off) gates fsync, not visibility,
+    so it does not suppress publication here: turning durability off must not
+    also turn off the cross-process read path, or a worker would miss committed
+    writes that the writer deliberately never fsynced.
+
+    Call sites invoke this via ``txn.call_after``, i.e. only after the SQL
+    commit, so a transaction's own mutations are queued before publication.
+
+    Known limitation: this publication is not transaction-scoped. A concurrent
+    SQL transaction may have mtxdb mutations in the same pending journal queue,
+    and this call may publish them before that SQL transaction commits. In
+    non-WAL mode, the three independent journal publications are also
+    sequential rather than atomic. Production-safe transaction ordering
+    requires transaction-scoped publication in mtxdb or serialization of
+    embedded writes across the SQL commit boundary.
+    """
+    if not _engine_configured or tier is not SyncTier.DURABLE:
+        return
+
+    from synapse.storage.databases.embedded_engine import get_embedded_engine
+
+    engine = get_embedded_engine("mtxdb")
+    if pools is not None and not set(pools):
+        return
+
+    _st = time.monotonic()
+    engine.publish_pending()
+    ffi_timing("ffi_publish_pending", time.monotonic() - _st)
 
 
 # ── Commit-aware flush coalescer ──────────────────────────────────────
@@ -831,14 +1168,16 @@ class _FlushCoalescer:
     with backoff.
     """
 
-    def __init__(self, clock: Clock) -> None:
+    def __init__(
+        self, clock: Clock, flush_delay_secs: float = FLUSH_DELAY_SECS
+    ) -> None:
         from synapse.util.duration import Duration
 
         self._clock = clock
         self._dirty: set[Pool] = set()
         self._delayed_call: DelayedCallWrapper | None = None
         self._closed: bool = False
-        self._FLUSH_DELAY = Duration(seconds=FLUSH_DELAY_SECS)
+        self._FLUSH_DELAY = Duration(seconds=flush_delay_secs)
         self._RETRY_DELAY = Duration(seconds=1.0)
 
     def mark_dirty(self, pool: Pool) -> None:
@@ -881,10 +1220,24 @@ class _FlushCoalescer:
         to_flush = set(self._dirty)  # snapshot
         if not to_flush:
             return
+        ffi_count(
+            "sync_origin.coalescer_flush."
+            + "+".join(sorted(p.name.lower() for p in to_flush)),
+            1,
+        )
         try:
             _do_sync_pools(to_flush)
+            if Pool.EVENT_DAG in to_flush and not _sync_disabled:
+                # This is a successful delayed/coalesced flush. The native
+                # sync counters above record the actual pool call; this
+                # counter identifies the coalescer's contribution.
+                ffi_count("event_dag_sync_coalesced", 1)
             self._dirty.difference_update(to_flush)
         except Exception:
+            if Pool.EVENT_DAG in to_flush:
+                # This coarse batch signal is a subset of the native
+                # event_dag_sync_errors counter, not an independent error.
+                ffi_count("event_dag_sync_coalesced_errors", 1)
             logger.warning(
                 "Flush coalescer sync failed for %s, will retry",
                 to_flush,
@@ -898,19 +1251,91 @@ class _FlushCoalescer:
         """Immediate barrier for destructive ops and shutdown.
 
         Cancels any pending delayed flush, syncs the requested pools
-        (or all dirty pools if None), and reschedules if still dirty.
+        (or all dirty pools if None), draining queued EVENT_DAG edge writes
+        first. Each pool is synced independently so a failure syncing one
+        pool neither masks nor is blamed on another: only the pool(s) whose
+        sync actually raised are re-marked dirty and cause a raise.
         """
         if self._closed:
             return
         if self._delayed_call is not None:
             self._delayed_call.cancel()
             self._delayed_call = None
+
         to_flush = set(pools) if pools is not None else set(self._dirty)
-        if to_flush:
-            _do_sync_pools(to_flush)
-            self._dirty.difference_update(to_flush)
-        if self._dirty and self._delayed_call is None:
-            self._delayed_call = self._clock.call_later(self._FLUSH_DELAY, self._flush)
+
+        first_exc: Exception | None = None
+        try:
+            # EVENT_DAG also owns coalesced forward-edge writes. An explicit
+            # EVENT_DAG barrier must include those queued records before
+            # syncing. A raise here must still hit the `finally` below, or
+            # EVENT_DAG can be left dirty with the timer we just cancelled
+            # never rearmed -- the same stranded-work bug fixed earlier.
+            if Pool.EVENT_DAG in to_flush:
+                self._dirty.add(Pool.EVENT_DAG)
+                if not _drain_edge_writes():
+                    self._dirty.discard(Pool.EVENT_DAG)
+
+            for pool in to_flush:
+                try:
+                    _do_sync_pools({pool})
+                    self._dirty.discard(pool)
+                except Exception as exc:
+                    self._dirty.add(pool)
+                    if first_exc is None:
+                        first_exc = exc
+        except Exception as exc:
+            if Pool.EVENT_DAG in to_flush:
+                self._dirty.add(Pool.EVENT_DAG)
+            first_exc = first_exc or exc
+        finally:
+            if self._dirty and self._delayed_call is None:
+                # A pool left dirty by an unrelated write during this call
+                # (not one of our own failures) should rejoin the normal
+                # debounce cadence, not be punished with the failure
+                # backoff delay.
+                delay = (
+                    self._RETRY_DELAY if first_exc is not None else self._FLUSH_DELAY
+                )
+                self._delayed_call = self._clock.call_later(delay, self._flush)
+
+        if first_exc is not None:
+            raise first_exc
+
+    def sync_event_dag_now(self) -> None:
+        """Sync EVENT_DAG without draining the coalesced edge queues.
+
+        Event JSON publication uses this narrower barrier because edge writes
+        are independently coalesced and should not be forced out once per
+        event. Full barriers continue to use ``sync_now``.
+        """
+        if self._closed:
+            return
+        try:
+            _do_sync_pools({Pool.EVENT_DAG})
+            # Do not clear EVENT_DAG here: the dirty bit may represent
+            # coalesced edge writes, which this narrow barrier deliberately
+            # leaves queued for the shared timer.
+        except Exception:
+            self._dirty.add(Pool.EVENT_DAG)
+            # Do not cancel an already-armed timer here either: this runs
+            # per persisted event, and under sustained failures (e.g. the
+            # store unreachable) cancel-then-reschedule on every call would
+            # perpetually push out the retry and starve `_flush` forever --
+            # the same livelock shape as the success path, just triggered by
+            # errors instead. `finally` below already guarantees a retry
+            # gets scheduled if none exists; an existing timer, whatever its
+            # delay, is left to fire on its own.
+            raise
+        finally:
+            # Do not cancel an already-armed timer: this barrier runs per
+            # persisted event, and cancel-then-reschedule on every call would
+            # perpetually push out the coalescer's flush under sustained
+            # traffic, starving the actual edge drain indefinitely.
+            if self._dirty and self._delayed_call is None:
+                self._delayed_call = self._clock.call_later(
+                    self._RETRY_DELAY, self._flush
+                )
 
     def close(self) -> None:
         """Flush outstanding dirty pools and shut down."""
@@ -1016,10 +1441,23 @@ def sync_now(pools: Iterable[Pool] | None = None) -> None:
     if not _engine_configured:
         return
 
+    pool_set = set(pools) if pools is not None else None
+    _count_sync_origin("sync_now", pool_set)
     if _coalescer is not None:
-        _coalescer.sync_now(pools)
-    elif pools is not None:
-        maybe_sync(SyncTier.DURABLE, pools=pools)
+        _coalescer.sync_now(pool_set)
+    elif pool_set is not None:
+        maybe_sync(SyncTier.DURABLE, pools=pool_set)
+
+
+def sync_event_dag_now() -> None:
+    """Sync event JSON's EVENT_DAG records without draining edge queues."""
+    if not _engine_configured:
+        return
+    _count_sync_origin("sync_event_dag_now", [Pool.EVENT_DAG])
+    if _coalescer is not None:
+        _coalescer.sync_event_dag_now()
+    else:
+        maybe_sync(SyncTier.DURABLE, pools=[Pool.EVENT_DAG])
 
 
 def close_coalescer() -> None:

@@ -486,6 +486,20 @@ class HomeserverTestCase(TestCase):
         # Reset to not use frozen dicts.
         events.USE_FROZEN_DICTS = False
 
+        if os.environ.get("SYNAPSE_TEST_MTXDB_REPACK_BETWEEN_TESTS") not in (
+            "1",
+            "true",
+            "True",
+            "yes",
+            "on",
+            "On",
+        ):
+            return
+
+        from synapse.synapse_rust import mtxdb_engine
+
+        mtxdb_engine.repack()
+
     def wait_for_background_updates(self) -> None:
         """Block until all background database updates have completed."""
         store = self.hs.get_datastores().main

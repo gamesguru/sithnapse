@@ -47,7 +47,10 @@ from synapse.storage.database import (
 )
 from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
 from synapse.storage.databases.main.embedded_common import Pool, SyncTier, maybe_sync
-from synapse.storage.databases.main.embedded_event_json import put_event_json_batch
+from synapse.storage.databases.main.embedded_event_json import (
+    get_event_json_batch,
+    put_event_json_batch,
+)
 from synapse.storage.databases.main.embedded_event_to_state_group import (
     get_state_group_for_events_batch,
     increment_state_group_refcounts_batch,
@@ -629,7 +632,7 @@ class EventsBackgroundUpdatesStore(
         def reindex_txn(txn: LoggingTransaction) -> int:
             sql = (
                 "SELECT stream_ordering, event_id, json FROM events"
-                " INNER JOIN event_json USING (event_id)"
+                " LEFT JOIN event_json USING (event_id)"
                 " WHERE ? <= stream_ordering AND stream_ordering < ?"
                 " ORDER BY stream_ordering DESC"
                 " LIMIT ?"
@@ -643,11 +646,29 @@ class EventsBackgroundUpdatesStore(
 
             min_stream_id = rows[-1][0]
 
+            missing_json_ids = [event_id for _, event_id, json in rows if json is None]
+            json_by_id = {}
+            if missing_json_ids and getattr(
+                self, "_embedded_event_json_enabled", False
+            ):
+                found = get_event_json_batch(
+                    self._embedded_hamt_engine,
+                    self._embedded_hamt_namespace,
+                    missing_json_ids,
+                )
+                for eid, (_, j, _) in found.items():
+                    json_by_id[eid] = j
+
             update_rows = []
             for row in rows:
                 try:
                     event_id = row[1]
-                    event_json = db_to_json(row[2])
+                    raw_json = row[2]
+                    if raw_json is None:
+                        raw_json = json_by_id.get(event_id)
+                    if not raw_json:
+                        continue
+                    event_json = db_to_json(raw_json)
                     sender = event_json["sender"]
                     content = event_json["content"]
 
@@ -824,8 +845,32 @@ class EventsBackgroundUpdatesStore(
                 """,
                 (batch_size,),
             )
+            rows = txn.fetchall()
 
-            for prev_event_id, event_id, metadata, rejected, outlier in txn:
+            # The initial query's `event_json` join is SQL-only, but the
+            # embedded event-JSON backend (when enabled) is the read-path
+            # authority and leaves no SQL row. Pull the missing
+            # `internal_metadata` from it so soft-failed extremities are
+            # classified correctly -- same fallback the recursive query below
+            # already applies.
+            missing_meta_ids = [
+                event_id
+                for _, event_id, metadata, _, _ in rows
+                if event_id and metadata is None
+            ]
+            meta_by_id = {}
+            if missing_meta_ids and getattr(
+                self, "_embedded_event_json_enabled", False
+            ):
+                found = get_event_json_batch(
+                    self._embedded_hamt_engine,
+                    self._embedded_hamt_namespace,
+                    missing_meta_ids,
+                )
+                for eid, (m, _, _) in found.items():
+                    meta_by_id[eid] = m
+
+            for prev_event_id, event_id, metadata, rejected, outlier in rows:
                 original_set.add(prev_event_id)
 
                 if not event_id or outlier:
@@ -835,9 +880,11 @@ class EventsBackgroundUpdatesStore(
 
                 graph.setdefault(event_id, set()).add(prev_event_id)
 
-                soft_failed = False
-                if metadata:
-                    soft_failed = db_to_json(metadata).get("soft_failed")
+                if metadata is None:
+                    metadata = meta_by_id.get(event_id)
+                soft_failed = (
+                    db_to_json(metadata).get("soft_failed") if metadata else False
+                )
 
                 if soft_failed or rejected:
                     soft_failed_events_to_lookup.add(event_id)
@@ -858,7 +905,7 @@ class EventsBackgroundUpdatesStore(
                     rejections.event_id IS NOT NULL
                     FROM event_edges
                     INNER JOIN events USING (event_id)
-                    INNER JOIN event_json USING (event_id)
+                    LEFT JOIN event_json USING (event_id)
                     LEFT JOIN rejections USING (event_id)
                     WHERE
                         NOT events.outlier
@@ -868,8 +915,24 @@ class EventsBackgroundUpdatesStore(
                     self.database_engine, "prev_event_id", to_check
                 )
                 txn.execute(sql + clause, list(args))
+                rows = txn.fetchall()
 
-                for prev_event_id, event_id, metadata, rejected in txn:
+                missing_meta_ids = [
+                    event_id for _, event_id, metadata, _ in rows if metadata is None
+                ]
+                meta_by_id = {}
+                if missing_meta_ids and getattr(
+                    self, "_embedded_event_json_enabled", False
+                ):
+                    found = get_event_json_batch(
+                        self._embedded_hamt_engine,
+                        self._embedded_hamt_namespace,
+                        missing_meta_ids,
+                    )
+                    for eid, (m, _, _) in found.items():
+                        meta_by_id[eid] = m
+
+                for prev_event_id, event_id, metadata, rejected in rows:
                     if event_id in graph:
                         # Already handled this event previously, but we still
                         # want to record the edge.
@@ -878,7 +941,11 @@ class EventsBackgroundUpdatesStore(
 
                     graph[event_id] = {prev_event_id}
 
-                    soft_failed = db_to_json(metadata).get("soft_failed")
+                    if metadata is None:
+                        metadata = meta_by_id.get(event_id)
+                    soft_failed = (
+                        db_to_json(metadata).get("soft_failed") if metadata else False
+                    )
                     if soft_failed or rejected:
                         soft_failed_events_to_lookup.add(event_id)
                     else:
@@ -1034,8 +1101,29 @@ class EventsBackgroundUpdatesStore(
             if not rows:
                 return 0
 
+            # The join is SQL-only; under the embedded event-JSON backend the
+            # `internal_metadata` lives solely in mtxdb, so pull the missing
+            # rows from the mirror before deciding `recheck` -- otherwise every
+            # row looks like metadata-free and gets forced to false.
+            missing_meta_ids = [
+                event_id for event_id, metadata in rows if metadata is None
+            ]
+            meta_by_id = {}
+            if missing_meta_ids and getattr(
+                self, "_embedded_event_json_enabled", False
+            ):
+                found = get_event_json_batch(
+                    self._embedded_hamt_engine,
+                    self._embedded_hamt_namespace,
+                    missing_meta_ids,
+                )
+                for eid, (m, _, _) in found.items():
+                    meta_by_id[eid] = m
+
             updates = []
             for event_id, internal_metadata_json in rows:
+                if internal_metadata_json is None:
+                    internal_metadata_json = meta_by_id.get(event_id)
                 if internal_metadata_json is not None:
                     internal_metadata = db_to_json(internal_metadata_json)
                     recheck = bool(internal_metadata.get("recheck_redaction", False))
@@ -1108,21 +1196,51 @@ class EventsBackgroundUpdatesStore(
         last_event_id = progress.get("last_event_id", "")
 
         def _event_store_labels_txn(txn: LoggingTransaction) -> int:
+            # Paginate over `events`, not `event_json`: under the embedded
+            # event-JSON backend `event_json` has no SQL rows, so selecting
+            # from it would find nothing and end the update without storing a
+            # single label. `events` is backend-independent; `json` is pulled
+            # from `event_json` when SQL holds it and from mtxdb otherwise.
             txn.execute(
                 """
-                SELECT event_id, json FROM event_json
+                SELECT e.event_id, ej.json
+                FROM events AS e
+                LEFT JOIN event_json AS ej USING (event_id)
                 LEFT JOIN event_labels USING (event_id)
-                WHERE event_id > ? AND label IS NULL
-                ORDER BY event_id LIMIT ?
+                WHERE e.event_id > ? AND label IS NULL
+                ORDER BY e.event_id LIMIT ?
                 """,
                 (last_event_id, batch_size),
             )
 
             results = list(txn)
 
+            # The join above is SQL-only; pull the rows the embedded backend
+            # would otherwise leave NULL before reading each event's labels.
+            missing_json_ids = [event_id for event_id, raw in results if raw is None]
+            json_by_id: dict[str, str] = {}
+            if missing_json_ids and getattr(
+                self, "_embedded_event_json_enabled", False
+            ):
+                found = get_event_json_batch(
+                    self._embedded_hamt_engine,
+                    self._embedded_hamt_namespace,
+                    missing_json_ids,
+                )
+                for event_id, (_meta, body, _format_version) in found.items():
+                    json_by_id[event_id] = body
+
             nbrows = 0
             last_row_event_id = ""
             for event_id, event_json_raw in results:
+                if event_json_raw is None:
+                    event_json_raw = json_by_id.get(event_id)
+                if event_json_raw is None:
+                    # JSON lives in neither backend (e.g. a purge race):
+                    # nothing to label, but still advance the cursor.
+                    nbrows += 1
+                    last_row_event_id = event_id
+                    continue
                 try:
                     event_json = db_to_json(event_json_raw)
 
@@ -1191,7 +1309,7 @@ class EventsBackgroundUpdatesStore(
                     state_events.event_id IS NOT NULL,
                     event_auth.event_id IS NOT NULL
                 FROM rejections
-                INNER JOIN event_json USING (event_id)
+                LEFT JOIN event_json USING (event_id)
                 LEFT JOIN rooms USING (room_id)
                 LEFT JOIN state_events USING (event_id)
                 LEFT JOIN event_auth USING (event_id)
@@ -1208,10 +1326,35 @@ class EventsBackgroundUpdatesStore(
                 ),
             )
 
-            return cast(
-                list[tuple[str, str, JsonDict, bool, bool]],
-                [(row[0], row[1], db_to_json(row[2]), row[3], row[4]) for row in txn],
-            )
+            rows = txn.fetchall()
+            if not rows:
+                return []
+
+            missing_json_ids = [row[0] for row in rows if row[2] is None]
+            json_by_id = {}
+            if missing_json_ids and getattr(
+                self, "_embedded_event_json_enabled", False
+            ):
+                found = get_event_json_batch(
+                    self._embedded_hamt_engine,
+                    self._embedded_hamt_namespace,
+                    missing_json_ids,
+                )
+                for eid, (_, j, _) in found.items():
+                    json_by_id[eid] = j
+
+            results_list = []
+            for row in rows:
+                raw_json = row[2]
+                if raw_json is None:
+                    raw_json = json_by_id.get(row[0])
+                if not raw_json:
+                    continue
+                results_list.append(
+                    (row[0], row[1], db_to_json(raw_json), row[3], row[4])
+                )
+
+            return results_list
 
         results = await self.db_pool.runInteraction(
             desc="_rejected_events_metadata_get", func=get_rejected_events
@@ -1592,20 +1735,43 @@ class EventsBackgroundUpdatesStore(
 
         def _event_arbitrary_relations_txn(txn: LoggingTransaction) -> int:
             # Fetch events and then filter based on whether the event has a
-            # relation or not.
+            # relation or not. Enumerate from `events` rather than
+            # `event_json` directly: under the embedded event-JSON backend,
+            # `event_json` has no rows to page through at all (see
+            # events.py's `_embedded_event_json_enabled` gating), so a plain
+            # `event_json` scan silently processes nothing.
             txn.execute(
                 """
-                SELECT event_id, json FROM event_json
-                WHERE event_id > ?
-                ORDER BY event_id LIMIT ?
+                SELECT ev.event_id, event_json.json FROM events AS ev
+                LEFT JOIN event_json USING (event_id)
+                WHERE ev.event_id > ?
+                ORDER BY ev.event_id LIMIT ?
                 """,
                 (last_event_id, batch_size),
             )
 
             results = list(txn)
+
+            missing_json_ids = [event_id for event_id, json in results if json is None]
+            json_by_id = {}
+            if missing_json_ids and getattr(
+                self, "_embedded_event_json_enabled", False
+            ):
+                found = get_event_json_batch(
+                    self._embedded_hamt_engine,
+                    self._embedded_hamt_namespace,
+                    missing_json_ids,
+                )
+                for eid, (_, j, _) in found.items():
+                    json_by_id[eid] = j
+
             # (event_id, parent_id, rel_type) for each relation
             relations_to_insert: list[tuple[str, str, str, str]] = []
             for event_id, event_json_raw in results:
+                if event_json_raw is None:
+                    event_json_raw = json_by_id.get(event_id)
+                if not event_json_raw:
+                    continue
                 try:
                     event_json = db_to_json(event_json_raw)
                 except Exception as e:

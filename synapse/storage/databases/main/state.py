@@ -604,28 +604,13 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
 
     async def _get_state_group_for_event(self, event_id: str) -> int | None:
         if getattr(self, "_embedded_event_json_enabled", False):
-            if event_id not in self._un_partial_stated_event_ids:
-                found = get_state_group_for_events_batch(
-                    self._embedded_hamt_engine,
-                    self._embedded_hamt_namespace,
-                    [event_id],
-                    purpose="read_point",
-                )
-                if event_id in found:
-                    return found[event_id]
-            row = await self.db_pool.simple_select_one_onecol(
-                table="event_to_state_groups",
-                keyvalues={"event_id": event_id},
-                retcol="state_group",
-                allow_none=True,
-                desc="_get_state_group_for_event_sql_fallback",
+            found = get_state_group_for_events_batch(
+                self._embedded_hamt_engine,
+                self._embedded_hamt_namespace,
+                [event_id],
+                purpose="read_point",
             )
-            if row is not None:
-                return row
-            return self._get_state_group_for_event_sql.cache.get_immediate(
-                event_id,
-                None,
-            )
+            return found.get(event_id)
         return await self._get_state_group_for_event_sql(event_id)
 
     @cached(max_entries=50000)
@@ -639,7 +624,7 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
         )
 
     async def _get_state_group_for_events(
-        self, event_ids: Collection[str]
+        self, event_ids: Collection[str], raise_on_missing: bool = True
     ) -> Mapping[str, int]:
         """Returns mapping event_id -> state_group.
 
@@ -649,37 +634,40 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
         another worker is persisting the mapping; reusing that negative would
         prevent the refresh-aware mtxdb lookup from running.
 
+        Args:
+            event_ids: the events to look up.
+            raise_on_missing: if ``True`` (the default), raise ``RuntimeError``
+                if any event has no state group. Callers that deliberately
+                want to skip stateless outliers (whose absence is expected)
+                pass ``False`` and receive a partial mapping. This also skips
+                the scalar-cache recovery below, so a lagging batch view is
+                indistinguishable from a genuine outlier.
+
         Raises:
              RuntimeError if the state is unknown at any of the given events
+                and ``raise_on_missing`` is true.
         """
         if getattr(self, "_embedded_event_json_enabled", False):
-            un_partial_stated = {
-                eid for eid in event_ids if eid in self._un_partial_stated_event_ids
-            }
-            embedded_event_ids = [e for e in event_ids if e not in un_partial_stated]
+            event_ids = list(event_ids)
+            logger.info(
+                "[mtxdb-trace] worker=%s state-group read purpose=read_batch requested=%d event_ids=%s",
+                self._instance_name,
+                len(event_ids),
+                list(event_ids),
+            )
             res = get_state_group_for_events_batch(
                 self._embedded_hamt_engine,
                 self._embedded_hamt_namespace,
-                embedded_event_ids,
+                event_ids,
                 purpose="read_batch",
             )
-            missing_event_ids = [
-                event_id for event_id in embedded_event_ids if event_id not in res
-            ]
-            missing_event_ids.extend(un_partial_stated)
-            if missing_event_ids:
-                rows = cast(
-                    list[tuple[str, int]],
-                    await self.db_pool.simple_select_many_batch(
-                        table="event_to_state_groups",
-                        column="event_id",
-                        iterable=missing_event_ids,
-                        keyvalues={},
-                        retcols=("event_id", "state_group"),
-                        desc="_get_state_group_for_events_sql_fallback",
-                    ),
-                )
-                res.update(dict(rows))
+            logger.info(
+                "[mtxdb-trace] worker=%s state-group read result purpose=read_batch hits=%d misses=%d hit_event_ids=%s",
+                self._instance_name,
+                len(res),
+                len(event_ids) - len(res),
+                sorted(res),
+            )
         else:
             rows = cast(
                 list[tuple[str, int]],
@@ -695,28 +683,24 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             res = dict(rows)
 
         missing = set(event_ids).difference(res)
-        if missing:
-            # The batch reads above can transiently miss an event whose
-            # mapping was already prefilled into the scalar cache at persist
-            # commit: the embedded engine's mapping publication is coalesced,
-            # and a worker may observe the event before the fallback SQL row
-            # is visible to it. Peek the scalar cache for *completed* values
-            # (never call it, so no negative results are planted) before
-            # giving up.
-            for event_id in list(missing):
-                # `_get_state_group_for_event_sql` takes a single arg, so its
-                # cache key is the bare event_id, not a 1-tuple -- the
-                # key-builder special-cases num_args == 1 to skip wrapping.
+        if missing and raise_on_missing:
+            # A scalar read can already have populated the per-event cache
+            # while the batch view is briefly behind it.  Recover those
+            # from completed cache entries before treating the batch miss as
+            # a real disappearance. Do not invoke the cached method here:
+            # that would issue one scalar query per miss and could cache a
+            # negative result, defeating the refresh-aware embedded lookup.
+            for event_id in missing:
                 cached = self._get_state_group_for_event_sql.cache.get_immediate(
-                    # A cached `None` (e.g. a rejected event's mapping) is the
-                    # same as a miss here: it carries no usable state group.
+                    # The single-argument cache key is the bare event ID.
                     event_id,
                     None,
                 )
                 if cached is not None:
                     res[event_id] = cached
-            missing = set(event_ids).difference(res)
-        if missing:
+
+        missing = set(event_ids).difference(res)
+        if missing and raise_on_missing:
             raise RuntimeError(
                 "State mapping disappeared before _get_state_group_for_events "
                 f"returned: {missing}"
@@ -803,11 +787,11 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
         assert state_group is not None
 
         if getattr(self, "_embedded_event_json_enabled", False):
-            # Exclusive by configured engine, not a dual-write. Unlike
-            # put_event_to_state_group_batch's initial-insert callers, this
-            # is a genuine rewrite of which state_group this event
-            # references -- the old one loses a reference and the new one
-            # gains one, so the refcount must move with it, not just get
+            # Update the mtxdb mapping and refcounts. Unlike
+            # put_event_to_state_group_batch's
+            # initial-insert callers, this is a genuine rewrite of the state
+            # group for this event: the old one loses a reference and the new
+            # one gains one, so the refcount must move with it, not just get
             # incremented again (that would double-count the old group's
             # reference forever, since a partial-state event's placeholder
             # group is never otherwise decremented).
@@ -834,12 +818,6 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
                     self._embedded_hamt_namespace,
                     [state_group],
                 )
-            self.db_pool.simple_update_txn(
-                txn,
-                table="event_to_state_groups",
-                keyvalues={"event_id": event.event_id},
-                updatevalues={"state_group": state_group},
-            )
             # Immediately sync STATE pool to mtxdb after SQL commit so reader workers
             # see the updated state group without waiting for debounce.
             txn.call_after(sync_now, [Pool.STATE])
@@ -869,11 +847,12 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
         )
 
         txn.call_after(self.is_partial_state_event.invalidate, (event.event_id,))
-        txn.call_after(
-            self._get_state_group_for_event_sql.prefill,
-            (event.event_id,),
-            state_group,
-        )
+        if not getattr(self, "_embedded_event_json_enabled", False):
+            txn.call_after(
+                self._get_state_group_for_event_sql.prefill,
+                (event.event_id,),
+                state_group,
+            )
 
         self.db_pool.simple_insert_txn(
             txn,

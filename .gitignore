@@ -36,6 +36,7 @@ __pycache__/
 /uploads
 /homeserver-config-overrides.d
 tmp/
+.tmp/
 
 # For direnv users
 /.envrc
@@ -73,6 +74,7 @@ book/
 *.crt
 *.csr
 *.cnf
+*.srl
 
 # complement
 /complement-*

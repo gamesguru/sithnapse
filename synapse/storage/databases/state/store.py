@@ -48,6 +48,7 @@ from synapse.storage.database import (
 )
 from synapse.storage.databases.embedded_engine import get_embedded_engine
 from synapse.storage.databases.main.embedded_common import (
+    FLUSH_DELAY_SECS,
     Pool,
     _clear_coalescer,
     _FlushCoalescer,
@@ -262,9 +263,15 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 # Every write path into the embedded engine above was
                 # changed to *not* fsync per write/per batch -- an fsync
                 # Commit-aware flush coalescer: dirty marking happens via
-                # txn.call_after (after SQL commit), debounced 250-500ms.
+                # txn.call_after (after SQL commit), debounced 250-500ms (or 2.0s on HDD).
                 # Replaces the former 1-second periodic sync timer.
-                self._flush_coalescer = _FlushCoalescer(hs.get_clock())
+                flush_delay = (
+                    hs.config.database.embedded_hamt_flush_delay_secs
+                    or FLUSH_DELAY_SECS
+                )
+                self._flush_coalescer = _FlushCoalescer(
+                    hs.get_clock(), flush_delay_secs=flush_delay
+                )
                 _set_coalescer(self._flush_coalescer)
                 hs.register_sync_shutdown_handler(
                     phase="during",
@@ -1408,7 +1415,17 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         )
         ffi_timing("ffi_get_hamt_root", time.monotonic() - _et)
         if raw is None:
+            logger.info(
+                "[mtxdb-trace] state-hamt root miss state_group=%d room_prefix=%s",
+                state_group,
+                room_prefix.hex(),
+            )
             return None
+        logger.info(
+            "[mtxdb-trace] state-hamt root hit state_group=%d room_prefix=%s",
+            state_group,
+            room_prefix.hex(),
+        )
         _room_prefix, root_hash, lattice, _room_id = _decode_state_hamt_root(bytes(raw))
         if not lattice:
             # A root written before the lattice column existed -- no usable

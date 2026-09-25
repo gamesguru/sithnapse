@@ -82,6 +82,7 @@ keeps multiple homeservers sharing one mtxdb file from colliding on event_id.
 from __future__ import annotations
 
 import logging
+import os
 import struct
 import time
 from typing import TYPE_CHECKING
@@ -90,6 +91,7 @@ from synapse.storage.databases.main.embedded_common import (
     Pool,
     ffi_timing,
     mirror_timing,
+    sync_event_dag_now,
     sync_now,
 )
 
@@ -97,6 +99,18 @@ if TYPE_CHECKING:
     from synapse.server import HomeServer
 
 logger = logging.getLogger(__name__)
+
+# THROWAWAY DIAGNOSTIC -- remove once the publication-timing question is
+# settled. Forces a synchronous EVENT_DAG fsync after every `event_json`
+# write, i.e. the write becomes durable before the persist transaction
+# returns instead of waiting for the flush coalescer. Wired from
+# `SYNAPSE_TEST_MTXDB_FORCE_SYNC_EVENT_JSON` in scripts-dev/complement.sh so
+# the forced-sync half of the experiment matrix needs no rebuild. Never
+# enable outside a diagnostic run: it is a whole-device cache flush per
+# persisted event.
+_FORCE_SYNC_EVENT_JSON = os.environ.get(
+    "SYNAPSE_MTXDB_FORCE_SYNC_EVENT_JSON", ""
+).strip().lower() not in ("", "0", "false", "no", "off")
 
 
 def open_embedded_event_json_engine(hs: "HomeServer") -> bool:
@@ -163,16 +177,24 @@ def put_event_json_batch(
     `_store_state_hamt_root_embedded_txn`: an mtxdb call is local, no
     network round-trip to justify deferring past commit.
 
-    By default, does not call sync() after the write: unlike every other
-    embedded sidecar, get_event_json_batch's caller falls back to SQL on a
-    miss (see its docstring), so an unflushed write lost to a crash before
-    the next fsync just means a slower read via that fallback, not silent
-    data loss -- not worth paying a synchronous fsync on this hot a path
-    for every persisted event.
+    By default, does not call sync() after the write: this is the hottest
+    embedded write path (one call per persisted event) and a synchronous
+    fsync per event is a whole-device cache flush each time. The write
+    becomes durable when the flush coalescer next syncs the EVENT_DAG pool
+    (see `embedded_common._FlushCoalescer`).
 
-    For censorship/expiry operations, pass `sync=True` to ensure the
-    replacement is durable before returning, preventing a crash from
-    leaving stale pre-censor content in the mirror.
+    Note: the earlier rationale here -- "get_event_json_batch's caller falls
+    back to SQL on a miss" -- does not hold in embedded-exclusive mode.
+    `_persist_events_txn` skips the SQL `event_json` insert when
+    `_embedded_event_json_enabled`, so a miss has no SQL copy to fall back
+    to: it stays a miss until the writer's coalescer flush lands. Don't
+    treat that fallback as covering the coalescer window.
+
+    Pass `sync=True` only at standalone barrier call sites (e.g. a purge
+    that must be durable before returning). Censoring/expiry loops that
+    replace one event's JSON per iteration should pass `sync=False` and
+    let the flush coalescer fsync the EVENT_DAG pool once they finish;
+    fsyncing per event is a whole-device cache flush each time.
     """
     with mirror_timing("event_json_put"):
         from synapse.synapse_rust.mtxdb_engine import event_json_put
@@ -190,8 +212,8 @@ def put_event_json_batch(
         event_json_put(namespace, tuples)
         ffi_timing("ffi_event_json_put", time.monotonic() - _et)
 
-        if sync:
-            sync_now(pools=[Pool.EVENT_DAG])
+        if sync or _FORCE_SYNC_EVENT_JSON:
+            sync_event_dag_now()
 
 
 def get_event_json_batch(
@@ -219,6 +241,12 @@ def get_event_json_batch(
             internal_metadata = _decode_event_json_metadata(metadata_record)
             json_str, format_version = _decode_event_json_body(body_record)
             result[event_id] = (internal_metadata, json_str, format_version)
+    logger.info(
+        "[mtxdb-trace] event-json read requested=%d returned=%d missing=%s",
+        len(event_ids),
+        len(result),
+        [event_id for event_id in event_ids if event_id not in result],
+    )
     return result
 
 

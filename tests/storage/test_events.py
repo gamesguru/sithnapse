@@ -20,19 +20,22 @@
 #
 
 import logging
+from unittest import mock
 
 from twisted.internet.testing import MemoryReactor
 
 from synapse.api.constants import EventTypes, Membership
 from synapse.api.room_versions import RoomVersions
 from synapse.events import EventBase
+from synapse.events.snapshot import EventContext
 from synapse.rest import admin
 from synapse.rest.client import login, room
 from synapse.server import HomeServer
+from synapse.storage.databases.main.embedded_common import Pool, SyncTier
 from synapse.types import StateMap
 from synapse.util.clock import Clock
 
-from tests.test_utils.event_builders import make_test_pdu_event
+from tests.test_utils.event_builders import make_test_event, make_test_pdu_event
 from tests.unittest import HomeserverTestCase, skip_unless
 from tests.utils import EMBEDDED_HAMT_ENGINE
 
@@ -106,6 +109,89 @@ class EventsTestCase(HomeserverTestCase):
         event = self.get_success(self._store.get_event(event_id))
         self.assertEqual(event.event_id, event_id)
         self.assertEqual(event.content.get("body"), "hello embedded mtxdb")
+
+    @skip_unless(bool(EMBEDDED_HAMT_ENGINE), "requires embedded HAMT engine")
+    def test_de_outlier_publishes_state_barrier(self) -> None:
+        """De-outliering an already-persisted outlier must schedule an immediate
+        STATE barrier.
+
+        The ex-outlier pass writes the event's embedded event->state-group
+        mapping on this writer; the HAMT root for the referenced state group
+        normally already exists. Another worker -- e.g. the next event in the
+        same /send transaction, whose prev is this event -- reads the mapping
+        back as soon as it arrives, well inside the coalescer's 250-500ms flush
+        window. Because `_update_outliers_txn` removes the de-outliered event
+        from the normal persist list, the publishing barrier used to miss it and
+        only `mark_dirty` the STATE pool; in the mtxdb-exclusive engine there is
+        no SQL fallback, so that is a hard miss on the reader. Regression guard
+        for that gap.
+        """
+        persistence = self.hs.get_storage_controllers().persistence
+        assert persistence is not None
+
+        # `SYNAPSE_TEST_MTXDB` makes the test harness configure and open the
+        # embedded engine on the homeserver's stores (see tests.utils.
+        # default_config), so the engine path here is the real one, not a
+        # private client opened behind the store's back.
+        persist_store = self.hs.get_datastores().persist_events
+        assert persist_store is not None
+        self.assertTrue(persist_store._embedded_event_json_enabled)
+        self.assertEqual(persist_store._embedded_hamt_engine, "mtxdb")
+
+        user = self.register_user("de_outlier_user", "pass")
+        token = self.login("de_outlier_user", "pass")
+        room_id = self.helper.create_room_as(user, tok=token)
+        room_version = self.get_success(self._store.get_room_version(room_id))
+
+        anchor = self.helper.send(room_id, "anchor", tok=token)["event_id"]
+        state_group = self.get_success(
+            self.hs.get_storage_controllers().state.get_state_group_for_events([anchor])
+        )[anchor]
+        self.assertIsNotNone(state_group)
+
+        event = make_test_event(
+            room_version=room_version,
+            type="m.room.message",
+            room_id=room_id,
+            sender=user,
+            content={"body": "de-outlier me"},
+            prev_events=[anchor],
+            depth=1,
+            origin_server_ts=1,
+        )
+        event.internal_metadata.outlier = True
+
+        # Persist it as an outlier first: the shape a partial-state resync pull
+        # leaves behind. This only coalesces STATE, so it must not sync.
+        with mock.patch(
+            "synapse.storage.databases.main.events.sync_now"
+        ) as outlier_sync:
+            self.get_success(
+                persistence.persist_event(
+                    event,
+                    EventContext.for_outlier(self.hs.get_storage_controllers()),
+                )
+            )
+        outlier_sync.assert_not_called()
+
+        # Now the live copy arrives and de-outliers it. Its embedded mapping
+        # must be visible before this returns.
+        event.internal_metadata.outlier = False
+        live_context = EventContext.with_state(
+            storage=self.hs.get_storage_controllers(),
+            state_group=state_group,
+            state_group_before_event=state_group,
+            state_delta_due_to_event=None,
+            partial_state=False,
+            state_group_deltas={},
+        )
+
+        with mock.patch(
+            "synapse.storage.databases.main.events.maybe_publish"
+        ) as de_outlier_publish:
+            self.get_success(persistence.persist_event(event, live_context))
+
+        de_outlier_publish.assert_called_once_with(SyncTier.DURABLE, [Pool.STATE])
 
     def test_get_senders_for_event_ids(self) -> None:
         """Tests the `get_senders_for_event_ids` storage function."""

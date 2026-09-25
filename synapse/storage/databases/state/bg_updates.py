@@ -48,6 +48,7 @@ from synapse.types import MutableStateMap, StateMap
 from synapse.types.state import StateFilter
 from synapse.util.caches import intern_string
 from synapse.util.iterutils import batch_iter
+from synapse.util.timings_flush import register_periodic_flush
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
@@ -237,7 +238,9 @@ def _print_state_timings() -> None:
 
     run_dir = os.environ.get("SYNAPSE_TIMINGS_RUN_DIR")
     if run_dir:
-        tmp_path = os.path.join(run_dir, f"state_{os.getpid()}.tmp")
+        tmp_path = os.path.join(
+            run_dir, f"state_{os.getpid()}.{threading.get_ident()}.tmp"
+        )
         final_path = os.path.join(run_dir, f"state_{os.getpid()}.json")
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
@@ -324,7 +327,9 @@ def _print_node_write_stats() -> None:
 
     run_dir = os.environ.get("SYNAPSE_TIMINGS_RUN_DIR")
     if run_dir:
-        tmp_path = os.path.join(run_dir, f"node_writes_{os.getpid()}.tmp")
+        tmp_path = os.path.join(
+            run_dir, f"node_writes_{os.getpid()}.{threading.get_ident()}.tmp"
+        )
         final_path = os.path.join(run_dir, f"node_writes_{os.getpid()}.json")
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
@@ -390,7 +395,9 @@ def _print_root_write_stats() -> None:
         return
     run_dir = os.environ.get("SYNAPSE_TIMINGS_RUN_DIR")
     if run_dir:
-        tmp_path = os.path.join(run_dir, f"root_writes_{os.getpid()}.tmp")
+        tmp_path = os.path.join(
+            run_dir, f"root_writes_{os.getpid()}.{threading.get_ident()}.tmp"
+        )
         final_path = os.path.join(run_dir, f"root_writes_{os.getpid()}.json")
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
@@ -448,6 +455,9 @@ if _PG_TIMINGS_ENABLED:
     atexit.register(flush_state_timings)
     atexit.register(flush_node_write_stats)
     atexit.register(flush_root_write_stats)
+    register_periodic_flush(flush_state_timings)
+    register_periodic_flush(flush_node_write_stats)
+    register_periodic_flush(flush_root_write_stats)
 
     import signal as _signal
     from types import FrameType as _FrameType

@@ -30,7 +30,18 @@ from synapse.storage.database import (
     LoggingTransaction,
 )
 from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
-from synapse.storage.databases.main.embedded_event_json import put_event_json_batch
+from synapse.storage.databases.main.embedded_common import (
+    Pool,
+    mark_dirty,
+    sync_now,
+)
+from synapse.storage.databases.main.embedded_event_json import (
+    get_event_json_batch,
+    put_event_json_batch,
+)
+from synapse.storage.databases.main.embedded_redactions import (
+    set_have_censored_batch,
+)
 from synapse.storage.databases.main.events_worker import EventsWorkerStore
 from synapse.synapse_rust.events import redact_event
 from synapse.util.duration import Duration
@@ -133,9 +144,14 @@ class CensorEventsStore(EventsWorkerStore, CacheInvalidationWorkerStore, SQLBase
             updates.append((redaction_id, event_id, pruned_json))
 
         def _update_censor_txn(txn: LoggingTransaction) -> None:
+            # Keep censorship durable before the SQL transaction commits, but
+            # pay for only one EventDag sync per batch rather than one per event.
+            event_json_mirror_changed = False
             for redaction_id, event_id, pruned_json in updates:
                 if pruned_json:
-                    self._censor_event_txn(txn, event_id, pruned_json)
+                    event_json_mirror_changed |= self._censor_event_txn(
+                        txn, event_id, pruned_json, sync=False
+                    )
 
                 self.db_pool.simple_update_one_txn(
                     txn,
@@ -144,45 +160,110 @@ class CensorEventsStore(EventsWorkerStore, CacheInvalidationWorkerStore, SQLBase
                     updatevalues={"have_censored": True},
                 )
 
+                # Mirror the flag flip into the embedded engine if configured,
+                # keyed by the redacted event id -- see embedded_redactions.py.
+                if getattr(self, "_embedded_event_json_enabled", False):
+                    set_have_censored_batch(
+                        self._embedded_hamt_engine,
+                        self._embedded_hamt_namespace,
+                        [event_id],
+                        True,
+                    )
+
+            if event_json_mirror_changed:
+                sync_now(pools=[Pool.EVENT_DAG])
+
         await self.db_pool.runInteraction("_update_censor_txn", _update_censor_txn)
 
     def _censor_event_txn(
-        self, txn: LoggingTransaction, event_id: str, pruned_json: str
-    ) -> None:
-        """Censor an event by replacing its JSON in the event_json table with the
-        provided pruned JSON.
+        self,
+        txn: LoggingTransaction,
+        event_id: str,
+        pruned_json: str,
+        *,
+        sync: bool = False,
+    ) -> bool:
+        """Censor an event by replacing its JSON in the event_json table or embedded
+        store with the provided pruned JSON.
 
         Args:
             txn: The database transaction.
             event_id: The ID of the event to censor.
             pruned_json: The pruned JSON
+            sync: Whether to fsync the embedded mirror immediately. Defaults to
+                False: this is called once per event from censoring/expiry loops,
+                so callers that need a barrier should pass ``True`` (a whole batch)
+                or mark the pool dirty once after the loop instead of paying an
+                fsync per event.
         """
-        self.db_pool.simple_update_one_txn(
+        # Under exclusive mtxdb mode, event_json may not exist in SQL.
+        # Check and update mtxdb first if enabled.
+        mirrored = False
+        if getattr(self, "_embedded_event_json_enabled", False):
+            found = get_event_json_batch(
+                self._embedded_hamt_engine,
+                self._embedded_hamt_namespace,
+                [event_id],
+            )
+            if event_id in found:
+                internal_metadata, _, format_version = found[event_id]
+                room_id = self.db_pool.simple_select_one_onecol_txn(
+                    txn,
+                    table="events",
+                    keyvalues={"event_id": event_id},
+                    retcol="room_id",
+                    allow_none=True,
+                )
+                if room_id is not None:
+                    put_event_json_batch(
+                        self._embedded_hamt_engine,
+                        self._embedded_hamt_namespace,
+                        [
+                            (
+                                event_id,
+                                room_id,
+                                internal_metadata,
+                                pruned_json,
+                                format_version,
+                            )
+                        ],
+                        sync=sync,
+                    )
+                    mirrored = True
+            else:
+                row = self.db_pool.simple_select_one_txn(
+                    txn,
+                    table="event_json",
+                    keyvalues={"event_id": event_id},
+                    retcols=("room_id", "internal_metadata", "format_version"),
+                    allow_none=True,
+                )
+                if row:
+                    room_id, internal_metadata, format_version = row
+                    put_event_json_batch(
+                        self._embedded_hamt_engine,
+                        self._embedded_hamt_namespace,
+                        [
+                            (
+                                event_id,
+                                room_id,
+                                internal_metadata,
+                                pruned_json,
+                                format_version,
+                            )
+                        ],
+                        sync=sync,
+                    )
+                    mirrored = True
+
+        # Update SQL event_json table if the row exists (for legacy/vanilla rows)
+        self.db_pool.simple_update_txn(
             txn,
             table="event_json",
             keyvalues={"event_id": event_id},
             updatevalues={"json": pruned_json},
         )
-
-        # SQL is updated in place above, so the embedded mirror (if any) must
-        # be updated to match -- otherwise get_event would keep serving the
-        # pre-censor/pre-expiry JSON forever from mtxdb. internal_metadata and
-        # format_version aren't changing here, so re-fetch them rather than
-        # thread them through every _censor_event_txn caller.
-        if getattr(self, "_embedded_event_json_enabled", False):
-            row = self.db_pool.simple_select_one_txn(
-                txn,
-                table="event_json",
-                keyvalues={"event_id": event_id},
-                retcols=("room_id", "internal_metadata", "format_version"),
-            )
-            room_id, internal_metadata, format_version = row
-            put_event_json_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
-                [(event_id, room_id, internal_metadata, pruned_json, format_version)],
-                sync=True,
-            )
+        return mirrored
 
     async def expire_event(self, event_id: str) -> None:
         """Retrieve and expire an event that has expired, and delete its associated
@@ -195,7 +276,7 @@ class CensorEventsStore(EventsWorkerStore, CacheInvalidationWorkerStore, SQLBase
         # Try to retrieve the event's content from the database or the event cache.
         event = await self.get_event(event_id)
 
-        def delete_expired_event_txn(txn: LoggingTransaction) -> None:
+        def delete_expired_event_txn(txn: LoggingTransaction) -> bool:
             # Delete the expiry timestamp associated with this event from the database.
             self._delete_event_expiry_txn(txn, event_id)
 
@@ -206,14 +287,18 @@ class CensorEventsStore(EventsWorkerStore, CacheInvalidationWorkerStore, SQLBase
                 logger.warning(
                     "Can't expire event %s because we don't have it.", event_id
                 )
-                return
+                return False
 
             # Prune the event's dict then convert it to JSON.
             pruned_json = json_encoder.encode(redact_event(event).get_pdu_json())
 
             # Update the event_json table to replace the event's JSON with the pruned
-            # JSON.
-            self._censor_event_txn(txn, event.event_id, pruned_json)
+            # JSON. Expiry runs once per expired event, so defers its fsync to the
+            # coalescer (`sync=False`) instead of paying a whole-device cache flush
+            # per event -- matching the batch censor path in `_update_censor_txn`.
+            mirrored = self._censor_event_txn(
+                txn, event.event_id, pruned_json, sync=False
+            )
 
             # We need to invalidate the event cache entry for this event because we
             # changed its content in the database. We can't call
@@ -225,10 +310,13 @@ class CensorEventsStore(EventsWorkerStore, CacheInvalidationWorkerStore, SQLBase
             self._send_invalidation_to_replication(
                 txn, "_get_event_cache", (event.event_id,)
             )
+            return mirrored
 
-        await self.db_pool.runInteraction(
+        mirrored = await self.db_pool.runInteraction(
             "delete_expired_event", delete_expired_event_txn
         )
+        if mirrored:
+            mark_dirty(Pool.EVENT_DAG)
 
     def _delete_event_expiry_txn(self, txn: LoggingTransaction, event_id: str) -> None:
         """Delete the expiry timestamp associated with an event ID without deleting the

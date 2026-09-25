@@ -36,6 +36,7 @@ from immutabledict import immutabledict
 from prometheus_client import Counter, Histogram
 
 from synapse.api.constants import EventTypes
+from synapse.api.errors import PartialStateConflictError
 from synapse.api.room_versions import KNOWN_ROOM_VERSIONS, StateResolutionVersions
 from synapse.events import EventBase
 from synapse.events.py_protocol import supports_msc4242_state_dag
@@ -252,14 +253,17 @@ class StateHandler:
             The hosts in the room at the given events
         """
         if len(event_ids) > 1:
-            rows = await self.store.db_pool.simple_select_many_batch(
-                table="event_to_state_groups",
-                column="event_id",
-                iterable=event_ids,
-                retcols=("event_id",),
-                desc="get_hosts_in_room_at_events_filter_outliers",
+            # Drop stateless outliers (e.g. out-of-band invites) before
+            # resolving, since they have no state group and would otherwise
+            # make `resolve_state_groups_for_events` raise. This must go
+            # through the store's embedded-aware lookup rather than querying
+            # `event_to_state_groups` directly: under the mtxdb-exclusive
+            # engine that SQL table is intentionally empty, so a direct query
+            # silently filters nothing and the resolution fails.
+            state_groups = await self.store._get_state_group_for_events(
+                event_ids, raise_on_missing=False
             )
-            non_outlier_event_ids = {r[0] for r in rows}
+            non_outlier_event_ids = set(state_groups)
             if non_outlier_event_ids:
                 event_ids = non_outlier_event_ids
 
@@ -359,11 +363,21 @@ class StateHandler:
                 if non_outlier_prev_events:
                     state_prev_event_ids = frozenset(non_outlier_prev_events)
 
-            entry = await self.resolve_state_groups_for_events(
-                event.room_id,
-                state_prev_event_ids,
-                await_full_state=False,
-            )
+            try:
+                entry = await self.resolve_state_groups_for_events(
+                    event.room_id,
+                    state_prev_event_ids,
+                    await_full_state=False,
+                )
+            except RuntimeError as e:
+                # If resolving state groups fails because the room is undergoing a
+                # partial-state transition or un-partial-stating race, raise
+                # PartialStateConflictError so the caller's retry loop can re-attempt.
+                if partial_state or await self.store.is_partial_state_room(
+                    event.room_id
+                ):
+                    raise PartialStateConflictError() from e
+                raise
 
             # Ensure we still have the state groups we're relying on, and bump
             # their usage time to avoid them being deleted from under us.

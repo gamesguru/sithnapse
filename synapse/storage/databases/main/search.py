@@ -41,6 +41,7 @@ from synapse.storage.database import (
     LoggingDatabaseConnection,
     LoggingTransaction,
 )
+from synapse.storage.databases.main.embedded_event_json import get_event_json_batch
 from synapse.storage.databases.main.events_worker import EventRedactBehaviour
 from synapse.storage.engines import PostgresEngine, Sqlite3Engine
 from synapse.types import JsonDict
@@ -168,7 +169,7 @@ class SearchBackgroundUpdateStore(SearchWorkerStore):
             sql = """
             SELECT stream_ordering, event_id, room_id, type, json, origin_server_ts
             FROM events
-            JOIN event_json USING (room_id, event_id)
+            LEFT JOIN event_json USING (room_id, event_id)
             WHERE ? <= stream_ordering AND stream_ordering < ?
             AND (%s)
             ORDER BY stream_ordering DESC
@@ -187,6 +188,21 @@ class SearchBackgroundUpdateStore(SearchWorkerStore):
 
             min_stream_id = rows[-1][0]
 
+            missing_json_ids = [
+                event_id for _, event_id, _, _, json_str, _ in rows if json_str is None
+            ]
+            json_by_id = {}
+            if missing_json_ids and getattr(
+                self, "_embedded_event_json_enabled", False
+            ):
+                found = get_event_json_batch(
+                    self._embedded_hamt_engine,
+                    self._embedded_hamt_namespace,
+                    missing_json_ids,
+                )
+                for eid, (_, j, _) in found.items():
+                    json_by_id[eid] = j
+
             event_search_rows = []
             for (
                 stream_ordering,
@@ -198,6 +214,10 @@ class SearchBackgroundUpdateStore(SearchWorkerStore):
             ) in rows:
                 try:
                     try:
+                        if json is None:
+                            json = json_by_id.get(event_id)
+                        if not json:
+                            continue
                         event_json = db_to_json(json)
                         content = event_json["content"]
                     except Exception:

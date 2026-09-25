@@ -711,6 +711,103 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                 out("")
 
 
+def _flatten_container_timings(root: str) -> str:
+    """Merge per-container timing directories into one flat directory.
+
+    Complement writes ``<root>/<container>/<kind>_<pid>.json``. Every container
+    has its own PID namespace, so PIDs repeat across containers; give each
+    container a distinct numeric prefix so ``_aggregate_and_print_timings`` (which
+    expects one flat directory keyed by PID) sees every process.
+    """
+    flat = tempfile.mkdtemp(prefix="synapse_timings_flat_")
+    containers = sorted(
+        d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))
+    )
+    for index, container in enumerate(containers):
+        cdir = os.path.join(root, container)
+        for fname in os.listdir(cdir):
+            m = re.fullmatch(r"(.+)_(\d+)\.json", fname)
+            if not m:
+                continue
+            kind, pid = m.group(1), int(m.group(2))
+            shutil.copyfile(
+                os.path.join(cdir, fname),
+                os.path.join(flat, f"{kind}_{index:05d}{pid:07d}.json"),
+            )
+    return flat
+
+
+def _print_mtxdb_engine_stats(timings_dir: str) -> None:
+    """Sum the per-process mtxdb engine stats (``mtxdb_<pid>.json``)."""
+    totals: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    processes = 0
+    for fname in sorted(os.listdir(timings_dir)):
+        if not (fname.startswith("mtxdb_") and fname.endswith(".json")):
+            continue
+        try:
+            with open(os.path.join(timings_dir, fname), encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception as e:
+            print(f"Warning: failed to read {fname}: {e}", file=sys.stderr)
+            continue
+        processes += 1
+        for pool, ps in data.items():
+            if not isinstance(ps, dict):
+                continue
+            acc = totals[pool]
+            for key in ("get_calls", "get_misses", "cache_hits", "cache_misses"):
+                acc[key] += ps.get(key, 0) or 0
+            for key, value in (ps.get("sync_totals") or {}).items():
+                if isinstance(value, (int, float)):
+                    acc[f"sync_{key}"] += value
+    if not totals:
+        return
+
+    def fmt(us: float) -> str:
+        if us < 1000:
+            return f"{us:.0f}us"
+        if us < 1_000_000:
+            return f"{us / 1000:.1f}ms"
+        return f"{us / 1_000_000:.2f}s"
+
+    err = sys.stderr
+    print(
+        f"\n=== mtxdb runtime stats (summed over {processes} process(es)) ===", file=err
+    )
+    for pool in ("state", "event_dag", "auth_chain"):
+        pool_totals = totals.get(pool)
+        if not pool_totals:
+            continue
+        print(f"\n  [{pool}]", file=err)
+        print(
+            f"    get: {pool_totals['get_calls']:,.0f} calls, {pool_totals['get_misses']:,.0f} misses"
+            f" | cache: {pool_totals['cache_hits']:,.0f} hits, {pool_totals['cache_misses']:,.0f} misses",
+            file=err,
+        )
+        calls = pool_totals.get("sync_calls", 0)
+        if calls:
+            print(
+                f"    sync ({calls:,.0f} calls): total={fmt(pool_totals.get('sync_total_us', 0))}"
+                f" flush={fmt(pool_totals.get('sync_pack_flush_us', 0))}"
+                f" fsync={fmt(pool_totals.get('sync_pack_fsync_us', 0))}"
+                f" sidecar={fmt(pool_totals.get('sync_sidecar_us', 0))}"
+                f" delta={fmt(pool_totals.get('sync_delta_log_us', 0))}"
+                f" checkpoint={fmt(pool_totals.get('sync_checkpoint_us', 0))}",
+                file=err,
+            )
+    print("===============================\n", file=err)
+
+
+def aggregate_container_timings(root: str) -> None:
+    """Print the combined report for a Complement run's timing directory."""
+    flat = _flatten_container_timings(root)
+    try:
+        _aggregate_and_print_timings(flat)
+        _print_mtxdb_engine_stats(flat)
+    finally:
+        shutil.rmtree(flat, ignore_errors=True)
+
+
 def run() -> None:
     config = Options()
     try:
@@ -905,4 +1002,7 @@ def run() -> None:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--aggregate-timings":
+        aggregate_container_timings(sys.argv[2])
+        sys.exit(0)
     run()

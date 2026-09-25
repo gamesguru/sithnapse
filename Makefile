@@ -11,20 +11,26 @@ STYLE_RESET := $(shell tput sgr0 2>/dev/null || echo -e "\033[0m")
 
 .PHONY: format
 format: ##H Format with ruff
-	uv run ruff format .
-	uv run ruff check --fix .
+	uv run --no-sync ruff format .
+	uv run --no-sync ruff check --fix .
 	cargo +nightly fmt
 
 .PHONY: lint
 lint: ##H Lint the code with mypy
-	uv run mypy
+	uv run --no-sync mypy
 	cargo +nightly clippy --all-targets --all-features
 
 
 .PHONY: sync
-sync:	##H Runs: uv run maturin develop
+sync:	##H Sync deps (uv) then build the Rust extension (maturin develop)
+	# Install/refresh dependencies without touching the project package: uv
+	# and `maturin develop` otherwise fight over who owns the editable
+	# `matrix-synapse` install, so every subsequent `uv run` would uninstall
+	# and reinstall it. `--no-install-project` leaves the package to maturin;
+	# `--inexact` keeps it from being treated as extraneous and removed.
+	uv sync --no-install-project --inexact
 	@rm -f target/maturin/libsynapse.so target/release/libsynapse.so
-	@RUSTC_WRAPPER= uv run maturin develop --release
+	@RUSTC_WRAPPER= uv run --no-sync maturin develop --release
 	@test -s target/maturin/libsynapse.so || { \
 		echo "maturin produced an empty libsynapse.so" >&2; \
 		exit 1; \
@@ -64,19 +70,37 @@ TRIAL_JOBS := $(shell if [ -n "$(TRIAL_JOBS_REQUESTED)" ]; then \
 test: ##H Run tests, e.g., on tests/storage/
 	cargo +nightly test
 	if [ -n "$$SYNAPSE_POSTGRES" ] && [ -z "$$SYNAPSE_POSTGRES_HOST" ]; then eval "$$(scripts-dev/start_test_postgres.sh)" || exit 1; fi; \
-	uv run python scripts-dev/trial_ctrlc.py $(if $(TRIAL_JOBS),-j $(TRIAL_JOBS),) $(p)
+	uv run --no-sync python scripts-dev/trial_ctrlc.py $(if $(TRIAL_JOBS),-j $(TRIAL_JOBS),) $(p)
 
 # Match Complement's package and in-package parallelism to an explicit GNU
-# Make -jN value for monolith runs. Worker-mode Complement deployments start
-# many Synapse processes per homeserver, so keep their default at 2 even when
-# make is invoked with -jN; callers can explicitly override this with
-# COMPLEMENT_PARALLEL.
+# Make -jN value. A plain `make complement` keeps the script's conservative
+# default of 2; callers can also override COMPLEMENT_PARALLEL directly.
 COMPLEMENT_MAKE_JOBS := $(shell printf '%s\n' "$(MAKEFLAGS)" | sed -n 's/.*-j\([0-9][0-9]*\).*/\1/p')
-COMPLEMENT_DEFAULT_PARALLEL := $(if $(WORKERS),2,$(if $(COMPLEMENT_MAKE_JOBS),$(COMPLEMENT_MAKE_JOBS),2))
+COMPLEMENT_DEFAULT_PARALLEL := $(if $(COMPLEMENT_MAKE_JOBS),$(COMPLEMENT_MAKE_JOBS),2)
 
 .PHONY: complement
 complement: ##H Run Complement tests (use -jN to set Complement parallelism)
 	COMPLEMENT_PARALLEL=$${COMPLEMENT_PARALLEL:-$(COMPLEMENT_DEFAULT_PARALLEL)} ./scripts-dev/complement.sh $(COMPLEMENT_ARGS)
+
+.PHONY: _complement/cleanup
+_complement/cleanup: ##H Stop Complement and remove its labeled containers/networks
+	@set -euo pipefail; \
+	lock_file="$${TMPDIR:-/tmp}/synapse-complement.lock"; \
+	if command -v fuser >/dev/null 2>&1 && [ -e "$$lock_file" ]; then \
+		fuser -TERM "$$lock_file" 2>/dev/null || true; \
+		for _ in 1 2 3 4 5; do \
+			if ! fuser "$$lock_file" >/dev/null 2>&1; then break; fi; \
+			sleep 1; \
+		done; \
+		fuser -KILL "$$lock_file" 2>/dev/null || true; \
+	fi; \
+	exec 9>"$$lock_file"; \
+	flock -n 9 || { echo "Complement lock is still owned; refusing cleanup" >&2; exit 1; }; \
+	runtime="$${CONTAINER_RUNTIME:-docker}"; \
+	if command -v "$$runtime" >/dev/null 2>&1; then \
+		"$$runtime" ps -aq --filter label=complement_pkg | xargs -r "$$runtime" rm -f; \
+		"$$runtime" network ls -q --filter label=complement_pkg | xargs -r "$$runtime" network rm || true; \
+	fi
 
 
 .PHONY: build
@@ -85,7 +109,7 @@ build: ##H Build the package
 
 .PHONY: all
 all:	##H Run the main targets
-all: format lint sync test
+all: sync format lint test
 
 
 .PHONY: publish
@@ -95,6 +119,7 @@ publish: build ##H Upload the package to PyPI using twine
 
 .PHONY: clean
 clean: ##H Clean the virtual environment and caches
+	cargo clean
 	#rm -rf $(VENV)
 	find . -type f -name '*.pyc' -delete
 	find . -type d -name '__pycache__' -exec rm -rf {} +

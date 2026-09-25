@@ -360,13 +360,25 @@ class RedactionTestCase(unittest.HomeserverTestCase):
             event,
         )
 
-        event_json = self.get_success(
-            self.store.db_pool.simple_select_one_onecol(
-                table="event_json",
-                keyvalues={"event_id": msg_event.event_id},
-                retcol="json",
+        if getattr(self.store, "_embedded_event_json_enabled", False):
+            from synapse.storage.databases.main.embedded_event_json import (
+                get_event_json_batch,
             )
-        )
+
+            found = get_event_json_batch(
+                self.store._embedded_hamt_engine,
+                self.store._embedded_hamt_namespace,
+                [msg_event.event_id],
+            )
+            event_json = found[msg_event.event_id][1]
+        else:
+            event_json = self.get_success(
+                self.store.db_pool.simple_select_one_onecol(
+                    table="event_json",
+                    keyvalues={"event_id": msg_event.event_id},
+                    retcol="json",
+                )
+            )
 
         self.assert_dict(
             {"content": {"body": "t", "msgtype": "message"}}, json.loads(event_json)
@@ -378,13 +390,25 @@ class RedactionTestCase(unittest.HomeserverTestCase):
         self.reactor.advance(60 * 60 * 24 * 31)
         self.reactor.advance(60 * 60 * 2)
 
-        event_json = self.get_success(
-            self.store.db_pool.simple_select_one_onecol(
-                table="event_json",
-                keyvalues={"event_id": msg_event.event_id},
-                retcol="json",
+        if getattr(self.store, "_embedded_event_json_enabled", False):
+            from synapse.storage.databases.main.embedded_event_json import (
+                get_event_json_batch,
             )
-        )
+
+            found = get_event_json_batch(
+                self.store._embedded_hamt_engine,
+                self.store._embedded_hamt_namespace,
+                [msg_event.event_id],
+            )
+            event_json = found[msg_event.event_id][1]
+        else:
+            event_json = self.get_success(
+                self.store.db_pool.simple_select_one_onecol(
+                    table="event_json",
+                    keyvalues={"event_id": msg_event.event_id},
+                    retcol="json",
+                )
+            )
 
         self.assert_dict({"content": {}}, json.loads(event_json))
 

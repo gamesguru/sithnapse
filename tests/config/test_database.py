@@ -52,6 +52,21 @@ class DatabaseConfigTestCase(unittest.TestCase):
             config["embedded_hamt"] = embedded_hamt
 
         old_env = os.environ.copy()
+        # These tests assert on the embedded-engine *environment* handling, so
+        # start from a clean slate for every variable DatabaseConfig consults
+        # rather than inheriting whatever the runner exported. In particular
+        # tests/utils.py sets SYNAPSE_MTXDB_WAL=1 whenever the engine is on, so
+        # without this an "unset WAL must be rejected" case would silently pass
+        # in a developer shell and fail in CI (or vice versa).
+        for var in (
+            "SYNAPSE_EMBEDDED_HAMT_ENGINE",
+            "SYNAPSE_EMBEDDED_HAMT_PATH",
+            "SYNAPSE_MTXDB",
+            "SYNAPSE_MTXDB_PATH",
+            "SYNAPSE_MTXDB_WAL",
+            "SYNAPSE_MTXDB_NO_SYNC",
+        ):
+            os.environ.pop(var, None)
         if env:
             os.environ.update(env)
         try:
@@ -99,7 +114,12 @@ class DatabaseConfigTestCase(unittest.TestCase):
             )
 
     def test_engine_mtxdb_ok(self) -> None:
-        """engine set to 'mtxdb' with a path → no error."""
+        """engine set to 'mtxdb' with a path → no error. WAL is not required
+        here: DatabaseConfig alone can't tell whether this is a worker
+        deployment, so that check lives in WorkerConfig instead (see
+        EmbeddedHamtWorkerGuardTestCase) -- WAL is only mandatory in a
+        worker deployment, since a single process never goes through the
+        cross-process gate WAL's overlay closes."""
         dc = self._read_config(
             embedded_hamt={"engine": "mtxdb", "path": "/tmp/test"},
         )
@@ -135,8 +155,14 @@ class EmbeddedHamtWorkerGuardTestCase(unittest.TestCase):
         stream_writers: dict | None = None,
         run_background_tasks_on: str | None = None,
         embedded_hamt_engine: str | None = "mtxdb",
+        wal_env: str | None = "1",
     ) -> None:
-        """Build a WorkerConfig and call read_config, triggering the guard."""
+        """Build a WorkerConfig and call read_config, triggering the guard.
+
+        `wal_env` defaults to a truthy value so every test exercising one of
+        the *other* guards isn't incidentally tripped by the WAL-required
+        check too; the WAL-specific tests below override it explicitly.
+        """
         from unittest.mock import Mock
 
         from synapse.config.workers import WorkerConfig
@@ -154,7 +180,16 @@ class EmbeddedHamtWorkerGuardTestCase(unittest.TestCase):
             config["stream_writers"] = stream_writers
         if run_background_tasks_on is not None:
             config["run_background_tasks_on"] = run_background_tasks_on
-        worker_config.read_config(config, allow_secrets_in_config=True)
+
+        old_env = os.environ.copy()
+        os.environ.pop("SYNAPSE_MTXDB_WAL", None)
+        if wal_env is not None:
+            os.environ["SYNAPSE_MTXDB_WAL"] = wal_env
+        try:
+            worker_config.read_config(config, allow_secrets_in_config=True)
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
 
     def test_worker_app_with_single_events_writer_ok(self) -> None:
         """embedded_hamt + worker_app, default (single) events writer →
@@ -253,3 +288,55 @@ class EmbeddedHamtWorkerGuardTestCase(unittest.TestCase):
             stream_writers={"events": ["event_persister1", "event_persister2"]},
             embedded_hamt_engine=None,
         )
+
+    def test_single_process_wal_unset_ok(self) -> None:
+        """embedded_hamt + no worker deployment + SYNAPSE_MTXDB_WAL unset →
+        no error. WAL is only required in a worker deployment: a single
+        process never goes through the cross-process
+        get_many_with_refresh gate that WAL's read-committed overlay
+        closes, so requiring it here would cost the journal for no
+        corresponding benefit."""
+        self._make_worker_config(wal_env=None)
+
+    def test_worker_deployment_wal_unset_raises(self) -> None:
+        """embedded_hamt + a worker deployment + SYNAPSE_MTXDB_WAL unset →
+        ConfigError: without the journal, a read-only worker's
+        get_many_with_refresh gate can keep reporting a committed write
+        as absent for up to the checkpoint rewrite budget."""
+        with self.assertRaises(ConfigError):
+            self._make_worker_config(
+                worker_app="synapse.app.generic_worker",
+                instance_map={"main": {"host": "127.0.0.1", "port": 8008}},
+                wal_env=None,
+            )
+
+    def test_worker_deployment_wal_falsey_raises(self) -> None:
+        """embedded_hamt + a worker deployment + a falsey SYNAPSE_MTXDB_WAL
+        → ConfigError."""
+        for falsey in ("", "0", "false", "no", "off", " OFF "):
+            with self.assertRaises(ConfigError):
+                self._make_worker_config(
+                    worker_app="synapse.app.generic_worker",
+                    instance_map={"main": {"host": "127.0.0.1", "port": 8008}},
+                    wal_env=falsey,
+                )
+
+    def test_worker_deployment_wal_truthy_ok(self) -> None:
+        """embedded_hamt + a worker deployment + a truthy SYNAPSE_MTXDB_WAL
+        → no error. The accepted set must match mtxdb_syn.rs's
+        wal_enabled_from()."""
+        for truthy in ("1", "true", "yes", "on", "enabled", " TRUE "):
+            self._make_worker_config(
+                worker_app="synapse.app.generic_worker",
+                instance_map={"main": {"host": "127.0.0.1", "port": 8008}},
+                wal_env=truthy,
+            )
+
+    def test_instance_map_worker_deployment_wal_unset_raises(self) -> None:
+        """embedded_hamt + non-empty instance_map (no worker_app, still a
+        worker deployment) + SYNAPSE_MTXDB_WAL unset → ConfigError."""
+        with self.assertRaises(ConfigError):
+            self._make_worker_config(
+                instance_map={"main": {"host": "127.0.0.1", "port": 8008}},
+                wal_env=None,
+            )

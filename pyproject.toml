@@ -290,6 +290,15 @@ dev = [
     "types-requests>=2.26.0",
     "types-setuptools>=57.4.0",
 
+    # Postgres driver, installed in dev so that a plain `uv sync`/`make sync`
+    # doesn't leave `make test` failing with "Cannot create PostgresEngine --
+    # psycopg2 module is not installed". Kept out of the runtime dependencies
+    # (it lives in the `postgres` extra) so wheels don't require building
+    # psycopg2 from source. PyPy uses psycopg2cffi.
+    "psycopg2>=2.8;platform_python_implementation != 'PyPy'",
+    "psycopg2cffi>=2.8;platform_python_implementation == 'PyPy'",
+    "psycopg2cffi-compat==1.1;platform_python_implementation == 'PyPy'",
+
     # Dependencies which are exclusively required by unit test code. This is
     # NOT a list of all modules that are necessary to run the unit tests.
     # Tests assume that all optional dependencies are installed.

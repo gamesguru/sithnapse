@@ -52,6 +52,7 @@ from synapse.storage.databases.main.embedded_common import (
     lock_wait_timing,
     mark_dirty,
     mirror_timing,
+    sync_event_dag_now,
     sync_now,
 )
 
@@ -276,8 +277,14 @@ def open_embedded_event_edges_engine(hs: HomeServer) -> bool:
 
 def embedded_event_edges_is_writable(hs: HomeServer) -> bool:
     """Return whether this process is permitted to write to embedded event-edges."""
-    return open_embedded_event_edges_engine(hs) and not getattr(
-        hs.config.database, "read_only", False
+    # The embedded event DAG has a single writer: the events stream writer.
+    # ``database.read_only`` is not sufficient here. Worker processes can have
+    # a normal SQL connection while opening mtxdb read-only, and attempting a
+    # repair write from one of those workers raises in the Rust binding.
+    return (
+        open_embedded_event_edges_engine(hs)
+        and not getattr(hs.config.database, "read_only", False)
+        and hs.get_instance_name() in hs.config.worker.writers.events
     )
 
 
@@ -323,14 +330,15 @@ def delete_event_edges_batch(
     or threshold flush interleaves, and drops any queued row that writes an
     edge FOR a purged event (those mirror the SQL `event_edges` rows the purge
     is deleting).  Rows queued for events that are merely referencing the
-    purged ids are kept and flushed before the tombstone.
+    purged ids remain queued for the normal coalescer.
 
     The purged ids are marked as "purging" for the duration of the barrier and
     promoted to permanent tombstones only after the FFI delete succeeds:
     `queue_edge_write` takes the same flush lock and drops rows matching either
     marker, so a transaction whose post-commit enqueue lands after the cancel
     step cannot resurrect the event, while a failed delete still lets repair
-    writes through.
+    writes through. `event_edges_put` appends against the post-delete forward
+    list, so leaving unrelated rows queued cannot resurrect a purged child.
     """
     if not event_ids:
         return
@@ -361,20 +369,7 @@ def delete_event_edges_batch(
                 else:
                     _edge_write_queues.pop(namespace, None)
 
-        # 2. Drain the remaining queue under the same lock so the delete below
-        #    observes a settled forward-edge state.
-        try:
-            _flush_namespace_locked(namespace)
-        except Exception:
-            # Non-purged rows stay queued for the coalescer retry; the
-            # destructive delete below must still run.
-            logger.warning(
-                "Failed to flush queued edge writes before purge of %d events",
-                len(event_ids),
-                exc_info=True,
-            )
-
-        # 3. Delete the purged events' edges.  Only promote the purging marker
+        # 2. Delete the purged events' edges. Only promote the purging marker
         #    to a permanent tombstone once the delete has actually returned:
         #    if it fails, the stale edges are still there and a tombstone would
         #    suppress the repair writes that recover from the failure.
@@ -383,9 +378,48 @@ def delete_event_edges_batch(
                 from synapse.synapse_rust.mtxdb_engine import event_edges_delete
 
                 _et = time.monotonic()
-                event_edges_delete(namespace, event_ids)
+                phase_timings = event_edges_delete(namespace, event_ids)
                 elapsed = time.monotonic() - _et
                 ffi_timing("ffi_event_edges_delete", elapsed)
+                ffi_timing(
+                    "ffi_event_edges_delete_lock_wait", phase_timings["lock_wait"]
+                )
+                ffi_timing(
+                    "ffi_event_edges_delete_locator_read",
+                    phase_timings["locator_read"],
+                )
+                # Delete no longer reads or rewrites any parent's forward
+                # list (see embedded_edges.rs's `event_edges_delete` doc
+                # comment) -- there is no forward_read/mutate_write/
+                # forward_nodes phase left to report. backward_read was
+                # renamed to backward_tombstone_write: it always was a
+                # write, never a read.
+                ffi_timing(
+                    "ffi_event_edges_delete_backward_tombstone_write",
+                    phase_timings["backward_tombstone_write"],
+                )
+                # closure_duration times all work inside py.detach (the three
+                # phases above plus untimed glue between them); detached_duration
+                # times py.detach itself from outside. Their difference isolates
+                # GIL-reacquisition/return overhead from mtxdb/Rust work, and
+                # comparing detached_duration to `elapsed` above isolates
+                # anything left in the FFI boundary itself -- see
+                # embedded_edges.rs's `event_edges_delete` doc comment.
+                ffi_timing(
+                    "ffi_event_edges_delete_closure_duration",
+                    phase_timings["closure_duration"],
+                )
+                ffi_timing(
+                    "ffi_event_edges_delete_detached_duration",
+                    phase_timings["detached_duration"],
+                )
+                # The Rust dict is typed float | int; the count is an integer.
+                room_count = int(phase_timings["rooms"])
+                ffi_count("event_edges_delete_rooms", room_count)
+                # Per-call batch shape, so a slow delete can be matched to the
+                # event/room counts that produced it.
+                ffi_batch_size("event_edges_delete_events", len(event_ids))
+                ffi_batch_size("event_edges_delete_rooms", room_count)
                 ffi_count("event_edges_deleted", len(event_ids))
         except Exception:
             with lock_wait_timing(_edge_write_queues_lock, "edge_queues"):
@@ -415,7 +449,9 @@ def delete_event_edges_batch(
             for event_id in purged:
                 tombstones[event_id] = deadline
 
-        sync_now(pools=[Pool.EVENT_DAG])
+        # Sync the deletion itself without forcing unrelated queued edge rows
+        # through the FFI. The coalescer will drain those rows later.
+        sync_event_dag_now()
 
 
 def get_event_edges_backward_batch(

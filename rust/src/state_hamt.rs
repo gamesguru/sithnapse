@@ -168,7 +168,7 @@ fn build_typed_root_nodes_and_lattice(
     room_id: &str,
     entries: Vec<(String, String, String)>,
 ) -> Result<(TypedRoot, LtHash, Vec<PersistedNodeBytes>), String> {
-    let room_key = room_structural_key_raw(room_id);
+    let room_key = room_typed_key(room_id);
     let mut by_type: std::collections::BTreeMap<String, Vec<(String, String)>> =
         std::collections::BTreeMap::new();
     // The state-group identity is the unkeyed LtHash lattice over every
@@ -209,9 +209,19 @@ fn build_typed_root_nodes_and_lattice(
 }
 
 #[must_use]
-pub fn room_structural_key_raw(room_id: &str) -> [u8; 32] {
-    let hash = Sha256::digest(room_id.as_bytes());
-    hash.into()
+/// Return the canonical rezzy structural namespace for a room.
+///
+/// Rezzy's HAMT API takes this namespace as caller-provided bytes. For the
+/// Matrix state HAMT it is the canonical room ID itself, not a digest of it.
+pub fn room_structural_key_raw(room_id: &str) -> Vec<u8> {
+    room_id.as_bytes().to_vec()
+}
+
+/// The typed-root directory uses HMAC-SHA256 as its private subtree namespace
+/// and therefore still needs a fixed-width key. This is separate from the
+/// canonical flat HAMT structural key above.
+fn room_typed_key(room_id: &str) -> [u8; 32] {
+    Sha256::digest(room_id.as_bytes()).into()
 }
 
 /// Derive a fixed-width, room-scoped prefix used to lay out this room's HAMT
@@ -259,7 +269,7 @@ pub fn room_hamt_prefix_raw(
         }
         prefix.copy_from_slice(&decoded[..PREFIX_LEN]);
     } else {
-        let full_key = room_structural_key_raw(room_id);
+        let full_key = room_typed_key(room_id);
         prefix.copy_from_slice(&full_key[..PREFIX_LEN]);
     }
 
@@ -578,7 +588,7 @@ fn apply_typed_state_updates_impl(
     lattice_bytes: &[u8],
     updates: Vec<(String, String, Option<String>)>,
 ) -> Result<ApplyTypedOutcome, String> {
-    let room_key = room_structural_key_raw(room_id);
+    let room_key = room_typed_key(room_id);
     let mut lattice = lattice_from_bytes(lattice_bytes)?;
 
     let typed_root = TypedRoot::decode_v1(typed_root_bytes)?;
@@ -905,7 +915,7 @@ fn structural_hash_from_bytes(hash_bytes: Vec<u8>) -> Result<StructuralHash, PyE
 #[pyfunction]
 #[pyo3(text_signature = "(room_id, /)")]
 pub fn room_structural_key(room_id: &str) -> PyResult<Vec<u8>> {
-    Ok(room_structural_key_raw(room_id).to_vec())
+    Ok(room_structural_key_raw(room_id))
 }
 
 /// See `room_hamt_prefix_raw` for the derivation. `msc4291_room_ids_as_hashes`
@@ -1133,14 +1143,26 @@ pub fn materialize_state_entries(
 /// catch: corrupted/substituted bytes for a node this room's own tree
 /// actually depends on.
 fn lookup_state_entries_impl(
-    structural_key: &[u8; 32],
+    structural_key: &[u8],
+    typed_key: &[u8; 32],
     root_node_bytes: &[u8],
     nodes: Vec<(StructuralHash, Vec<u8>)>,
     keys: &[(String, String)],
 ) -> Result<(Vec<PyStateEntry>, Vec<StructuralHash>), String> {
-    let root_node = decode_persisted_node_with_key(root_node_bytes, structural_key)?;
-    let root_hash = root_node.structural_hash;
-    let mut node_map = HashMap::from([(root_hash, root_node)]);
+    let typed_root = TypedRoot::decode_v1(root_node_bytes).ok();
+    let root_node = if typed_root.is_none() {
+        Some(decode_persisted_node_with_key(
+            root_node_bytes,
+            structural_key,
+        )?)
+    } else {
+        None
+    };
+    let root_hash = root_node.as_ref().map(|node| node.structural_hash);
+    let mut node_map = root_node
+        .as_ref()
+        .map(|node| HashMap::from([(node.structural_hash, node.clone())]))
+        .unwrap_or_default();
     let mut raw_bytes: HashMap<StructuralHash, Vec<u8>> = HashMap::new();
     for (hash, node_bytes) in nodes {
         let node = decode_persisted_node_unverified(&node_bytes, hash)?;
@@ -1148,11 +1170,38 @@ fn lookup_state_entries_impl(
         node_map.insert(hash, node);
     }
 
-    let (entries, missing) = lookup_from_node_map(&root_hash, structural_key, keys, &node_map)?;
-
-    if let Ok(typed_root) = TypedRoot::decode_v1(root_node_bytes) {
+    if let Some(typed_root) = typed_root {
+        let directory: HashMap<String, StructuralHash> =
+            typed_root.directory.iter().cloned().collect();
+        let mut entries = Vec::new();
+        let mut missing = HashSet::new();
+        for (event_type, state_key) in keys {
+            let Some(subtree_root_hash) = directory.get(event_type) else {
+                continue;
+            };
+            // Typed subtrees are built from `(state_key, event_id)` pairs, so
+            // their HAMT key is the raw state key. The flat HAMT instead uses
+            // the JSON `(event_type, state_key)` tuple.
+            let encoded_key = state_key.clone();
+            let mut resolver = |hash: &StructuralHash| {
+                node_map.get(hash).cloned().ok_or_else(|| {
+                    missing.insert(*hash);
+                })
+            };
+            let Some(subtree_root) = node_map.get(subtree_root_hash) else {
+                missing.insert(*subtree_root_hash);
+                continue;
+            };
+            if let Ok(Some(event_id)) = subtree_root.search(
+                &typed_subtree_key(typed_key, event_type),
+                &encoded_key,
+                &mut resolver,
+            ) {
+                entries.push((event_type.clone(), state_key.clone(), event_id));
+            }
+        }
         for (event_type, subtree_root_hash) in typed_root.directory {
-            let subtree_key = typed_subtree_key(structural_key, &event_type);
+            let subtree_key = typed_subtree_key(typed_key, &event_type);
             let mut seen = HashSet::from([subtree_root_hash]);
             let mut stack = vec![subtree_root_hash];
             while let Some(hash) = stack.pop() {
@@ -1169,7 +1218,10 @@ fn lookup_state_entries_impl(
                 }
             }
         }
+        Ok((entries, missing.into_iter().collect()))
     } else {
+        let root_hash = root_hash.expect("flat root was decoded above");
+        let (entries, missing) = lookup_from_node_map(&root_hash, structural_key, keys, &node_map)?;
         // A flat root uses the room structural key directly. As above, verify
         // only nodes actually reachable from this root: the fetched batch can
         // legitimately contain nodes for other rooms.
@@ -1188,9 +1240,8 @@ fn lookup_state_entries_impl(
                 }
             }
         }
+        Ok((entries, missing.into_iter().collect()))
     }
-
-    Ok((entries, missing.into_iter().collect()))
 }
 
 #[pyfunction]
@@ -1202,6 +1253,7 @@ pub fn lookup_state_entries(
     keys: Vec<(String, String)>,
 ) -> PyResult<PyStateLookup> {
     let structural_key = room_structural_key_raw(room_id);
+    let typed_key = room_typed_key(room_id);
     let nodes = nodes
         .into_iter()
         .map(|(hash_bytes, node_bytes)| {
@@ -1209,7 +1261,7 @@ pub fn lookup_state_entries(
         })
         .collect::<PyResult<Vec<_>>>()?;
     let (entries, missing) =
-        lookup_state_entries_impl(&structural_key, &root_node_bytes, nodes, &keys)
+        lookup_state_entries_impl(&structural_key, &typed_key, &root_node_bytes, nodes, &keys)
             .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
     Ok((
         entries,
@@ -1524,7 +1576,7 @@ mod tests {
             "initial directory should contain the removed event type"
         );
         let empty_subtree_hash = rezzy::hamt::build_hamt(
-            &typed_subtree_key(&room_structural_key_raw(room_id), "m.room.join_rules"),
+            &typed_subtree_key(&room_typed_key(room_id), "m.room.join_rules"),
             Vec::<(String, String)>::new(),
         )
         .expect("empty typed subtree should build")
@@ -1857,7 +1909,7 @@ mod tests {
 
         assert_eq!(key1, key2);
         assert_ne!(key1, other_key);
-        assert_eq!(key1.len(), 32);
+        assert_eq!(key1, room_id.as_bytes());
     }
 
     #[test]
@@ -1976,6 +2028,38 @@ mod tests {
             flat_state_group_id, [0u8; 32],
             "state_group_id must not be the digest of the zero lattice"
         );
+    }
+
+    #[test]
+    fn typed_root_lookup_uses_subtree_namespace_before_flat_decode() {
+        let room_id = "!typed-lookup:test.example";
+        let entries = vec![
+            (
+                "m.room.member".to_owned(),
+                "@alice:test.example".to_owned(),
+                "$member".to_owned(),
+            ),
+            ("m.room.name".to_owned(), String::new(), "$name".to_owned()),
+        ];
+        let (root, _lattice, nodes) =
+            build_typed_root_nodes_and_lattice(room_id, entries).expect("typed root builds");
+        let result = lookup_state_entries_impl(
+            &room_structural_key_raw(room_id),
+            &room_typed_key(room_id),
+            &root.encode_v1().expect("typed root encodes"),
+            nodes.into_iter().collect(),
+            &[("m.room.member".to_owned(), "@alice:test.example".to_owned())],
+        )
+        .expect("typed lookup succeeds");
+        assert_eq!(
+            result.0,
+            vec![(
+                "m.room.member".to_owned(),
+                "@alice:test.example".to_owned(),
+                "$member".to_owned()
+            )]
+        );
+        assert!(result.1.is_empty());
     }
 
     #[test]
@@ -2131,7 +2215,11 @@ mod tests {
             .1 = root_bytes.clone();
 
         let structural_key = room_structural_key_raw(room_id);
-        assert!(lookup_state_entries_impl(&structural_key, &root_bytes, nodes, &[]).is_err());
+        let typed_key = room_typed_key(room_id);
+        assert!(
+            lookup_state_entries_impl(&structural_key, &typed_key, &root_bytes, nodes, &[])
+                .is_err()
+        );
     }
 
     #[test]
@@ -2174,13 +2262,17 @@ mod tests {
             nodes.into_iter().chain(other_nodes).collect();
 
         let structural_key = room_structural_key_raw(room_id);
+        let typed_key = room_typed_key(room_id);
         let keys = vec![("m.room.name".to_owned(), "".to_owned())];
 
-        let (entries, missing) =
-            lookup_state_entries_impl(&structural_key, &root_node_bytes, combined_nodes, &keys)
-                .expect(
-                    "lookup must not fail just because the batch also carries another room's nodes",
-                );
+        let (entries, missing) = lookup_state_entries_impl(
+            &structural_key,
+            &typed_key,
+            &root_node_bytes,
+            combined_nodes,
+            &keys,
+        )
+        .expect("lookup must not fail just because the batch also carries another room's nodes");
         assert!(missing.is_empty());
         assert_eq!(
             entries,

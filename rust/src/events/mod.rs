@@ -114,7 +114,9 @@ pub(crate) struct EventResolverData {
     /// field to trust explicitly, rather than guessing from which one happens
     /// to be non-empty.
     pub(crate) msc4242_state_dags: bool,
-    pub(crate) content: Value,
+    /// Cloning this Arc-backed object shares the content tree with the event;
+    /// state resolution does not serialize or rebuild JSON for typed events.
+    pub(crate) content: JsonObject,
     pub(crate) rejected: bool,
     pub(crate) soft_failed: bool,
 }
@@ -655,6 +657,10 @@ impl Event {
 }
 
 impl Event {
+    /// Extract the fields needed by state resolution.
+    ///
+    /// `content` is shared through `JsonObject`'s `Arc`; the event metadata and
+    /// event-reference lists are converted to owned strings for `LeanEvent`.
     pub(crate) fn resolver_data(&self) -> PyResult<EventResolverData> {
         let origin_server_ts = u64::try_from(self.origin_server_ts()).map_err(|_| {
             PyValueError::new_err(format!(
@@ -665,10 +671,7 @@ impl Event {
         let depth = u64::try_from(self.depth()).map_err(|_| {
             PyValueError::new_err(format!("event {} has a negative depth", self.event_id))
         })?;
-        let content =
-            serde_json::to_value(&self.parsed_event.common_fields.content).map_err(|err| {
-                PyValueError::new_err(format!("Failed to serialize event content: {err}"))
-            })?;
+        let content = self.parsed_event.common_fields.content.clone();
 
         Ok(EventResolverData {
             event_id: self.event_id.to_string(),
