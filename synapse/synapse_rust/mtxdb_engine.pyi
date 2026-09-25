@@ -89,6 +89,11 @@ def get_state_hamt_roots_for_room(
     room_prefix: bytes,
     state_groups: list[int],
 ) -> list[bytes | None]: ...
+def get_state_hamt_roots_by_state_group_id(
+    namespace: str,
+    room_prefix: bytes,
+    state_group_ids: list[bytes],
+) -> list[bytes | None]: ...
 def get_state_hamt_roots_bulk(
     namespace: str,
     state_groups: list[int],
