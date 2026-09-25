@@ -140,7 +140,7 @@ class ReplicationFederationSendEventsRestServlet(ReplicationEndpoint):
             event_and_contexts = []
             # All events in this request are for the same room (`room_id` above), so
             # pending mirror replays across every event are collected here and
-            # replayed in a single `redo_embedded_hamt_mirror_writes_batch` call
+            # replayed in a single `redo_embedded_db_mirror_writes_batch` call
             # after the loop, rather than once per event -- each call is its own
             # `runInteraction`/DB transaction, and this room may see many events
             # (e.g. a backfill/outlier burst) in one replication request.
@@ -161,7 +161,7 @@ class ReplicationFederationSendEventsRestServlet(ReplicationEndpoint):
                     self._storage_controllers, event_payload["context"]
                 )
 
-                if context.pending_embedded_hamt_mirror_roots is not None:
+                if context.pending_embedded_db_mirror_roots is not None:
                     # Federation workers may have created this state group (or its
                     # predecessors) while holding a read-only mtxdb handle. Replay the
                     # deferred mirrors on the events writer before the event becomes
@@ -169,7 +169,7 @@ class ReplicationFederationSendEventsRestServlet(ReplicationEndpoint):
                     # Sort by state group so that the predecessor is always
                     # mirror-written before the child group that depends on it.
                     for sg, payload in sorted(
-                        context.pending_embedded_hamt_mirror_roots.items()
+                        context.pending_embedded_db_mirror_roots.items()
                     ):
                         prev_sg = None
                         delta: StateMap[str] | None = None
@@ -331,7 +331,7 @@ class ReplicationFederationSendEventsRestServlet(ReplicationEndpoint):
                         continue
                     seen_groups.add(sg)
                     deduped_replays.append(replay)
-                await self._state_store.redo_embedded_hamt_mirror_writes_batch(
+                await self._state_store.redo_embedded_db_mirror_writes_batch(
                     room_id,
                     room_ver,
                     deduped_replays,

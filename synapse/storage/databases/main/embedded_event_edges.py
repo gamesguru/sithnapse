@@ -91,7 +91,7 @@ _EDGE_WRITE_THRESHOLD: int = 64
 EdgeRow = tuple[str, str, str, bool]
 # Queues are keyed by namespace rather than owned by a coalescer instance.
 # Namespaces partition the embedded data (and are unique per homeserver /
-# config, see `DatabaseConfig.embedded_hamt_namespace`), and the mtxdb engine
+# config, see `DatabaseConfig.embedded_db_namespace`), and the mtxdb engine
 # itself is a process-global OnceCell, so (engine, namespace) is already the
 # ownership boundary: two homeservers sharing a process cannot collide here
 # without also colliding in mtxdb.  A per-coalescer queue would not change
@@ -270,8 +270,8 @@ def _flush_namespace_locked(namespace: str, *, sync: bool = False) -> bool:
 def open_embedded_event_edges_engine(hs: HomeServer) -> bool:
     """Return whether the embedded event-edges backend is available for readers and writers."""
     return bool(
-        hs.config.database.embedded_hamt_engine == "mtxdb"
-        and hs.config.database.embedded_hamt_path
+        hs.config.database.embedded_db_engine == "mtxdb"
+        and hs.config.database.embedded_db_path
     )
 
 

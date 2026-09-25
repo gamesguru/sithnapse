@@ -12,7 +12,7 @@
 # <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
 
-"""Central resolver for the embedded HAMT engine's PyO3 module.
+"""Central resolver for the embedded DB engine's PyO3 module.
 
 Every consumer of the embedded engine (the state HAMT layer in
 `state/store.py`, `state/bg_updates.py`, and the mirrors in
@@ -21,7 +21,7 @@ Every consumer of the embedded engine (the state HAMT layer in
 directly by name. That scattered the engine name across a dozen files and
 made swapping engines a whole-repo refactor.
 
-This module is the single place that maps an `embedded_hamt.engine` config
+This module is the single place that maps an `embedded_db.engine` config
 value to its PyO3 submodule and validates unknown names with a consistent
 error. Consumers resolve the module here and never import it directly, so
 switching engines (or renaming the module) is a one-file change.
@@ -31,10 +31,10 @@ from types import ModuleType
 
 
 def get_embedded_engine(engine_name: str | None) -> ModuleType:
-    """Return the PyO3 module implementing the named embedded HAMT engine.
+    """Return the PyO3 module implementing the named embedded DB engine.
 
     Args:
-        engine_name: the `embedded_hamt.engine` config value (e.g. "mtxdb").
+        engine_name: the `embedded_db.engine` config value (e.g. "mtxdb").
             Callers only invoke this after gating on the engine being
             configured, so `None` shouldn't reach here; if it does, it fails
             loudly below rather than as an AttributeError in a hot path.
@@ -52,5 +52,5 @@ def get_embedded_engine(engine_name: str | None) -> ModuleType:
 
         return mtxdb_engine
     raise RuntimeError(
-        f"Unknown embedded_hamt_engine: {engine_name!r} (supported engine(s): mtxdb)"
+        f"Unknown embedded_db_engine: {engine_name!r} (supported engine(s): mtxdb)"
     )

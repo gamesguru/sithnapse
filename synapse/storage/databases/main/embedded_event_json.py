@@ -71,11 +71,11 @@ that. So a mirror gap (e.g. an id that predates this feature) stays a
 permanent SQL fallback rather than self-healing; closing that gap needs an
 explicit, serialized backfill job, not a read-path write.
 
-Reuses the same `embedded_hamt_engine`/`embedded_hamt_path` config and mtxdb
+Reuses the same `embedded_db_engine`/`embedded_db_path` config and mtxdb
 keyspace the state store already opens (one flat keyspace, prefixed keys --
 `hamt:node:...`, `hamt:root:...`, `event_json:...` -- rather than a second
 mtxdb directory/config knob), and is on whenever that is -- see
-`open_embedded_event_json_engine`. Namespacing via `embedded_hamt_namespace`
+`open_embedded_event_json_engine`. Namespacing via `embedded_db_namespace`
 keeps multiple homeservers sharing one mtxdb file from colliding on event_id.
 """
 
@@ -115,17 +115,16 @@ _FORCE_SYNC_EVENT_JSON = os.environ.get(
 
 def open_embedded_event_json_engine(hs: "HomeServer") -> bool:
     """Return whether the optional embedded event-JSON backend is enabled --
-    on whenever the embedded engine itself is (`embedded_hamt_engine` +
-    `embedded_hamt_path` configured), same as every other embedded mirror.
+    on whenever the embedded engine itself is (`embedded_db_engine` +
+    `embedded_db_path` configured), same as every other embedded mirror.
 
-    Keys are namespaced by `embedded_hamt_namespace` (see `_event_json_key`),
+    Keys are namespaced by `embedded_db_namespace` (see `_event_json_key`),
     same scheme `embedded_event_to_state_group.py`/
     `embedded_event_auth_chain_links.py` already use, so multiple
     homeservers sharing one mtxdb file don't collide on event_id.
     """
     return bool(
-        hs.config.database.embedded_hamt_engine
-        and hs.config.database.embedded_hamt_path
+        hs.config.database.embedded_db_engine and hs.config.database.embedded_db_path
     )
 
 

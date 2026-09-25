@@ -1232,8 +1232,8 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
                 self, "_embedded_event_json_enabled", False
             ):
                 found = get_event_json_batch(
-                    self._embedded_hamt_engine,
-                    self._embedded_hamt_namespace,
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
                     missing_json_ids,
                 )
                 for eid, (_, j, _) in found.items():
@@ -2110,8 +2110,8 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
                 self, "_embedded_event_json_enabled", False
             ):
                 found = get_event_json_batch(
-                    self._embedded_hamt_engine,
-                    self._embedded_hamt_namespace,
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
                     [event_id],
                 )
                 if event_id in found:
@@ -2678,8 +2678,8 @@ class RoomBackgroundUpdateStore(RoomWorkerStore):
             json_by_id = {}
             if missing_ids and getattr(self, "_embedded_event_json_enabled", False):
                 found = get_event_json_batch(
-                    self._embedded_hamt_engine,
-                    self._embedded_hamt_namespace,
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
                     missing_ids,
                 )
                 for eid, (_, j, _) in found.items():
@@ -2885,8 +2885,8 @@ class RoomBackgroundUpdateStore(RoomWorkerStore):
             json_by_id = {}
             if missing_ids and getattr(self, "_embedded_event_json_enabled", False):
                 found = get_event_json_batch(
-                    self._embedded_hamt_engine,
-                    self._embedded_hamt_namespace,
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
                     missing_ids,
                 )
                 for eid, (_, j, _) in found.items():
@@ -2970,8 +2970,8 @@ class RoomBackgroundUpdateStore(RoomWorkerStore):
             json_by_id = {}
             if missing_ids and getattr(self, "_embedded_event_json_enabled", False):
                 found = get_event_json_batch(
-                    self._embedded_hamt_engine,
-                    self._embedded_hamt_namespace,
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
                     missing_ids,
                 )
                 for eid, (_, j, _) in found.items():

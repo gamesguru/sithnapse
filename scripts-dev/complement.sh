@@ -468,25 +468,25 @@ main() {
   export PASS_SYNAPSE_LOG_TESTING=1
 
   # Only TEST-scoped controls may enter Complement containers. In particular,
-  # never inherit a developer's production embedded-HAMT path: a path without
+  # never inherit a developer's production embedded-db path: a path without
   # its engine is an invalid Synapse config, and a path with its engine could
   # mutate a real local store.
   SYNAPSE_MTXDB="${SYNAPSE_TEST_MTXDB:-}"
-  SYNAPSE_EMBEDDED_HAMT_ENGINE="${SYNAPSE_TEST_EMBEDDED_HAMT_ENGINE:-}"
-  SYNAPSE_EMBEDDED_HAMT_PATH="${SYNAPSE_TEST_EMBEDDED_HAMT_PATH:-}"
+  SYNAPSE_EMBEDDED_DB_ENGINE="${SYNAPSE_TEST_EMBEDDED_DB_ENGINE:-}"
+  SYNAPSE_EMBEDDED_DB_PATH="${SYNAPSE_TEST_EMBEDDED_DB_PATH:-}"
 
-  if [[ -n "${SYNAPSE_MTXDB:-}" && -z "$SYNAPSE_EMBEDDED_HAMT_ENGINE" ]]; then
-    SYNAPSE_EMBEDDED_HAMT_ENGINE="mtxdb"
+  if [[ -n "${SYNAPSE_MTXDB:-}" && -z "$SYNAPSE_EMBEDDED_DB_ENGINE" ]]; then
+    SYNAPSE_EMBEDDED_DB_ENGINE="mtxdb"
   fi
 
-  if [[ -n "$SYNAPSE_EMBEDDED_HAMT_ENGINE" ]]; then
-    export PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE="$SYNAPSE_EMBEDDED_HAMT_ENGINE"
-    # SYNAPSE_EMBEDDED_HAMT_PATH is read inside the Complement container, not
+  if [[ -n "$SYNAPSE_EMBEDDED_DB_ENGINE" ]]; then
+    export PASS_SYNAPSE_EMBEDDED_DB_ENGINE="$SYNAPSE_EMBEDDED_DB_ENGINE"
+    # SYNAPSE_EMBEDDED_DB_PATH is read inside the Complement container, not
     # on the host -- a caller who just wants to turn mtxdb on shouldn't have
     # to know or care about that. Default it to a path that's always
     # writable there (the image's WORKDIR) rather than making them supply an
     # in-container path themselves.
-    SYNAPSE_EMBEDDED_HAMT_PATH="${SYNAPSE_EMBEDDED_HAMT_PATH:-/data/embedded_hamt}"
+    SYNAPSE_EMBEDDED_DB_PATH="${SYNAPSE_EMBEDDED_DB_PATH:-/data/embedded_db}"
 
     # Optional: keep every container's mtxdb store on a host directory (e.g. a
     # large, slow disk) instead of Docker's overlay. Each container writes to
@@ -498,7 +498,7 @@ main() {
     if [[ -n "${COMPLEMENT_MTXDB_HOST_DIR:-}" ]]; then
       mkdir -p "$COMPLEMENT_MTXDB_HOST_DIR"
       export COMPLEMENT_HOST_MOUNTS="${COMPLEMENT_HOST_MOUNTS:+$COMPLEMENT_HOST_MOUNTS;}$COMPLEMENT_MTXDB_HOST_DIR:/mtxdb-host"
-      SYNAPSE_EMBEDDED_HAMT_PATH="/mtxdb-host/@HOSTNAME@"
+      SYNAPSE_EMBEDDED_DB_PATH="/mtxdb-host/@HOSTNAME@"
 
       # The Complement image starts as root and uses UID/GID to drop Synapse
       # privileges. Pass through the invoking user's numeric identity so
@@ -509,7 +509,7 @@ main() {
       export PASS_GID="${PASS_GID:-$(id -g)}"
     fi
 
-    export PASS_SYNAPSE_EMBEDDED_HAMT_PATH="$SYNAPSE_EMBEDDED_HAMT_PATH"
+    export PASS_SYNAPSE_EMBEDDED_DB_PATH="$SYNAPSE_EMBEDDED_DB_PATH"
   fi
 
   # Test-only durability escape hatch, matching the engine/path controls
@@ -567,7 +567,7 @@ main() {
   # configuration, not just a way to trigger the rejection. Same
   # truthy/falsey semantics as above.
   _default_mtxdb_wal=""
-  if [[ -n "$SYNAPSE_EMBEDDED_HAMT_ENGINE" ]]; then
+  if [[ -n "$SYNAPSE_EMBEDDED_DB_ENGINE" ]]; then
     _default_mtxdb_wal=1
   fi
   case "${SYNAPSE_TEST_MTXDB_WAL:-$_default_mtxdb_wal}" in
@@ -611,13 +611,13 @@ main() {
   synapse_revision="$(git -C "$repo_root" describe --tags --always --dirty 2>/dev/null || echo '<unknown>')"
   echo "Synapse revision: ${synapse_revision}" >&2
   local mtxdb_location=""
-  if [[ -n "${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:-}" ]]; then
-    mtxdb_location=" at ${PASS_SYNAPSE_EMBEDDED_HAMT_PATH:-<not set>}"
+  if [[ -n "${PASS_SYNAPSE_EMBEDDED_DB_ENGINE:-}" ]]; then
+    mtxdb_location=" at ${PASS_SYNAPSE_EMBEDDED_DB_PATH:-<not set>}"
     if [[ -n "${COMPLEMENT_MTXDB_HOST_DIR:-}" ]]; then
       mtxdb_location+=" (host: ${COMPLEMENT_MTXDB_HOST_DIR%/}/<container-hostname>)"
     fi
   fi
-  echo "Database: ${PASS_SYNAPSE_COMPLEMENT_DATABASE} (workers: ${PASS_SYNAPSE_COMPLEMENT_USE_WORKERS:-false}) | Embedded HAMT engine: ${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:-<none>}${mtxdb_location}${PASS_SYNAPSE_MTXDB_NO_SYNC:+ (no_sync)}${PASS_SYNAPSE_MTXDB_SYNC:+ (sync=$PASS_SYNAPSE_MTXDB_SYNC)}${PASS_SYNAPSE_MTXDB_WAL:+ (wal)}${PASS_SYNAPSE_MTXDB_STATS:+ (stats)}${PASS_SYNAPSE_MTXDB_FORCE_SYNC_EVENT_JSON:+ (force-sync-event-json)}" >&2
+  echo "Database: ${PASS_SYNAPSE_COMPLEMENT_DATABASE} (workers: ${PASS_SYNAPSE_COMPLEMENT_USE_WORKERS:-false}) | Embedded DB engine: ${PASS_SYNAPSE_EMBEDDED_DB_ENGINE:-<none>}${mtxdb_location}${PASS_SYNAPSE_MTXDB_NO_SYNC:+ (no_sync)}${PASS_SYNAPSE_MTXDB_SYNC:+ (sync=$PASS_SYNAPSE_MTXDB_SYNC)}${PASS_SYNAPSE_MTXDB_WAL:+ (wal)}${PASS_SYNAPSE_MTXDB_STATS:+ (stats)}${PASS_SYNAPSE_MTXDB_FORCE_SYNC_EVENT_JSON:+ (force-sync-event-json)}" >&2
 
   # Complement's Destroy() force-removes every homeserver container
   # unconditionally, pass or fail -- there is no "keep failed containers"

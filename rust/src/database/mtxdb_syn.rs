@@ -998,7 +998,7 @@ pub fn refresh_state_hamt_collections_for_groups(
 
 /// A flat, direct-offset `state_group -> room_prefix` index: entry N lives
 /// at byte offset `N * ROOM_PREFIX_LEN` in a per-namespace file under
-/// `<embedded_hamt_path>/room_index/<namespace_hash>.bin`. Exists so
+/// `<embedded_db_path>/room_index/<namespace_hash>.bin`. Exists so
 /// `_fetch_hamt_roots_for_embedded_txn` (bg_updates.py) -- which only ever
 /// has a bare `state_group` int, by design, and needs to resolve which
 /// room's mtxdb collection to look a root up in -- doesn't have to touch
@@ -1039,7 +1039,7 @@ pub fn refresh_state_hamt_collections_for_groups(
 ///    are written in the same uncommitted window. That's consistent, not
 ///    a new gap -- the root itself has no stronger guarantee in that same
 ///    window. A resulting miss for a group still inside the
-///    `EMBEDDED_HAMT_MIGRATION_UPDATE_NAME` window falls through to
+///    `EMBEDDED_DB_MIGRATION_UPDATE_NAME` window falls through to
 ///    `_fetch_hamt_roots_for_embedded_txn`'s SQL fallback, same as a
 ///    genuine migration-window miss.
 ///

@@ -101,8 +101,8 @@ with open('/sytest/scripts/synapse_sytest.sh', 'w') as f:
 PY
 
 echo "--- Patching /sytest/lib/SyTest/Homeserver/Synapse.pm to inject config"
-# When SYNAPSE_EMBEDDED_HAMT_ENGINE/SYNAPSE_EMBEDDED_HAMT_PATH are set, add an
-# `embedded_hamt` block to the homeserver config that sytest generates, so
+# When SYNAPSE_EMBEDDED_DB_ENGINE/SYNAPSE_EMBEDDED_DB_PATH are set, add an
+# `embedded_db` block to the homeserver config that sytest generates, so
 # the HAMT state backend runs against a real mtxdb database (mirrors
 # trial-mtxdb / complement-mtxdb). Synapse also reads these as plain
 # environment variables directly (see synapse/config/database.py), but
@@ -126,10 +126,10 @@ injection = '''        databases => \\%db_configs,
         # if a test specifically wants to exercise backoff behaviour.
         key_fetch_backoff_floor => ( length( $ENV{SYNAPSE_KEY_FETCH_BACKOFF_FLOOR} // '' ) ? $ENV{SYNAPSE_KEY_FETCH_BACKOFF_FLOOR} : "0s" ),
         ( do {
-            my $engine = $ENV{SYNAPSE_EMBEDDED_HAMT_ENGINE} // '';
-            my $path = $ENV{SYNAPSE_EMBEDDED_HAMT_PATH} // '';
+            my $engine = $ENV{SYNAPSE_EMBEDDED_DB_ENGINE} // '';
+            my $path = $ENV{SYNAPSE_EMBEDDED_DB_PATH} // '';
             ( length($engine) && length($path) )
-                ? ( embedded_hamt => { engine => $engine, path => $path } )
+                ? ( embedded_db => { engine => $engine, path => $path } )
                 : ();
         } ),'''
 

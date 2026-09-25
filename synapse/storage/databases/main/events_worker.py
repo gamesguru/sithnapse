@@ -249,15 +249,15 @@ class EventsWorkerStore(SQLBaseStore):
         self._embedded_event_json_enabled = open_embedded_event_json_engine(hs)
         self._embedded_event_edges_enabled = open_embedded_event_edges_engine(hs)
         self._embedded_event_edges_writable = embedded_event_edges_is_writable(hs)
-        self._embedded_hamt_engine = hs.config.database.embedded_hamt_engine
+        self._embedded_db_engine = hs.config.database.embedded_db_engine
         # Namespaces event_to_state_group/refcount keys in the embedded
         # engine -- see embedded_event_to_state_group.py's module docstring.
         # Independent from (but must agree with) the state datastore's own
         # hamt_namespace property: both default to the server name unless
-        # embedded_hamt.namespace is set in config, so they naturally agree
+        # embedded_db.namespace is set in config, so they naturally agree
         # without needing to share an instance.
-        self._embedded_hamt_namespace = (
-            hs.config.database.embedded_hamt_namespace or hs.hostname
+        self._embedded_db_namespace = (
+            hs.config.database.embedded_db_namespace or hs.hostname
         )
 
         txn = db_conn.cursor()
@@ -530,8 +530,8 @@ class EventsWorkerStore(SQLBaseStore):
         # falls through to the authoritative SQL row below.
         if getattr(self, "_embedded_event_json_enabled", False):
             found = get_redactions_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
                 [event_id],
             )
             if event_id in found:
@@ -1668,7 +1668,7 @@ class EventsWorkerStore(SQLBaseStore):
         still_missing = event_ids
         if self._embedded_event_json_enabled:
             found = get_event_json_batch(
-                self._embedded_hamt_engine, self._embedded_hamt_namespace, event_ids
+                self._embedded_db_engine, self._embedded_db_namespace, event_ids
             )
             still_missing = [e for e in event_ids if e not in found]
 
@@ -2611,7 +2611,7 @@ class EventsWorkerStore(SQLBaseStore):
                 )
 
                 forward_map = get_event_edges_forward_batch(
-                    self._embedded_hamt_namespace, [event.event_id]
+                    self._embedded_db_namespace, [event.event_id]
                 )
                 children = forward_map.get(event.event_id)
                 if children is not None:

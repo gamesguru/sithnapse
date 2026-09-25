@@ -244,7 +244,7 @@ class EventsBackgroundUpdatesStore(
             self._event_arbitrary_relations,
         )
 
-        if hs.config.database.embedded_hamt_engine == "mtxdb":
+        if hs.config.database.embedded_db_engine == "mtxdb":
             self.db_pool.updates.register_background_update_handler(
                 self.EMBEDDED_EVENT_TO_STATE_GROUP_MIGRATION_UPDATE_NAME,
                 self._background_migrate_event_to_state_groups_to_embedded,
@@ -424,7 +424,7 @@ class EventsBackgroundUpdatesStore(
         `embedded_event_to_state_group.py` needs, since that never existed
         in SQL at all).
 
-        See `_enqueue_embedded_hamt_migration_if_needed`
+        See `_enqueue_embedded_db_migration_if_needed`
         (storage/databases/state/store.py) for why this can't just check
         `has_completed_background_update` -- the same `_all_done` fast-path
         problem applies here.
@@ -448,7 +448,7 @@ class EventsBackgroundUpdatesStore(
         (`embedded_event_to_state_group.py`'s
         `increment_state_group_refcounts_batch`) that backs
         `get_referenced_state_groups` once this table is embedded-exclusive
-        -- for data written before `embedded_hamt_engine` was turned on.
+        -- for data written before `embedded_db_engine` was turned on.
         New writes never need this; they already go straight to the
         configured engine exclusively.
 
@@ -489,8 +489,8 @@ class EventsBackgroundUpdatesStore(
         # migrated last time. Only increment for event_ids this batch
         # hasn't already written to mtxdb.
         already_migrated = get_state_group_for_events_batch(
-            self._embedded_hamt_engine,
-            self._embedded_hamt_namespace,
+            self._embedded_db_engine,
+            self._embedded_db_namespace,
             [event_id for event_id, _state_group in rows],
             purpose="migration_probe",
         )
@@ -500,11 +500,11 @@ class EventsBackgroundUpdatesStore(
             if event_id not in already_migrated
         ]
         put_event_to_state_group_batch(
-            self._embedded_hamt_engine, self._embedded_hamt_namespace, rows
+            self._embedded_db_engine, self._embedded_db_namespace, rows
         )
         increment_state_group_refcounts_batch(
-            self._embedded_hamt_engine,
-            self._embedded_hamt_namespace,
+            self._embedded_db_engine,
+            self._embedded_db_namespace,
             [state_group for _event_id, state_group in new_rows],
         )
         # One sync for the whole batch (put + increment above), not one per
@@ -539,7 +539,7 @@ class EventsBackgroundUpdatesStore(
         self, progress: JsonDict, batch_size: int
     ) -> int:
         """Copy existing SQL `event_auth_chain_links` rows into the embedded
-        engine, for data written before `embedded_hamt_engine` was turned
+        engine, for data written before `embedded_db_engine` was turned
         on. New writes never need this; they already go straight to the
         configured engine exclusively (see `_persist_chain_cover_index` in
         events.py).
@@ -598,8 +598,8 @@ class EventsBackgroundUpdatesStore(
         )
 
         put_chain_links_batch(
-            self._embedded_hamt_engine,
-            self._embedded_hamt_namespace,
+            self._embedded_db_engine,
+            self._embedded_db_namespace,
             rows,
             sync=True,
         )
@@ -652,8 +652,8 @@ class EventsBackgroundUpdatesStore(
                 self, "_embedded_event_json_enabled", False
             ):
                 found = get_event_json_batch(
-                    self._embedded_hamt_engine,
-                    self._embedded_hamt_namespace,
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
                     missing_json_ids,
                 )
                 for eid, (_, j, _) in found.items():
@@ -863,8 +863,8 @@ class EventsBackgroundUpdatesStore(
                 self, "_embedded_event_json_enabled", False
             ):
                 found = get_event_json_batch(
-                    self._embedded_hamt_engine,
-                    self._embedded_hamt_namespace,
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
                     missing_meta_ids,
                 )
                 for eid, (m, _, _) in found.items():
@@ -925,8 +925,8 @@ class EventsBackgroundUpdatesStore(
                     self, "_embedded_event_json_enabled", False
                 ):
                     found = get_event_json_batch(
-                        self._embedded_hamt_engine,
-                        self._embedded_hamt_namespace,
+                        self._embedded_db_engine,
+                        self._embedded_db_namespace,
                         missing_meta_ids,
                     )
                     for eid, (m, _, _) in found.items():
@@ -1113,8 +1113,8 @@ class EventsBackgroundUpdatesStore(
                 self, "_embedded_event_json_enabled", False
             ):
                 found = get_event_json_batch(
-                    self._embedded_hamt_engine,
-                    self._embedded_hamt_namespace,
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
                     missing_meta_ids,
                 )
                 for eid, (m, _, _) in found.items():
@@ -1223,8 +1223,8 @@ class EventsBackgroundUpdatesStore(
                 self, "_embedded_event_json_enabled", False
             ):
                 found = get_event_json_batch(
-                    self._embedded_hamt_engine,
-                    self._embedded_hamt_namespace,
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
                     missing_json_ids,
                 )
                 for event_id, (_meta, body, _format_version) in found.items():
@@ -1336,8 +1336,8 @@ class EventsBackgroundUpdatesStore(
                 self, "_embedded_event_json_enabled", False
             ):
                 found = get_event_json_batch(
-                    self._embedded_hamt_engine,
-                    self._embedded_hamt_namespace,
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
                     missing_json_ids,
                 )
                 for eid, (_, j, _) in found.items():
@@ -1626,7 +1626,7 @@ class EventsBackgroundUpdatesStore(
             event_to_types,
             cast(dict[str, StrCollection], event_to_auth_chain),
             resolve_namespace(self),
-            self._embedded_hamt_engine,
+            self._embedded_db_engine,
         )
 
         return _CalculateChainCover(
@@ -1688,13 +1688,13 @@ class EventsBackgroundUpdatesStore(
                 resolve_namespace,
             )
 
-            embedded_hamt_namespace = resolve_namespace(self)
-            if embedded_hamt_namespace is not None:
+            embedded_db_namespace = resolve_namespace(self)
+            if embedded_db_namespace is not None:
                 # Exclusive by configured engine, not a dual-write -- see
                 # embedded_event_auth_chain_links.py.
                 delete_chain_links_batch(
-                    self._embedded_hamt_engine,
-                    embedded_hamt_namespace,
+                    self._embedded_db_engine,
+                    embedded_db_namespace,
                     unreferenced_chain_id_tuples,
                     sync=True,
                 )
@@ -1758,8 +1758,8 @@ class EventsBackgroundUpdatesStore(
                 self, "_embedded_event_json_enabled", False
             ):
                 found = get_event_json_batch(
-                    self._embedded_hamt_engine,
-                    self._embedded_hamt_namespace,
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
                     missing_json_ids,
                 )
                 for eid, (_, j, _) in found.items():
@@ -3310,8 +3310,8 @@ class EventsBackgroundUpdatesStore(
                 # signature) JSON forever from the embedded engine.
                 if getattr(self, "_embedded_event_json_enabled", False):
                     put_event_json_batch(
-                        self._embedded_hamt_engine,
-                        self._embedded_hamt_namespace,
+                        self._embedded_db_engine,
+                        self._embedded_db_namespace,
                         [
                             (
                                 event_id,

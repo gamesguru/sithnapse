@@ -57,7 +57,7 @@ from synapse.util.json import json_encoder
 
 import tests.unittest
 import tests.utils
-from tests.utils import EMBEDDED_HAMT_ENGINE
+from tests.utils import EMBEDDED_DB_ENGINE
 
 # The silly auth graph we use to test the auth difference algorithm,
 # where the top are the most recent events.
@@ -806,12 +806,12 @@ class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
         # insert the fixture the same way the production write path does
         # rather than always writing straight to the SQL table, otherwise
         # this test would only ever check the SQL backend under the
-        # trial-mtxdb CI job's `embedded_hamt_engine` config.
-        embedded_hamt_namespace = resolve_namespace(self.store)
-        if embedded_hamt_namespace is not None:
+        # trial-mtxdb CI job's `embedded_db_engine` config.
+        embedded_db_namespace = resolve_namespace(self.store)
+        if embedded_db_namespace is not None:
             put_chain_links_batch(
-                getattr(self.store, "_embedded_hamt_engine", None),
-                embedded_hamt_namespace,
+                getattr(self.store, "_embedded_db_engine", None),
+                embedded_db_namespace,
                 [
                     (
                         link.origin_chain_and_seq[0],
@@ -950,7 +950,7 @@ class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
                 )
             )
 
-    @unittest.skipUnless(EMBEDDED_HAMT_ENGINE, "requires embedded HAMT engine")
+    @unittest.skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
     def test_conflicted_subgraph_embedded_closures(self) -> None:
         """Embedded-closures counterpart to `test_conflicted_subgraph`.
 
@@ -972,11 +972,11 @@ class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
             get_or_create_short_ids,
         )
 
-        embedded_hamt_namespace = resolve_namespace(self.store)
-        if embedded_hamt_namespace is None:
+        embedded_db_namespace = resolve_namespace(self.store)
+        if embedded_db_namespace is None:
             self.skipTest("embedded closures namespace not configured")
 
-        engine_name = getattr(self.store, "_embedded_hamt_engine", None)
+        engine_name = getattr(self.store, "_embedded_db_engine", None)
         room_id = "!conflicted_subgraph_embedded_closures"
 
         # Direct auth edges reproducing the same ancestry as the chain
@@ -1002,12 +1002,12 @@ class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
         }
         event_ids = list(auth_edges)
         short_ids = get_or_create_short_ids(
-            engine_name, embedded_hamt_namespace, room_id, event_ids
+            engine_name, embedded_db_namespace, room_id, event_ids
         )
         short_id_of = dict(zip(event_ids, short_ids))
         embed_auth_edges_batch(
             engine_name,
-            embedded_hamt_namespace,
+            embedded_db_namespace,
             room_id,
             [
                 (short_id_of[event_id], [short_id_of[auth_id] for auth_id in auths])
@@ -1093,7 +1093,7 @@ class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
         def run_test(txn: LoggingTransaction, test_case: TestCase) -> None:
             result = self.store._get_auth_chain_difference_using_embedded_closures_txn(
                 txn,
-                embedded_hamt_namespace,
+                embedded_db_namespace,
                 room_id,
                 [test_case.conflicted.union(test_case.additional_backwards_reachable)],
                 test_case.conflicted,

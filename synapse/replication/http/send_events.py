@@ -158,14 +158,14 @@ class ReplicationSendEventsRestServlet(ReplicationEndpoint):
                     self._storage_controllers, event_payload["context"]
                 )
 
-                if context.pending_embedded_hamt_mirror_roots is not None:
+                if context.pending_embedded_db_mirror_roots is not None:
                     # The instance that created this event's state group (or its
                     # predecessors) opened mtxdb read-only and could not mirror-write
                     # it -- collect those writes here, to be redone on the events writer.
                     for (
                         sg,
                         pending_payload,
-                    ) in context.pending_embedded_hamt_mirror_roots.items():
+                    ) in context.pending_embedded_db_mirror_roots.items():
                         if sg in replays_by_room[(event.room_id, event.room_version)]:
                             continue
 
@@ -329,7 +329,7 @@ class ReplicationSendEventsRestServlet(ReplicationEndpoint):
                         raise RuntimeError(
                             "Cannot replay multiple legacy HAMT payloads"
                         )
-                    await self._state_store.redo_embedded_hamt_mirror_writes_batch(
+                    await self._state_store.redo_embedded_db_mirror_writes_batch(
                         room_id,
                         room_version,
                         replays,

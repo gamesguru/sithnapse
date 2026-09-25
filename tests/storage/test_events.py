@@ -47,7 +47,7 @@ from synapse.util.clock import Clock
 
 from tests.test_utils.event_builders import make_test_event, make_test_pdu_event
 from tests.unittest import HomeserverTestCase, skip_unless
-from tests.utils import EMBEDDED_HAMT_ENGINE
+from tests.utils import EMBEDDED_DB_ENGINE
 
 logger = logging.getLogger(__name__)
 
@@ -64,10 +64,10 @@ class EventsTestCase(HomeserverTestCase):
     ) -> None:
         self._store = self.hs.get_datastores().main
 
-    @skip_unless(bool(EMBEDDED_HAMT_ENGINE), "requires embedded HAMT engine")
+    @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
     def test_get_event_via_embedded_mtxdb_engine(self) -> None:
         """`_store_event_txn` mirrors event_json into mtxdb when
-        embedded_hamt_engine is configured; `_fetch_event_json_for_ids_txn`
+        embedded_db_engine is configured; `_fetch_event_json_for_ids_txn`
         reads it back on the `get_event` path. Deleting the SQL
         `event_json` row entirely and still fetching the event correctly
         proves the embedded-engine fast path is actually taken, not a
@@ -93,9 +93,9 @@ class EventsTestCase(HomeserverTestCase):
         persist_store = self.hs.get_datastores().persist_events
         assert persist_store is not None
         persist_store._embedded_event_json_enabled = True
-        persist_store._embedded_hamt_engine = "mtxdb"
+        persist_store._embedded_db_engine = "mtxdb"
         self._store._embedded_event_json_enabled = True
-        self._store._embedded_hamt_engine = "mtxdb"
+        self._store._embedded_db_engine = "mtxdb"
 
         user = self.register_user("embedded_event_json_user", "pass")
         token = self.login("embedded_event_json_user", "pass")
@@ -146,7 +146,7 @@ class EventsTestCase(HomeserverTestCase):
         persist_store = self.hs.get_datastores().persist_events
         assert persist_store is not None
         self.assertTrue(persist_store._embedded_event_json_enabled)
-        self.assertEqual(persist_store._embedded_hamt_engine, "mtxdb")
+        self.assertEqual(persist_store._embedded_db_engine, "mtxdb")
 
         user = self.register_user("de_outlier_user", "pass")
         token = self.login("de_outlier_user", "pass")
@@ -228,11 +228,11 @@ class EventsTestCase(HomeserverTestCase):
             )
             de_outlier_publish.assert_not_called()
 
-    @skip_unless(bool(EMBEDDED_HAMT_ENGINE), "requires embedded HAMT engine")
+    @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
     def test_de_outlier_syncs_state_barrier_by_default(self) -> None:
         self._check_de_outlier_state_barrier(publish_at_commit=False)
 
-    @skip_unless(bool(EMBEDDED_HAMT_ENGINE), "requires embedded HAMT engine")
+    @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
     def test_de_outlier_publishes_state_barrier_when_publishing_at_commit(
         self,
     ) -> None:
@@ -304,7 +304,7 @@ class EventsTestCase(HomeserverTestCase):
                 self.helper.send(room_id, "event json sync mode", tok=token)
         return calls, put_kwargs
 
-    @skip_unless(bool(EMBEDDED_HAMT_ENGINE), "requires embedded HAMT engine")
+    @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
     def test_default_mode_issues_one_in_txn_barrier_per_persist(self) -> None:
         """`always` pays one fsync per persist: a single barrier, in the transaction.
 
@@ -342,7 +342,7 @@ class EventsTestCase(HomeserverTestCase):
             calls.index(("call_after_mark_dirty", (Pool.AUTH_CHAIN,))),
         )
 
-    @skip_unless(bool(EMBEDDED_HAMT_ENGINE), "requires embedded HAMT engine")
+    @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
     def test_auth_event_is_published_in_txn_when_publishing_at_commit(self) -> None:
         """`interval`/`off` publish an auth event's writes; they must not `sync_now`.
 
@@ -367,7 +367,7 @@ class EventsTestCase(HomeserverTestCase):
         )
         self.assertFalse([call for call in calls if call[0] == "sync"])
 
-    @skip_unless(bool(EMBEDDED_HAMT_ENGINE), "requires embedded HAMT engine")
+    @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
     def test_auth_event_takes_one_in_txn_barrier_by_default(self) -> None:
         """`always` covers an auth event with one barrier over all three pools."""
         calls, _ = self._persist_message_recording_event_json_sync(
@@ -437,7 +437,7 @@ class EventsTestCase(HomeserverTestCase):
             )
         return publish, sync, dirty
 
-    @skip_unless(bool(EMBEDDED_HAMT_ENGINE), "requires embedded HAMT engine")
+    @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
     def test_partial_state_rewrite_publishes_when_publishing_at_commit(self) -> None:
         """`interval`/`off`: publish the rewritten mapping and leave fsync to the
         coalescer. A `sync_now` here fsyncs on the reactor thread under
@@ -451,7 +451,7 @@ class EventsTestCase(HomeserverTestCase):
         dirty.assert_called_once_with(Pool.STATE)
         sync.assert_not_called()
 
-    @skip_unless(bool(EMBEDDED_HAMT_ENGINE), "requires embedded HAMT engine")
+    @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
     def test_partial_state_rewrite_syncs_by_default(self) -> None:
         """`always` keeps the strict barrier and does not publish separately."""
         publish, sync, dirty = self._rewrite_partial_state_mapping(
@@ -462,7 +462,7 @@ class EventsTestCase(HomeserverTestCase):
         publish.assert_not_called()
         dirty.assert_not_called()
 
-    @skip_unless(bool(EMBEDDED_HAMT_ENGINE), "requires embedded HAMT engine")
+    @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
     def test_event_json_publish_precedes_commit_when_publishing_at_commit(
         self,
     ) -> None:
@@ -488,7 +488,7 @@ class EventsTestCase(HomeserverTestCase):
         mark = ("call_after_mark_dirty", (Pool.EVENT_DAG,))
         self.assertLess(calls.index(publish), calls.index(mark))
 
-    @skip_unless(bool(EMBEDDED_HAMT_ENGINE), "requires embedded HAMT engine")
+    @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
     def test_rolled_back_event_json_publish_leaves_unreachable_orphan(self) -> None:
         """A rolled-back persist can publish event JSON that no reader serves.
 
@@ -502,8 +502,8 @@ class EventsTestCase(HomeserverTestCase):
         path that learns an id (``get_event``) cannot find it.
         """
         self.assertTrue(self._store._embedded_event_json_enabled)
-        namespace = self._store._embedded_hamt_namespace
-        engine = self._store._embedded_hamt_engine
+        namespace = self._store._embedded_db_namespace
+        engine = self._store._embedded_db_engine
         user = self.register_user("orphan_json_user", "pass")
         token = self.login("orphan_json_user", "pass")
         room_id = self.helper.create_room_as(user, tok=token)

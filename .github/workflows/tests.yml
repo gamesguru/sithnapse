@@ -501,8 +501,8 @@ jobs:
           SYNAPSE_POSTGRES_HOST: /var/run/postgresql
           SYNAPSE_POSTGRES_USER: postgres
           SYNAPSE_POSTGRES_PASSWORD: postgres
-          SYNAPSE_TEST_EMBEDDED_HAMT_ENGINE: ${{ matrix.job.database == 'mtxdb' && 'mtxdb' || '' }}
-          SYNAPSE_TEST_EMBEDDED_HAMT_PATH: ${{ matrix.job.database == 'mtxdb' && '/tmp/synapse-embedded-hamt' || '' }}
+          SYNAPSE_TEST_EMBEDDED_DB_ENGINE: ${{ matrix.job.database == 'mtxdb' && 'mtxdb' || '' }}
+          SYNAPSE_TEST_EMBEDDED_DB_PATH: ${{ matrix.job.database == 'mtxdb' && '/tmp/synapse-embedded-db' || '' }}
       - name: Dump PostgreSQL statistics
         if: ${{ always() && matrix.job.database == 'postgres' }}
         run: .ci/scripts/dump_postgres_stats.sh /tmp/postgres-stats.txt || true
@@ -532,7 +532,7 @@ jobs:
 
   trial-mtxdb:
     # Runs the trial suite with the embedded mtxdb engine for HAMT state
-    # storage (see embedded_hamt_engine in synapse/config/database.py), so
+    # storage (see embedded_db_engine in synapse/config/database.py), so
     # tests that exercise it -- e.g.
     # test_state_group_hamt_corruption_does_not_fallback_to_sql in
     # tests/storage/test_state.py -- actually run against mtxdb rather than
@@ -572,8 +572,8 @@ jobs:
           done
       - run: uv run trial --jobs="$(nproc)" tests
         env:
-          SYNAPSE_TEST_EMBEDDED_HAMT_ENGINE: mtxdb
-          SYNAPSE_TEST_EMBEDDED_HAMT_PATH: /tmp/synapse-embedded-hamt
+          SYNAPSE_TEST_EMBEDDED_DB_ENGINE: mtxdb
+          SYNAPSE_TEST_EMBEDDED_DB_PATH: /tmp/synapse-embedded-db
       - name: Dump logs
         # Logs are most useful when the command fails, always include them.
         if: ${{ always() }}
@@ -712,8 +712,8 @@ jobs:
         ASYNCIO_REACTOR: ${{ (matrix.job.reactor == 'asyncio') || '' }}
         WORKERS: ${{ matrix.job.workers && 1 }}
         BLACKLIST: ${{ matrix.job.workers && 'synapse-blacklist-with-workers' }}
-        SYNAPSE_EMBEDDED_HAMT_ENGINE: ${{ matrix.job.embedded_hamt && 'mtxdb' }}
-        SYNAPSE_EMBEDDED_HAMT_PATH: ${{ matrix.job.embedded_hamt && '/tmp/synapse-embedded-hamt' }}
+        SYNAPSE_EMBEDDED_DB_ENGINE: ${{ matrix.job.embedded_db && 'mtxdb' }}
+        SYNAPSE_EMBEDDED_DB_PATH: ${{ matrix.job.embedded_db && '/tmp/synapse-embedded-db' }}
         TOP: ${{ github.workspace }}
 
     strategy:

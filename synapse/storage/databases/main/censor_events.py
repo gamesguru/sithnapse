@@ -164,8 +164,8 @@ class CensorEventsStore(EventsWorkerStore, CacheInvalidationWorkerStore, SQLBase
                 # keyed by the redacted event id -- see embedded_redactions.py.
                 if getattr(self, "_embedded_event_json_enabled", False):
                     set_have_censored_batch(
-                        self._embedded_hamt_engine,
-                        self._embedded_hamt_namespace,
+                        self._embedded_db_engine,
+                        self._embedded_db_namespace,
                         [event_id],
                         True,
                     )
@@ -201,8 +201,8 @@ class CensorEventsStore(EventsWorkerStore, CacheInvalidationWorkerStore, SQLBase
         mirrored = False
         if getattr(self, "_embedded_event_json_enabled", False):
             found = get_event_json_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
                 [event_id],
             )
             if event_id in found:
@@ -216,8 +216,8 @@ class CensorEventsStore(EventsWorkerStore, CacheInvalidationWorkerStore, SQLBase
                 )
                 if room_id is not None:
                     put_event_json_batch(
-                        self._embedded_hamt_engine,
-                        self._embedded_hamt_namespace,
+                        self._embedded_db_engine,
+                        self._embedded_db_namespace,
                         [
                             (
                                 event_id,
@@ -241,8 +241,8 @@ class CensorEventsStore(EventsWorkerStore, CacheInvalidationWorkerStore, SQLBase
                 if row:
                     room_id, internal_metadata, format_version = row
                     put_event_json_batch(
-                        self._embedded_hamt_engine,
-                        self._embedded_hamt_namespace,
+                        self._embedded_db_engine,
+                        self._embedded_db_namespace,
                         [
                             (
                                 event_id,

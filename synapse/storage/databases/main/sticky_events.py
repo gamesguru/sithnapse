@@ -239,8 +239,8 @@ class StickyEventsWorkerStore(StateGroupWorkerStore, CacheInvalidationWorkerStor
         meta_by_id = {}
         if missing_meta_ids and getattr(self, "_embedded_event_json_enabled", False):
             found = get_event_json_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
                 missing_meta_ids,
             )
             for eid, (m, _, _) in found.items():
@@ -317,8 +317,8 @@ class StickyEventsWorkerStore(StateGroupWorkerStore, CacheInvalidationWorkerStor
         meta_by_id = {}
         if missing_ids and getattr(self, "_embedded_event_json_enabled", False):
             found = get_event_json_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
                 missing_ids,
             )
             for eid, (m, _, _) in found.items():

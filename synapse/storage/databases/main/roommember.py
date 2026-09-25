@@ -2068,8 +2068,8 @@ class RoomMemberBackgroundUpdateStore(SQLBaseStore):
                 self, "_embedded_event_json_enabled", False
             ):
                 found = get_event_json_batch(
-                    self._embedded_hamt_engine,
-                    self._embedded_hamt_namespace,
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
                     missing_json_ids,
                 )
                 for eid, (_, j, _) in found.items():

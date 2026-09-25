@@ -117,8 +117,8 @@ jobs:
           # bare ones to keep a developer's production env out of containers),
           # so the engine/path MUST use the SYNAPSE_TEST_ prefix or the
           # "hybrid, mtxdb" job silently boots plain SQLite.
-          SYNAPSE_TEST_EMBEDDED_HAMT_ENGINE: ${{ (contains(matrix.database, 'mtxdb')) && 'mtxdb' || '' }}
-          SYNAPSE_TEST_EMBEDDED_HAMT_PATH: ${{ (contains(matrix.database, 'mtxdb')) && '/data/embedded_hamt' || '' }}
+          SYNAPSE_TEST_EMBEDDED_DB_ENGINE: ${{ (contains(matrix.database, 'mtxdb')) && 'mtxdb' || '' }}
+          SYNAPSE_TEST_EMBEDDED_DB_PATH: ${{ (contains(matrix.database, 'mtxdb')) && '/data/embedded_db' || '' }}
           # Per-lane durability: all mtxdb lanes except the sync-on smoke alarm
           # disable fsync. complement.sh forwards NO_SYNC/STATS as their
           # in-container SYNAPSE_MTXDB_* equivalents.
@@ -147,8 +147,8 @@ jobs:
           # bare ones to keep a developer's production env out of containers),
           # so the engine/path MUST use the SYNAPSE_TEST_ prefix or the
           # "hybrid, mtxdb" job silently boots plain SQLite.
-          SYNAPSE_TEST_EMBEDDED_HAMT_ENGINE: ${{ (contains(matrix.database, 'mtxdb')) && 'mtxdb' || '' }}
-          SYNAPSE_TEST_EMBEDDED_HAMT_PATH: ${{ (contains(matrix.database, 'mtxdb')) && '/data/embedded_hamt' || '' }}
+          SYNAPSE_TEST_EMBEDDED_DB_ENGINE: ${{ (contains(matrix.database, 'mtxdb')) && 'mtxdb' || '' }}
+          SYNAPSE_TEST_EMBEDDED_DB_PATH: ${{ (contains(matrix.database, 'mtxdb')) && '/data/embedded_db' || '' }}
           # Per-lane durability: all mtxdb lanes except the sync-on smoke alarm
           # disable fsync. complement.sh forwards NO_SYNC/STATS as their
           # in-container SYNAPSE_MTXDB_* equivalents.

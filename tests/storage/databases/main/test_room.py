@@ -168,15 +168,15 @@ class RoomBackgroundUpdateStoreTestCase(HomeserverTestCase):
             )
 
             existing = get_event_json_batch(
-                self.store._embedded_hamt_engine,
-                self.store._embedded_hamt_namespace,
+                self.store._embedded_db_engine,
+                self.store._embedded_db_namespace,
                 [event_id],
             ).get(event_id)
             internal_metadata = existing[0] if existing else "{}"
             format_version = existing[2] if existing else None
             put_event_json_batch(
-                self.store._embedded_hamt_engine,
-                self.store._embedded_hamt_namespace,
+                self.store._embedded_db_engine,
+                self.store._embedded_db_namespace,
                 [
                     (
                         event_id,

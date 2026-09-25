@@ -89,11 +89,11 @@ class PurgeTests(HomeserverTestCase):
         assert persist_store is not None
         for store in (self.store, persist_store):
             store._embedded_event_json_enabled = True
-            store._embedded_hamt_engine = "mtxdb"
+            store._embedded_db_engine = "mtxdb"
 
-        engine = self.store._embedded_hamt_engine
+        engine = self.store._embedded_db_engine
         assert engine is not None
-        return engine, self.store._embedded_hamt_namespace
+        return engine, self.store._embedded_db_namespace
 
     def _seed_redaction_and_rejection_mirror(
         self, engine: str, namespace: str, target_id: str, redaction_id: str
@@ -534,20 +534,20 @@ class PurgeTests(HomeserverTestCase):
         # backend directly -- a raw SQL-only insert would silently stop
         # making this group look referenced the moment the embedded engine
         # is on, since real writes wouldn't touch SQL at all in that case.
-        if getattr(self.store, "_embedded_hamt_engine", None):
+        if getattr(self.store, "_embedded_db_engine", None):
             from synapse.storage.databases.main.embedded_event_to_state_group import (
                 increment_state_group_refcounts_batch,
                 put_event_to_state_group_batch,
             )
 
             put_event_to_state_group_batch(
-                self.store._embedded_hamt_engine,
-                self.store._embedded_hamt_namespace,
+                self.store._embedded_db_engine,
+                self.store._embedded_db_namespace,
                 [("$new_event", referenced_chain_state_group)],
             )
             increment_state_group_refcounts_batch(
-                self.store._embedded_hamt_engine,
-                self.store._embedded_hamt_namespace,
+                self.store._embedded_db_engine,
+                self.store._embedded_db_namespace,
                 [referenced_chain_state_group],
             )
         else:

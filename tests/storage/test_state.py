@@ -41,7 +41,7 @@ from synapse.util.clock import Clock
 from synapse.util.stringutils import random_string
 
 from tests.unittest import HomeserverTestCase
-from tests.utils import EMBEDDED_HAMT_ENGINE
+from tests.utils import EMBEDDED_DB_ENGINE
 
 logger = logging.getLogger(__name__)
 
@@ -70,13 +70,13 @@ class StateStoreTestCase(HomeserverTestCase):
 
     def _force_sql_only_hamt(self) -> None:
         """Some tests assert pure-SQL HAMT behaviour specifically and must
-        stay deterministic regardless of SYNAPSE_TEST_EMBEDDED_HAMT_ENGINE
+        stay deterministic regardless of SYNAPSE_TEST_EMBEDDED_DB_ENGINE
         (the trial-mtxdb CI job runs the *whole* suite through the embedded
         engine by default -- see tests/utils.py's default_config -- so a
         test that specifically wants SQL must force it off locally rather
         than assume it's already off).
         """
-        self.state_datastore._embedded_hamt_engine = None
+        self.state_datastore._embedded_db_engine = None
 
     def inject_state_event(
         self, room: RoomID, sender: UserID, typ: str, state_key: str, content: JsonDict
@@ -161,9 +161,9 @@ class StateStoreTestCase(HomeserverTestCase):
             {(EventTypes.Create, ""): e1.event_id, (EventTypes.Name, ""): e2.event_id},
         )
 
-    @unittest.skipUnless(EMBEDDED_HAMT_ENGINE, "requires embedded HAMT engine")
+    @unittest.skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
     def test_state_group_reads_via_embedded_mtxdb_engine(self) -> None:
-        """With `embedded_hamt_engine` configured before these events are
+        """With `embedded_db_engine` configured before these events are
         persisted, `_store_state_hamt_nodes_txn` writes exclusively to mtxdb
         (not SQL -- see `_persist_state_hamt_txn`), and reads resolve
         entirely through `_materialize_state_hamts_from_embedded_txn` /
@@ -178,9 +178,9 @@ class StateStoreTestCase(HomeserverTestCase):
         tmpdir = tempfile.mkdtemp(prefix="test-embedded-mtxdb-")
         self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
         mtxdb_engine.open_client(tmpdir)
-        self.state_datastore._embedded_hamt_engine = "mtxdb"
-        self.state_datastore._embedded_hamt_path = tmpdir
-        # Note: __init__ already set self._embedded_hamt_namespace to a
+        self.state_datastore._embedded_db_engine = "mtxdb"
+        self.state_datastore._embedded_db_path = tmpdir
+        # Note: __init__ already set self._embedded_db_namespace to a
         # unique per-test value (see tests/utils.py's default_config), which
         # keeps different tests' state_group ids from colliding on the same
         # mtxdb keys. Don't override it here -- rewriting it to a shared
@@ -213,7 +213,7 @@ class StateStoreTestCase(HomeserverTestCase):
         )
         self.assertEqual(
             mtxdb_engine.get_room_index(
-                self.state_datastore._embedded_hamt_namespace,
+                self.state_datastore._embedded_db_namespace,
                 [state_group],
             ),
             [expected_room_prefix],
@@ -246,9 +246,9 @@ class StateStoreTestCase(HomeserverTestCase):
             {(EventTypes.Name, ""): e2.event_id},
         )
 
-    @unittest.skipUnless(EMBEDDED_HAMT_ENGINE, "requires embedded HAMT engine")
+    @unittest.skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
     def test_embedded_engine_writes_are_exclusive_not_dual(self) -> None:
-        """Once `embedded_hamt_engine` is configured, new state groups are
+        """Once `embedded_db_engine` is configured, new state groups are
         written to mtxdb ONLY -- `state_hamt_roots`/`state_hamt_nodes` SQL
         rows are not also inserted (see `_persist_state_hamt_txn`).
         """
@@ -260,9 +260,9 @@ class StateStoreTestCase(HomeserverTestCase):
         tmpdir = tempfile.mkdtemp(prefix="test-exclusive-write-mtxdb-")
         self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
         mtxdb_engine.open_client(tmpdir)
-        self.state_datastore._embedded_hamt_engine = "mtxdb"
-        self.state_datastore._embedded_hamt_path = tmpdir
-        # Note: __init__ already set self._embedded_hamt_namespace to a
+        self.state_datastore._embedded_db_engine = "mtxdb"
+        self.state_datastore._embedded_db_path = tmpdir
+        # Note: __init__ already set self._embedded_db_namespace to a
         # unique per-test value (see tests/utils.py's default_config), which
         # keeps different tests' state_group ids from colliding on the same
         # mtxdb keys. Don't override it here -- rewriting it to a shared
@@ -303,9 +303,9 @@ class StateStoreTestCase(HomeserverTestCase):
             full_state[state_group], {(EventTypes.Create, ""): event.event_id}
         )
 
-    @unittest.skipUnless(EMBEDDED_HAMT_ENGINE, "requires embedded HAMT engine")
-    def test_embedded_hamt_migration_copies_existing_sql_data(self) -> None:
-        """A state group written before `embedded_hamt_engine` was turned on
+    @unittest.skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
+    def test_embedded_db_migration_copies_existing_sql_data(self) -> None:
+        """A state group written before `embedded_db_engine` was turned on
         stays SQL-only until `_background_migrate_state_hamt_to_embedded`
         runs; after it completes, the group is readable via mtxdb with SQL
         deleted out from under it -- proving the data actually moved, not
@@ -331,18 +331,18 @@ class StateStoreTestCase(HomeserverTestCase):
                 table="state_hamt_roots",
                 keyvalues={"state_group": state_group},
                 retcol="state_group",
-                desc="test_embedded_hamt_migration.check_sql_before",
+                desc="test_embedded_db_migration.check_sql_before",
             )
         )
         self.assertEqual(sql_root_before, state_group)
 
         # Now turn on the embedded engine and run the migration. In real
-        # deployments `embedded_hamt_engine` is set before the store is
+        # deployments `embedded_db_engine` is set before the store is
         # constructed, so __init__ registers the handler for
         # do_next_background_update to dispatch to; this test flips the
         # config after construction (same pattern the other embedded-engine
         # tests here use), so no handler was ever registered for this store
-        # instance. Exercise _enqueue_embedded_hamt_migration_if_needed
+        # instance. Exercise _enqueue_embedded_db_migration_if_needed
         # (real production code, still worth covering), but do not start its
         # poller: it would race this test's direct handler invocation and
         # repeatedly fail to dispatch the unregistered handler. Drive the
@@ -350,9 +350,9 @@ class StateStoreTestCase(HomeserverTestCase):
         tmpdir = tempfile.mkdtemp(prefix="test-hamt-migration-mtxdb-")
         self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
         mtxdb_engine.open_client(tmpdir)
-        self.state_datastore._embedded_hamt_engine = "mtxdb"
-        self.state_datastore._embedded_hamt_path = tmpdir
-        # Note: __init__ already set self._embedded_hamt_namespace to a
+        self.state_datastore._embedded_db_engine = "mtxdb"
+        self.state_datastore._embedded_db_path = tmpdir
+        # Note: __init__ already set self._embedded_db_namespace to a
         # unique per-test value (see tests/utils.py's default_config), which
         # keeps different tests' state_group ids from colliding on the same
         # mtxdb keys. Don't override it here -- rewriting it to a shared
@@ -363,7 +363,7 @@ class StateStoreTestCase(HomeserverTestCase):
             self.store.db_pool.updates, "start_doing_background_updates"
         ) as start_background_updates:
             self.get_success(
-                self.state_datastore._enqueue_embedded_hamt_migration_if_needed()
+                self.state_datastore._enqueue_embedded_db_migration_if_needed()
             )
         start_background_updates.assert_called_once_with()
 
@@ -372,7 +372,7 @@ class StateStoreTestCase(HomeserverTestCase):
         # Model that selection explicitly rather than relying on a concurrently
         # running poller to set this private dispatcher state.
         self.store.db_pool.updates._current_background_update = (
-            self.state_datastore.EMBEDDED_HAMT_MIGRATION_UPDATE_NAME
+            self.state_datastore.EMBEDDED_DB_MIGRATION_UPDATE_NAME
         )
         progress: dict = {}
         while True:
@@ -392,7 +392,7 @@ class StateStoreTestCase(HomeserverTestCase):
             self.store.db_pool.simple_delete(
                 table="state_hamt_roots",
                 keyvalues={"state_group": state_group},
-                desc="test_embedded_hamt_migration.delete_sql_root",
+                desc="test_embedded_db_migration.delete_sql_root",
             )
         )
 
@@ -405,7 +405,7 @@ class StateStoreTestCase(HomeserverTestCase):
             full_state[state_group], {(EventTypes.Create, ""): event.event_id}
         )
 
-    @unittest.skipUnless(EMBEDDED_HAMT_ENGINE, "requires embedded HAMT engine")
+    @unittest.skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
     def test_embedded_engine_root_lookup_does_not_need_sql(self) -> None:
         """`_store_state_hamt_root_embedded_txn` mirrors the HAMT root
         record into the embedded engine itself (under the `hamt:root:...`
@@ -422,9 +422,9 @@ class StateStoreTestCase(HomeserverTestCase):
         tmpdir = tempfile.mkdtemp(prefix="test-embedded-root-mtxdb-")
         self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
         mtxdb_engine.open_client(tmpdir)
-        self.state_datastore._embedded_hamt_engine = "mtxdb"
-        self.state_datastore._embedded_hamt_path = tmpdir
-        # Note: __init__ already set self._embedded_hamt_namespace to a
+        self.state_datastore._embedded_db_engine = "mtxdb"
+        self.state_datastore._embedded_db_path = tmpdir
+        # Note: __init__ already set self._embedded_db_namespace to a
         # unique per-test value (see tests/utils.py's default_config), which
         # keeps different tests' state_group ids from colliding on the same
         # mtxdb keys. Don't override it here -- rewriting it to a shared
@@ -709,8 +709,8 @@ class StateStoreTestCase(HomeserverTestCase):
         tmpdir = tempfile.mkdtemp(prefix=prefix)
         self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
         mtxdb_engine.open_client(tmpdir)
-        self.state_datastore._embedded_hamt_engine = "mtxdb"
-        self.state_datastore._embedded_hamt_path = tmpdir
+        self.state_datastore._embedded_db_engine = "mtxdb"
+        self.state_datastore._embedded_db_path = tmpdir
 
     def test_purge_unreferenced_state_groups_deletes_embedded_root(self) -> None:
         """Regression test: `purge_unreferenced_state_groups` used to call
@@ -742,7 +742,7 @@ class StateStoreTestCase(HomeserverTestCase):
 
         # Sanity check: the root really is there before purging.
         self.assertIsNotNone(
-            self.state_datastore._get_embedded_hamt_root(room_prefix, state_group)
+            self.state_datastore._get_embedded_db_root(room_prefix, state_group)
         )
 
         with patch.object(
@@ -758,7 +758,7 @@ class StateStoreTestCase(HomeserverTestCase):
         self.assertTrue(deleted)
 
         self.assertIsNone(
-            self.state_datastore._get_embedded_hamt_root(room_prefix, state_group)
+            self.state_datastore._get_embedded_db_root(room_prefix, state_group)
         )
         # e1's create-event state group must be untouched.
         prev_state_group = self.get_success(
@@ -766,7 +766,7 @@ class StateStoreTestCase(HomeserverTestCase):
         )
         assert prev_state_group is not None
         self.assertIsNotNone(
-            self.state_datastore._get_embedded_hamt_root(room_prefix, prev_state_group)
+            self.state_datastore._get_embedded_db_root(room_prefix, prev_state_group)
         )
 
     def test_drain_embedded_root_deletion_queue_deletes_and_empties_queue(
@@ -794,7 +794,7 @@ class StateStoreTestCase(HomeserverTestCase):
             self.room.to_string(), room_version.msc4291_room_ids_as_hashes
         )
         self.assertIsNotNone(
-            self.state_datastore._get_embedded_hamt_root(room_prefix, state_group)
+            self.state_datastore._get_embedded_db_root(room_prefix, state_group)
         )
 
         self.get_success(
@@ -810,7 +810,7 @@ class StateStoreTestCase(HomeserverTestCase):
         )
 
         self.assertIsNone(
-            self.state_datastore._get_embedded_hamt_root(room_prefix, state_group)
+            self.state_datastore._get_embedded_db_root(room_prefix, state_group)
         )
         remaining = self.get_success(
             self.store.db_pool.simple_select_list(
@@ -930,7 +930,7 @@ class StateStoreTestCase(HomeserverTestCase):
         )
         sg = 80001
         self.get_success(
-            self.state_datastore.redo_embedded_hamt_mirror_writes_batch(
+            self.state_datastore.redo_embedded_db_mirror_writes_batch(
                 room_id,
                 room_version,
                 [
@@ -947,7 +947,7 @@ class StateStoreTestCase(HomeserverTestCase):
                 ],
             )
         )
-        stored_root = self.state_datastore._get_embedded_hamt_root(room_prefix, sg)
+        stored_root = self.state_datastore._get_embedded_db_root(room_prefix, sg)
         self.assertIsNotNone(stored_root)
         assert stored_root is not None
         self.assertEqual(stored_root[0], root_hash)
@@ -978,7 +978,7 @@ class StateStoreTestCase(HomeserverTestCase):
         )
         sg1, sg2 = 80002, 80003
         self.get_success(
-            self.state_datastore.redo_embedded_hamt_mirror_writes_batch(
+            self.state_datastore.redo_embedded_db_mirror_writes_batch(
                 room_id,
                 room_version,
                 [
@@ -1004,10 +1004,10 @@ class StateStoreTestCase(HomeserverTestCase):
             )
         )
         self.assertIsNotNone(
-            self.state_datastore._get_embedded_hamt_root(room_prefix, sg1)
+            self.state_datastore._get_embedded_db_root(room_prefix, sg1)
         )
         self.assertIsNotNone(
-            self.state_datastore._get_embedded_hamt_root(room_prefix, sg2)
+            self.state_datastore._get_embedded_db_root(room_prefix, sg2)
         )
 
     def test_redo_mirror_write_batch_atomic_rollback_on_mismatch(self) -> None:
@@ -1029,7 +1029,7 @@ class StateStoreTestCase(HomeserverTestCase):
         )
         sg1, sg2 = 80004, 80005
         self.get_failure(
-            self.state_datastore.redo_embedded_hamt_mirror_writes_batch(
+            self.state_datastore.redo_embedded_db_mirror_writes_batch(
                 room_id,
                 room_version,
                 [
@@ -1056,12 +1056,8 @@ class StateStoreTestCase(HomeserverTestCase):
             RuntimeError,
         )
         # Neither group was published
-        self.assertIsNone(
-            self.state_datastore._get_embedded_hamt_root(room_prefix, sg1)
-        )
-        self.assertIsNone(
-            self.state_datastore._get_embedded_hamt_root(room_prefix, sg2)
-        )
+        self.assertIsNone(self.state_datastore._get_embedded_db_root(room_prefix, sg1))
+        self.assertIsNone(self.state_datastore._get_embedded_db_root(room_prefix, sg2))
 
     def test_redo_mirror_write_v0_missing_predecessor_fails_closed(self) -> None:
         """Version-0 replay without state map fails closed when predecessor is missing."""
@@ -1070,7 +1066,7 @@ class StateStoreTestCase(HomeserverTestCase):
         room_version = self.get_success(self.store.get_room_version(room_id))
 
         self.get_failure(
-            self.state_datastore.redo_embedded_hamt_mirror_writes_batch(
+            self.state_datastore.redo_embedded_db_mirror_writes_batch(
                 room_id,
                 room_version,
                 [
@@ -1093,7 +1089,7 @@ class StateStoreTestCase(HomeserverTestCase):
         room_version = self.get_success(self.store.get_room_version(room_id))
 
         self.get_failure(
-            self.state_datastore.redo_embedded_hamt_mirror_writes_batch(
+            self.state_datastore.redo_embedded_db_mirror_writes_batch(
                 room_id,
                 room_version,
                 [

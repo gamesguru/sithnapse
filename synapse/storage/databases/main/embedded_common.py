@@ -1060,7 +1060,7 @@ def publishes_at_commit() -> bool:
 
 def _set_engine_configured() -> None:
     """Record that an embedded engine was configured. Called once per store
-    init when `embedded_hamt.engine` + `embedded_hamt.path` are set."""
+    init when `embedded_db.engine` + `embedded_db.path` are set."""
     global _engine_configured
     _engine_configured = True
 

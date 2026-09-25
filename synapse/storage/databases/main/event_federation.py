@@ -302,14 +302,14 @@ class EventFederationWorkerStore(
                 resolve_namespace,
             )
 
-            embedded_hamt_namespace = resolve_namespace(self)
+            embedded_db_namespace = resolve_namespace(self)
             is_embedded_writer = (
-                embedded_hamt_namespace is not None
+                embedded_db_namespace is not None
                 and self.hs.get_instance_name() in self.hs.config.worker.writers.events
             )
             try:
                 if is_embedded_writer:
-                    assert embedded_hamt_namespace is not None
+                    assert embedded_db_namespace is not None
                     _auth_coverage(
                         "get_auth_chain_ids", "embedded_attempt", len(event_ids)
                     )
@@ -317,7 +317,7 @@ class EventFederationWorkerStore(
                         result = await self.db_pool.runInteraction(
                             "get_auth_chain_ids_embedded",
                             self._get_auth_chain_ids_using_embedded_closures_txn,
-                            embedded_hamt_namespace,
+                            embedded_db_namespace,
                             room_id,
                             event_ids,
                             include_given,
@@ -355,7 +355,7 @@ class EventFederationWorkerStore(
                         )
                         return result
 
-                # Non-writers (or instances without embedded HAMT): prefer the cover
+                # Non-writers (or instances without embedded DB): prefer the cover
                 # index when complete. Non-writers hold a read-only mtxdb handle and
                 # cannot safely repair missing links; if the cover index is incomplete or
                 # missing, fall back to the authoritative legacy SQL BFS walk.
@@ -410,7 +410,7 @@ class EventFederationWorkerStore(
     def _get_auth_chain_ids_using_embedded_closures_txn(
         self,
         txn: LoggingTransaction,
-        embedded_hamt_namespace: str,
+        embedded_db_namespace: str,
         room_id: str,
         event_ids: Collection[str],
         include_given: bool,
@@ -439,18 +439,18 @@ class EventFederationWorkerStore(
             "get_auth_chain_ids: using EMBEDDED CLOSURES path for room=%s "
             "namespace=%s initial_events=%s include_given=%s",
             room_id,
-            embedded_hamt_namespace,
+            embedded_db_namespace,
             initial_events,
             include_given,
         )
 
-        engine_name = self._embedded_hamt_engine
+        engine_name = self._embedded_db_engine
         short_ids = get_or_create_short_ids(
-            engine_name, embedded_hamt_namespace, room_id, initial_events
+            engine_name, embedded_db_namespace, room_id, initial_events
         )
 
         closures = self._auth_chain_closure_cache.get_closures_batch(
-            txn, engine_name, embedded_hamt_namespace, room_id, short_ids
+            txn, engine_name, embedded_db_namespace, room_id, short_ids
         )
 
         result_short_ids: set[int] = set()
@@ -465,7 +465,7 @@ class EventFederationWorkerStore(
 
         resolved = resolve_short_ids_to_event_ids(
             engine_name,
-            embedded_hamt_namespace,
+            embedded_db_namespace,
             room_id,
             list(result_short_ids),
         )
@@ -536,12 +536,12 @@ class EventFederationWorkerStore(
             resolve_namespace,
         )
 
-        embedded_hamt_namespace = resolve_namespace(self)
+        embedded_db_namespace = resolve_namespace(self)
         for links in self._get_chain_links(
             txn,
             set(event_chains.keys()),
-            embedded_hamt_namespace,
-            self._embedded_hamt_engine,
+            embedded_db_namespace,
+            self._embedded_db_engine,
         ):
             for chain_id in links:
                 if chain_id not in event_chains:
@@ -647,8 +647,8 @@ class EventFederationWorkerStore(
         cls,
         txn: LoggingTransaction,
         chains_to_fetch: set[int],
-        embedded_hamt_namespace: str | None,
-        embedded_hamt_engine: str | None,
+        embedded_db_namespace: str | None,
+        embedded_db_engine: str | None,
     ) -> Generator[dict[int, list[tuple[int, int, int]]], None, None]:
         """Fetch all auth chain links from the given set of chains, and all
         links from those chains, recursively.
@@ -659,15 +659,15 @@ class EventFederationWorkerStore(
         Returns a generator that produces dicts from origin chain ID to 3-tuple
         of origin sequence number, target chain ID and target sequence number.
 
-        `embedded_hamt_namespace`: the caller's resolved namespace when the
+        `embedded_db_namespace`: the caller's resolved namespace when the
         embedded engine is configured, `None` when it isn't -- a
         `@classmethod` has no `self` of its own, so this can't be
         recomputed here; see `embedded_event_auth_chain_links.py`.
 
-        `embedded_hamt_engine`: the engine name threaded alongside
-        `embedded_hamt_namespace` (same `@classmethod` constraint).
+        `embedded_db_engine`: the engine name threaded alongside
+        `embedded_db_namespace` (same `@classmethod` constraint).
         """
-        if embedded_hamt_namespace is not None:
+        if embedded_db_namespace is not None:
             # Exclusive by configured engine, not a dual-write. mtxdb has no
             # recursive-query primitive, so the walk is done here in Python
             # instead of SQL's `WITH RECURSIVE` below -- see
@@ -708,7 +708,7 @@ class EventFederationWorkerStore(
                     batch = set(itertools.islice(to_walk, 1000))
                     to_walk.difference_update(batch)
                     embedded_links = get_chain_links_batch(
-                        embedded_hamt_engine, embedded_hamt_namespace, batch
+                        embedded_db_engine, embedded_db_namespace, batch
                     )
                     for chain_id, edges in embedded_links.items():
                         accumulated.setdefault(chain_id, []).extend(edges)
@@ -885,14 +885,14 @@ class EventFederationWorkerStore(
             )
 
             try:
-                embedded_hamt_namespace = resolve_namespace(self)
+                embedded_db_namespace = resolve_namespace(self)
                 is_embedded_writer = (
-                    embedded_hamt_namespace is not None
+                    embedded_db_namespace is not None
                     and self.hs.get_instance_name()
                     in self.hs.config.worker.writers.events
                 )
                 if is_embedded_writer:
-                    assert embedded_hamt_namespace is not None
+                    assert embedded_db_namespace is not None
                     _auth_coverage(
                         "get_auth_chain_difference",
                         "embedded_attempt",
@@ -902,7 +902,7 @@ class EventFederationWorkerStore(
                         result = await self.db_pool.runInteraction(
                             "get_auth_chain_difference_embedded",
                             self._get_auth_chain_difference_using_embedded_closures_txn,
-                            embedded_hamt_namespace,
+                            embedded_db_namespace,
                             room_id,
                             state_sets,
                             conflicted_set,
@@ -999,7 +999,7 @@ class EventFederationWorkerStore(
     def _get_auth_chain_difference_using_embedded_closures_txn(
         self,
         txn: LoggingTransaction,
-        embedded_hamt_namespace: str,
+        embedded_db_namespace: str,
         room_id: str,
         state_sets: list[set[str]],
         conflicted_set: set[str] | None = None,
@@ -1038,7 +1038,7 @@ class EventFederationWorkerStore(
             resolve_short_ids_to_event_ids,
         )
 
-        engine_name = self._embedded_hamt_engine
+        engine_name = self._embedded_db_engine
 
         is_state_res_v21 = conflicted_set is not None
         initial_events = set(state_sets[0]).union(*state_sets[1:])
@@ -1063,7 +1063,7 @@ class EventFederationWorkerStore(
 
         event_ids = list(initial_events)
         short_ids = get_or_create_short_ids(
-            engine_name, embedded_hamt_namespace, room_id, event_ids
+            engine_name, embedded_db_namespace, room_id, event_ids
         )
         short_id_of = dict(zip(event_ids, short_ids))
 
@@ -1080,7 +1080,7 @@ class EventFederationWorkerStore(
             closures = self._auth_chain_closure_cache.get_closures_batch(
                 txn,
                 engine_name,
-                embedded_hamt_namespace,
+                embedded_db_namespace,
                 room_id,
                 member_short_ids,
             )
@@ -1107,7 +1107,7 @@ class EventFederationWorkerStore(
             for closure in self._auth_chain_closure_cache.get_closures_batch(
                 txn,
                 engine_name,
-                embedded_hamt_namespace,
+                embedded_db_namespace,
                 room_id,
                 conflicted_short_ids,
             ).values():
@@ -1121,7 +1121,7 @@ class EventFederationWorkerStore(
                 for closure in self._auth_chain_closure_cache.get_closures_batch(
                     txn,
                     engine_name,
-                    embedded_hamt_namespace,
+                    embedded_db_namespace,
                     room_id,
                     additional_short_ids,
                 ).values():
@@ -1132,7 +1132,7 @@ class EventFederationWorkerStore(
             forwards_ids = get_forward_reachable_short_ids(
                 txn,
                 engine_name,
-                embedded_hamt_namespace,
+                embedded_db_namespace,
                 room_id,
                 conflicted_short_ids,
                 candidate_short_ids=backwards_ids,
@@ -1144,7 +1144,7 @@ class EventFederationWorkerStore(
                 return set()
             resolved = resolve_short_ids_to_event_ids(
                 engine_name,
-                embedded_hamt_namespace,
+                embedded_db_namespace,
                 room_id,
                 list(short_id_iter),
             )
@@ -1310,9 +1310,9 @@ class EventFederationWorkerStore(
             resolve_namespace,
         )
 
-        embedded_hamt_namespace = resolve_namespace(self)
+        embedded_db_namespace = resolve_namespace(self)
         for links in self._get_chain_links(
-            txn, set(seen_chains), embedded_hamt_namespace, self._embedded_hamt_engine
+            txn, set(seen_chains), embedded_db_namespace, self._embedded_db_engine
         ):
             # `links` encodes the backwards reachable events _from a single chain_ all the way to
             # the root of the graph.
@@ -2693,7 +2693,7 @@ class EventFederationWorkerStore(
             )
 
             forward_map = get_event_edges_forward_batch(
-                self._embedded_hamt_namespace, [event_id]
+                self._embedded_db_namespace, [event_id]
             )
             successors = forward_map.get(event_id)
             if successors is not None:
@@ -2718,7 +2718,7 @@ class EventFederationWorkerStore(
                     )
                     if room_id:
                         queue_edge_write(
-                            self._embedded_hamt_namespace,
+                            self._embedded_db_namespace,
                             [
                                 (room_id, succ_id, event_id, False)
                                 for succ_id in sql_res

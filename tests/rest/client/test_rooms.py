@@ -795,10 +795,10 @@ class RoomsCreateTestCase(RoomBase):
         self.assertEqual(HTTPStatus.OK, channel.code, channel.result)
         self.assertTrue("room_id" in channel.json_body)
         assert channel.resource_usage is not None
-        # The embedded HAMT engine (mtxdb) keeps state HAMT nodes/roots
+        # The embedded DB engine (mtxdb) keeps state HAMT nodes/roots
         # in-process; a SQL-only configuration issues extra DB transactions
         # for the `state_hamt_nodes`/`state_hamt_roots` fallback.
-        expected_txn_count = 32 if self.hs.config.database.embedded_hamt_engine else 35
+        expected_txn_count = 32 if self.hs.config.database.embedded_db_engine else 35
         self.assertEqual(expected_txn_count, channel.resource_usage.db_txn_count)
 
     def test_post_room_initial_state(self) -> None:
@@ -813,7 +813,7 @@ class RoomsCreateTestCase(RoomBase):
         self.assertTrue("room_id" in channel.json_body)
         assert channel.resource_usage is not None
         # See the comment in test_post_room_no_keys.
-        expected_txn_count = 34 if self.hs.config.database.embedded_hamt_engine else 37
+        expected_txn_count = 34 if self.hs.config.database.embedded_db_engine else 37
         self.assertEqual(expected_txn_count, channel.resource_usage.db_txn_count)
 
     def test_post_room_topic(self) -> None:

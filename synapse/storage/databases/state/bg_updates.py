@@ -680,7 +680,7 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
             existing_in_sql = {group for (group,) in existing_rows}
             if (
                 existing_in_sql
-                and getattr(self, "_embedded_hamt_engine", None) == "mtxdb"
+                and getattr(self, "_embedded_db_engine", None) == "mtxdb"
             ):
                 # In a multi-worker deployment, this worker's in-process
                 # mtxdb index may simply be stale rather than the group
@@ -698,8 +698,8 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
                     refresh_state_hamt_collections_for_groups,
                 )
 
-                namespace = getattr(self, "_embedded_hamt_namespace", None)
-                # __init__ always sets this alongside `_embedded_hamt_engine`
+                namespace = getattr(self, "_embedded_db_namespace", None)
+                # __init__ always sets this alongside `_embedded_db_engine`
                 # in the same branch (see store.py) -- reaching here with
                 # the engine set but not the namespace would be an init bug,
                 # not a normal runtime state.
@@ -932,7 +932,7 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
         # falling back to `state_hamt_roots`/`state_groups` SQL only for a
         # group it doesn't have. Always use the bulk path (it degrades to a
         # single-root fetch fine for len(groups) == 1).
-        use_embedded = bool(getattr(self, "_embedded_hamt_engine", None))
+        use_embedded = bool(getattr(self, "_embedded_db_engine", None))
 
         bulk_results: dict[int, list[tuple[str, str, str]] | None] | None = None
         bulk_selective_results: dict[int, list[tuple[str, str, str]] | None] | None = (
@@ -1339,7 +1339,7 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
         that is NOT silently re-fetched from SQL: once the embedded engine
         is configured it's the source of truth for new data, so a real miss
         means either genuine corruption or (the one legitimate exception)
-        that `EMBEDDED_HAMT_MIGRATION_UPDATE_NAME` hasn't finished copying
+        that `EMBEDDED_DB_MIGRATION_UPDATE_NAME` hasn't finished copying
         this group's pre-existing SQL row over yet -- see
         `_background_migrate_state_hamt_to_embedded`. Only in that bounded,
         explicit window does this fall back to SQL.
@@ -1351,8 +1351,8 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
         groups the reads by room, and decodes their records before returning
         to Python. This keeps the whole operation to one FFI crossing.
         """
-        engine = get_embedded_engine(getattr(self, "_embedded_hamt_engine", None))
-        namespace = getattr(self, "_embedded_hamt_namespace", None)
+        engine = get_embedded_engine(getattr(self, "_embedded_db_engine", None))
+        namespace = getattr(self, "_embedded_db_namespace", None)
         found: dict[int, tuple[bytes, bytes, str]] = {}
         still_missing: list[int] = []
 
@@ -1367,7 +1367,7 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
             return found
 
         migration_name = getattr(
-            self, "EMBEDDED_HAMT_MIGRATION_UPDATE_NAME", "state_hamt_embedded_migration"
+            self, "EMBEDDED_DB_MIGRATION_UPDATE_NAME", "state_hamt_embedded_migration"
         )
         txn.execute(
             "SELECT 1 FROM background_updates WHERE update_name = ?",
@@ -1422,11 +1422,11 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
         roots = self._fetch_hamt_roots_for_embedded_txn(txn, groups)
         if not roots:
             return results
-        engine = get_embedded_engine(getattr(self, "_embedded_hamt_engine", None))
+        engine = get_embedded_engine(getattr(self, "_embedded_db_engine", None))
         ordered_groups = list(roots.keys())
         _et = time.monotonic()
         materialized = engine.materialize_state_hamts(
-            getattr(self, "_embedded_hamt_namespace", None),
+            getattr(self, "_embedded_db_namespace", None),
             [roots[group] for group in ordered_groups],
         )
         ffi_timing("ffi_materialize_hamts", time.monotonic() - _et)
@@ -1446,7 +1446,7 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
         roots = self._fetch_hamt_roots_for_embedded_txn(txn, groups)
         if not roots:
             return results
-        engine = get_embedded_engine(getattr(self, "_embedded_hamt_engine", None))
+        engine = get_embedded_engine(getattr(self, "_embedded_db_engine", None))
         ordered_groups = list(roots.keys())
         queries = [
             (room_prefix, root_hash, self._room_structural_key(room_id), keys)
@@ -1454,7 +1454,7 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
         ]
         _et = time.monotonic()
         looked_up = engine.lookup_state_hamts(
-            getattr(self, "_embedded_hamt_namespace", None), queries
+            getattr(self, "_embedded_db_namespace", None), queries
         )
         ffi_timing("ffi_lookup_hamts", time.monotonic() - _et)
         for group, entries in zip(ordered_groups, looked_up):
@@ -1529,7 +1529,7 @@ class StateBackgroundUpdateStore(StateGroupBackgroundUpdateStore):
         # (see `_maybe_requeue_state_hamt_backfill`) when the source
         # database is missing roots for some rooms (e.g. an interrupted
         # source-side backfill, or -- historically -- a source that was
-        # TiKV-backed, back when that was a supported HAMT engine). Guard
+        # TiKV-backed, back when that was a supported embedded engine). Guard
         # the registration so constructing that composed `Store` doesn't
         # crash on the missing attribute.
         if hasattr(self, "_background_backfill_state_hamt_roots"):

@@ -322,9 +322,9 @@ class PersistEventsStore:
         self._embedded_event_json_enabled = open_embedded_event_json_engine(hs)
         self._embedded_event_edges_enabled = open_embedded_event_edges_engine(hs)
         self._embedded_event_edges_writable = embedded_event_edges_is_writable(hs)
-        self._embedded_hamt_engine = hs.config.database.embedded_hamt_engine
-        self._embedded_hamt_namespace = (
-            hs.config.database.embedded_hamt_namespace or hs.hostname
+        self._embedded_db_engine = hs.config.database.embedded_db_engine
+        self._embedded_db_namespace = (
+            hs.config.database.embedded_db_namespace or hs.hostname
         )
 
         # This should only exist on instances that are configured to write
@@ -992,7 +992,7 @@ class PersistEventsStore:
             event_to_types,
             event_to_auth_chain,
             resolve_namespace(self),
-            self._embedded_hamt_engine,
+            self._embedded_db_engine,
         )
 
     async def _get_events_which_are_prevs(self, event_ids: Iterable[str]) -> list[str]:
@@ -1037,8 +1037,8 @@ class PersistEventsStore:
                 self, "_embedded_event_json_enabled", False
             ):
                 found = get_event_json_batch(
-                    self._embedded_hamt_engine,
-                    self._embedded_hamt_namespace,
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
                     missing_meta_ids,
                 )
                 for eid, (m, _, _) in found.items():
@@ -1118,8 +1118,8 @@ class PersistEventsStore:
                     self, "_embedded_event_json_enabled", False
                 ):
                     found = get_event_json_batch(
-                        self._embedded_hamt_engine,
-                        self._embedded_hamt_namespace,
+                        self._embedded_db_engine,
+                        self._embedded_db_namespace,
                         missing_meta_ids,
                     )
                     for eid, (m, _, _) in found.items():
@@ -1342,7 +1342,7 @@ class PersistEventsStore:
         # 250-500ms window is a hard 404 there. Make those writes durable before
         # the response that depends on them is returned. Backfilled events are
         # skipped -- no live request waits on them.
-        if self._embedded_hamt_engine:
+        if self._embedded_db_engine:
             needs_auth_chain_barrier = any(
                 ev.type in AUTH_CHAIN_EVENT_TYPES
                 and not ev.internal_metadata.is_outlier()
@@ -1470,7 +1470,7 @@ class PersistEventsStore:
                 self.db_pool,
                 new_event_links,
                 resolve_namespace(self),
-                self._embedded_hamt_engine,
+                self._embedded_db_engine,
                 sync=False,
             )
 
@@ -1505,8 +1505,8 @@ class PersistEventsStore:
         event_to_room_id: dict[str, str],
         event_to_types: dict[str, tuple[str, str]],
         event_to_auth_chain: dict[str, StrCollection],
-        embedded_hamt_namespace: str | None,
-        embedded_hamt_engine: str | None,
+        embedded_db_namespace: str | None,
+        embedded_db_engine: str | None,
     ) -> None:
         """Calculate and persist the chain cover index for the given events.
 
@@ -1515,12 +1515,12 @@ class PersistEventsStore:
             event_to_types: Event ID to type and state_key of the event
             event_to_auth_chain: Event ID to list of auth event IDs of the
                 event (events with no auth events can be excluded).
-            embedded_hamt_namespace: the caller's resolved namespace when the
+            embedded_db_namespace: the caller's resolved namespace when the
                 embedded engine is configured, `None` when it isn't -- a
                 `@classmethod` has no `self` of its own, so this can't be
                 recomputed here; see `embedded_event_auth_chain_links.py`.
-            embedded_hamt_engine: the engine name threaded alongside
-                `embedded_hamt_namespace` (same `@classmethod` constraint).
+            embedded_db_engine: the engine name threaded alongside
+                `embedded_db_namespace` (same `@classmethod` constraint).
         """
 
         new_event_links = cls._calculate_chain_cover_index(
@@ -1530,11 +1530,11 @@ class PersistEventsStore:
             event_to_room_id,
             event_to_types,
             event_to_auth_chain,
-            embedded_hamt_namespace,
-            embedded_hamt_engine,
+            embedded_db_namespace,
+            embedded_db_engine,
         )
         cls._persist_chain_cover_index(
-            txn, db_pool, new_event_links, embedded_hamt_namespace, embedded_hamt_engine
+            txn, db_pool, new_event_links, embedded_db_namespace, embedded_db_engine
         )
 
     @classmethod
@@ -1546,8 +1546,8 @@ class PersistEventsStore:
         event_to_room_id: dict[str, str],
         event_to_types: dict[str, tuple[str, str]],
         event_to_auth_chain: dict[str, StrCollection],
-        embedded_hamt_namespace: str | None,
-        embedded_hamt_engine: str | None,
+        embedded_db_namespace: str | None,
+        embedded_db_engine: str | None,
     ) -> dict[str, NewEventChainLinks]:
         """Calculate the chain cover index for the given events.
 
@@ -1741,8 +1741,8 @@ class PersistEventsStore:
         for links in EventFederationStore._get_chain_links(
             txn,
             {chain_id for chain_id, _ in chain_map.values()},
-            embedded_hamt_namespace,
-            embedded_hamt_engine,
+            embedded_db_namespace,
+            embedded_db_engine,
         ):
             for origin_chain_id, inner_links in links.items():
                 for (
@@ -1798,8 +1798,8 @@ class PersistEventsStore:
         txn: LoggingTransaction,
         db_pool: DatabasePool,
         new_event_links: dict[str, NewEventChainLinks],
-        embedded_hamt_namespace: str | None,
-        embedded_hamt_engine: str | None,
+        embedded_db_namespace: str | None,
+        embedded_db_engine: str | None,
         sync: bool = True,
     ) -> None:
         db_pool.simple_insert_many_txn(
@@ -1831,7 +1831,7 @@ class PersistEventsStore:
             for (target_chain_id, target_sequence_number) in new_links.links
         ]
 
-        if embedded_hamt_namespace is not None:
+        if embedded_db_namespace is not None:
             # Exclusive by configured engine, not a dual-write -- see
             # embedded_event_auth_chain_links.py.
             from synapse.storage.databases.main.embedded_event_auth_chain_links import (
@@ -1839,7 +1839,7 @@ class PersistEventsStore:
             )
 
             put_chain_links_batch(
-                embedded_hamt_engine, embedded_hamt_namespace, chain_links, sync=sync
+                embedded_db_engine, embedded_db_namespace, chain_links, sync=sync
             )
             return
 
@@ -2865,8 +2865,8 @@ class PersistEventsStore:
                 self, "_embedded_event_json_enabled", False
             ):
                 found = get_event_json_batch(
-                    self._embedded_hamt_engine,
-                    self._embedded_hamt_namespace,
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
                     [event_id],
                 )
                 if event_id in found:
@@ -3182,8 +3182,8 @@ class PersistEventsStore:
             # Exclusive by configured engine -- event_json writes go directly
             # to mtxdb without duplicating the highest-disk-usage table in SQL.
             put_event_json_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
                 [
                     (event_id, room_id, internal_metadata, json, format_version)
                     for event_id, room_id, internal_metadata, json, format_version in event_json_rows
@@ -3282,8 +3282,8 @@ class PersistEventsStore:
         # mirror record are skipped by set_have_censored_batch.
         if unredacted_events and getattr(self, "_embedded_event_json_enabled", False):
             set_have_censored_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
                 unredacted_events,
                 False,
             )
@@ -3528,8 +3528,8 @@ class PersistEventsStore:
         # set_have_censored_batch.
         if getattr(self, "_embedded_event_json_enabled", False):
             put_redaction_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
                 [(event.redacts, event.event_id, False)],
             )
 
@@ -4037,8 +4037,8 @@ class PersistEventsStore:
         # see embedded_rejections.py.
         if getattr(self, "_embedded_event_json_enabled", False):
             put_rejection_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
                 [(event_id, reason, last_check)],
             )
 
@@ -4138,8 +4138,8 @@ class PersistEventsStore:
             # event_ids are genuinely new before deciding what to
             # increment.
             existing = get_state_group_for_events_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
                 list(state_groups.keys()),
                 purpose="persist_existence_check",
             )
@@ -4147,13 +4147,13 @@ class PersistEventsStore:
                 event_id for event_id in state_groups if event_id not in existing
             ]
             put_event_to_state_group_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
                 list(non_null_state_groups.items()),
             )
             increment_state_group_refcounts_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
                 [
                     non_null_state_groups[event_id]
                     for event_id in new_event_ids
@@ -4223,7 +4223,7 @@ class PersistEventsStore:
             if edge_rows:
                 txn.call_after(
                     queue_edge_write,
-                    self._embedded_hamt_namespace,
+                    self._embedded_db_namespace,
                     edge_rows,
                 )
                 txn.call_after(mark_dirty, Pool.EVENT_DAG)

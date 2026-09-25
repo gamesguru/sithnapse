@@ -306,8 +306,8 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             # backed by the separate refcount).
             all_purge_event_ids = [event_id for event_id, _should_delete in event_rows]
             event_id_to_state_group = get_state_group_for_events_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
                 all_purge_event_ids,
                 purpose="purge_traversal",
             )
@@ -318,13 +318,13 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
 
             logger.info("[purge] removing events from event_to_state_groups")
             delete_event_to_state_group_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
                 list(event_id_to_state_group.keys()),
             )
             decrement_state_group_refcounts_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
                 list(event_id_to_state_group.values()),
             )
             # Immediate sync + clear dirty flags for the whole purge batch.
@@ -389,13 +389,13 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
         # rejections use the purged event ID.
         if getattr(self, "_embedded_event_json_enabled", False):
             delete_redactions_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
                 redacted_event_ids,
             )
             delete_rejections_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
                 purged_event_ids,
             )
 
@@ -405,8 +405,8 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
         # pre-purge content forever from mtxdb -- see embedded_event_json.py.
         if getattr(self, "_embedded_event_json_enabled", False):
             delete_event_json_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
                 [event_id for event_id, should_delete in event_rows if should_delete],
             )
         if getattr(self, "_embedded_event_edges_writable", False):
@@ -416,7 +416,7 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             if deleted_edge_ids:
                 txn.call_after(
                     delete_event_edges_batch,
-                    self._embedded_hamt_namespace,
+                    self._embedded_db_namespace,
                     deleted_edge_ids,
                 )
 
@@ -651,8 +651,8 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             )
 
             delete_chain_links_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
                 [
                     (chain_id, sequence_number)
                     for chain_id, sequence_number in referenced_chain_id_tuples
@@ -691,13 +691,13 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
 
         if room_event_ids:
             delete_redactions_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
                 room_redacted_event_ids,
             )
             delete_rejections_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
                 room_event_ids,
             )
 
@@ -705,32 +705,32 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
         # SQL, the embedded mirror needs its own delete pass.
         if room_event_ids:
             delete_event_json_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
                 room_event_ids,
             )
             if getattr(self, "_embedded_event_edges_writable", False):
                 txn.call_after(
                     delete_event_edges_batch,
-                    self._embedded_hamt_namespace,
+                    self._embedded_db_namespace,
                     room_event_ids,
                 )
             # Same for event_to_state_groups: fetch state_groups before
             # deleting so the refcount can be rebalanced.
             event_id_to_state_group = get_state_group_for_events_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
                 room_event_ids,
                 purpose="purge_traversal",
             )
             delete_event_to_state_group_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
                 list(event_id_to_state_group.keys()),
             )
             decrement_state_group_refcounts_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
                 list(event_id_to_state_group.values()),
             )
             # One sync for the whole purge batch (event_json delete +

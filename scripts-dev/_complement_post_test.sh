@@ -22,7 +22,7 @@
 #      very large writable layer, so it must not happen for passing tests.
 #      The saved image can later be inspected with, e.g.:
 #        docker run --rm -it --entrypoint sh <tag>
-#        docker cp <a-container-from-that-image>:/data/embedded_hamt ./out
+#        docker cp <a-container-from-that-image>:/data/embedded_db ./out
 #
 # Failures in here are deliberately non-fatal (Complement only logs
 # executePostScript's error, it doesn't fail the test run on our account)

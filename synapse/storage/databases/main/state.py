@@ -609,8 +609,8 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
     async def _get_state_group_for_event(self, event_id: str) -> int | None:
         if getattr(self, "_embedded_event_json_enabled", False):
             found = get_state_group_for_events_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
                 [event_id],
                 purpose="read_point",
             )
@@ -660,8 +660,8 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
                 list(event_ids),
             )
             res = get_state_group_for_events_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
                 event_ids,
                 purpose="read_batch",
             )
@@ -732,8 +732,8 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             # module docstring for why a count (not an event-list index)
             # keeps this O(1) per write regardless of room activity.
             return get_referenced_state_groups_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
                 list(state_groups),
             )
 
@@ -800,26 +800,26 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             # reference forever, since a partial-state event's placeholder
             # group is never otherwise decremented).
             old = get_state_group_for_events_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
                 [event.event_id],
                 purpose="partial_state_rewrite",
             )
             put_event_to_state_group_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
                 [(event.event_id, state_group)],
             )
             old_state_group = old.get(event.event_id)
             if old_state_group is not None and old_state_group != state_group:
                 decrement_state_group_refcounts_batch(
-                    self._embedded_hamt_engine,
-                    self._embedded_hamt_namespace,
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
                     [old_state_group],
                 )
                 increment_state_group_refcounts_batch(
-                    self._embedded_hamt_engine,
-                    self._embedded_hamt_namespace,
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
                     [state_group],
                 )
             # Publish the rewritten mapping after SQL commit so reader workers

@@ -1253,7 +1253,7 @@ class Porter:
             return
 
         # Some source roots are absent (e.g. an interrupted source-side
-        # backfill, or -- historically -- a non-SQL HAMT engine). Delete
+        # backfill, or -- historically -- a non-SQL embedded engine). Delete
         # the completed entry copied from SQLite and re-insert it as
         # pending so Synapse backfills every missing root.
         await self.postgres_store.db_pool.simple_delete(

@@ -38,10 +38,10 @@ from synapse.storage.databases.main.embedded_rejections import (
 from synapse.synapse_rust import mtxdb_engine
 
 from tests import unittest
-from tests.utils import EMBEDDED_HAMT_ENGINE, EMBEDDED_HAMT_PATH
+from tests.utils import EMBEDDED_DB_ENGINE, EMBEDDED_DB_PATH
 
-if EMBEDDED_HAMT_ENGINE and EMBEDDED_HAMT_PATH:
-    _TEST_ENGINE_TMPDIR = EMBEDDED_HAMT_PATH
+if EMBEDDED_DB_ENGINE and EMBEDDED_DB_PATH:
+    _TEST_ENGINE_TMPDIR = EMBEDDED_DB_PATH
 else:
     _TEST_ENGINE_TMPDIR = tempfile.mkdtemp(prefix="test-embedded-redactions-")
     atexit.register(shutil.rmtree, _TEST_ENGINE_TMPDIR, ignore_errors=True)

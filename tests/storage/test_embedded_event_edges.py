@@ -52,13 +52,13 @@ from synapse.util.clock import Clock
 from tests import unittest
 from tests.server import ThreadedMemoryReactorClock
 from tests.unittest import HomeserverTestCase
-from tests.utils import EMBEDDED_HAMT_ENGINE, EMBEDDED_HAMT_PATH
+from tests.utils import EMBEDDED_DB_ENGINE, EMBEDDED_DB_PATH
 
-if EMBEDDED_HAMT_ENGINE and EMBEDDED_HAMT_PATH:
+if EMBEDDED_DB_ENGINE and EMBEDDED_DB_PATH:
     # The test harness has already selected a worker-specific store. Reuse
     # that path instead of opening a private store before the homeserver is
     # created, which would win the Rust process-global OnceCell.
-    _TEST_ENGINE_TMPDIR = EMBEDDED_HAMT_PATH
+    _TEST_ENGINE_TMPDIR = EMBEDDED_DB_PATH
 else:
     _TEST_ENGINE_TMPDIR = tempfile.mkdtemp(prefix="test-embedded-event-edges-")
     # mtxdb's Python binding owns process-global pools. Keep this directory
@@ -893,7 +893,7 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         # reactor by what this homeserver actually got instead of assuming
         # the module constant matches the runtime value.
         self._flush_delay_secs = (
-            hs.config.database.embedded_hamt_flush_delay_secs or FLUSH_DELAY_SECS
+            hs.config.database.embedded_db_flush_delay_secs or FLUSH_DELAY_SECS
         )
         self.user_id = self.register_user("alice", "test")
         self.tok = self.login("alice", "test")
@@ -903,17 +903,17 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
 
         self.store._embedded_event_edges_enabled = True
         self.store._embedded_event_edges_writable = True
-        self.store._embedded_hamt_engine = "mtxdb"
-        if not getattr(self.store, "_embedded_hamt_namespace", None):
-            self.store._embedded_hamt_namespace = hs.hostname
+        self.store._embedded_db_engine = "mtxdb"
+        if not getattr(self.store, "_embedded_db_namespace", None):
+            self.store._embedded_db_namespace = hs.hostname
 
         self.persist_store = hs.get_datastores().persist_events
         if self.persist_store is not None:
             self.persist_store._embedded_event_edges_enabled = True
             self.persist_store._embedded_event_edges_writable = True
-            self.persist_store._embedded_hamt_engine = "mtxdb"
-            if not getattr(self.persist_store, "_embedded_hamt_namespace", None):
-                self.persist_store._embedded_hamt_namespace = hs.hostname
+            self.persist_store._embedded_db_engine = "mtxdb"
+            if not getattr(self.persist_store, "_embedded_db_namespace", None):
+                self.persist_store._embedded_db_namespace = hs.hostname
 
     def _advance_past_flush_window(self) -> None:
         """Advance the reactor past the coalescer's actual debounce window."""
@@ -929,11 +929,11 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         # Edge writes are coalesced in-process; drain the queue so the mirror
         # reflects them (in production the next flush / threshold / shutdown
         # would do this, but the test asserts immediately).
-        flush_edge_writes(self.store._embedded_hamt_namespace)
+        flush_edge_writes(self.store._embedded_db_namespace)
 
         # e2 should have e1 in its backward edges in mtxdb
         backward = get_event_edges_backward_batch(
-            self.store._embedded_hamt_namespace, [e2_id]
+            self.store._embedded_db_namespace, [e2_id]
         )
         self.assertIsNotNone(backward[e2_id])
         prev_ids = [p for p, _ in backward[e2_id] or []]
@@ -943,13 +943,13 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         successors = self.get_success(self.store.get_successor_events(e1_id))
         self.assertIn(e2_id, successors)
 
-    @skipUnless(EMBEDDED_HAMT_ENGINE, "requires embedded HAMT engine")
+    @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
     def test_below_threshold_queue_flushes_on_timer(self) -> None:
         """A sub-threshold edge write is drained by the flush coalescer's
         bounded debounce timer -- no explicit flush, threshold, or shutdown
         required -- and does so even when fsync is disabled (`no_sync`), since
         the queue must land in mtxdb regardless of the sync setting."""
-        ns = self.store._embedded_hamt_namespace
+        ns = self.store._embedded_db_namespace
         # Force the no-sync path so the test proves the edge drain is not
         # coupled to whether the sync coalescer actually fsyncs.
         previous_no_sync = embedded_common._sync_disabled
@@ -998,26 +998,26 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         e2_id = res2["event_id"]
 
         # Drain the coalesced edge writes so the mirror reflects both sends.
-        flush_edge_writes(self.store._embedded_hamt_namespace)
+        flush_edge_writes(self.store._embedded_db_namespace)
 
         # Before deletion: e1 has e2 as forward successor
         fwd_before = get_event_edges_forward_batch(
-            self.store._embedded_hamt_namespace, [e1_id]
+            self.store._embedded_db_namespace, [e1_id]
         )
         self.assertIn(e2_id, fwd_before.get(e1_id) or [])
 
         # Purge e2
-        delete_event_edges_batch(self.store._embedded_hamt_namespace, [e2_id])
+        delete_event_edges_batch(self.store._embedded_db_namespace, [e2_id])
 
         # After deletion: e2 is tombstoned in backward edges
         back_after = get_event_edges_backward_batch(
-            self.store._embedded_hamt_namespace, [e2_id]
+            self.store._embedded_db_namespace, [e2_id]
         )
         self.assertIsNone(back_after[e2_id])
 
         # And e1's forward edges no longer contain e2
         fwd_after = get_event_edges_forward_batch(
-            self.store._embedded_hamt_namespace, [e1_id]
+            self.store._embedded_db_namespace, [e1_id]
         )
         self.assertNotIn(e2_id, fwd_after.get(e1_id) or [])
 
@@ -1074,14 +1074,12 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
 
         # Check mtxdb: fake_id is NOT in mtxdb backward edges
         back = get_event_edges_backward_batch(
-            self.store._embedded_hamt_namespace, [fake_id]
+            self.store._embedded_db_namespace, [fake_id]
         )
         self.assertIsNone(back[fake_id])
 
         # And e1_id's forward edges do NOT contain fake_id
-        fwd = get_event_edges_forward_batch(
-            self.store._embedded_hamt_namespace, [e1_id]
-        )
+        fwd = get_event_edges_forward_batch(self.store._embedded_db_namespace, [e1_id])
         self.assertNotIn(fake_id, fwd.get(e1_id) or [])
 
     def test_read_only_worker_reads_edges(self) -> None:
@@ -1098,7 +1096,7 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         successors = self.get_success(self.store.get_successor_events(e1_id))
         self.assertIn(e2_id, successors)
 
-    @skipUnless(EMBEDDED_HAMT_ENGINE, "requires embedded HAMT engine")
+    @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
     def test_sql_fallback_and_repair_on_missing_mtxdb_edges(self) -> None:
         """SQL fallback returns edges missing from mtxdb and repairs the local store.
 
@@ -1117,7 +1115,7 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         res2 = self.helper.send(self.room_id, "child", tok=self.tok)
         c_id = res2["event_id"]
 
-        ns = self.store._embedded_hamt_namespace
+        ns = self.store._embedded_db_namespace
         # Persist the coalesced edges, then simulate a post-commit mirror write
         # that never landed by deleting the edge directly at the FFI layer.
         # Deliberately NOT `delete_event_edges_batch`: that records a purge
@@ -1168,7 +1166,7 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
                 "expected no SQL fallback for the read-only query after repair",
             )
 
-    @skipUnless(EMBEDDED_HAMT_ENGINE, "requires embedded HAMT engine")
+    @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
     def test_sql_fallback_repairs_preserved_row2_edge_despite_purge(self) -> None:
         """SQL keeps the live-child → purged-parent `event_edges` row (a
         backward extremity).  Even after a genuine purge tombstoned the parent,
@@ -1181,7 +1179,7 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         res2 = self.helper.send(self.room_id, "child", tok=self.tok)
         c_id = res2["event_id"]
 
-        ns = self.store._embedded_hamt_namespace
+        ns = self.store._embedded_db_namespace
         flush_edge_writes(ns)
 
         # True purge of the parent: records an owner-based tombstone for p_id.

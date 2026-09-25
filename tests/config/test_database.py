@@ -45,12 +45,12 @@ class DatabaseConfigTestCase(unittest.TestCase):
         self.assertEqual(conf["database"], expected_database_conf)
 
     def _read_config(
-        self, embedded_hamt: dict | None = None, env: dict[str, str] | None = None
+        self, embedded_db: dict | None = None, env: dict[str, str] | None = None
     ) -> DatabaseConfig:
         """Helper: build a minimal config dict and parse it via DatabaseConfig."""
         config: dict = {"database": {"name": "sqlite3", "args": {}}}
-        if embedded_hamt is not None:
-            config["embedded_hamt"] = embedded_hamt
+        if embedded_db is not None:
+            config["embedded_db"] = embedded_db
 
         old_env = os.environ.copy()
         # These tests assert on the embedded-engine *environment* handling, so
@@ -60,8 +60,8 @@ class DatabaseConfigTestCase(unittest.TestCase):
         # without this an "unset WAL must be rejected" case would silently pass
         # in a developer shell and fail in CI (or vice versa).
         for var in (
-            "SYNAPSE_EMBEDDED_HAMT_ENGINE",
-            "SYNAPSE_EMBEDDED_HAMT_PATH",
+            "SYNAPSE_EMBEDDED_DB_ENGINE",
+            "SYNAPSE_EMBEDDED_DB_PATH",
             "SYNAPSE_MTXDB",
             "SYNAPSE_MTXDB_PATH",
             "SYNAPSE_MTXDB_WAL",
@@ -82,28 +82,28 @@ class DatabaseConfigTestCase(unittest.TestCase):
     def test_sync_mode_defaults_to_interval(self) -> None:
         """Group fsyncs are the default; `always` is one setting away."""
         dc = self._read_config()
-        self.assertEqual(dc.embedded_hamt_sync_mode, "interval")
+        self.assertEqual(dc.embedded_db_sync_mode, "interval")
 
     def test_sync_mode_always_is_still_selectable(self) -> None:
-        dc = self._read_config(embedded_hamt={"sync_mode": "always"})
-        self.assertEqual(dc.embedded_hamt_sync_mode, "always")
+        dc = self._read_config(embedded_db={"sync_mode": "always"})
+        self.assertEqual(dc.embedded_db_sync_mode, "always")
 
     def test_sync_mode_from_config_and_env(self) -> None:
-        dc = self._read_config(embedded_hamt={"sync_mode": "Interval"})
-        self.assertEqual(dc.embedded_hamt_sync_mode, "interval")
+        dc = self._read_config(embedded_db={"sync_mode": "Interval"})
+        self.assertEqual(dc.embedded_db_sync_mode, "interval")
 
         # The environment overrides the config file, as for the other switches.
         dc = self._read_config(
-            embedded_hamt={"sync_mode": "interval"},
+            embedded_db={"sync_mode": "interval"},
             env={"SYNAPSE_MTXDB_SYNC": "off"},
         )
-        self.assertEqual(dc.embedded_hamt_sync_mode, "off")
+        self.assertEqual(dc.embedded_db_sync_mode, "off")
 
     def test_invalid_sync_mode_raises(self) -> None:
         from synapse.config._base import ConfigError
 
         with self.assertRaises(ConfigError):
-            self._read_config(embedded_hamt={"sync_mode": "sometimes"})
+            self._read_config(embedded_db={"sync_mode": "sometimes"})
         with self.assertRaises(ConfigError):
             self._read_config(env={"SYNAPSE_MTXDB_SYNC": "sometimes"})
 
@@ -113,16 +113,16 @@ class DatabaseConfigTestCase(unittest.TestCase):
 
         with self.assertRaises(ConfigError):
             self._read_config(
-                embedded_hamt={"engine": "mtxdb"},
+                embedded_db={"engine": "mtxdb"},
             )
 
     def test_engine_without_path_env_raises(self) -> None:
-        """SYNAPSE_EMBEDDED_HAMT_ENGINE set + path missing → ConfigError."""
+        """SYNAPSE_EMBEDDED_DB_ENGINE set + path missing → ConfigError."""
         from synapse.config._base import ConfigError
 
         with self.assertRaises(ConfigError):
             self._read_config(
-                env={"SYNAPSE_EMBEDDED_HAMT_ENGINE": "mtxdb"},
+                env={"SYNAPSE_EMBEDDED_DB_ENGINE": "mtxdb"},
             )
 
     def test_path_without_engine_raises(self) -> None:
@@ -131,7 +131,7 @@ class DatabaseConfigTestCase(unittest.TestCase):
 
         with self.assertRaises(ConfigError):
             self._read_config(
-                embedded_hamt={"path": "/tmp/test.mtxdb"},
+                embedded_db={"path": "/tmp/test.mtxdb"},
             )
 
     def test_engine_unsupported_raises(self) -> None:
@@ -140,31 +140,31 @@ class DatabaseConfigTestCase(unittest.TestCase):
 
         with self.assertRaises(ConfigError):
             self._read_config(
-                embedded_hamt={"engine": "unknown_engine", "path": "/tmp/test"},
+                embedded_db={"engine": "unknown_engine", "path": "/tmp/test"},
             )
 
     def test_engine_mtxdb_ok(self) -> None:
         """engine set to 'mtxdb' with a path → no error. WAL is not required
         here: DatabaseConfig alone can't tell whether this is a worker
         deployment, so that check lives in WorkerConfig instead (see
-        EmbeddedHamtWorkerGuardTestCase) -- WAL is only mandatory in a
+        EmbeddedDbWorkerGuardTestCase) -- WAL is only mandatory in a
         worker deployment, since a single process never goes through the
         cross-process gate WAL's overlay closes."""
         dc = self._read_config(
-            embedded_hamt={"engine": "mtxdb", "path": "/tmp/test"},
+            embedded_db={"engine": "mtxdb", "path": "/tmp/test"},
         )
-        self.assertEqual(dc.embedded_hamt_engine, "mtxdb")
-        self.assertEqual(dc.embedded_hamt_path, "/tmp/test")
+        self.assertEqual(dc.embedded_db_engine, "mtxdb")
+        self.assertEqual(dc.embedded_db_path, "/tmp/test")
 
     def test_neither_set_ok(self) -> None:
         """engine + path both unset → no error."""
         dc = self._read_config()
-        self.assertIsNone(dc.embedded_hamt_engine)
-        self.assertIsNone(dc.embedded_hamt_path)
+        self.assertIsNone(dc.embedded_db_engine)
+        self.assertIsNone(dc.embedded_db_path)
 
 
-class EmbeddedHamtWorkerGuardTestCase(unittest.TestCase):
-    """Test that embedded_hamt.engine is rejected only for *sharded-events*
+class EmbeddedDbWorkerGuardTestCase(unittest.TestCase):
+    """Test that embedded_db.engine is rejected only for *sharded-events*
     multi-worker configs (more than one instance in `writers.events`), not
     multi-worker configs in general.
 
@@ -184,7 +184,7 @@ class EmbeddedHamtWorkerGuardTestCase(unittest.TestCase):
         instance_map: dict | None = None,
         stream_writers: dict | None = None,
         run_background_tasks_on: str | None = None,
-        embedded_hamt_engine: str | None = "mtxdb",
+        embedded_db_engine: str | None = "mtxdb",
         wal_env: str | None = "1",
         sync_mode: str = "interval",
         no_sync: bool = False,
@@ -201,9 +201,9 @@ class EmbeddedHamtWorkerGuardTestCase(unittest.TestCase):
         from synapse.config.workers import WorkerConfig
 
         root = Mock()
-        root.database.embedded_hamt_engine = embedded_hamt_engine
-        root.database.embedded_hamt_sync_mode = sync_mode
-        root.database.embedded_hamt_no_sync = no_sync
+        root.database.embedded_db_engine = embedded_db_engine
+        root.database.embedded_db_sync_mode = sync_mode
+        root.database.embedded_db_no_sync = no_sync
 
         worker_config = WorkerConfig(root)
         config: dict = {}
@@ -230,7 +230,7 @@ class EmbeddedHamtWorkerGuardTestCase(unittest.TestCase):
             os.environ.update(old_env)
 
     def test_worker_app_with_single_events_writer_ok(self) -> None:
-        """embedded_hamt + worker_app, default (single) events writer →
+        """embedded_db + worker_app, default (single) events writer →
         no error: this is the supported single-writer, N-read-only-worker
         topology."""
         self._make_worker_config(
@@ -239,14 +239,14 @@ class EmbeddedHamtWorkerGuardTestCase(unittest.TestCase):
         )
 
     def test_instance_map_with_single_events_writer_ok(self) -> None:
-        """embedded_hamt + non-empty instance_map (no worker_app), default
+        """embedded_db + non-empty instance_map (no worker_app), default
         (single) events writer → no error."""
         self._make_worker_config(
             instance_map={"main": {"host": "127.0.0.1", "port": 8008}},
         )
 
     def test_sharded_events_writers_raises(self) -> None:
-        """embedded_hamt + more than one events writer → ConfigError: each
+        """embedded_db + more than one events writer → ConfigError: each
         would independently open the store writable and race for mtxdb's
         exclusive lock."""
         with self.assertRaises(ConfigError):
@@ -261,8 +261,8 @@ class EmbeddedHamtWorkerGuardTestCase(unittest.TestCase):
             )
 
     def test_single_explicit_events_writer_not_master_raises(self) -> None:
-        """embedded_hamt + exactly one events writer, but it isn't the main
-        process → ConfigError: the embedded-HAMT background migration's
+        """embedded_db + exactly one events writer, but it isn't the main
+        process → ConfigError: the embedded-db background migration's
         poll loop only ever runs on main (see synapse/app/homeserver.py),
         so main must also be the mtxdb writer or that migration crashes
         writing through main's read-only-opened store."""
@@ -277,7 +277,7 @@ class EmbeddedHamtWorkerGuardTestCase(unittest.TestCase):
             )
 
     def test_single_explicit_events_writer_is_master_ok(self) -> None:
-        """embedded_hamt + exactly one events writer, and it's explicitly
+        """embedded_db + exactly one events writer, and it's explicitly
         the main process → no error."""
         self._make_worker_config(
             worker_app="synapse.app.generic_worker",
@@ -286,11 +286,11 @@ class EmbeddedHamtWorkerGuardTestCase(unittest.TestCase):
         )
 
     def test_run_background_tasks_on_other_worker_raises(self) -> None:
-        """embedded_hamt + a single events writer that is main, but
+        """embedded_db + a single events writer that is main, but
         run_background_tasks_on names a different instance → ConfigError:
         that instance would run its own independent background-updates
         poll loop, concurrently with main's own unconditional one, with no
-        cross-instance coordination on the embedded-HAMT-writing rows."""
+        cross-instance coordination on the embedded-db-writing rows."""
         with self.assertRaises(ConfigError):
             self._make_worker_config(
                 worker_app="synapse.app.generic_worker",
@@ -302,7 +302,7 @@ class EmbeddedHamtWorkerGuardTestCase(unittest.TestCase):
             )
 
     def test_run_background_tasks_on_master_explicit_ok(self) -> None:
-        """embedded_hamt + single events writer (main) + run_background_tasks_on
+        """embedded_db + single events writer (main) + run_background_tasks_on
         explicitly set to main → no error."""
         self._make_worker_config(
             worker_app="synapse.app.generic_worker",
@@ -346,11 +346,11 @@ class EmbeddedHamtWorkerGuardTestCase(unittest.TestCase):
         self._make_worker_config(no_sync=True)
 
     def test_single_process_ok(self) -> None:
-        """embedded_hamt alone (no worker_app, no instance_map) → no error."""
+        """embedded_db alone (no worker_app, no instance_map) → no error."""
         self._make_worker_config()
 
-    def test_no_embedded_hamt_with_sharded_writers_ok(self) -> None:
-        """Sharded events writers without embedded_hamt → no error."""
+    def test_no_embedded_db_with_sharded_writers_ok(self) -> None:
+        """Sharded events writers without embedded_db → no error."""
         self._make_worker_config(
             worker_app="synapse.app.generic_worker",
             instance_map={
@@ -359,11 +359,11 @@ class EmbeddedHamtWorkerGuardTestCase(unittest.TestCase):
                 "event_persister2": {"host": "127.0.0.1", "port": 8010},
             },
             stream_writers={"events": ["event_persister1", "event_persister2"]},
-            embedded_hamt_engine=None,
+            embedded_db_engine=None,
         )
 
     def test_single_process_wal_unset_ok(self) -> None:
-        """embedded_hamt + no worker deployment + SYNAPSE_MTXDB_WAL unset →
+        """embedded_db + no worker deployment + SYNAPSE_MTXDB_WAL unset →
         no error. WAL is only required in a worker deployment: a single
         process never goes through the cross-process
         get_many_with_refresh gate that WAL's read-committed overlay
@@ -372,7 +372,7 @@ class EmbeddedHamtWorkerGuardTestCase(unittest.TestCase):
         self._make_worker_config(wal_env=None)
 
     def test_worker_deployment_wal_unset_raises(self) -> None:
-        """embedded_hamt + a worker deployment + SYNAPSE_MTXDB_WAL unset →
+        """embedded_db + a worker deployment + SYNAPSE_MTXDB_WAL unset →
         ConfigError: without the journal, a read-only worker's
         get_many_with_refresh gate can keep reporting a committed write
         as absent for up to the checkpoint rewrite budget."""
@@ -384,7 +384,7 @@ class EmbeddedHamtWorkerGuardTestCase(unittest.TestCase):
             )
 
     def test_worker_deployment_wal_falsey_raises(self) -> None:
-        """embedded_hamt + a worker deployment + a falsey SYNAPSE_MTXDB_WAL
+        """embedded_db + a worker deployment + a falsey SYNAPSE_MTXDB_WAL
         → ConfigError."""
         for falsey in ("", "0", "false", "no", "off", " OFF "):
             with self.assertRaises(ConfigError):
@@ -395,7 +395,7 @@ class EmbeddedHamtWorkerGuardTestCase(unittest.TestCase):
                 )
 
     def test_worker_deployment_wal_truthy_ok(self) -> None:
-        """embedded_hamt + a worker deployment + a truthy SYNAPSE_MTXDB_WAL
+        """embedded_db + a worker deployment + a truthy SYNAPSE_MTXDB_WAL
         → no error. The accepted set must match mtxdb_syn.rs's
         wal_enabled_from()."""
         for truthy in ("1", "true", "yes", "on", "enabled", " TRUE "):
@@ -406,7 +406,7 @@ class EmbeddedHamtWorkerGuardTestCase(unittest.TestCase):
             )
 
     def test_instance_map_worker_deployment_wal_unset_raises(self) -> None:
-        """embedded_hamt + non-empty instance_map (no worker_app, still a
+        """embedded_db + non-empty instance_map (no worker_app, still a
         worker deployment) + SYNAPSE_MTXDB_WAL unset → ConfigError."""
         with self.assertRaises(ConfigError):
             self._make_worker_config(
