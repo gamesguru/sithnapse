@@ -299,7 +299,7 @@ fn deduplicate_root_node_pairs(
     let mut unique_pairs: HashMap<NodeId, NodeData> = HashMap::new();
     for (node_id, value) in pairs {
         if let Some(previous) = unique_pairs.get(&node_id) {
-            if previous.bytes != value.bytes {
+            if previous.bytes.as_ref() != value.bytes.as_ref() {
                 return Err("duplicate derived HAMT node ID with different values in one batch");
             }
         } else {
@@ -3864,6 +3864,15 @@ pub(crate) mod auth_chain_closure_tests {
                 vec![(9, value.clone()), (9, value.clone())],
             )
             .expect("identical duplicate writes are safe");
+            repack(py).expect("repack should preserve room-scoped root aliases");
+            let operational = get_state_hamt_roots_for_room(
+                py,
+                namespace.to_owned(),
+                room.as_bytes().to_vec(),
+                vec![9],
+            )
+            .expect("operational lookup");
+            assert_eq!(operational, vec![Some(value.clone())]);
             let roots = get_state_hamt_roots_by_state_group_id(
                 py,
                 namespace.to_owned(),
@@ -3896,16 +3905,16 @@ pub(crate) mod auth_chain_closure_tests {
     #[test]
     fn state_root_delete_handles_alias_only_and_legacy_only_records() {
         ensure_open();
-        for (suffix, remove_legacy) in [("alias-only", true), ("legacy-only", false)] {
+        for (suffix, leave_legacy_missing) in [("alias-only", true), ("legacy-only", false)] {
             let namespace = format!("ns-root-delete-{suffix}");
             let room = format!("!root-delete-{suffix}:example.org");
-            let state_group = if remove_legacy { 21 } else { 22 };
+            let state_group = if leave_legacy_missing { 21 } else { 22 };
             let value = test_root_value(&room, 5, 6);
             let id = test_root_id(&value);
             test_put_root(&namespace, &room, state_group, value);
 
             let room_id = room_id_from_prefix(room.as_bytes());
-            let node_id = if remove_legacy {
+            let node_id = if leave_legacy_missing {
                 root_node_id(&namespace, state_group)
             } else {
                 state_group_id_alias_node_id(&namespace, state_group)
@@ -3932,10 +3941,6 @@ pub(crate) mod auth_chain_closure_tests {
                 .expect("semantic lookup after delete");
                 assert_eq!(roots, vec![None]);
             });
-
-            // Keep the collection identifier live in this test even when a
-            // future storage implementation changes the direct-write API.
-            assert_ne!(room_id, [0; 16]);
         }
     }
 
@@ -3946,7 +3951,6 @@ pub(crate) mod auth_chain_closure_tests {
         let room = "!root-delete-disagree:example.org";
         let state_group = 31;
         let value = test_root_value(room, 7, 8);
-        let id = test_root_id(&value);
         test_put_root(namespace, room, state_group, value.clone());
 
         state_db()
@@ -3983,7 +3987,6 @@ pub(crate) mod auth_chain_closure_tests {
             .expect("legacy lookup")
         });
         assert_eq!(roots, vec![Some(value)]);
-        assert_ne!(id, [0; 32]);
     }
 
     #[test]
