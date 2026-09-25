@@ -112,11 +112,17 @@ build: ##H Build the package
 # Install
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-# Defaults for `make install`. Override them in .env (sourced below) or in
-# the environment, e.g. `make install INSTALL_USER=deploy`.
+# Defaults for `make install` / `make install/gen-config` / `make install/server`.
+# Override them in .env (sourced below) or in the environment, e.g.
+# `make install INSTALL_USER=deploy`. The virtualenv lives at INSTALL_DIR/.venv.
 INSTALL_USER ?= sith
 INSTALL_DIR ?= /opt/sithnapse
 INSTALL_PYTHON ?= python3
+
+# Defaults for `make install/gen-config` / `make install/server`.
+SERVER_NAME ?= sith.nutra.tk
+CONFIG_PATH ?= /etc/sithnapse/homeserver.yaml
+REPORT_STATS ?= no
 
 .PHONY: install
 install: ##H Create the venv and pip-install the package as INSTALL_USER
@@ -130,6 +136,36 @@ install: ##H Create the venv and pip-install the package as INSTALL_USER
 	sudo -u "$$install_user" -H "$$install_python" -m venv "$$venv"; \
 	echo "Installing $$install_dir into $$venv"; \
 	sudo -u "$$install_user" -H "$$venv/bin/pip" install "$$install_dir"
+
+.PHONY: install/gen-config
+install/gen-config: ##H Generate the homeserver config as INSTALL_USER
+	set -euo pipefail; \
+	if [ -f .env ]; then set -a; . ./.env; set +a; fi; \
+	install_user="$${INSTALL_USER:-$(INSTALL_USER)}"; \
+	install_dir="$${INSTALL_DIR:-$(INSTALL_DIR)}"; \
+	venv="$$install_dir/.venv"; \
+	server_name="$${SERVER_NAME:-$(SERVER_NAME)}"; \
+	config_path="$${CONFIG_PATH:-$(CONFIG_PATH)}"; \
+	report_stats="$${REPORT_STATS:-$(REPORT_STATS)}"; \
+	echo "Generating $$config_path for $$server_name"; \
+	sudo -u "$$install_user" -H "$$venv/bin/python" \
+		-m synapse.app.homeserver \
+		--server-name "$$server_name" \
+		--config-path "$$config_path" \
+		--generate-config \
+		--report-stats="$$report_stats"
+
+.PHONY: install/server
+install/server: ##H Run the homeserver as INSTALL_USER with CONFIG_PATH
+	set -euo pipefail; \
+	if [ -f .env ]; then set -a; . ./.env; set +a; fi; \
+	install_user="$${INSTALL_USER:-$(INSTALL_USER)}"; \
+	install_dir="$${INSTALL_DIR:-$(INSTALL_DIR)}"; \
+	config_path="$${CONFIG_PATH:-$(CONFIG_PATH)}"; \
+	echo "Starting homeserver from $$config_path as $$install_user"; \
+	sudo -u "$$install_user" -H "$$install_dir/.venv/bin/python" \
+		-m synapse.app.homeserver \
+		--config-path "$$config_path"
 
 .PHONY: all
 all:	##H Run the main targets
