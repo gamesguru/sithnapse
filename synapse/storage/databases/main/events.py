@@ -71,6 +71,7 @@ from synapse.storage.databases.main.embedded_common import (
     SyncTier,
     mark_dirty,
     maybe_publish,
+    maybe_sync,
     publishes_at_commit,
     sync_now,
 )
@@ -1379,10 +1380,40 @@ class PersistEventsStore:
                 and not ev.internal_metadata.is_outlier()
                 for ev, ctx in de_outliered_events
             )
+            # All three embedded pools share one write-ahead journal, so a
+            # single sync commits every pool's pending records: `sync_state`
+            # after writing to both the state and event-DAG pools costs one
+            # fsync, and a second or third barrier straight after it costs
+            # none. The number of fsyncs per persist therefore depends on how
+            # many *times* barriers are issued, not on how many pools they
+            # name, so `always` issues exactly one: here, at the end of the
+            # transaction after every embedded write, in the database thread
+            # (not from `call_after`, which runs on the reactor thread and
+            # would stall the whole process for each fsync). It is durable
+            # before the SQL commit, and concurrent transactions on other
+            # database threads coalesce on the same journal sync.
+            barrier_in_txn = (
+                self._embedded_event_json_enabled and not publishes_at_commit()
+            )
             if self._embedded_event_json_enabled and needs_auth_chain_barrier:
-                txn.call_after(sync_now, [Pool.STATE, Pool.AUTH_CHAIN, Pool.EVENT_DAG])
+                if barrier_in_txn:
+                    maybe_sync(
+                        SyncTier.DURABLE,
+                        pools=[Pool.STATE, Pool.AUTH_CHAIN, Pool.EVENT_DAG],
+                    )
+                else:
+                    txn.call_after(
+                        sync_now, [Pool.STATE, Pool.AUTH_CHAIN, Pool.EVENT_DAG]
+                    )
             elif self._embedded_event_json_enabled and needs_state_barrier:
-                if publishes_at_commit():
+                if barrier_in_txn:
+                    # A de-outlier writes only a state mapping: no event JSON.
+                    maybe_sync(
+                        SyncTier.DURABLE,
+                        pools=[Pool.STATE]
+                        + ([Pool.EVENT_DAG] if events_and_contexts else []),
+                    )
+                elif publishes_at_commit():
                     # `sync_mode` is interval/off: publish the state-group
                     # mapping at the commit boundary so a co-located read-only
                     # worker sees it immediately, instead of waiting out the
@@ -1391,8 +1422,6 @@ class PersistEventsStore:
                     # writes, the barrier above. Visibility is not durability.
                     txn.call_after(maybe_publish, SyncTier.DURABLE, [Pool.STATE])
                     txn.call_after(mark_dirty, Pool.STATE)
-                else:
-                    txn.call_after(sync_now, [Pool.STATE])
                 # A live state event can also have written chain-cover links
                 # (see `calculate_chain_cover_index_for_events`) even when its
                 # type is not in `AUTH_CHAIN_EVENT_TYPES`. Those links have no
@@ -1400,6 +1429,11 @@ class PersistEventsStore:
                 # dropping the AUTH_CHAIN dirty mark entirely.
                 txn.call_after(mark_dirty, Pool.AUTH_CHAIN)
             else:
+                if barrier_in_txn and events_and_contexts:
+                    # Outliers and the like have no state barrier, but their
+                    # event JSON has no SQL copy, so it is still durable before
+                    # the row it belongs to commits.
+                    maybe_sync(SyncTier.DURABLE, pools=[Pool.EVENT_DAG])
                 txn.call_after(mark_dirty, Pool.STATE)
                 txn.call_after(mark_dirty, Pool.AUTH_CHAIN)
 
@@ -3137,19 +3171,32 @@ class PersistEventsStore:
                     (event_id, room_id, internal_metadata, json, format_version)
                     for event_id, room_id, internal_metadata, json, format_version in event_json_rows
                 ],
-                # The event is about to become visible through the replication
-                # stream, and with no SQL copy a reader that finds the row but
-                # not the JSON has nothing to fall back to. `always` therefore
-                # syncs EVENT_DAG here, inside the transaction.
-                sync=not publishes_at_commit(),
+                # Not synced here: `_persist_events_txn` issues one barrier at
+                # the end of the transaction that covers this write together
+                # with the state and auth-chain writes that come after it, so
+                # the persist pays a single fsync instead of one per stage.
+                sync=False,
             )
             if publishes_at_commit():
-                # `sync_mode` is interval/off: publish EVENT_DAG before the
-                # transaction can commit (not from `call_after`, which would
-                # leave a window in which the SQL row is visible but the JSON
-                # is not), without the per-event fsync. A rolled-back
-                # transaction leaves an unreferenced record, as `sync=True`
-                # did. Durability lands through the coalescer (`mark_dirty`).
+                # Consistency decision: exclusive event JSON publishes before
+                # the SQL row can become visible, never from `call_after`.
+                # Post-commit publication opens a window in which a worker
+                # finds the committed row but not its JSON; with no SQL copy
+                # to fall back to that window is a hard event-not-found, which
+                # is strictly worse than the alternative. Publishing first
+                # means a rolled-back transaction can instead leave a
+                # published JSON record behind, but that orphan is
+                # unreachable: the read path only ever asks for ids it
+                # discovered from committed SQL rows (`_fetch_event_rows` ->
+                # `_fetch_event_json_for_ids_txn`), so a record with no row is
+                # never served. That is the same shape `sync=True` always
+                # produced, not a new failure mode. Durability still lands
+                # through the coalescer (`mark_dirty`).
+                #
+                # `maybe_publish` flushes the engine's whole pending queue, so
+                # it may also publish a concurrent transaction's uncommitted
+                # mutations. That is an existing property of the shared journal
+                # (see `maybe_publish`), not introduced by this ordering.
                 maybe_publish(SyncTier.DURABLE, [Pool.EVENT_DAG])
                 txn.call_after(mark_dirty, Pool.EVENT_DAG)
 

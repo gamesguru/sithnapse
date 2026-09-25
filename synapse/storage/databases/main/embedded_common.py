@@ -529,6 +529,10 @@ if os.environ.get("SYNAPSE_PG_TIMINGS"):
 # ── mtxdb runtime stats (opt-in via SYNAPSE_MTXDB_STATS=1) ──────────────
 
 
+# Display names for the stats keys, matching mtxdb's own `ShardType` names.
+_POOL_LABELS: dict[str, str] = {"auth_chain": "edges"}
+
+
 def _print_mtxdb_stats() -> None:
     """Print an end-of-run mtxdb runtime stats report for all three pools."""
     if not os.environ.get("SYNAPSE_MTXDB_STATS"):
@@ -571,7 +575,9 @@ def _print_mtxdb_stats() -> None:
         ps = s.get(pool_name, {})
         if not ps:
             continue
-        print(f"\n  [{pool_name}]", file=out)
+        # The third pool is mtxdb's `Edges` (previous-event and auth-chain
+        # edges); the stats key kept the older `auth_chain` name.
+        print(f"\n  [{_POOL_LABELS.get(pool_name, pool_name)}]", file=out)
         print(
             f"    collections: {ps.get('collection_count', 0)}  shards: {ps.get('shard_count', 0)}  index: {ps.get('index_bytes', 0):,}B",
             file=out,

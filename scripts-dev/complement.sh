@@ -524,6 +524,20 @@ main() {
     *) export PASS_SYNAPSE_MTXDB_NO_SYNC=1 ;;
   esac
 
+  # Persist sync mode for the containers: always | interval | off. Unset keeps
+  # the engine default (`always`: an fsync barrier per persisted event).
+  # `interval` and `off` publish writes at the commit boundary so workers still
+  # see them, and leave (or skip) fsync. Only the TEST_-scoped variable is
+  # honoured, for the same reason as the no-sync switch above.
+  case "${SYNAPSE_TEST_MTXDB_SYNC_MODE:-}" in
+    "") ;;
+    always | interval | off) export PASS_SYNAPSE_MTXDB_SYNC="$SYNAPSE_TEST_MTXDB_SYNC_MODE" ;;
+    *)
+      echo "SYNAPSE_TEST_MTXDB_SYNC_MODE must be one of: always, interval, off" >&2
+      exit 1
+      ;;
+  esac
+
   # synapse/config/workers.py requires the write-ahead journal whenever the
   # embedded engine is on *and* the deployment is multi-process (worker_app
   # set or a non-empty instance_map -- i.e. WORKERS=1 runs, not every
@@ -593,7 +607,7 @@ main() {
       mtxdb_location+=" (host: ${COMPLEMENT_MTXDB_HOST_DIR%/}/<container-hostname>)"
     fi
   fi
-  echo "Database: ${PASS_SYNAPSE_COMPLEMENT_DATABASE} (workers: ${PASS_SYNAPSE_COMPLEMENT_USE_WORKERS:-false}) | Embedded HAMT engine: ${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:-<none>}${mtxdb_location}${PASS_SYNAPSE_MTXDB_NO_SYNC:+ (no_sync)}${PASS_SYNAPSE_MTXDB_WAL:+ (wal)}${PASS_SYNAPSE_MTXDB_STATS:+ (stats)}${PASS_SYNAPSE_MTXDB_FORCE_SYNC_EVENT_JSON:+ (force-sync-event-json)}" >&2
+  echo "Database: ${PASS_SYNAPSE_COMPLEMENT_DATABASE} (workers: ${PASS_SYNAPSE_COMPLEMENT_USE_WORKERS:-false}) | Embedded HAMT engine: ${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:-<none>}${mtxdb_location}${PASS_SYNAPSE_MTXDB_NO_SYNC:+ (no_sync)}${PASS_SYNAPSE_MTXDB_SYNC:+ (sync=$PASS_SYNAPSE_MTXDB_SYNC)}${PASS_SYNAPSE_MTXDB_WAL:+ (wal)}${PASS_SYNAPSE_MTXDB_STATS:+ (stats)}${PASS_SYNAPSE_MTXDB_FORCE_SYNC_EVENT_JSON:+ (force-sync-event-json)}" >&2
 
   # Complement's Destroy() force-removes every homeserver container
   # unconditionally, pass or fail -- there is no "keep failed containers"

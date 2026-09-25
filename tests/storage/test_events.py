@@ -19,6 +19,7 @@
 #
 #
 
+import json
 import logging
 from collections.abc import Iterable
 from unittest import mock
@@ -33,7 +34,7 @@ from synapse.rest import admin
 from synapse.rest.client import login, room
 from synapse.server import HomeServer
 from synapse.storage.database import LoggingTransaction
-from synapse.storage.databases.main import events as events_module
+from synapse.storage.databases.main import embedded_event_json, events as events_module
 from synapse.storage.databases.main.embedded_common import Pool, SyncTier
 from synapse.types import StateMap
 from synapse.util.clock import Clock
@@ -196,15 +197,23 @@ class EventsTestCase(HomeserverTestCase):
                 return_value=publish_at_commit,
             ),
             mock.patch.object(events_module, "maybe_publish") as de_outlier_publish,
+            mock.patch.object(events_module, "maybe_sync") as de_outlier_barrier,
             mock.patch.object(events_module, "sync_now") as de_outlier_sync,
         ):
             self.get_success(persistence.persist_event(event, live_context))
 
+        # Neither mode may leave the mapping to the reactor thread: the old
+        # post-commit `sync_now` barrier is gone.
+        de_outlier_sync.assert_not_called()
         if publish_at_commit:
             de_outlier_publish.assert_called_once_with(SyncTier.DURABLE, [Pool.STATE])
-            de_outlier_sync.assert_not_called()
+            de_outlier_barrier.assert_not_called()
         else:
-            de_outlier_sync.assert_called_once_with([Pool.STATE])
+            # A de-outlier writes only a state mapping, so only STATE is synced,
+            # in the transaction, before it commits.
+            de_outlier_barrier.assert_called_once_with(
+                SyncTier.DURABLE, pools=[Pool.STATE]
+            )
             de_outlier_publish.assert_not_called()
 
     @skip_unless(bool(EMBEDDED_HAMT_ENGINE), "requires embedded HAMT engine")
@@ -219,7 +228,7 @@ class EventsTestCase(HomeserverTestCase):
 
     def _persist_message_recording_event_json_sync(
         self, *, publish_at_commit: bool
-    ) -> tuple[list[object], list[object]]:
+    ) -> tuple[list[tuple[str, tuple[object, ...]]], list[object]]:
         """Persist one message, recording what the EVENT_DAG write path does.
 
         Returns `(calls, put_kwargs)`: an ordered log of publishes and of
@@ -230,13 +239,16 @@ class EventsTestCase(HomeserverTestCase):
         token = self.login("json_sync_user", "pass")
         room_id = self.helper.create_room_as(user, tok=token)
 
-        calls: list[object] = []
+        calls: list[tuple[str, tuple[object, ...]]] = []
         put_kwargs: list[object] = []
         real_put = events_module.put_event_json_batch
         real_call_after = LoggingTransaction.call_after
 
         def fake_publish(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
             calls.append(("publish", tuple(pools or ())))
+
+        def fake_sync(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
+            calls.append(("sync", tuple(pools or ())))
 
         def recording_put(*args: object, **kwargs: object) -> None:
             put_kwargs.append(kwargs.get("sync"))
@@ -249,6 +261,8 @@ class EventsTestCase(HomeserverTestCase):
                 calls.append(("call_after_publish", args))
             elif callback is events_module.mark_dirty:
                 calls.append(("call_after_mark_dirty", args))
+            elif callback is events_module.sync_now:
+                calls.append(("call_after_sync_now", args))
             real_call_after(txn, callback, *args, **kwargs)  # type: ignore[arg-type]
 
         fake_publish_mock = mock.Mock(side_effect=fake_publish)
@@ -257,6 +271,9 @@ class EventsTestCase(HomeserverTestCase):
                 events_module, "publishes_at_commit", return_value=publish_at_commit
             ),
             mock.patch.object(events_module, "maybe_publish", fake_publish_mock),
+            mock.patch.object(
+                events_module, "maybe_sync", mock.Mock(side_effect=fake_sync)
+            ),
             mock.patch.object(events_module, "put_event_json_batch", recording_put),
             mock.patch.object(
                 LoggingTransaction,
@@ -269,15 +286,42 @@ class EventsTestCase(HomeserverTestCase):
         return calls, put_kwargs
 
     @skip_unless(bool(EMBEDDED_HAMT_ENGINE), "requires embedded HAMT engine")
-    def test_event_json_is_synced_in_txn_by_default(self) -> None:
-        """`always` keeps the pre-commit EVENT_DAG sync and never publishes it."""
+    def test_default_mode_issues_one_in_txn_barrier_per_persist(self) -> None:
+        """`always` pays one fsync per persist: a single barrier, in the transaction.
+
+        The pools share one journal, so a barrier covers every pool's pending
+        records. Issuing it once at the end of the transaction (after the event
+        JSON, the state mapping and any auth-chain links are written) replaces
+        the old pair -- an event-JSON sync mid-transaction plus a post-commit
+        `sync_now` for whatever was written after it -- and, being in the
+        transaction, it runs on the database thread instead of the reactor.
+        """
         calls, put_kwargs = self._persist_message_recording_event_json_sync(
             publish_at_commit=False
         )
 
+        # No per-put sync: the end-of-transaction barrier covers the JSON.
         self.assertTrue(put_kwargs)
-        self.assertTrue(all(sync is True for sync in put_kwargs), put_kwargs)
+        self.assertTrue(all(sync is False for sync in put_kwargs), put_kwargs)
+
+        barriers = [call for call in calls if call[0] == "sync"]
+        self.assertEqual(
+            barriers,
+            [("sync", (Pool.STATE, Pool.EVENT_DAG))],
+            "expected exactly one barrier covering the state and event-DAG writes",
+        )
+        # Nothing is left for the reactor thread, and nothing is published
+        # (that is the interval/off path).
+        self.assertNotIn(("call_after_sync_now", ([Pool.STATE],)), calls)
+        self.assertFalse([call for call in calls if call[0] == "call_after_sync_now"])
         self.assertNotIn(("publish", (Pool.EVENT_DAG,)), calls)
+        # In the transaction: the barrier is issued before the post-commit
+        # durability marks that the same block registers. (An earlier
+        # `mark_dirty(EVENT_DAG)` is the edge writes' own coalescing.)
+        self.assertLess(
+            calls.index(barriers[0]),
+            calls.index(("call_after_mark_dirty", (Pool.AUTH_CHAIN,))),
+        )
 
     @skip_unless(bool(EMBEDDED_HAMT_ENGINE), "requires embedded HAMT engine")
     def test_event_json_publish_precedes_commit_when_publishing_at_commit(
