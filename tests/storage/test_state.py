@@ -930,7 +930,7 @@ class StateStoreTestCase(HomeserverTestCase):
         )
         sg = 80001
         self.get_success(
-            self.state_datastore.redo_embedded_db_mirror_writes_batch(
+            self.state_datastore.redo_embedded_hamt_mirror_writes_batch(
                 room_id,
                 room_version,
                 [
@@ -978,7 +978,7 @@ class StateStoreTestCase(HomeserverTestCase):
         )
         sg1, sg2 = 80002, 80003
         self.get_success(
-            self.state_datastore.redo_embedded_db_mirror_writes_batch(
+            self.state_datastore.redo_embedded_hamt_mirror_writes_batch(
                 room_id,
                 room_version,
                 [
@@ -1029,7 +1029,7 @@ class StateStoreTestCase(HomeserverTestCase):
         )
         sg1, sg2 = 80004, 80005
         self.get_failure(
-            self.state_datastore.redo_embedded_db_mirror_writes_batch(
+            self.state_datastore.redo_embedded_hamt_mirror_writes_batch(
                 room_id,
                 room_version,
                 [
@@ -1066,7 +1066,7 @@ class StateStoreTestCase(HomeserverTestCase):
         room_version = self.get_success(self.store.get_room_version(room_id))
 
         self.get_failure(
-            self.state_datastore.redo_embedded_db_mirror_writes_batch(
+            self.state_datastore.redo_embedded_hamt_mirror_writes_batch(
                 room_id,
                 room_version,
                 [
@@ -1089,7 +1089,7 @@ class StateStoreTestCase(HomeserverTestCase):
         room_version = self.get_success(self.store.get_room_version(room_id))
 
         self.get_failure(
-            self.state_datastore.redo_embedded_db_mirror_writes_batch(
+            self.state_datastore.redo_embedded_hamt_mirror_writes_batch(
                 room_id,
                 room_version,
                 [

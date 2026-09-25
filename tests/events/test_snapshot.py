@@ -119,3 +119,51 @@ class TestEventContext(unittest.HomeserverTestCase):
             self.get_success(context.get_prev_state_ids()),
             self.get_success(d_context.get_prev_state_ids()),
         )
+
+    def test_serialize_uses_historical_pending_mirror_root_key(self) -> None:
+        """The deferred state-HAMT mirror roots travel under their historical
+        wire key even though the storage engine is now `embedded_db`, so
+        mixed-version workers keep interoperating during a rolling upgrade."""
+        event, context = self.get_success(
+            create_event(
+                self.hs,
+                room_id=self.room_id,
+                type="m.test",
+                sender=self.user_id,
+            )
+        )
+        context.pending_embedded_hamt_mirror_roots = {1: {"expected_root": "abcd"}}
+
+        serialized = self.get_success(context.serialize(event, self.store))
+
+        self.assertEqual(
+            serialized["pending_embedded_hamt_mirror_roots"],
+            {"1": {"expected_root": "abcd"}},
+        )
+        self.assertNotIn("pending_embedded_db_mirror_roots", serialized)
+
+        d_context = EventContext.deserialize(self._storage_controllers, serialized)
+        self.assertEqual(
+            d_context.pending_embedded_hamt_mirror_roots,
+            {1: {"expected_root": "abcd"}},
+        )
+
+    def test_deserialize_accepts_legacy_singular_mirror_root(self) -> None:
+        """Even older workers send a single hex string, not the plural map."""
+        event, context = self.get_success(
+            create_event(
+                self.hs,
+                room_id=self.room_id,
+                type="m.test",
+                sender=self.user_id,
+            )
+        )
+        serialized = self.get_success(context.serialize(event, self.store))
+        serialized.pop("pending_embedded_hamt_mirror_roots")
+        serialized["pending_embedded_hamt_mirror_root"] = "abcd"
+
+        d_context = EventContext.deserialize(self._storage_controllers, serialized)
+        self.assertEqual(
+            d_context.pending_embedded_hamt_mirror_roots,
+            {context.state_group: {"expected_root": "abcd"}},
+        )

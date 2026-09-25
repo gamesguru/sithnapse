@@ -183,7 +183,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         # non-writer instance whose mtxdb mirror write was skipped. Keep this
         # available even when embedded DB is disabled: the replication
         # handoff helper is shared by both configurations.
-        self._pending_embedded_db_mirrors: dict[int, dict[str, Any]] = {}
+        self._pending_embedded_hamt_mirrors: dict[int, dict[str, Any]] = {}
 
         # Always assign these, even when the embedded engine is disabled:
         # `_assert_embedded_db_writer` and the mirror-redo path read them
@@ -220,9 +220,9 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             # state_group -> root_structural_hash for groups created on
             # this (non-writer) instance whose mtxdb mirror write was
             # skipped -- see `store_state_group`'s skip_mirror_write and
-            # `pop_pending_embedded_db_root`. Entries live only between
+            # `pop_pending_embedded_hamt_root`. Entries live only between
             # `store_state_group` returning and the immediate
-            # `pop_pending_embedded_db_root` call in
+            # `pop_pending_embedded_hamt_root` call in
             # `UnpersistedEventContext.persist` a few lines later in the
             # same coroutine -- not held across a request lifetime, so
             # there's nothing here for `EventContext.serialize` retries to
@@ -325,7 +325,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 "mirror writes must only happen on the events writer."
             )
 
-    def pop_pending_embedded_db_root(self, state_group: int) -> dict[str, Any] | None:
+    def pop_pending_embedded_hamt_root(self, state_group: int) -> dict[str, Any] | None:
         """Returns and clears the expected root_structural_hash for a state
         group created on this (non-writer) instance whose mtxdb mirror
         write was skipped, or None if `state_group` has no pending mirror
@@ -339,9 +339,9 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         else catches a silent divergence between what the creator computed
         and what the writer redid.
         """
-        return self._pending_embedded_db_mirrors.pop(state_group, None)
+        return self._pending_embedded_hamt_mirrors.pop(state_group, None)
 
-    async def redo_embedded_db_mirror_writes_batch(
+    async def redo_embedded_hamt_mirror_writes_batch(
         self,
         room_id: str,
         room_version: RoomVersion,
@@ -512,10 +512,10 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             txn.call_after(mark_dirty, Pool.STATE)
 
         await self.db_pool.runInteraction(
-            "redo_embedded_db_mirror_writes_batch", redo_all_txn
+            "redo_embedded_hamt_mirror_writes_batch", redo_all_txn
         )
 
-    async def redo_embedded_db_mirror_write(
+    async def redo_embedded_hamt_mirror_write(
         self,
         state_group: int,
         prev_state_group: int | None,
@@ -526,7 +526,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         state_map: Mapping[tuple[str, str], str] | None = None,
     ) -> None:
         """Redo, on the events writer, a single mtxdb mirror write."""
-        await self.redo_embedded_db_mirror_writes_batch(
+        await self.redo_embedded_hamt_mirror_writes_batch(
             room_id,
             room_version,
             [
@@ -988,7 +988,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         request need them), but do not attempt to persist them here. The
         events writer will redo this write from the `updates` delta it
         receives over `send_events` replication instead -- see
-        `pop_pending_embedded_db_root`. SQL row creation for the state
+        `pop_pending_embedded_hamt_root`. SQL row creation for the state
         group itself (`_persist_state_group_snapshot_txn`'s own inserts)
         is unaffected by this flag and always happens locally.
 
@@ -1970,7 +1970,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                             f"State map for state group {sg_after} exceeds maximum replication payload size "
                             f"({len(state_map)} > {self.MAX_MIRROR_STATE_ENTRIES})"
                         )
-                    self._pending_embedded_db_mirrors[sg_after] = {
+                    self._pending_embedded_hamt_mirrors[sg_after] = {
                         "version": 1,
                         "state_group": sg_after,
                         "predecessor_state_group": sg_before,
@@ -2105,7 +2105,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         # writer) -- the mirror write must be skipped here and redone by
         # the writer from `updates`/`delta_ids` once this state group's
         # event reaches it over `send_events` replication. See
-        # `_assert_embedded_db_writer` and `pop_pending_embedded_db_root`.
+        # `_assert_embedded_db_writer` and `pop_pending_embedded_hamt_root`.
         skip_mirror_write = bool(self._embedded_db_engine) and not getattr(
             self, "_embedded_db_is_writer", True
         )
@@ -2165,7 +2165,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                     f"State map for state group {state_group} exceeds maximum replication payload size "
                     f"({len(current_state_ids)} > {self.MAX_MIRROR_STATE_ENTRIES})"
                 )
-            self._pending_embedded_db_mirrors[state_group] = {
+            self._pending_embedded_hamt_mirrors[state_group] = {
                 "version": 1,
                 "state_group": state_group,
                 "predecessor_state_group": prev_group,
