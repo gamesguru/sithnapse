@@ -243,6 +243,19 @@ fn state_group_root_node_id(namespace: &str, state_group_id: &[u8; 32]) -> [u8; 
     id
 }
 
+fn state_group_refcount_node_id(namespace: &str, state_group_id: &[u8; 32]) -> [u8; 16] {
+    let namespace_len = u32::try_from(namespace.len()).expect("namespace length fits u32");
+    let mut buf = Vec::with_capacity(b"hamt:root-refcount:v1:".len() + 4 + namespace.len() + 32);
+    buf.extend_from_slice(b"hamt:root-refcount:v1:");
+    buf.extend_from_slice(&namespace_len.to_be_bytes());
+    buf.extend_from_slice(namespace.as_bytes());
+    buf.extend_from_slice(state_group_id);
+    let hash = Sha256::digest(&buf);
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&hash[..16]);
+    id
+}
+
 fn state_group_id_alias_node_id(namespace: &str, state_group: i64) -> [u8; 16] {
     let namespace_len = u32::try_from(namespace.len()).expect("namespace length fits u32");
     let mut buf = Vec::with_capacity(b"hamt:root-map:v1:".len() + 4 + namespace.len() + 8);
@@ -258,7 +271,7 @@ fn state_group_id_alias_node_id(namespace: &str, state_group: i64) -> [u8; 16] {
 
 /// Decode the canonical LtHash digest from an encoded `MTHR\x01` root.
 /// The lattice is the final 2048 bytes of the root record.
-fn state_group_id_from_root_value(value: &[u8]) -> Result<[u8; 32], String> {
+fn root_record_parts(value: &[u8]) -> Result<(Vec<u8>, String, &[u8]), String> {
     if value.len() < 7 || &value[..4] != b"MTHR" || value[4] != 1 {
         return Err("invalid or unsupported HAMT root record".to_owned());
     }
@@ -283,7 +296,15 @@ fn state_group_id_from_root_value(value: &[u8]) -> Result<[u8; 32], String> {
     if value.len() != lattice_end {
         return Err("HAMT root record must contain exactly one 2048-byte lattice".to_owned());
     }
-    let lattice_bytes = &value[lattice_start..lattice_end];
+    let room_prefix = value[7..room_len_offset].to_vec();
+    let room_id = std::str::from_utf8(&value[room_len_end..room_len_end + room_len])
+        .map_err(|_| "HAMT root record contains invalid UTF-8 room ID".to_owned())?
+        .to_owned();
+    Ok((room_prefix, room_id, &value[lattice_start..lattice_end]))
+}
+
+fn state_group_id_from_root_value(value: &[u8]) -> Result<[u8; 32], String> {
+    let (_, _, lattice_bytes) = root_record_parts(value)?;
     let mut lattice = [0u16; 1024];
     for (index, chunk) in lattice_bytes.chunks_exact(2).enumerate() {
         lattice[index] = u16::from_le_bytes([chunk[0], chunk[1]]);
@@ -291,6 +312,25 @@ fn state_group_id_from_root_value(value: &[u8]) -> Result<[u8; 32], String> {
     Ok(rezzy::hamt::state_group_id_from_lthash(
         &rezzy::state::LtHash(lattice),
     ))
+}
+
+fn state_group_id_from_root_value_for_room(
+    value: &[u8],
+    expected_room_prefix: &[u8],
+) -> Result<[u8; 32], String> {
+    let (room_prefix, room_id, _) = root_record_parts(value)?;
+    if room_prefix != expected_room_prefix {
+        return Err("HAMT root record room prefix does not match its collection".to_owned());
+    }
+    // Production callers pass the fixed-width derived room prefix, which is
+    // not reversible to the Matrix room ID. When a full room ID is supplied
+    // (as in legacy/tests), it is still possible to validate both fields.
+    if expected_room_prefix.len() != ROOM_PREFIX_LEN
+        && state_hamt_room_id(&room_id) != room_id_from_prefix(expected_room_prefix)
+    {
+        return Err("HAMT root record room ID does not match its collection".to_owned());
+    }
+    state_group_id_from_root_value(value)
 }
 
 fn deduplicate_root_node_pairs(
@@ -395,7 +435,7 @@ pub fn put_state_hamt_roots(
     let mut operational_values: HashMap<i64, ([u8; 32], Vec<u8>)> = HashMap::new();
     let mut semantic_values: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
     for (state_group, value) in roots {
-        let state_group_id = state_group_id_from_root_value(&value)
+        let state_group_id = state_group_id_from_root_value_for_room(&value, &room_prefix)
             .map_err(pyo3::exceptions::PyValueError::new_err)?;
         if let Some((previous_id, previous_value)) = operational_values.get(&state_group) {
             if *previous_id != state_group_id || *previous_value != value {
@@ -440,8 +480,6 @@ pub fn put_state_hamt_roots(
             )
         }))
         .collect();
-    let pairs =
-        deduplicate_root_node_pairs(pairs).map_err(pyo3::exceptions::PyValueError::new_err)?;
     py.detach(|| {
         let _write_guard = STATE_HAMT_ROOT_WRITE_LOCK
             .get_or_init(|| Mutex::new(()))
@@ -456,9 +494,10 @@ pub fn put_state_hamt_roots(
             .get_read_committed(&room_id, &semantic_node_ids)
             .map_err(map_read_storage_error)?;
         for (existing, expected_id) in existing.into_iter().zip(semantic_ids.iter()) {
-            if let Some(existing) = existing.filter(|data| !data.bytes.is_empty()) {
-                let actual_id = state_group_id_from_root_value(&existing.bytes)
-                    .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            if let Some(existing) = existing.as_ref().filter(|data| !data.bytes.is_empty()) {
+                let actual_id =
+                    state_group_id_from_root_value_for_room(&existing.bytes, &room_prefix)
+                        .map_err(pyo3::exceptions::PyValueError::new_err)?;
                 if actual_id != *expected_id {
                     return Err(pyo3::exceptions::PyValueError::new_err(
                         "StateGroupId index collision detected",
@@ -473,8 +512,8 @@ pub fn put_state_hamt_roots(
         let aliases = engine
             .get_read_committed(&room_id, &alias_node_ids)
             .map_err(map_read_storage_error)?;
-        for ((_, _, expected_id), existing) in validated_roots.iter().zip(aliases) {
-            if let Some(existing) = existing.filter(|data| !data.bytes.is_empty()) {
+        for ((_, _, expected_id), existing) in validated_roots.iter().zip(aliases.iter()) {
+            if let Some(existing) = existing.as_ref().filter(|data| !data.bytes.is_empty()) {
                 if existing.bytes.as_ref() != expected_id.as_slice() {
                     return Err(pyo3::exceptions::PyValueError::new_err(
                         "state_group alias collision detected",
@@ -482,6 +521,55 @@ pub fn put_state_hamt_roots(
                 }
             }
         }
+        let refcount_node_ids: Vec<NodeId> = semantic_ids
+            .iter()
+            .map(|id| state_group_refcount_node_id(&namespace, id))
+            .collect();
+        let refcounts = engine
+            .get_read_committed(&room_id, &refcount_node_ids)
+            .map_err(map_read_storage_error)?;
+        let mut refcounts_by_id: HashMap<[u8; 32], u64> = semantic_ids
+            .iter()
+            .copied()
+            .zip(refcounts)
+            .map(|(id, value)| {
+                let count = value
+                    .filter(|data| !data.bytes.is_empty())
+                    .map(|data| {
+                        let bytes: [u8; 8] = data.bytes.as_ref().try_into().map_err(|_| {
+                            pyo3::exceptions::PyValueError::new_err(
+                                "corrupt StateGroupId reference count",
+                            )
+                        })?;
+                        Ok::<u64, PyErr>(u64::from_be_bytes(bytes))
+                    })
+                    .transpose()?;
+                Ok::<([u8; 32], u64), PyErr>((id, count.unwrap_or(0)))
+            })
+            .collect::<PyResult<_>>()?;
+        let mut pairs = pairs;
+        for ((_, _, state_group_id), alias) in validated_roots.iter().zip(aliases.iter()) {
+            if alias
+                .as_ref()
+                .filter(|data| !data.bytes.is_empty())
+                .is_none()
+            {
+                let count = refcounts_by_id.entry(*state_group_id).or_default();
+                *count = count.checked_add(1).ok_or_else(|| {
+                    pyo3::exceptions::PyOverflowError::new_err(
+                        "StateGroupId reference count overflow",
+                    )
+                })?;
+            }
+        }
+        for (state_group_id, count) in refcounts_by_id {
+            pairs.push((
+                state_group_refcount_node_id(&namespace, &state_group_id),
+                NodeData::from_slice(&count.to_be_bytes()),
+            ));
+        }
+        let pairs =
+            deduplicate_root_node_pairs(pairs).map_err(pyo3::exceptions::PyValueError::new_err)?;
         let committed = engine.put_many(&room_id, &pairs).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {}", e))
         })?;
@@ -542,6 +630,7 @@ pub fn delete_state_hamt_roots_for_room(
                 )
             })
             .collect();
+        let mut resolved = Vec::with_capacity(state_groups.len());
         for ((state_group, alias), legacy) in state_groups.iter().zip(alias_values).zip(existing) {
             let alias_id = if let Some(alias) = alias.filter(|data| !data.bytes.is_empty()) {
                 let id: [u8; 32] = alias.bytes.as_ref().try_into().map_err(|_| {
@@ -556,7 +645,7 @@ pub fn delete_state_hamt_roots_for_room(
             let legacy_id = legacy
                 .as_ref()
                 .filter(|data| !data.bytes.is_empty())
-                .map(|data| state_group_id_from_root_value(&data.bytes))
+                .map(|data| state_group_id_from_root_value_for_room(&data.bytes, &room_prefix))
                 .transpose()
                 .map_err(pyo3::exceptions::PyValueError::new_err)?;
             if let (Some(alias_id), Some(legacy_id)) = (alias_id, legacy_id) {
@@ -567,15 +656,84 @@ pub fn delete_state_hamt_roots_for_room(
                 }
             }
             let state_group_id = alias_id.or(legacy_id);
+            resolved.push((*state_group, state_group_id));
             pairs.push((
                 state_group_id_alias_node_id(&namespace, *state_group),
                 NodeData::new(bytes::Bytes::new()),
             ));
+        }
+        let semantic_ids: Vec<[u8; 32]> = resolved
+            .iter()
+            .filter_map(|(_, id)| *id)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let refcount_node_ids: Vec<NodeId> = semantic_ids
+            .iter()
+            .map(|id| state_group_refcount_node_id(&namespace, id))
+            .collect();
+        let refcounts = engine
+            .get_read_committed(&room_id, &refcount_node_ids)
+            .map_err(map_read_storage_error)?;
+        let refcounts: HashMap<[u8; 32], Option<u64>> = semantic_ids
+            .iter()
+            .copied()
+            .zip(refcounts)
+            .map(|(id, value)| {
+                let count = value
+                    .filter(|data| !data.bytes.is_empty())
+                    .map(|data| {
+                        let bytes: [u8; 8] = data.bytes.as_ref().try_into().map_err(|_| {
+                            pyo3::exceptions::PyValueError::new_err(
+                                "corrupt StateGroupId reference count",
+                            )
+                        })?;
+                        Ok::<u64, PyErr>(u64::from_be_bytes(bytes))
+                    })
+                    .transpose()?;
+                Ok::<([u8; 32], Option<u64>), PyErr>((id, count))
+            })
+            .collect::<PyResult<_>>()?;
+        let mut decrements: HashMap<[u8; 32], u64> = HashMap::new();
+        for (_, state_group_id) in resolved {
             if let Some(state_group_id) = state_group_id {
-                pairs.push((
-                    state_group_root_node_id(&namespace, &state_group_id),
-                    NodeData::new(bytes::Bytes::new()),
-                ));
+                let decrement = decrements.entry(state_group_id).or_default();
+                *decrement = decrement.checked_add(1).ok_or_else(|| {
+                    pyo3::exceptions::PyOverflowError::new_err(
+                        "StateGroupId reference count overflow",
+                    )
+                })?;
+            }
+        }
+        for (state_group_id, decrement) in decrements {
+            match refcounts.get(&state_group_id).copied().flatten() {
+                Some(count) if count < decrement => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "StateGroupId reference count is smaller than deletion batch",
+                    ));
+                }
+                Some(count) if count > decrement => {
+                    pairs.push((
+                        state_group_refcount_node_id(&namespace, &state_group_id),
+                        NodeData::from_slice(&(count - decrement).to_be_bytes()),
+                    ));
+                }
+                Some(_) => {
+                    pairs.push((
+                        state_group_refcount_node_id(&namespace, &state_group_id),
+                        NodeData::new(bytes::Bytes::new()),
+                    ));
+                    pairs.push((
+                        state_group_root_node_id(&namespace, &state_group_id),
+                        NodeData::new(bytes::Bytes::new()),
+                    ));
+                }
+                None => {
+                    // Roots written before the reference index existed cannot
+                    // be proven unshared. Remove the operational aliases but
+                    // retain the semantic root rather than breaking another
+                    // state_group that may point at it.
+                }
             }
         }
         let committed = engine.put_many(&room_id, &pairs).map_err(|e| {
@@ -663,7 +821,7 @@ pub fn get_state_hamt_roots_by_state_group_id(
                 if data.bytes.is_empty() {
                     return Ok(None);
                 }
-                let actual_id = state_group_id_from_root_value(&data.bytes)
+                let actual_id = state_group_id_from_root_value_for_room(&data.bytes, &room_prefix)
                     .map_err(pyo3::exceptions::PyValueError::new_err)?;
                 if actual_id != *expected_id {
                     return Err(pyo3::exceptions::PyValueError::new_err(
@@ -3891,6 +4049,84 @@ pub(crate) mod auth_chain_closure_tests {
             .expect_err("reusing an operational id for another root must fail")
         });
         assert!(error.to_string().contains("state_group alias collision"));
+    }
+
+    #[test]
+    fn state_root_delete_preserves_shared_semantic_root_until_last_alias() {
+        ensure_open();
+        let namespace = "ns-root-shared-semantic";
+        let room = "!root-shared-semantic:example.org";
+        let value = test_root_value(room, 1, 2);
+        let id = test_root_id(&value);
+        test_put_root(namespace, room, 41, value.clone());
+        test_put_root(namespace, room, 42, value.clone());
+
+        pyo3::Python::attach(|py| {
+            delete_state_hamt_roots_for_room(
+                py,
+                namespace.to_owned(),
+                room.as_bytes().to_vec(),
+                vec![41],
+            )
+            .expect("first alias deletion");
+            assert_eq!(
+                get_state_hamt_roots_for_room(
+                    py,
+                    namespace.to_owned(),
+                    room.as_bytes().to_vec(),
+                    vec![42],
+                )
+                .expect("remaining operational lookup"),
+                vec![Some(value.clone())]
+            );
+            assert_eq!(
+                get_state_hamt_roots_by_state_group_id(
+                    py,
+                    namespace.to_owned(),
+                    room.as_bytes().to_vec(),
+                    vec![id.to_vec()],
+                )
+                .expect("shared semantic lookup"),
+                vec![Some(value.clone())]
+            );
+            delete_state_hamt_roots_for_room(
+                py,
+                namespace.to_owned(),
+                room.as_bytes().to_vec(),
+                vec![42],
+            )
+            .expect("last alias deletion");
+            assert_eq!(
+                get_state_hamt_roots_by_state_group_id(
+                    py,
+                    namespace.to_owned(),
+                    room.as_bytes().to_vec(),
+                    vec![id.to_vec()],
+                )
+                .expect("semantic lookup after last deletion"),
+                vec![None]
+            );
+        });
+    }
+
+    #[test]
+    fn state_root_rejects_root_from_another_room_collection() {
+        ensure_open();
+        let namespace = "ns-root-room-mismatch";
+        let room_a = "!root-room-a:example.org";
+        let room_b = "!root-room-b:example.org";
+        let error = pyo3::Python::attach(|py| {
+            put_state_hamt_roots(
+                py,
+                namespace.to_owned(),
+                room_a.as_bytes().to_vec(),
+                vec![(51, test_root_value(room_b, 3, 4))],
+            )
+            .expect_err("a root from another room must be rejected")
+        });
+        assert!(error
+            .to_string()
+            .contains("room prefix does not match its collection"));
     }
 
     #[test]
