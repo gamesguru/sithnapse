@@ -97,6 +97,7 @@ from synapse.storage.databases.main.embedded_common import (
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
+    from synapse.synapse_rust.mtxdb_engine import MtxdbTransaction
 
 logger = logging.getLogger(__name__)
 
@@ -169,8 +170,14 @@ def put_event_json_batch(
     rows: list[tuple[str, str, str, str, int | None]],
     *,
     sync: bool = False,
+    transaction: MtxdbTransaction | None = None,
 ) -> None:
     """`rows`: `(event_id, room_id, internal_metadata, json, format_version)`.
+
+    With a `transaction`, the write is staged in it instead of applied: nothing
+    is visible until the transaction commits, and it disappears if the
+    transaction aborts. `sync` is then ignored (a staged write has nothing to
+    fsync until it commits).
     Called from the event persister only (the sole writer of `event_json`),
     synchronously in the persisting transaction -- same reasoning as
     `_store_state_hamt_root_embedded_txn`: an mtxdb call is local, no
@@ -208,6 +215,10 @@ def put_event_json_batch(
             for event_id, room_id, internal_metadata, json, format_version in rows
         ]
         _et = time.monotonic()
+        if transaction is not None:
+            transaction.event_json_put(namespace, tuples)
+            ffi_timing("ffi_event_json_put", time.monotonic() - _et)
+            return
         event_json_put(namespace, tuples)
         ffi_timing("ffi_event_json_put", time.monotonic() - _et)
 

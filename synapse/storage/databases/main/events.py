@@ -69,6 +69,7 @@ from synapse.storage.database import (
 from synapse.storage.databases.main.embedded_common import (
     Pool,
     SyncTier,
+    begin_embedded_transaction,
     mark_dirty,
     maybe_sync,
     publishes_at_commit,
@@ -116,6 +117,7 @@ from synapse.util.stringutils import non_null_str_or_none
 if TYPE_CHECKING:
     from synapse.server import HomeServer
     from synapse.storage.databases.main import DataStore
+    from synapse.synapse_rust.mtxdb_engine import MtxdbTransaction
 
 
 logger = logging.getLogger(__name__)
@@ -1157,6 +1159,85 @@ class PersistEventsStore:
         sliding_sync_table_changes: SlidingSyncTableChanges | None,
         new_state_dag_forward_extremities: set[str] | None = None,
     ) -> None:
+        """Persist events, staging the embedded event-JSON writes in one mtxdb
+        transaction that commits with this SQL transaction.
+
+        The staged writes are invisible to every reader until `commit()`. They
+        are committed here, at the end of the body and before the SQL COMMIT,
+        so an event's JSON is visible before its row can be (exclusive mode has
+        no SQL copy to fall back to, so the reverse order would be a hard
+        event-not-found). Anything that raises first aborts the staged writes,
+        so a failed or retried attempt leaves nothing behind. The one window
+        left is the SQL COMMIT itself failing after mtxdb committed: that
+        leaves JSON with no row, which no reader asks for, because reads only
+        look up ids discovered from committed SQL rows.
+
+        This must not move to `txn.call_after`: after-commit callbacks
+        accumulate across retried attempts and all run on the final success, so
+        an earlier failed attempt's writes would be committed too, and they run
+        on the reactor thread after the row is already visible.
+
+        See `_persist_events_txn_body` for the arguments.
+        """
+        mtxdb_txn = (
+            begin_embedded_transaction() if self._embedded_event_json_enabled else None
+        )
+        if mtxdb_txn is None:
+            self._persist_events_txn_body(
+                txn,
+                room_id=room_id,
+                events_and_contexts=events_and_contexts,
+                inhibit_local_membership_updates=inhibit_local_membership_updates,
+                state_delta_for_room=state_delta_for_room,
+                new_forward_extremities=new_forward_extremities,
+                new_event_links=new_event_links,
+                sliding_sync_table_changes=sliding_sync_table_changes,
+                new_state_dag_forward_extremities=new_state_dag_forward_extremities,
+                mtxdb_txn=None,
+            )
+            return
+
+        commit_started = False
+        try:
+            self._persist_events_txn_body(
+                txn,
+                room_id=room_id,
+                events_and_contexts=events_and_contexts,
+                inhibit_local_membership_updates=inhibit_local_membership_updates,
+                state_delta_for_room=state_delta_for_room,
+                new_forward_extremities=new_forward_extremities,
+                new_event_links=new_event_links,
+                sliding_sync_table_changes=sliding_sync_table_changes,
+                new_state_dag_forward_extremities=new_state_dag_forward_extremities,
+                mtxdb_txn=mtxdb_txn,
+            )
+            commit_started = True
+            mtxdb_txn.commit()
+        except BaseException:
+            # After a failed commit the group may already be published, and
+            # aborting a published transaction is an error that would hide the
+            # real one, so only abort what is still purely staged.
+            if not commit_started:
+                try:
+                    mtxdb_txn.abort()
+                except Exception:
+                    logger.exception("Failed to abort the mtxdb transaction")
+            raise
+
+    def _persist_events_txn_body(
+        self,
+        txn: LoggingTransaction,
+        *,
+        room_id: str,
+        events_and_contexts: list[EventPersistencePair],
+        inhibit_local_membership_updates: bool,
+        state_delta_for_room: DeltaState | None,
+        new_forward_extremities: set[str] | None,
+        new_event_links: dict[str, NewEventChainLinks],
+        sliding_sync_table_changes: SlidingSyncTableChanges | None,
+        new_state_dag_forward_extremities: set[str] | None,
+        mtxdb_txn: "MtxdbTransaction | None",
+    ) -> None:
         """Insert some number of room events into the necessary database tables.
 
         Rejected events are only inserted into the events table, the events_json table,
@@ -1264,7 +1345,9 @@ class PersistEventsStore:
         wrote_event_json = self._embedded_event_json_enabled and bool(
             events_and_contexts
         )
-        self._store_event_txn(txn, events_and_contexts=events_and_contexts)
+        self._store_event_txn(
+            txn, events_and_contexts=events_and_contexts, mtxdb_txn=mtxdb_txn
+        )
 
         if new_forward_extremities:
             self._update_forward_extremities_txn(
@@ -3133,9 +3216,13 @@ class PersistEventsStore:
         self,
         txn: LoggingTransaction,
         events_and_contexts: Collection[EventPersistencePair],
+        mtxdb_txn: "MtxdbTransaction | None" = None,
     ) -> None:
         """Insert new events into the event, event_json, redaction and
         state_events tables.
+
+        With an `mtxdb_txn` the embedded event JSON is staged in it (committed
+        by `_persist_events_txn`) instead of written straight away.
         """
 
         if not events_and_contexts:
@@ -3187,23 +3274,20 @@ class PersistEventsStore:
                 # with the state and auth-chain writes that come after it, so
                 # the persist pays a single fsync instead of one per stage.
                 sync=False,
+                transaction=mtxdb_txn,
             )
             if publishes_at_commit():
-                # Consistency decision: exclusive event JSON publishes before
-                # the SQL row can become visible, never from `call_after`.
-                # Post-commit publication opens a window in which a worker
-                # finds the committed row but not its JSON; with no SQL copy
-                # to fall back to that window is a hard event-not-found, which
-                # is strictly worse than the alternative. Publishing first
-                # means a rolled-back transaction can instead leave a
-                # published JSON record behind, but that orphan is
-                # unreachable: the read path only ever asks for ids it
+                # Exclusive event JSON must be visible before its SQL row, never
+                # from `call_after`: a worker that finds the committed row but
+                # not its JSON has no SQL copy to fall back to, a hard
+                # event-not-found. With a transaction the JSON is staged here
+                # and `_persist_events_txn` commits it before the SQL COMMIT,
+                # and not at all if this attempt fails. Without one (no shared
+                # WAL) it was journaled above, and a rolled-back attempt can
+                # leave an orphan: unreachable, since reads only look up ids
                 # discovered from committed SQL rows (`_fetch_event_rows` ->
-                # `_fetch_event_json_for_ids_txn`), so a record with no row is
-                # never served. That is the same shape `sync=True` always
-                # produced, not a new failure mode. Durability still lands
-                # through the coalescer (`mark_dirty`).
-                #
+                # `_fetch_event_json_for_ids_txn`). Durability lands through
+                # the coalescer (`mark_dirty`).
                 txn.call_after(mark_dirty, Pool.EVENT_DAG)
 
         self.db_pool.simple_insert_many_txn(

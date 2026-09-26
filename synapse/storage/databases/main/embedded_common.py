@@ -17,6 +17,7 @@ from typing import IO, TYPE_CHECKING, Any, Callable, Iterable, Iterator
 from synapse.util.timings_flush import register_periodic_flush
 
 if TYPE_CHECKING:
+    from synapse.synapse_rust.mtxdb_engine import MtxdbTransaction
     from synapse.util.clock import Clock, DelayedCallWrapper
 
 logger = logging.getLogger(__name__)
@@ -1174,6 +1175,26 @@ def maybe_sync(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
         _st = time.monotonic()
         engine.sync_auth_chain()
         ffi_timing("ffi_sync_auth_chain", time.monotonic() - _st)
+
+
+def begin_embedded_transaction() -> "MtxdbTransaction | None":
+    """Begin an mtxdb transaction for one persist attempt, or `None`.
+
+    Only where writes defer durability to the coalescer (`publishes_at_commit`):
+    `always` keeps its per-persist barrier on directly written records. `None`
+    also means the engine has no shared WAL to publish a group through, so
+    callers write directly.
+
+    The transaction is not tied to the SQL transaction: the caller commits it
+    at the end of the persist body, before the SQL COMMIT, and aborts it on any
+    error (see `EventsWorkerStore._persist_events_txn`).
+    """
+    if not _engine_configured or not publishes_at_commit():
+        return None
+
+    from synapse.storage.databases.embedded_engine import get_embedded_engine
+
+    return get_embedded_engine("mtxdb").begin_transaction()
 
 
 def request_durable() -> None:

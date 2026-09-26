@@ -533,6 +533,92 @@ class EventsTestCase(HomeserverTestCase):
         # reports a missing event by raising, not by returning None.
         self.get_failure(self._store.get_event(event_id), NotFoundError)
 
+    def _stage_json_in_persist(self, event_id: str, *, fail: bool) -> None:
+        """Run `_persist_events_txn` with a body that stages one event's JSON in
+        the transaction it is given, then raises if `fail`. Waits for it, and
+        expects the `RuntimeError` when `fail`."""
+        persist_store = self.hs.get_datastores().persist_events
+        assert persist_store is not None
+        namespace = persist_store._embedded_db_namespace
+        room_id = "!staged:test"
+
+        def body(txn: LoggingTransaction, **kwargs: object) -> None:
+            embedded_event_json.put_event_json_batch(
+                "mtxdb",
+                namespace,
+                [(event_id, room_id, "{}", json.dumps({"body": event_id}), 1)],
+                transaction=kwargs["mtxdb_txn"],  # type: ignore[arg-type]
+            )
+            if fail:
+                raise RuntimeError("simulated persist failure")
+
+        def run(txn: LoggingTransaction) -> None:
+            persist_store._persist_events_txn(
+                txn,
+                room_id=room_id,
+                events_and_contexts=[],
+                inhibit_local_membership_updates=False,
+                state_delta_for_room=None,
+                new_forward_extremities=None,
+                new_event_links={},
+                sliding_sync_table_changes=None,
+            )
+
+        with (
+            mock.patch.object(
+                embedded_common, "publishes_at_commit", return_value=True
+            ),
+            mock.patch.object(
+                persist_store, "_persist_events_txn_body", side_effect=body
+            ),
+        ):
+            deferred = self._store.db_pool.runInteraction("staged_json", run)
+            if fail:
+                self.get_failure(deferred, RuntimeError)
+            else:
+                self.get_success(deferred)
+
+    def _json_present(self, event_id: str) -> bool:
+        persist_store = self.hs.get_datastores().persist_events
+        assert persist_store is not None
+        found = embedded_event_json.get_event_json_batch(
+            "mtxdb", persist_store._embedded_db_namespace, [event_id]
+        )
+        return event_id in found
+
+    @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
+    def test_failed_persist_leaves_no_event_json(self) -> None:
+        """A persist that raises after staging its event JSON leaves nothing.
+
+        The JSON is staged in an mtxdb transaction that `_persist_events_txn`
+        aborts on any error, so unlike a direct write there is no orphan record
+        for the failed attempt.
+        """
+        with mock.patch.object(
+            embedded_common, "publishes_at_commit", return_value=True
+        ):
+            if embedded_common.begin_embedded_transaction() is None:
+                self.skipTest("needs the shared WAL")
+        event_id = f"$never_committed_{self.clock.time()}:test"
+        self._stage_json_in_persist(event_id, fail=True)
+        self.assertFalse(self._json_present(event_id))
+
+    @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
+    def test_each_persist_attempt_gets_its_own_transaction(self) -> None:
+        """A failed attempt does not leak its writes into the next one, and a
+        successful attempt commits its JSON before the SQL transaction ends."""
+        with mock.patch.object(
+            embedded_common, "publishes_at_commit", return_value=True
+        ):
+            if embedded_common.begin_embedded_transaction() is None:
+                self.skipTest("needs the shared WAL")
+        failed = f"$attempt_one_{self.clock.time()}:test"
+        committed = f"$attempt_two_{self.clock.time()}:test"
+        self._stage_json_in_persist(failed, fail=True)
+        self._stage_json_in_persist(committed, fail=False)
+        self.assertFalse(self._json_present(failed))
+        self.assertTrue(self._json_present(committed))
+
     def test_get_senders_for_event_ids(self) -> None:
         """Tests the `get_senders_for_event_ids` storage function."""
 

@@ -6,13 +6,13 @@ use std::sync::{
 use std::time::Duration;
 
 use mtxdb::storage::{DigestAlgorithm, StorageError};
-use mtxdb::SharedDatabase;
 use mtxdb::{
     derive_collection_id, derive_group_full_id, derive_member_collection_id_from_group,
     CollectionMetadata, DatabaseLayout, FrameIdPolicy, GroupCommitConfig, NodeData, NodeId,
     PackfileStorage, PayloadPolicy, RecordIdentityRule, ShardType, StorageEngine,
     MEMBER_NAMESPACE_INTL,
 };
+use mtxdb::{DatabaseTransaction, SharedDatabase};
 use once_cell::sync::OnceCell;
 use pyo3::prelude::*;
 use sha2::{Digest, Sha256};
@@ -23,7 +23,7 @@ struct MtxdbPools {
     state: Arc<PackfileStorage>,
     event_dag: Arc<PackfileStorage>,
     auth_chain: Arc<PackfileStorage>,
-    _shared_database: Option<SharedDatabase>,
+    shared_database: Option<SharedDatabase>,
 }
 
 /// Base directory for the state_group -> room_prefix room-index file (see
@@ -1897,7 +1897,7 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
             state,
             event_dag,
             auth_chain,
-            _shared_database: shared_database,
+            shared_database,
         });
         let _ = OPENER_PID.set(std::process::id());
         let _ = WRITE_MODE.set(true);
@@ -1972,7 +1972,7 @@ pub fn open_client_read_only(py: Python<'_>, path: String) -> PyResult<()> {
             state,
             event_dag,
             auth_chain,
-            _shared_database: None,
+            shared_database: None,
         });
         let _ = OPENER_PID.set(std::process::id());
         let _ = WRITE_MODE.set(false);
@@ -2896,6 +2896,55 @@ pub(crate) fn state_hamt_metadata(room_id: &str) -> CollectionMetadata {
     }
 }
 
+/// One event-JSON write, keyed for the EventDag pool: `(collection, records)`
+/// groups in the order they must be written.
+type EventJsonPuts = Vec<([u8; 16], Vec<(NodeId, NodeData)>)>;
+
+/// Reject rows the mirror cannot store: empty metadata/body is the tombstone
+/// encoding.
+fn validate_event_json_rows(rows: &[(String, String, Vec<u8>, Vec<u8>)]) -> PyResult<()> {
+    for (_, _, metadata, body) in rows {
+        if metadata.is_empty() || body.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "event_json_put does not accept empty metadata/body (used as tombstones)",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The records an `event_json_put` writes, grouped by collection so each
+/// locator bucket / room dag collection is written with one `put_many`.
+/// Returns the room DAG writes and the locator writes, in the order they must
+/// be applied: bodies first, locator publication last, so a stale locator may
+/// only ever be a miss, never a pointer to a body that isn't there. The direct
+/// and the transactional write paths both use this, so they cannot disagree
+/// about a record's key.
+fn event_json_puts(
+    namespace: &str,
+    rows: Vec<(String, String, Vec<u8>, Vec<u8>)>,
+) -> (EventJsonPuts, EventJsonPuts) {
+    let mut locator_puts: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
+    let mut dag_puts: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
+    for (room_id, event_id, metadata, body) in rows {
+        let identity = event_node_id(namespace, &event_id);
+        let meta_identity = event_meta_node_id(namespace, &event_id);
+        let room_collection = event_dag_room_id(namespace, &room_id);
+        let locator_collection = event_locator_collection_id(namespace, &identity);
+        let puts = dag_puts.entry(room_collection).or_default();
+        puts.push((identity, NodeData::new(bytes::Bytes::from(body))));
+        puts.push((meta_identity, NodeData::new(bytes::Bytes::from(metadata))));
+        locator_puts.entry(locator_collection).or_default().push((
+            identity,
+            NodeData::new(bytes::Bytes::copy_from_slice(&room_collection)),
+        ));
+    }
+    (
+        dag_puts.into_iter().collect(),
+        locator_puts.into_iter().collect(),
+    )
+}
+
 /// Put split event_json records into the room-aware mirror: a locator entry
 /// (`event_locator_collection_id` bucket -> room EventDag collection id) and
 /// two physically separate records in the room's own EventDag collection --
@@ -2931,46 +2980,84 @@ pub fn event_json_put(
     rows: Vec<(String, String, Vec<u8>, Vec<u8>)>,
 ) -> PyResult<()> {
     assert_writable()?;
-    for (_, _, metadata, body) in &rows {
-        if metadata.is_empty() || body.is_empty() {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "event_json_put does not accept empty metadata/body (used as tombstones)",
-            ));
-        }
-    }
+    validate_event_json_rows(&rows)?;
     py.detach(|| {
         let engine = event_dag_db()?;
-        // Group by collection so each locator bucket / room dag collection is
-        // written with a single put_many.
-        let mut locator_puts: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
-        let mut dag_puts: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
-        for (room_id, event_id, metadata, body) in rows {
-            let identity = event_node_id(&namespace, &event_id);
-            let meta_identity = event_meta_node_id(&namespace, &event_id);
-            let room_collection = event_dag_room_id(&namespace, &room_id);
-            let locator_collection = event_locator_collection_id(&namespace, &identity);
-            let puts = dag_puts.entry(room_collection).or_default();
-            puts.push((identity, NodeData::new(bytes::Bytes::from(body))));
-            puts.push((meta_identity, NodeData::new(bytes::Bytes::from(metadata))));
-            locator_puts.entry(locator_collection).or_default().push((
-                identity,
-                NodeData::new(bytes::Bytes::copy_from_slice(&room_collection)),
-            ));
-        }
-        // Body writes first, locator publication last: a stale locator may
-        // only ever be a miss, never a pointer to a body that isn't there.
-        for (collection, pairs) in dag_puts {
-            engine.put_many(&collection, &pairs).map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {e}"))
-            })?;
-        }
-        for (collection, pairs) in locator_puts {
+        let (dag_puts, locator_puts) = event_json_puts(&namespace, rows);
+        for (collection, pairs) in dag_puts.into_iter().chain(locator_puts) {
             engine.put_many(&collection, &pairs).map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {e}"))
             })?;
         }
         Ok(())
     })
+}
+
+/// A write transaction spanning the mtxdb pools. Writes staged through it are
+/// invisible to every reader until `commit()`, which publishes them as one
+/// journal group: all of them or none. `abort()` discards them. Only available
+/// with the shared WAL (see `begin_transaction`).
+#[pyclass(frozen, name = "MtxdbTransaction")]
+pub struct PyMtxdbTransaction {
+    inner: DatabaseTransaction<'static>,
+}
+
+fn map_transaction_error(context: &str, error: impl std::fmt::Display) -> PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb transaction {context}: {error}"))
+}
+
+#[pymethods]
+impl PyMtxdbTransaction {
+    /// Stage what `event_json_put` would write, without touching the pool.
+    fn event_json_put(
+        &self,
+        py: Python<'_>,
+        namespace: String,
+        rows: Vec<(String, String, Vec<u8>, Vec<u8>)>,
+    ) -> PyResult<()> {
+        validate_event_json_rows(&rows)?;
+        py.detach(|| {
+            let (dag_puts, locator_puts) = event_json_puts(&namespace, rows);
+            for (collection, pairs) in dag_puts.into_iter().chain(locator_puts) {
+                for (node, data) in pairs {
+                    self.inner
+                        .put(ShardType::EventDag, collection, node, &data)
+                        .map_err(|e| map_transaction_error("stage", e))?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Publish every staged write as one group. After an error, the writes may
+    /// or may not have been published, so the transaction must not be aborted.
+    fn commit(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| {
+            self.inner
+                .commit()
+                .map_err(|e| map_transaction_error("commit", e))
+        })
+    }
+
+    /// Discard the staged writes. Fails once publication has started.
+    fn abort(&self) -> PyResult<()> {
+        self.inner
+            .abort()
+            .map_err(|e| map_transaction_error("abort", e))
+    }
+}
+
+/// Begin a transaction, or return `None` when the engine has no shared WAL to
+/// publish through (callers then write directly).
+#[pyfunction]
+pub fn begin_transaction() -> PyResult<Option<PyMtxdbTransaction>> {
+    assert_writable()?;
+    Ok(pools()?
+        .shared_database
+        .as_ref()
+        .map(|database| PyMtxdbTransaction {
+            inner: database.begin_transaction(),
+        }))
 }
 
 /// Read split event_json records by event id: resolve each id's locator to
@@ -4052,6 +4139,8 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(sync_state, m)?)?;
     m.add_function(wrap_pyfunction!(sync_event_dag, m)?)?;
     m.add_function(wrap_pyfunction!(sync_auth_chain, m)?)?;
+    m.add_function(wrap_pyfunction!(begin_transaction, m)?)?;
+    m.add_class::<PyMtxdbTransaction>()?;
     m.add_function(wrap_pyfunction!(start_background_commit, m)?)?;
     m.add_function(wrap_pyfunction!(stop_background_commit, m)?)?;
     m.add_function(wrap_pyfunction!(background_commit_error, m)?)?;
