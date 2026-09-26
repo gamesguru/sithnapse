@@ -165,6 +165,8 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
         return
 
     out(f"\n=== Diagnostics aggregated from {len(worker_pids)} process(es) ===")
+    for line in _run_identity():
+        out(line)
 
     # 1. Lifecycle timings
     lc_lifecycle_counters: dict[str, int] = defaultdict(int)
@@ -956,6 +958,55 @@ def _print_mtxdb_engine_stats(timings_dir: str) -> None:
             file=err,
         )
     print("===============================\n", file=err)
+
+
+def _git(*args: str) -> str:
+    """Output of a git command in the repo, or "?" if it can't be run."""
+    import subprocess
+
+    try:
+        return subprocess.run(
+            ["git", *args],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        ).stdout.strip()
+    except Exception:
+        return "?"
+
+
+def _run_identity() -> list[str]:
+    """Lines naming the code, pin and settings a run was made with, so a log
+    can be attributed to a commit later instead of remembered."""
+    dirty = _git("status", "--porcelain", "--untracked-files=no")
+    mtxdb = "?"
+    try:
+        with open(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Cargo.lock")
+        ) as f:
+            lock = f.read()
+        m = re.search(r'name = "mtxdb"\n.*?#([0-9a-f]{7})', lock, re.S)
+        if m:
+            mtxdb = m.group(1)
+    except OSError:
+        pass
+    jobs = "-"
+    for i, arg in enumerate(sys.argv):
+        if arg == "-j" and i + 1 < len(sys.argv):
+            jobs = sys.argv[i + 1]
+        elif arg.startswith("-j") and arg[2:].isdigit():
+            jobs = arg[2:]
+    modified = f"{len(dirty.splitlines())} modified file(s)" if dirty else "clean"
+    return [
+        f"  commit:    {_git('rev-parse', '--short=9', 'HEAD')} "
+        f"({modified}) {_git('log', '-1', '--format=%s')}",
+        f"  branch:    {_git('rev-parse', '--abbrev-ref', 'HEAD')}",
+        f"  mtxdb pin: {mtxdb}",
+        f"  jobs:      -j{jobs} on {os.cpu_count()} cpus",
+        f"  sync mode: {os.environ.get('SYNAPSE_TEST_MTXDB_SYNC_MODE', '(unset)')}",
+    ]
 
 
 def aggregate_container_timings(root: str) -> None:
