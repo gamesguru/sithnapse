@@ -19,7 +19,7 @@
 #
 #
 
-from typing import Callable
+from typing import Callable, Sequence
 from unittest.mock import Mock, call, patch
 
 import attr
@@ -81,11 +81,14 @@ class TrackSlowStatementTestCase(unittest.TestCase):
     """The slow-statement report keeps the worst statements and how much data
     they sent, without ever breaking the query being timed."""
 
-    def _track(self, entries: list[tuple[str, float, object]]) -> list[tuple]:
-        with patch.object(database_module, "_SLOW_STATEMENTS", []) as kept:
+    def _track(
+        self, entries: Sequence[tuple[str, float, object]]
+    ) -> list[tuple[float, str, int, int]]:
+        slow: list[tuple[float, str, int, int]] = []
+        with patch.object(database_module, "_SLOW_STATEMENTS", slow):
             for sql, elapsed, parameters in entries:
                 database_module._track_slow_statement(sql, elapsed, 1, parameters)
-            return list(kept)
+        return list(slow)
 
     def test_fast_statements_are_not_kept(self) -> None:
         self.assertEqual(self._track([("SELECT 1", 0.001, ())]), [])
