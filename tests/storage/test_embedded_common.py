@@ -291,3 +291,17 @@ class SyncModeTestCase(TestCase):
         self.assertFalse(embedded_common._sync_disabled)
         embedded_common.configure_sync(no_sync=False, mode=SyncMode.OFF)
         self.assertTrue(embedded_common._sync_disabled)
+
+
+class FfiCountingScopeTestCase(TestCase):
+    def test_counting_scope_keeps_counts_made_before_it(self) -> None:
+        """A test that scopes its own counters must not wipe the run's totals."""
+        with mock.patch.dict(embedded_common._FFI_COUNTERS, {"before": 3}, clear=True):
+            with embedded_common.enable_ffi_counting():
+                # Clean inside the block, so before/after snapshots work.
+                self.assertEqual(embedded_common._FFI_COUNTERS.get("before", 0), 0)
+                embedded_common.ffi_count("inside", 2)
+                embedded_common.ffi_count("before", 1)
+
+            self.assertEqual(embedded_common._FFI_COUNTERS["before"], 4)
+            self.assertEqual(embedded_common._FFI_COUNTERS["inside"], 2)

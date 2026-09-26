@@ -167,18 +167,23 @@ def enable_ffi_counting() -> Iterator[None]:
     """Context manager that activates ffi_count() for the duration of the block.
 
     Intended for tests that need to assert on hit/fallback counters without
-    requiring SYNAPSE_PG_TIMINGS.  Resets the affected counter dict on entry
-    so that before/after snapshots are clean.
+    requiring SYNAPSE_PG_TIMINGS.  The counters start empty inside the block so
+    that before/after snapshots are clean, and whatever the process had counted
+    before is added back on exit, so a `SYNAPSE_PG_TIMINGS` run's totals are not
+    wiped by the tests that use this.
 
     Not thread-safe; use only in single-threaded test code.
     """
     global _ffi_counting_enabled
     _ffi_counting_enabled = True
+    earlier = dict(_FFI_COUNTERS)
     _FFI_COUNTERS.clear()
     try:
         yield
     finally:
         _ffi_counting_enabled = False
+        for tag, count in earlier.items():
+            _FFI_COUNTERS[tag] += count
 
 
 def ffi_batch_size(tag: str, size: int) -> None:
