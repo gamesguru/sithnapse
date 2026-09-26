@@ -3052,6 +3052,27 @@ impl PyMtxdbTransaction {
     }
 }
 
+/// `(phase, total seconds, calls)` per transaction-commit phase.
+type CommitPhaseRows = Vec<(&'static str, f64, u64)>;
+
+/// Cumulative time (seconds) and call count per transaction-commit phase since
+/// the shared database opened, or `None` without a shared WAL. Diagnostics only.
+#[pyfunction]
+pub fn txn_commit_phases() -> PyResult<Option<CommitPhaseRows>> {
+    let Some(database) = pools()?.shared_database.as_ref() else {
+        return Ok(None);
+    };
+    let stats = database.commit_phase_stats();
+    let phase = |name, timing: mtxdb::PhaseTiming| (name, timing.total.as_secs_f64(), timing.calls);
+    Ok(Some(vec![
+        phase("overlay", stats.overlay),
+        phase("publish", stats.publish),
+        phase("register_wait", stats.register_wait),
+        phase("materialize_wait", stats.materialize_wait),
+        phase("materialize", stats.materialize),
+    ]))
+}
+
 /// Begin a transaction, or return `None` when the engine has no shared WAL to
 /// publish through (callers then write directly).
 #[pyfunction]
@@ -4133,6 +4154,7 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(sync_event_dag, m)?)?;
     m.add_function(wrap_pyfunction!(sync_auth_chain, m)?)?;
     m.add_function(wrap_pyfunction!(begin_transaction, m)?)?;
+    m.add_function(wrap_pyfunction!(txn_commit_phases, m)?)?;
     m.add_class::<PyMtxdbTransaction>()?;
     m.add_function(wrap_pyfunction!(start_background_commit, m)?)?;
     m.add_function(wrap_pyfunction!(stop_background_commit, m)?)?;

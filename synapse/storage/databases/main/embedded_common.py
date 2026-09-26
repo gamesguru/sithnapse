@@ -1169,6 +1169,34 @@ def maybe_sync(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
         ffi_timing("ffi_sync_auth_chain", time.monotonic() - _st)
 
 
+_LAST_COMMIT_PHASES: dict[str, tuple[float, int]] = {}
+_COMMIT_PHASES_LOCK = threading.Lock()
+
+
+def record_commit_phases() -> None:
+    """Record how much each mtxdb commit phase grew since the last call.
+
+    mtxdb keeps these totals per open database, so a reopened store restarts at
+    zero; a total that went backwards is taken as a fresh start. Diagnostics
+    only: a no-op unless `SYNAPSE_PG_TIMINGS` is set.
+    """
+    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+        return
+    from synapse.synapse_rust.mtxdb_engine import txn_commit_phases
+
+    phases = txn_commit_phases()
+    if phases is None:
+        return
+    with _COMMIT_PHASES_LOCK:
+        for name, total, calls in phases:
+            last_total, last_calls = _LAST_COMMIT_PHASES.get(name, (0.0, 0))
+            if calls < last_calls or total < last_total:
+                last_total, last_calls = 0.0, 0
+            _LAST_COMMIT_PHASES[name] = (total, calls)
+            if calls > last_calls:
+                ffi_timing(f"ffi_txn_phase_{name}", total - last_total)
+
+
 def _persist_txn_enabled() -> bool:
     """Whether a persist stages its embedded writes in one mtxdb transaction.
 

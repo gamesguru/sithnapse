@@ -76,6 +76,7 @@ from synapse.storage.databases.main.embedded_common import (
     mark_dirty,
     maybe_sync,
     publishes_at_commit,
+    record_commit_phases,
 )
 from synapse.storage.databases.main.embedded_event_edges import (
     embedded_event_edges_is_writable,
@@ -1227,6 +1228,7 @@ class PersistEventsStore:
                 "ffi_txn_commit_gil_wait", max(0.0, total_seconds - engine_seconds)
             )
             ffi_count("txn_committed", 1)
+            record_commit_phases()
         except BaseException:
             # After a failed commit the group may already be published, and
             # aborting a published transaction is an error that would hide the
