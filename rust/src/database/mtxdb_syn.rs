@@ -3868,14 +3868,8 @@ fn stats_to_dict(
             "journal_lock_wait_us",
             st.journal_lock_wait.as_micros() as u64,
         )?;
-        sd.set_item(
-            "journal_pending_wait_us",
-            st.journal_pending_wait.as_micros() as u64,
-        )?;
-        sd.set_item("journal_append_us", st.journal_append.as_micros() as u64)?;
         sd.set_item("journal_fsync_us", st.journal_fsync.as_micros() as u64)?;
         sd.set_item("journal_sync_calls", st.journal_sync_calls)?;
-        sd.set_item("journal_bytes", st.journal_bytes)?;
         sd.set_item("journal_records", st.journal_records)?;
         sd.set_item("journal_waiters", st.journal_waiters)?;
         sd.set_item("journal_coalesced", st.journal_coalesced)?;
@@ -3901,14 +3895,8 @@ fn stats_to_dict(
         "journal_lock_wait_us",
         st.journal_lock_wait.as_micros() as u64,
     )?;
-    sd.set_item(
-        "journal_pending_wait_us",
-        st.journal_pending_wait.as_micros() as u64,
-    )?;
-    sd.set_item("journal_append_us", st.journal_append.as_micros() as u64)?;
     sd.set_item("journal_fsync_us", st.journal_fsync.as_micros() as u64)?;
     sd.set_item("journal_sync_calls", st.journal_sync_calls)?;
-    sd.set_item("journal_bytes", st.journal_bytes)?;
     sd.set_item("journal_records", st.journal_records)?;
     sd.set_item("journal_waiters", st.journal_waiters)?;
     sd.set_item("journal_coalesced", st.journal_coalesced)?;

@@ -832,13 +832,8 @@ def _mtxdb_snapshot_metrics(ps: dict[str, Any]) -> dict[str, float]:
         "sync_checkpoint_us": float(sync_totals.get("checkpoint_us", 0) or 0),
         "wal_us": float(sync_totals.get("wal_us", 0) or 0),
         "journal_lock_wait_us": float(sync_totals.get("journal_lock_wait_us", 0) or 0),
-        "journal_pending_wait_us": float(
-            sync_totals.get("journal_pending_wait_us", 0) or 0
-        ),
-        "journal_append_us": float(sync_totals.get("journal_append_us", 0) or 0),
         "journal_fsync_us": float(sync_totals.get("journal_fsync_us", 0) or 0),
         "journal_sync_calls": float(sync_totals.get("journal_sync_calls", 0) or 0),
-        "journal_bytes": float(sync_totals.get("journal_bytes", 0) or 0),
         "journal_records": float(sync_totals.get("journal_records", 0) or 0),
         "journal_waiters": float(sync_totals.get("journal_waiters", 0) or 0),
         "journal_coalesced": float(sync_totals.get("journal_coalesced", 0) or 0),
@@ -875,11 +870,8 @@ def _format_mtxdb_snapshot_segment(
         f"/delta+{d['delta_log_us'] / 1000:.1f}/ckpt+{d['sync_checkpoint_us'] / 1000:.1f}"
         f"/wal+{d['wal_us'] / 1000:.1f} "
         f"j=lock+{d['journal_lock_wait_us'] / 1000:.1f}"
-        f"/pend+{d['journal_pending_wait_us'] / 1000:.1f}"
-        f"/append+{d['journal_append_us'] / 1000:.1f}"
         f"/fsync+{d['journal_fsync_us'] / 1000:.1f}ms"
         f" c=+{int(d['journal_sync_calls'])}"
-        f" b=+{int(d['journal_bytes'])}"
         f" r=+{int(d['journal_records'])}"
         f" wait=+{int(d['journal_waiters'])}"
         f" coal=+{int(d['journal_coalesced'])}"

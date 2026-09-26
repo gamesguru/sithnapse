@@ -4,7 +4,7 @@
 # See the GNU Affero General Public License for more details:
 # <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
-"""Line-driven mtxdb process for `test_mtxdb_publish_visibility.py`.
+"""Line-driven mtxdb process for `test_mtxdb_journal_visibility.py`.
 
     python mtxdb_visibility_worker.py {writer|reader} <store dir> [namespace]
 
@@ -15,7 +15,10 @@ Commands arrive on stdin, one per line, and each is answered with one line.
 `event_json_put`/`event_json_get` go through the production
 `embedded_event_json` helpers (not raw `batch_put`/`batch_get`): the point of
 those cases is that the real event-JSON read path -- the one a worker uses --
-sees a write the writer published but never fsynced.
+sees a write the writer journaled but never fsynced.
+
+`txn_begin`, `txn_event_json_put`, `txn_commit` and `txn_abort` drive one open
+`MtxdbTransaction`: its writes are invisible to the worker until `txn_commit`.
 """
 
 import json
@@ -28,8 +31,8 @@ from synapse.storage.databases.main.embedded_event_json import (
 )
 from synapse.synapse_rust import mtxdb_engine
 
-# The worker's stdout is a line protocol; `get_event_json_batch` logs an INFO
-# trace that must not land between replies.
+# The worker's stdout is a line protocol; `get_event_json_batch` logs a trace
+# that must not land between replies.
 logging.getLogger("synapse.storage.databases.main.embedded_event_json").setLevel(
     logging.WARNING
 )
@@ -52,14 +55,13 @@ def main() -> None:
     else:
         mtxdb_engine.open_client_read_only(path)
     print("READY", flush=True)
+    transaction = None
 
     for line in sys.stdin:
         command, *args = line.split()
         try:
             if command == "put":
                 mtxdb_engine.batch_put([(args[0].encode(), args[1].encode())])
-                reply = "ok"
-            elif command == "publish":
                 reply = "ok"
             elif command == "sync":
                 mtxdb_engine.sync()
@@ -86,6 +88,28 @@ def main() -> None:
                 reply = json.dumps(
                     found_json[args[0]][1] if args[0] in found_json else None
                 )
+            elif command == "txn_begin":
+                transaction = mtxdb_engine.begin_transaction()
+                if transaction is None:
+                    raise RuntimeError("no shared WAL: cannot begin a transaction")
+                reply = "ok"
+            elif command == "txn_event_json_put":
+                room_id, event_id, body = args
+                put_event_json_batch(
+                    "mtxdb",
+                    namespace,
+                    [(event_id, room_id, "{}", body, 1)],
+                    transaction=transaction,
+                )
+                reply = "ok"
+            elif command == "txn_commit":
+                assert transaction is not None
+                transaction.commit()
+                reply = "ok"
+            elif command == "txn_abort":
+                assert transaction is not None
+                transaction.abort()
+                reply = "ok"
             elif command == "fsyncs":
                 reply = str(_fsyncs())
             elif command == "exit":

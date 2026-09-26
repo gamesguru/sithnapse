@@ -4,7 +4,7 @@
 # See the GNU Affero General Public License for more details:
 # <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
-"""Cross-process visibility of published-but-not-fsynced mtxdb writes.
+"""Cross-process visibility of journaled-but-not-fsynced mtxdb writes.
 
 The visibility/durability split rests on one claim: a write the writer has
 *journaled* is readable by a read-only worker process
@@ -94,7 +94,7 @@ class _Process:
                     stream.close()
 
 
-class MtxdbPublishVisibilityTestCase(unittest.TestCase):
+class MtxdbJournalVisibilityTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.store_dir = tempfile.mkdtemp(prefix="test-mtxdb-visibility-")
         self.addCleanup(shutil.rmtree, self.store_dir, ignore_errors=True)
@@ -106,45 +106,32 @@ class MtxdbPublishVisibilityTestCase(unittest.TestCase):
         self.addCleanup(reader.close)
         return reader
 
-    def test_published_write_is_visible_to_worker_without_fsync(self) -> None:
-        """A worker opened *before* the write sees it after publish, with no fsync."""
+    def test_a_write_is_visible_to_a_stale_worker_without_fsync(self) -> None:
+        """A worker opened *before* the write sees it at once, with no fsync.
+
+        mtxdb journals each autocommit write as its own group when it is
+        written, so there is nothing further to publish.
+        """
         reader = self._reader()
 
         for key in (_STATE_KEY, _EVENT_DAG_KEY):
             with self.subTest(key=key):
                 self.writer.call(f"put {key} value")
-                # Control: before any barrier the write is invisible, so the
-                # assertion below is about publish, not about the worker
-                # happening to see everything.
-                self.assertIsNone(reader.get(key), "unpublished write leaked")
-
-        self.writer.call("publish")
-
-        for key in (_STATE_KEY, _EVENT_DAG_KEY):
-            with self.subTest(key=key):
                 self.assertEqual(reader.get(key), "value")
 
         # Visible is not durable: nothing on the writer ever fsynced.
         self.assertEqual(self.writer.call("fsyncs"), "0")
 
-    def test_worker_opened_after_publish_sees_write(self) -> None:
-        """A worker that starts after publish (late-started or restarted) sees it.
-
-        This pins the late-start case only. It does not show that publish is
-        *required* there: a worker opened after the write can see it even when
-        the writer never published (the other tests are the ones that fail
-        without publish).
-        """
+    def test_worker_opened_after_the_write_sees_it(self) -> None:
+        """A worker that starts later (late-started or restarted) sees it too."""
         self.writer.call(f"put {_STATE_KEY} value")
-        self.writer.call("publish")
 
         reader = self._reader()
 
         self.assertEqual(reader.get(_STATE_KEY), "value")
         self.assertEqual(self.writer.call("fsyncs"), "0")
 
-    def test_one_publish_covers_many_writes(self) -> None:
-        """One publish makes every queued write visible: the per-persist boundary."""
+    def test_many_writes_are_all_visible(self) -> None:
         reader = self._reader()
         keys = [f"vis:many:{i}" for i in range(20)] + [
             f"event_json:many:{i}" for i in range(20)
@@ -152,23 +139,17 @@ class MtxdbPublishVisibilityTestCase(unittest.TestCase):
         for key in keys:
             self.writer.call(f"put {key} {key}")
 
-        self.writer.call("publish")
-
         missing = [key for key in keys if reader.get(key) != key]
-        self.assertEqual(missing, [], "published writes not visible to the worker")
+        self.assertEqual(missing, [], "journaled writes not visible to the worker")
         self.assertEqual(self.writer.call("fsyncs"), "0")
 
-    def test_writes_after_a_publish_need_their_own_publish(self) -> None:
-        """Publish is a boundary, not a mode switch: later writes stay unpublished."""
+    def test_later_writes_are_visible_too(self) -> None:
+        """There is no boundary to cross: every write is visible as it lands."""
         reader = self._reader()
         self.writer.call(f"put {_STATE_KEY}:1 one")
-        self.writer.call("publish")
         self.assertEqual(reader.get(f"{_STATE_KEY}:1"), "one")
 
         self.writer.call(f"put {_STATE_KEY}:2 two")
-        self.assertIsNone(reader.get(f"{_STATE_KEY}:2"))
-
-        self.writer.call("publish")
         self.assertEqual(reader.get(f"{_STATE_KEY}:2"), "two")
         self.assertEqual(self.writer.call("fsyncs"), "0")
 
@@ -177,15 +158,15 @@ _EVENT_JSON_ROOM = "!vis:test"
 _EVENT_JSON_NS = "vis-event-json"
 
 
-class MtxdbEventJsonPublishVisibilityTestCase(unittest.TestCase):
-    """The real event-JSON read path sees a committed-but-unfsynced write.
+class MtxdbEventJsonVisibilityTestCase(unittest.TestCase):
+    """The real event-JSON read path against a journaled-but-unfsynced write.
 
-    In exclusive mode event JSON has no SQL copy, so a stale worker whose view
-    is not refreshed at the commit boundary would report a committed event as
-    absent. The writer models the persister's commit boundary with the
-    production helpers: ``event_json_put`` (``put_event_json_batch(sync=False)``)
-    then ``publish``. The reader is opened *before* both, so it can only see
-    the record through publication, never through an open-time rescan.
+    In exclusive mode event JSON has no SQL copy, so a stale worker that could
+    not see a committed event's JSON would report it absent. The direct write is
+    visible as soon as it is journaled. A write staged in a transaction is
+    invisible to the worker until the transaction commits, and never appears if
+    it aborts. The reader is opened *before* every write, so it can only see a
+    record through the journal, never through an open-time rescan.
     """
 
     def setUp(self) -> None:
@@ -199,34 +180,36 @@ class MtxdbEventJsonPublishVisibilityTestCase(unittest.TestCase):
         self.addCleanup(reader.close)
         return reader
 
-    def test_committed_event_json_is_visible_to_stale_worker(self) -> None:
+    def test_event_json_is_visible_to_a_stale_worker_once_written(self) -> None:
         reader = self._reader()
 
-        # Control: before publish the record is invisible, so the assertion
-        # below is about the commit-boundary publish, not about the worker
-        # happening to see everything.
-        self.writer.event_json_put(_EVENT_JSON_ROOM, "$ej1:test", "unpublished")
-        self.assertIsNone(reader.event_json_get("$ej1:test"))
+        self.writer.event_json_put(_EVENT_JSON_ROOM, "$ej1:test", "first")
+        self.assertEqual(reader.event_json_get("$ej1:test"), "first")
 
-        # The writer commits: put + publish, with no fsync.
-        self.writer.call("publish")
-        self.assertEqual(reader.event_json_get("$ej1:test"), "unpublished")
-
-        # Publish is a boundary, not a mode switch: a later write needs its own.
         self.writer.event_json_put(_EVENT_JSON_ROOM, "$ej2:test", "second")
-        self.assertIsNone(reader.event_json_get("$ej2:test"))
-        self.writer.call("publish")
         self.assertEqual(reader.event_json_get("$ej2:test"), "second")
 
         self.assertEqual(self.writer.call("fsyncs"), "0")
 
-    def test_event_json_without_publish_is_invisible_to_stale_worker(self) -> None:
+    def test_staged_event_json_is_invisible_until_commit(self) -> None:
         reader = self._reader()
 
-        self.writer.event_json_put(_EVENT_JSON_ROOM, "$ej3:test", "never")
-
-        # Without publication the read fails: this is precisely the
-        # committed-row/missing-JSON window the writer must not open, and why
-        # event JSON publishes at the commit boundary.
+        self.writer.call("txn_begin")
+        self.writer.call(f"txn_event_json_put {_EVENT_JSON_ROOM} $ej3:test staged")
+        # Control that the writer really has the write staged: it is the
+        # commit, not the worker's view, that makes it appear.
         self.assertIsNone(reader.event_json_get("$ej3:test"))
+
+        self.writer.call("txn_commit")
+        self.assertEqual(reader.event_json_get("$ej3:test"), "staged")
+
+    def test_aborted_event_json_never_becomes_visible(self) -> None:
+        reader = self._reader()
+
+        self.writer.call("txn_begin")
+        self.writer.call(f"txn_event_json_put {_EVENT_JSON_ROOM} $ej4:test dropped")
+        self.assertIsNone(reader.event_json_get("$ej4:test"))
+
+        self.writer.call("txn_abort")
+        self.assertIsNone(reader.event_json_get("$ej4:test"))
         self.assertEqual(self.writer.call("fsyncs"), "0")
