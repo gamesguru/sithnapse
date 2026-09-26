@@ -115,6 +115,11 @@ class TrackSlowStatementTestCase(unittest.TestCase):
         kept = self._track([(sql, 0.3, ())])
         self.assertEqual(kept[0][1], "SELECT 1 FROM t")
 
+    def test_string_literals_in_sql_are_masked(self) -> None:
+        sql = "SELECT 1 FROM t WHERE name = 'it''s secret' AND k = 'x'"
+        kept = self._track([(sql, 0.3, ())])
+        self.assertEqual(kept[0][1], "SELECT 1 FROM t WHERE name = '?' AND k = '?'")
+
     def test_only_the_worst_are_retained(self) -> None:
         many = [(f"SELECT {i}", 0.06 + i / 1000, ()) for i in range(200)]
         kept = self._track(many)

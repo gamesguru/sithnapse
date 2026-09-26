@@ -235,6 +235,11 @@ def _track_table_op(sql: str, elapsed: float, rowcount: int = 0) -> None:
             _TABLE_OPS_ROWS[table] += max(rowcount, 0)
 
 
+# Quoted string literals, including doubled quotes inside them. Masked in the
+# slow-statement report so a value written into SQL text is never printed.
+_SQL_STRING_LITERAL_RE = re.compile(r"'(?:[^']|'')*'")
+
+
 def _payload_bytes(parameters: object, _depth: int = 0) -> int:
     """Total size of the bytes/str values in a statement's parameters.
 
@@ -265,7 +270,9 @@ def _track_slow_statement(
         payload = -1
     if "--" in sql or "/*" in sql:
         sql = _SQL_COMMENT_RE.sub(" ", sql)
-    text = " ".join(sql.split())[:_SLOW_STATEMENT_SQL_CHARS]
+    text = _SQL_STRING_LITERAL_RE.sub("'?'", " ".join(sql.split()))[
+        :_SLOW_STATEMENT_SQL_CHARS
+    ]
     with _TABLE_OPS_LOCK:
         _SLOW_STATEMENTS.append(
             (elapsed, text, payload, rowcount if isinstance(rowcount, int) else 0)

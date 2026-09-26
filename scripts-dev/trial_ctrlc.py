@@ -998,6 +998,11 @@ def _load_average() -> str:
         return "?"
 
 
+# Taken when the wrapper starts, i.e. at the start of the run, so the report can
+# show whether the machine was already busy before the tests began.
+_LOAD_AT_START = _load_average()
+
+
 def _run_identity() -> list[str]:
     """Lines naming the code, pin and settings a run was made with, so a log
     can be attributed to a commit later instead of remembered."""
@@ -1026,7 +1031,8 @@ def _run_identity() -> list[str]:
         f"  branch:    {_git('rev-parse', '--abbrev-ref', 'HEAD')}",
         f"  mtxdb pin: {mtxdb}",
         f"  jobs:      -j{jobs} on {os.cpu_count()} cpus",
-        f"  load avg:  {_load_average()} (1/5/15 min, when this report was made)",
+        f"  load avg:  {_LOAD_AT_START} at start, {_load_average()} at report "
+        "(1/5/15 min)",
         f"  sync mode: {os.environ.get('SYNAPSE_TEST_MTXDB_SYNC_MODE', '(unset)')}",
         f"  persist txn: {os.environ.get('SYNAPSE_MTXDB_PERSIST_TXN', '(unset, on)')}",
     ]
