@@ -1215,8 +1215,9 @@ class PersistEventsStore:
             )
             commit_started = True
             _ct = time.monotonic()
-            mtxdb_txn.commit()
+            engine_seconds = mtxdb_txn.commit()
             ffi_timing("ffi_txn_commit", time.monotonic() - _ct)
+            ffi_timing("ffi_txn_commit_engine", engine_seconds)
         except BaseException:
             # After a failed commit the group may already be published, and
             # aborting a published transaction is an error that would hide the

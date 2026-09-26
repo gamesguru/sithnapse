@@ -3031,11 +3031,16 @@ impl PyMtxdbTransaction {
 
     /// Publish every staged write as one group. After an error, the writes may
     /// or may not have been published, so the transaction must not be aborted.
-    fn commit(&self, py: Python<'_>) -> PyResult<()> {
+    ///
+    /// Returns the seconds spent inside the engine's `commit()`, excluding the
+    /// wait to get the GIL back, so callers can tell the two apart.
+    fn commit(&self, py: Python<'_>) -> PyResult<f64> {
         py.detach(|| {
+            let started = std::time::Instant::now();
             self.inner
                 .commit()
-                .map_err(|e| map_transaction_error("commit", e))
+                .map_err(|e| map_transaction_error("commit", e))?;
+            Ok(started.elapsed().as_secs_f64())
         })
     }
 
