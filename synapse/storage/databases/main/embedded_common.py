@@ -1169,6 +1169,21 @@ def maybe_sync(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
         ffi_timing("ffi_sync_auth_chain", time.monotonic() - _st)
 
 
+def _persist_txn_enabled() -> bool:
+    """Whether a persist stages its embedded writes in one mtxdb transaction.
+
+    On unless `SYNAPSE_MTXDB_PERSIST_TXN` is `0`/`false`/`no`/`off`. Off falls
+    back to direct writes, which skips the per-persist group commit at the cost
+    of the all-or-nothing persist. Read on every call so tests can flip it.
+    """
+    return os.environ.get("SYNAPSE_MTXDB_PERSIST_TXN", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
 def begin_embedded_transaction() -> "MtxdbTransaction | None":
     """Begin an mtxdb transaction for one persist attempt, or `None`.
 
@@ -1181,7 +1196,11 @@ def begin_embedded_transaction() -> "MtxdbTransaction | None":
     at the end of the persist body, before the SQL COMMIT, and aborts it on any
     error (see `EventsWorkerStore._persist_events_txn`).
     """
-    if not _engine_configured or not publishes_at_commit():
+    if (
+        not _engine_configured
+        or not publishes_at_commit()
+        or not _persist_txn_enabled()
+    ):
         return None
 
     from synapse.storage.databases.embedded_engine import get_embedded_engine

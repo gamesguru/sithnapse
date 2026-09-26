@@ -1006,6 +1006,7 @@ def _run_identity() -> list[str]:
         f"  mtxdb pin: {mtxdb}",
         f"  jobs:      -j{jobs} on {os.cpu_count()} cpus",
         f"  sync mode: {os.environ.get('SYNAPSE_TEST_MTXDB_SYNC_MODE', '(unset)')}",
+        f"  persist txn: {os.environ.get('SYNAPSE_MTXDB_PERSIST_TXN', '(unset, on)')}",
     ]
 
 

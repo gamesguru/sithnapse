@@ -71,6 +71,7 @@ from synapse.storage.databases.main.embedded_common import (
     Pool,
     SyncTier,
     begin_embedded_transaction,
+    ffi_count,
     ffi_timing,
     mark_dirty,
     maybe_sync,
@@ -1199,6 +1200,7 @@ class PersistEventsStore:
             )
             return
 
+        ffi_count("txn_begun", 1)
         commit_started = False
         try:
             self._persist_events_txn_body(
@@ -1216,13 +1218,21 @@ class PersistEventsStore:
             commit_started = True
             _ct = time.monotonic()
             engine_seconds = mtxdb_txn.commit()
-            ffi_timing("ffi_txn_commit", time.monotonic() - _ct)
+            total_seconds = time.monotonic() - _ct
+            ffi_timing("ffi_txn_commit", total_seconds)
             ffi_timing("ffi_txn_commit_engine", engine_seconds)
+            # What is left after the engine's own time: the wait to get the GIL
+            # (and a CPU) back once the commit returned.
+            ffi_timing(
+                "ffi_txn_commit_gil_wait", max(0.0, total_seconds - engine_seconds)
+            )
+            ffi_count("txn_committed", 1)
         except BaseException:
             # After a failed commit the group may already be published, and
             # aborting a published transaction is an error that would hide the
             # real one, so only abort what is still purely staged.
             if not commit_started:
+                ffi_count("txn_aborted", 1)
                 try:
                     mtxdb_txn.abort()
                 except Exception:
