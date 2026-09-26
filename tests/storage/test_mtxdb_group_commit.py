@@ -31,7 +31,6 @@ def commits():
 
 # 1. No committer running: wait_durable performs the blocking commit itself.
 m.batch_put([("vis:a".encode(), b"1"), ("event_json:a".encode(), b"2")])
-m.publish_pending()
 targets = m.request_durable()
 out["targets"] = targets
 m.wait_durable(targets)
@@ -40,7 +39,6 @@ out["after_blocking_wait"] = commits()
 # 2. With the background committer, a waiter is released by its group commit.
 m.start_background_commit(5, 1000)
 m.batch_put([("vis:b".encode(), b"1")])
-m.publish_pending()
 m.wait_durable(m.request_durable())
 out["after_group_commit"] = commits()
 m.stop_background_commit()

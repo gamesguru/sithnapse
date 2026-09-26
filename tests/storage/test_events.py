@@ -172,8 +172,8 @@ class EventsTestCase(HomeserverTestCase):
         event.internal_metadata.outlier = True
 
         # Persist it as an outlier first: the shape a partial-state resync pull
-        # leaves behind. This only coalesces STATE, so it must not sync or
-        # publish that pool (its event JSON may still get a barrier of its own).
+        # leaves behind. This only coalesces STATE, so it must not sync that
+        # pool (its event JSON may still get a barrier of its own).
         with (
             mock.patch.object(
                 events_module,
@@ -181,7 +181,6 @@ class EventsTestCase(HomeserverTestCase):
                 return_value=publish_at_commit,
             ),
             mock.patch.object(events_module, "maybe_sync") as outlier_barrier,
-            mock.patch.object(events_module, "maybe_publish") as outlier_publish,
         ):
             self.get_success(
                 persistence.persist_event(
@@ -191,8 +190,6 @@ class EventsTestCase(HomeserverTestCase):
             )
         for call in outlier_barrier.call_args_list:
             self.assertNotIn(Pool.STATE, call.kwargs.get("pools", []))
-        for call in outlier_publish.call_args_list:
-            self.assertNotIn(Pool.STATE, call.args[1] if len(call.args) > 1 else [])
 
         # Now the live copy arrives and de-outliers it. Its embedded mapping
         # must be visible before this returns.
@@ -212,13 +209,13 @@ class EventsTestCase(HomeserverTestCase):
                 "publishes_at_commit",
                 return_value=publish_at_commit,
             ),
-            mock.patch.object(events_module, "maybe_publish") as de_outlier_publish,
             mock.patch.object(events_module, "maybe_sync") as de_outlier_barrier,
         ):
             self.get_success(persistence.persist_event(event, live_context))
 
         if publish_at_commit:
-            de_outlier_publish.assert_called_once_with(SyncTier.DURABLE, [Pool.STATE])
+            # The mapping is visible as soon as it is journaled; durability is
+            # left to the coalescer, so there is no barrier.
             de_outlier_barrier.assert_not_called()
         else:
             # A de-outlier writes only a state mapping, so only STATE is synced,
@@ -226,14 +223,13 @@ class EventsTestCase(HomeserverTestCase):
             de_outlier_barrier.assert_called_once_with(
                 SyncTier.DURABLE, pools=[Pool.STATE]
             )
-            de_outlier_publish.assert_not_called()
 
     @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
     def test_de_outlier_syncs_state_barrier_by_default(self) -> None:
         self._check_de_outlier_state_barrier(publish_at_commit=False)
 
     @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
-    def test_de_outlier_publishes_state_barrier_when_publishing_at_commit(
+    def test_de_outlier_leaves_durability_to_the_coalescer_at_commit(
         self,
     ) -> None:
         self._check_de_outlier_state_barrier(publish_at_commit=True)
@@ -243,7 +239,7 @@ class EventsTestCase(HomeserverTestCase):
     ) -> tuple[list[tuple[str, tuple[object, ...]]], list[object]]:
         """Persist one message, recording what the EVENT_DAG write path does.
 
-        Returns `(calls, put_kwargs)`: an ordered log of publishes and of
+        Returns `(calls, put_kwargs)`: an ordered log of barriers and of
         `call_after` registrations, and the keyword arguments each
         `put_event_json_batch` call received.
         """
@@ -258,9 +254,6 @@ class EventsTestCase(HomeserverTestCase):
         real_put = events_module.put_event_json_batch
         real_call_after = LoggingTransaction.call_after
 
-        def fake_publish(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
-            calls.append(("publish", tuple(pools or ())))
-
         def fake_sync(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
             calls.append(("sync", tuple(pools or ())))
 
@@ -271,20 +264,16 @@ class EventsTestCase(HomeserverTestCase):
         def recording_call_after(
             txn: LoggingTransaction, callback: object, *args: object, **kwargs: object
         ) -> None:
-            if callback is fake_publish_mock:
-                calls.append(("call_after_publish", args))
-            elif callback is events_module.mark_dirty:
+            if callback is events_module.mark_dirty:
                 calls.append(("call_after_mark_dirty", args))
             elif callback is embedded_common.sync_now:
                 calls.append(("call_after_sync_now", args))
             real_call_after(txn, callback, *args, **kwargs)  # type: ignore[arg-type]
 
-        fake_publish_mock = mock.Mock(side_effect=fake_publish)
         with (
             mock.patch.object(
                 events_module, "publishes_at_commit", return_value=publish_at_commit
             ),
-            mock.patch.object(events_module, "maybe_publish", fake_publish_mock),
             mock.patch.object(
                 events_module, "maybe_sync", mock.Mock(side_effect=fake_sync)
             ),
@@ -329,11 +318,9 @@ class EventsTestCase(HomeserverTestCase):
             [("sync", (Pool.STATE, Pool.EVENT_DAG))],
             "expected exactly one barrier covering the state and event-DAG writes",
         )
-        # Nothing is left for the reactor thread, and nothing is published
-        # (that is the interval/off path).
+        # Nothing is left for the reactor thread.
         self.assertNotIn(("call_after_sync_now", ([Pool.STATE],)), calls)
         self.assertFalse([call for call in calls if call[0] == "call_after_sync_now"])
-        self.assertNotIn(("publish", (Pool.EVENT_DAG,)), calls)
         # In the transaction: the barrier is issued before the post-commit
         # durability marks that the same block registers. (An earlier
         # `mark_dirty(EVENT_DAG)` is the edge writes' own coalescing.)
@@ -343,24 +330,25 @@ class EventsTestCase(HomeserverTestCase):
         )
 
     @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
-    def test_auth_event_is_published_in_txn_when_publishing_at_commit(self) -> None:
-        """`interval`/`off` publish an auth event's writes; they must not `sync_now`.
+    def test_auth_event_leaves_durability_to_the_coalescer_at_commit(self) -> None:
+        """`interval`/`off` do not `sync_now` for an auth event's writes.
 
         Auth-chain events (create, membership, power levels) are read back by
-        another worker straight away. Under `off`, `sync_now` is a no-op, so
-        routing this barrier through it published nothing at all and workers
-        failed with "State mapping disappeared". It has to be a publish, made
-        in the transaction, with durability left to the coalescer.
+        another worker straight away, which needs no barrier: mtxdb publishes
+        each write as it is journaled. Under `off`, `sync_now` is a no-op and
+        under `interval` it would fsync on the reactor thread, so durability
+        goes through the coalescer instead.
         """
         calls, _ = self._persist_message_recording_event_json_sync(
             publish_at_commit=True, action="join"
         )
 
-        self.assertIn(
-            ("publish", (Pool.STATE, Pool.AUTH_CHAIN, Pool.EVENT_DAG)),
-            calls,
-            "an auth event's writes were never published to workers",
-        )
+        for pool in (Pool.STATE, Pool.AUTH_CHAIN, Pool.EVENT_DAG):
+            self.assertIn(
+                ("call_after_mark_dirty", (pool,)),
+                calls,
+                f"{pool} was never marked for the coalescer",
+            )
         self.assertFalse(
             [call for call in calls if call[0] == "call_after_sync_now"],
             "auth barrier is still a reactor-thread sync_now, a no-op under `off`",
@@ -382,10 +370,10 @@ class EventsTestCase(HomeserverTestCase):
 
     def _rewrite_partial_state_mapping(
         self, *, publish_at_commit: bool
-    ) -> tuple[mock.Mock, mock.Mock, mock.Mock]:
+    ) -> tuple[mock.Mock, mock.Mock]:
         """Run the partial-state rewrite of an event's state group.
 
-        Returns the `(publish, sync_now, mark_dirty)` mocks it used.
+        Returns the `(sync_now, mark_dirty)` mocks it used.
         """
         user = self.register_user("partial_state_user", "pass")
         token = self.login("partial_state_user", "pass")
@@ -428,49 +416,46 @@ class EventsTestCase(HomeserverTestCase):
             mock.patch.object(
                 state_module, "publishes_at_commit", return_value=publish_at_commit
             ),
-            mock.patch.object(state_module, "maybe_publish") as publish,
             mock.patch.object(state_module, "sync_now") as sync,
             mock.patch.object(state_module, "mark_dirty") as dirty,
         ):
             self.get_success(
                 self._store.update_state_for_partial_state_event(event, context)
             )
-        return publish, sync, dirty
+        return sync, dirty
 
     @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
-    def test_partial_state_rewrite_publishes_when_publishing_at_commit(self) -> None:
-        """`interval`/`off`: publish the rewritten mapping and leave fsync to the
+    def test_partial_state_rewrite_defers_durability_when_publishing_at_commit(
+        self,
+    ) -> None:
+        """`interval`/`off`: leave fsync of the rewritten mapping to the
         coalescer. A `sync_now` here fsyncs on the reactor thread under
         `interval` and does nothing at all under `off`, so workers never saw the
         rewrite (the resync tests then fail to find the event)."""
-        publish, sync, dirty = self._rewrite_partial_state_mapping(
-            publish_at_commit=True
-        )
+        sync, dirty = self._rewrite_partial_state_mapping(publish_at_commit=True)
 
-        publish.assert_called_once_with(SyncTier.DURABLE, [Pool.STATE])
         dirty.assert_called_once_with(Pool.STATE)
         sync.assert_not_called()
 
     @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
     def test_partial_state_rewrite_syncs_by_default(self) -> None:
-        """`always` keeps the strict barrier and does not publish separately."""
-        publish, sync, dirty = self._rewrite_partial_state_mapping(
-            publish_at_commit=False
-        )
+        """`always` keeps the strict barrier."""
+        sync, dirty = self._rewrite_partial_state_mapping(publish_at_commit=False)
 
         sync.assert_called_once_with([Pool.STATE])
-        publish.assert_not_called()
         dirty.assert_not_called()
 
     @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
-    def test_event_json_publish_precedes_commit_when_publishing_at_commit(
+    def test_event_json_is_written_unsynced_and_marked_dirty_at_commit(
         self,
     ) -> None:
-        """`interval`/`off` publish EVENT_DAG inside the transaction, not after it.
+        """`interval`/`off` write EVENT_DAG unsynced and leave durability to the
+        coalescer.
 
-        A `call_after` runs only once the SQL row is committed and visible, so
-        publishing from one would leave a window in which a worker finds the
-        event but not its JSON (there is no SQL copy to fall back to).
+        The JSON is journaled, and so visible, inside the transaction, before
+        the SQL row can be seen: a worker that finds the row also finds its JSON
+        (there is no SQL copy to fall back to). Nothing is synced per put, and
+        the coalescer is told the pool is dirty after commit.
         """
         calls, put_kwargs = self._persist_message_recording_event_json_sync(
             publish_at_commit=True
@@ -478,24 +463,19 @@ class EventsTestCase(HomeserverTestCase):
 
         self.assertTrue(put_kwargs)
         self.assertTrue(all(sync is False for sync in put_kwargs), put_kwargs)
-        publish = ("publish", (Pool.EVENT_DAG,))
-        self.assertIn(publish, calls)
-        self.assertNotIn(
-            ("call_after_publish", (SyncTier.DURABLE, [Pool.EVENT_DAG])), calls
+        self.assertIn(("call_after_mark_dirty", (Pool.EVENT_DAG,)), calls)
+        self.assertFalse(
+            [call for call in calls if call[0] in ("sync", "call_after_sync_now")]
         )
-        # Each in-transaction publish is followed by that transaction's
-        # durability mark, so the publish came first.
-        mark = ("call_after_mark_dirty", (Pool.EVENT_DAG,))
-        self.assertLess(calls.index(publish), calls.index(mark))
 
     @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
-    def test_rolled_back_event_json_publish_leaves_unreachable_orphan(self) -> None:
-        """A rolled-back persist can publish event JSON that no reader serves.
+    def test_rolled_back_event_json_leaves_unreachable_orphan(self) -> None:
+        """A rolled-back persist can leave event JSON that no reader serves.
 
-        Exclusive event JSON publishes inside the transaction (to avoid a
-        committed-row/missing-JSON window), so the failure mode of a rollback
-        is a published-but-unreferenced JSON record rather than an invisible
-        write. That orphan is acceptable because it is unreachable: every
+        Exclusive event JSON is journaled, and so visible, inside the
+        transaction (to avoid a committed-row/missing-JSON window), so the
+        failure mode of a rollback is a visible-but-unreferenced JSON record
+        rather than an invisible write. That orphan is acceptable because it is unreachable: every
         event-JSON read is driven by ids discovered from committed SQL
         ``events`` rows, so a record whose row rolled back is never looked up.
         This pins both halves -- the record really is in mtxdb, and the read
@@ -536,8 +516,6 @@ class EventsTestCase(HomeserverTestCase):
             embedded_event_json.put_event_json_batch(
                 engine, namespace, [(event_id, room_id, "{}", body, 1)], sync=False
             )
-            # The commit-boundary publish the production path performs.
-            events_module.maybe_publish(SyncTier.DURABLE, [Pool.EVENT_DAG])
             raise RuntimeError("simulated persist rollback")
 
         failure = self.get_failure(

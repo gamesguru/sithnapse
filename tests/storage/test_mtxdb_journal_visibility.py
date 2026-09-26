@@ -7,15 +7,15 @@
 """Cross-process visibility of published-but-not-fsynced mtxdb writes.
 
 The visibility/durability split rests on one claim: a write the writer has
-*published* (``publish_pending``) is readable by a read-only worker process
+*journaled* is readable by a read-only worker process
 even though the writer has never fsynced it. Existing tests run reader and
 writer in one process, so they cannot show that. Here each role is its own
 process, because mtxdb's Python binding holds process-global pools.
 
-Most cases drive the shim directly, pinning the primitive ``events.py`` now
-depends on (it publishes through ``maybe_publish``). The event-JSON cases use
-the production ``embedded_event_json`` read/write helpers instead, so the same
-published-but-unfsynced visibility is exercised through the real event-JSON
+Most cases drive the engine directly, pinning the primitive ``events.py``
+depends on: a write is visible once journaled. The event-JSON cases use the
+production ``embedded_event_json`` read/write helpers instead, so the same
+journaled-but-unfsynced visibility is exercised through the real event-JSON
 path a worker uses.
 """
 

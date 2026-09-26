@@ -70,7 +70,6 @@ from synapse.storage.databases.main.embedded_common import (
     Pool,
     SyncTier,
     mark_dirty,
-    maybe_publish,
     maybe_sync,
     publishes_at_commit,
 )
@@ -1415,10 +1414,6 @@ class PersistEventsStore:
                     # the transaction like the event JSON. Durability lands
                     # through the coalescer, as the mode says. (A `sync_now`
                     # from `call_after` would fsync on the reactor thread.)
-                    maybe_publish(
-                        SyncTier.DURABLE,
-                        [Pool.STATE, Pool.AUTH_CHAIN, Pool.EVENT_DAG],
-                    )
                     txn.call_after(mark_dirty, Pool.STATE)
                     txn.call_after(mark_dirty, Pool.AUTH_CHAIN)
                     txn.call_after(mark_dirty, Pool.EVENT_DAG)
@@ -1437,7 +1432,6 @@ class PersistEventsStore:
                     # coalescer's 250-500ms flush. Durability lands through the
                     # coalescer (`mark_dirty`) and, for acknowledged auth
                     # writes, the barrier above. Visibility is not durability.
-                    txn.call_after(maybe_publish, SyncTier.DURABLE, [Pool.STATE])
                     txn.call_after(mark_dirty, Pool.STATE)
                 # A live state event can also have written chain-cover links
                 # (see `calculate_chain_cover_index_for_events`) even when its
@@ -3210,11 +3204,6 @@ class PersistEventsStore:
                 # produced, not a new failure mode. Durability still lands
                 # through the coalescer (`mark_dirty`).
                 #
-                # `maybe_publish` flushes the engine's whole pending queue, so
-                # it may also publish a concurrent transaction's uncommitted
-                # mutations. That is an existing property of the shared journal
-                # (see `maybe_publish`), not introduced by this ordering.
-                maybe_publish(SyncTier.DURABLE, [Pool.EVENT_DAG])
                 txn.call_after(mark_dirty, Pool.EVENT_DAG)
 
         self.db_pool.simple_insert_many_txn(

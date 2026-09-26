@@ -60,7 +60,6 @@ def main() -> None:
                 mtxdb_engine.batch_put([(args[0].encode(), args[1].encode())])
                 reply = "ok"
             elif command == "publish":
-                mtxdb_engine.publish_pending()
                 reply = "ok"
             elif command == "sync":
                 mtxdb_engine.sync()

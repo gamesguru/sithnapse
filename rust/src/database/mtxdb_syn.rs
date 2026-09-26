@@ -3448,30 +3448,6 @@ pub fn sync_auth_chain(py: Python<'_>) -> PyResult<()> {
     py.detach(|| sync_one("auth-chain", auth_chain_db()?))
 }
 
-/// Publish all queued mutations without fsyncing them.
-///
-/// In WAL mode the pools share one JournalCoordinator, so the first call drains
-/// the shared queue and the remaining calls are no-ops. In non-WAL mode each
-/// pool has its own journal, so all three must be published. Durability is
-/// provided separately by the coalesced sync path.
-///
-/// This is not transaction-scoped: a pending mutation from another concurrent
-/// SQL transaction can be published by this call. Non-WAL publication is also
-/// sequential across the three journals, not atomic. Callers must treat this
-/// as a visibility optimization until the storage layer provides transaction-
-/// scoped publication or the caller serializes embedded writes through SQL
-/// commit.
-#[pyfunction]
-pub fn publish_pending(py: Python<'_>) -> PyResult<()> {
-    assert_writable()?;
-    py.detach(|| {
-        publish_journal("state", state_db()?)?;
-        publish_journal("event-dag", event_dag_db()?)?;
-        publish_journal("auth-chain", auth_chain_db()?)?;
-        Ok(())
-    })
-}
-
 /// Start the WAL group committer for the writable pools.
 ///
 /// The pools share a coordinator in WAL mode; starting it on each pool is
@@ -3598,20 +3574,6 @@ pub fn wait_durable(py: Python<'_>, targets: Vec<u64>) -> PyResult<()> {
     })
 }
 
-fn publish_journal(name: &str, engine: &Arc<PackfileStorage>) -> PyResult<()> {
-    let journal = engine.journal().ok_or_else(|| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "mtxdb publish error for {name} pool: journal is unavailable"
-        ))
-    })?;
-    journal.publish_pending().map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "mtxdb publish error for {name} pool: {e}"
-        ))
-    })?;
-    Ok(())
-}
-
 fn sync_one(name: &str, engine: &Arc<PackfileStorage>) -> PyResult<()> {
     engine.sync().map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb sync error for {name} pool: {e}"))
@@ -3662,7 +3624,6 @@ fn durability_to_dict<'py>(
     d.set_item("commit_records", stats.commit_records)?;
     d.set_item("max_commit_records", stats.max_commit_records)?;
     d.set_item("records_per_commit", stats.records_per_commit())?;
-    d.set_item("staged_publish_refused", stats.staged_publish_refused)?;
     Ok(d)
 }
 
@@ -4091,7 +4052,6 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(sync_state, m)?)?;
     m.add_function(wrap_pyfunction!(sync_event_dag, m)?)?;
     m.add_function(wrap_pyfunction!(sync_auth_chain, m)?)?;
-    m.add_function(wrap_pyfunction!(publish_pending, m)?)?;
     m.add_function(wrap_pyfunction!(start_background_commit, m)?)?;
     m.add_function(wrap_pyfunction!(stop_background_commit, m)?)?;
     m.add_function(wrap_pyfunction!(background_commit_error, m)?)?;

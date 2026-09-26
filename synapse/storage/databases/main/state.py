@@ -52,9 +52,7 @@ from synapse.storage.database import (
 )
 from synapse.storage.databases.main.embedded_common import (
     Pool,
-    SyncTier,
     mark_dirty,
-    maybe_publish,
     publishes_at_commit,
     sync_now,
 )
@@ -822,12 +820,10 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
                     self._embedded_db_namespace,
                     [state_group],
                 )
-            # Publish the rewritten mapping after SQL commit so reader workers
-            # see it immediately. In interval/off mode, durability is handled
-            # separately by the coalescer; always mode retains the strict
-            # barrier.
+            # The mapping is already visible in mtxdb. In interval/off mode,
+            # durability is handled separately by the coalescer; always mode
+            # retains the strict barrier.
             if publishes_at_commit():
-                txn.call_after(maybe_publish, SyncTier.DURABLE, [Pool.STATE])
                 txn.call_after(mark_dirty, Pool.STATE)
             else:
                 txn.call_after(sync_now, [Pool.STATE])

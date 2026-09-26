@@ -69,7 +69,7 @@ class MtxdbSnapshotMetricsTestCase(TestCase):
 
 
 class SyncDisabledPublicationTestCase(TestCase):
-    def test_sync_disabled_suppresses_fsync_but_not_publication(self) -> None:
+    def test_sync_disabled_suppresses_fsync_and_touches_nothing_else(self) -> None:
         """Durability off must not also turn off cross-process visibility.
 
         ``_sync_disabled`` is set by the test-only no-sync mode. It gates the
@@ -92,16 +92,9 @@ class SyncDisabledPublicationTestCase(TestCase):
             engine.sync_state.assert_not_called()
             engine.sync_event_dag.assert_not_called()
             engine.sync_auth_chain.assert_not_called()
-            # A barrier with durability off still publishes: its callers need
-            # the write visible to other workers, and it was their only way to
-            # publish it.
-            engine.publish_pending.assert_called_once_with()
+            self.assertEqual(engine.mock_calls, [])
 
-            engine.publish_pending.reset_mock()
-            embedded_common.maybe_publish(SyncTier.DURABLE, pools=[Pool.EVENT_DAG])
-            engine.publish_pending.assert_called_once_with()
-
-    def test_sync_now_with_durability_off_publishes(self) -> None:
+    def test_sync_now_with_durability_off_is_a_noop(self) -> None:
         """`sync_now` (the barrier most call sites use) must not become a no-op."""
         engine = mock.Mock()
         with (
@@ -117,27 +110,7 @@ class SyncDisabledPublicationTestCase(TestCase):
             embedded_common.sync_now([Pool.STATE])
 
         engine.sync_state.assert_not_called()
-        engine.publish_pending.assert_called_once_with()
-
-    def test_publication_is_a_noop_without_the_wal(self) -> None:
-        """Without the WAL there is no journal: publishing must not be attempted.
-
-        The engine raises "journal is unavailable" from ``publish_pending``
-        when the WAL is off, and no read-committed worker can exist to see a
-        published write, so ``maybe_publish`` has to leave it alone.
-        """
-        engine = mock.Mock()
-        with (
-            mock.patch.dict(os.environ, {"SYNAPSE_MTXDB_WAL": ""}),
-            mock.patch.object(embedded_common, "_engine_configured", True),
-            mock.patch(
-                "synapse.storage.databases.embedded_engine.get_embedded_engine",
-                return_value=engine,
-            ),
-        ):
-            embedded_common.maybe_publish(SyncTier.DURABLE, pools=[Pool.EVENT_DAG])
-
-        engine.publish_pending.assert_not_called()
+        self.assertEqual(engine.mock_calls, [])
 
 
 class GroupCommitWiringTestCase(TestCase):
@@ -162,7 +135,7 @@ class GroupCommitWiringTestCase(TestCase):
         engine.request_durable.assert_called_once_with()
         engine.stop_background_commit.assert_called_once_with()
 
-    def test_interval_flush_publishes_before_requesting_durability(self) -> None:
+    def test_interval_flush_requests_durability(self) -> None:
         coalescer = object.__new__(embedded_common._FlushCoalescer)
         coalescer._delayed_call = None
         coalescer._closed = False
@@ -180,11 +153,6 @@ class GroupCommitWiringTestCase(TestCase):
             ),
             mock.patch.object(
                 embedded_common,
-                "maybe_publish",
-                side_effect=lambda *args, **kwargs: calls.append("publish"),
-            ),
-            mock.patch.object(
-                embedded_common,
                 "request_durable",
                 side_effect=lambda: calls.append("request"),
             ),
@@ -194,7 +162,7 @@ class GroupCommitWiringTestCase(TestCase):
         ):
             coalescer._flush()
 
-        self.assertEqual(calls, ["publish", "request"])
+        self.assertEqual(calls, ["request"])
         self.assertFalse(coalescer._dirty)
 
     def test_background_failure_keeps_dirty_pools_for_retry(self) -> None:
@@ -212,13 +180,20 @@ class GroupCommitWiringTestCase(TestCase):
             mock.patch.object(
                 embedded_common, "_drain_edge_writes", return_value=False
             ),
-            mock.patch.object(embedded_common, "maybe_publish"),
             mock.patch.object(embedded_common, "request_durable"),
             mock.patch.object(
                 embedded_common,
                 "background_commit_error",
                 return_value="disk full",
             ),
+            # Strict recovery fails too, so the pools must be kept for retry.
+            mock.patch.object(
+                embedded_common,
+                "_do_sync_pools",
+                side_effect=RuntimeError("still failing"),
+            ),
+            mock.patch.object(embedded_common, "stop_background_commit"),
+            mock.patch.object(embedded_common, "start_background_commit"),
         ):
             coalescer._flush()
 
@@ -249,11 +224,6 @@ class GroupCommitWiringTestCase(TestCase):
             ),
             mock.patch.object(
                 embedded_common,
-                "maybe_publish",
-                side_effect=lambda *args, **kwargs: calls.append("publish"),
-            ),
-            mock.patch.object(
-                embedded_common,
                 "request_durable",
                 side_effect=lambda: calls.append("request"),
             ),
@@ -279,10 +249,10 @@ class GroupCommitWiringTestCase(TestCase):
             coalescer._flush()
 
         self.assertEqual(coalescer._dirty, set())
-        self.assertEqual(calls[0:2], ["publish", "request"])
-        strict_call = cast(tuple[str, object], calls[2])
+        self.assertEqual(calls[0], "request")
+        strict_call = cast(tuple[str, object], calls[1])
         self.assertEqual(strict_call[0], "strict")
-        self.assertEqual(calls[3:], ["stop", ("start", 0.5)])
+        self.assertEqual(calls[2:], ["stop", ("start", 0.5)])
 
 
 class SyncModeTestCase(TestCase):
@@ -304,14 +274,14 @@ class SyncModeTestCase(TestCase):
             self.assertFalse(self._publishes(None, no_sync=False, wal=wal))
             self.assertFalse(self._publishes(SyncMode.ALWAYS, no_sync=False, wal=wal))
 
-    def test_interval_and_off_publish_only_with_the_wal(self) -> None:
+    def test_interval_and_off_defer_durability_only_with_the_wal(self) -> None:
         for mode in (SyncMode.INTERVAL, SyncMode.OFF):
             self.assertTrue(self._publishes(mode, no_sync=False, wal="1"))
-            # No WAL, no journal to publish to: fall back to the barriers.
+            # No WAL, no journal to defer to: fall back to the barriers.
             self.assertFalse(self._publishes(mode, no_sync=False, wal=""))
 
     def test_no_sync_means_off(self) -> None:
-        """The older boolean switch still disables fsync, and now publishes too."""
+        """The older boolean switch still disables fsync, and defers like `off`."""
         self.assertTrue(self._publishes(None, no_sync=True, wal="1"))
         self.assertTrue(embedded_common._sync_disabled)
         self.assertIs(embedded_common._sync_mode, SyncMode.OFF)

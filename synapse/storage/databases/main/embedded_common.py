@@ -1116,8 +1116,7 @@ def maybe_sync(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
 
     A DURABLE write has no SQL fallback, or uses accumulating/delta
     semantics (counters, auth-chain links, HAMT roots). This function is the
-    durability path; request-path visibility barriers should use
-    ``maybe_publish`` so they do not pay an fsync per transaction.
+    durability path; mtxdb publishes autocommit writes when they are written.
 
     A CACHE write has a SQL fallback on the read path. A lost unflushed
     write just means a slower read via that fallback, not data loss.
@@ -1137,13 +1136,8 @@ def maybe_sync(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
         return
 
     if _sync_disabled:
-        # Durability is off, but nearly every caller of a barrier also needs the
-        # write to be visible to other workers straight away (the barrier was
-        # its only way to publish it). Skipping the whole barrier would leave
-        # those writes queued in this process, unseen by readers, until some
-        # unrelated persist happened to publish them. Turn the barrier into a
-        # publish: no fsync, but nothing left invisible.
-        maybe_publish(tier, pools)
+        # Publication happens with the mtxdb write. With durability disabled,
+        # there is no sync work to perform here.
         return
 
     if sys._getframe(1).f_code.co_filename != __file__:
@@ -1182,63 +1176,11 @@ def maybe_sync(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
         ffi_timing("ffi_sync_auth_chain", time.monotonic() - _st)
 
 
-def maybe_publish(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
-    """Publish queued mtxdb mutations for cross-process visibility.
-
-    The operation publishes every pool journal: WAL mode shares one journal
-    coordinator, while non-WAL mode has one journal per pool. ``pools`` only
-    identifies whether this call site has anything requiring publication; it
-    does not scope the journal operation. Publication advances the
-    read-committed boundary but deliberately does not make mutations durable.
-    The coalesced ``maybe_sync`` path remains responsible for durability.
-
-    ``_sync_disabled`` (test-only durability off) gates fsync, not visibility,
-    so it does not suppress publication here: turning durability off must not
-    also turn off the cross-process read path, or a worker would miss committed
-    writes that the writer deliberately never fsynced.
-
-    Call sites are either direct calls or ``txn.call_after`` registrations,
-    and the difference is deliberate. Event JSON publishes *directly*, inside
-    the transaction, because it has no SQL copy to fall back to: a reader that
-    sees the committed row must already see the JSON, so the JSON has to be
-    published before the row can become visible. State/de-outlier publishes
-    via ``txn.call_after`` (after commit), as it always has. In the exclusive
-    engine the mapping has no SQL copy either, so that leaves a small pre-existing
-    window between the commit and this publish; it is not closed here.
-
-    Known limitation: this publication is not transaction-scoped. It flushes
-    the engine's whole pending queue, so a concurrent SQL transaction's mtxdb
-    mutations may be published here before that SQL transaction commits. That
-    is an existing property of the shared journal, not something a particular
-    call site introduces. In non-WAL mode, the three independent journal
-    publications are also sequential rather than atomic. Production-safe
-    transaction ordering requires transaction-scoped publication in mtxdb or
-    serialization of embedded writes across the SQL commit boundary.
-    """
-    if not _engine_configured or tier is not SyncTier.DURABLE:
-        return
-    if not wal_enabled():
-        # No journal to publish to (the engine raises "journal is unavailable"),
-        # and no read-committed worker that could see a published write.
-        return
-
-    from synapse.storage.databases.embedded_engine import get_embedded_engine
-
-    engine = get_embedded_engine("mtxdb")
-    if pools is not None and not set(pools):
-        return
-
-    _st = time.monotonic()
-    engine.publish_pending()
-    ffi_timing("ffi_publish_pending", time.monotonic() - _st)
-
-
 def request_durable() -> None:
     """Request durability for the current published boundary of every pool.
 
-    This is deliberately separate from ``maybe_publish``: callers must first
-    publish the writes, then capture the boundary that the background
-    committer should cover. The request is non-blocking.
+    mtxdb has already published autocommit writes when they were written, so
+    this captures the current boundary. The request is non-blocking.
     """
     if not _engine_configured or _sync_disabled or not publishes_at_commit():
         return
@@ -1376,7 +1318,6 @@ class _FlushCoalescer:
                 # All pools share a WAL in the normal layout. Publish first,
                 # then capture one boundary covering every pool; the native
                 # background committer performs the eventual shared fsync.
-                maybe_publish(SyncTier.DURABLE, to_flush)
                 request_durable()
                 if error := background_commit_error():
                     # The native committer is terminal after an I/O error.
