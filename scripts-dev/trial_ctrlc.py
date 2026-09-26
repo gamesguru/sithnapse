@@ -308,6 +308,7 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
         sql_scheduling_total = 0.0
         sql_scheduling_count = 0
         sql_scheduling_samples: list[float] = []
+        sql_slow_statements: list[tuple[float, str, int, int]] = []
         for fname in sql_files:
             try:
                 with open(os.path.join(timings_dir, fname), encoding="utf-8") as sql_fh:
@@ -322,6 +323,8 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                 sql_scheduling_total += scheduling.get("total", 0.0)
                 sql_scheduling_count += scheduling.get("count", 0)
                 sql_scheduling_samples.extend(scheduling.get("latencies", []))
+                for elapsed, text, payload, rowcount in data.get("slow_statements", []):
+                    sql_slow_statements.append((elapsed, text, payload, rowcount))
             except Exception as e:
                 out(f"Warning: failed to read {fname}: {e}")
 
@@ -376,6 +379,16 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                 f"  {total_row[0]:{table_width}s}  {total_row[1]:>{total_width}s}  {total_row[2]:>{calls_width}s}  {total_row[3]:>{rows_width}s}  {total_row[4]:>{avg_width}s}"
             )
             out("=====================================")
+            out("")
+
+        if sql_slow_statements:
+            sql_slow_statements.sort(key=lambda entry: entry[0], reverse=True)
+            out("=== Slowest SQL statements (all processes) ===")
+            for elapsed, text, payload, rowcount in sql_slow_statements[:10]:
+                out(
+                    f"  {elapsed * 1000:9.1f}ms  sent={payload:>9,d}B  "
+                    f"rows={rowcount:>6,d}  {text}"
+                )
             out("")
 
         if sql_scheduling_count and sql_scheduling_samples:
@@ -977,6 +990,14 @@ def _git(*args: str) -> str:
         return "?"
 
 
+def _load_average() -> str:
+    """The machine's load average, so a slow run can be told from a busy box."""
+    try:
+        return " ".join(f"{value:.2f}" for value in os.getloadavg())
+    except OSError:
+        return "?"
+
+
 def _run_identity() -> list[str]:
     """Lines naming the code, pin and settings a run was made with, so a log
     can be attributed to a commit later instead of remembered."""
@@ -1005,6 +1026,7 @@ def _run_identity() -> list[str]:
         f"  branch:    {_git('rev-parse', '--abbrev-ref', 'HEAD')}",
         f"  mtxdb pin: {mtxdb}",
         f"  jobs:      -j{jobs} on {os.cpu_count()} cpus",
+        f"  load avg:  {_load_average()} (1/5/15 min, when this report was made)",
         f"  sync mode: {os.environ.get('SYNAPSE_TEST_MTXDB_SYNC_MODE', '(unset)')}",
         f"  persist txn: {os.environ.get('SYNAPSE_MTXDB_PERSIST_TXN', '(unset, on)')}",
     ]

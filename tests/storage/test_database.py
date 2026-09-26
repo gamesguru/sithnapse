@@ -77,6 +77,52 @@ class TrackTableOpTestCase(unittest.TestCase):
             self.assertEqual(database_module._TABLE_OPS_ROWS[table], before_rows)
 
 
+class TrackSlowStatementTestCase(unittest.TestCase):
+    """The slow-statement report keeps the worst statements and how much data
+    they sent, without ever breaking the query being timed."""
+
+    def _track(self, entries: list[tuple[str, float, object]]) -> list[tuple]:
+        with patch.object(database_module, "_SLOW_STATEMENTS", []) as kept:
+            for sql, elapsed, parameters in entries:
+                database_module._track_slow_statement(sql, elapsed, 1, parameters)
+            return list(kept)
+
+    def test_fast_statements_are_not_kept(self) -> None:
+        self.assertEqual(self._track([("SELECT 1", 0.001, ())]), [])
+
+    def test_slow_statement_records_payload_bytes(self) -> None:
+        kept = self._track(
+            [("INSERT INTO t (a, b) VALUES (?, ?)", 0.2, (b"x" * 500, "yy", 7))]
+        )
+        self.assertEqual(len(kept), 1)
+        elapsed, text, payload, rowcount = kept[0]
+        self.assertEqual((elapsed, payload, rowcount), (0.2, 502, 1))
+        self.assertEqual(text, "INSERT INTO t (a, b) VALUES (?, ?)")
+
+    def test_payload_of_nested_and_odd_parameters(self) -> None:
+        self.assertEqual(database_module._payload_bytes(({"k": b"abc"}, ["de"])), 5)
+        self.assertEqual(database_module._payload_bytes(object()), 0)
+        self.assertEqual(database_module._payload_bytes(None), 0)
+
+    def test_sql_is_collapsed_and_truncated(self) -> None:
+        sql = "SELECT\n    a\n  FROM   " + "t" * 1000
+        kept = self._track([(sql, 0.3, ())])
+        self.assertLessEqual(len(kept[0][1]), database_module._SLOW_STATEMENT_SQL_CHARS)
+        self.assertNotIn("\n", kept[0][1])
+
+    def test_sql_comments_do_not_crowd_out_the_statement(self) -> None:
+        sql = "-- a long licence header\n/* and another */ SELECT 1 FROM t"
+        kept = self._track([(sql, 0.3, ())])
+        self.assertEqual(kept[0][1], "SELECT 1 FROM t")
+
+    def test_only_the_worst_are_retained(self) -> None:
+        many = [(f"SELECT {i}", 0.06 + i / 1000, ()) for i in range(200)]
+        kept = self._track(many)
+        # The list is trimmed as it grows, and the slowest always survive.
+        self.assertLess(len(kept), 200)
+        self.assertIn(max(entry[0] for entry in kept), {0.06 + 199 / 1000})
+
+
 class ExecuteScriptTestCase(unittest.HomeserverTestCase):
     """Tests for `BaseDatabaseEngine.executescript` implementations."""
 

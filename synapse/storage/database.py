@@ -130,6 +130,15 @@ _TABLE_OPS_ROWS: dict[str, int] = defaultdict(int)
 # "dictionary changed size during iteration" and lose the flush it exists
 # to produce.
 _TABLE_OPS_LOCK = threading.Lock()
+
+# The slowest individual statements seen (opt-in `SYNAPSE_PG_TIMINGS` report),
+# kept under `_TABLE_OPS_LOCK`. A per-table average hides which statement is slow
+# and how much data it carried, so keep the few worst ones with their payload size.
+# `SYNAPSE_SLOW_SQL_MS` lowers the cutoff for a small run.
+_SLOW_STATEMENT_THRESHOLD_S = float(os.environ.get("SYNAPSE_SLOW_SQL_MS", "50")) / 1000
+_SLOW_STATEMENTS_KEPT = 10
+_SLOW_STATEMENT_SQL_CHARS = 240
+_SLOW_STATEMENTS: list[tuple[float, str, int, int]] = []
 _SQL_SCHEDULING_LOCK = threading.Lock()
 _SQL_SCHEDULING_TOTAL: float = 0.0
 _SQL_SCHEDULING_COUNT: int = 0
@@ -226,6 +235,46 @@ def _track_table_op(sql: str, elapsed: float, rowcount: int = 0) -> None:
             _TABLE_OPS_ROWS[table] += max(rowcount, 0)
 
 
+def _payload_bytes(parameters: object, _depth: int = 0) -> int:
+    """Total size of the bytes/str values in a statement's parameters.
+
+    Only called for statements already known to be slow, so the walk is bounded
+    rather than cheap: it stops descending after two levels.
+    """
+    if isinstance(parameters, (bytes, bytearray, memoryview, str)):
+        return len(parameters)
+    if _depth >= 2:
+        return 0
+    if isinstance(parameters, dict):
+        parameters = list(parameters.values())
+    if isinstance(parameters, (list, tuple)):
+        return sum(_payload_bytes(item, _depth + 1) for item in parameters)
+    return 0
+
+
+def _track_slow_statement(
+    sql: str, elapsed: float, rowcount: int, parameters: object
+) -> None:
+    """Remember the slowest statements, with the bytes they sent."""
+    if elapsed < _SLOW_STATEMENT_THRESHOLD_S:
+        return
+    try:
+        payload = _payload_bytes(parameters)
+    except Exception:
+        # Instrumentation must never break the query it is timing.
+        payload = -1
+    if "--" in sql or "/*" in sql:
+        sql = _SQL_COMMENT_RE.sub(" ", sql)
+    text = " ".join(sql.split())[:_SLOW_STATEMENT_SQL_CHARS]
+    with _TABLE_OPS_LOCK:
+        _SLOW_STATEMENTS.append(
+            (elapsed, text, payload, rowcount if isinstance(rowcount, int) else 0)
+        )
+        if len(_SLOW_STATEMENTS) > 4 * _SLOW_STATEMENTS_KEPT:
+            _SLOW_STATEMENTS.sort(key=lambda entry: entry[0], reverse=True)
+            del _SLOW_STATEMENTS[_SLOW_STATEMENTS_KEPT:]
+
+
 def _track_sql_scheduling(elapsed: float) -> None:
     """Record pool checkout/thread scheduling delay for the opt-in report."""
     global _SQL_SCHEDULING_TOTAL, _SQL_SCHEDULING_COUNT
@@ -244,6 +293,9 @@ def _print_table_ops() -> None:
         table_ops = dict(_TABLE_OPS)
         table_counts = dict(_TABLE_OPS_COUNTS)
         table_rows = dict(_TABLE_OPS_ROWS)
+        slow_statements = sorted(_SLOW_STATEMENTS, key=lambda e: e[0], reverse=True)[
+            :_SLOW_STATEMENTS_KEPT
+        ]
 
     with _SQL_SCHEDULING_LOCK:
         scheduling_total = _SQL_SCHEDULING_TOTAL
@@ -273,6 +325,7 @@ def _print_table_ops() -> None:
                         "counts": table_counts,
                         "rows": table_rows,
                         "scheduling": scheduling,
+                        "slow_statements": slow_statements,
                     },
                     f,
                 )
@@ -330,6 +383,16 @@ def _print_table_ops() -> None:
     )
     _timings_print("=====================================")
     _timings_print("")
+
+    if slow_statements:
+        _timings_print(
+            f"=== Slowest SQL statements (over {_SLOW_STATEMENT_THRESHOLD_S * 1000:.0f} ms) ==="
+        )
+        for elapsed, text, payload, rowcount in slow_statements:
+            _timings_print(
+                f"  {elapsed * 1000:9.1f}ms  sent={payload:>9,d}B  rows={rowcount:>6,d}  {text}"
+            )
+        _timings_print("")
 
     if scheduling_count and scheduling_samples:
         samples = scheduling_samples
@@ -819,6 +882,7 @@ class LoggingTransaction:
                 except Exception:
                     rowcount = 0
                 _track_table_op(sql, secs, rowcount)
+                _track_slow_statement(sql, secs, rowcount, args)
 
     def close(self) -> None:
         self.txn.close()
