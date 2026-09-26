@@ -22,6 +22,7 @@
 import collections
 import itertools
 import logging
+import time
 from collections import OrderedDict
 from typing import (
     TYPE_CHECKING,
@@ -70,6 +71,7 @@ from synapse.storage.databases.main.embedded_common import (
     Pool,
     SyncTier,
     begin_embedded_transaction,
+    ffi_timing,
     mark_dirty,
     maybe_sync,
     publishes_at_commit,
@@ -1212,7 +1214,9 @@ class PersistEventsStore:
                 mtxdb_txn=mtxdb_txn,
             )
             commit_started = True
+            _ct = time.monotonic()
             mtxdb_txn.commit()
+            ffi_timing("ffi_txn_commit", time.monotonic() - _ct)
         except BaseException:
             # After a failed commit the group may already be published, and
             # aborting a published transaction is an error that would hide the

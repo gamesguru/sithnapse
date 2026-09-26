@@ -651,25 +651,27 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
         """
         if getattr(self, "_embedded_event_json_enabled", False):
             event_ids = list(event_ids)
-            logger.info(
-                "[mtxdb-trace] worker=%s state-group read purpose=read_batch requested=%d event_ids=%s",
-                self._instance_name,
-                len(event_ids),
-                list(event_ids),
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[mtxdb-trace] worker=%s state-group read purpose=read_batch requested=%d event_ids=%s",
+                    self._instance_name,
+                    len(event_ids),
+                    list(event_ids),
+                )
             res = get_state_group_for_events_batch(
                 self._embedded_db_engine,
                 self._embedded_db_namespace,
                 event_ids,
                 purpose="read_batch",
             )
-            logger.info(
-                "[mtxdb-trace] worker=%s state-group read result purpose=read_batch hits=%d misses=%d hit_event_ids=%s",
-                self._instance_name,
-                len(res),
-                len(event_ids) - len(res),
-                sorted(res),
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[mtxdb-trace] worker=%s state-group read result purpose=read_batch hits=%d misses=%d hit_event_ids=%s",
+                    self._instance_name,
+                    len(res),
+                    len(event_ids) - len(res),
+                    sorted(res),
+                )
         else:
             rows = cast(
                 list[tuple[str, int]],
