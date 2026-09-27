@@ -222,6 +222,15 @@ class EventAuthHandler:
         """
         # If the member is invited or currently joined, then nothing to do.
         if prev_membership in (Membership.JOIN, Membership.INVITE):
+            # Probe: this short-circuit is taken before the CALL log below, so
+            # a make_join that should have been rejected by mangled join rules
+            # but was allowed by a stale membership read leaves no other trace.
+            logger.warning(
+                "[mtxdb-restricted] SKIP user=%s prev_membership=%s state_keys=%s",
+                user_id,
+                prev_membership,
+                sorted(str(k) for k in state_ids),
+            )
             return
 
         logger.warning(
@@ -302,6 +311,11 @@ class EventAuthHandler:
         # If there's no join rule, then it defaults to invite (so this doesn't apply).
         join_rules_event_id = partial_state_ids.get((EventTypes.JoinRules, ""), None)
         if not join_rules_event_id:
+            # Probe: a stale state read can drop the join_rules entry entirely.
+            logger.warning(
+                "[mtxdb-restricted] NO-JOIN-RULES state_keys=%s",
+                sorted(str(k) for k in partial_state_ids),
+            )
             return False
 
         # If the join rule is not restricted, this doesn't apply.
@@ -310,10 +324,25 @@ class EventAuthHandler:
         if content_join_rule == JoinRules.RESTRICTED:
             return True
 
+        # Probe: logged only on the paths that return False, so a
+        # correctly-restricted MSC3787 room stays silent. For a room expected
+        # to be restricted this shows what was read instead of a silent allow.
         # also check for MSC3787 behaviour
         if room_version.knock_restricted_join_rule:
-            return content_join_rule == JoinRules.KNOCK_RESTRICTED
+            if content_join_rule == JoinRules.KNOCK_RESTRICTED:
+                return True
+            logger.warning(
+                "[mtxdb-restricted] NOT-RESTRICTED join_rules_event_id=%s join_rules_content=%s",
+                join_rules_event_id,
+                join_rules_event.content,
+            )
+            return False
 
+        logger.warning(
+            "[mtxdb-restricted] NOT-RESTRICTED join_rules_event_id=%s join_rules_content=%s",
+            join_rules_event_id,
+            join_rules_event.content,
+        )
         return False
 
     async def get_rooms_that_allow_join(
