@@ -84,7 +84,7 @@ tests/complement/*
 *.jsonl
 
 # rust
-/target/
+target/
 /synapse/*.so
 *.bin
 *.pack
