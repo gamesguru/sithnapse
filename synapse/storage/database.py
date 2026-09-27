@@ -1003,6 +1003,10 @@ class DatabasePool:
         self.hs = hs
         self.server_name = hs.hostname
         self._clock = hs.get_clock()
+        if _PG_TIMINGS_ENABLED:
+            from synapse.storage._stall_watchdog import start_stall_watchdog
+
+            start_stall_watchdog(hs.get_reactor())
         self._txn_limit = database_config.config.get("txn_limit", 0)
         self._database_config = database_config
         self._db_pool = make_pool(
@@ -1540,6 +1544,21 @@ class DatabasePool:
                     ).observe(sched_duration_sec)
                     if _PG_TIMINGS_ENABLED:
                         _track_sql_scheduling(sched_duration_sec)
+                        if sched_duration_sec >= _SLOW_STATEMENT_THRESHOLD_S * 2:
+                            # Diagnostic: was the pool exhausted (every thread
+                            # working, this call queued) or did the call wait
+                            # for a thread/connection to be created?
+                            _threads = self._db_pool.threadpool
+                            logger.warning(
+                                "[slow-sched] %s waited %.0f ms for a db thread: "
+                                "pool=%s threads=%d working=%d idle=%d",
+                                curr_context,
+                                sched_duration_sec * 1000,
+                                self.name(),
+                                len(_threads.threads),
+                                len(_threads.working),
+                                len(_threads.waiters),
+                            )
                     context.add_database_scheduled(sched_duration_sec)
 
                     if self._txn_limit > 0:
