@@ -41,11 +41,10 @@ jobs:
 
           - arrangement: hybrid
             database: SQLite (hybrid, mtxdb)
-            # The one sync-on mtxdb lane: it is the smoke alarm for the
-            # durability path and the only lane where SYNAPSE_MTXDB_STATS can
-            # report a real fsync/checkpoint split. The other mtxdb lanes run
-            # with sync off for speed.
-            mtxdb_sync_mode: "on"
+            # Complement containers are destroyed after every test, so the
+            # durable fsync path buys nothing here. Keep this lane consistent
+            # with the Postgres mtxdb lanes and run with sync off for speed.
+            mtxdb_sync_mode: "off"
 
           - arrangement: monolith
             database: Postgres
@@ -119,8 +118,8 @@ jobs:
           # "hybrid, mtxdb" job silently boots plain SQLite.
           SYNAPSE_TEST_EMBEDDED_DB_ENGINE: ${{ (contains(matrix.database, 'mtxdb')) && 'mtxdb' || '' }}
           SYNAPSE_TEST_EMBEDDED_DB_PATH: ${{ (contains(matrix.database, 'mtxdb')) && '/data/embedded_db' || '' }}
-          # Per-lane durability: the SQLite mtxdb lane is the sync-on smoke
-          # alarm; the Postgres mtxdb lanes disable fsync for speed.
+          # Complement mtxdb lanes disable fsync for speed; containers are
+          # destroyed after every test, so durability adds no value here.
           SYNAPSE_TEST_MTXDB_SYNC_MODE: ${{ contains(matrix.database, 'mtxdb') && matrix.mtxdb_sync_mode || '' }}
           SYNAPSE_TEST_MTXDB_STATS: ${{ (contains(matrix.database, 'mtxdb') && matrix.mtxdb_sync_mode != 'off') && '1' || '' }}
           TEST_ONLY_IGNORE_POETRY_LOCKFILE: ${{ inputs.use_latest_deps && 1 || '' }}
@@ -148,8 +147,8 @@ jobs:
           # "hybrid, mtxdb" job silently boots plain SQLite.
           SYNAPSE_TEST_EMBEDDED_DB_ENGINE: ${{ (contains(matrix.database, 'mtxdb')) && 'mtxdb' || '' }}
           SYNAPSE_TEST_EMBEDDED_DB_PATH: ${{ (contains(matrix.database, 'mtxdb')) && '/data/embedded_db' || '' }}
-          # Per-lane durability: the SQLite mtxdb lane is the sync-on smoke
-          # alarm; the Postgres mtxdb lanes disable fsync for speed.
+          # Complement mtxdb lanes disable fsync for speed; containers are
+          # destroyed after every test, so durability adds no value here.
           SYNAPSE_TEST_MTXDB_SYNC_MODE: ${{ contains(matrix.database, 'mtxdb') && matrix.mtxdb_sync_mode || '' }}
           SYNAPSE_TEST_MTXDB_STATS: ${{ (contains(matrix.database, 'mtxdb') && matrix.mtxdb_sync_mode != 'off') && '1' || '' }}
           TEST_ONLY_IGNORE_POETRY_LOCKFILE: ${{ inputs.use_latest_deps && 1 || '' }}
