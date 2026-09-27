@@ -119,10 +119,6 @@ sql_txn_duration = Counter(
 # a busy homeserver, even though the timing functions themselves no-op.
 _PG_TIMINGS_ENABLED = bool(os.environ.get("SYNAPSE_PG_TIMINGS"))
 
-# Diagnostic (`SYNAPSE_PG_TIMINGS`): what each db thread is running and since
-# when, so a call that waits for a thread can say who held them.
-_RUNNING_INTERACTIONS: dict[int, tuple[str, float]] = {}
-
 _TABLE_OPS: dict[str, float] = defaultdict(float)
 _TABLE_OPS_COUNTS: dict[str, int] = defaultdict(int)
 _TABLE_OPS_ROWS: dict[str, int] = defaultdict(int)
@@ -1548,28 +1544,6 @@ class DatabasePool:
                     ).observe(sched_duration_sec)
                     if _PG_TIMINGS_ENABLED:
                         _track_sql_scheduling(sched_duration_sec)
-                        if sched_duration_sec >= _SLOW_STATEMENT_THRESHOLD_S * 2:
-                            # Diagnostic: was the pool exhausted (every thread
-                            # working, this call queued) or did the call wait
-                            # for a thread/connection to be created?
-                            _threads = self._db_pool.threadpool
-                            _now = monotonic_time()
-                            logger.warning(
-                                "[slow-sched] %s waited %.0f ms for a db thread: "
-                                "pool=%s threads=%d working=%d idle=%d running=%s",
-                                curr_context,
-                                sched_duration_sec * 1000,
-                                self.name(),
-                                len(_threads.threads),
-                                len(_threads.working),
-                                len(_threads.waiters),
-                                [
-                                    f"{label} {(_now - since) * 1000:.0f}ms"
-                                    for label, since in list(
-                                        _RUNNING_INTERACTIONS.values()
-                                    )
-                                ],
-                            )
                     context.add_database_scheduled(sched_duration_sec)
 
                     if self._txn_limit > 0:
@@ -1607,19 +1581,8 @@ class DatabasePool:
                             default_txn_name="runWithConnection",
                             server_name=self.server_name,
                         )
-                        if _PG_TIMINGS_ENABLED:
-                            _RUNNING_INTERACTIONS[threading.get_ident()] = (
-                                f"{curr_context}:"
-                                + (
-                                    args[0]
-                                    if args and isinstance(args[0], str)
-                                    else getattr(func, "__name__", "?")
-                                ),
-                                monotonic_time(),
-                            )
                         return func(db_conn, *args, **kwargs)
                     finally:
-                        _RUNNING_INTERACTIONS.pop(threading.get_ident(), None)
                         if db_autocommit:
                             self.engine.attempt_to_set_autocommit(conn, False)
                         if isolation_level:
