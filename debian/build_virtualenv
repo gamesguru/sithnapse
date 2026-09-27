@@ -70,7 +70,7 @@ RUSTC_BOOTSTRAP=1 dh_virtualenv \
     --extra-pip-arg="--no-deps" \
     --extra-pip-arg="--no-cache-dir" \
     --extra-pip-arg="--compile" \
-    --verbose \
+    --extra-pip-arg="--verbose" \
     --extras="all,test" \
     --requirements="exported_requirements.txt"
 
