@@ -13,9 +13,11 @@ completed test, including its test ID, process ID, and elapsed milliseconds.
 
 import json
 import os
+import pathlib
 import re
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -1025,6 +1027,41 @@ def aggregate_container_timings(root: str) -> None:
         shutil.rmtree(flat, ignore_errors=True)
 
 
+def _preserve_failure_logs(working_dir: str) -> None:
+    """Copy each test.log under the trial working directory into a new
+    `res/logs/<date>-trial-failure-<rev>-<time>/` directory, with a manifest.
+
+    A failed test's server-side traceback lives only in these files, and the
+    next run reuses (and overwrites) the working directory. The destination is
+    unique per run, so later reruns never replace it. Nothing is committed.
+    """
+    logs = sorted(pathlib.Path(working_dir).rglob("test.log"))
+    if not logs:
+        return
+    repo = pathlib.Path(__file__).resolve().parent.parent
+    try:
+        rev = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        rev = "unknown"
+    stamp = time.strftime("%Y-%m-%d-%H%M%S")
+    dest = repo / "res" / "logs" / f"{stamp}-trial-failure-{rev}"
+    dest.mkdir(parents=True, exist_ok=True)
+    manifest = {}
+    for i, log in enumerate(logs):
+        rel = log.relative_to(working_dir)
+        name = f"{i:02d}-" + "_".join(rel.parts)
+        shutil.copy2(log, dest / name)
+        manifest[name] = str(log)
+    (dest / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    sys.stderr.write(f"Preserved {len(logs)} test.log file(s) in {dest}\n")
+
+
 def run() -> None:
     config = Options()
     try:
@@ -1214,6 +1251,16 @@ def run() -> None:
                 _aggregate_and_print_timings(timings_dir)
             finally:
                 shutil.rmtree(timings_dir, ignore_errors=True)
+
+    if not successful and not interrupted:
+        try:
+            _preserve_failure_logs(
+                distributed_runner._workingDirectory
+                if config["jobs"] is not None
+                else trialRunner.workingDirectory
+            )
+        except Exception as e:  # never mask the test result
+            sys.stderr.write(f"Could not preserve failure logs: {e}\n")
 
     sys.exit(130 if interrupted else int(not successful))
 
