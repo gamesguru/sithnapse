@@ -271,6 +271,7 @@ def _reset_recycled_postgres_db(
     """Reset a recycled test DB. Returns True on success."""
 
     _t0 = time.monotonic()
+    _phase = _t0
     try:
         conn = db_engine.module.connect(
             dbname=test_db,
@@ -281,7 +282,9 @@ def _reset_recycled_postgres_db(
         )
         db_engine.attempt_to_set_autocommit(conn, True)
         cur = conn.cursor()
+        _pg_timing("db_reset_connect", time.monotonic() - _phase, test_name=test_name)
 
+        _phase = time.monotonic()
         try:
             cur.execute(
                 "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
@@ -290,6 +293,11 @@ def _reset_recycled_postgres_db(
             )
         except Exception:
             pass
+        _pg_timing(
+            "db_reset_terminate_backends",
+            time.monotonic() - _phase,
+            test_name=test_name,
+        )
 
         # Dirty-table tracking is process-global and SQL-shape-dependent, so it
         # cannot safely determine which rows belong to this particular DB.
@@ -303,6 +311,7 @@ def _reset_recycled_postgres_db(
         # TRUNCATE itself, not a repeated pg_tables catalog query too.
         global _TABLES_TO_TRUNCATE_CACHE
         if _TABLES_TO_TRUNCATE_CACHE is None:
+            _phase = time.monotonic()
             cur.execute(
                 "SELECT quote_ident(tablename) FROM pg_tables "
                 "WHERE schemaname = 'public' ORDER BY tablename"
@@ -312,19 +321,33 @@ def _reset_recycled_postgres_db(
                 for row in cur.fetchall()
                 if row[0] not in _METADATA_TABLES_IGNORE
             ]
+            _pg_timing(
+                "db_reset_catalog", time.monotonic() - _phase, test_name=test_name
+            )
         tables_to_truncate = _TABLES_TO_TRUNCATE_CACHE
         if tables_to_truncate:
+            _phase = time.monotonic()
             cur.execute(
                 "TRUNCATE TABLE "
                 + ", ".join(tables_to_truncate)
                 + " RESTART IDENTITY CASCADE;"
             )
+            _pg_timing(
+                "db_reset_truncate", time.monotonic() - _phase, test_name=test_name
+            )
 
+        _phase = time.monotonic()
         cur.execute(_RESEED_SQL)
+        _pg_timing("db_reset_reseed", time.monotonic() - _phase, test_name=test_name)
 
+        _phase = time.monotonic()
         cur.execute(_RESET_SEQUENCES_SQL)
+        _pg_timing("db_reset_sequences", time.monotonic() - _phase, test_name=test_name)
+
+        _phase = time.monotonic()
         cur.close()
         conn.close()
+        _pg_timing("db_reset_close", time.monotonic() - _phase, test_name=test_name)
         _pg_timing("db_recycle_reset", time.monotonic() - _t0, test_name=test_name)
         _pg_counter("recycle_reset_success")
         return True
@@ -669,6 +692,47 @@ def _print_pg_timings() -> None:
             f"    └── {'hs_unattributed':38s}  {unatt_wall * 1000:8.1f}ms  {wall_cnt:6d}  {(unatt_wall / wall_cnt) * 1000:10.3f}ms"
         )
 
+        # ── Database recycle reset phase breakdown ───────────────────────────
+        # `db_recycle_reset` is otherwise a single opaque span covering the
+        # whole reset; these sub-phases are what tells us whether the cost is
+        # connection setup, backend termination, the TRUNCATE itself, or the
+        # reseed/sequence bookkeeping that follows it.
+        if "db_recycle_reset" in timings:
+            _timings_print("\n=== Database Recycle Reset Phase Timings ===")
+            _timings_print("")
+            _timings_print(
+                f"  {'':44s}  {'total':>10s}  {'calls':>6s}  {'avg':>12s}  {'max':>12s}",
+            )
+            rr_s = timings["db_recycle_reset"]
+            rr_cnt = counts["db_recycle_reset"]
+            rr_max = maxs.get("db_recycle_reset", 0.0)
+            _timings_print(
+                f"  {'db_recycle_reset':44s}  {rr_s * 1000:8.1f}ms  {rr_cnt:6d}  {(rr_s / rr_cnt) * 1000:10.3f}ms  {rr_max * 1000:10.3f}ms"
+            )
+            reset_sub_tags = (
+                "db_reset_connect",
+                "db_reset_terminate_backends",
+                "db_reset_catalog",
+                "db_reset_truncate",
+                "db_reset_reseed",
+                "db_reset_sequences",
+                "db_reset_close",
+            )
+            sub_reset = 0.0
+            present_reset_tags = [t for t in reset_sub_tags if t in timings]
+            for sub_tag in present_reset_tags:
+                sub_s = timings[sub_tag]
+                sub_cnt = counts[sub_tag]
+                sub_max = maxs.get(sub_tag, 0.0)
+                sub_reset += sub_s
+                _timings_print(
+                    f"    ├── {sub_tag:38s}  {sub_s * 1000:8.1f}ms  {sub_cnt:6d}  {(sub_s / sub_cnt) * 1000:10.3f}ms  {sub_max * 1000:10.3f}ms"
+                )
+            reset_residual = max(0.0, rr_s - sub_reset)
+            _timings_print(
+                f"    └── {'db_reset_unattributed':38s}  {reset_residual * 1000:8.1f}ms  {rr_cnt:6d}  {(reset_residual / rr_cnt) * 1000:10.3f}ms"
+            )
+
         # ── Teardown phase breakdown ─────────────────────────────────────────
         teardown_tags = (
             "hs_shutdown",
@@ -757,6 +821,14 @@ def _print_pg_timings() -> None:
             "db_drop_terminate_backends",
             "db_drop_statement",
             "db_drop_retry_sleep",
+            "db_recycle_reset",
+            "db_reset_connect",
+            "db_reset_terminate_backends",
+            "db_reset_catalog",
+            "db_reset_truncate",
+            "db_reset_reseed",
+            "db_reset_sequences",
+            "db_reset_close",
         }
         for tag in sorted(timings):
             if tag not in known:

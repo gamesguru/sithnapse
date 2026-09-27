@@ -220,6 +220,21 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                     out(
                         f"    ├── {'db_recycle_reset':38s}  {rr_s * 1000:8.1f}ms  {rr_cnt:6d}  {(rr_s / rr_cnt) * 1000:10.3f}ms"
                     )
+                    for sub_tag in (
+                        "db_reset_connect",
+                        "db_reset_terminate_backends",
+                        "db_reset_catalog",
+                        "db_reset_truncate",
+                        "db_reset_reseed",
+                        "db_reset_sequences",
+                        "db_reset_close",
+                    ):
+                        if sub_tag in lc_timings:
+                            sub_s = lc_timings[sub_tag]
+                            sub_cnt = lc_counts[sub_tag]
+                            out(
+                                f"    │     ├── {sub_tag:32s}  {sub_s * 1000:8.1f}ms  {sub_cnt:6d}  {(sub_s / sub_cnt) * 1000:10.3f}ms"
+                            )
                 if "hs_setup_total" in lc_timings:
                     st_s = lc_timings["hs_setup_total"]
                     st_cnt = lc_counts["hs_setup_total"]
@@ -264,6 +279,13 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                     "hs_setup_wall",
                     "create_database",
                     "db_recycle_reset",
+                    "db_reset_connect",
+                    "db_reset_terminate_backends",
+                    "db_reset_catalog",
+                    "db_reset_truncate",
+                    "db_reset_reseed",
+                    "db_reset_sequences",
+                    "db_reset_close",
                     "hs_setup_total",
                     "make_conn",
                     "prepare_database",
