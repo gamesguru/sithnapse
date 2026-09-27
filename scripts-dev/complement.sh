@@ -530,20 +530,21 @@ main() {
       ;;
   esac
 
-  # Persist sync mode for the containers: always | interval | off. Unset keeps
+  # Persist sync mode for the containers: on | interval | off. Unset keeps
   # the engine default (`interval`: publish at commit, coalesced fsyncs).
   # `interval` and `off` publish writes at the commit boundary so workers still
   # see them, and leave (or skip) fsync. Only the TEST_-scoped variable is
   # honoured, for the same reason as the no-sync switch above.
   case "${SYNAPSE_TEST_MTXDB_SYNC_MODE:-}" in
     "") ;;
-    always | interval) export PASS_SYNAPSE_MTXDB_SYNC="$SYNAPSE_TEST_MTXDB_SYNC_MODE" ;;
+    on) export PASS_SYNAPSE_MTXDB_SYNC=always ;;
+    interval) export PASS_SYNAPSE_MTXDB_SYNC=interval ;;
     off)
       export PASS_SYNAPSE_MTXDB_SYNC=off
       export PASS_SYNAPSE_TEST_MTXDB_ALLOW_UNSAFE_OFF=1
       ;;
     *)
-      echo "SYNAPSE_TEST_MTXDB_SYNC_MODE must be one of: always, interval, off" >&2
+      echo "SYNAPSE_TEST_MTXDB_SYNC_MODE must be one of: on, interval, off" >&2
       exit 1
       ;;
   esac
