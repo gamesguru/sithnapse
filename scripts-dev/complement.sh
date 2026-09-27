@@ -1350,6 +1350,11 @@ for suite, total in sorted(suite_times.items(), key=lambda x: -x[1]):
   fi
 
   # ── Aggregate per-process timing snapshots from all containers ───────────
+  # The aggregator prints the run header's load/pressure lines (through
+  # trial_ctrlc.py). When it does not run -- no SYNAPSE_PG_TIMINGS, or no
+  # snapshots -- print them here instead, so a run is never left without an
+  # end-of-run report. Exactly one of the two paths prints.
+  _run_header_end_printed=0
   if [[ -n "${_TIMINGS_RUN_DIR:-}" ]] && [[ -d "$_TIMINGS_RUN_DIR" ]]; then
     if [ -z "$(find "$_TIMINGS_RUN_DIR" -name '*.json' -print -quit)" ]; then
       echo "warning: SYNAPSE_PG_TIMINGS is set but no timing snapshots were written under $_TIMINGS_RUN_DIR (containers not rebuilt, or the directory isn't writable by Synapse's user)" >&2
@@ -1359,8 +1364,12 @@ for suite, total in sorted(suite_times.items(), key=lambda x: -x[1]):
       _timings_report="${staged_results_file%.jsonl}.timings.txt"
       uv run --no-sync python "${repo_root}/scripts-dev/trial_ctrlc.py" --aggregate-timings "$_TIMINGS_RUN_DIR" 2>&1 | tee "$_timings_report" >&2 || true
       echo "timings report saved at $_timings_report" >&2
+      _run_header_end_printed=1
     fi
     rm -rf "$_TIMINGS_RUN_DIR"
+  fi
+  if [[ -n "${RUN_HEADER_STATE:-}" ]] && [[ "$_run_header_end_printed" -eq 0 ]]; then
+    python3 "${repo_root}/scripts-dev/run_header.py" end "$RUN_HEADER_STATE" >&2 || true
   fi
   rm -f "${RUN_HEADER_STATE:-}"
 
