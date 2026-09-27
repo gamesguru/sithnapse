@@ -44,14 +44,28 @@ class _Process:
             [sys.executable, _WORKER, role, store_dir, namespace],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            # Kept separate from stdout, not merged: stdout is a strict
+            # line protocol (the first line must be exactly "READY"), and
+            # anything else that writes to stderr during import -- a
+            # deprecation warning, a C-level/Rust warning, an unrelated
+            # future log line -- would otherwise land on that same stream
+            # and get misread as the readiness line (see mtxdb_visibility_
+            # worker.py's logging.disable(...) around its Synapse imports,
+            # which covers today's known trigger but not every possible
+            # one). Capturing it separately means any such noise shows up
+            # as diagnostic context below, instead of silently corrupting
+            # the protocol.
+            stderr=subprocess.PIPE,
             text=True,
             env=env,
         )
         ready = self._stdout().readline().strip()
         if ready != "READY":
+            stderr_output = self._proc.stderr.read() if self._proc.stderr else ""
             self.close()
-            raise AssertionError(f"{role} process failed to start: {ready!r}")
+            raise AssertionError(
+                f"{role} process failed to start: {ready!r}\nstderr:\n{stderr_output}"
+            )
 
     def _stdin(self) -> IO[str]:
         assert self._proc.stdin is not None
@@ -89,7 +103,7 @@ class _Process:
         except Exception:
             self._proc.kill()
         finally:
-            for stream in (self._proc.stdin, self._proc.stdout):
+            for stream in (self._proc.stdin, self._proc.stdout, self._proc.stderr):
                 if stream is not None:
                     stream.close()
 
