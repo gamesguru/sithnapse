@@ -975,25 +975,35 @@ def _print_mtxdb_engine_stats(timings_dir: str) -> None:
     print("===============================\n", file=err)
 
 
-_BASELINE = run_header.Baseline()
+# Complement starts the baseline before its run (complement.sh exports the path);
+# this process only aggregates afterwards, so a fresh one would show no load
+# change and no pressure. Trial has no such file and starts its own.
+_BASELINE = (
+    run_header.Baseline.load_from(os.environ["RUN_HEADER_STATE"])
+    if os.environ.get("RUN_HEADER_STATE")
+    else run_header.Baseline()
+)
 
 
 def _run_identity() -> list[str]:
     """Lines naming the code, pin and settings a run was made with, so a log
     can be attributed to a commit later instead of remembered."""
     jobs = "-"
+    if os.environ.get("RUN_HEADER_WORKERS"):
+        jobs = f"-p{os.environ['RUN_HEADER_WORKERS']} (go test)"
     for i, arg in enumerate(sys.argv):
         if arg == "-j" and i + 1 < len(sys.argv):
-            jobs = sys.argv[i + 1]
+            jobs = f"-j{sys.argv[i + 1]}"
         elif arg.startswith("-j") and arg[2:].isdigit():
-            jobs = arg[2:]
+            jobs = arg
     return [
         *run_header.header_lines(
             [
-                ("workers", f"-j{jobs}"),
+                ("workers", jobs),
                 (
                     "sync mode",
-                    os.environ.get("SYNAPSE_TEST_MTXDB_SYNC_MODE", "(unset)"),
+                    os.environ.get("SYNAPSE_TEST_MTXDB_SYNC_MODE")
+                    or os.environ.get("PASS_SYNAPSE_MTXDB_SYNC", "(unset)"),
                 ),
                 (
                     "persist txn",

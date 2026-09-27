@@ -750,6 +750,15 @@ main() {
   echo "\$RUN_TESTS: $RUN_TESTS" >&2
   echo "" >&2
 
+  # Baseline for the run header (scripts-dev/run_header.py); the timing
+  # aggregator in trial_ctrlc.py reads it back to report load and pressure over
+  # the run instead of over its own start-up.
+  export RUN_HEADER_STATE="${staging_dir}/run_header.${run_suffix}.${run_stamp}.json"
+  export RUN_HEADER_WORKERS="$test_parallel"
+  python3 "${repo_root}/scripts-dev/run_header.py" start "$RUN_HEADER_STATE" \
+    "workers=-p${test_parallel} (go test)" \
+    "sync mode=${PASS_SYNAPSE_MTXDB_SYNC:-(unset)}" >&2 || true
+
   # ── anchor_one: per-segment ^ anchoring so -run TestFoo doesn't match TestFooBar ──
   anchor_one() {
     local pattern="$1"
@@ -1353,6 +1362,7 @@ for suite, total in sorted(suite_times.items(), key=lambda x: -x[1]):
     fi
     rm -rf "$_TIMINGS_RUN_DIR"
   fi
+  rm -f "${RUN_HEADER_STATE:-}"
 
   # ── Extract timing from captured docker logs ─────────────────────────────
   if [[ -n "${SYNAPSE_PG_TIMINGS:-}" ]] && [[ -n "${_PG_TIMING_DIRS:-}" ]]; then
