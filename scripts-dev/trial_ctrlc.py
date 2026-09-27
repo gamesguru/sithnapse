@@ -1003,6 +1003,52 @@ def _load_average() -> str:
 _LOAD_AT_START = _load_average()
 
 
+def _pressure_snapshot() -> dict[str, float]:
+    """Cumulative stall seconds (PSI cpu/io/memory "some") and CPU jiffies, so
+    two snapshots give what share of the run was spent stalled or in iowait."""
+    snapshot: dict[str, float] = {}
+    for resource in ("cpu", "io", "memory"):
+        try:
+            with open(f"/proc/pressure/{resource}") as f:
+                for line in f:
+                    if line.startswith("some"):
+                        total = line.rsplit("total=", 1)[1]
+                        snapshot[resource] = int(total) / 1e6
+        except (OSError, ValueError, IndexError):
+            pass
+    try:
+        with open("/proc/stat") as f:
+            fields = [int(v) for v in f.readline().split()[1:]]
+        snapshot["jiffies"] = float(sum(fields))
+        snapshot["iowait"] = float(fields[4])
+    except (OSError, ValueError, IndexError):
+        pass
+    return snapshot
+
+
+_PRESSURE_AT_START = _pressure_snapshot()
+_WALL_AT_START = time.monotonic()
+
+
+def _pressure_summary() -> str:
+    """Share of the run stalled on cpu/io/memory (PSI) and in iowait, told
+    apart from load average, which cannot separate CPU from disk waiting."""
+    end = _pressure_snapshot()
+    wall = time.monotonic() - _WALL_AT_START
+    if wall <= 0 or not _PRESSURE_AT_START or not end:
+        return "unavailable"
+    parts = [
+        f"{name} stall {100 * (end[name] - _PRESSURE_AT_START[name]) / wall:.1f}%"
+        for name in ("cpu", "io", "memory")
+        if name in end and name in _PRESSURE_AT_START
+    ]
+    jiffies = end.get("jiffies", 0) - _PRESSURE_AT_START.get("jiffies", 0)
+    if jiffies > 0 and "iowait" in end:
+        iowait = end["iowait"] - _PRESSURE_AT_START["iowait"]
+        parts.append(f"iowait {100 * iowait / jiffies:.1f}% of cpu time")
+    return ", ".join(parts)
+
+
 def _run_identity() -> list[str]:
     """Lines naming the code, pin and settings a run was made with, so a log
     can be attributed to a commit later instead of remembered."""
@@ -1033,6 +1079,7 @@ def _run_identity() -> list[str]:
         f"  jobs:      -j{jobs} on {os.cpu_count()} cpus",
         f"  load avg:  {_LOAD_AT_START} at start, {_load_average()} at report "
         "(1/5/15 min)",
+        f"  pressure:  {_pressure_summary()} (over the run)",
         f"  sync mode: {os.environ.get('SYNAPSE_TEST_MTXDB_SYNC_MODE', '(unset)')}",
         f"  persist txn: {os.environ.get('SYNAPSE_MTXDB_PERSIST_TXN', '(unset, on)')}",
     ]
