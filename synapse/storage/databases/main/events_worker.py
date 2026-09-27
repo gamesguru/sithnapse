@@ -1303,6 +1303,17 @@ class EventsWorkerStore(SQLBaseStore):
                     for _, deferred in event_fetches_to_fail:
                         deferred.errback(exc)
 
+    def _event_fetch_pool_is_small(self) -> bool:
+        """Whether the connection pool has no thread to spare for fetch threads.
+
+        An idle fetch thread waits `EVENT_QUEUE_ITERATIONS * EVENT_QUEUE_TIMEOUT_S`
+        (about 0.4 s) for more requests while holding a database thread. With
+        no more pool threads than fetch threads, every other query queues behind
+        those waits: Complement runs workers with `cp_max: 3`, and a join sat
+        behind idle fetch loops for 400 ms.
+        """
+        return bool(self.db_pool._db_pool.max <= EVENT_QUEUE_THREADS)
+
     def _fetch_loop(self, conn: LoggingDatabaseConnection) -> None:
         """Takes a database connection and waits for requests for events from
         the _event_fetch_list queue.
@@ -1321,6 +1332,7 @@ class EventsWorkerStore(SQLBaseStore):
                     if (
                         not self.USE_DEDICATED_DB_THREADS_FOR_EVENT_FETCHING
                         or single_threaded
+                        or self._event_fetch_pool_is_small()
                         or i > EVENT_QUEUE_ITERATIONS
                     ):
                         return
