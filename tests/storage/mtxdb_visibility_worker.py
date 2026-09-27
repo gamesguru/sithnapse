@@ -25,11 +25,26 @@ import json
 import logging
 import sys
 
-from synapse.storage.databases.main.embedded_event_json import (
+# The worker's stdout is a line protocol whose first line must be exactly
+# "READY" (see test_mtxdb_journal_visibility.py's `_Process.__init__`,
+# which reads it with stderr merged into stdout). `synapse.metrics` logs a
+# non-fatal compatibility warning at import time on an older-but-still-
+# supported `prometheus_client` (its `_use_created` hack has no clean
+# feature-detection below 0.14.0 -- see
+# `_set_prometheus_client_use_created_metrics`) -- harmless for a normal
+# process, but fatal here since it can land before "READY" and get read as
+# the readiness line. Blanket-suppress logging for the length of these
+# imports (nothing worth seeing happens during import) rather than bumping
+# Synapse's prometheus-client floor just to dodge one log line, or trying
+# to guess every logger name that might fire during import.
+logging.disable(logging.CRITICAL)
+from synapse.storage.databases.main.embedded_event_json import (  # noqa: E402
     get_event_json_batch,
     put_event_json_batch,
 )
-from synapse.synapse_rust import mtxdb_engine
+from synapse.synapse_rust import mtxdb_engine  # noqa: E402
+
+logging.disable(logging.NOTSET)
 
 # The worker's stdout is a line protocol; `get_event_json_batch` logs a trace
 # that must not land between replies.
