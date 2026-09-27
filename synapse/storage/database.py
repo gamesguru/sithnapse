@@ -1003,10 +1003,6 @@ class DatabasePool:
         self.hs = hs
         self.server_name = hs.hostname
         self._clock = hs.get_clock()
-        if _PG_TIMINGS_ENABLED:
-            from synapse.storage._stall_watchdog import start_stall_watchdog
-
-            start_stall_watchdog(hs.get_reactor())
         self._txn_limit = database_config.config.get("txn_limit", 0)
         self._database_config = database_config
         self._db_pool = make_pool(
