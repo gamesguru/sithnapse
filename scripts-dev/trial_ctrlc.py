@@ -1255,9 +1255,9 @@ def run() -> None:
     if not successful and not interrupted:
         try:
             _preserve_failure_logs(
-                distributed_runner._workingDirectory
+                cast(_DistributedRunner, trialRunner)._workingDirectory
                 if config["jobs"] is not None
-                else trialRunner.workingDirectory
+                else cast(TrialRunner, trialRunner).workingDirectory
             )
         except Exception as e:  # never mask the test result
             sys.stderr.write(f"Could not preserve failure logs: {e}\n")
