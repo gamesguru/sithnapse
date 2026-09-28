@@ -1981,6 +1981,16 @@ pub fn open_client_read_only(py: Python<'_>, path: String) -> PyResult<()> {
         let state = open_pool(ShardType::State, "state")?;
         let event_dag = open_pool(ShardType::EventDag, "event-dag")?;
         let auth_chain = open_pool(ShardType::Edges, "edges")?;
+        // Deployment proof for the SQL-read-removal gate: every read-only
+        // process role must log `true` here before SQL fallback reads can be
+        // removed. `false` means reads still pay the stat path.
+        log::info!(
+            "mtxdb read-only worker opened: wal={} publish_signal_active state={} event_dag={} edges={}",
+            wal_enabled(),
+            state.read_journal_publish_signal_active(),
+            event_dag.read_journal_publish_signal_active(),
+            auth_chain.read_journal_publish_signal_active(),
+        );
         let _ = DBS.set(MtxdbPools {
             state,
             event_dag,
@@ -3785,9 +3795,14 @@ fn stats_to_dict(
     name: &str,
     s: &mtxdb::packfile::storage::RuntimeStats,
     sync_diagnostics: &mtxdb::packfile::storage::SyncDiagnosticsSnapshot,
+    read_journal_publish_signal_active: bool,
 ) -> PyResult<Py<PyDict>> {
     let d = PyDict::new(py);
     d.set_item("pool", name)?;
+    d.set_item(
+        "read_journal_publish_signal_active",
+        read_journal_publish_signal_active,
+    )?;
     d.set_item("open_count", s.open_count)?;
     d.set_item("get_calls", s.get_calls)?;
     d.set_item("get_misses", s.get_misses)?;
@@ -4007,6 +4022,30 @@ pub fn stats_snapshot(py: Python<'_>) -> PyResult<Py<PyDict>> {
     stats_impl(py, true)
 }
 
+/// Report, per pool, whether the read-only handle mapped the writer's
+/// cross-process publish signal -- i.e. strict cross-process freshness is
+/// active for reads, not the stat-based fallback.
+///
+/// `false` is correct but not strict: a worker opened before the writer, or a
+/// non-WAL snapshot handle, keeps the stat path. Deployment proof for the
+/// SQL-read-removal gate must show `true` on every read-only process role.
+#[pyfunction]
+pub fn publish_signal_active(py: Python<'_>) -> PyResult<Py<PyDict>> {
+    let (state, event_dag, auth_chain) = py.detach(|| -> PyResult<(bool, bool, bool)> {
+        let pools = pools()?;
+        Ok((
+            pools.state.read_journal_publish_signal_active(),
+            pools.event_dag.read_journal_publish_signal_active(),
+            pools.auth_chain.read_journal_publish_signal_active(),
+        ))
+    })?;
+    let out = PyDict::new(py);
+    out.set_item("state", state)?;
+    out.set_item("event_dag", event_dag)?;
+    out.set_item("auth_chain", auth_chain)?;
+    Ok(out.unbind())
+}
+
 fn stats_impl(py: Python<'_>, take_diagnostics: bool) -> PyResult<Py<PyDict>> {
     let snapshots = py.detach(
         || -> Result<
@@ -4014,6 +4053,7 @@ fn stats_impl(py: Python<'_>, take_diagnostics: bool) -> PyResult<Py<PyDict>> {
                 &str,
                 mtxdb::packfile::storage::RuntimeStats,
                 mtxdb::packfile::storage::SyncDiagnosticsSnapshot,
+                bool,
             )>,
             pyo3::PyErr,
         > {
@@ -4030,6 +4070,7 @@ fn stats_impl(py: Python<'_>, take_diagnostics: bool) -> PyResult<Py<PyDict>> {
                     } else {
                         state_stats.sync_diagnostics.clone()
                     },
+                    pools.state.read_journal_publish_signal_active(),
                 ),
                 (
                     "event_dag",
@@ -4039,6 +4080,7 @@ fn stats_impl(py: Python<'_>, take_diagnostics: bool) -> PyResult<Py<PyDict>> {
                     } else {
                         event_dag_stats.sync_diagnostics.clone()
                     },
+                    pools.event_dag.read_journal_publish_signal_active(),
                 ),
                 (
                     "auth_chain",
@@ -4048,13 +4090,17 @@ fn stats_impl(py: Python<'_>, take_diagnostics: bool) -> PyResult<Py<PyDict>> {
                     } else {
                         auth_chain_stats.sync_diagnostics.clone()
                     },
+                    pools.auth_chain.read_journal_publish_signal_active(),
                 ),
             ])
         },
     )?;
     let out = PyDict::new(py);
-    for (name, s, diagnostics) in &snapshots {
-        out.set_item(*name, stats_to_dict(py, name, s, diagnostics)?)?;
+    for (name, s, diagnostics, publish_signal_active) in &snapshots {
+        out.set_item(
+            *name,
+            stats_to_dict(py, name, s, diagnostics, *publish_signal_active)?,
+        )?;
     }
     Ok(out.unbind())
 }
@@ -4205,6 +4251,7 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(wait_durable, m)?)?;
     m.add_function(wrap_pyfunction!(stats, m)?)?;
     m.add_function(wrap_pyfunction!(stats_snapshot, m)?)?;
+    m.add_function(wrap_pyfunction!(publish_signal_active, m)?)?;
     m.add_function(wrap_pyfunction!(reset_stats, m)?)?;
     m.add_function(wrap_pyfunction!(set_stats_enabled, m)?)?;
     m.add_function(wrap_pyfunction!(set_checkpoint_rewrite_budget, m)?)?;
