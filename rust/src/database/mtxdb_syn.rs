@@ -1983,14 +1983,24 @@ pub fn open_client_read_only(py: Python<'_>, path: String) -> PyResult<()> {
         let auth_chain = open_pool(ShardType::Edges, "edges")?;
         // Deployment proof for the SQL-read-removal gate: every read-only
         // process role must log `true` here before SQL fallback reads can be
-        // removed. `false` means reads still pay the stat path.
-        log::info!(
-            "mtxdb read-only worker opened: wal={} publish_signal_active state={} event_dag={} edges={}",
-            wal_enabled(),
-            state.read_journal_publish_signal_active(),
-            event_dag.read_journal_publish_signal_active(),
-            auth_chain.read_journal_publish_signal_active(),
-        );
+        // removed. In snapshot mode (WAL off) no overlay is installed, so the
+        // flag is structurally false and says nothing about the gate -- keep it
+        // at info only in WAL mode, and demote it to debug otherwise.
+        if wal_enabled() {
+            log::info!(
+                "mtxdb read-only worker opened: publish_signal_active state={} event_dag={} edges={}",
+                state.read_journal_publish_signal_active(),
+                event_dag.read_journal_publish_signal_active(),
+                auth_chain.read_journal_publish_signal_active(),
+            );
+        } else {
+            log::debug!(
+                "mtxdb read-only worker opened (snapshot, no publish signal): state={} event_dag={} edges={}",
+                state.read_journal_publish_signal_active(),
+                event_dag.read_journal_publish_signal_active(),
+                auth_chain.read_journal_publish_signal_active(),
+            );
+        }
         let _ = DBS.set(MtxdbPools {
             state,
             event_dag,
