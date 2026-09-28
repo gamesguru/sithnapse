@@ -32,6 +32,10 @@ from synapse.api.room_versions import (
 from synapse.events import EventBase
 from synapse.rest.client import room
 from synapse.server import HomeServer
+from synapse.storage.databases.main.embedded_common import (
+    enable_ffi_counting,
+    get_ffi_count,
+)
 from synapse.storage.databases.main.embedded_redactions import (
     get_redactions_batch,
     put_redaction_batch,
@@ -265,6 +269,60 @@ class PurgeTests(HomeserverTestCase):
         )
 
         self._assert_mirrors(engine, namespace, target["event_id"], present=False)
+
+    def test_purge_history_tombstones_never_backfilled_edge(self) -> None:
+        """A purged event that was never mirrored into mtxdb (the shape a
+        pre-existing/legacy event_edges row has before
+        `event_edges_backfill_mtxdb` runs) still gets correctly tombstoned:
+        purge computes its purge set from SQL `events`, not from whether
+        mtxdb has already seen the row, so there is no gap here for
+        `res/docs/2026-09-20-events-table-deprecation-plan.md`'s "make purge
+        mtxdb-aware for legacy rows" item -- it already is.
+
+        `get_event_edges_backward_batch` returns `None` for both "no record"
+        and "tombstoned" (that collapse is the whole point of the lazy
+        design), so a before/after `None` read can't tell "purge tombstoned
+        it" apart from "purge did nothing." The `event_edges_deleted` FFI
+        counter is the only Python-visible signal that the Rust delete
+        actually ran for this id, so that's what this test checks.
+        """
+        engine, namespace = self._enable_embedded_engine()
+        # Edges mirror starts disabled: these events' edges only ever exist
+        # in SQL, exactly like a row written before the engine was enabled.
+        persist_store = self.hs.get_datastores().persist_events
+        assert persist_store is not None
+
+        room_id = self.helper.create_room_as(self.user_id)
+        first = self.helper.send(room_id, body="never-mirrored-first")
+        last = self.helper.send(room_id, body="last")
+
+        # Enable the edges mirror only now -- after the event was already
+        # persisted SQL-only -- then purge it, the same way a server would
+        # enable the engine and later purge history that predates that.
+        for store in (self.store, persist_store):
+            store._embedded_event_edges_enabled = True
+            store._embedded_event_edges_writable = True
+
+        token = self.get_success(
+            self.store.get_topological_token_for_event(last["event_id"])
+        )
+        token_str = self.get_success(token.to_string(self.hs.get_datastores().main))
+
+        with enable_ffi_counting():
+            self.get_success(
+                self._storage_controllers.purge_events.purge_history(
+                    room_id, token_str, True
+                )
+            )
+            self.assertGreaterEqual(
+                get_ffi_count("event_edges_deleted"),
+                1,
+                "purge must call the mtxdb edge delete for the purged event, "
+                "even though its edge was never mirrored there before",
+            )
+
+        self.store._invalidate_local_get_event_cache(first["event_id"])
+        self.get_failure(self.store.get_event(first["event_id"]), NotFoundError)
 
     def test_purge_history_deletes_state_groups(self) -> None:
         """Test that unreferenced state groups get cleaned up after purge"""
