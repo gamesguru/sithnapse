@@ -2,7 +2,8 @@
 //!
 //! Stores the DAG edges connecting Matrix events:
 //! - Backward edges: `event_id -> [(prev_event_id, is_state)]` (immutable, write-once).
-//! - Forward edges: `prev_event_id -> [child_event_id]` (appended & deduplicated under RMW_LOCK).
+//! - Forward edges: `prev_event_id -> [child_event_id]` (appended and
+//!   deduplicated under a per-room lock; see `lock_rooms`).
 //!
 //! Locators are primarily owned by `event_json_put`, but `event_edges_put`
 //! re-publishes the locator for every event a row touches (its own id and
@@ -15,6 +16,7 @@
 //! -- `event_json_delete` owns that.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use mtxdb::{NodeData, NodeId, StorageEngine};
 use pyo3::prelude::*;
@@ -23,8 +25,51 @@ use sha2::{Digest, Sha256};
 
 use super::mtxdb_syn::{
     assert_writable, auth_chain_db, event_locator_collection_id, event_node_id, prev_edges_room_id,
-    RMW_LOCK,
 };
+
+/// Per-room locks replacing the process-wide `RMW_LOCK` for event-edge
+/// writes: a `put`/`delete` batch only serializes against other batches that
+/// touch the same rooms, not every room in the deployment.
+///
+/// Locks are never removed once created, so this map grows to one entry per
+/// room the process has ever written edges for. That's an accepted tradeoff
+/// at Matrix room-count scale (thousands), not an oversight -- it's also what
+/// lets `room_lock` hand back a `&'static Mutex<()>` instead of an `Arc`, so
+/// `lock_rooms` can return owned guards directly.
+static ROOM_LOCKS: OnceLock<Mutex<HashMap<[u8; 16], &'static Mutex<()>>>> = OnceLock::new();
+
+fn room_lock(room_collection: [u8; 16]) -> &'static Mutex<()> {
+    let table = ROOM_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut table = table.lock().unwrap_or_else(|poison| poison.into_inner());
+    table
+        .entry(room_collection)
+        .or_insert_with(|| Box::leak(Box::new(Mutex::new(()))))
+}
+
+/// Acquire per-room locks for every distinct room collection in
+/// `room_collections`, in a stable order (sorted by room-collection bytes),
+/// and return the held guards.
+///
+/// `put` and `delete` both go through this with the same sort key, so a put
+/// touching rooms `{A, B}` and a delete touching `{B, A}` can never acquire
+/// in opposite orders and deadlock.
+///
+/// `std::sync::Mutex` poisons on panic. A panic while a room's lock is held
+/// (e.g. a decode error) would otherwise permanently wedge that one room, so
+/// a poisoned guard is recovered here rather than propagated -- the caller's
+/// own `Result` is what signals a failed batch, not lock poisoning.
+fn lock_rooms(
+    room_collections: impl IntoIterator<Item = [u8; 16]>,
+) -> Vec<MutexGuard<'static, ()>> {
+    let mut sorted: Vec<[u8; 16]> = room_collections.into_iter().collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    sorted
+        .into_iter()
+        .map(room_lock)
+        .map(|lock| lock.lock().unwrap_or_else(|poison| poison.into_inner()))
+        .collect()
+}
 
 fn event_edges_backward_node_id(namespace: &str, event_id: &str) -> NodeId {
     let mut hasher = Sha256::new();
@@ -168,10 +213,17 @@ pub fn event_edges_put(
     rows: Vec<(String, String, String, bool)>, // (room_id, event_id, prev_event_id, is_state)
 ) -> PyResult<()> {
     assert_writable()?;
+    // Rooms are known from the caller's own rows, before any lock is taken,
+    // so lock ordering doesn't depend on anything read under the lock.
+    let room_collections: Vec<[u8; 16]> = rows
+        .iter()
+        .map(|(room_id, _, _, _)| prev_edges_room_id(&namespace, room_id))
+        .collect();
     py.detach(|| {
-        let _guard = RMW_LOCK
-            .lock()
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}")))?;
+        // Held for the whole function: the forward-list read below happens
+        // after these locks, so it's the authoritative RMW read, not a stale
+        // pre-lock cache (see `lock_rooms`).
+        let _guards = lock_rooms(room_collections);
         let engine = auth_chain_db()?;
 
         let mut backward_map: HashMap<(String, String), Vec<(String, bool)>> = HashMap::new();
@@ -561,13 +613,10 @@ pub fn event_edges_delete(
             // work done here -- without that split, a slow call can't be
             // attributed to mtxdb vs. the FFI boundary.
             let closure_started = std::time::Instant::now();
-            // Keep lock acquisition outside the GIL, otherwise a purge waiting
-            // behind another read/modify/write operation stalls unrelated Python
-            // work as well. The caller consumes the returned phase timings.
-            let lock_started = std::time::Instant::now();
-            let _guard = RMW_LOCK.lock().unwrap();
-            let lock_wait = lock_started.elapsed().as_secs_f64();
             let engine = auth_chain_db()?;
+            // Locator resolution is a plain read, not a read-modify-write, so
+            // it happens without any lock (see the module-level doc and
+            // `lock_rooms`).
             let locator_started = std::time::Instant::now();
             let node_ids: Vec<NodeId> = event_ids
                 .iter()
@@ -614,6 +663,16 @@ pub fn event_edges_delete(
                         .push(backward_node);
                 }
             }
+
+            // The tombstone write below is an unconditional overwrite, not a
+            // read-modify-write, so this lock isn't needed for its own
+            // correctness. It's taken anyway, in the same order `put` uses,
+            // purely so both operations share one lock/ordering contract --
+            // otherwise a put touching {A, B} and a delete touching {B, A}
+            // could deadlock (see `lock_rooms`).
+            let lock_started = std::time::Instant::now();
+            let _guards = lock_rooms(backward_ids.keys().copied());
+            let lock_wait = lock_started.elapsed().as_secs_f64();
 
             let tombstone_started = std::time::Instant::now();
             let mut dag_updates: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
@@ -901,5 +960,94 @@ mod tests {
                 );
             }
         });
+    }
+
+    /// The per-room lock (`lock_rooms`) must still make `put`'s forward-list
+    /// read-modify-write atomic for concurrent batches in the *same* room:
+    /// otherwise two threads both read the empty list, both append their own
+    /// child, and one write clobbers the other's.
+    #[test]
+    fn concurrent_puts_same_room_do_not_lose_children() {
+        crate::database::mtxdb_syn::auth_chain_closure_tests::ensure_open();
+        let ns = "ns-edges-concurrent-same-room";
+        let room = "!room-edges:example.org";
+        let parent = "$shared-parent";
+        let thread_count = 16usize;
+
+        let handles: Vec<_> = (0..thread_count)
+            .map(|i| {
+                let child = format!("$concurrent-child{i}");
+                std::thread::spawn(move || {
+                    pyo3::Python::attach(|py| {
+                        event_edges_put(
+                            py,
+                            ns.to_string(),
+                            vec![(room.to_string(), child, parent.to_string(), false)],
+                        )
+                        .expect("put from concurrent thread")
+                    });
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("thread did not panic");
+        }
+
+        let forward = pyo3::Python::attach(|py| {
+            event_edges_get_forward(py, ns.to_string(), vec![parent.to_string()])
+                .expect("get forward after concurrent puts")
+        });
+        let children = forward[0].1.as_ref().expect("parent has children");
+        assert_eq!(
+            children.len(),
+            thread_count,
+            "every concurrent put's child must survive the RMW, none lost to a lost update"
+        );
+        for i in 0..thread_count {
+            assert!(
+                children.contains(&format!("$concurrent-child{i}")),
+                "child {i} missing from forward list"
+            );
+        }
+    }
+
+    /// Rooms that don't overlap must not serialize against each other: that's
+    /// the entire point of replacing the process-wide `RMW_LOCK` with
+    /// `lock_rooms`. Hold room A's lock on the main thread and confirm a
+    /// `put` touching only room B still completes promptly.
+    #[test]
+    fn concurrent_puts_independent_rooms_do_not_serialize() {
+        crate::database::mtxdb_syn::auth_chain_closure_tests::ensure_open();
+        let ns = "ns-edges-concurrent-independent-rooms";
+        let room_a = "!room-a-edges:example.org";
+        let room_b = "!room-b-edges:example.org";
+
+        let room_a_collection = prev_edges_room_id(ns, room_a);
+        let _held = lock_rooms([room_a_collection]);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ns_owned = ns.to_string();
+        let room_b_owned = room_b.to_string();
+        let handle = std::thread::spawn(move || {
+            pyo3::Python::attach(|py| {
+                event_edges_put(
+                    py,
+                    ns_owned,
+                    vec![(
+                        room_b_owned,
+                        "$independent-child".to_string(),
+                        "$independent-parent".to_string(),
+                        false,
+                    )],
+                )
+                .expect("put to independent room");
+            });
+            let _ = tx.send(());
+        });
+
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("put to an unrelated room must not block behind room A's held lock");
+        handle.join().expect("thread did not panic");
+        drop(_held);
     }
 }
