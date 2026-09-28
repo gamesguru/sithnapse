@@ -128,6 +128,19 @@ pub(crate) fn auth_chain_db() -> PyResult<&'static Arc<PackfileStorage>> {
     Ok(&pools()?.auth_chain)
 }
 
+/// A fresh mtxdb write transaction, or `None` without a shared WAL (matches
+/// `begin_transaction`'s Python-facing contract). Internal Rust callers (e.g.
+/// `embedded_edges::event_edges_put`) that want to collapse several
+/// `put_many` calls into one journal group use this directly, without a
+/// Python round trip through `PyMtxdbTransaction`.
+pub(crate) fn begin_internal_transaction() -> PyResult<Option<DatabaseTransaction<'static>>> {
+    assert_writable()?;
+    Ok(pools()?
+        .shared_database
+        .as_ref()
+        .map(SharedDatabase::begin_transaction))
+}
+
 const RETRYABLE_READ_ERROR_PREFIX: &str = "__MTXDB_RETRYABLE_READ__: ";
 
 /// Preserve journal contention as a retryable Python I/O error. Other storage

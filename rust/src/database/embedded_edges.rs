@@ -18,14 +18,77 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use mtxdb::{NodeData, NodeId, StorageEngine};
+use mtxdb::{DatabaseTransaction, NodeData, NodeId, ShardType, StorageEngine};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use sha2::{Digest, Sha256};
 
 use super::mtxdb_syn::{
-    assert_writable, auth_chain_db, event_locator_collection_id, event_node_id, prev_edges_room_id,
+    assert_writable, auth_chain_db, begin_internal_transaction, event_locator_collection_id,
+    event_node_id, prev_edges_room_id,
 };
+
+/// The read/write surface `event_edges_put` needs, common to a direct engine
+/// write and a staged transaction write, so the merge logic below (batch-read
+/// existing forward lists, append, re-encode) is written once and used by
+/// both.
+///
+/// Only `get_many`/`put_many` are needed: `event_edges_put` never deletes.
+trait EdgeWriteTarget {
+    fn edge_get_many(
+        &self,
+        collection: &[u8; 16],
+        ids: &[NodeId],
+    ) -> Result<Vec<Option<NodeData>>, mtxdb::storage::StorageError>;
+    fn edge_put_many(
+        &self,
+        collection: [u8; 16],
+        pairs: Vec<(NodeId, NodeData)>,
+    ) -> Result<(), mtxdb::storage::StorageError>;
+}
+
+impl EdgeWriteTarget for mtxdb::PackfileStorage {
+    fn edge_get_many(
+        &self,
+        collection: &[u8; 16],
+        ids: &[NodeId],
+    ) -> Result<Vec<Option<NodeData>>, mtxdb::storage::StorageError> {
+        StorageEngine::get_many(self, collection, ids)
+    }
+
+    fn edge_put_many(
+        &self,
+        collection: [u8; 16],
+        pairs: Vec<(NodeId, NodeData)>,
+    ) -> Result<(), mtxdb::storage::StorageError> {
+        StorageEngine::put_many(self, &collection, &pairs).map(|_| ())
+    }
+}
+
+/// Stages into the edges pool instead of writing the live pool: every
+/// `put_many` below becomes one `DatabaseTransaction::put` per record, and
+/// nothing is visible or durable until the caller commits.
+impl EdgeWriteTarget for DatabaseTransaction<'_> {
+    fn edge_get_many(
+        &self,
+        collection: &[u8; 16],
+        ids: &[NodeId],
+    ) -> Result<Vec<Option<NodeData>>, mtxdb::storage::StorageError> {
+        self.get(ShardType::Edges, collection, ids)
+    }
+
+    fn edge_put_many(
+        &self,
+        collection: [u8; 16],
+        pairs: Vec<(NodeId, NodeData)>,
+    ) -> Result<(), mtxdb::storage::StorageError> {
+        for (node, data) in pairs {
+            self.put(ShardType::Edges, collection, node, &data)
+                .map_err(mtxdb::storage::StorageError::Io)?;
+        }
+        Ok(())
+    }
+}
 
 /// Per-room locks replacing the process-wide `RMW_LOCK` for event-edge
 /// writes: a `put`/`delete` batch only serializes against other batches that
@@ -220,130 +283,168 @@ pub fn event_edges_put(
         .map(|(room_id, _, _, _)| prev_edges_room_id(&namespace, room_id))
         .collect();
     py.detach(|| {
-        // Held for the whole function: the forward-list read below happens
-        // after these locks, so it's the authoritative RMW read, not a stale
-        // pre-lock cache (see `lock_rooms`).
+        // Held for the whole function, including the transaction's commit
+        // below: releasing it between staging and commit would let another
+        // writer's direct read/merge interleave against data this call has
+        // already decided to overwrite (mtxdb has no RMW conflict detection
+        // to catch that after the fact -- see `res/docs/2026-09-26-
+        // priorities.md` §0.4). Keeping stage-through-commit inside one
+        // held lock sidesteps needing that.
         let _guards = lock_rooms(room_collections);
-        let engine = auth_chain_db()?;
 
-        let mut backward_map: HashMap<(String, String), Vec<(String, bool)>> = HashMap::new();
-        let mut forward_map: HashMap<(String, String), Vec<String>> = HashMap::new();
+        // Stage everything as one transaction when a shared WAL is open, so
+        // the three put_many groups below (backward records, forward-list
+        // rewrites, locators) publish as a single journal group instead of
+        // three -- the same win `event_json_put`'s staging already has, see
+        // `res/docs/2026-09-26-priorities.md` §1.4. Without a shared WAL
+        // (`begin_internal_transaction` returns `None`) fall back to writing
+        // the live pool directly, exactly as before.
+        match begin_internal_transaction()? {
+            Some(txn) => {
+                write_edges(&txn, &namespace, rows)?;
+                txn.commit().map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "mtxdb transaction commit error: {e}"
+                    ))
+                })
+            }
+            None => {
+                let engine: &mtxdb::PackfileStorage = auth_chain_db()?;
+                write_edges(engine, &namespace, rows)
+            }
+        }
+    })
+}
 
-        for (room_id, event_id, prev_event_id, is_state) in rows {
-            backward_map
-                .entry((room_id.clone(), event_id.clone()))
-                .or_default()
-                .push((prev_event_id.clone(), is_state));
-            forward_map
-                .entry((room_id, prev_event_id))
-                .or_default()
-                .push(event_id);
+/// The merge logic shared by a direct engine write and a staged transaction
+/// write: batch-read existing forward child lists, append/deduplicate new
+/// children, and write backward records, forward-list rewrites, and locators
+/// through `target`. Caller holds the room locks for `rows`' rooms.
+fn write_edges(
+    target: &impl EdgeWriteTarget,
+    namespace: &str,
+    rows: Vec<(String, String, String, bool)>,
+) -> PyResult<()> {
+    let namespace = namespace.to_string();
+    let engine = target;
+
+    let mut backward_map: HashMap<(String, String), Vec<(String, bool)>> = HashMap::new();
+    let mut forward_map: HashMap<(String, String), Vec<String>> = HashMap::new();
+
+    for (room_id, event_id, prev_event_id, is_state) in rows {
+        backward_map
+            .entry((room_id.clone(), event_id.clone()))
+            .or_default()
+            .push((prev_event_id.clone(), is_state));
+        forward_map
+            .entry((room_id, prev_event_id))
+            .or_default()
+            .push(event_id);
+    }
+
+    let mut dag_puts: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
+    // Nested map deduplicates repeated locators within the batch.
+    let mut locator_puts: HashMap<[u8; 16], HashMap<NodeId, NodeData>> = HashMap::new();
+
+    for ((room_id, event_id), edges) in backward_map {
+        let room_collection = prev_edges_room_id(&namespace, &room_id);
+        let edge_node = event_edges_backward_node_id(&namespace, &event_id);
+
+        let encoded = encode_backward_edges(&edges);
+        dag_puts
+            .entry(room_collection)
+            .or_default()
+            .push((edge_node, NodeData::new(bytes::Bytes::from(encoded))));
+        insert_event_locator(&mut locator_puts, &namespace, &room_id, &event_id);
+    }
+
+    // Batch-read the existing forward child lists for every distinct
+    // (room, parent) this batch touches, instead of one `get` per parent.
+    // `get_many` groups by shard and orders by offset, so a persist batch
+    // touching many parents costs one round trip per room collection.
+    let mut forward_by_collection: HashMap<[u8; 16], Vec<NodeId>> = HashMap::new();
+    for (room_id, prev_event_id) in forward_map.keys() {
+        let room_collection = prev_edges_room_id(&namespace, room_id);
+        let forward_node = event_edges_forward_node_id(&namespace, prev_event_id);
+        forward_by_collection
+            .entry(room_collection)
+            .or_default()
+            .push(forward_node);
+    }
+    let mut forward_cache: HashMap<([u8; 16], NodeId), Vec<String>> = HashMap::new();
+    for (collection, node_ids) in forward_by_collection.iter_mut() {
+        // Distinct nodes only: two logical (room, parent) keys can in
+        // principle derive the same collection/node pair, and this makes
+        // "one read per distinct node" true.
+        node_ids.sort_unstable();
+        node_ids.dedup();
+        let found = engine.edge_get_many(collection, node_ids).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {e}"))
+        })?;
+        for (forward_node, value) in node_ids.iter().zip(found) {
+            let children = match value {
+                Some(data) if !data.bytes.is_empty() => decode_forward_edges(&data.bytes)?,
+                _ => Vec::new(),
+            };
+            forward_cache.insert((*collection, *forward_node), children);
+        }
+    }
+
+    for ((room_id, prev_event_id), new_children) in forward_map {
+        let room_collection = prev_edges_room_id(&namespace, &room_id);
+        let forward_node = event_edges_forward_node_id(&namespace, &prev_event_id);
+
+        // Every (room, parent) key was read above, so the cached list can
+        // be moved out rather than cloned. A miss means two logical keys
+        // derived the same collection/node pair (a node-id collision) or
+        // the cache was built inconsistently; fail loudly rather than
+        // write an empty list over existing children. Nothing has been
+        // written yet, so a failure here leaves the store untouched.
+        let mut existing_children = forward_cache
+            .remove(&(room_collection, forward_node))
+            .ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "forward-edge node id collision while batching parent reads \
+                         (collection {:02x?}, node {:02x?})",
+                    room_collection, forward_node
+                ))
+            })?;
+
+        let mut seen: HashSet<String> = existing_children.iter().cloned().collect();
+        let mut changed = false;
+        for child in new_children {
+            if seen.insert(child.clone()) {
+                existing_children.push(child);
+                changed = true;
+            }
         }
 
-        let mut dag_puts: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
-        // Nested map deduplicates repeated locators within the batch.
-        let mut locator_puts: HashMap<[u8; 16], HashMap<NodeId, NodeData>> = HashMap::new();
-
-        for ((room_id, event_id), edges) in backward_map {
-            let room_collection = prev_edges_room_id(&namespace, &room_id);
-            let edge_node = event_edges_backward_node_id(&namespace, &event_id);
-
-            let encoded = encode_backward_edges(&edges);
+        if changed {
+            let encoded = encode_forward_edges(&existing_children);
             dag_puts
                 .entry(room_collection)
                 .or_default()
-                .push((edge_node, NodeData::new(bytes::Bytes::from(encoded))));
-            insert_event_locator(&mut locator_puts, &namespace, &room_id, &event_id);
+                .push((forward_node, NodeData::new(bytes::Bytes::from(encoded))));
         }
+        insert_event_locator(&mut locator_puts, &namespace, &room_id, &prev_event_id);
+    }
 
-        // Batch-read the existing forward child lists for every distinct
-        // (room, parent) this batch touches, instead of one `get` per parent.
-        // `get_many` groups by shard and orders by offset, so a persist batch
-        // touching many parents costs one round trip per room collection.
-        let mut forward_by_collection: HashMap<[u8; 16], Vec<NodeId>> = HashMap::new();
-        for (room_id, prev_event_id) in forward_map.keys() {
-            let room_collection = prev_edges_room_id(&namespace, room_id);
-            let forward_node = event_edges_forward_node_id(&namespace, prev_event_id);
-            forward_by_collection
-                .entry(room_collection)
-                .or_default()
-                .push(forward_node);
-        }
-        let mut forward_cache: HashMap<([u8; 16], NodeId), Vec<String>> = HashMap::new();
-        for (collection, node_ids) in forward_by_collection.iter_mut() {
-            // Distinct nodes only: two logical (room, parent) keys can in
-            // principle derive the same collection/node pair, and this makes
-            // "one read per distinct node" true.
-            node_ids.sort_unstable();
-            node_ids.dedup();
-            let found = engine.get_many(collection, node_ids).map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {e}"))
-            })?;
-            for (forward_node, value) in node_ids.iter().zip(found) {
-                let children = match value {
-                    Some(data) if !data.bytes.is_empty() => decode_forward_edges(&data.bytes)?,
-                    _ => Vec::new(),
-                };
-                forward_cache.insert((*collection, *forward_node), children);
-            }
-        }
+    // Edge records first, locator publication last: a reader that races
+    // between the two sees a miss and falls back to SQL, never a locator
+    // pointing at an edge record that isn't there yet.
+    for (collection, pairs) in dag_puts {
+        engine.edge_put_many(collection, pairs).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {e}"))
+        })?;
+    }
+    for (collection, pairs) in locator_puts {
+        let pairs: Vec<(NodeId, NodeData)> = pairs.into_iter().collect();
+        engine.edge_put_many(collection, pairs).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {e}"))
+        })?;
+    }
 
-        for ((room_id, prev_event_id), new_children) in forward_map {
-            let room_collection = prev_edges_room_id(&namespace, &room_id);
-            let forward_node = event_edges_forward_node_id(&namespace, &prev_event_id);
-
-            // Every (room, parent) key was read above, so the cached list can
-            // be moved out rather than cloned. A miss means two logical keys
-            // derived the same collection/node pair (a node-id collision) or
-            // the cache was built inconsistently; fail loudly rather than
-            // write an empty list over existing children. Nothing has been
-            // written yet, so a failure here leaves the store untouched.
-            let mut existing_children = forward_cache
-                .remove(&(room_collection, forward_node))
-                .ok_or_else(|| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "forward-edge node id collision while batching parent reads \
-                         (collection {:02x?}, node {:02x?})",
-                        room_collection, forward_node
-                    ))
-                })?;
-
-            let mut seen: HashSet<String> = existing_children.iter().cloned().collect();
-            let mut changed = false;
-            for child in new_children {
-                if seen.insert(child.clone()) {
-                    existing_children.push(child);
-                    changed = true;
-                }
-            }
-
-            if changed {
-                let encoded = encode_forward_edges(&existing_children);
-                dag_puts
-                    .entry(room_collection)
-                    .or_default()
-                    .push((forward_node, NodeData::new(bytes::Bytes::from(encoded))));
-            }
-            insert_event_locator(&mut locator_puts, &namespace, &room_id, &prev_event_id);
-        }
-
-        // Edge records first, locator publication last: a reader that races
-        // between the two sees a miss and falls back to SQL, never a locator
-        // pointing at an edge record that isn't there yet.
-        for (collection, pairs) in dag_puts {
-            engine.put_many(&collection, &pairs).map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {e}"))
-            })?;
-        }
-        for (collection, pairs) in locator_puts {
-            let pairs: Vec<(NodeId, NodeData)> = pairs.into_iter().collect();
-            engine.put_many(&collection, &pairs).map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {e}"))
-            })?;
-        }
-
-        Ok(())
-    })
+    Ok(())
 }
 
 /// Read backward edges: given event_ids, returns `(event_id, Option<[(prev_event_id, is_state)]>)`

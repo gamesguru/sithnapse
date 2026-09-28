@@ -220,8 +220,7 @@ def run_mtxdb() -> None:
 
 def main() -> None:
     print(
-        f"cumulative parents: {CUMULATIVE_PARENTS}, "
-        "fan-out 95%=1 / 4%=2-4 / 1%=5-40\n"
+        f"cumulative parents: {CUMULATIVE_PARENTS}, fan-out 95%=1 / 4%=2-4 / 1%=5-40\n"
     )
     print("--- mtxdb ---")
     run_mtxdb()
