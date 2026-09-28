@@ -846,11 +846,10 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jobserver"
-version = "0.1.35"
+version = "0.1.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c00acbd29eabad4a2392fa0e921c874934dbbf4194312ad20f04a0ed67a3cb3"
+checksum = "48d1dbcbbeb6a7fec7e059840aa538bd62aaccf972c7346c4d9d2059312853d0"
 dependencies = [
- "getrandom 0.4.3",
  "libc",
 ]
 
@@ -969,13 +968,14 @@ dependencies = [
 [[package]]
 name = "mtxdb"
 version = "0.1.0-beta.2"
-source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=refactor/pack-id-store-layout#553638bf9e1740724d7e577dc53ba6f26bdbede9"
+source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=refactor/pack-id-store-layout#cfed6b6adc4843d4f8f48c0e1cb1013b3db477e3"
 dependencies = [
  "arc-swap",
  "blake3",
  "bytes",
  "crc32fast",
  "fs2",
+ "jobserver",
  "memmap2",
  "parking_lot",
  "sha2",

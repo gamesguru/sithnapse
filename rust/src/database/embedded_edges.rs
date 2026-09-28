@@ -158,78 +158,213 @@ fn event_edges_forward_node_id(namespace: &str, prev_event_id: &str) -> NodeId {
     id
 }
 
-fn encode_backward_edges(edges: &[(String, bool)]) -> Vec<u8> {
+// --- Identity encoding ---------------------------------------------------
+//
+// An event id is either a hash-derived, self-verifying string (room v3:
+// "$" + base64(STANDARD, no pad, 32-byte SHA-256); room v4+/v11/MSC4242:
+// same but URL_SAFE -- see `events/utils.rs::compute_event_reference_hash`)
+// or an opaque, server-assigned string (room v1/v2, which predate hash-
+// derived event ids entirely). Storing the raw 32 hash bytes instead of the
+// ~44-char base64 text roughly halves an identity's stored size for every
+// v3+ room, which is the overwhelming majority of rooms in practice.
+//
+// The per-identity discriminant below is chosen by attempting the decode and
+// verifying decode -> re-encode reproduces the original string byte-for-byte
+// -- not by trusting room-version metadata. Room version is per-room state
+// this module doesn't have and shouldn't need to look up just to store an
+// edge; the round-trip check is exactly the property re-emission actually
+// depends on, verifiable locally, and correct even for an id that happens to
+// be malformed or from an unanticipated future format (it simply falls back
+// to the opaque form).
+const IDENTITY_TAG_HASH_STANDARD: u8 = 0x00;
+const IDENTITY_TAG_HASH_URL_SAFE: u8 = 0x01;
+const IDENTITY_TAG_OPAQUE: u8 = 0x02;
+
+fn standard_no_pad() -> base64::engine::GeneralPurpose {
+    base64::engine::GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        base64::engine::general_purpose::NO_PAD,
+    )
+}
+
+fn url_safe_no_pad() -> base64::engine::GeneralPurpose {
+    base64::engine::GeneralPurpose::new(
+        &base64::alphabet::URL_SAFE,
+        base64::engine::general_purpose::NO_PAD,
+    )
+}
+
+/// Append `identity` (an event id, with or without its leading `$`) to `buf`
+/// as one tag byte plus its payload.
+fn encode_identity(buf: &mut Vec<u8>, identity: &str) {
+    use base64::Engine as _;
+
+    let rest = identity.strip_prefix('$').unwrap_or(identity);
+    for (tag, engine) in [
+        (IDENTITY_TAG_HASH_STANDARD, standard_no_pad()),
+        (IDENTITY_TAG_HASH_URL_SAFE, url_safe_no_pad()),
+    ] {
+        if let Ok(hash) = engine.decode(rest) {
+            if hash.len() == 32 && engine.encode(&hash) == rest {
+                buf.push(tag);
+                buf.extend_from_slice(&hash);
+                return;
+            }
+        }
+    }
+    buf.push(IDENTITY_TAG_OPAQUE);
+    let bytes = identity.as_bytes();
+    buf.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+/// Read one identity from `bytes` starting at `*offset`, advancing it past
+/// what was consumed. Always reconstructs the leading `$`.
+fn decode_identity(bytes: &[u8], offset: &mut usize) -> PyResult<String> {
+    use base64::Engine as _;
+
+    let tag = *bytes.get(*offset).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err("truncated event-edge record (identity tag)")
+    })?;
+    *offset += 1;
+    match tag {
+        IDENTITY_TAG_HASH_STANDARD | IDENTITY_TAG_HASH_URL_SAFE => {
+            let hash = bytes.get(*offset..*offset + 32).ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(
+                    "truncated event-edge record (hash identity)",
+                )
+            })?;
+            *offset += 32;
+            let engine = if tag == IDENTITY_TAG_HASH_STANDARD {
+                standard_no_pad()
+            } else {
+                url_safe_no_pad()
+            };
+            Ok(format!("${}", engine.encode(hash)))
+        }
+        IDENTITY_TAG_OPAQUE => {
+            let len_bytes = bytes.get(*offset..*offset + 2).ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(
+                    "truncated event-edge record (opaque identity length)",
+                )
+            })?;
+            let len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
+            *offset += 2;
+            let raw = bytes.get(*offset..*offset + len).ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(
+                    "truncated event-edge record (opaque identity)",
+                )
+            })?;
+            *offset += len;
+            let id_str = std::str::from_utf8(raw).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "malformed event-edge record: invalid utf8 in opaque identity: {e}"
+                ))
+            })?;
+            Ok(id_str.to_string())
+        }
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "malformed event-edge record: unknown identity tag {other:#04x}"
+        ))),
+    }
+}
+
+// --- Backward record ------------------------------------------------------
+//
+// Format version 2 (no legacy decoder: nothing is deployed yet).
+// `[format_version: u8][self_identity][edge_count: u16]{[is_state: u8][parent_identity]}*`
+//
+// Carries the record's own event id (`self_identity`) in the payload, not
+// just derivable from the (one-way hashed) node id it's stored under -- so a
+// full scan of the backward-edge collection can rebuild forward adjacency
+// directly (self_identity is the forward key, each parent_identity a member
+// of that key's child list), with no locator lookups or joins.
+const BACKWARD_EDGES_FORMAT_VERSION: u8 = 2;
+
+fn encode_backward_edges(self_identity: &str, edges: &[(String, bool)]) -> Vec<u8> {
     let mut buf = Vec::new();
+    buf.push(BACKWARD_EDGES_FORMAT_VERSION);
+    encode_identity(&mut buf, self_identity);
     buf.extend_from_slice(&(edges.len() as u16).to_be_bytes());
     for (prev_id, is_state) in edges {
         buf.push(if *is_state { 1 } else { 0 });
-        let bytes = prev_id.as_bytes();
-        buf.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
-        buf.extend_from_slice(bytes);
+        encode_identity(&mut buf, prev_id);
     }
     buf
 }
 
-fn decode_backward_edges(bytes: &[u8]) -> PyResult<Vec<(String, bool)>> {
-    if bytes.len() < 2 {
-        return Ok(Vec::new());
+/// Returns `(self_identity, edges)`. Errors (rather than truncating
+/// silently) on anything short of a well-formed record: an unrecognized
+/// format version, an unknown identity tag, or a length that runs past the
+/// record's end.
+fn decode_backward_edges(bytes: &[u8]) -> PyResult<(String, Vec<(String, bool)>)> {
+    let version = *bytes.first().ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err("truncated event-edge record (empty)")
+    })?;
+    if version != BACKWARD_EDGES_FORMAT_VERSION {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "malformed event-edge record: unknown backward-edge format version {version}"
+        )));
     }
-    let count = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
-    let mut offset = 2;
+    let mut offset = 1;
+    let self_identity = decode_identity(bytes, &mut offset)?;
+
+    let count_bytes = bytes.get(offset..offset + 2).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err("truncated event-edge record (edge count)")
+    })?;
+    let count = u16::from_be_bytes([count_bytes[0], count_bytes[1]]) as usize;
+    offset += 2;
+
     let mut edges = Vec::with_capacity(count);
     for _ in 0..count {
-        if offset >= bytes.len() {
-            break;
-        }
-        let is_state = bytes[offset] != 0;
+        let is_state_byte = *bytes.get(offset).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("truncated event-edge record (is_state)")
+        })?;
         offset += 1;
-        if offset + 2 > bytes.len() {
-            break;
-        }
-        let len = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]) as usize;
-        offset += 2;
-        if offset + len > bytes.len() {
-            break;
-        }
-        let id_str = std::str::from_utf8(&bytes[offset..offset + len])
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("utf8 error: {e}")))?;
-        edges.push((id_str.to_string(), is_state));
-        offset += len;
+        let prev_id = decode_identity(bytes, &mut offset)?;
+        edges.push((prev_id, is_state_byte != 0));
     }
-    Ok(edges)
+    Ok((self_identity, edges))
 }
+
+// --- Forward record --------------------------------------------------------
+//
+// Format version 2: `[format_version: u8][child_count: u32]{[child_identity]}*`.
+// Same identity tag scheme as the backward record, for the same size win.
+const FORWARD_EDGES_FORMAT_VERSION: u8 = 2;
 
 fn encode_forward_edges(children: &[String]) -> Vec<u8> {
     let mut buf = Vec::new();
+    buf.push(FORWARD_EDGES_FORMAT_VERSION);
     buf.extend_from_slice(&(children.len() as u32).to_be_bytes());
     for child in children {
-        let bytes = child.as_bytes();
-        buf.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
-        buf.extend_from_slice(bytes);
+        encode_identity(&mut buf, child);
     }
     buf
 }
 
 fn decode_forward_edges(bytes: &[u8]) -> PyResult<Vec<String>> {
-    if bytes.len() < 4 {
-        return Ok(Vec::new());
+    let version = *bytes.first().ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err("truncated event-edge record (empty)")
+    })?;
+    if version != FORWARD_EDGES_FORMAT_VERSION {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "malformed event-edge record: unknown forward-edge format version {version}"
+        )));
     }
-    let count = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
-    let mut offset = 4;
+    let count_bytes = bytes.get(1..5).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err("truncated event-edge record (child count)")
+    })?;
+    let count = u32::from_be_bytes([
+        count_bytes[0],
+        count_bytes[1],
+        count_bytes[2],
+        count_bytes[3],
+    ]) as usize;
+    let mut offset = 5;
     let mut children = Vec::with_capacity(count);
     for _ in 0..count {
-        if offset + 2 > bytes.len() {
-            break;
-        }
-        let len = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]) as usize;
-        offset += 2;
-        if offset + len > bytes.len() {
-            break;
-        }
-        let id_str = std::str::from_utf8(&bytes[offset..offset + len])
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("utf8 error: {e}")))?;
-        children.push(id_str.to_string());
-        offset += len;
+        children.push(decode_identity(bytes, &mut offset)?);
     }
     Ok(children)
 }
@@ -346,7 +481,7 @@ fn write_edges(
         let room_collection = prev_edges_room_id(&namespace, &room_id);
         let edge_node = event_edges_backward_node_id(&namespace, &event_id);
 
-        let encoded = encode_backward_edges(&edges);
+        let encoded = encode_backward_edges(&event_id, &edges);
         dag_puts
             .entry(room_collection)
             .or_default()
@@ -518,7 +653,22 @@ pub fn event_edges_get_backward(
             for ((position, _), value) in ids.into_iter().zip(found) {
                 if let Some(data) = value {
                     if !data.bytes.is_empty() {
-                        results[position] = Some(decode_backward_edges(&data.bytes)?);
+                        let (self_identity, edges) = decode_backward_edges(&data.bytes)?;
+                        // The record's own identity, carried in the payload
+                        // precisely so a raw scan can rebuild forward
+                        // adjacency without this lookup -- but on this
+                        // lookup-by-id path, it doubles as a corruption
+                        // check: a node-id hash collision or a misdirected
+                        // write would otherwise read back silently as some
+                        // other event's edges.
+                        if self_identity != event_ids[position] {
+                            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                                "event-edge backward record identity mismatch: requested {:?}, \
+                                 record says {self_identity:?} (node id collision or corrupt write?)",
+                                event_ids[position]
+                            )));
+                        }
+                        results[position] = Some(edges);
                     }
                 }
             }
@@ -848,6 +998,139 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A real room-v3-shaped event id: "$" + STANDARD-no-pad base64 of a
+    /// 32-byte SHA-256, matching `compute_event_reference_hash`
+    /// (`events/utils.rs`) for `EventFormatVersions::ROOM_V3`.
+    fn v3_event_id() -> String {
+        use base64::Engine as _;
+        let hash = Sha256::digest(b"room-v3-event-fixture");
+        format!("${}", standard_no_pad().encode(hash))
+    }
+
+    /// A real room-v4+/v11/MSC4242-shaped event id: same hash, URL_SAFE
+    /// alphabet.
+    fn v4_event_id() -> String {
+        use base64::Engine as _;
+        let hash = Sha256::digest(b"room-v4-event-fixture");
+        format!("${}", url_safe_no_pad().encode(hash))
+    }
+
+    /// A room-v1/v2-shaped event id: opaque, server-assigned, not
+    /// hash-derived at all -- doesn't decode as base64 of any length, let
+    /// alone 32 bytes.
+    fn v1_event_id() -> String {
+        "$AserverAssignedOpaqueEventIdSuffix:example.org".to_string()
+    }
+
+    #[test]
+    fn identity_round_trips_v3_hash_form() {
+        let id = v3_event_id();
+        let mut buf = Vec::new();
+        encode_identity(&mut buf, &id);
+        assert_eq!(buf[0], IDENTITY_TAG_HASH_STANDARD);
+        assert_eq!(buf.len(), 1 + 32, "32 raw hash bytes, not ~44 base64 chars");
+        let mut offset = 0;
+        assert_eq!(decode_identity(&buf, &mut offset).unwrap(), id);
+        assert_eq!(offset, buf.len());
+    }
+
+    #[test]
+    fn identity_round_trips_v4_hash_form() {
+        let id = v4_event_id();
+        let mut buf = Vec::new();
+        encode_identity(&mut buf, &id);
+        assert_eq!(buf[0], IDENTITY_TAG_HASH_URL_SAFE);
+        assert_eq!(buf.len(), 1 + 32);
+        let mut offset = 0;
+        assert_eq!(decode_identity(&buf, &mut offset).unwrap(), id);
+        assert_eq!(offset, buf.len());
+    }
+
+    #[test]
+    fn identity_round_trips_opaque_form() {
+        let id = v1_event_id();
+        let mut buf = Vec::new();
+        encode_identity(&mut buf, &id);
+        assert_eq!(buf[0], IDENTITY_TAG_OPAQUE);
+        let mut offset = 0;
+        assert_eq!(decode_identity(&buf, &mut offset).unwrap(), id);
+        assert_eq!(offset, buf.len());
+    }
+
+    #[test]
+    fn identity_falls_back_to_opaque_when_not_32_bytes() {
+        // Decodes as valid base64 (both alphabets accept it), but not to 32
+        // bytes, so it isn't a hash-shaped identity -- must fall back to the
+        // opaque form rather than being misencoded as a truncated/padded
+        // "hash". The round-trip check is decode-*and*-length, not just parse.
+        let too_short = "$AAAA";
+        let mut buf = Vec::new();
+        encode_identity(&mut buf, too_short);
+        assert_eq!(buf[0], IDENTITY_TAG_OPAQUE);
+        let mut offset = 0;
+        assert_eq!(decode_identity(&buf, &mut offset).unwrap(), too_short);
+    }
+
+    #[test]
+    fn decode_identity_rejects_unknown_tag() {
+        let buf = vec![0x99u8];
+        let mut offset = 0;
+        let err = decode_identity(&buf, &mut offset).unwrap_err();
+        assert!(err.to_string().contains("unknown identity tag"));
+    }
+
+    #[test]
+    fn decode_identity_rejects_truncated_hash() {
+        let buf = vec![IDENTITY_TAG_HASH_STANDARD, 1, 2, 3]; // 3 bytes, not 32
+        let mut offset = 0;
+        assert!(decode_identity(&buf, &mut offset).is_err());
+    }
+
+    #[test]
+    fn decode_backward_edges_rejects_unknown_format_version() {
+        let buf = vec![0xffu8]; // not BACKWARD_EDGES_FORMAT_VERSION
+        let err = decode_backward_edges(&buf).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unknown backward-edge format version"));
+    }
+
+    #[test]
+    fn decode_forward_edges_rejects_unknown_format_version() {
+        let buf = vec![0xffu8, 0, 0, 0, 0];
+        let err = decode_forward_edges(&buf).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unknown forward-edge format version"));
+    }
+
+    #[test]
+    fn decode_backward_edges_rejects_empty_record() {
+        assert!(decode_backward_edges(&[]).is_err());
+    }
+
+    #[test]
+    fn backward_edges_round_trip_mixed_identity_forms() {
+        let self_id = v3_event_id();
+        let edges = vec![
+            (v3_event_id(), true),
+            (v4_event_id(), false),
+            (v1_event_id(), true),
+        ];
+        let encoded = encode_backward_edges(&self_id, &edges);
+        let (decoded_self, decoded_edges) = decode_backward_edges(&encoded).unwrap();
+        assert_eq!(decoded_self, self_id);
+        assert_eq!(decoded_edges, edges);
+    }
+
+    #[test]
+    fn forward_edges_round_trip_mixed_identity_forms() {
+        let children = vec![v3_event_id(), v4_event_id(), v1_event_id()];
+        let encoded = encode_forward_edges(&children);
+        let decoded = decode_forward_edges(&encoded).unwrap();
+        assert_eq!(decoded, children);
+    }
 
     #[test]
     fn put_get_backward_and_forward_round_trip() {
