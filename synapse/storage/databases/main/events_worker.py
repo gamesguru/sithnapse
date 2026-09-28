@@ -2584,6 +2584,22 @@ class EventsWorkerStore(SQLBaseStore):
             "This function relies on `event_edges` and `event_forward_extremities` which won't be filled in for `outliers`."
         )
 
+        # Resolved before runInteraction: the txn closure below is sync, and
+        # this check is async. Gated on the event_edges_backfill_mtxdb
+        # background update (mirrors pre-existing SQL-only event_edges rows
+        # into mtxdb -- unrelated to Matrix federation backfill, what this
+        # gap check itself feeds into), not just on the engine being enabled
+        # -- see get_successor_events's matching comment in
+        # event_federation.py for why a plain "enabled" check isn't enough
+        # (a non-empty-but-incomplete mtxdb hit looks the same as a complete
+        # one). has_completed_background_update caches internally once true,
+        # so this is a cheap check after the first one.
+        embedded_edges_trustworthy = getattr(
+            self, "_embedded_event_edges_enabled", False
+        ) and await self.db_pool.updates.has_completed_background_update(
+            "event_edges_backfill_mtxdb"
+        )
+
         def is_event_next_to_gap_txn(txn: LoggingTransaction) -> bool:
             # If the event in question is a forward extremity, we will just
             # consider any potential forward gap as not a gap since it's one of
@@ -2618,7 +2634,7 @@ class EventsWorkerStore(SQLBaseStore):
             if txn.fetchone():
                 return False
 
-            if self._embedded_event_edges_enabled:
+            if embedded_edges_trustworthy:
                 from synapse.storage.databases.main.embedded_event_edges import (
                     get_event_edges_forward_batch,
                 )

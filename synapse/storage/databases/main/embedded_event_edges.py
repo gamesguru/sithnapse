@@ -42,7 +42,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING, Callable, Iterable, TypeVar
 
 from synapse.storage.databases.main.embedded_common import (
     Pool,
@@ -60,6 +60,8 @@ if TYPE_CHECKING:
     from synapse.server import HomeServer
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 # ---------------------------------------------------------------------------
 # Edge write coalescer
@@ -454,6 +456,38 @@ def delete_event_edges_batch(
         sync_event_dag_now()
 
 
+# Both forward/backward reads now go through mtxdb's `get_read_committed`
+# (embedded_edges.rs), which -- unlike the plain `get_many` path they used
+# before -- surfaces transient journal/checkpoint contention as a retryable
+# `BlockingIOError` (see `map_read_storage_error`, mtxdb_syn.rs), the same
+# error class `database.py`'s own `runInteraction` retry loop already catches
+# for a whole SQL transaction attempt (`database.py:1291`). A caller inside
+# `runInteraction` (e.g. `is_event_next_to_forward_gap`) is retried for free
+# by that loop; a caller outside one (e.g. `get_successor_events`, a bare
+# mtxdb read with no enclosing transaction) is not, so it must retry the FFI
+# call itself or the exception is simply unhandled. Retrying here, once, in
+# the module that owns the FFI boundary, covers every caller instead of
+# duplicating a retry loop at each call site.
+#
+# Same attempt count as `database.py`'s own retry loop
+# (`MAX_NUMBER_OF_ATTEMPTS = 5`), no backoff between attempts, matching that
+# convention for the same underlying contention class.
+_MAX_READ_CONTENTION_ATTEMPTS = 5
+
+
+def _retry_on_contention(call: "Callable[[], _T]") -> "_T":
+    """Retry `call` up to `_MAX_READ_CONTENTION_ATTEMPTS` times on
+    `BlockingIOError` (transient mtxdb journal/checkpoint contention from a
+    `get_read_committed` read), re-raising the last attempt's error."""
+    for attempt in range(1, _MAX_READ_CONTENTION_ATTEMPTS + 1):
+        try:
+            return call()
+        except BlockingIOError:
+            if attempt == _MAX_READ_CONTENTION_ATTEMPTS:
+                raise
+    raise AssertionError("unreachable: loop always returns or raises")
+
+
 def get_event_edges_backward_batch(
     namespace: str,
     event_ids: list[str],
@@ -469,7 +503,9 @@ def get_event_edges_backward_batch(
         from synapse.synapse_rust.mtxdb_engine import event_edges_get_backward
 
         _et = time.monotonic()
-        results = event_edges_get_backward(namespace, event_ids)
+        results = _retry_on_contention(
+            lambda: event_edges_get_backward(namespace, event_ids)
+        )
         elapsed = time.monotonic() - _et
         ffi_timing("ffi_event_edges_get_backward", elapsed)
         ffi_batch_size("event_edges_get_backward", len(event_ids))
@@ -492,7 +528,9 @@ def get_event_edges_forward_batch(
         from synapse.synapse_rust.mtxdb_engine import event_edges_get_forward
 
         _et = time.monotonic()
-        results = event_edges_get_forward(namespace, prev_event_ids)
+        results = _retry_on_contention(
+            lambda: event_edges_get_forward(namespace, prev_event_ids)
+        )
         elapsed = time.monotonic() - _et
         ffi_timing("ffi_event_edges_get_forward", elapsed)
         ffi_batch_size("event_edges_get_forward", len(prev_event_ids))

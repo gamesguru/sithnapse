@@ -1261,3 +1261,162 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         self.assertIn(
             c_id, forward.get(p_id) or [], "backfill must mirror the forward edge"
         )
+
+    @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
+    def test_get_successor_events_gates_on_backfill_completion(self) -> None:
+        """A parent with two children -- one legacy (SQL-only, predates the
+        mirror), one mirrored (a live post-enable write) -- gives mtxdb a
+        forward list that is non-empty but *incomplete*: `[mirrored_child]`,
+        missing `legacy_child`. `get_successor_events`'s fallback is
+        miss-triggered (`successors is not None`), so it cannot detect a
+        partial hit as anything other than a hit. Confirms it does not try:
+        while `event_edges_backfill_mtxdb` is incomplete, both children must
+        come back (the all-SQL path, gated shut); once complete, both must
+        still come back (mtxdb now has both, backfill covered the legacy
+        one)."""
+        ns = self.store._embedded_db_namespace
+
+        parent_res = self.helper.send(self.room_id, "gate-parent", tok=self.tok)
+        parent_id = parent_res["event_id"]
+
+        # Two children of the same parent, inserted directly (a real forked
+        # DAG needs auth-event plumbing this test doesn't need): one SQL-only
+        # (the legacy shape), one also mirrored (the live post-enable shape).
+        legacy_child = "$gate-legacy-child:test"
+        mirrored_child = "$gate-mirrored-child:test"
+        for child_id in (legacy_child, mirrored_child):
+            self.get_success(
+                self.store.db_pool.simple_insert(
+                    table="events",
+                    values={
+                        "event_id": child_id,
+                        "room_id": self.room_id,
+                        "topological_ordering": 1,
+                        "depth": 1,
+                        "type": "m.test",
+                        "sender": self.user_id,
+                        "processed": True,
+                        "outlier": False,
+                    },
+                )
+            )
+            self.get_success(
+                self.store.db_pool.simple_insert(
+                    table="event_edges",
+                    values={"event_id": child_id, "prev_event_id": parent_id},
+                )
+            )
+        put_event_edges_batch(ns, [(self.room_id, mirrored_child, parent_id, False)])
+
+        # Sanity: mtxdb's forward list for parent_id is now a real hit, but
+        # an incomplete one -- exactly the shape the gate exists for.
+        raw_forward = get_event_edges_forward_batch(ns, [parent_id])
+        self.assertEqual(raw_forward.get(parent_id), [mirrored_child])
+
+        # event_edges_backfill_mtxdb is not registered as pending in a fresh
+        # test DB (it's marked complete, like every other background update),
+        # so has_completed_background_update already reports True. Reinsert
+        # it and reset the cache to actually exercise the gate being closed
+        # (test_backfill_mtxdb_background_update_mirrors_legacy_rows's idiom).
+        self.get_success(
+            self.store.db_pool.simple_insert(
+                table="background_updates",
+                values={
+                    "update_name": "event_edges_backfill_mtxdb",
+                    "progress_json": "{}",
+                },
+            )
+        )
+        self.store.db_pool.updates._all_done = False
+        self.store.db_pool.updates._completed_background_updates.discard(
+            "event_edges_backfill_mtxdb"
+        )
+
+        # Gate closed: must take the all-SQL path and return both children,
+        # not the incomplete mtxdb list.
+        successors = self.get_success(self.store.get_successor_events(parent_id))
+        self.assertEqual(
+            set(successors),
+            {legacy_child, mirrored_child},
+            "gate closed: must not trust the incomplete mtxdb hit",
+        )
+
+        # Drive the background update to completion: it mirrors the legacy
+        # child too, so mtxdb's forward list becomes complete.
+        self.wait_for_background_updates()
+
+        successors_after = self.get_success(self.store.get_successor_events(parent_id))
+        self.assertEqual(
+            set(successors_after),
+            {legacy_child, mirrored_child},
+            "gate open: mtxdb must now be complete (backfill mirrored the "
+            "legacy child), so the hit is correct",
+        )
+
+    @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
+    def test_is_event_next_to_forward_gap_gates_on_backfill_completion(self) -> None:
+        """Same partial-hit shape as
+        `test_get_successor_events_gates_on_backfill_completion`, for
+        `is_event_next_to_forward_gap`'s independent gate
+        (`embedded_edges_trustworthy`, resolved before `runInteraction` since
+        its txn closure is sync). `parent` has a real (non-rejected) child,
+        so it must never be reported as a forward gap, gate open or closed --
+        the gate exists so an incomplete mtxdb hit can't override that by
+        claiming `children == []` when the mirror simply hasn't caught up."""
+        ns = self.store._embedded_db_namespace
+
+        parent_res = self.helper.send(self.room_id, "fg-gate-parent", tok=self.tok)
+        parent_id = parent_res["event_id"]
+        parent_event = self.get_success(self.store.get_event(parent_id))
+
+        legacy_child = "$fg-gate-legacy-child:test"
+        mirrored_child = "$fg-gate-mirrored-child:test"
+        for child_id in (legacy_child, mirrored_child):
+            self.get_success(
+                self.store.db_pool.simple_insert(
+                    table="events",
+                    values={
+                        "event_id": child_id,
+                        "room_id": self.room_id,
+                        "topological_ordering": 1,
+                        "depth": 1,
+                        "type": "m.test",
+                        "sender": self.user_id,
+                        "processed": True,
+                        "outlier": False,
+                    },
+                )
+            )
+            self.get_success(
+                self.store.db_pool.simple_insert(
+                    table="event_edges",
+                    values={"event_id": child_id, "prev_event_id": parent_id},
+                )
+            )
+        put_event_edges_batch(ns, [(self.room_id, mirrored_child, parent_id, False)])
+
+        self.get_success(
+            self.store.db_pool.simple_insert(
+                table="background_updates",
+                values={
+                    "update_name": "event_edges_backfill_mtxdb",
+                    "progress_json": "{}",
+                },
+            )
+        )
+        self.store.db_pool.updates._all_done = False
+        self.store.db_pool.updates._completed_background_updates.discard(
+            "event_edges_backfill_mtxdb"
+        )
+
+        self.assertFalse(
+            self.get_success(self.store.is_event_next_to_forward_gap(parent_event)),
+            "gate closed: a real child exists, must not be reported as a gap",
+        )
+
+        self.wait_for_background_updates()
+
+        self.assertFalse(
+            self.get_success(self.store.is_event_next_to_forward_gap(parent_event)),
+            "gate open: still a real child, still not a gap",
+        )
