@@ -283,10 +283,10 @@ For many local users with devices polling active rooms, optimize in this order:
 5. Batch push-action and receipt lookups.
 6. Reduce repeated stream-position and cache-invalidation queries.
 
-Presence, typing, and similar ephemeral data should remain in memory or a
-purpose-built ephemeral replication path unless profiling shows a durable store
-is necessary. Durable mtxdb writes for every typing/presence update are likely
-to increase I/O rather than reduce it.
+Typing is out of scope for the durable mtxdb plan. Synapse typing is already an
+in-memory room-to-users map on the writer, replicated over the worker TCP path;
+putting it in mtxdb would add durable-write and refresh overhead without fixing
+its existing fan-out path.
 
 ### Presence-specific plan
 
@@ -309,12 +309,50 @@ The first presence optimizations should be Synapse-level:
 - measure notifier wakeups, stream rows written, rows read, and serialized
   presence bytes separately.
 
-Presence should not initially be put into the durable `server_info` pool or the
+Presence should not be put into the durable `server_info` pool or the
 room/event pools. Its state is mutable and high-churn, and its main cost is
-fan-out and notification scheduling rather than large shared blobs. If a future
-benchmark shows PostgreSQL stream writes are the limiting factor, the right
-mtxdb design would be a purpose-built ephemeral presence stream with coalescing
-and bounded retention, not ordinary durable key/value records.
+fan-out and notification scheduling rather than large shared blobs.
+
+### Presence mtxdb design, staged
+
+The first experiment should be a CURRENT-only design in a separate fourth
+`ephemeral` pool:
+
+```text
+ephemeral pool
+└── presence
+    └── CURRENT: user_id -> latest presence value and expiry
+```
+
+This version deliberately has no per-update presence stream ID and no change
+history. It measures whether shared current-state reads are a meaningful
+PostgreSQL cost before adding a more complicated incremental-read structure.
+Reads fall back to SQL on a miss, and writes are coalesced per user before a
+batch commit.
+
+If CURRENT-only reads are insufficient for incremental `/sync`, version two
+adds a bounded pool-level change index rather than putting change records under
+each user:
+
+```text
+PRESENCE_BATCH/<revision_u64_be> -> coalesced changed user IDs
+PRESENCE_HORIZON                -> oldest retained revision
+```
+
+The revision is one per coalesced batch, not one per heartbeat. A sync client
+whose revision predates `PRESENCE_HORIZON` receives a full relevant snapshot;
+otherwise the worker scans changed user IDs and batch-reads CURRENT values.
+
+This requires explicit horizon tracking, range reads, bounded retention, and a
+well-defined refresh contract for read-only workers. A pool commit revision is
+not automatically a usable sync token until those semantics exist.
+
+The fourth pool is a design blocker, not an implemented feature. We must
+decide whether it participates in the shared WAL/group-commit coordinator or
+is an independent `PackfileStorage`. Presence does not need an atomic
+transaction with event/state writes, so an independent pool may be the simpler
+first implementation. Either choice must define checkpoint, refresh,
+`request_durable`, wait-durable, compaction, and crash-recovery behavior.
 
 ## Phase 5: device lists and federation metadata
 
@@ -377,12 +415,13 @@ A change is ready to land only when:
 
 ## Immediate next actions
 
-1. Validate the conditional `server_keys_json` upsert on SQLite and Postgres.
-2. Add mtxdb runtime counters for server-info reads, misses, refreshes, and
+1. Add mtxdb runtime counters for server-info reads, misses, refreshes, and
    bytes.
-3. Design the `server_info` pool and parent/member collection API.
-4. Implement `KEYS` shadow writes and SQL-vs-mtxdb comparison.
-5. Add concurrent MSC4499 tests for `SIGN` compare-and-set behavior.
-6. Profile device-list polling and worker startup separately.
+2. Design the `server_info` pool and parent/member collection API.
+3. Implement `KEYS` shadow writes and SQL-vs-mtxdb comparison.
+4. Add concurrent MSC4499 tests for `SIGN` compare-and-set behavior.
+5. Profile device-list polling and worker startup separately.
+6. Implement the presence CURRENT-only experiment in an isolated ephemeral
+   pool, if the presence read profile justifies it.
 7. Only then evaluate moving `current_state_delta_stream` and additional
    client-sync reads.
