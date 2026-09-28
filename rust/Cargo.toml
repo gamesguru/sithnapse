@@ -7,7 +7,17 @@ name = "synapse"
 version = "0.1.0"
 
 edition = "2021"
-rust-version = "1.82.0"
+# Match CI's actual enforced floor (tests.yml/complement_tests.yml/
+# latest_deps.yml all pin RUST_VERSION: 1.87.0) -- this field had drifted to
+# 1.82.0, stale against reality: the icu_* pins below already silently
+# require 1.86+, and cpufeatures 0.3.1 (transitive via rand -> chacha20,
+# pulled in even though reqwest's "http3" feature that gates quinn is never
+# enabled -- Cargo.lock still needs to resolve/fetch it) requires
+# edition2024, unstable before 1.85. A declared rust-version below what the
+# dependency graph actually needs just means `cargo +<declared-version>
+# build` fails while a plain `cargo build` (using whatever's installed)
+# silently succeeds and hides it.
+rust-version = "1.87.0"
 
 [lib]
 name = "synapse"
@@ -74,17 +84,15 @@ icu_locale_core = "=2.2.0"
 # haven't moved past it.
 getrandom = "=0.3.4"
 # Transitive-only (sha1/sha2/keccak use the 0.2.x line; pinned here for the
-# same drift reason as getrandom above). NOT a full fix on its own: rand
-# 0.10.x -> chacha20 0.10.2 hard-requires cpufeatures ^0.3, and 0.3.1 (the
-# only 0.3.x release published) requires `edition2024`, unstable on this
-# crate's pinned rust-version (1.82.0, see the top of this file) -- `cargo
-# +1.82.0 build`/`clippy` fails just parsing that manifest, regardless of
-# whether cpufeatures 0.3.1 is actually compiled for this target. This pin
-# doesn't remove that second copy (chacha20's own requirement can't be
-# satisfied by 0.2.x); still investigating whether pinning something further
-# up the chain (chacha20, rand, or quinn-proto/reqwest's quinn pull) avoids
-# it, since no 0.3.0 (pre-edition2024) release of cpufeatures exists to fall
-# back to.
+# same drift reason as getrandom above). A second copy, cpufeatures 0.3.1
+# (via rand 0.10.x -> chacha20 0.10.2, target-conditional on x86/x86_64 --
+# see chacha20's Cargo.toml -- and pulled into Cargo.lock even though
+# reqwest's "http3" feature that gates quinn/quinn-proto/rand-0.10 is never
+# enabled: an unresolved optional dependency's manifest still needs
+# fetching), requires `edition2024`. That's fine now that rust-version above
+# matches CI's real 1.87.0 floor; it broke a build declaring the stale
+# 1.82.0 field, which is what surfaced this whole chain -- see that field's
+# comment.
 cpufeatures = "=0.2.17"
 reqwest = { version = "0.12.15", default-features = false, features = [
     "http2",
