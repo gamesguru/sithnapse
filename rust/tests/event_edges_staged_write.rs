@@ -26,7 +26,7 @@ const ROOM: &str = "!integration-edges-staged-write:example.org";
 #[test]
 fn staged_put_merges_forward_lists_and_publishes_backward_edges() {
     // SAFETY: single-threaded test-binary startup, before `open_client`
-    // reads it (see `mtxdb_transaction_get_edges.rs`'s `open_wal_store`).
+    // reads it (mirrors event_edges_restart.rs's own setup).
     unsafe {
         std::env::set_var("SYNAPSE_MTXDB_WAL", "1");
     }

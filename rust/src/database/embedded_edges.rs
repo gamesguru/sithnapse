@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 
 use super::mtxdb_syn::{
     assert_writable, auth_chain_db, begin_internal_transaction, event_locator_collection_id,
-    event_node_id, prev_edges_room_id,
+    event_node_id, map_transaction_error, prev_edges_room_id,
 };
 
 /// The read/write surface `event_edges_put` needs, common to a direct engine
@@ -302,11 +302,7 @@ pub fn event_edges_put(
         match begin_internal_transaction()? {
             Some(txn) => {
                 write_edges(&txn, &namespace, rows)?;
-                txn.commit().map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "mtxdb transaction commit error: {e}"
-                    ))
-                })
+                txn.commit().map_err(|e| map_transaction_error("commit", e))
             }
             None => {
                 let engine: &mtxdb::PackfileStorage = auth_chain_db()?;
@@ -378,9 +374,9 @@ fn write_edges(
         // "one read per distinct node" true.
         node_ids.sort_unstable();
         node_ids.dedup();
-        let found = engine.edge_get_many(collection, node_ids).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {e}"))
-        })?;
+        let found = engine
+            .edge_get_many(collection, node_ids)
+            .map_err(|e| map_transaction_error("get_many", e))?;
         for (forward_node, value) in node_ids.iter().zip(found) {
             let children = match value {
                 Some(data) if !data.bytes.is_empty() => decode_forward_edges(&data.bytes)?,
@@ -433,15 +429,15 @@ fn write_edges(
     // between the two sees a miss and falls back to SQL, never a locator
     // pointing at an edge record that isn't there yet.
     for (collection, pairs) in dag_puts {
-        engine.edge_put_many(collection, pairs).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {e}"))
-        })?;
+        engine
+            .edge_put_many(collection, pairs)
+            .map_err(|e| map_transaction_error("put_many", e))?;
     }
     for (collection, pairs) in locator_puts {
         let pairs: Vec<(NodeId, NodeData)> = pairs.into_iter().collect();
-        engine.edge_put_many(collection, pairs).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {e}"))
-        })?;
+        engine
+            .edge_put_many(collection, pairs)
+            .map_err(|e| map_transaction_error("put_many", e))?;
     }
 
     Ok(())

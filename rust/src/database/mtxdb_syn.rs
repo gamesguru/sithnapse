@@ -3015,8 +3015,35 @@ pub struct PyMtxdbTransaction {
     inner: DatabaseTransaction<'static>,
 }
 
-fn map_transaction_error(context: &str, error: impl std::fmt::Display) -> PyErr {
-    pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb transaction {context}: {error}"))
+/// `DatabaseTransaction::put` (`event_json_put`/edges staging) fails with a
+/// plain `io::Error`; journal contention shows up the same way it does for a
+/// direct write, `ErrorKind::WouldBlock`, so map it retryable the same way
+/// `map_read_storage_error` maps a contended read.
+pub(crate) fn map_transaction_io_error(context: &str, error: std::io::Error) -> PyErr {
+    let retryable = error.kind() == std::io::ErrorKind::WouldBlock;
+    let message = format!("mtxdb transaction {context}: {error}");
+    if retryable {
+        pyo3::exceptions::PyBlockingIOError::new_err(message)
+    } else {
+        pyo3::exceptions::PyRuntimeError::new_err(message)
+    }
+}
+
+/// `DatabaseTransaction::commit`/`abort` fail with `StorageError`. Previously
+/// always a plain `PyRuntimeError`, which meant a contended commit was not
+/// retried the way a contended direct write or read already is -- fixed here
+/// to match `map_read_storage_error`'s retryable mapping.
+pub(crate) fn map_transaction_error(context: &str, error: StorageError) -> PyErr {
+    let retryable = matches!(
+        &error,
+        StorageError::Io(io_error) if io_error.kind() == std::io::ErrorKind::WouldBlock
+    );
+    let message = format!("mtxdb transaction {context}: {error}");
+    if retryable {
+        pyo3::exceptions::PyBlockingIOError::new_err(message)
+    } else {
+        pyo3::exceptions::PyRuntimeError::new_err(message)
+    }
 }
 
 #[pymethods]
@@ -3035,7 +3062,7 @@ impl PyMtxdbTransaction {
                 for (node, data) in pairs {
                     self.inner
                         .put(ShardType::EventDag, collection, node, &data)
-                        .map_err(|e| map_transaction_error("stage", e))?;
+                        .map_err(|e| map_transaction_io_error("stage", e))?;
                 }
             }
             Ok(())
@@ -3062,62 +3089,6 @@ impl PyMtxdbTransaction {
         self.inner
             .abort()
             .map_err(|e| map_transaction_error("abort", e))
-    }
-
-    /// Stage a raw node write into the edges pool, without touching the live
-    /// pool. Visible to `get_edges` on this same transaction immediately;
-    /// visible everywhere else only after `commit()`.
-    ///
-    /// The pairing for `get_edges` below: together they let
-    /// `event_edges_put`'s read-modify-write of a parent's forward-child list
-    /// run entirely inside the persist transaction (one journal group per
-    /// persist, like `event_json_put`) instead of the direct `put_many` it
-    /// uses today (one group per call, under `RMW_LOCK`).
-    pub fn put_edges(
-        &self,
-        py: Python<'_>,
-        collection_id: [u8; 16],
-        node_id: [u8; 16],
-        data: Vec<u8>,
-    ) -> PyResult<()> {
-        py.detach(|| {
-            self.inner
-                .put(
-                    ShardType::Edges,
-                    collection_id,
-                    node_id,
-                    &NodeData::new(bytes::Bytes::from(data)),
-                )
-                .map_err(|e| map_transaction_error("stage", e))
-        })
-    }
-
-    /// Read raw nodes from the edges pool through this transaction: this
-    /// transaction's own staged puts first, then the live pool for anything
-    /// the stage has no opinion on. Nothing here is visible to other readers
-    /// until `commit()`. Returns `None` per id for a miss, in `node_ids` order.
-    ///
-    /// Scoped to the edges pool for now -- the only staged read a caller
-    /// needs today is `event_edges_put`'s read-modify-write of a parent's
-    /// forward-child list -- but `DatabaseTransaction::get` itself takes any
-    /// `ShardType`, so widening this to the other pools is a signature change,
-    /// not new engine work.
-    pub fn get_edges(
-        &self,
-        py: Python<'_>,
-        collection_id: [u8; 16],
-        node_ids: Vec<NodeId>,
-    ) -> PyResult<Vec<Option<Vec<u8>>>> {
-        py.detach(|| {
-            let found = self
-                .inner
-                .get(ShardType::Edges, &collection_id, &node_ids)
-                .map_err(map_read_storage_error)?;
-            Ok(found
-                .into_iter()
-                .map(|entry| entry.map(|data| data.bytes.to_vec()))
-                .collect())
-        })
     }
 }
 
@@ -3864,6 +3835,8 @@ fn stats_to_dict(
     d.set_item("delta_appends", s.delta_appends)?;
     d.set_item("read_reloads", s.read_reloads)?;
     d.set_item("read_reload_failures", s.read_reload_failures)?;
+    d.set_item("read_refreshes", s.read_refreshes)?;
+    d.set_item("read_refresh_bytes", s.read_refresh_bytes)?;
     d.set_item("delta_invalidations", s.delta_invalidations)?;
     d.set_item("cache_hits", s.cache.hits)?;
     d.set_item("cache_misses", s.cache.misses)?;
