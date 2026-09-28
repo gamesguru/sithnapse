@@ -1201,3 +1201,63 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         # The preserved row[2] edge is repaired in mtxdb despite the tombstone.
         fwd_repaired = get_event_edges_forward_batch(ns, [p_id])
         self.assertIn(c_id, fwd_repaired.get(p_id) or [])
+
+    @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
+    def test_backfill_mtxdb_background_update_mirrors_legacy_rows(self) -> None:
+        """`_background_backfill_event_edges_mtxdb` mirrors `event_edges` rows
+        that predate the embedded engine being enabled -- simulated here by
+        writing SQL-only (mirror disabled) before turning the engine back on,
+        the same shape as a server enabling it after already running."""
+        ns = self.store._embedded_db_namespace
+        assert self.persist_store is not None
+
+        # SQL-only: disable the mirror before these events persist, so the
+        # only place this edge exists afterward is the SQL event_edges row,
+        # exactly like a pre-existing server's history.
+        self.persist_store._embedded_event_edges_writable = False
+        res1 = self.helper.send(self.room_id, "legacy-parent", tok=self.tok)
+        p_id = res1["event_id"]
+        res2 = self.helper.send(self.room_id, "legacy-child", tok=self.tok)
+        c_id = res2["event_id"]
+        self.persist_store._embedded_event_edges_writable = True
+
+        flush_edge_writes(ns)
+        self.assertIsNone(
+            get_event_edges_backward_batch(ns, [c_id]).get(c_id),
+            "the mirror-disabled write must not have reached mtxdb",
+        )
+        self.assertIsNone(
+            get_event_edges_forward_batch(ns, [p_id]).get(p_id),
+            "the mirror-disabled write must not have reached mtxdb",
+        )
+
+        # Re-register the background update (a fresh test DB already marks it
+        # complete) and drive it to completion, the same pattern
+        # test_events_bg_updates.py uses.
+        self.get_success(
+            self.store.db_pool.simple_insert(
+                table="background_updates",
+                values={
+                    "update_name": "event_edges_backfill_mtxdb",
+                    "progress_json": "{}",
+                },
+            )
+        )
+        # has_completed_background_updates() caches _all_done=True forever
+        # once it's observed an empty table -- which it already has by now,
+        # via reactor pumps inside the register_user/login/send calls above.
+        # Reset it so wait_for_background_updates() re-checks the DB instead
+        # of trusting the stale cache (test_events_bg_updates.py's
+        # TestRedactionsRecheckBgUpdate does the same for the same reason).
+        self.store.db_pool.updates._all_done = False
+        self.wait_for_background_updates()
+
+        backward = get_event_edges_backward_batch(ns, [c_id])
+        self.assertIsNotNone(backward.get(c_id))
+        prev_ids = [prev for prev, _ in backward[c_id] or []]
+        self.assertIn(p_id, prev_ids, "backfill must mirror the backward edge")
+
+        forward = get_event_edges_forward_batch(ns, [p_id])
+        self.assertIn(
+            c_id, forward.get(p_id) or [], "backfill must mirror the forward edge"
+        )

@@ -47,6 +47,7 @@ from synapse.storage.database import (
 )
 from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
 from synapse.storage.databases.main.embedded_common import Pool, SyncTier, maybe_sync
+from synapse.storage.databases.main.embedded_event_edges import put_event_edges_batch
 from synapse.storage.databases.main.embedded_event_json import (
     get_event_json_batch,
     put_event_json_batch,
@@ -331,6 +332,11 @@ class EventsBackgroundUpdatesStore(
             unique=True,
             # the old index which just covered event_id is now redundant.
             replaces_index="ev_edges_id",
+        )
+
+        self.db_pool.updates.register_background_update_handler(
+            _BackgroundUpdates.EVENT_EDGES_BACKFILL_MTXDB,
+            self._background_backfill_event_edges_mtxdb,
         )
 
         self.db_pool.updates.register_background_update_handler(
@@ -2025,6 +2031,123 @@ class EventsBackgroundUpdatesStore(
             )
 
         return batch_size
+
+    async def _background_backfill_event_edges_mtxdb(
+        self, progress: JsonDict, batch_size: int
+    ) -> int:
+        """Mirror pre-existing `event_edges` rows into the embedded engine.
+
+        `event_edges_put` (`embedded_event_edges.put_event_edges_batch`) has
+        mirrored every *new* row since the embedded edges engine was enabled,
+        but rows written before that point -- or on a server that enables the
+        engine after already running for a while -- only exist in SQL. Two
+        read sites (`get_successor_events`, `is_event_next_to_forward_gap`)
+        already lazily repair a miss into mtxdb on read, but that only covers
+        rows that get read; this background update covers the rest, so the
+        SQL `event_edges` insert can eventually be dropped without an mtxdb
+        miss silently returning nothing for a legacy row nobody has read yet.
+
+        A no-op (ends immediately) unless the embedded edges engine is both
+        enabled and writable on this process -- there is nothing to backfill
+        into otherwise, and only the events-stream writer may write it.
+
+        Same windowed-batch shape as `_background_drop_invalid_event_edges_rows`:
+        ordered by `event_id` (covered by the `event_edges_event_id_prev_event_id_idx`
+        unique index), progress tracked as the last `event_id` processed.
+        `put_event_edges_batch` is idempotent (a forward-list append
+        deduplicates, a backward record overwrite is identical), so retrying
+        a batch after a partial failure is safe.
+        """
+        if not getattr(self, "_embedded_event_edges_enabled", False) or not getattr(
+            self, "_embedded_event_edges_writable", False
+        ):
+            await self.db_pool.updates._end_background_update(
+                _BackgroundUpdates.EVENT_EDGES_BACKFILL_MTXDB
+            )
+            return 0
+
+        last_event_id = progress.get("last_event_id", "")
+
+        def backfill_txn(
+            txn: LoggingTransaction,
+        ) -> tuple[bool, list[tuple[str, str, str, bool]]]:
+            """Returns (done, rows) for this batch."""
+
+            # Find this batch's endpoint the same way
+            # `_background_drop_invalid_event_edges_rows` does: order by
+            # event_id, skip batch_size-1 rows, and take the next one.
+            txn.execute(
+                """
+                SELECT event_id FROM event_edges
+                WHERE event_id > ?
+                ORDER BY event_id
+                LIMIT 1 OFFSET ?
+                """,
+                (last_event_id, batch_size),
+            )
+            row = txn.fetchone()
+            endpoint = row[0] if row else None
+
+            where_clause = "ee.event_id > ?"
+            args: list[object] = [last_event_id]
+            if endpoint is not None:
+                where_clause += " AND ee.event_id <= ?"
+                args.append(endpoint)
+
+            # event_edges.room_id itself is never populated on write
+            # (`_handle_mult_prev_events` inserts only event_id/prev_event_id;
+            # is_state defaults false, room_id stays NULL) -- join `events`
+            # for it instead, the same way
+            # `_background_drop_invalid_event_edges_rows` above joins it to
+            # validate the row. The event_edges_event_id_fkey (validated by
+            # that same background update) guarantees every event_id here
+            # has a matching events row, so an inner join can't silently drop
+            # rows the way a NULL room_id column would.
+            txn.execute(
+                f"""
+                SELECT ee.event_id, ee.prev_event_id, ev.room_id, ee.is_state
+                FROM event_edges ee
+                JOIN events ev ON ev.event_id = ee.event_id
+                WHERE {where_clause}
+                ORDER BY ee.event_id
+                """,
+                args,
+            )
+            rows = [
+                (room_id, event_id, prev_event_id, bool(is_state))
+                for event_id, prev_event_id, room_id, is_state in txn
+            ]
+            return endpoint is None, rows
+
+        done, rows = await self.db_pool.runInteraction(
+            desc="backfill_event_edges_mtxdb_read", func=backfill_txn
+        )
+
+        if rows:
+            # Outside the SQL transaction: the mirror write is not
+            # transactional with SQL, but it's idempotent and this is a
+            # read-only backfill (nothing in SQL changes), so a crash between
+            # the SQL read and this write only means the batch is repeated,
+            # not corrupted.
+            put_event_edges_batch(self._embedded_db_namespace, rows)
+
+        if done:
+            await self.db_pool.updates._end_background_update(
+                _BackgroundUpdates.EVENT_EDGES_BACKFILL_MTXDB
+            )
+            return len(rows) or batch_size
+
+        last_event_id = rows[-1][1] if rows else last_event_id
+        await self.db_pool.runInteraction(
+            desc="backfill_event_edges_mtxdb_progress",
+            func=lambda txn: self.db_pool.updates._background_update_progress_txn(
+                txn,
+                _BackgroundUpdates.EVENT_EDGES_BACKFILL_MTXDB,
+                {"last_event_id": last_event_id},
+            ),
+        )
+
+        return len(rows) or batch_size
 
     async def _background_events_populate_state_key_rejections(
         self, progress: JsonDict, batch_size: int
