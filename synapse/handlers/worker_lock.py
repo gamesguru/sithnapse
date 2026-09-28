@@ -305,12 +305,16 @@ class WaitingLock:
     ) -> bool | None:
         assert self._inner_lock
 
-        self.handler.notify_lock_released(self.lock_name, self.lock_key)
-
         try:
             r = await self._inner_lock.__aexit__(exc_type, exc, tb)
         finally:
             self._lock_span.__exit__(exc_type, exc, tb)
+
+        # Wake waiters only after the database row has been removed. Notifying
+        # first makes every waiter race the releasing transaction, generating
+        # another failed lock-acquisition query and increasing DB-pool
+        # contention under load.
+        self.handler.notify_lock_released(self.lock_name, self.lock_key)
 
         return r
 
@@ -415,13 +419,14 @@ class WaitingMultiLock:
     ) -> bool | None:
         assert self._inner_lock_cm
 
-        for lock_name, lock_key in self.lock_names:
-            self.handler.notify_lock_released(lock_name, lock_key)
-
         try:
             r = await self._inner_lock_cm.__aexit__(exc_type, exc, tb)
         finally:
             self._lock_span.__exit__(exc_type, exc, tb)
+
+        # Wake waiters only after all database rows have been removed.
+        for lock_name, lock_key in self.lock_names:
+            self.handler.notify_lock_released(lock_name, lock_key)
 
         return r
 
