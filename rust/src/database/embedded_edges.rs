@@ -445,12 +445,18 @@ fn write_edges(
 
 /// Read backward edges: given event_ids, returns `(event_id, Option<[(prev_event_id, is_state)]>)`
 ///
-/// Reads via `get_read_committed`, not plain `get_many`: a plain read only
-/// sees the read-journal overlay while a transaction is actively publishing
-/// (`overlay_reads_active`), so a reader process already open before a
-/// writer's commit could otherwise miss it until its own next refresh --
-/// see `res/docs/2026-09-28-event-edge-cross-process-read-visibility.md`,
-/// which measured and confirmed this for the plain path.
+/// Reads via `get_read_committed`, not plain `get_many`. In the common case
+/// (no writer transaction actively publishing right now) `get_read_committed`
+/// falls through to `get_many_with_refresh`: on a genuine miss it takes a
+/// refresh lock and checks the durable fingerprint, potentially rescanning
+/// the index, which a plain `get_many` never does. That refresh-on-miss path
+/// -- not "the overlay is always checked" -- is what makes a reader process
+/// already open before a writer's commit observe it without reopening; see
+/// `res/docs/2026-09-28-event-edge-cross-process-read-visibility.md`. This
+/// makes every genuine miss pay a lock + possible rescan it didn't before,
+/// which is a real, currently unmeasured cost for `is_event_next_to_forward_gap`
+/// (queries the miss/gap case specifically) and any childless parent in
+/// `get_successor_events` -- not yet validated as cheap enough to keep.
 #[pyfunction]
 #[allow(clippy::type_complexity)]
 pub fn event_edges_get_backward(
