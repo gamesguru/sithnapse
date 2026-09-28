@@ -66,6 +66,26 @@ icu_segmenter = "=2.2.0"
 # NOTE: pinned to match icu_segmenter; transitive-only but must not drift past 2.2.0 (MSRV 1.87)
 icu_provider = "=2.2.0"
 icu_locale_core = "=2.2.0"
+# Transitive-only (pulled in via rand, quinn-proto, tempfile), not a direct
+# dep of ours -- pinned so a `cargo update` can't silently bump it to a new
+# major on its own, the same reasoning as the icu_* pins above. Held at the
+# older 0.3.x line deliberately (not the newer 0.4.x some dependents also
+# accept): 0.2.x is also still present transitively for dependents that
+# haven't moved past it.
+getrandom = "=0.3.4"
+# Transitive-only (sha1/sha2/keccak use the 0.2.x line; pinned here for the
+# same drift reason as getrandom above). NOT a full fix on its own: rand
+# 0.10.x -> chacha20 0.10.2 hard-requires cpufeatures ^0.3, and 0.3.1 (the
+# only 0.3.x release published) requires `edition2024`, unstable on this
+# crate's pinned rust-version (1.82.0, see the top of this file) -- `cargo
+# +1.82.0 build`/`clippy` fails just parsing that manifest, regardless of
+# whether cpufeatures 0.3.1 is actually compiled for this target. This pin
+# doesn't remove that second copy (chacha20's own requirement can't be
+# satisfied by 0.2.x); still investigating whether pinning something further
+# up the chain (chacha20, rand, or quinn-proto/reqwest's quinn pull) avoids
+# it, since no 0.3.0 (pre-edition2024) release of cpufeatures exists to fall
+# back to.
+cpufeatures = "=0.2.17"
 reqwest = { version = "0.12.15", default-features = false, features = [
     "http2",
     "stream",
@@ -90,7 +110,7 @@ path = "benches/state_hamt.rs"
 harness = false
 
 [package.metadata.cargo-machete]
-ignored = ["icu_provider", "icu_locale_core"]
+ignored = ["icu_provider", "icu_locale_core", "getrandom"]
 
 [dev-dependencies]
 itertools = "0.14.0"
