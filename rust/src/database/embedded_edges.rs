@@ -812,4 +812,94 @@ mod tests {
         let total: usize = locators.values().map(|pairs| pairs.len()).sum();
         assert_eq!(total, 2, "one locator per distinct event id");
     }
+
+    /// `embedded-edge-tombstones.md`: a delete must not read or rewrite any
+    /// parent's forward list. Deleting children therefore leaves stale ids
+    /// behind, and the raw list grows until a compactor exists; reads stay
+    /// correct because the filter drops tombstoned children.
+    ///
+    /// The invariant is asserted at the raw-node level on purpose: the Python
+    /// FFI always applies the backward-edge filter, so it can never observe a
+    /// stale id. A raw read is the only way to prove the delete avoided the
+    /// RMW *and* that the growth the compaction design must bound is real.
+    #[test]
+    fn delete_leaves_forward_lists_stale_and_growth_is_real() {
+        crate::database::mtxdb_syn::auth_chain_closure_tests::ensure_open();
+        let ns = "ns-edges-staleness-growth";
+        let room = "!room-edges:example.org";
+        let parent = "$stale-parent";
+        let child_count = 64usize;
+
+        pyo3::Python::attach(|py| {
+            let children: Vec<String> = (0..child_count).map(|i| format!("$sc{i}")).collect();
+            let rows: Vec<(String, String, String, bool)> = children
+                .iter()
+                .map(|child| (room.to_string(), child.clone(), parent.to_string(), false))
+                .collect();
+            event_edges_put(py, ns.to_string(), rows).expect("put children");
+
+            let engine = auth_chain_db().expect("edge engine");
+            let collection = prev_edges_room_id(ns, room);
+            let node = event_edges_forward_node_id(ns, parent);
+
+            let before = engine
+                .get_many(&collection, std::slice::from_ref(&node))
+                .expect("raw get_many before")
+                .into_iter()
+                .next()
+                .expect("one result before")
+                .expect("forward node present before")
+                .bytes
+                .to_vec();
+            assert_eq!(
+                decode_forward_edges(&before).expect("decode before").len(),
+                child_count
+            );
+
+            // Purge every other child. `event_edges_delete` tombstones only the
+            // backward records; the parent forward list is deliberately left
+            // untouched, so the delete cannot pay for the list's size.
+            let purged: Vec<String> = children.iter().step_by(2).cloned().collect();
+            event_edges_delete(py, ns.to_string(), purged.clone()).expect("delete children");
+
+            let after = engine
+                .get_many(&collection, std::slice::from_ref(&node))
+                .expect("raw get_many after")
+                .into_iter()
+                .next()
+                .expect("one result after")
+                .expect("forward node present after")
+                .bytes
+                .to_vec();
+            assert_eq!(
+                before, after,
+                "delete must not rewrite the parent's forward list"
+            );
+            assert_eq!(
+                decode_forward_edges(&after).expect("decode after").len(),
+                child_count,
+                "stale ids remain in the raw forward list until compaction"
+            );
+
+            // The filtered read is still correct: only live children survive.
+            let forward = event_edges_get_forward(py, ns.to_string(), vec![parent.to_string()])
+                .expect("filtered get forward");
+            let kept = forward[0].1.as_ref().expect("live children present");
+            let expected: Vec<String> = children
+                .iter()
+                .filter(|child| !purged.contains(*child))
+                .cloned()
+                .collect();
+            assert_eq!(kept.len(), expected.len());
+            for child in &expected {
+                assert!(kept.contains(child), "live child {child} must be kept");
+            }
+            for child in &purged {
+                assert!(
+                    !kept.contains(child),
+                    "purged child {child} must be filtered"
+                );
+            }
+        });
+    }
 }
