@@ -1,6 +1,6 @@
-//! Probe for the open visibility question on `event_edges` forward reads:
+//! Regression test for `event_edges` forward-read cross-process visibility:
 //! does a read-only worker process, already open *before* a writer commits,
-//! observe the new edge on a plain read, without reopening?
+//! observe the new edge on a read, without reopening?
 //!
 //! This is deliberately a harder scenario than `event_edges_restart.rs`
 //! (which reopens fresh *after* the write, so it always sees the durable
@@ -8,14 +8,16 @@
 //! the reader reads through its already-open handle -- the shape a real
 //! worker process is in between its own commits/refreshes.
 //!
-//! Per mtxdb's `StorageEngine::get_many` (what every edge read uses,
-//! `embedded_edges.rs`): it redirects to the read-journal overlay only while
-//! `transaction_overlay_users != 0` (mid-publish), not unconditionally.
-//! `get_read_committed` (what `event_json_get` uses) checks the overlay
-//! unconditionally instead. So the expectation from source is: a reader that
-//! opened before the write, reading with a plain `get_many`-based call
-//! shortly after the writer's commit returns, sees a miss -- not a hit --
-//! until its own next index refresh/reopen.
+//! Originally written as an open-ended probe: `event_edges_get_forward` used
+//! plain `get_many`, which per mtxdb's `StorageEngine::get_many` only
+//! redirects to the read-journal overlay while `transaction_overlay_users
+//! != 0` (mid-publish), not unconditionally -- unlike `get_read_committed`,
+//! which checks it unconditionally. That predicted (and this test then
+//! confirmed, 5/5 runs) a miss here. `event_edges_get_forward` was switched
+//! to `get_read_committed` afterward
+//! (`res/docs/2026-09-28-event-edge-cross-process-read-visibility.md`), so
+//! this is now a regression test asserting the fixed behavior (a hit),
+//! not an open probe.
 //!
 //! Two processes, synchronized by small marker files (no shared clock
 //! assumptions): reader opens and signals ready; writer waits for that
@@ -33,7 +35,7 @@ use synapse::database::mtxdb_syn::{open_client, open_client_read_only, sync_auth
 
 const DIR_ENV: &str = "SYNAPSE_TEST_EDGES_VISIBILITY_DIR";
 const PHASE_ENV: &str = "SYNAPSE_TEST_EDGES_VISIBILITY_PHASE";
-const TEST_NAME: &str = "reader_open_before_write_sees_stale_forward_list";
+const TEST_NAME: &str = "reader_open_before_write_observes_it_via_read_committed";
 const NAMESPACE: &str = "integration-edges-visibility";
 const ROOM: &str = "!integration-edges-visibility:example.org";
 const PARENT: &str = "$visibility-parent";
@@ -69,7 +71,8 @@ fn reader_phase(py: Python<'_>, dir: &str) {
     wait_for_marker(&marker_path(dir, "writer_done"), Duration::from_secs(30));
 
     // Single read attempt, no retry/refresh loop: this is exactly what a
-    // plain (non-read-committed) call gets a caller today.
+    // caller gets today (`get_read_committed`, which checks the read-journal
+    // overlay unconditionally rather than only mid-publish).
     let forward = event_edges_get_forward(py, NAMESPACE.to_owned(), vec![PARENT.to_owned()])
         .expect("forward read after writer's commit");
     let observed_child = forward[0]
@@ -105,7 +108,7 @@ fn writer_phase(py: Python<'_>, dir: &str) {
 }
 
 #[test]
-fn reader_open_before_write_sees_stale_forward_list() {
+fn reader_open_before_write_observes_it_via_read_committed() {
     if let Ok(dir) = std::env::var(DIR_ENV) {
         Python::initialize();
         let phase = std::env::var(PHASE_ENV).expect("phase env set by the parent");
@@ -137,19 +140,15 @@ fn reader_open_before_write_sees_stale_forward_list() {
 
     let result = fs::read_to_string(marker_path(&dir, "reader_result"))
         .expect("reader_result marker written");
-    // This is the probe's answer, not an assertion the design requires: a
-    // "hit" here would mean the source-level analysis above is wrong (a
-    // plain get_many redirected to the overlay outside overlay_reads_active),
-    // which would be worth knowing. Print rather than assert either way, so
-    // this test documents the finding instead of failing once the answer is
-    // confirmed.
     println!(
-        "cross-process visibility probe: reader opened before writer's commit, \
-         single post-commit read through the plain (non-read-committed) path: {result}"
+        "cross-process visibility: reader opened before writer's commit, \
+         single post-commit get_read_committed read: {result}"
     );
-    assert!(
-        result == "hit" || result == "miss",
-        "unexpected reader_result marker content: {result:?}"
+    assert_eq!(
+        result, "hit",
+        "a reader opened before the writer's commit must observe it on a \
+         get_read_committed read -- if this is 'miss', event_edges_get_forward \
+         has regressed off get_read_committed back onto a plain read"
     );
 }
 
