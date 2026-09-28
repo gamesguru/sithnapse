@@ -3034,7 +3034,7 @@ impl PyMtxdbTransaction {
     ///
     /// Returns the seconds spent inside the engine's `commit()`, excluding the
     /// wait to get the GIL back, so callers can tell the two apart.
-    fn commit(&self, py: Python<'_>) -> PyResult<f64> {
+    pub fn commit(&self, py: Python<'_>) -> PyResult<f64> {
         py.detach(|| {
             let started = std::time::Instant::now();
             self.inner
@@ -3045,10 +3045,66 @@ impl PyMtxdbTransaction {
     }
 
     /// Discard the staged writes. Fails once publication has started.
-    fn abort(&self) -> PyResult<()> {
+    pub fn abort(&self) -> PyResult<()> {
         self.inner
             .abort()
             .map_err(|e| map_transaction_error("abort", e))
+    }
+
+    /// Stage a raw node write into the edges pool, without touching the live
+    /// pool. Visible to `get_edges` on this same transaction immediately;
+    /// visible everywhere else only after `commit()`.
+    ///
+    /// The pairing for `get_edges` below: together they let
+    /// `event_edges_put`'s read-modify-write of a parent's forward-child list
+    /// run entirely inside the persist transaction (one journal group per
+    /// persist, like `event_json_put`) instead of the direct `put_many` it
+    /// uses today (one group per call, under `RMW_LOCK`).
+    pub fn put_edges(
+        &self,
+        py: Python<'_>,
+        collection_id: [u8; 16],
+        node_id: [u8; 16],
+        data: Vec<u8>,
+    ) -> PyResult<()> {
+        py.detach(|| {
+            self.inner
+                .put(
+                    ShardType::Edges,
+                    collection_id,
+                    node_id,
+                    &NodeData::new(bytes::Bytes::from(data)),
+                )
+                .map_err(|e| map_transaction_error("stage", e))
+        })
+    }
+
+    /// Read raw nodes from the edges pool through this transaction: this
+    /// transaction's own staged puts first, then the live pool for anything
+    /// the stage has no opinion on. Nothing here is visible to other readers
+    /// until `commit()`. Returns `None` per id for a miss, in `node_ids` order.
+    ///
+    /// Scoped to the edges pool for now -- the only staged read a caller
+    /// needs today is `event_edges_put`'s read-modify-write of a parent's
+    /// forward-child list -- but `DatabaseTransaction::get` itself takes any
+    /// `ShardType`, so widening this to the other pools is a signature change,
+    /// not new engine work.
+    pub fn get_edges(
+        &self,
+        py: Python<'_>,
+        collection_id: [u8; 16],
+        node_ids: Vec<NodeId>,
+    ) -> PyResult<Vec<Option<Vec<u8>>>> {
+        py.detach(|| {
+            let found = self
+                .inner
+                .get(ShardType::Edges, &collection_id, &node_ids)
+                .map_err(map_read_storage_error)?;
+            Ok(found
+                .into_iter()
+                .map(|entry| entry.map(|data| data.bytes.to_vec()))
+                .collect())
+        })
     }
 }
 

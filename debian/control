@@ -10,6 +10,7 @@ Build-Depends:
  libpq-dev,
  libicu-dev,
  libclang-dev,
+ libzstd-dev,
  pkg-config,
  lsb-release,
  python3-dev,

@@ -77,6 +77,8 @@ RUN apt-get update -qq -o Acquire::Languages=none \
     libffi-dev \
     # Required for the mtxdb crate to run bindgen.
     libclang-dev \
+    # Required for the mtxdb crate's zstd-sys dependency.
+    libzstd-dev \
     libsystemd-dev \
     lsb-release \
     pkg-config \
