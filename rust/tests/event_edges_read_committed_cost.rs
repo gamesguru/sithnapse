@@ -157,12 +157,22 @@ fn worker_phase(py: Python<'_>, dir: &str) {
         .collect();
     let leaf_children: Vec<String> = (0..N_PARENTS).map(|i| format!("$cost-child-{i}")).collect();
 
+    // First pass: cold, this process has never read these keys before.
     let (hit_p50, hit_p99) = time_reads(py, &parents);
     let (miss_p50, miss_p99) = time_reads(py, &leaf_children);
+    // Second pass over the exact same keys: isolates a one-time cold-cache/
+    // index-load cost (would drop sharply here) from a genuine per-call cost
+    // the overlay-refresh check pays every time (would stay flat).
+    let (hit_p50_warm, hit_p99_warm) = time_reads(py, &parents);
+    let (miss_p50_warm, miss_p99_warm) = time_reads(py, &leaf_children);
 
     fs::write(
         marker_path(dir, "worker_result"),
-        format!("hit_p50={hit_p50} hit_p99={hit_p99} miss_p50={miss_p50} miss_p99={miss_p99}"),
+        format!(
+            "hit_p50={hit_p50} hit_p99={hit_p99} miss_p50={miss_p50} miss_p99={miss_p99} \
+             hit_p50_warm={hit_p50_warm} hit_p99_warm={hit_p99_warm} \
+             miss_p50_warm={miss_p50_warm} miss_p99_warm={miss_p99_warm}"
+        ),
     )
     .expect("write worker_result marker");
 }
