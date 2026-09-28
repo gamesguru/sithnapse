@@ -145,7 +145,7 @@ const RETRYABLE_READ_ERROR_PREFIX: &str = "__MTXDB_RETRYABLE_READ__: ";
 
 /// Preserve journal contention as a retryable Python I/O error. Other storage
 /// failures remain runtime errors so corruption is never retried as contention.
-fn map_read_storage_error(error: StorageError) -> PyErr {
+pub(crate) fn map_read_storage_error(error: StorageError) -> PyErr {
     let retryable = matches!(
         &error,
         StorageError::Io(io_error) if io_error.kind() == std::io::ErrorKind::WouldBlock

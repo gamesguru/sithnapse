@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 
 use super::mtxdb_syn::{
     assert_writable, auth_chain_db, begin_internal_transaction, event_locator_collection_id,
-    event_node_id, map_transaction_error, prev_edges_room_id,
+    event_node_id, map_read_storage_error, map_transaction_error, prev_edges_room_id,
 };
 
 /// The read/write surface `event_edges_put` needs, common to a direct engine
@@ -444,6 +444,13 @@ fn write_edges(
 }
 
 /// Read backward edges: given event_ids, returns `(event_id, Option<[(prev_event_id, is_state)]>)`
+///
+/// Reads via `get_read_committed`, not plain `get_many`: a plain read only
+/// sees the read-journal overlay while a transaction is actively publishing
+/// (`overlay_reads_active`), so a reader process already open before a
+/// writer's commit could otherwise miss it until its own next refresh --
+/// see `res/docs/2026-09-28-event-edge-cross-process-read-visibility.md`,
+/// which measured and confirmed this for the plain path.
 #[pyfunction]
 #[allow(clippy::type_complexity)]
 pub fn event_edges_get_backward(
@@ -470,9 +477,9 @@ pub fn event_edges_get_backward(
         let mut room_collections: Vec<Option<[u8; 16]>> = vec![None; event_ids.len()];
         for (collection, ids) in locator_ids {
             let node_ids_only: Vec<NodeId> = ids.iter().map(|(_, id)| *id).collect();
-            let found = engine.get_many(&collection, &node_ids_only).map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {e}"))
-            })?;
+            let found = engine
+                .get_read_committed(&collection, &node_ids_only)
+                .map_err(map_read_storage_error)?;
             for ((position, _), value) in ids.into_iter().zip(found) {
                 if let Some(data) = value {
                     if !data.bytes.is_empty() {
@@ -499,9 +506,9 @@ pub fn event_edges_get_backward(
         let mut results: Vec<Option<Vec<(String, bool)>>> = vec![None; event_ids.len()];
         for (collection, ids) in dag_ids {
             let node_ids_only: Vec<NodeId> = ids.iter().map(|(_, id)| *id).collect();
-            let found = engine.get_many(&collection, &node_ids_only).map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {e}"))
-            })?;
+            let found = engine
+                .get_read_committed(&collection, &node_ids_only)
+                .map_err(map_read_storage_error)?;
             for ((position, _), value) in ids.into_iter().zip(found) {
                 if let Some(data) = value {
                     if !data.bytes.is_empty() {
@@ -516,6 +523,9 @@ pub fn event_edges_get_backward(
 }
 
 /// Read forward edges: given prev_event_ids, returns `(prev_event_id, Option<[child_event_id]>)`
+///
+/// Reads via `get_read_committed`, not plain `get_many` -- see
+/// `event_edges_get_backward`'s doc comment for why.
 #[pyfunction]
 pub fn event_edges_get_forward(
     py: Python<'_>,
@@ -541,9 +551,9 @@ pub fn event_edges_get_forward(
         let mut room_collections: Vec<Option<[u8; 16]>> = vec![None; prev_event_ids.len()];
         for (collection, ids) in locator_ids {
             let node_ids_only: Vec<NodeId> = ids.iter().map(|(_, id)| *id).collect();
-            let found = engine.get_many(&collection, &node_ids_only).map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {e}"))
-            })?;
+            let found = engine
+                .get_read_committed(&collection, &node_ids_only)
+                .map_err(map_read_storage_error)?;
             for ((position, _), value) in ids.into_iter().zip(found) {
                 if let Some(data) = value {
                     if !data.bytes.is_empty() {
@@ -571,9 +581,9 @@ pub fn event_edges_get_forward(
         let mut results: Vec<Option<Vec<String>>> = vec![None; prev_event_ids.len()];
         for (collection, ids) in &dag_ids {
             let node_ids_only: Vec<NodeId> = ids.iter().map(|(_, id)| *id).collect();
-            let found = engine.get_many(collection, &node_ids_only).map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {e}"))
-            })?;
+            let found = engine
+                .get_read_committed(collection, &node_ids_only)
+                .map_err(map_read_storage_error)?;
             for ((position, _), value) in ids.iter().zip(found) {
                 if let Some(data) = value {
                     if !data.bytes.is_empty() {
@@ -626,10 +636,8 @@ pub fn event_edges_get_forward(
                 .map(|child| event_edges_backward_node_id(&namespace, child))
                 .collect();
             let found = engine
-                .get_many(collection, &backward_node_ids)
-                .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get_many error: {e}"))
-                })?;
+                .get_read_committed(collection, &backward_node_ids)
+                .map_err(map_read_storage_error)?;
             for (child, value) in children.iter().zip(found) {
                 let status = value.map(|data| !data.bytes.is_empty());
                 live.insert((*collection, child.clone()), status);
