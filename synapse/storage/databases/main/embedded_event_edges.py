@@ -290,6 +290,76 @@ def embedded_event_edges_is_writable(hs: HomeServer) -> bool:
     )
 
 
+# Flip to True only in the same release that actually removes the SQL
+# ``event_edges`` INSERT (``_handle_mult_prev_events``,
+# ``synapse/storage/databases/main/events.py``) and the SQL fallback reads in
+# ``get_successor_events``/``is_event_next_to_forward_gap``. Until then this
+# stays False and `check_event_edges_migration_complete` is a deliberate
+# no-op -- there is nothing to protect yet, since the SQL fallback still
+# covers every server regardless of migration progress. See
+# `res/docs/2026-09-28-event-edges-sql-removal-plan.md`'s "Blocker 1":
+# a server that upgrades to the insert-dropping release while still
+# mid-migration would have rows that exist only in mtxdb, with nothing left
+# to fall back to -- this is the hard precondition that catches that,
+# modeled on `prepare_database.py`'s worker schema-version check
+# (`UpgradeDatabaseException`/`OUTDATED_SCHEMA_ON_WORKER_ERROR`), but for the
+# events-stream writer specifically rather than every worker, and checked
+# after the async datastore layer is up (`has_completed_background_update`
+# needs it) rather than during synchronous schema prep.
+EVENT_EDGES_SQL_INSERT_REMOVED = False
+
+
+class EventEdgesMigrationIncompleteError(Exception):
+    """Raised by `check_event_edges_migration_complete` when this process is
+    the events-stream writer, the SQL `event_edges` insert has been removed
+    (`EVENT_EDGES_SQL_INSERT_REMOVED = True`), and
+    `event_edges_migrate_mtxdb` has not finished on this server.
+
+    Deliberately a plain exception, not a process exit: the caller (expected
+    to be a fatal startup check, e.g. `synapse.app._base.start`) decides how
+    to fail the process. Keeping the decision here pure and the exit
+    mechanism at the call site is what makes this testable without a real
+    `sys.exit` in the test run.
+    """
+
+
+async def check_event_edges_migration_complete(hs: HomeServer) -> None:
+    """Fatal precondition for the release that removes the SQL `event_edges`
+    insert: refuse to let this process act as the events-stream writer
+    unless `event_edges_migrate_mtxdb` has already finished on this server.
+
+    A no-op today (`EVENT_EDGES_SQL_INSERT_REMOVED` is False) and a no-op on
+    every process that isn't the events-stream writer -- workers don't write
+    `event_edges` themselves, and a schema-version mismatch on an outdated
+    worker is already caught elsewhere
+    (`prepare_database.py`'s `OUTDATED_SCHEMA_ON_WORKER_ERROR`).
+
+    Raises:
+        EventEdgesMigrationIncompleteError: if this process is the writer,
+            the SQL insert has been removed, and the migration is incomplete.
+    """
+    if not EVENT_EDGES_SQL_INSERT_REMOVED:
+        return
+    if not embedded_event_edges_is_writable(hs):
+        return
+
+    store = hs.get_datastores().main
+    if await store.db_pool.updates.has_completed_background_update(
+        "event_edges_migrate_mtxdb"
+    ):
+        return
+
+    raise EventEdgesMigrationIncompleteError(
+        "This server has not finished migrating event_edges rows into the "
+        "embedded mtxdb engine (background update 'event_edges_migrate_mtxdb'), "
+        "but this release no longer writes event_edges to SQL. Starting "
+        "would leave rows written from this point on with no SQL fallback "
+        "and no proof mtxdb already has everything written before it.\n\n"
+        "Run the migration to completion before starting this version:\n"
+        "    update_synapse_database --run-background-updates"
+    )
+
+
 def put_event_edges_batch(
     namespace: str,
     rows: Iterable[EdgeRow],

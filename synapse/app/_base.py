@@ -672,6 +672,20 @@ async def start(hs: "HomeServer", *, freeze: bool = True) -> None:
     server_name = hs.hostname
     reactor = hs.get_reactor()
 
+    # Fatal precondition for the (not-yet-shipped) release that removes the
+    # SQL event_edges insert -- a no-op today, see
+    # embedded_event_edges.EVENT_EDGES_SQL_INSERT_REMOVED and
+    # res/docs/2026-09-28-event-edges-sql-removal-plan.md's "Blocker 1".
+    from synapse.storage.databases.main.embedded_event_edges import (
+        EventEdgesMigrationIncompleteError,
+        check_event_edges_migration_complete,
+    )
+
+    try:
+        await check_event_edges_migration_complete(hs)
+    except EventEdgesMigrationIncompleteError as e:
+        quit_with_error(str(e))
+
     # We want to use a separate thread pool for the resolver so that large
     # numbers of DNS requests don't starve out other users of the threadpool.
     resolver_threadpool = ThreadPool(name="gai_resolver")
