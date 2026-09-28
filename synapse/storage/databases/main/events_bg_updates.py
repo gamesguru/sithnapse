@@ -335,8 +335,8 @@ class EventsBackgroundUpdatesStore(
         )
 
         self.db_pool.updates.register_background_update_handler(
-            _BackgroundUpdates.EVENT_EDGES_BACKFILL_MTXDB,
-            self._background_backfill_event_edges_mtxdb,
+            _BackgroundUpdates.EVENT_EDGES_MIGRATE_MTXDB,
+            self._background_migrate_event_edges_mtxdb,
         )
 
         self.db_pool.updates.register_background_update_handler(
@@ -2032,7 +2032,7 @@ class EventsBackgroundUpdatesStore(
 
         return batch_size
 
-    async def _background_backfill_event_edges_mtxdb(
+    async def _background_migrate_event_edges_mtxdb(
         self, progress: JsonDict, batch_size: int
     ) -> int:
         """Mirror pre-existing `event_edges` rows into the embedded engine.
@@ -2048,7 +2048,7 @@ class EventsBackgroundUpdatesStore(
         miss silently returning nothing for a legacy row nobody has read yet.
 
         A no-op (ends immediately) unless the embedded edges engine is both
-        enabled and writable on this process -- there is nothing to backfill
+        enabled and writable on this process -- there is nothing to migrate
         into otherwise, and only the events-stream writer may write it.
 
         Same windowed-batch shape as `_background_drop_invalid_event_edges_rows`:
@@ -2062,13 +2062,13 @@ class EventsBackgroundUpdatesStore(
             self, "_embedded_event_edges_writable", False
         ):
             await self.db_pool.updates._end_background_update(
-                _BackgroundUpdates.EVENT_EDGES_BACKFILL_MTXDB
+                _BackgroundUpdates.EVENT_EDGES_MIGRATE_MTXDB
             )
             return 0
 
         last_event_id = progress.get("last_event_id", "")
 
-        def backfill_txn(
+        def migrate_txn(
             txn: LoggingTransaction,
         ) -> tuple[bool, list[tuple[str, str, str, bool]]]:
             """Returns (done, rows) for this batch."""
@@ -2120,7 +2120,7 @@ class EventsBackgroundUpdatesStore(
             return endpoint is None, rows
 
         done, rows = await self.db_pool.runInteraction(
-            desc="backfill_event_edges_mtxdb_read", func=backfill_txn
+            desc="migrate_event_edges_mtxdb_read", func=migrate_txn
         )
 
         if rows:
@@ -2133,16 +2133,16 @@ class EventsBackgroundUpdatesStore(
 
         if done:
             await self.db_pool.updates._end_background_update(
-                _BackgroundUpdates.EVENT_EDGES_BACKFILL_MTXDB
+                _BackgroundUpdates.EVENT_EDGES_MIGRATE_MTXDB
             )
             return len(rows) or batch_size
 
         last_event_id = rows[-1][1] if rows else last_event_id
         await self.db_pool.runInteraction(
-            desc="backfill_event_edges_mtxdb_progress",
+            desc="migrate_event_edges_mtxdb_progress",
             func=lambda txn: self.db_pool.updates._background_update_progress_txn(
                 txn,
-                _BackgroundUpdates.EVENT_EDGES_BACKFILL_MTXDB,
+                _BackgroundUpdates.EVENT_EDGES_MIGRATE_MTXDB,
                 {"last_event_id": last_event_id},
             ),
         )

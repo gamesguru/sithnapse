@@ -33,7 +33,7 @@ class _BackgroundUpdates:
 
     EVENT_EDGES_DROP_INVALID_ROWS = "event_edges_drop_invalid_rows"
     EVENT_EDGES_REPLACE_INDEX = "event_edges_replace_index"
-    EVENT_EDGES_BACKFILL_MTXDB = "event_edges_backfill_mtxdb"
+    EVENT_EDGES_MIGRATE_MTXDB = "event_edges_migrate_mtxdb"
 
     EVENTS_POPULATE_STATE_KEY_REJECTIONS = "events_populate_state_key_rejections"
 

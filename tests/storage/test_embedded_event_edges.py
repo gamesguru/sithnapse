@@ -1203,8 +1203,8 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         self.assertIn(c_id, fwd_repaired.get(p_id) or [])
 
     @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
-    def test_backfill_mtxdb_background_update_mirrors_legacy_rows(self) -> None:
-        """`_background_backfill_event_edges_mtxdb` mirrors `event_edges` rows
+    def test_migrate_mtxdb_background_update_mirrors_legacy_rows(self) -> None:
+        """`_background_migrate_event_edges_mtxdb` mirrors `event_edges` rows
         that predate the embedded engine being enabled -- simulated here by
         writing SQL-only (mirror disabled) before turning the engine back on,
         the same shape as a server enabling it after already running."""
@@ -1238,7 +1238,7 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
             self.store.db_pool.simple_insert(
                 table="background_updates",
                 values={
-                    "update_name": "event_edges_backfill_mtxdb",
+                    "update_name": "event_edges_migrate_mtxdb",
                     "progress_json": "{}",
                 },
             )
@@ -1263,14 +1263,14 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         )
 
     @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
-    def test_get_successor_events_gates_on_backfill_completion(self) -> None:
+    def test_get_successor_events_gates_on_mtxdb_migration_completion(self) -> None:
         """A parent with two children -- one legacy (SQL-only, predates the
         mirror), one mirrored (a live post-enable write) -- gives mtxdb a
         forward list that is non-empty but *incomplete*: `[mirrored_child]`,
         missing `legacy_child`. `get_successor_events`'s fallback is
         miss-triggered (`successors is not None`), so it cannot detect a
         partial hit as anything other than a hit. Confirms it does not try:
-        while `event_edges_backfill_mtxdb` is incomplete, both children must
+        while `event_edges_migrate_mtxdb` is incomplete, both children must
         come back (the all-SQL path, gated shut); once complete, both must
         still come back (mtxdb now has both, backfill covered the legacy
         one)."""
@@ -1313,23 +1313,23 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         raw_forward = get_event_edges_forward_batch(ns, [parent_id])
         self.assertEqual(raw_forward.get(parent_id), [mirrored_child])
 
-        # event_edges_backfill_mtxdb is not registered as pending in a fresh
+        # event_edges_migrate_mtxdb is not registered as pending in a fresh
         # test DB (it's marked complete, like every other background update),
         # so has_completed_background_update already reports True. Reinsert
         # it and reset the cache to actually exercise the gate being closed
-        # (test_backfill_mtxdb_background_update_mirrors_legacy_rows's idiom).
+        # (test_migrate_mtxdb_background_update_mirrors_legacy_rows's idiom).
         self.get_success(
             self.store.db_pool.simple_insert(
                 table="background_updates",
                 values={
-                    "update_name": "event_edges_backfill_mtxdb",
+                    "update_name": "event_edges_migrate_mtxdb",
                     "progress_json": "{}",
                 },
             )
         )
         self.store.db_pool.updates._all_done = False
         self.store.db_pool.updates._completed_background_updates.discard(
-            "event_edges_backfill_mtxdb"
+            "event_edges_migrate_mtxdb"
         )
 
         # Gate closed: must take the all-SQL path and return both children,
@@ -1354,9 +1354,11 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         )
 
     @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
-    def test_is_event_next_to_forward_gap_gates_on_backfill_completion(self) -> None:
+    def test_is_event_next_to_forward_gap_gates_on_mtxdb_migration_completion(
+        self,
+    ) -> None:
         """Same partial-hit shape as
-        `test_get_successor_events_gates_on_backfill_completion`, for
+        `test_get_successor_events_gates_on_mtxdb_migration_completion`, for
         `is_event_next_to_forward_gap`'s independent gate
         (`embedded_edges_trustworthy`, resolved before `runInteraction` since
         its txn closure is sync). `parent` has a real (non-rejected) child,
@@ -1399,14 +1401,14 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
             self.store.db_pool.simple_insert(
                 table="background_updates",
                 values={
-                    "update_name": "event_edges_backfill_mtxdb",
+                    "update_name": "event_edges_migrate_mtxdb",
                     "progress_json": "{}",
                 },
             )
         )
         self.store.db_pool.updates._all_done = False
         self.store.db_pool.updates._completed_background_updates.discard(
-            "event_edges_backfill_mtxdb"
+            "event_edges_migrate_mtxdb"
         )
 
         self.assertFalse(

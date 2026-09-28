@@ -2686,7 +2686,7 @@ class EventFederationWorkerStore(
         Args:
             event_id: The event to search for as a prev_event.
         """
-        # Gated on the event_edges_backfill_mtxdb background update (mirrors
+        # Gated on the event_edges_migrate_mtxdb background update (mirrors
         # pre-existing SQL-only event_edges rows into mtxdb -- unrelated to
         # Matrix federation backfill, which this function's caller feeds
         # into), not just on the engine being enabled. event_edges_put only
@@ -2702,7 +2702,7 @@ class EventFederationWorkerStore(
         if getattr(
             self, "_embedded_event_edges_enabled", False
         ) and await self.db_pool.updates.has_completed_background_update(
-            "event_edges_backfill_mtxdb"
+            "event_edges_migrate_mtxdb"
         ):
             from synapse.storage.databases.main.embedded_event_edges import (
                 get_event_edges_forward_batch,

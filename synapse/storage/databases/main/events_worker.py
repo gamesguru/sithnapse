@@ -2585,7 +2585,7 @@ class EventsWorkerStore(SQLBaseStore):
         )
 
         # Resolved before runInteraction: the txn closure below is sync, and
-        # this check is async. Gated on the event_edges_backfill_mtxdb
+        # this check is async. Gated on the event_edges_migrate_mtxdb
         # background update (mirrors pre-existing SQL-only event_edges rows
         # into mtxdb -- unrelated to Matrix federation backfill, what this
         # gap check itself feeds into), not just on the engine being enabled
@@ -2597,7 +2597,7 @@ class EventsWorkerStore(SQLBaseStore):
         embedded_edges_trustworthy = getattr(
             self, "_embedded_event_edges_enabled", False
         ) and await self.db_pool.updates.has_completed_background_update(
-            "event_edges_backfill_mtxdb"
+            "event_edges_migrate_mtxdb"
         )
 
         def is_event_next_to_gap_txn(txn: LoggingTransaction) -> bool:

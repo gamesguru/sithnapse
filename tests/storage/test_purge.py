@@ -270,10 +270,10 @@ class PurgeTests(HomeserverTestCase):
 
         self._assert_mirrors(engine, namespace, target["event_id"], present=False)
 
-    def test_purge_history_tombstones_never_backfilled_edge(self) -> None:
+    def test_purge_history_tombstones_never_migrated_edge(self) -> None:
         """A purged event that was never mirrored into mtxdb (the shape a
         pre-existing/legacy event_edges row has before
-        `event_edges_backfill_mtxdb` runs) still gets correctly tombstoned:
+        `event_edges_migrate_mtxdb` runs) still gets correctly tombstoned:
         purge computes its purge set from SQL `events`, not from whether
         mtxdb has already seen the row, so there is no gap here for
         `res/docs/2026-09-20-events-table-deprecation-plan.md`'s "make purge

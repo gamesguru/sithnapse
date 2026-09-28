@@ -14,6 +14,6 @@
 -- Mirror pre-existing `event_edges` rows into the embedded mtxdb engine, for
 -- servers that enabled it after already running (or before this backfill
 -- existed). A no-op when the embedded edges engine isn't enabled/writable on
--- this process -- see `_background_backfill_event_edges_mtxdb`.
+-- this process -- see `_background_migrate_event_edges_mtxdb`.
 INSERT INTO background_updates (ordering, update_name, progress_json) VALUES
-  (9505, 'event_edges_backfill_mtxdb', '{}');
+  (9505, 'event_edges_migrate_mtxdb', '{}');
