@@ -968,7 +968,7 @@ dependencies = [
 [[package]]
 name = "mtxdb"
 version = "0.1.0-beta.2"
-source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=refactor%2Fpack-id-store-layout#51e76eb8de1b69672ed3d26606a0e7ac298aa298"
+source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=refactor%2Fpack-id-store-layout#f4592466566d2451bf001aa19a25585794bb17d0"
 dependencies = [
  "arc-swap",
  "blake3",
@@ -1382,7 +1382,7 @@ dependencies = [
 [[package]]
 name = "rezzy"
 version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#a95979264070f91b822d771bad59c0d818ec110e"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#6be6adeb0f5071c2429caa5d1fc6b6ace5cec71d"
 dependencies = [
  "base64 0.22.1",
  "blake2",
@@ -1397,7 +1397,7 @@ dependencies = [
 [[package]]
 name = "rezzy-json"
 version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#a95979264070f91b822d771bad59c0d818ec110e"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#6be6adeb0f5071c2429caa5d1fc6b6ace5cec71d"
 dependencies = [
  "ryu",
 ]
