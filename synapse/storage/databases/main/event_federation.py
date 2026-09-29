@@ -2706,7 +2706,7 @@ class EventFederationWorkerStore(
         ):
             from synapse.storage.databases.main.embedded_event_edges import (
                 get_event_edges_forward_batch,
-                queue_edge_write,
+                repair_edge_index_from_sql,
             )
 
             room_id = await self.db_pool.simple_select_one_onecol(
@@ -2753,18 +2753,13 @@ class EventFederationWorkerStore(
                         desc="get_successor_events_room_id",
                     )
                     if room_id:
-                        queue_edge_write(
+                        await repair_edge_index_from_sql(
+                            self,
                             self._embedded_db_namespace,
-                            [
-                                (room_id, succ_id, event_id, False)
-                                for succ_id in sql_res
-                            ],
+                            room_id,
+                            event_id,
+                            sql_res,
                         )
-                        # The row joins the per-namespace coalescing queue; the
-                        # flush coalescer drains it within its debounce window.
-                        # Reads before then fall back to SQL, which already
-                        # covered this miss, so a following read of the same
-                        # event stays correct.
                         ffi_count("event_edges_successor_repairs", len(sql_res))
                 except Exception:
                     logger.debug(

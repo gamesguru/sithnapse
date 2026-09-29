@@ -137,6 +137,42 @@ def record_edge_index_deletes_txn(db_pool: Any, txn: Any, event_ids: list[str]) 
         )
 
 
+def record_edge_index_repairs_txn(
+    db_pool: Any,
+    txn: Any,
+    room_id: str,
+    prev_event_id: str,
+    event_ids: list[str],
+) -> int | None:
+    """Add a SQL-fallback repair to the room's ordered forward-index outbox.
+
+    The repair gets a fresh room source version, just like a normal edge
+    mutation. The outbox drainer can then apply it together with every earlier
+    pending room mutation before advancing the FWD completeness watermark.
+    """
+    event_ids = list(dict.fromkeys(event_ids))
+    if not event_ids:
+        return None
+
+    source_version = bump_room_edge_source_version(txn, room_id)
+    db_pool.simple_insert_many_txn(
+        txn,
+        table="edge_index_outbox",
+        keys=(
+            "room_id",
+            "source_version",
+            "event_id",
+            "prev_event_id",
+            "operation",
+        ),
+        values=[
+            (room_id, source_version, event_id, prev_event_id, "insert")
+            for event_id in event_ids
+        ],
+    )
+    return source_version
+
+
 # ---------------------------------------------------------------------------
 # Edge write coalescer
 # ---------------------------------------------------------------------------
@@ -722,7 +758,11 @@ def get_event_edges_forward_batch(
 
 
 async def drain_edge_index_outbox(
-    store: Any, limit: int = 256, *, namespace: str = "synapse"
+    store: Any,
+    limit: int = 256,
+    *,
+    namespace: str = "synapse",
+    room_id: str | None = None,
 ) -> bool:
     """Publish one room's durable edge mutations into the active FWD generation.
 
@@ -735,10 +775,17 @@ async def drain_edge_index_outbox(
         return False
 
     def _room(txn: Any) -> str | None:
-        txn.execute(
-            "SELECT room_id FROM edge_index_outbox "
-            "ORDER BY room_id, source_version LIMIT 1"
-        )
+        if room_id is None:
+            txn.execute(
+                "SELECT room_id FROM edge_index_outbox "
+                "ORDER BY room_id, source_version LIMIT 1"
+            )
+        else:
+            txn.execute(
+                "SELECT room_id FROM edge_index_outbox "
+                "WHERE room_id = ? ORDER BY source_version LIMIT 1",
+                (room_id,),
+            )
         row = txn.fetchone()
         return None if row is None else str(row[0])
 
@@ -832,6 +879,43 @@ async def drain_edge_index_outbox(
         await store.db_pool.runInteraction("edge_outbox_ack", _ack_through, max_version)
         ffi_count("event_edges_outbox_rows", len(rows))
         return True
+
+
+async def repair_edge_index_from_sql(
+    store: Any,
+    namespace: str,
+    room_id: str,
+    prev_event_id: str,
+    event_ids: list[str],
+) -> None:
+    """Repair a SQL-fallback miss through the ordered FWD outbox.
+
+    The PREV mirror is still queued for compatibility, while the repair is
+    recorded as a fresh SQL outbox version. Draining that room applies all
+    earlier pending changes before it advances the FWD completeness watermark;
+    a parent-only repair must never claim the room-wide index is complete.
+    """
+
+    def _enqueue_repair(txn: Any) -> int | None:
+        return record_edge_index_repairs_txn(
+            store.db_pool, txn, room_id, prev_event_id, event_ids
+        )
+
+    source_version = await store.db_pool.runInteraction(
+        "record_edge_index_repair", _enqueue_repair
+    )
+    if source_version is None:
+        return
+
+    queue_edge_write(
+        namespace,
+        [(room_id, event_id, prev_event_id, False) for event_id in event_ids],
+    )
+    # The ordinary worker continues draining other rooms. Target this room so
+    # a successful repair can make the next gated read an embedded hit now.
+    # Any incomplete backlog remains durable in SQL and is picked up by the
+    # regular worker; the current request already has its correct SQL result.
+    await drain_edge_index_outbox(store, namespace=namespace, room_id=room_id)
 
 
 async def acquire_rebuild_checkpoint(

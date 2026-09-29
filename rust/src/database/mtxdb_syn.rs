@@ -1791,8 +1791,10 @@ pub fn room_forward_meta_get(room_id: String) -> PyResult<Option<(u32, u64)>> {
     read_room_forward_meta(&room_id)
 }
 
-#[pyfunction]
-pub fn room_forward_meta_put(
+/// Low-level generation pointer/coverage write. Call only after the referenced
+/// generation has been fully populated and caught up. Active-generation delta
+/// writes must update FWD and metadata together through the transaction API.
+pub(crate) fn room_forward_meta_put(
     room_id: String,
     active_generation: u32,
     published_source_version: u64,
@@ -4569,7 +4571,6 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(auth_chain_children_append, m)?)?;
     m.add_function(wrap_pyfunction!(auth_chain_purge_room, m)?)?;
     m.add_function(wrap_pyfunction!(room_forward_meta_get, m)?)?;
-    m.add_function(wrap_pyfunction!(room_forward_meta_put, m)?)?;
     m.add_function(wrap_pyfunction!(batch_get, m)?)?;
     m.add_function(wrap_pyfunction!(batch_put, m)?)?;
     m.add_function(wrap_pyfunction!(batch_delete, m)?)?;
