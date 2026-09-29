@@ -19,7 +19,7 @@
 #
 #
 
-SCHEMA_VERSION = 95  # remember to update the list below when updating
+SCHEMA_VERSION = 96  # remember to update the list below when updating
 """Represents the expectations made by the codebase about the database schema
 
 This should be incremented whenever the codebase changes its requirements on the
@@ -187,6 +187,10 @@ Changes in SCHEMA_VERSION = 95
     - Change `delayed_events` primary key to be globally unique rather than
       scoped to a user localpart (MSC4140).
 
+Changes in SCHEMA_VERSION = 96
+    - Add room edge source versions and a durable outbox for the embedded
+      forward-edge index publication bridge.
+
 """
 
 
@@ -194,7 +198,7 @@ SCHEMA_COMPAT_VERSION = (
     # HAMT state roots are authoritative in the embedded engine when one is
     # configured, and delayed-event IDs are globally unique rather than
     # scoped to a user localpart.
-    95
+    96
 )
 """Limit on how far the synapse codebase can be rolled back without breaking db compat
 

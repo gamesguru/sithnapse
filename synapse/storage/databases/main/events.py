@@ -4304,6 +4304,54 @@ class PersistEventsStore:
             ],
         )
 
+        # Keep the authoritative SQL edge write, its per-room source version,
+        # and the embedded-index publication mutations in one transaction.
+        # The outbox is deliberately populated even when the embedded engine
+        # is disabled: it makes enabling the publisher later a resumable,
+        # database-backed operation rather than a best-effort mirror.
+        edges_by_room: dict[str, list[tuple[str, str]]] = collections.defaultdict(list)
+        for event in events:
+            edges_by_room[event.room_id].extend(
+                (event.event_id, prev_event_id)
+                for prev_event_id in event.prev_event_ids()
+            )
+
+        for room_id, room_edges in edges_by_room.items():
+            if not room_edges:
+                continue
+
+            # Keep the outbox key idempotent if an input batch repeats an
+            # identical prev-event edge.
+            room_edges = list(dict.fromkeys(room_edges))
+            txn.execute(
+                "SELECT source_version FROM room_edge_source_version WHERE room_id = ?",
+                (room_id,),
+            )
+            row = txn.fetchone()
+            source_version = (int(row[0]) if row is not None else 0) + 1
+
+            self.db_pool.simple_upsert_txn(
+                txn,
+                table="room_edge_source_version",
+                keyvalues={"room_id": room_id},
+                values={"source_version": source_version},
+            )
+            self.db_pool.simple_insert_many_txn(
+                txn,
+                table="edge_index_outbox",
+                keys=(
+                    "room_id",
+                    "source_version",
+                    "event_id",
+                    "prev_event_id",
+                    "operation",
+                ),
+                values=[
+                    (room_id, source_version, event_id, prev_event_id, "I")
+                    for event_id, prev_event_id in room_edges
+                ],
+            )
+
         if self._embedded_event_edges_writable:
             edge_rows = [
                 (ev.room_id, ev.event_id, e_id, False)
