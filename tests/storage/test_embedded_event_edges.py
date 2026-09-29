@@ -13,12 +13,11 @@
 #
 
 import atexit
-import os
 import shutil
 import tempfile
 import threading
 from typing import Any
-from unittest import mock, skipIf, skipUnless
+from unittest import mock, skipUnless
 
 from twisted.test.proto_helpers import MemoryReactor
 
@@ -56,10 +55,6 @@ from tests import unittest
 from tests.server import ThreadedMemoryReactorClock
 from tests.unittest import HomeserverTestCase
 from tests.utils import EMBEDDED_DB_ENGINE, EMBEDDED_DB_PATH
-
-_SKIP_MTXDB_EDGE_MIGRATION_TESTS = (
-    os.environ.get("SYNAPSE_TEST_SKIP_EVENT_EDGES_MIGRATION_WORK") == "1"
-)
 
 if EMBEDDED_DB_ENGINE and EMBEDDED_DB_PATH:
     # The test harness has already selected a worker-specific store. Reuse
@@ -1210,7 +1205,6 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         self.assertIn(c_id, fwd_repaired.get(p_id) or [])
 
     @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
-    @skipIf(_SKIP_MTXDB_EDGE_MIGRATION_TESTS, "migration work skipped for benchmark")
     def test_migrate_mtxdb_background_update_mirrors_legacy_rows(self) -> None:
         """`_background_migrate_event_edges_mtxdb` mirrors `event_edges` rows
         that predate the embedded engine being enabled -- simulated here by
@@ -1271,7 +1265,6 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         )
 
     @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
-    @skipIf(_SKIP_MTXDB_EDGE_MIGRATION_TESTS, "migration work skipped for benchmark")
     def test_get_successor_events_gates_on_mtxdb_migration_completion(self) -> None:
         """A parent with two children -- one legacy (SQL-only, predates the
         mirror), one mirrored (a live post-enable write) -- gives mtxdb a
@@ -1363,7 +1356,6 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         )
 
     @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
-    @skipIf(_SKIP_MTXDB_EDGE_MIGRATION_TESTS, "migration work skipped for benchmark")
     def test_is_event_next_to_forward_gap_gates_on_mtxdb_migration_completion(
         self,
     ) -> None:
