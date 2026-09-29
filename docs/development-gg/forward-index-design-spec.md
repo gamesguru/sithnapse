@@ -53,14 +53,58 @@ pub fn forward_edges_room_gen_id(room_id: &str, generation: u64) -> [u8; 16] {
 
 ## 3. Protocol Specification
 
-### 3.1 Reader Path (`get_forward_edges`)
+### 3.1 Reader Path & FFI Contract (`get_forward_edges`)
 
-1. Read `source_version` from SQL / cache, and read `(active_generation, published_source_version)` from `room_forward_meta`.
-2. **Validity Check:**
-   * If `published_source_version == source_version`:
-     Query `forward_edges_v2` at `forward_edges_room_gen_id(room_id, active_generation)`.
-   * If `published_source_version != source_version` (outbox lagging or worker crashed post-commit):
-     Route query to primary SQL fallback (or trigger immediate outbox drain).
+The reader path uses **Option B (Context Passing)** to pass `(room_id, expected_source_version)` into Rust, keeping gate validation and collection scanning co-located within the mtxdb engine:
+
+```rust
+pub enum ForwardReadResult {
+    /// mtxdb is fully caught up; returns forward edges directly.
+    Hit(Vec<ForwardEdgeRecord>),
+    /// mtxdb is lagging (published_version != expected_version) or uninitialized.
+    /// Caller falls back to SQL query.
+    VersionMismatch {
+        published_version: u64,
+        expected_version: u64,
+    },
+    /// Internal engine error.
+    Error(String),
+}
+
+pub fn event_edges_get_forward(
+    prev_event_ids: &[EventId],
+    room_id: &[u8; 32],
+    expected_source_version: u64,
+) -> ForwardReadResult {
+    let meta = match get_room_forward_meta(room_id) {
+        Ok(Some(meta)) => meta,
+        Ok(None) => {
+            return ForwardReadResult::VersionMismatch {
+                published_version: 0,
+                expected_version: expected_source_version,
+            };
+        }
+        Err(e) => return ForwardReadResult::Error(e.to_string()),
+    };
+
+    if meta.published_source_version != expected_source_version {
+        return ForwardReadResult::VersionMismatch {
+            published_version: meta.published_source_version,
+            expected_version: expected_source_version,
+        };
+    }
+
+    // Fast path: scan mtxdb FWD collection at active_generation
+    match scan_fwd_collection(room_id, meta.active_generation, prev_event_ids) {
+        Ok(edges) => ForwardReadResult::Hit(edges),
+        Err(e) => ForwardReadResult::Error(e.to_string()),
+    }
+}
+```
+
+1. Python reads `expected_source_version` from `room_edge_source_version` (or cached transaction state).
+2. Invokes `event_edges_get_forward(prev_event_ids, room_id, expected_source_version)`.
+3. If `Hit(edges)`, returns edges immediately. If `VersionMismatch`, records metrics and queries `event_edges` in SQL.
 
 ### 3.2 Live Writer Path (Outbox Publication)
 
