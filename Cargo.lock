@@ -846,11 +846,10 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jobserver"
-version = "0.1.35"
+version = "0.1.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c00acbd29eabad4a2392fa0e921c874934dbbf4194312ad20f04a0ed67a3cb3"
+checksum = "48d1dbcbbeb6a7fec7e059840aa538bd62aaccf972c7346c4d9d2059312853d0"
 dependencies = [
- "getrandom 0.4.3",
  "libc",
 ]
 
@@ -969,13 +968,14 @@ dependencies = [
 [[package]]
 name = "mtxdb"
 version = "0.1.0-beta.2"
-source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=feat%2Ftransactional-server-info-pool#c0075d942384b77358444721c6525226a40fa6d1"
+source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?rev=1df3043e67f4ed81fe8efa35b080aea05de28fb4#1df3043e67f4ed81fe8efa35b080aea05de28fb4"
 dependencies = [
  "arc-swap",
  "blake3",
  "bytes",
  "crc32fast",
  "fs2",
+ "jobserver",
  "memmap2",
  "parking_lot",
  "sha2",
@@ -1382,7 +1382,7 @@ dependencies = [
 [[package]]
 name = "rezzy"
 version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#1f5d9d33cefed42b8c58a0353b2183a755c5bd55"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#aa04265ced8e9bdb48412e0156b760acbaefe343"
 dependencies = [
  "base64 0.22.1",
  "blake2",
@@ -1398,7 +1398,7 @@ dependencies = [
 [[package]]
 name = "rezzy-json"
 version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#1f5d9d33cefed42b8c58a0353b2183a755c5bd55"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#aa04265ced8e9bdb48412e0156b760acbaefe343"
 dependencies = [
  "ryu",
 ]
@@ -1406,7 +1406,7 @@ dependencies = [
 [[package]]
 name = "rezzy-recon"
 version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#1f5d9d33cefed42b8c58a0353b2183a755c5bd55"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#aa04265ced8e9bdb48412e0156b760acbaefe343"
 dependencies = [
  "base64 0.22.1",
  "sha2",
@@ -1787,7 +1787,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

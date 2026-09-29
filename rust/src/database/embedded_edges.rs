@@ -1200,22 +1200,27 @@ fn apply_forward_delta(
     rows: Vec<(String, String, String)>,
 ) -> PyResult<()> {
     let collection = forward_edges_room_id(room_id, generation);
-    let mut deltas: HashMap<String, (HashSet<String>, HashSet<String>)> = HashMap::new();
+    // Fold the rows into a per-parent, per-child last-operation-wins map rather
+    // than a set of additions and removals. Rows arrive in `source_version`
+    // order, so a later row for the same `(parent, child)` pair overrides an
+    // earlier one regardless of operation. A pair of sets cannot express that:
+    // applying every removal before every addition would let an earlier insert
+    // resurrect a pair that a later delete removed.
+    let mut deltas: HashMap<String, HashMap<String, bool>> = HashMap::new();
     for (event_id, prev_event_id, operation) in rows {
-        let (additions, removals) = deltas.entry(prev_event_id).or_default();
-        match operation.as_str() {
-            "insert" => {
-                additions.insert(event_id);
-            }
-            "delete" => {
-                removals.insert(event_id);
-            }
+        let is_insert = match operation.as_str() {
+            "insert" => true,
+            "delete" => false,
             other => {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "unknown edge-index outbox operation: {other}"
                 )));
             }
-        }
+        };
+        deltas
+            .entry(prev_event_id)
+            .or_default()
+            .insert(event_id, is_insert);
     }
 
     let mut parents: Vec<String> = deltas.keys().cloned().collect();
@@ -1230,19 +1235,26 @@ fn apply_forward_delta(
 
     let mut puts = Vec::with_capacity(parents.len());
     for (parent, existing) in parents.into_iter().zip(existing) {
-        let (additions, removals) = deltas
+        let state = deltas
             .remove(&parent)
             .expect("every sorted parent has a delta");
         let mut children = match existing {
             Some(data) if !data.bytes.is_empty() => decode_forward_edges(&data.bytes)?,
             _ => Vec::new(),
         };
-        children.retain(|child| !removals.contains(child));
-        for child in additions {
-            if !children.iter().any(|existing| existing == &child) {
-                children.push(child);
+        for (child, is_insert) in state {
+            if is_insert {
+                if !children.iter().any(|existing| existing == &child) {
+                    children.push(child);
+                }
+            } else {
+                children.retain(|existing| existing != &child);
             }
         }
+        // Sort and dedup so the encoded payload is byte-stable across replays
+        // and independent of the (unordered) map iteration above.
+        children.sort_unstable();
+        children.dedup();
         puts.push((
             event_edges_forward_node_id(namespace, &parent),
             NodeData::new(bytes::Bytes::from(encode_forward_edges(&children))),

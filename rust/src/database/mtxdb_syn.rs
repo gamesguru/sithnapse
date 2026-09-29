@@ -1645,8 +1645,8 @@ pub(crate) fn room_forward_meta_node_id(room_id: &str) -> NodeId {
 pub(crate) fn encode_room_forward_meta(
     active_generation: u32,
     published_source_version: u64,
-) -> [u8; 20] {
-    let mut bytes = [0u8; 20];
+) -> [u8; 16] {
+    let mut bytes = [0u8; 16];
     bytes[0] = 1;
     bytes[4..8].copy_from_slice(&active_generation.to_be_bytes());
     bytes[8..16].copy_from_slice(&published_source_version.to_be_bytes());
@@ -1654,7 +1654,7 @@ pub(crate) fn encode_room_forward_meta(
 }
 
 fn decode_room_forward_meta(bytes: &[u8]) -> PyResult<(u32, u64)> {
-    if bytes.len() != 20 || bytes[0] != 1 || bytes[1..4] != [0, 0, 0] {
+    if bytes.len() != 16 || bytes[0] != 1 || bytes[1..4] != [0, 0, 0] {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
             "malformed room forward metadata",
         ));

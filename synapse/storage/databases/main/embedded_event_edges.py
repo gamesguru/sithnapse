@@ -66,6 +66,33 @@ logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 
 
+def bump_room_edge_source_version(txn: Any, room_id: str) -> int:
+    """Atomically increment and return a room's edge source version.
+
+    Both the insert and delete paths advance the version inside the caller's
+    SQL transaction, so the outbox rows and the version they are tagged with
+    commit or roll back together. The increment must be atomic: a read followed
+    by a write lets two concurrent transactions observe the same version and
+    both publish it, duplicating a version in the stream and breaking the
+    strictly-increasing replay cursor. `UPDATE ... RETURNING` (via an upsert on
+    first use) serializes writers on the row lock instead.
+    """
+    txn.execute(
+        """
+        INSERT INTO room_edge_source_version (room_id, source_version)
+        VALUES (?, 1)
+        ON CONFLICT (room_id) DO UPDATE
+        SET source_version = room_edge_source_version.source_version + 1
+        RETURNING source_version
+        """,
+        (room_id,),
+    )
+    row = txn.fetchone()
+    if row is None:
+        raise RuntimeError("room_edge_source_version upsert returned no row")
+    return int(row[0])
+
+
 def record_edge_index_deletes_txn(db_pool: Any, txn: Any, event_ids: list[str]) -> None:
     """Record edge deletions before SQL purge removes the source rows.
 
@@ -92,18 +119,7 @@ def record_edge_index_deletes_txn(db_pool: Any, txn: Any, event_ids: list[str]) 
 
     for room_id, rows in rows_by_room.items():
         rows = list(dict.fromkeys(rows))
-        txn.execute(
-            "SELECT source_version FROM room_edge_source_version WHERE room_id = ?",
-            (room_id,),
-        )
-        row = txn.fetchone()
-        source_version = (int(row[0]) if row is not None else 0) + 1
-        db_pool.simple_upsert_txn(
-            txn,
-            table="room_edge_source_version",
-            keyvalues={"room_id": room_id},
-            values={"source_version": source_version},
-        )
+        source_version = bump_room_edge_source_version(txn, room_id)
         db_pool.simple_insert_many_txn(
             txn,
             table="edge_index_outbox",

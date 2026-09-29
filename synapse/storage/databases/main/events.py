@@ -79,6 +79,7 @@ from synapse.storage.databases.main.embedded_common import (
     record_commit_phases,
 )
 from synapse.storage.databases.main.embedded_event_edges import (
+    bump_room_edge_source_version,
     embedded_event_edges_is_writable,
     open_embedded_event_edges_engine,
     queue_edge_write,
@@ -4323,19 +4324,7 @@ class PersistEventsStore:
             # Keep the outbox key idempotent if an input batch repeats an
             # identical prev-event edge.
             room_edges = list(dict.fromkeys(room_edges))
-            txn.execute(
-                "SELECT source_version FROM room_edge_source_version WHERE room_id = ?",
-                (room_id,),
-            )
-            row = txn.fetchone()
-            source_version = (int(row[0]) if row is not None else 0) + 1
-
-            self.db_pool.simple_upsert_txn(
-                txn,
-                table="room_edge_source_version",
-                keyvalues={"room_id": room_id},
-                values={"source_version": source_version},
-            )
+            source_version = bump_room_edge_source_version(txn, room_id)
             self.db_pool.simple_insert_many_txn(
                 txn,
                 table="edge_index_outbox",
