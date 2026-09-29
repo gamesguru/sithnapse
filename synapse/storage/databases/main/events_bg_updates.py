@@ -20,6 +20,7 @@
 #
 
 import logging
+import os
 from typing import TYPE_CHECKING, cast
 
 import attr
@@ -85,6 +86,42 @@ if TYPE_CHECKING:
     from synapse.server import HomeServer
 
 logger = logging.getLogger(__name__)
+
+
+# Benchmark-only kill switch for the event-edges migration's mirror work.
+#
+# `SYNAPSE_TEST_SKIP_EVENT_EDGES_MIGRATION_WORK=1` makes
+# `_background_migrate_event_edges_mtxdb` end its background update without
+# reading SQL `event_edges` or mirroring anything into mtxdb. The update stays
+# registered and still reaches the completed state, so
+# `has_completed_background_update("event_edges_migrate_mtxdb")` -- and the read
+# gate that depends on it -- resolves exactly as in a normal run; only the
+# migration work is removed. That isolates the migration's per-store cost in a
+# suite timing comparison without the completion-state confound of dropping its
+# registration.
+#
+# Off by default, and only equivalence-preserving on stores with no SQL-only
+# legacy rows to migrate. A run with it set must exclude the tests that drive
+# the migration to completion and assert a legacy row becomes visible through
+# it -- with the switch set, the row is never mirrored and those assertions
+# fail:
+#   tests/storage/test_embedded_event_edges.py::
+#     EventEdgesStorageIntegrationTestCase::
+#       test_migrate_mtxdb_background_update_mirrors_legacy_rows
+#       test_get_successor_events_gates_on_mtxdb_migration_completion
+#       test_is_event_next_to_forward_gap_gates_on_mtxdb_migration_completion
+# The `EventEdgesMigrationGateTestCase` tests and
+# `tests/storage/test_purge.py::PurgeTests::test_purge_history_tombstones_never_migrated_edge`
+# neither create legacy rows for it to mirror nor depend on the mirror work, so
+# they are safe with the switch set.
+_SKIP_EVENT_EDGES_MIGRATION_WORK_ENV = "SYNAPSE_TEST_SKIP_EVENT_EDGES_MIGRATION_WORK"
+
+
+def _skip_event_edges_migration_work() -> bool:
+    """Benchmark-only: skip the migration's mirror work but keep its
+    completion. See `_SKIP_EVENT_EDGES_MIGRATION_WORK_ENV`.
+    """
+    return os.environ.get(_SKIP_EVENT_EDGES_MIGRATION_WORK_ENV) == "1"
 
 
 _REPLACE_STREAM_ORDERING_SQL_COMMANDS = (
@@ -2058,6 +2095,17 @@ class EventsBackgroundUpdatesStore(
         deduplicates, a backward record overwrite is identical), so retrying
         a batch after a partial failure is safe.
         """
+        # Benchmark-only kill switch: keep the update registered and still end
+        # it (so completion -- and the read gate that depends on it -- resolves
+        # exactly as in a normal run) but skip the SQL read and mtxdb mirror
+        # work. Off by default; see `_SKIP_EVENT_EDGES_MIGRATION_WORK_ENV` for
+        # the tests a timing run must exclude while it is set.
+        if _skip_event_edges_migration_work():
+            await self.db_pool.updates._end_background_update(
+                _BackgroundUpdates.EVENT_EDGES_MIGRATE_MTXDB
+            )
+            return 0
+
         if not getattr(self, "_embedded_event_edges_enabled", False) or not getattr(
             self, "_embedded_event_edges_writable", False
         ):
