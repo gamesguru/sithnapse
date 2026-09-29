@@ -1382,7 +1382,7 @@ dependencies = [
 [[package]]
 name = "rezzy"
 version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#b3b1178730ac9880309a7e4e9cfa1372798e81fe"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#1f5d9d33cefed42b8c58a0353b2183a755c5bd55"
 dependencies = [
  "base64 0.22.1",
  "blake2",
@@ -1398,7 +1398,7 @@ dependencies = [
 [[package]]
 name = "rezzy-json"
 version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#b3b1178730ac9880309a7e4e9cfa1372798e81fe"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#1f5d9d33cefed42b8c58a0353b2183a755c5bd55"
 dependencies = [
  "ryu",
 ]
@@ -1406,7 +1406,7 @@ dependencies = [
 [[package]]
 name = "rezzy-recon"
 version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#b3b1178730ac9880309a7e4e9cfa1372798e81fe"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#1f5d9d33cefed42b8c58a0353b2183a755c5bd55"
 dependencies = [
  "base64 0.22.1",
  "sha2",
