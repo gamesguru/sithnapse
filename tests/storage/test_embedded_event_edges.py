@@ -1673,13 +1673,23 @@ class EventEdgesMigrationGateTestCase(EventEdgesStorageIntegrationTestCase):
     def test_raises_when_writer_and_migration_incomplete(self) -> None:
         """With the flag on (simulating the future release) and the
         migration incomplete, the events-stream writer must refuse to
-        proceed."""
+        proceed.
+
+        `embedded_event_edges_is_writable` is config-derived, and `prepare`
+        only forces the store's writable attributes, so the writer role has
+        to be mocked here (as `test_no_op_for_non_writer_process` mocks the
+        non-writer role)."""
         self._make_migration_incomplete()
 
-        self.get_failure(
-            check_event_edges_migration_complete(self.hs),
-            EventEdgesMigrationIncompleteError,
-        )
+        with mock.patch.object(
+            embedded_event_edges_module,
+            "embedded_event_edges_is_writable",
+            return_value=True,
+        ):
+            self.get_failure(
+                check_event_edges_migration_complete(self.hs),
+                EventEdgesMigrationIncompleteError,
+            )
 
     @mock.patch.object(
         embedded_event_edges_module, "EVENT_EDGES_SQL_INSERT_REMOVED", True
