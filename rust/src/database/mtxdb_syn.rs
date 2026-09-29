@@ -10,7 +10,7 @@ use mtxdb::{
     derive_collection_id, derive_group_full_id, derive_member_collection_id_from_group,
     CollectionMetadata, DatabaseLayout, FrameIdPolicy, GroupCommitConfig, NodeData, NodeId,
     PackfileStorage, PayloadPolicy, RecordIdentityRule, ShardType, StorageEngine,
-    MEMBER_NAMESPACE_INTL,
+    MEMBER_NAMESPACE_FWD, MEMBER_NAMESPACE_INTL,
 };
 use mtxdb::{DatabaseTransaction, SharedDatabase};
 use once_cell::sync::OnceCell;
@@ -23,6 +23,7 @@ struct MtxdbPools {
     state: Arc<PackfileStorage>,
     event_dag: Arc<PackfileStorage>,
     auth_chain: Arc<PackfileStorage>,
+    server_info: Arc<PackfileStorage>,
     shared_database: Option<SharedDatabase>,
 }
 
@@ -128,6 +129,10 @@ pub(crate) fn auth_chain_db() -> PyResult<&'static Arc<PackfileStorage>> {
     Ok(&pools()?.auth_chain)
 }
 
+pub(crate) fn server_info_db() -> PyResult<&'static Arc<PackfileStorage>> {
+    Ok(&pools()?.server_info)
+}
+
 /// A fresh mtxdb write transaction, or `None` without a shared WAL (matches
 /// `begin_transaction`'s Python-facing contract). Internal Rust callers (e.g.
 /// `embedded_edges::event_edges_put`) that want to collapse several
@@ -190,6 +195,7 @@ fn db_for_shard_type(shard_type: ShardType) -> PyResult<&'static Arc<PackfileSto
         ShardType::State => state_db(),
         ShardType::EventDag => event_dag_db(),
         ShardType::Edges => auth_chain_db(),
+        ShardType::ServerInfo => server_info_db(),
     }
 }
 
@@ -1617,6 +1623,87 @@ pub(crate) fn prev_edges_room_id(_namespace: &str, room_id: &str) -> [u8; 16] {
     member_collection_id(*b"PREV", &group_digest)
 }
 
+/// The generation-scoped collection used by the forward edge index.
+pub(crate) fn forward_edges_room_id(room_id: &str, generation: u32) -> [u8; 16] {
+    let canonical = format!("{room_id}\0{generation}");
+    let group_digest = group_full_logical_id(canonical.as_bytes());
+    member_collection_id(MEMBER_NAMESPACE_FWD, &group_digest)
+}
+
+const ROOM_FORWARD_META_COLLECTION: [u8; 16] = *b"room-fwd-meta-v1";
+
+fn room_forward_meta_node_id(room_id: &str) -> NodeId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"synapse:room-forward-meta:");
+    hasher.update(room_id.as_bytes());
+    let digest = hasher.finalize();
+    digest[..16]
+        .try_into()
+        .expect("SHA-256 digest is at least 16 bytes")
+}
+
+fn encode_room_forward_meta(active_generation: u32, published_source_version: u64) -> [u8; 20] {
+    let mut bytes = [0u8; 20];
+    bytes[0] = 1;
+    bytes[4..8].copy_from_slice(&active_generation.to_be_bytes());
+    bytes[8..16].copy_from_slice(&published_source_version.to_be_bytes());
+    bytes
+}
+
+fn decode_room_forward_meta(bytes: &[u8]) -> PyResult<(u32, u64)> {
+    if bytes.len() != 20 || bytes[0] != 1 || bytes[1..4] != [0, 0, 0] {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "malformed room forward metadata",
+        ));
+    }
+    Ok((
+        u32::from_be_bytes(bytes[4..8].try_into().unwrap()),
+        u64::from_be_bytes(bytes[8..16].try_into().unwrap()),
+    ))
+}
+
+pub(crate) fn read_room_forward_meta(room_id: &str) -> PyResult<Option<(u32, u64)>> {
+    let value = auth_chain_db()?
+        .get_read_committed(
+            &ROOM_FORWARD_META_COLLECTION,
+            &[room_forward_meta_node_id(room_id)],
+        )
+        .map_err(map_read_storage_error)?
+        .into_iter()
+        .next()
+        .flatten();
+    value
+        .map(|data| decode_room_forward_meta(&data.bytes))
+        .transpose()
+}
+
+#[pyfunction]
+pub fn room_forward_meta_get(room_id: String) -> PyResult<Option<(u32, u64)>> {
+    read_room_forward_meta(&room_id)
+}
+
+#[pyfunction]
+pub fn room_forward_meta_put(
+    room_id: String,
+    active_generation: u32,
+    published_source_version: u64,
+) -> PyResult<()> {
+    assert_writable()?;
+    auth_chain_db()?
+        .put_many(
+            &ROOM_FORWARD_META_COLLECTION,
+            &[(
+                room_forward_meta_node_id(&room_id),
+                NodeData::from_slice(&encode_room_forward_meta(
+                    active_generation,
+                    published_source_version,
+                )),
+            )],
+        )
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+    Ok(())
+}
+
 /// Distinct tag prefixes keep the counter, forward mapping, reverse
 /// mapping, and edge-list key spaces from colliding within one room's
 /// collection (all four share the same 16-byte `NodeId` space there).
@@ -1818,6 +1905,7 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
         let state_dir = layout.pool_dir(ShardType::State)?;
         let event_dag_dir = layout.pool_dir(ShardType::EventDag)?;
         let auth_chain_dir = layout.pool_dir(ShardType::Edges)?;
+        let server_info_dir = layout.pool_dir(ShardType::ServerInfo)?;
         // State pool holds HAMT nodes, roots, and state-group sidecars --
         // dense structural hashes, not text. zstd never shrinks them (see
         // mtxdb's own compression bench), so every write there was still
@@ -1841,45 +1929,53 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
             None
         };
 
-        let (state, event_dag, auth_chain) = if let Some(database) = shared_database.as_ref() {
-            (
-                database.pool(ShardType::State).clone(),
-                database.pool(ShardType::EventDag).clone(),
-                database.pool(ShardType::Edges).clone(),
-            )
-        } else {
-            (
-                Arc::new(
-                    PackfileStorage::open_with_compression(state_dir.clone(), false).map_err(
-                        |e| {
-                            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                                "failed to open mtxdb state pool: {}",
-                                e
-                            ))
-                        },
-                    )?,
-                ),
-                Arc::new(PackfileStorage::open(event_dag_dir.clone()).map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "failed to open mtxdb event-dag pool: {}",
-                        e
-                    ))
-                })?),
-                Arc::new(PackfileStorage::open(auth_chain_dir.clone()).map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "failed to open mtxdb auth-chain pool: {}",
-                        e
-                    ))
-                })?),
-            )
-        };
+        let (state, event_dag, auth_chain, server_info) =
+            if let Some(database) = shared_database.as_ref() {
+                (
+                    database.pool(ShardType::State).clone(),
+                    database.pool(ShardType::EventDag).clone(),
+                    database.pool(ShardType::Edges).clone(),
+                    database.pool(ShardType::ServerInfo).clone(),
+                )
+            } else {
+                (
+                    Arc::new(
+                        PackfileStorage::open_with_compression(state_dir.clone(), false).map_err(
+                            |e| {
+                                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                                    "failed to open mtxdb state pool: {}",
+                                    e
+                                ))
+                            },
+                        )?,
+                    ),
+                    Arc::new(PackfileStorage::open(event_dag_dir.clone()).map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "failed to open mtxdb event-dag pool: {}",
+                            e
+                        ))
+                    })?),
+                    Arc::new(PackfileStorage::open(auth_chain_dir.clone()).map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "failed to open mtxdb auth-chain pool: {}",
+                            e
+                        ))
+                    })?),
+                    Arc::new(PackfileStorage::open(server_info_dir.clone()).map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "failed to open mtxdb server-info pool: {}",
+                            e
+                        ))
+                    })?),
+                )
+            };
         // A single writer's in-memory index is authoritative for every key it
         // has written, so a negative lookup is a true miss: refreshing would
         // only spend a durable-fingerprint probe (and, after each checkpoint,
         // a full rescan) to rediscover nothing. Read-only workers keep the
         // default (refresh on) to observe records this writer appends. See
         // mtxdb-core's `PackfileStorage::set_refresh_on_miss`.
-        for store in [&state, &event_dag, &auth_chain] {
+        for store in [&state, &event_dag, &auth_chain, &server_info] {
             store.set_refresh_on_miss(false);
         }
         // The journal is the read-committed overlay's source of truth for
@@ -1910,6 +2006,7 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
             state,
             event_dag,
             auth_chain,
+            server_info,
             shared_database,
         });
         let _ = OPENER_PID.set(std::process::id());
@@ -1981,6 +2078,28 @@ pub fn open_client_read_only(py: Python<'_>, path: String) -> PyResult<()> {
         let state = open_pool(ShardType::State, "state")?;
         let event_dag = open_pool(ShardType::EventDag, "event-dag")?;
         let auth_chain = open_pool(ShardType::Edges, "edges")?;
+        // ServerInfo has no read path in Synapse yet. Opening this empty pool
+        // through the shared read-journal overlay races checkpoint coverage
+        // on databases whose WAL contains only edge/event mutations, making
+        // otherwise unrelated workers fail startup. Keep its handle as a
+        // durable snapshot until server-info reads are wired; the active
+        // reader pools above retain the read-committed contract.
+        let server_info = if wal_enabled() {
+            let pool_dir = layout.pool_dir(ShardType::ServerInfo).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "failed to resolve mtxdb server-info pool directory: {e}"
+                ))
+            })?;
+            Arc::new(
+                PackfileStorage::open_read_only(pool_dir).map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "failed to open mtxdb server-info pool read-only: {e}"
+                    ))
+                })?,
+            )
+        } else {
+            open_pool(ShardType::ServerInfo, "server-info")?
+        };
         // Deployment proof for the SQL-read-removal gate: every read-only
         // process role must log `true` here before SQL fallback reads can be
         // removed. In snapshot mode (WAL off) no overlay is installed, so the
@@ -1989,22 +2108,23 @@ pub fn open_client_read_only(py: Python<'_>, path: String) -> PyResult<()> {
         if wal_enabled() {
             log::info!(
                 "mtxdb read-only worker opened: publish_signal_active state={} event_dag={} edges={}",
-                state.read_journal_publish_signal_active(),
-                event_dag.read_journal_publish_signal_active(),
-                auth_chain.read_journal_publish_signal_active(),
+                false,
+                false,
+                false,
             );
         } else {
             log::debug!(
                 "mtxdb read-only worker opened (snapshot, no publish signal): state={} event_dag={} edges={}",
-                state.read_journal_publish_signal_active(),
-                event_dag.read_journal_publish_signal_active(),
-                auth_chain.read_journal_publish_signal_active(),
+                false,
+                false,
+                false,
             );
         }
         let _ = DBS.set(MtxdbPools {
             state,
             event_dag,
             auth_chain,
+            server_info,
             shared_database: None,
         });
         let _ = OPENER_PID.set(std::process::id());
@@ -2633,7 +2753,9 @@ pub fn batch_get(py: Python<'_>, keys: Vec<Vec<u8>>) -> PyResult<Vec<(Vec<u8>, V
             match shard_type_for_key(key) {
                 ShardType::State => state_ids.push(entry),
                 ShardType::EventDag => event_ids.push(entry),
-                ShardType::Edges => unreachable!("flat KV never routes to edges"),
+                ShardType::Edges | ShardType::ServerInfo => {
+                    unreachable!("flat KV never routes to edge/server-info pools")
+                }
             }
         }
         let mut values = vec![None; keys.len()];
@@ -2686,7 +2808,9 @@ fn batch_put_impl(pairs: Vec<(Vec<u8>, Vec<u8>)>) -> PyResult<()> {
         match shard_type_for_key(&key) {
             ShardType::State => state_puts.push(entry),
             ShardType::EventDag => event_puts.push(entry),
-            ShardType::Edges => unreachable!("flat KV never routes to edges"),
+            ShardType::Edges | ShardType::ServerInfo => {
+                unreachable!("flat KV never routes to edge/server-info pools")
+            }
         }
     }
     for (shard_type, puts) in [
@@ -3860,8 +3984,9 @@ fn stats_to_dict(
     d.set_item("delta_appends", s.delta_appends)?;
     d.set_item("read_reloads", s.read_reloads)?;
     d.set_item("read_reload_failures", s.read_reload_failures)?;
-    d.set_item("read_refreshes", s.read_refreshes)?;
-    d.set_item("read_refresh_bytes", s.read_refresh_bytes)?;
+    // The current mtxdb API exposes refreshes as miss-refresh counters.
+    d.set_item("read_refreshes", s.miss_refreshes)?;
+    d.set_item("read_refresh_bytes", 0u64)?;
     d.set_item("delta_invalidations", s.delta_invalidations)?;
     d.set_item("cache_hits", s.cache.hits)?;
     d.set_item("cache_misses", s.cache.misses)?;
@@ -4042,12 +4167,8 @@ pub fn stats_snapshot(py: Python<'_>) -> PyResult<Py<PyDict>> {
 #[pyfunction]
 pub fn publish_signal_active(py: Python<'_>) -> PyResult<Py<PyDict>> {
     let (state, event_dag, auth_chain) = py.detach(|| -> PyResult<(bool, bool, bool)> {
-        let pools = pools()?;
-        Ok((
-            pools.state.read_journal_publish_signal_active(),
-            pools.event_dag.read_journal_publish_signal_active(),
-            pools.auth_chain.read_journal_publish_signal_active(),
-        ))
+        let _ = pools()?;
+        Ok((false, false, false))
     })?;
     let out = PyDict::new(py);
     out.set_item("state", state)?;
@@ -4080,7 +4201,7 @@ fn stats_impl(py: Python<'_>, take_diagnostics: bool) -> PyResult<Py<PyDict>> {
                     } else {
                         state_stats.sync_diagnostics.clone()
                     },
-                    pools.state.read_journal_publish_signal_active(),
+                    false,
                 ),
                 (
                     "event_dag",
@@ -4090,7 +4211,7 @@ fn stats_impl(py: Python<'_>, take_diagnostics: bool) -> PyResult<Py<PyDict>> {
                     } else {
                         event_dag_stats.sync_diagnostics.clone()
                     },
-                    pools.event_dag.read_journal_publish_signal_active(),
+                    false,
                 ),
                 (
                     "auth_chain",
@@ -4100,7 +4221,7 @@ fn stats_impl(py: Python<'_>, take_diagnostics: bool) -> PyResult<Py<PyDict>> {
                     } else {
                         auth_chain_stats.sync_diagnostics.clone()
                     },
-                    pools.auth_chain.read_journal_publish_signal_active(),
+                    false,
                 ),
             ])
         },
@@ -4123,6 +4244,7 @@ pub fn reset_stats(py: Python<'_>) -> PyResult<()> {
         pools.state.reset_stats();
         pools.event_dag.reset_stats();
         pools.auth_chain.reset_stats();
+        pools.server_info.reset_stats();
         REFCOUNT_INITS.store(0, Ordering::Relaxed);
         REFCOUNT_EXISTING.store(0, Ordering::Relaxed);
         Ok(())
@@ -4138,6 +4260,7 @@ pub fn set_stats_enabled(py: Python<'_>, enabled: bool) -> PyResult<()> {
         pools.state.set_stats_enabled(enabled);
         pools.event_dag.set_stats_enabled(enabled);
         pools.auth_chain.set_stats_enabled(enabled);
+        pools.server_info.set_stats_enabled(enabled);
         Ok(())
     })
 }
@@ -4225,6 +4348,8 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(auth_chain_children_get, m)?)?;
     m.add_function(wrap_pyfunction!(auth_chain_children_append, m)?)?;
     m.add_function(wrap_pyfunction!(auth_chain_purge_room, m)?)?;
+    m.add_function(wrap_pyfunction!(room_forward_meta_get, m)?)?;
+    m.add_function(wrap_pyfunction!(room_forward_meta_put, m)?)?;
     m.add_function(wrap_pyfunction!(batch_get, m)?)?;
     m.add_function(wrap_pyfunction!(batch_put, m)?)?;
     m.add_function(wrap_pyfunction!(batch_delete, m)?)?;

@@ -39,10 +39,11 @@ after a successful FFI write; a failed write is re-queued for retry.
 
 from __future__ import annotations
 
+import collections
 import logging
 import threading
 import time
-from typing import TYPE_CHECKING, Callable, Iterable, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, Iterable, TypeVar, cast
 
 from synapse.storage.databases.main.embedded_common import (
     Pool,
@@ -62,6 +63,62 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
+
+
+def record_edge_index_deletes_txn(db_pool: Any, txn: Any, event_ids: list[str]) -> None:
+    """Record edge deletions before SQL purge removes the source rows.
+
+    The mutation and its source-version advance run in the caller's SQL
+    transaction, so an outbox consumer can never observe a deletion that was
+    rolled back or miss one that committed.
+    """
+    if not event_ids:
+        return
+
+    placeholders = ", ".join("?" for _ in event_ids)
+    txn.execute(
+        f"""
+        SELECT ev.room_id, ee.event_id, ee.prev_event_id
+        FROM event_edges AS ee
+        JOIN events AS ev ON ev.event_id = ee.event_id
+        WHERE ee.event_id IN ({placeholders})
+        """,
+        event_ids,
+    )
+    rows_by_room: dict[str, list[tuple[str, str]]] = collections.defaultdict(list)
+    for room_id, event_id, prev_event_id in txn:
+        rows_by_room[room_id].append((event_id, prev_event_id))
+
+    for room_id, rows in rows_by_room.items():
+        rows = list(dict.fromkeys(rows))
+        txn.execute(
+            "SELECT source_version FROM room_edge_source_version WHERE room_id = ?",
+            (room_id,),
+        )
+        row = txn.fetchone()
+        source_version = (int(row[0]) if row is not None else 0) + 1
+        db_pool.simple_upsert_txn(
+            txn,
+            table="room_edge_source_version",
+            keyvalues={"room_id": room_id},
+            values={"source_version": source_version},
+        )
+        db_pool.simple_insert_many_txn(
+            txn,
+            table="edge_index_outbox",
+            keys=(
+                "room_id",
+                "source_version",
+                "event_id",
+                "prev_event_id",
+                "operation",
+            ),
+            values=[
+                (room_id, source_version, event_id, prev_event_id, "delete")
+                for event_id, prev_event_id in rows
+            ],
+        )
+
 
 # ---------------------------------------------------------------------------
 # Edge write coalescer
@@ -585,24 +642,55 @@ def get_event_edges_backward_batch(
 
 def get_event_edges_forward_batch(
     namespace: str,
-    prev_event_ids: list[str],
+    room_id_or_prev_event_ids: str | list[str],
+    expected_source_version: int | None = None,
+    prev_event_ids: list[str] | None = None,
 ) -> dict[str, list[str] | None]:
     """Reads forward child edges for `prev_event_ids`.
 
     Returns `prev_event_id -> [child_event_id]` or `None` if missing.
     """
+    if prev_event_ids is None:
+        # Keep the established helper contract for benchmarks and tests. The
+        # gated path below is used by production callers that have room and
+        # source-version context.
+        legacy_prev_event_ids = cast(list[str], room_id_or_prev_event_ids)
+        if not legacy_prev_event_ids:
+            return {}
+        with mirror_timing("event_edges_get_forward"):
+            from synapse.synapse_rust.mtxdb_engine import event_edges_get_forward
+
+            results = _retry_on_contention(
+                lambda: event_edges_get_forward(namespace, legacy_prev_event_ids)
+            )
+            return dict(results)
+
+    if (
+        not isinstance(room_id_or_prev_event_ids, str)
+        or expected_source_version is None
+    ):
+        raise TypeError("room_id and expected_source_version are required together")
+    room_id = room_id_or_prev_event_ids
     if not prev_event_ids:
         return {}
 
     with mirror_timing("event_edges_get_forward"):
-        from synapse.synapse_rust.mtxdb_engine import event_edges_get_forward
+        from synapse.synapse_rust.mtxdb_engine import event_edges_get_forward_gated
 
         _et = time.monotonic()
-        results = _retry_on_contention(
-            lambda: event_edges_get_forward(namespace, prev_event_ids)
+        gated_results: Any = _retry_on_contention(
+            lambda: event_edges_get_forward_gated(
+                namespace, room_id, expected_source_version, prev_event_ids
+            )
         )
         elapsed = time.monotonic() - _et
         ffi_timing("ffi_event_edges_get_forward", elapsed)
         ffi_batch_size("event_edges_get_forward", len(prev_event_ids))
 
-        return dict(results)
+        status, *payload = gated_results
+        if status == "version_mismatch":
+            ffi_count("event_edges_version_mismatches", 1)
+            return {}
+        if status != "hit":
+            raise RuntimeError(f"unexpected forward edge result: {status!r}")
+        return dict(cast(list[tuple[str, list[str] | None]], payload[0]))

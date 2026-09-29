@@ -26,7 +26,10 @@ from synapse.api.errors import SynapseError
 from synapse.storage.database import LoggingTransaction
 from synapse.storage.databases.main import CacheInvalidationWorkerStore
 from synapse.storage.databases.main.embedded_common import Pool, sync_now
-from synapse.storage.databases.main.embedded_event_edges import delete_event_edges_batch
+from synapse.storage.databases.main.embedded_event_edges import (
+    delete_event_edges_batch,
+    record_edge_index_deletes_txn,
+)
 from synapse.storage.databases.main.embedded_event_json import delete_event_json_batch
 from synapse.storage.databases.main.embedded_event_to_state_group import (
     decrement_state_group_refcounts_batch,
@@ -365,6 +368,7 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             redacted_event_ids = [redacts for (redacts,) in txn if redacts is not None]
 
         # Delete all remote non-state events
+        record_edge_index_deletes_txn(self.db_pool, txn, purged_event_ids)
         for table in (
             "event_edges",
             "events",
@@ -670,6 +674,7 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             )
 
         # Now we delete tables which lack an index on `room_id` but have one on `event_id`
+        record_edge_index_deletes_txn(self.db_pool, txn, room_event_ids)
         for table in purge_room_tables_with_event_id_index:
             logger.info("[purge] removing from %s", table)
 

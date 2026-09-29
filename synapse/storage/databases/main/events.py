@@ -4347,7 +4347,7 @@ class PersistEventsStore:
                     "operation",
                 ),
                 values=[
-                    (room_id, source_version, event_id, prev_event_id, "I")
+                    (room_id, source_version, event_id, prev_event_id, "insert")
                     for event_id, prev_event_id in room_edges
                 ],
             )

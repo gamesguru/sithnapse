@@ -62,6 +62,16 @@ def event_edges_get_forward(
     namespace: str,
     prev_event_ids: list[str],
 ) -> list[tuple[str, list[str] | None]]: ...
+def event_edges_get_forward_gated(
+    namespace: str,
+    room_id: str,
+    expected_source_version: int,
+    prev_event_ids: list[str],
+) -> tuple[str, list[tuple[str, list[str] | None]]] | tuple[str, int, int]: ...
+def room_forward_meta_get(room_id: str) -> tuple[int, int] | None: ...
+def room_forward_meta_put(
+    room_id: str, active_generation: int, published_source_version: int
+) -> None: ...
 def event_edges_delete(
     namespace: str,
     event_ids: list[str],

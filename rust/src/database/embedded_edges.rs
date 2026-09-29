@@ -20,12 +20,13 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use mtxdb::{DatabaseTransaction, NodeData, NodeId, ShardType, StorageEngine};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyList, PyTuple};
 use sha2::{Digest, Sha256};
 
 use super::mtxdb_syn::{
     assert_writable, auth_chain_db, begin_internal_transaction, event_locator_collection_id,
-    event_node_id, map_read_storage_error, map_transaction_error, prev_edges_room_id,
+    event_node_id, forward_edges_room_id, map_read_storage_error, map_transaction_error,
+    prev_edges_room_id, read_room_forward_meta,
 };
 
 /// The read/write surface `event_edges_put` needs, common to a direct engine
@@ -837,6 +838,84 @@ pub fn event_edges_get_forward(
     })
 }
 
+/// Read the generation-scoped forward index after checking its publication
+/// watermark. A lagging or uninitialized index is an expected cache miss, so
+/// it is returned as a tagged tuple for the Python caller to fall back to SQL.
+/// Storage and decoding failures remain exceptions.
+#[pyfunction]
+pub fn event_edges_get_forward_gated(
+    py: Python<'_>,
+    namespace: String,
+    room_id: String,
+    expected_source_version: u64,
+    prev_event_ids: Vec<String>,
+) -> PyResult<Py<PyAny>> {
+    enum ReadResult {
+        VersionMismatch { published: u64, expected: u64 },
+        Hit(Vec<(String, Option<Vec<String>>)>),
+    }
+
+    let read_result = py.detach(|| -> PyResult<ReadResult> {
+        let Some((generation, published_version)) = read_room_forward_meta(&room_id)? else {
+            return Ok(ReadResult::VersionMismatch {
+                published: 0,
+                expected: expected_source_version,
+            });
+        };
+        if published_version != expected_source_version {
+            return Ok(ReadResult::VersionMismatch {
+                published: published_version,
+                expected: expected_source_version,
+            });
+        }
+
+        let engine = auth_chain_db()?;
+        let collection = forward_edges_room_id(&room_id, generation);
+        let node_ids: Vec<NodeId> = prev_event_ids
+            .iter()
+            .map(|id| event_edges_forward_node_id(&namespace, id))
+            .collect();
+        let found = engine
+            .get_read_committed(&collection, &node_ids)
+            .map_err(map_read_storage_error)?;
+        let mut rows = Vec::with_capacity(prev_event_ids.len());
+        for (event_id, value) in prev_event_ids.into_iter().zip(found) {
+            let children = value
+                .filter(|data| !data.bytes.is_empty())
+                .map(|data| decode_forward_edges(&data.bytes))
+                .transpose()?;
+            rows.push((event_id, children));
+        }
+        Ok(ReadResult::Hit(rows))
+    })?;
+
+    match read_result {
+        ReadResult::VersionMismatch {
+            published,
+            expected,
+        } => {
+            let result = PyTuple::empty(py);
+            result.set_item(0, "version_mismatch")?;
+            result.set_item(1, published)?;
+            result.set_item(2, expected)?;
+            Ok(result.unbind().into())
+        }
+        ReadResult::Hit(rows) => {
+            let py_rows = PyList::empty(py);
+            for (event_id, children) in rows {
+                let item = PyTuple::empty(py);
+                item.set_item(0, event_id)?;
+                item.set_item(1, children)?;
+                py_rows.append(item)?;
+            }
+            let result = PyTuple::empty(py);
+            result.set_item(0, "hit")?;
+            result.set_item(1, py_rows)?;
+            Ok(result.unbind().into())
+        }
+    }
+}
+
 /// Tombstone backward edges for purged events.
 ///
 /// Deliberately does NOT touch parents' forward lists. Splicing a purged
@@ -991,6 +1070,7 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(event_edges_put, m)?)?;
     m.add_function(wrap_pyfunction!(event_edges_get_backward, m)?)?;
     m.add_function(wrap_pyfunction!(event_edges_get_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(event_edges_get_forward_gated, m)?)?;
     m.add_function(wrap_pyfunction!(event_edges_delete, m)?)?;
     Ok(())
 }

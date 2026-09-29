@@ -2709,8 +2709,27 @@ class EventFederationWorkerStore(
                 queue_edge_write,
             )
 
+            room_id = await self.db_pool.simple_select_one_onecol(
+                table="events",
+                keyvalues={"event_id": event_id},
+                retcol="room_id",
+                allow_none=True,
+                desc="get_successor_events_room_id",
+            )
+            if room_id is None:
+                return []
+            source_version = await self.db_pool.simple_select_one_onecol(
+                table="room_edge_source_version",
+                keyvalues={"room_id": room_id},
+                retcol="source_version",
+                allow_none=True,
+                desc="get_successor_events_source_version",
+            )
             forward_map = get_event_edges_forward_batch(
-                self._embedded_db_namespace, [event_id]
+                self._embedded_db_namespace,
+                room_id,
+                int(source_version or 0),
+                [event_id],
             )
             successors = forward_map.get(event_id)
             if successors is not None:

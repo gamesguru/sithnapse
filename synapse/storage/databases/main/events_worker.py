@@ -2639,8 +2639,17 @@ class EventsWorkerStore(SQLBaseStore):
                     get_event_edges_forward_batch,
                 )
 
+                txn.execute(
+                    "SELECT source_version FROM room_edge_source_version WHERE room_id = ?",
+                    (event.room_id,),
+                )
+                source_version_row = txn.fetchone()
+                source_version = int(source_version_row[0]) if source_version_row else 0
                 forward_map = get_event_edges_forward_batch(
-                    self._embedded_db_namespace, [event.event_id]
+                    self._embedded_db_namespace,
+                    event.room_id,
+                    source_version,
+                    [event.event_id],
                 )
                 children = forward_map.get(event.event_id)
                 if children is not None:
