@@ -1166,6 +1166,32 @@ pub fn room_forward_meta_swap(
     room_forward_meta_put(room_id, target_generation, target_source_version)
 }
 
+/// Drop an inactive generation. Callers must only invoke this after the
+/// reader-epoch/grace-period policy has established that no worker can still
+/// be reading the generation.
+#[pyfunction]
+pub fn event_edges_drop_generation(
+    py: Python<'_>,
+    room_id: String,
+    retired_generation: u32,
+) -> PyResult<()> {
+    assert_writable()?;
+    py.detach(|| {
+        let collection = forward_edges_room_id(&room_id, retired_generation);
+        let _guards = lock_rooms([collection]);
+        match begin_internal_transaction()? {
+            Some(txn) => {
+                txn.delete_collection(ShardType::Edges, collection)
+                    .map_err(|e| map_transaction_io_error("drop_generation", e))?;
+                txn.commit().map_err(|e| map_transaction_error("commit", e))
+            }
+            None => auth_chain_db()?
+                .delete_collection(&collection)
+                .map_err(|e| map_transaction_error("drop_generation", e)),
+        }
+    })
+}
+
 fn apply_forward_delta(
     target: &impl ForwardWriteTarget,
     namespace: &str,
@@ -1392,6 +1418,7 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(event_edges_build_generation_batch, m)?)?;
     m.add_function(wrap_pyfunction!(event_edges_reset_generation, m)?)?;
     m.add_function(wrap_pyfunction!(room_forward_meta_swap, m)?)?;
+    m.add_function(wrap_pyfunction!(event_edges_drop_generation, m)?)?;
     m.add_function(wrap_pyfunction!(event_edges_delete, m)?)?;
     Ok(())
 }
@@ -1475,6 +1502,7 @@ mod tests {
 
     #[test]
     fn decode_identity_rejects_unknown_tag() {
+        Python::initialize();
         let buf = vec![0x99u8];
         let mut offset = 0;
         let err = decode_identity(&buf, &mut offset).unwrap_err();
@@ -1490,6 +1518,7 @@ mod tests {
 
     #[test]
     fn decode_backward_edges_rejects_unknown_format_version() {
+        Python::initialize();
         let buf = vec![0xffu8]; // not BACKWARD_EDGES_FORMAT_VERSION
         let err = decode_backward_edges(&buf).unwrap_err();
         assert!(err
@@ -1499,6 +1528,7 @@ mod tests {
 
     #[test]
     fn decode_forward_edges_rejects_unknown_format_version() {
+        Python::initialize();
         let buf = vec![0xffu8, 0, 0, 0, 0];
         let err = decode_forward_edges(&buf).unwrap_err();
         assert!(err

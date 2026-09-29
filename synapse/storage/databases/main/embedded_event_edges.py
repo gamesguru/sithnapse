@@ -887,6 +887,74 @@ async def release_rebuild_checkpoint(store: Any, room_id: str, rebuild_id: str) 
     await store.db_pool.runInteraction("release_rebuild_checkpoint", _delete)
 
 
+async def enqueue_retired_generation(store: Any, room_id: str, generation: int) -> None:
+    """Record a generation for deferred GC; do not delete it yet."""
+    retired_at_ms = int(time.time() * 1000)
+
+    def _insert(txn: Any) -> None:
+        txn.execute(
+            "INSERT INTO room_edge_retired_generations "
+            "(room_id, generation, retired_at_ms) VALUES (?, ?, ?) "
+            "ON CONFLICT (room_id, generation) DO NOTHING",
+            (room_id, generation, retired_at_ms),
+        )
+
+    await store.db_pool.runInteraction("enqueue_retired_edge_generation", _insert)
+
+
+async def gc_retired_forward_generations(
+    store: Any,
+    *,
+    grace_period_ms: int = 600_000,
+    limit: int = 32,
+) -> bool:
+    """Drop retired generations after the configured reader grace period."""
+    cutoff_ms = int(time.time() * 1000) - grace_period_ms
+
+    def _candidates(txn: Any) -> list[tuple[str, int]]:
+        txn.execute(
+            "SELECT room_id, generation FROM room_edge_retired_generations "
+            "WHERE retired_at_ms <= ? ORDER BY retired_at_ms LIMIT ?",
+            (cutoff_ms, limit),
+        )
+        return [(str(room_id), int(generation)) for room_id, generation in txn]
+
+    candidates = await store.db_pool.runInteraction(
+        "fetch_retired_edge_generations", _candidates
+    )
+    if not candidates:
+        return False
+
+    from synapse.synapse_rust.mtxdb_engine import (
+        event_edges_drop_generation,
+        room_forward_meta_get,
+    )
+
+    did_work = False
+    locks = store.hs.get_worker_locks_handler()
+    for room_id, retired_generation in candidates:
+        async with locks.acquire_lock("embedded_edge_index_outbox", room_id):
+            meta = _retry_on_contention(lambda: room_forward_meta_get(room_id))
+            if meta is None or meta[0] <= retired_generation:
+                continue
+
+            _retry_on_contention(
+                lambda: event_edges_drop_generation(room_id, retired_generation)
+            )
+
+            def _ack(txn: Any) -> None:
+                txn.execute(
+                    "DELETE FROM room_edge_retired_generations "
+                    "WHERE room_id = ? AND generation = ?",
+                    (room_id, retired_generation),
+                )
+
+            await store.db_pool.runInteraction("ack_retired_edge_generation", _ack)
+            did_work = True
+
+    return did_work
+
+
 async def rebuild_room_forward_index(
     store: Any,
     room_id: str,
@@ -1066,6 +1134,7 @@ async def rebuild_room_forward_index(
                     room_id, target_generation, final_version
                 )
             )
+            await enqueue_retired_generation(store, room_id, active_generation)
         return True
     finally:
         await release_rebuild_checkpoint(store, room_id, rebuild_id)
