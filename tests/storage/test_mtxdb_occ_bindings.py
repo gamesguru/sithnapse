@@ -153,9 +153,7 @@ class MtxdbOccBindingsTestCase(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr[-2000:])
 
     def test_record_version_expectations_are_per_record(self) -> None:
-        with tempfile.TemporaryDirectory(
-            prefix="test-mtxdb-record-versions-"
-        ) as store:
+        with tempfile.TemporaryDirectory(prefix="test-mtxdb-record-versions-") as store:
             result = self._run_script(_RECORD_SCRIPT, store)
 
         self.assertEqual(result.returncode, 0, result.stderr[-2000:])
