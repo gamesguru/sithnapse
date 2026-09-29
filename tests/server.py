@@ -363,7 +363,12 @@ def _reset_recycled_postgres_db(
             "JOIN pg_namespace n ON n.oid = c.relnamespace "
             "WHERE n.nspname = 'public' "
             "AND c.relkind IN ('r', 'p') "
-            "AND pg_relation_size(c.oid) > 0"
+            "AND (pg_relation_size(c.oid) > 0 OR EXISTS ("
+            "SELECT 1 FROM pg_depend d "
+            "JOIN pg_class seq ON seq.oid = d.objid AND seq.relkind = 'S' "
+            "WHERE d.classid = 'pg_class'::regclass "
+            "AND d.refclassid = 'pg_class'::regclass "
+            "AND d.refobjid = c.oid AND d.deptype IN ('a', 'i')))"
         )
         nonempty = {row[0] for row in cur.fetchall()}
         _pg_timing(
