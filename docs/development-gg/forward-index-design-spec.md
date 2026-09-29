@@ -58,53 +58,29 @@ pub fn forward_edges_room_gen_id(room_id: &str, generation: u64) -> [u8; 16] {
 The reader path uses **Option B (Context Passing)** to pass `(room_id, expected_source_version)` into Rust, keeping gate validation and collection scanning co-located within the mtxdb engine:
 
 ```rust
-pub enum ForwardReadResult {
-    /// mtxdb is fully caught up; returns forward edges directly.
-    Hit(Vec<ForwardEdgeRecord>),
-    /// mtxdb is lagging (published_version != expected_version) or uninitialized.
-    /// Caller falls back to SQL query.
-    VersionMismatch {
-        published_version: u64,
-        expected_version: u64,
-    },
-    /// Internal engine error.
-    Error(String),
-}
-
+/// PyO3-compatible return type for forward edge queries:
+/// - `("hit", Vec<(String, Vec<String>)>)` on valid cached match
+/// - `("version_mismatch", u64, u64)` on stale/lagging published version
+/// - Storage errors raise PyRuntimeError directly
+#[pyfunction]
 pub fn event_edges_get_forward(
-    prev_event_ids: &[EventId],
-    room_id: &[u8; 32],
+    py: Python<'_>,
+    namespace: String,
+    room_id: String,
     expected_source_version: u64,
-) -> ForwardReadResult {
-    let meta = match get_room_forward_meta(room_id) {
-        Ok(Some(meta)) => meta,
-        Ok(None) => {
-            return ForwardReadResult::VersionMismatch {
-                published_version: 0,
-                expected_version: expected_source_version,
-            };
-        }
-        Err(e) => return ForwardReadResult::Error(e.to_string()),
-    };
-
-    if meta.published_source_version != expected_source_version {
-        return ForwardReadResult::VersionMismatch {
-            published_version: meta.published_source_version,
-            expected_version: expected_source_version,
-        };
-    }
-
-    // Fast path: scan mtxdb FWD collection at active_generation
-    match scan_fwd_collection(room_id, meta.active_generation, prev_event_ids) {
-        Ok(edges) => ForwardReadResult::Hit(edges),
-        Err(e) => ForwardReadResult::Error(e.to_string()),
-    }
+    prev_event_ids: Vec<String>,
+) -> PyResult<PyObject> {
+    // 1. Read room_forward_meta for room_id
+    // 2. If meta.published_source_version != expected_source_version:
+    //      return ("version_mismatch", meta.published_source_version, expected_source_version).to_object(py)
+    // 3. Scan FWD collection for active_generation:
+    //      return ("hit", decoded_edges).to_object(py)
 }
 ```
 
 1. Python reads `expected_source_version` from `room_edge_source_version` (or cached transaction state).
-2. Invokes `event_edges_get_forward(prev_event_ids, room_id, expected_source_version)`.
-3. If `Hit(edges)`, returns edges immediately. If `VersionMismatch`, records metrics and queries `event_edges` in SQL.
+2. Invokes `event_edges_get_forward(namespace, room_id, expected_source_version, prev_event_ids)`.
+3. If `("hit", edges)`, returns dict mapping immediately. If `("version_mismatch", published, expected)`, falls back to SQL query on `event_edges`. Storage errors raise exceptions across the FFI boundary.
 
 ### 3.2 Live Writer Path (Outbox Publication)
 
