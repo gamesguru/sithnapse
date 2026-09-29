@@ -216,6 +216,24 @@ There is currently no mtxdb implementation or public document providing these
 server-info collections. This plan is a design proposal, not a claim of
 completed MSC4499 compliance.
 
+The steady-state authority must be mtxdb, not SQL. Keeping SQL as the writer
+authority and duplicating every response into mtxdb would retain the measured
+`server_keys_json` write hotspot and create an inefficient dual-write path.
+SQL may remain temporarily as a migration/read-recovery fallback, but normal
+key writes must perform MSC4499 resolution in mtxdb and must not write the SQL
+blob table on every fetch.
+
+This also means a Python read-then-write sequence is insufficient for `SIGN`:
+the mtxdb layer needs an atomic compare-and-set/upsert primitive, or a single
+serialized mtxdb writer that owns the resolution. A standalone pool without
+such a primitive cannot safely claim MSC4499 concurrency compliance.
+
+`SIGN` and `KEYS` publication should be one mtxdb transaction where possible.
+An accepted `SIGN` binding with a failed `KEYS` blob write would leave the
+authoritative collections inconsistent. A per-process mutex may protect local
+threads, but cross-process serialization must come from mtxdb's writer or
+transaction mechanism; the mutex alone is not sufficient.
+
 ## Phase 3: event and room-state fan-out
 
 The largest client-facing opportunity is not the polling request itself. It is
@@ -388,15 +406,18 @@ small tables.
 
 Every migration should proceed in these steps:
 
-1. Add mtxdb records and counters behind a feature flag.
-2. Backfill from SQL while SQL remains authoritative.
-3. Run shadow reads and compare byte-for-byte results.
-4. Enable mtxdb reads with SQL fallback.
-5. Measure refresh misses, stale reads, and fallback frequency.
-6. Enable mtxdb writes after crash/restart tests pass.
-7. Stop normal SQL writes only after a rebuild tool exists.
-8. Retain SQL fallback until at least one successful repair/rebuild cycle is
-   demonstrated.
+1. Add a standalone `server_info` PackfileStorage, counters, and atomic
+   mutation primitives behind a feature flag.
+2. Implement `SIGN` first-seen-wins CAS in Rust, with cross-process writer
+   serialization and local locking only as a supplement.
+3. Publish the resolved `SIGN` record and corresponding `KEYS` blob
+   transactionally where possible; do not write either SQL table on the new
+   path.
+4. Add SQL fallback reads only for rows written before migration.
+5. Backfill SQL rows into mtxdb, resolving conflicts during the backfill.
+6. Run shadow comparisons and measure misses, stale reads, and refresh cost.
+7. After backfill and a clean restart/recovery cycle, remove SQL fallback
+   reads and stop maintaining the SQL tables.
 
 ## Acceptance gates
 
@@ -418,8 +439,10 @@ A change is ready to land only when:
 1. Add mtxdb runtime counters for server-info reads, misses, refreshes, and
    bytes.
 2. Design the `server_info` pool and parent/member collection API.
-3. Implement `KEYS` shadow writes and SQL-vs-mtxdb comparison.
-4. Add concurrent MSC4499 tests for `SIGN` compare-and-set behavior.
+3. Implement atomic `SIGN` compare-and-set and authoritative `KEYS`/`SIGN`
+   writes in mtxdb; do not add steady-state SQL dual writes.
+4. Add concurrent MSC4499 tests for `SIGN` compare-and-set behavior and
+   crash/recovery tests for joint `SIGN`/`KEYS` publication.
 5. Profile device-list polling and worker startup separately.
 6. Implement the presence CURRENT-only experiment in an isolated ephemeral
    pool, if the presence read profile justifies it.
