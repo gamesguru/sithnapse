@@ -17,6 +17,7 @@
 //! -- `event_json_delete` owns that.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use mtxdb::{DatabaseTransaction, NodeData, NodeId, ShardType, StorageEngine};
@@ -595,16 +596,37 @@ enum EdgeOccOutcome {
 /// a retryable error the caller (Python) can back off on.
 const MAX_OCC_ATTEMPTS: usize = 16;
 
+/// Number of collection-version conflicts observed by the edge OCC path.
+/// Exposed as a diagnostic so integration tests and operators can distinguish
+/// a successful uncontended write from one that required replay.
+static EDGE_OCC_CONFLICTS: AtomicU64 = AtomicU64::new(0);
+
+/// Sequence mixed into the jitter source so threads retrying the same conflict
+/// do not derive identical delays from clocks with coarse resolution.
+static EDGE_OCC_JITTER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 /// Bounded exponential backoff with per-attempt jitter. Detached threads that
-/// lost the same race must not retry in lockstep and re-collide, so the delay
-/// is spread by a cheap clock-derived offset rather than a fixed sleep.
+/// lost the same race must not retry in lockstep and re-collide. Delays range
+/// from 0.5–1 ms initially and grow to a 8–16 ms window.
 fn occ_backoff(attempt: usize) {
-    let base_micros = 25u64 << attempt.min(5);
-    let jitter = std::time::SystemTime::now()
+    let cap_micros = 1_000u64 << attempt.min(4);
+    let clock_jitter = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| u64::from(elapsed.subsec_nanos()))
-        % (base_micros + 1);
-    std::thread::sleep(std::time::Duration::from_micros(base_micros + jitter));
+        .map_or(0, |elapsed| u64::from(elapsed.subsec_nanos()));
+    let sequence = EDGE_OCC_JITTER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let mut mixed = clock_jitter ^ sequence.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    mixed ^= mixed >> 12;
+    mixed ^= mixed << 25;
+    mixed ^= mixed >> 27;
+    let jitter_window = cap_micros / 2;
+    let delay_micros = jitter_window + mixed.wrapping_mul(0x2545_F491_4F6C_DD1D) % jitter_window;
+    std::thread::sleep(std::time::Duration::from_micros(delay_micros));
+}
+
+/// Return the number of edge OCC conflicts since this process started.
+#[pyfunction]
+pub fn event_edges_occ_conflicts() -> u64 {
+    EDGE_OCC_CONFLICTS.load(Ordering::Relaxed)
 }
 
 /// Run a version-bound edge write in an optimistic loop. `body` reads each
@@ -622,6 +644,7 @@ fn run_edge_occ(
         match body(&txn)? {
             EdgeOccOutcome::Done => return Ok(()),
             EdgeOccOutcome::Conflict => {
+                EDGE_OCC_CONFLICTS.fetch_add(1, Ordering::Relaxed);
                 occ_backoff(attempt);
                 txn = begin_internal_transaction()?.ok_or_else(|| {
                     pyo3::exceptions::PyRuntimeError::new_err(
@@ -1608,6 +1631,7 @@ pub fn event_edges_delete(
 
 pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(event_edges_put, m)?)?;
+    m.add_function(wrap_pyfunction!(event_edges_occ_conflicts, m)?)?;
     m.add_function(wrap_pyfunction!(event_edges_get_backward, m)?)?;
     m.add_function(wrap_pyfunction!(event_edges_get_forward, m)?)?;
     m.add_function(wrap_pyfunction!(event_edges_get_forward_gated, m)?)?;

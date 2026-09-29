@@ -626,9 +626,11 @@ _MAX_READ_CONTENTION_ATTEMPTS = 5
 
 
 def _retry_on_contention(call: "Callable[[], _T]") -> "_T":
-    """Retry `call` up to `_MAX_READ_CONTENTION_ATTEMPTS` times on
-    `BlockingIOError` (transient mtxdb journal/checkpoint contention from a
-    `get_read_committed` read), re-raising the last attempt's error."""
+    """Retry `call` on transient mtxdb contention, re-raising the last error.
+
+    Reads may raise this for journal/checkpoint contention. Edge writes may
+    also raise it after their native collection-OCC retry budget is exhausted.
+    """
     for attempt in range(1, _MAX_READ_CONTENTION_ATTEMPTS + 1):
         try:
             return call()

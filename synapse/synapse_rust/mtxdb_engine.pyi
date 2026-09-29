@@ -60,6 +60,7 @@ def event_edges_put(
     namespace: str,
     rows: Iterable[tuple[str, str, str, bool]],
 ) -> None: ...
+def event_edges_occ_conflicts() -> int: ...
 def event_edges_get_backward(
     namespace: str,
     event_ids: list[str],

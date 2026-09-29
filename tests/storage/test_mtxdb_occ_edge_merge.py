@@ -43,6 +43,7 @@ import threading
 from synapse.synapse_rust import mtxdb_engine as m
 
 m.open_client(sys.argv[1])
+conflicts_before = m.event_edges_occ_conflicts()
 
 namespace = "test-occ-edge-merge"
 room_id = "!occ-merge:test"
@@ -84,6 +85,11 @@ merged = forward.get(parent)
 assert merged is not None, forward
 # No child lost and none duplicated: a torn merge would drop a racer.
 assert sorted(merged) == sorted(children), (sorted(merged), sorted(children))
+conflicts_after = m.event_edges_occ_conflicts()
+assert conflicts_after > conflicts_before, (
+    "the race did not exercise EdgeOccOutcome::Conflict and run_edge_occ replay: "
+    f"before={conflicts_before}, after={conflicts_after}"
+)
 """
 
 
