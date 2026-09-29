@@ -607,9 +607,11 @@ static EDGE_OCC_JITTER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Bounded exponential backoff with per-attempt jitter. Detached threads that
 /// lost the same race must not retry in lockstep and re-collide. Delays range
-/// from 0.5–1 ms initially and grow to a 8–16 ms window.
+/// from 50–100 µs initially and grow to a 400–800 µs window, so a transient
+/// conflict costs microseconds rather than the multi-millisecond stalls an
+/// in-process journal engine should never pay.
 fn occ_backoff(attempt: usize) {
-    let cap_micros = 1_000u64 << attempt.min(4);
+    let cap_micros = 100u64 << attempt.min(3);
     let clock_jitter = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| u64::from(elapsed.subsec_nanos()));
