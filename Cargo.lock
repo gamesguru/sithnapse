@@ -968,7 +968,7 @@ dependencies = [
 [[package]]
 name = "mtxdb"
 version = "0.1.0-beta.2"
-source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?rev=1df3043e67f4ed81fe8efa35b080aea05de28fb4#1df3043e67f4ed81fe8efa35b080aea05de28fb4"
+source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=refactor%2Fpack-id-store-layout#f3dea3d6b6e7d469d2834783cea2e7aed034d8f5"
 dependencies = [
  "arc-swap",
  "blake3",
@@ -1382,7 +1382,7 @@ dependencies = [
 [[package]]
 name = "rezzy"
 version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#aa04265ced8e9bdb48412e0156b760acbaefe343"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#2240f0e16b7933d28bb9859231a59253d1d2f4e9"
 dependencies = [
  "base64 0.22.1",
  "blake2",
@@ -1390,6 +1390,7 @@ dependencies = [
  "imbl",
  "rezzy-json",
  "rezzy-recon",
+ "rezzy-types",
  "roaring",
  "sha2",
  "sha3",
@@ -1398,7 +1399,7 @@ dependencies = [
 [[package]]
 name = "rezzy-json"
 version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#aa04265ced8e9bdb48412e0156b760acbaefe343"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#2240f0e16b7933d28bb9859231a59253d1d2f4e9"
 dependencies = [
  "ryu",
 ]
@@ -1406,11 +1407,17 @@ dependencies = [
 [[package]]
 name = "rezzy-recon"
 version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#aa04265ced8e9bdb48412e0156b760acbaefe343"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#2240f0e16b7933d28bb9859231a59253d1d2f4e9"
 dependencies = [
  "base64 0.22.1",
+ "rezzy-types",
  "sha2",
 ]
+
+[[package]]
+name = "rezzy-types"
+version = "0.6.0-rc.0"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#2240f0e16b7933d28bb9859231a59253d1d2f4e9"
 
 [[package]]
 name = "ring"
@@ -1787,7 +1794,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
