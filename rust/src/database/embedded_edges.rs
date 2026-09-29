@@ -3,7 +3,8 @@
 //! Stores the DAG edges connecting Matrix events:
 //! - Backward edges: `event_id -> [(prev_event_id, is_state)]` (immutable, write-once).
 //! - Forward edges: `prev_event_id -> [child_event_id]` (appended and
-//!   deduplicated under a per-room lock; see `lock_rooms`).
+//!   deduplicated under optimistic collection-version checking when a shared
+//!   WAL is open, or the per-room lock `lock_rooms` without one).
 //!
 //! Locators are primarily owned by `event_json_put`, but `event_edges_put`
 //! re-publishes the locator for every event a row touches (its own id and
@@ -48,6 +49,30 @@ trait EdgeWriteTarget {
         collection: [u8; 16],
         pairs: Vec<(NodeId, NodeData)>,
     ) -> Result<(), mtxdb::storage::StorageError>;
+
+    /// Read records together with the collection's logical version. A direct
+    /// engine write has no logical clock and relies on its caller's room lock,
+    /// so it reports `None`; a staged transaction reports the version it will
+    /// require at commit. See `write_edges`.
+    fn edge_get_versioned(
+        &self,
+        collection: &[u8; 16],
+        ids: &[NodeId],
+    ) -> Result<(Vec<Option<NodeData>>, Option<u64>), mtxdb::storage::StorageError> {
+        self.edge_get_many(collection, ids)
+            .map(|found| (found, None))
+    }
+
+    /// Stage a precondition that `collection`'s logical version is unchanged at
+    /// commit. A no-op for a direct engine write (`None`).
+    fn edge_expect_version(
+        &self,
+        collection: &[u8; 16],
+        version: Option<u64>,
+    ) -> Result<(), mtxdb::storage::StorageError> {
+        let _ = (collection, version);
+        Ok(())
+    }
 }
 
 impl EdgeWriteTarget for mtxdb::PackfileStorage {
@@ -91,6 +116,28 @@ impl EdgeWriteTarget for DatabaseTransaction<'_> {
         }
         Ok(())
     }
+
+    fn edge_get_versioned(
+        &self,
+        collection: &[u8; 16],
+        ids: &[NodeId],
+    ) -> Result<(Vec<Option<NodeData>>, Option<u64>), mtxdb::storage::StorageError> {
+        self.get_with_collection_version(ShardType::Edges, collection, ids)
+            .map(|(found, version)| (found, Some(version)))
+    }
+
+    fn edge_expect_version(
+        &self,
+        collection: &[u8; 16],
+        version: Option<u64>,
+    ) -> Result<(), mtxdb::storage::StorageError> {
+        match version {
+            Some(version) => self
+                .expect_collection_version(ShardType::Edges, *collection, version)
+                .map_err(mtxdb::storage::StorageError::Io),
+            None => Ok(()),
+        }
+    }
 }
 
 trait ForwardWriteTarget {
@@ -110,6 +157,28 @@ trait ForwardWriteTarget {
         generation: u32,
         published_source_version: u64,
     ) -> Result<(), mtxdb::storage::StorageError>;
+
+    /// Read records together with the collection's logical version. See
+    /// [`EdgeWriteTarget::edge_get_versioned`].
+    fn forward_get_versioned(
+        &self,
+        collection: &[u8; 16],
+        ids: &[NodeId],
+    ) -> Result<(Vec<Option<NodeData>>, Option<u64>), mtxdb::storage::StorageError> {
+        self.forward_get_many(collection, ids)
+            .map(|found| (found, None))
+    }
+
+    /// Stage a precondition that `collection`'s logical version is unchanged at
+    /// commit. See [`EdgeWriteTarget::edge_expect_version`].
+    fn forward_expect_version(
+        &self,
+        collection: &[u8; 16],
+        version: Option<u64>,
+    ) -> Result<(), mtxdb::storage::StorageError> {
+        let _ = (collection, version);
+        Ok(())
+    }
 }
 
 impl ForwardWriteTarget for mtxdb::PackfileStorage {
@@ -187,6 +256,28 @@ impl ForwardWriteTarget for DatabaseTransaction<'_> {
             )),
         )
         .map_err(mtxdb::storage::StorageError::Io)
+    }
+
+    fn forward_get_versioned(
+        &self,
+        collection: &[u8; 16],
+        ids: &[NodeId],
+    ) -> Result<(Vec<Option<NodeData>>, Option<u64>), mtxdb::storage::StorageError> {
+        self.get_with_collection_version(ShardType::Edges, collection, ids)
+            .map(|(found, version)| (found, Some(version)))
+    }
+
+    fn forward_expect_version(
+        &self,
+        collection: &[u8; 16],
+        version: Option<u64>,
+    ) -> Result<(), mtxdb::storage::StorageError> {
+        match version {
+            Some(version) => self
+                .expect_collection_version(ShardType::Edges, *collection, version)
+                .map_err(mtxdb::storage::StorageError::Io),
+            None => Ok(()),
+        }
     }
 }
 
@@ -491,6 +582,60 @@ fn insert_event_locator(
     );
 }
 
+/// One optimistic edge-write attempt's result.
+enum EdgeOccOutcome {
+    Done,
+    /// The commit was rejected because a collection version moved. Expectation
+    /// validation runs before the append, so nothing was published and the
+    /// body is safe to replay on a fresh transaction.
+    Conflict,
+}
+
+/// Retry budget for a version-bound edge write before surfacing contention as
+/// a retryable error the caller (Python) can back off on.
+const MAX_OCC_ATTEMPTS: usize = 16;
+
+/// Bounded exponential backoff with per-attempt jitter. Detached threads that
+/// lost the same race must not retry in lockstep and re-collide, so the delay
+/// is spread by a cheap clock-derived offset rather than a fixed sleep.
+fn occ_backoff(attempt: usize) {
+    let base_micros = 25u64 << attempt.min(5);
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| u64::from(elapsed.subsec_nanos()))
+        % (base_micros + 1);
+    std::thread::sleep(std::time::Duration::from_micros(base_micros + jitter));
+}
+
+/// Run a version-bound edge write in an optimistic loop. `body` reads each
+/// touched collection through `*_get_versioned`, stages an expectation for it,
+/// and stages its mutations; this commits the transaction and retries only on
+/// [`mtxdb::storage::StorageError::StaleRead`]. Every other commit failure is
+/// ambiguous -- the writes may or may not have published -- so it is
+/// propagated without retry, and `abort` is never called after a failed
+/// commit.
+fn run_edge_occ(
+    mut txn: DatabaseTransaction<'static>,
+    body: &mut dyn FnMut(&DatabaseTransaction<'static>) -> PyResult<EdgeOccOutcome>,
+) -> PyResult<()> {
+    for attempt in 0..MAX_OCC_ATTEMPTS {
+        match body(&txn)? {
+            EdgeOccOutcome::Done => return Ok(()),
+            EdgeOccOutcome::Conflict => {
+                occ_backoff(attempt);
+                txn = begin_internal_transaction()?.ok_or_else(|| {
+                    pyo3::exceptions::PyRuntimeError::new_err(
+                        "shared WAL disappeared during an optimistic edge write",
+                    )
+                })?;
+            }
+        }
+    }
+    Err(pyo3::exceptions::PyBlockingIOError::new_err(
+        "mtxdb edge write kept losing the collection-version race; retry",
+    ))
+}
+
 /// Batch put event edges into the room-aware PREV collection in the Edges pool:
 /// 1. Backward edges: `event_id -> [(prev_event_id, is_state)]`
 /// 2. Forward edges: `prev_event_id -> [child_event_id]` (appended and deduplicated)
@@ -518,30 +663,36 @@ pub fn event_edges_put(
         .map(|(room_id, _, _, _)| prev_edges_room_id(&namespace, room_id))
         .collect();
     py.detach(|| {
-        // Held for the whole function, including the transaction's commit
-        // below: releasing it between staging and commit would let another
-        // writer's direct read/merge interleave against data this call has
-        // already decided to overwrite (mtxdb has no RMW conflict detection
-        // to catch that after the fact -- see `res/docs/2026-09-26-
-        // priorities.md` §0.4). Keeping stage-through-commit inside one
-        // held lock sidesteps needing that.
-        let _guards = lock_rooms(room_collections);
-
         // Stage everything as one transaction when a shared WAL is open, so
         // the three put_many groups below (backward records, forward-list
         // rewrites, locators) publish as a single journal group instead of
         // three -- the same win `event_json_put`'s staging already has, see
-        // `res/docs/2026-09-26-priorities.md` §1.4. Without a shared WAL
-        // (`begin_internal_transaction` returns `None`) fall back to writing
-        // the live pool directly, exactly as before.
+        // `res/docs/2026-09-26-priorities.md` §1.4.
+        //
+        // The merge is guarded optimistically: `write_edges` reads each
+        // touched PREV collection's logical version and stages an expectation,
+        // so a concurrent merge on the same room fails the commit with
+        // `StaleRead` before publishing and is replayed -- replacing the room
+        // lock, which existed only because mtxdb had no RMW conflict detection
+        // (see `res/docs/2026-09-26-priorities.md` §0.4). Without a shared WAL
+        // there is no logical clock, so fall back to the room lock and a
+        // direct write, exactly as before.
         match begin_internal_transaction()? {
             Some(txn) => {
-                write_edges(&txn, &namespace, rows)?;
-                txn.commit().map_err(|e| map_transaction_error("commit", e))
+                let mut body = |txn: &DatabaseTransaction<'static>| {
+                    write_edges(txn, &namespace, &rows)?;
+                    match txn.commit() {
+                        Ok(()) => Ok(EdgeOccOutcome::Done),
+                        Err(error) if error.is_stale_read() => Ok(EdgeOccOutcome::Conflict),
+                        Err(error) => Err(map_transaction_error("commit", error)),
+                    }
+                };
+                run_edge_occ(txn, &mut body)
             }
             None => {
+                let _guards = lock_rooms(room_collections);
                 let engine: &mtxdb::PackfileStorage = auth_chain_db()?;
-                write_edges(engine, &namespace, rows)
+                write_edges(engine, &namespace, &rows)
             }
         }
     })
@@ -550,11 +701,14 @@ pub fn event_edges_put(
 /// The merge logic shared by a direct engine write and a staged transaction
 /// write: batch-read existing forward child lists, append/deduplicate new
 /// children, and write backward records, forward-list rewrites, and locators
-/// through `target`. Caller holds the room locks for `rows`' rooms.
+/// through `target`. A staged transaction binds each forward read to the
+/// collection's logical version and requires it at commit (see
+/// [`EdgeWriteTarget::edge_expect_version`]); a direct write has no clock and
+/// relies on the caller's room lock instead.
 fn write_edges(
     target: &impl EdgeWriteTarget,
     namespace: &str,
-    rows: Vec<(String, String, String, bool)>,
+    rows: &[(String, String, String, bool)],
 ) -> PyResult<()> {
     let namespace = namespace.to_string();
     let engine = target;
@@ -566,11 +720,11 @@ fn write_edges(
         backward_map
             .entry((room_id.clone(), event_id.clone()))
             .or_default()
-            .push((prev_event_id.clone(), is_state));
+            .push((prev_event_id.clone(), *is_state));
         forward_map
-            .entry((room_id, prev_event_id))
+            .entry((room_id.clone(), prev_event_id.clone()))
             .or_default()
-            .push(event_id);
+            .push(event_id.clone());
     }
 
     let mut dag_puts: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
@@ -609,9 +763,16 @@ fn write_edges(
         // "one read per distinct node" true.
         node_ids.sort_unstable();
         node_ids.dedup();
-        let found = engine
-            .edge_get_many(collection, node_ids)
+        // Read at a known collection version and require it to hold at commit:
+        // a concurrent merge into this room collection turns the commit into a
+        // `StaleRead` (validated before the append) that the caller replays,
+        // standing in for the room lock a direct write still needs.
+        let (found, version) = engine
+            .edge_get_versioned(collection, node_ids)
             .map_err(|e| map_transaction_error("get_many", e))?;
+        engine
+            .edge_expect_version(collection, version)
+            .map_err(|e| map_transaction_error("expect_version", e))?;
         for (forward_node, value) in node_ids.iter().zip(found) {
             let children = match value {
                 Some(data) if !data.bytes.is_empty() => decode_forward_edges(&data.bytes)?,
@@ -1041,24 +1202,31 @@ pub fn event_edges_apply_forward_outbox(
         return Ok(());
     }
 
-    py.detach(|| {
-        let room_collection = forward_edges_room_id(&room_id, generation);
-        let _guards = lock_rooms([room_collection]);
-
-        match begin_internal_transaction()? {
-            Some(txn) => {
-                apply_forward_delta(&txn, &namespace, &room_id, generation, rows)?;
+    py.detach(|| match begin_internal_transaction()? {
+        // Only the per-room forward generation is version-bound; the shared
+        // room-metadata collection is deliberately left out of the expectation
+        // set so one room's watermark write can't conflict with another's.
+        Some(txn) => {
+            let mut body = |txn: &DatabaseTransaction<'static>| {
+                apply_forward_delta(txn, &namespace, &room_id, generation, &rows)?;
                 txn.forward_put_meta(&room_id, generation, published_source_version)
                     .map_err(|e| map_transaction_error("put_metadata", e))?;
-                txn.commit().map_err(|e| map_transaction_error("commit", e))
-            }
-            None => {
-                let engine = auth_chain_db()?;
-                apply_forward_delta(engine.as_ref(), &namespace, &room_id, generation, rows)?;
-                engine
-                    .forward_put_meta(&room_id, generation, published_source_version)
-                    .map_err(|e| map_transaction_error("put_metadata", e))
-            }
+                match txn.commit() {
+                    Ok(()) => Ok(EdgeOccOutcome::Done),
+                    Err(error) if error.is_stale_read() => Ok(EdgeOccOutcome::Conflict),
+                    Err(error) => Err(map_transaction_error("commit", error)),
+                }
+            };
+            run_edge_occ(txn, &mut body)
+        }
+        None => {
+            let room_collection = forward_edges_room_id(&room_id, generation);
+            let _guards = lock_rooms([room_collection]);
+            let engine = auth_chain_db()?;
+            apply_forward_delta(engine.as_ref(), &namespace, &room_id, generation, &rows)?;
+            engine
+                .forward_put_meta(&room_id, generation, published_source_version)
+                .map_err(|e| map_transaction_error("put_metadata", e))
         }
     })
 }
@@ -1079,18 +1247,23 @@ pub fn event_edges_apply_forward_generation_delta(
         return Ok(());
     }
 
-    py.detach(|| {
-        let collection = forward_edges_room_id(&room_id, generation);
-        let _guards = lock_rooms([collection]);
-        match begin_internal_transaction()? {
-            Some(txn) => {
-                apply_forward_delta(&txn, &namespace, &room_id, generation, rows)?;
-                txn.commit().map_err(|e| map_transaction_error("commit", e))
-            }
-            None => {
-                let engine = auth_chain_db()?;
-                apply_forward_delta(engine.as_ref(), &namespace, &room_id, generation, rows)
-            }
+    py.detach(|| match begin_internal_transaction()? {
+        Some(txn) => {
+            let mut body = |txn: &DatabaseTransaction<'static>| {
+                apply_forward_delta(txn, &namespace, &room_id, generation, &rows)?;
+                match txn.commit() {
+                    Ok(()) => Ok(EdgeOccOutcome::Done),
+                    Err(error) if error.is_stale_read() => Ok(EdgeOccOutcome::Conflict),
+                    Err(error) => Err(map_transaction_error("commit", error)),
+                }
+            };
+            run_edge_occ(txn, &mut body)
+        }
+        None => {
+            let collection = forward_edges_room_id(&room_id, generation);
+            let _guards = lock_rooms([collection]);
+            let engine = auth_chain_db()?;
+            apply_forward_delta(engine.as_ref(), &namespace, &room_id, generation, &rows)
         }
     })
 }
@@ -1207,7 +1380,7 @@ fn apply_forward_delta(
     namespace: &str,
     room_id: &str,
     generation: u32,
-    rows: Vec<(String, String, String)>,
+    rows: &[(String, String, String)],
 ) -> PyResult<()> {
     let collection = forward_edges_room_id(room_id, generation);
     // Fold the rows into a per-parent, per-child last-operation-wins map rather
@@ -1228,9 +1401,9 @@ fn apply_forward_delta(
             }
         };
         deltas
-            .entry(prev_event_id)
+            .entry(prev_event_id.clone())
             .or_default()
-            .insert(event_id, is_insert);
+            .insert(event_id.clone(), is_insert);
     }
 
     let mut parents: Vec<String> = deltas.keys().cloned().collect();
@@ -1239,9 +1412,15 @@ fn apply_forward_delta(
         .iter()
         .map(|parent| event_edges_forward_node_id(namespace, parent))
         .collect();
-    let existing = target
-        .forward_get_many(&collection, &node_ids)
+    // Read at a known version and require it to hold at commit, so a
+    // concurrent merge into this generation is a `StaleRead` (validated before
+    // the append) rather than a lost update.
+    let (existing, version) = target
+        .forward_get_versioned(&collection, &node_ids)
         .map_err(|e| map_transaction_error("get_many", e))?;
+    target
+        .forward_expect_version(&collection, version)
+        .map_err(|e| map_transaction_error("expect_version", e))?;
 
     let mut puts = Vec::with_capacity(parents.len());
     for (parent, existing) in parents.into_iter().zip(existing) {

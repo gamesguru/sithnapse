@@ -452,7 +452,13 @@ def put_event_edges_batch(
         from synapse.synapse_rust.mtxdb_engine import event_edges_put
 
         _et = time.monotonic()
-        event_edges_put(namespace, row_list)
+        # Under a shared WAL, `event_edges_put` runs the optimistic loop
+        # `run_edge_occ` internally: it replays collection-version conflicts up
+        # to `MAX_OCC_ATTEMPTS` and only then raises a retryable
+        # `BlockingIOError`, which nothing else here would catch -- unlike the
+        # forward-outbox and generation-delta writes, which already retry. Do
+        # the same for event persistence rather than surfacing contention.
+        _retry_on_contention(lambda: event_edges_put(namespace, row_list))
         elapsed = time.monotonic() - _et
         ffi_timing("ffi_event_edges_put", elapsed)
         ffi_count("event_edges_put_rows", len(row_list))

@@ -14,8 +14,83 @@ use mtxdb::{
 };
 use mtxdb::{DatabaseTransaction, SharedDatabase};
 use once_cell::sync::OnceCell;
-use pyo3::prelude::*;
+use pyo3::{create_exception, exceptions::PyException, prelude::*, PyTypeInfo};
 use sha2::{Digest, Sha256};
+
+create_exception!(
+    synapse.synapse_rust.mtxdb_engine,
+    StaleReadError,
+    PyException,
+    "An mtxdb transaction read a collection version that changed before commit"
+);
+
+fn parse_pool_tag(pool_tag: u8) -> PyResult<ShardType> {
+    match pool_tag {
+        0 => Ok(ShardType::State),
+        1 => Ok(ShardType::EventDag),
+        2 => Ok(ShardType::Edges),
+        3 => Ok(ShardType::ServerInfo),
+        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "invalid mtxdb pool tag {pool_tag}; expected 0 (state), 1 (event DAG), 2 (edges), or 3 (server info)"
+        ))),
+    }
+}
+
+fn parse_collection_id(collection_id: Vec<u8>) -> PyResult<[u8; 16]> {
+    collection_id.try_into().map_err(|bytes: Vec<u8>| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "collection_id must be exactly 16 bytes, got {}",
+            bytes.len()
+        ))
+    })
+}
+
+fn parse_node_ids(node_ids: Vec<Vec<u8>>) -> PyResult<Vec<NodeId>> {
+    node_ids
+        .into_iter()
+        .map(|node_id| {
+            let len = node_id.len();
+            node_id.try_into().map_err(|_: Vec<u8>| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "each node_id must be exactly 16 bytes, got {len}"
+                ))
+            })
+        })
+        .collect()
+}
+
+fn stale_read_error(pool: ShardType, collection_id: [u8; 16], expected: u64, actual: u64) -> PyErr {
+    StaleReadError::new_err((
+        format!(
+            "stale read on {} collection {:02x?}: expected {}, actual {}",
+            pool.as_str(),
+            collection_id,
+            expected,
+            actual
+        ),
+        pool.as_str(),
+        collection_id.to_vec(),
+        expected,
+        actual,
+    ))
+}
+
+fn map_versioned_storage_error(error: StorageError) -> PyErr {
+    match error {
+        StorageError::StaleRead {
+            pool,
+            collection_id,
+            expected,
+            actual,
+        } => stale_read_error(pool, collection_id, expected, actual),
+        StorageError::WouldBlock(message) => pyo3::exceptions::PyBlockingIOError::new_err(message),
+        StorageError::Io(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            pyo3::exceptions::PyBlockingIOError::new_err(error.to_string())
+        }
+        StorageError::Unsupported(message) => pyo3::exceptions::PyRuntimeError::new_err(message),
+        other => pyo3::exceptions::PyRuntimeError::new_err(other.to_string()),
+    }
+}
 
 use crate::database::hamt_store::{NodeStore, ROOM_PREFIX_LEN};
 
@@ -3215,20 +3290,105 @@ pub(crate) fn map_transaction_io_error(context: &str, error: std::io::Error) -> 
 /// retried the way a contended direct write or read already is -- fixed here
 /// to match `map_read_storage_error`'s retryable mapping.
 pub(crate) fn map_transaction_error(context: &str, error: StorageError) -> PyErr {
-    let retryable = matches!(
-        &error,
-        StorageError::Io(io_error) if io_error.kind() == std::io::ErrorKind::WouldBlock
-    );
-    let message = format!("mtxdb transaction {context}: {error}");
-    if retryable {
-        pyo3::exceptions::PyBlockingIOError::new_err(message)
-    } else {
-        pyo3::exceptions::PyRuntimeError::new_err(message)
+    match error {
+        StorageError::StaleRead {
+            pool,
+            collection_id,
+            expected,
+            actual,
+        } => stale_read_error(pool, collection_id, expected, actual),
+        StorageError::WouldBlock(message) => pyo3::exceptions::PyBlockingIOError::new_err(format!(
+            "mtxdb transaction {context}: {message}"
+        )),
+        StorageError::Unsupported(message) => pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "mtxdb transaction {context}: {message}"
+        )),
+        error => {
+            let retryable = matches!(
+                &error,
+                StorageError::Io(io_error) if io_error.kind() == std::io::ErrorKind::WouldBlock
+            );
+            let message = format!("mtxdb transaction {context}: {error}");
+            if retryable {
+                pyo3::exceptions::PyBlockingIOError::new_err(message)
+            } else {
+                pyo3::exceptions::PyRuntimeError::new_err(message)
+            }
+        }
     }
 }
 
 #[pymethods]
 impl PyMtxdbTransaction {
+    /// Read records and the collection's logical version from one visibility
+    /// boundary. Pool tags are stable: 0=state, 1=event DAG, 2=edges, 3=server
+    /// info. Collection and node IDs must each be 16 bytes. Records are
+    /// returned in node_ids order as bytes or None.
+    pub fn get_with_collection_version(
+        &self,
+        py: Python<'_>,
+        pool_tag: u8,
+        collection_id: Vec<u8>,
+        node_ids: Vec<Vec<u8>>,
+    ) -> PyResult<(Vec<Option<Vec<u8>>>, u64)> {
+        let pool = parse_pool_tag(pool_tag)?;
+        let collection_id = parse_collection_id(collection_id)?;
+        let node_ids = parse_node_ids(node_ids)?;
+        py.detach(|| {
+            let (records, version) = self
+                .inner
+                .get_with_collection_version(pool, &collection_id, &node_ids)
+                .map_err(map_versioned_storage_error)?;
+            Ok((
+                records
+                    .into_iter()
+                    .map(|record| record.map(|data| data.bytes.to_vec()))
+                    .collect(),
+                version,
+            ))
+        })
+    }
+
+    /// Require the collection's logical version to remain unchanged through
+    /// commit. A conflict raises `StaleReadError`, with `(message, pool,
+    /// collection_id, expected, actual)` in its args.
+    pub fn expect_collection_version(
+        &self,
+        pool_tag: u8,
+        collection_id: Vec<u8>,
+        expected: u64,
+    ) -> PyResult<()> {
+        let pool = parse_pool_tag(pool_tag)?;
+        let collection_id = parse_collection_id(collection_id)?;
+        self.inner
+            .expect_collection_version(pool, collection_id, expected)
+            .map_err(|error| map_transaction_io_error("stage version expectation", error))
+    }
+
+    /// Stage an arbitrary 16-byte-keyed record in the selected pool.
+    pub fn put(
+        &self,
+        py: Python<'_>,
+        pool_tag: u8,
+        collection_id: Vec<u8>,
+        node_id: Vec<u8>,
+        payload: Vec<u8>,
+    ) -> PyResult<()> {
+        let pool = parse_pool_tag(pool_tag)?;
+        let collection_id = parse_collection_id(collection_id)?;
+        let node_id = parse_node_ids(vec![node_id])?[0];
+        py.detach(|| {
+            self.inner
+                .put(
+                    pool,
+                    collection_id,
+                    node_id,
+                    &NodeData::new(bytes::Bytes::from(payload)),
+                )
+                .map_err(|error| map_transaction_io_error("stage put", error))
+        })
+    }
+
     /// Stage what `event_json_put` would write, without touching the pool.
     fn event_json_put(
         &self,
@@ -3271,6 +3431,25 @@ impl PyMtxdbTransaction {
             .abort()
             .map_err(|e| map_transaction_error("abort", e))
     }
+}
+
+/// Recheck a collection version after consuming a lazy scan. The token must
+/// have been captured before the scan. Pool tags use the same stable mapping
+/// as `MtxdbTransaction.get_with_collection_version`.
+#[pyfunction]
+pub fn recheck_collection_version(
+    py: Python<'_>,
+    pool_tag: u8,
+    collection_id: Vec<u8>,
+    expected: u64,
+) -> PyResult<bool> {
+    let pool = parse_pool_tag(pool_tag)?;
+    let collection_id = parse_collection_id(collection_id)?;
+    py.detach(|| {
+        db_for_shard_type(pool)?
+            .recheck_collection_version(&collection_id, expected)
+            .map_err(map_versioned_storage_error)
+    })
 }
 
 /// `(phase, total seconds, calls)` per transaction-commit phase.
@@ -4374,6 +4553,7 @@ pub fn repack(py: Python<'_>) -> PyResult<Py<PyDict>> {
 }
 
 pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("StaleReadError", StaleReadError::type_object(m.py()))?;
     m.add_function(wrap_pyfunction!(open_client, m)?)?;
     m.add_function(wrap_pyfunction!(open_client_read_only, m)?)?;
     m.add_function(wrap_pyfunction!(put_state_hamt_nodes, m)?)?;
@@ -4417,6 +4597,7 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(sync_event_dag, m)?)?;
     m.add_function(wrap_pyfunction!(sync_auth_chain, m)?)?;
     m.add_function(wrap_pyfunction!(begin_transaction, m)?)?;
+    m.add_function(wrap_pyfunction!(recheck_collection_version, m)?)?;
     m.add_function(wrap_pyfunction!(txn_commit_phases, m)?)?;
     m.add_class::<PyMtxdbTransaction>()?;
     m.add_function(wrap_pyfunction!(start_background_commit, m)?)?;
