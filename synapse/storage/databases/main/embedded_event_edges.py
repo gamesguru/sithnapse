@@ -43,6 +43,7 @@ import collections
 import logging
 import threading
 import time
+import uuid
 from typing import TYPE_CHECKING, Any, Callable, Iterable, TypeVar, cast
 
 from synapse.storage.databases.main.embedded_common import (
@@ -807,3 +808,264 @@ async def drain_edge_index_outbox(
         await store.db_pool.runInteraction("edge_outbox_ack", _ack_through, max_version)
         ffi_count("event_edges_outbox_rows", len(rows))
         return True
+
+
+async def acquire_rebuild_checkpoint(
+    store: Any,
+    room_id: str,
+    start_source_version: int,
+    *,
+    rebuild_id: str | None = None,
+    lease_duration_ms: int = 60_000,
+) -> str:
+    """Register a durable outbox consumer lease for a room rebuild."""
+    rebuild_id = rebuild_id or str(uuid.uuid4())
+    expires_at = int(time.time() * 1000) + lease_duration_ms
+
+    def _insert(txn: Any) -> None:
+        txn.execute(
+            "INSERT INTO room_edge_rebuild_checkpoints "
+            "(room_id, rebuild_id, start_source_version, "
+            "last_replayed_source_version, lease_expires_at_ms) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                room_id,
+                rebuild_id,
+                start_source_version,
+                start_source_version,
+                expires_at,
+            ),
+        )
+
+    await store.db_pool.runInteraction("acquire_rebuild_checkpoint", _insert)
+    return rebuild_id
+
+
+async def heartbeat_rebuild_checkpoint(
+    store: Any,
+    room_id: str,
+    rebuild_id: str,
+    replayed_source_version: int,
+    *,
+    lease_duration_ms: int = 60_000,
+) -> None:
+    """Advance a rebuild lease monotonically and extend its expiry."""
+    expires_at = int(time.time() * 1000) + lease_duration_ms
+
+    def _update(txn: Any) -> None:
+        txn.execute(
+            "UPDATE room_edge_rebuild_checkpoints "
+            "SET last_replayed_source_version = CASE "
+            "WHEN last_replayed_source_version < ? THEN ? "
+            "ELSE last_replayed_source_version END, "
+            "lease_expires_at_ms = ? "
+            "WHERE room_id = ? AND rebuild_id = ?",
+            (
+                replayed_source_version,
+                replayed_source_version,
+                expires_at,
+                room_id,
+                rebuild_id,
+            ),
+        )
+        if txn.rowcount != 1:
+            raise RuntimeError("edge rebuild checkpoint disappeared")
+
+    await store.db_pool.runInteraction("heartbeat_rebuild_checkpoint", _update)
+
+
+async def release_rebuild_checkpoint(store: Any, room_id: str, rebuild_id: str) -> None:
+    """Release a rebuild lease; the next drain can reclaim retained rows."""
+
+    def _delete(txn: Any) -> None:
+        txn.execute(
+            "DELETE FROM room_edge_rebuild_checkpoints "
+            "WHERE room_id = ? AND rebuild_id = ?",
+            (room_id, rebuild_id),
+        )
+
+    await store.db_pool.runInteraction("release_rebuild_checkpoint", _delete)
+
+
+async def rebuild_room_forward_index(
+    store: Any,
+    room_id: str,
+    *,
+    batch_size: int = 1000,
+    namespace: str = "synapse",
+) -> bool:
+    """Build and publish a complete forward index generation for one room."""
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+
+    from synapse.synapse_rust.mtxdb_engine import (
+        event_edges_apply_forward_generation_delta,
+        event_edges_build_generation_batch,
+        event_edges_reset_generation,
+        room_forward_meta_get,
+        room_forward_meta_swap,
+    )
+
+    locks = store.hs.get_worker_locks_handler()
+    # Register at zero while taking the initial snapshot version. This closes
+    # the window in which a drainer could truncate the stream before the lease
+    # exists; the checkpoint is advanced to the snapshot version afterwards.
+    async with locks.acquire_lock("embedded_edge_index_outbox", room_id):
+        meta = _retry_on_contention(lambda: room_forward_meta_get(room_id))
+        active_generation = meta[0] if meta is not None else 0
+        rebuild_id = await acquire_rebuild_checkpoint(store, room_id, 0)
+        try:
+
+            def _source_version(txn: Any) -> int:
+                txn.execute(
+                    "SELECT source_version FROM room_edge_source_version "
+                    "WHERE room_id = ?",
+                    (room_id,),
+                )
+                row = txn.fetchone()
+                return int(row[0]) if row else 0
+
+            start_version = await store.db_pool.runInteraction(
+                "get_rebuild_source_version", _source_version
+            )
+            await heartbeat_rebuild_checkpoint(
+                store, room_id, rebuild_id, start_version
+            )
+        except BaseException:
+            await release_rebuild_checkpoint(store, room_id, rebuild_id)
+            raise
+
+    target_generation = active_generation + 1
+    last_prev_id = ""
+
+    try:
+        _retry_on_contention(
+            lambda: event_edges_reset_generation(room_id, target_generation)
+        )
+        # Select parent keys first, then fetch every child for those parents.
+        # This prevents a single parent's adjacency list being split across
+        # build batches and overwritten by the next batch.
+        while True:
+
+            def _parent_batch(txn: Any) -> list[str]:
+                txn.execute(
+                    "SELECT DISTINCT ee.prev_event_id "
+                    "FROM event_edges AS ee JOIN events AS ev "
+                    "ON ev.event_id = ee.event_id "
+                    "WHERE ev.room_id = ? AND ee.prev_event_id > ? "
+                    "ORDER BY ee.prev_event_id LIMIT ?",
+                    (room_id, last_prev_id, batch_size),
+                )
+                return [str(row[0]) for row in txn]
+
+            parents = await store.db_pool.runInteraction(
+                "fetch_rebuild_parents", _parent_batch
+            )
+            if not parents:
+                break
+
+            first_parent, last_parent = parents[0], parents[-1]
+
+            def _edge_batch(txn: Any) -> list[tuple[str, str]]:
+                txn.execute(
+                    "SELECT ee.prev_event_id, ee.event_id "
+                    "FROM event_edges AS ee JOIN events AS ev "
+                    "ON ev.event_id = ee.event_id "
+                    "WHERE ev.room_id = ? AND ee.prev_event_id >= ? "
+                    "AND ee.prev_event_id <= ? "
+                    "ORDER BY ee.prev_event_id, ee.event_id",
+                    (room_id, first_parent, last_parent),
+                )
+                return [(str(prev), str(child)) for prev, child in txn]
+
+            raw_edges = await store.db_pool.runInteraction(
+                "fetch_rebuild_edges", _edge_batch
+            )
+            grouped: dict[str, list[str]] = collections.defaultdict(list)
+            for prev_id, child_id in raw_edges:
+                grouped[prev_id].append(child_id)
+            _retry_on_contention(
+                lambda: event_edges_build_generation_batch(
+                    namespace, room_id, target_generation, list(grouped.items())
+                )
+            )
+            last_prev_id = last_parent
+
+        last_replayed = start_version
+        while True:
+
+            def _outbox_batch(txn: Any) -> list[tuple[str, int, str, str]]:
+                txn.execute(
+                    "SELECT event_id, source_version, prev_event_id, operation "
+                    "FROM edge_index_outbox WHERE room_id = ? "
+                    "AND source_version > ? ORDER BY source_version, event_id "
+                    "LIMIT ?",
+                    (room_id, last_replayed, batch_size),
+                )
+                rows = [(str(a), int(b), str(c), str(d)) for a, b, c, d in txn]
+                if not rows:
+                    return []
+                max_version = max(row[1] for row in rows)
+                txn.execute(
+                    "SELECT event_id, source_version, prev_event_id, operation "
+                    "FROM edge_index_outbox WHERE room_id = ? "
+                    "AND source_version > ? AND source_version <= ? "
+                    "ORDER BY source_version, event_id, prev_event_id, operation",
+                    (room_id, last_replayed, max_version),
+                )
+                return [(str(a), int(b), str(c), str(d)) for a, b, c, d in txn]
+
+            rows = await store.db_pool.runInteraction(
+                "fetch_rebuild_outbox", _outbox_batch
+            )
+            if not rows:
+                break
+            max_version = max(row[1] for row in rows)
+            _retry_on_contention(
+                lambda: event_edges_apply_forward_generation_delta(
+                    namespace,
+                    room_id,
+                    target_generation,
+                    [(row[0], row[2], row[3]) for row in rows],
+                )
+            )
+            last_replayed = max_version
+            await heartbeat_rebuild_checkpoint(
+                store, room_id, rebuild_id, last_replayed
+            )
+
+        async with locks.acquire_lock("embedded_edge_index_outbox", room_id):
+
+            def _final(txn: Any) -> tuple[int, list[tuple[str, str, str]]]:
+                txn.execute(
+                    "SELECT source_version FROM room_edge_source_version "
+                    "WHERE room_id = ?",
+                    (room_id,),
+                )
+                row = txn.fetchone()
+                current_version = int(row[0]) if row else 0
+                txn.execute(
+                    "SELECT event_id, prev_event_id, operation "
+                    "FROM edge_index_outbox WHERE room_id = ? "
+                    "AND source_version > ? ORDER BY source_version, event_id",
+                    (room_id, last_replayed),
+                )
+                return current_version, [(str(a), str(b), str(c)) for a, b, c in txn]
+
+            final_version, final_rows = await store.db_pool.runInteraction(
+                "fetch_final_rebuild_outbox", _final
+            )
+            if final_rows:
+                _retry_on_contention(
+                    lambda: event_edges_apply_forward_generation_delta(
+                        namespace, room_id, target_generation, final_rows
+                    )
+                )
+            _retry_on_contention(
+                lambda: room_forward_meta_swap(
+                    room_id, target_generation, final_version
+                )
+            )
+        return True
+    finally:
+        await release_rebuild_checkpoint(store, room_id, rebuild_id)

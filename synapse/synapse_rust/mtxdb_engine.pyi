@@ -75,6 +75,22 @@ def event_edges_apply_forward_outbox(
     published_source_version: int,
     rows: Iterable[tuple[str, str, str]],
 ) -> None: ...
+def event_edges_apply_forward_generation_delta(
+    namespace: str,
+    room_id: str,
+    generation: int,
+    rows: Iterable[tuple[str, str, str]],
+) -> None: ...
+def event_edges_build_generation_batch(
+    namespace: str,
+    room_id: str,
+    target_generation: int,
+    edges: Iterable[tuple[str, list[str]]],
+) -> None: ...
+def event_edges_reset_generation(room_id: str, target_generation: int) -> None: ...
+def room_forward_meta_swap(
+    room_id: str, target_generation: int, target_source_version: int
+) -> None: ...
 def room_forward_meta_get(room_id: str) -> tuple[int, int] | None: ...
 def room_forward_meta_put(
     room_id: str, active_generation: int, published_source_version: int

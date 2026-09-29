@@ -26,8 +26,8 @@ use sha2::{Digest, Sha256};
 use super::mtxdb_syn::{
     assert_writable, auth_chain_db, begin_internal_transaction, encode_room_forward_meta,
     event_locator_collection_id, event_node_id, forward_edges_room_id, map_read_storage_error,
-    map_transaction_error, prev_edges_room_id, read_room_forward_meta, room_forward_meta_node_id,
-    ROOM_FORWARD_META_COLLECTION,
+    map_transaction_error, map_transaction_io_error, prev_edges_room_id, read_room_forward_meta,
+    room_forward_meta_node_id, room_forward_meta_put, ROOM_FORWARD_META_COLLECTION,
 };
 
 /// The read/write surface `event_edges_put` needs, common to a direct engine
@@ -1037,37 +1037,140 @@ pub fn event_edges_apply_forward_outbox(
 
         match begin_internal_transaction()? {
             Some(txn) => {
-                apply_forward_outbox(
-                    &txn,
-                    &namespace,
-                    &room_id,
-                    generation,
-                    published_source_version,
-                    rows,
-                )?;
+                apply_forward_delta(&txn, &namespace, &room_id, generation, rows)?;
+                txn.forward_put_meta(&room_id, generation, published_source_version)
+                    .map_err(|e| map_transaction_error("put_metadata", e))?;
                 txn.commit().map_err(|e| map_transaction_error("commit", e))
             }
             None => {
                 let engine = auth_chain_db()?;
-                apply_forward_outbox(
-                    engine.as_ref(),
-                    &namespace,
-                    &room_id,
-                    generation,
-                    published_source_version,
-                    rows,
-                )
+                apply_forward_delta(engine.as_ref(), &namespace, &room_id, generation, rows)?;
+                engine
+                    .forward_put_meta(&room_id, generation, published_source_version)
+                    .map_err(|e| map_transaction_error("put_metadata", e))
             }
         }
     })
 }
 
-fn apply_forward_outbox(
+/// Apply outbox deltas to an inactive generation without changing the active
+/// room metadata. Rebuild workers use this while constructing G+1; readers
+/// remain on G until `room_forward_meta_swap` succeeds.
+#[pyfunction]
+pub fn event_edges_apply_forward_generation_delta(
+    py: Python<'_>,
+    namespace: String,
+    room_id: String,
+    generation: u32,
+    rows: Vec<(String, String, String)>,
+) -> PyResult<()> {
+    assert_writable()?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    py.detach(|| {
+        let collection = forward_edges_room_id(&room_id, generation);
+        let _guards = lock_rooms([collection]);
+        match begin_internal_transaction()? {
+            Some(txn) => {
+                apply_forward_delta(&txn, &namespace, &room_id, generation, rows)?;
+                txn.commit().map_err(|e| map_transaction_error("commit", e))
+            }
+            None => {
+                let engine = auth_chain_db()?;
+                apply_forward_delta(engine.as_ref(), &namespace, &room_id, generation, rows)
+            }
+        }
+    })
+}
+
+/// Write forward adjacency records into an inactive generation. This does
+/// not change room metadata, so readers continue using the current generation
+/// until the caller performs the final pointer swap.
+#[pyfunction]
+pub fn event_edges_build_generation_batch(
+    py: Python<'_>,
+    namespace: String,
+    room_id: String,
+    target_generation: u32,
+    edges: Vec<(String, Vec<String>)>, // (prev_event_id, child_event_ids)
+) -> PyResult<()> {
+    assert_writable()?;
+    if edges.is_empty() {
+        return Ok(());
+    }
+
+    py.detach(|| {
+        let collection = forward_edges_room_id(&room_id, target_generation);
+        let _guards = lock_rooms([collection]);
+        let pairs = edges
+            .into_iter()
+            .map(|(prev_event_id, children)| {
+                (
+                    event_edges_forward_node_id(&namespace, &prev_event_id),
+                    NodeData::new(bytes::Bytes::from(encode_forward_edges(&children))),
+                )
+            })
+            .collect();
+
+        match begin_internal_transaction()? {
+            Some(txn) => {
+                txn.forward_put_many(collection, pairs)
+                    .map_err(|e| map_transaction_error("put_generation", e))?;
+                txn.commit().map_err(|e| map_transaction_error("commit", e))
+            }
+            None => auth_chain_db()?
+                .put_many(&collection, &pairs)
+                .map(|_| ())
+                .map_err(|e| map_transaction_error("put_generation", e)),
+        }
+    })
+}
+
+/// Remove all records from an inactive generation before rebuilding it. The
+/// active metadata pointer is untouched, so readers remain on the old
+/// generation while the replacement is reset and repopulated.
+#[pyfunction]
+pub fn event_edges_reset_generation(
+    py: Python<'_>,
+    room_id: String,
+    target_generation: u32,
+) -> PyResult<()> {
+    assert_writable()?;
+    py.detach(|| {
+        let collection = forward_edges_room_id(&room_id, target_generation);
+        let _guards = lock_rooms([collection]);
+        match begin_internal_transaction()? {
+            Some(txn) => {
+                txn.delete_collection(ShardType::Edges, collection)
+                    .map_err(|e| map_transaction_io_error("delete_generation", e))?;
+                txn.commit().map_err(|e| map_transaction_error("commit", e))
+            }
+            None => auth_chain_db()?
+                .delete_collection(&collection)
+                .map_err(|e| map_transaction_error("delete_generation", e)),
+        }
+    })
+}
+
+/// Publish an already-built generation by updating its room metadata record.
+/// The caller must hold the cross-process room lock and validate the
+/// source-version catch-up boundary before calling this.
+#[pyfunction]
+pub fn room_forward_meta_swap(
+    room_id: String,
+    target_generation: u32,
+    target_source_version: u64,
+) -> PyResult<()> {
+    room_forward_meta_put(room_id, target_generation, target_source_version)
+}
+
+fn apply_forward_delta(
     target: &impl ForwardWriteTarget,
     namespace: &str,
     room_id: &str,
     generation: u32,
-    published_source_version: u64,
     rows: Vec<(String, String, String)>,
 ) -> PyResult<()> {
     let collection = forward_edges_room_id(room_id, generation);
@@ -1123,9 +1226,6 @@ fn apply_forward_outbox(
     target
         .forward_put_many(collection, puts)
         .map_err(|e| map_transaction_error("put_many", e))?;
-    target
-        .forward_put_meta(room_id, generation, published_source_version)
-        .map_err(|e| map_transaction_error("put_metadata", e))?;
     Ok(())
 }
 
@@ -1285,6 +1385,13 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(event_edges_get_forward, m)?)?;
     m.add_function(wrap_pyfunction!(event_edges_get_forward_gated, m)?)?;
     m.add_function(wrap_pyfunction!(event_edges_apply_forward_outbox, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        event_edges_apply_forward_generation_delta,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(event_edges_build_generation_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(event_edges_reset_generation, m)?)?;
+    m.add_function(wrap_pyfunction!(room_forward_meta_swap, m)?)?;
     m.add_function(wrap_pyfunction!(event_edges_delete, m)?)?;
     Ok(())
 }
