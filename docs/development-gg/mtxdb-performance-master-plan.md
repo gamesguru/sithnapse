@@ -234,6 +234,26 @@ authoritative collections inconsistent. A per-process mutex may protect local
 threads, but cross-process serialization must come from mtxdb's writer or
 transaction mechanism; the mutex alone is not sufficient.
 
+**`DatabaseTransaction` constraint (verified from mtxdb source):**
+`DatabaseTransaction` is owned by `SharedDatabase` and spans exactly the three
+pools in `ShardType::ALL` via a fixed `[Arc<PackfileStorage>; 3]` array. A
+standalone `PackfileStorage` opened outside `SharedDatabase` (Path A) has no
+transaction primitive — only per-record group-commit batching. Joint `SIGN`+`KEYS`
+atomicity therefore requires one of:
+
+- **Path B**: add `ShardType::ServerInfo` to mtxdb, include it in
+  `SharedDatabase` and `PoolPolicies`, and use `begin_transaction()` spanning
+  all four pools. This is the correct long-term design and a prerequisite for
+  crash-safe joint publication.
+- **Path A with sequenced writes**: write `SIGN` first (serialized by the
+  single mtxdb writer), then write `KEYS`. If `KEYS` fails, `SIGN` is committed
+  but the blob is absent; readers must tolerate a missing `KEYS` record and fall
+  back to SQL. Acceptable as a prototype but not crash-safe.
+
+Path B is required before claiming full atomicity. Path A sequenced writes are
+acceptable as a migration-phase prototype, with the inconsistency window
+documented and covered by the SQL fallback read path.
+
 ## Phase 3: event and room-state fan-out
 
 The largest client-facing opportunity is not the polling request itself. It is
