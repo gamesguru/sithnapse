@@ -12,8 +12,10 @@
 # <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
 
+import asyncio
 import atexit
 import shutil
+import sqlite3
 import tempfile
 import threading
 from typing import Any
@@ -41,6 +43,7 @@ from synapse.storage.databases.main.embedded_event_edges import (
     EventEdgesMigrationIncompleteError,
     check_event_edges_migration_complete,
     delete_event_edges_batch,
+    drain_edge_index_outbox,
     flush_edge_writes,
     get_event_edges_backward_batch,
     get_event_edges_forward_batch,
@@ -89,6 +92,210 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
         # queue_edge_write (never flushed here -- the unit test has no flush
         # coalescer driving a timer) do not leak into the next test.
         flush_edge_writes()
+
+    def test_outbox_ack_is_idempotent_after_mtxdb_commit(self) -> None:
+        """Rows survive the commit/SQL-ack gap and are removed on retry."""
+
+        class _Txn:
+            def __init__(self, connection: sqlite3.Connection) -> None:
+                self._cursor = connection.cursor()
+
+            def execute(self, sql: str, args: tuple[Any, ...] = ()) -> None:
+                self._cursor.execute(sql, args)
+
+            def fetchone(self) -> Any:
+                return self._cursor.fetchone()
+
+            def __iter__(self) -> Any:
+                return iter(self._cursor)
+
+            @property
+            def rowcount(self) -> int:
+                return self._cursor.rowcount
+
+        class _DBPool:
+            def __init__(self) -> None:
+                self.connection = sqlite3.connect(":memory:")
+                self.connection.executescript(
+                    """
+                    CREATE TABLE edge_index_outbox (
+                        room_id TEXT, source_version INTEGER, event_id TEXT,
+                        prev_event_id TEXT, operation TEXT
+                    );
+                    CREATE TABLE room_edge_rebuild_checkpoints (
+                        room_id TEXT, last_replayed_source_version INTEGER,
+                        lease_expires_at_ms INTEGER
+                    );
+                    """
+                )
+
+            async def runInteraction(
+                self, _name: str, callback: Any, *args: Any
+            ) -> Any:
+                txn = _Txn(self.connection)
+                result = callback(txn, *args)
+                self.connection.commit()
+                return result
+
+        class _Lock:
+            async def __aenter__(self) -> None:
+                return None
+
+            async def __aexit__(self, *_args: Any) -> None:
+                return None
+
+        class _Locks:
+            def acquire_lock(self, *_args: Any) -> _Lock:
+                return _Lock()
+
+        class _HS:
+            def get_worker_locks_handler(self) -> _Locks:
+                return _Locks()
+
+        class _Store:
+            def __init__(self) -> None:
+                self.db_pool = _DBPool()
+                self.hs = _HS()
+
+        store = _Store()
+        room_id = "!outbox-idempotent:test"
+        store.db_pool.connection.execute(
+            "INSERT INTO edge_index_outbox VALUES (?, ?, ?, ?, ?)",
+            (room_id, 1, "$child", "$parent", "insert"),
+        )
+        store.db_pool.connection.execute(
+            "INSERT INTO room_edge_rebuild_checkpoints VALUES (?, ?, ?)",
+            (room_id, 0, 9_999_999_999_999),
+        )
+        store.db_pool.connection.commit()
+
+        with (
+            mock.patch(
+                "synapse.synapse_rust.mtxdb_engine.room_forward_meta_get",
+                return_value=(0, 1),
+            ),
+            mock.patch(
+                "synapse.synapse_rust.mtxdb_engine.event_edges_apply_forward_outbox"
+            ) as apply,
+        ):
+            # The mtxdb commit is already reflected by the watermark, but the
+            # active rebuild checkpoint prevents the SQL acknowledgement.
+            self.assertFalse(asyncio.run(drain_edge_index_outbox(store)))
+            apply.assert_not_called()
+            self.assertEqual(
+                store.db_pool.connection.execute(
+                    "SELECT COUNT(*) FROM edge_index_outbox"
+                ).fetchone()[0],
+                1,
+            )
+
+            # Once the consumer lease is gone, a retry must acknowledge the
+            # already-published row without applying it a second time.
+            store.db_pool.connection.execute(
+                "DELETE FROM room_edge_rebuild_checkpoints"
+            )
+            store.db_pool.connection.commit()
+            self.assertTrue(asyncio.run(drain_edge_index_outbox(store)))
+            apply.assert_not_called()
+            self.assertEqual(
+                store.db_pool.connection.execute(
+                    "SELECT COUNT(*) FROM edge_index_outbox"
+                ).fetchone()[0],
+                0,
+            )
+
+    def test_expired_rebuild_checkpoint_does_not_block_ack(self) -> None:
+        """An expired rebuild lease cannot retain published outbox rows."""
+
+        class _Txn:
+            def __init__(self, connection: sqlite3.Connection) -> None:
+                self._cursor = connection.cursor()
+
+            def execute(self, sql: str, args: tuple[Any, ...] = ()) -> None:
+                self._cursor.execute(sql, args)
+
+            def fetchone(self) -> Any:
+                return self._cursor.fetchone()
+
+            def __iter__(self) -> Any:
+                return iter(self._cursor)
+
+            @property
+            def rowcount(self) -> int:
+                return self._cursor.rowcount
+
+        class _DBPool:
+            def __init__(self) -> None:
+                self.connection = sqlite3.connect(":memory:")
+                self.connection.executescript(
+                    """
+                    CREATE TABLE edge_index_outbox (
+                        room_id TEXT, source_version INTEGER, event_id TEXT,
+                        prev_event_id TEXT, operation TEXT
+                    );
+                    CREATE TABLE room_edge_rebuild_checkpoints (
+                        room_id TEXT, last_replayed_source_version INTEGER,
+                        lease_expires_at_ms INTEGER
+                    );
+                    """
+                )
+
+            async def runInteraction(
+                self, _name: str, callback: Any, *args: Any
+            ) -> Any:
+                result = callback(_Txn(self.connection), *args)
+                self.connection.commit()
+                return result
+
+        class _Lock:
+            async def __aenter__(self) -> None:
+                return None
+
+            async def __aexit__(self, *_args: Any) -> None:
+                return None
+
+        class _Locks:
+            def acquire_lock(self, *_args: Any) -> _Lock:
+                return _Lock()
+
+        class _HS:
+            def get_worker_locks_handler(self) -> _Locks:
+                return _Locks()
+
+        class _Store:
+            def __init__(self) -> None:
+                self.db_pool = _DBPool()
+                self.hs = _HS()
+
+        store = _Store()
+        room_id = "!outbox-expired:test"
+        store.db_pool.connection.execute(
+            "INSERT INTO edge_index_outbox VALUES (?, ?, ?, ?, ?)",
+            (room_id, 2, "$child", "$parent", "insert"),
+        )
+        store.db_pool.connection.execute(
+            "INSERT INTO room_edge_rebuild_checkpoints VALUES (?, ?, ?)",
+            (room_id, 0, 1),
+        )
+        store.db_pool.connection.commit()
+
+        with (
+            mock.patch(
+                "synapse.synapse_rust.mtxdb_engine.room_forward_meta_get",
+                return_value=(0, 2),
+            ),
+            mock.patch(
+                "synapse.synapse_rust.mtxdb_engine.event_edges_apply_forward_outbox"
+            ) as apply,
+        ):
+            self.assertTrue(asyncio.run(drain_edge_index_outbox(store)))
+            apply.assert_not_called()
+            self.assertEqual(
+                store.db_pool.connection.execute(
+                    "SELECT COUNT(*) FROM edge_index_outbox"
+                ).fetchone()[0],
+                0,
+            )
 
     def test_event_dag_barrier_does_not_drain_edges(self) -> None:
         """The per-event JSON barrier must leave edge batching untouched."""
