@@ -968,7 +968,7 @@ dependencies = [
 [[package]]
 name = "mtxdb"
 version = "0.1.0-beta.2"
-source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=refactor%2Fpack-id-store-layout#f3dea3d6b6e7d469d2834783cea2e7aed034d8f5"
+source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=refactor%2Fpack-id-store-layout#5bd9edf7512cf631f5f5a3bb9d0e9cafd7c55b3b"
 dependencies = [
  "arc-swap",
  "blake3",
@@ -1382,7 +1382,7 @@ dependencies = [
 [[package]]
 name = "rezzy"
 version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#2240f0e16b7933d28bb9859231a59253d1d2f4e9"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#4bacb1ae572256c2370e29718f9a681e146c72bb"
 dependencies = [
  "base64 0.22.1",
  "blake2",
@@ -1399,7 +1399,7 @@ dependencies = [
 [[package]]
 name = "rezzy-json"
 version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#2240f0e16b7933d28bb9859231a59253d1d2f4e9"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#4bacb1ae572256c2370e29718f9a681e146c72bb"
 dependencies = [
  "ryu",
 ]
@@ -1407,7 +1407,7 @@ dependencies = [
 [[package]]
 name = "rezzy-recon"
 version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#2240f0e16b7933d28bb9859231a59253d1d2f4e9"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#4bacb1ae572256c2370e29718f9a681e146c72bb"
 dependencies = [
  "base64 0.22.1",
  "rezzy-types",
@@ -1417,7 +1417,7 @@ dependencies = [
 [[package]]
 name = "rezzy-types"
 version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#2240f0e16b7933d28bb9859231a59253d1d2f4e9"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#4bacb1ae572256c2370e29718f9a681e146c72bb"
 
 [[package]]
 name = "ring"
