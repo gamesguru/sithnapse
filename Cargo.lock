@@ -968,13 +968,14 @@ dependencies = [
 [[package]]
 name = "mtxdb"
 version = "0.1.0-beta.2"
-source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?rev=516370e8799f59bbe480611238c9dc435105ec87#516370e8799f59bbe480611238c9dc435105ec87"
+source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?rev=1df3043e67f4ed81fe8efa35b080aea05de28fb4#1df3043e67f4ed81fe8efa35b080aea05de28fb4"
 dependencies = [
  "arc-swap",
  "blake3",
  "bytes",
  "crc32fast",
  "fs2",
+ "jobserver",
  "memmap2",
  "parking_lot",
  "sha2",

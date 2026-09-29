@@ -259,6 +259,28 @@ _METADATA_TABLES_IGNORE = {
     "schema_compat_version",
 }
 
+# Tables `_RESEED_SQL` inserts singleton rows into. They are always truncated
+# alongside the data tables so those bare INSERTs can never collide with a row
+# that survived the previous reset.
+_RESEED_TABLES = {
+    "appservice_stream_position",
+    "event_push_summary_last_receipt_stream_id",
+    "event_push_summary_stream_ordering",
+    "stats_incremental_position",
+    "user_directory_stream_pos",
+    "federation_stream_position",
+    "device_lists_changes_in_room_max_pruned_stream_id",
+    "device_lists_changes_converted_stream_position",
+    "delayed_events_stream_pos",
+    "room_forgetter_stream_pos",
+    "scheduled_tasks",
+}
+
+
+def _quote_ident(identifier: str) -> str:
+    """Double-quote a table identifier for interpolation into test-only SQL."""
+    return '"' + identifier.replace('"', '""') + '"'
+
 
 _TABLES_TO_TRUNCATE_CACHE: list[str] | None = None
 
@@ -299,21 +321,31 @@ def _reset_recycled_postgres_db(
             test_name=test_name,
         )
 
-        # Dirty-table tracking is process-global and SQL-shape-dependent, so it
-        # cannot safely determine which rows belong to this particular DB.
-        # Truncate every public table except schema identity metadata instead.
+        # A recycled DB is dedicated to one worker process and must be returned
+        # to the fresh-clone state after every test. Truncating all ~180 public
+        # tables each time costs ~120ms on an idle host (inherent per-relation
+        # Postgres TRUNCATE overhead -- 200 empty trivial tables cost ~100ms
+        # too), which dominated a full run's wall time.
         #
-        # The table *set* is schema-derived and identical for every recycled
-        # DB this worker process ever resets -- a DB that picked up DDL never
-        # reaches this function (it's dropped and replaced with a fresh clone
-        # instead, see the `had_ddl` branch in cleanup()). Cache the list
-        # after the first lookup so the recurring per-reset cost is just the
-        # TRUNCATE itself, not a repeated pg_tables catalog query too.
+        # Instead truncate only the relations that actually hold data. A table
+        # with committed rows always has a non-zero heap size, and TRUNCATE
+        # resets that size to zero, so `pg_relation_size > 0` is a superset of
+        # what this DB's previous test dirtied. Unlike the removed
+        # process-global, SQL-regex dirty tracking it reads the physical DB
+        # being reset, so attribution is exact and it cannot miss a table whose
+        # mutation form the regex didn't recognise. `_RESEED_TABLES` are always
+        # included so `_RESEED_SQL`'s bare INSERTs never hit a surviving
+        # primary key.
+        #
+        # The candidate *set* is schema-derived and identical for every
+        # recycled DB this process resets -- a DB that picked up DDL is dropped
+        # and replaced with a fresh clone instead (the `had_ddl` branch in
+        # cleanup()) -- so cache the list after the first lookup.
         global _TABLES_TO_TRUNCATE_CACHE
         if _TABLES_TO_TRUNCATE_CACHE is None:
             _phase = time.monotonic()
             cur.execute(
-                "SELECT quote_ident(tablename) FROM pg_tables "
+                "SELECT tablename FROM pg_tables "
                 "WHERE schemaname = 'public' ORDER BY tablename"
             )
             _TABLES_TO_TRUNCATE_CACHE = [
@@ -324,12 +356,28 @@ def _reset_recycled_postgres_db(
             _pg_timing(
                 "db_reset_catalog", time.monotonic() - _phase, test_name=test_name
             )
-        tables_to_truncate = _TABLES_TO_TRUNCATE_CACHE
+
+        _phase = time.monotonic()
+        cur.execute(
+            "SELECT c.relname FROM pg_class c "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = 'public' "
+            "AND c.relkind IN ('r', 'p') "
+            "AND pg_relation_size(c.oid) > 0"
+        )
+        nonempty = {row[0] for row in cur.fetchall()}
+        _pg_timing(
+            "db_reset_dirty_scan", time.monotonic() - _phase, test_name=test_name
+        )
+
+        tables_to_truncate = sorted(
+            (nonempty & set(_TABLES_TO_TRUNCATE_CACHE)) | _RESEED_TABLES
+        )
         if tables_to_truncate:
             _phase = time.monotonic()
             cur.execute(
                 "TRUNCATE TABLE "
-                + ", ".join(tables_to_truncate)
+                + ", ".join(_quote_ident(t) for t in tables_to_truncate)
                 + " RESTART IDENTITY CASCADE;"
             )
             _pg_timing(
@@ -713,6 +761,7 @@ def _print_pg_timings() -> None:
                 "db_reset_connect",
                 "db_reset_terminate_backends",
                 "db_reset_catalog",
+                "db_reset_dirty_scan",
                 "db_reset_truncate",
                 "db_reset_reseed",
                 "db_reset_sequences",
@@ -825,6 +874,7 @@ def _print_pg_timings() -> None:
             "db_reset_connect",
             "db_reset_terminate_backends",
             "db_reset_catalog",
+            "db_reset_dirty_scan",
             "db_reset_truncate",
             "db_reset_reseed",
             "db_reset_sequences",

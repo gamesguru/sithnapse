@@ -2139,19 +2139,22 @@ pub fn open_client_read_only(py: Python<'_>, path: String) -> PyResult<()> {
         // removed. In snapshot mode (WAL off) no overlay is installed, so the
         // flag is structurally false and says nothing about the gate -- keep it
         // at info only in WAL mode, and demote it to debug otherwise.
+        let state_signal_active = state.read_journal_publish_signal_active();
+        let event_dag_signal_active = event_dag.read_journal_publish_signal_active();
+        let auth_chain_signal_active = auth_chain.read_journal_publish_signal_active();
         if wal_enabled() {
             log::info!(
                 "mtxdb read-only worker opened: publish_signal_active state={} event_dag={} edges={}",
-                false,
-                false,
-                false,
+                state_signal_active,
+                event_dag_signal_active,
+                auth_chain_signal_active,
             );
         } else {
             log::debug!(
                 "mtxdb read-only worker opened (snapshot, no publish signal): state={} event_dag={} edges={}",
-                false,
-                false,
-                false,
+                state_signal_active,
+                event_dag_signal_active,
+                auth_chain_signal_active,
             );
         }
         let _ = DBS.set(MtxdbPools {
@@ -4018,9 +4021,8 @@ fn stats_to_dict(
     d.set_item("delta_appends", s.delta_appends)?;
     d.set_item("read_reloads", s.read_reloads)?;
     d.set_item("read_reload_failures", s.read_reload_failures)?;
-    // The current mtxdb API exposes refreshes as miss-refresh counters.
-    d.set_item("read_refreshes", s.miss_refreshes)?;
-    d.set_item("read_refresh_bytes", 0u64)?;
+    d.set_item("read_refreshes", s.read_refreshes)?;
+    d.set_item("read_refresh_bytes", s.read_refresh_bytes)?;
     d.set_item("delta_invalidations", s.delta_invalidations)?;
     d.set_item("cache_hits", s.cache.hits)?;
     d.set_item("cache_misses", s.cache.misses)?;
@@ -4201,8 +4203,12 @@ pub fn stats_snapshot(py: Python<'_>) -> PyResult<Py<PyDict>> {
 #[pyfunction]
 pub fn publish_signal_active(py: Python<'_>) -> PyResult<Py<PyDict>> {
     let (state, event_dag, auth_chain) = py.detach(|| -> PyResult<(bool, bool, bool)> {
-        let _ = pools()?;
-        Ok((false, false, false))
+        let pools = pools()?;
+        Ok((
+            pools.state.read_journal_publish_signal_active(),
+            pools.event_dag.read_journal_publish_signal_active(),
+            pools.auth_chain.read_journal_publish_signal_active(),
+        ))
     })?;
     let out = PyDict::new(py);
     out.set_item("state", state)?;
@@ -4235,7 +4241,7 @@ fn stats_impl(py: Python<'_>, take_diagnostics: bool) -> PyResult<Py<PyDict>> {
                     } else {
                         state_stats.sync_diagnostics.clone()
                     },
-                    false,
+                    pools.state.read_journal_publish_signal_active(),
                 ),
                 (
                     "event_dag",
@@ -4245,7 +4251,7 @@ fn stats_impl(py: Python<'_>, take_diagnostics: bool) -> PyResult<Py<PyDict>> {
                     } else {
                         event_dag_stats.sync_diagnostics.clone()
                     },
-                    false,
+                    pools.event_dag.read_journal_publish_signal_active(),
                 ),
                 (
                     "auth_chain",
@@ -4255,7 +4261,7 @@ fn stats_impl(py: Python<'_>, take_diagnostics: bool) -> PyResult<Py<PyDict>> {
                     } else {
                         auth_chain_stats.sync_diagnostics.clone()
                     },
-                    false,
+                    pools.auth_chain.read_journal_publish_signal_active(),
                 ),
             ])
         },
