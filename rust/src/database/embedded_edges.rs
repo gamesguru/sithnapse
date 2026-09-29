@@ -3,7 +3,7 @@
 //! Stores the DAG edges connecting Matrix events:
 //! - Backward edges: `event_id -> [(prev_event_id, is_state)]` (immutable, write-once).
 //! - Forward edges: `prev_event_id -> [child_event_id]` (appended and
-//!   deduplicated under optimistic collection-version checking when a shared
+//!   deduplicated under optimistic per-record version checking when a shared
 //!   WAL is open, or the per-room lock `lock_rooms` without one).
 //!
 //! Locators are primarily owned by `event_json_put`, but `event_edges_put`
@@ -51,27 +51,28 @@ trait EdgeWriteTarget {
         pairs: Vec<(NodeId, NodeData)>,
     ) -> Result<(), mtxdb::storage::StorageError>;
 
-    /// Read records together with the collection's logical version. A direct
-    /// engine write has no logical clock and relies on its caller's room lock,
-    /// so it reports `None`; a staged transaction reports the version it will
-    /// require at commit. See `write_edges`.
-    fn edge_get_versioned(
+    /// Read records together with each record's write version. A direct engine
+    /// write has no logical clock and relies on its caller's room lock, so it
+    /// reports `None`; a staged transaction reports the per-record versions it
+    /// will require at commit. See `write_edges`.
+    fn edge_get_record_versions(
         &self,
         collection: &[u8; 16],
         ids: &[NodeId],
-    ) -> Result<(Vec<Option<NodeData>>, Option<u64>), mtxdb::storage::StorageError> {
+    ) -> Result<(Vec<Option<NodeData>>, Option<Vec<u64>>), mtxdb::storage::StorageError> {
         self.edge_get_many(collection, ids)
             .map(|found| (found, None))
     }
 
-    /// Stage a precondition that `collection`'s logical version is unchanged at
+    /// Stage a precondition that `node_id`'s write version is unchanged at
     /// commit. A no-op for a direct engine write (`None`).
-    fn edge_expect_version(
+    fn edge_expect_record_version(
         &self,
         collection: &[u8; 16],
+        node_id: &NodeId,
         version: Option<u64>,
     ) -> Result<(), mtxdb::storage::StorageError> {
-        let _ = (collection, version);
+        let _ = (collection, node_id, version);
         Ok(())
     }
 }
@@ -118,23 +119,24 @@ impl EdgeWriteTarget for DatabaseTransaction<'_> {
         Ok(())
     }
 
-    fn edge_get_versioned(
+    fn edge_get_record_versions(
         &self,
         collection: &[u8; 16],
         ids: &[NodeId],
-    ) -> Result<(Vec<Option<NodeData>>, Option<u64>), mtxdb::storage::StorageError> {
-        self.get_with_collection_version(ShardType::Edges, collection, ids)
-            .map(|(found, version)| (found, Some(version)))
+    ) -> Result<(Vec<Option<NodeData>>, Option<Vec<u64>>), mtxdb::storage::StorageError> {
+        self.get_with_record_versions(ShardType::Edges, collection, ids)
+            .map(|(found, versions)| (found, Some(versions)))
     }
 
-    fn edge_expect_version(
+    fn edge_expect_record_version(
         &self,
         collection: &[u8; 16],
+        node_id: &NodeId,
         version: Option<u64>,
     ) -> Result<(), mtxdb::storage::StorageError> {
         match version {
             Some(version) => self
-                .expect_collection_version(ShardType::Edges, *collection, version)
+                .expect_record_version(ShardType::Edges, *collection, *node_id, version)
                 .map_err(mtxdb::storage::StorageError::Io),
             None => Ok(()),
         }
@@ -159,25 +161,26 @@ trait ForwardWriteTarget {
         published_source_version: u64,
     ) -> Result<(), mtxdb::storage::StorageError>;
 
-    /// Read records together with the collection's logical version. See
-    /// [`EdgeWriteTarget::edge_get_versioned`].
-    fn forward_get_versioned(
+    /// Read records together with each record's write version. See
+    /// [`EdgeWriteTarget::edge_get_record_versions`].
+    fn forward_get_record_versions(
         &self,
         collection: &[u8; 16],
         ids: &[NodeId],
-    ) -> Result<(Vec<Option<NodeData>>, Option<u64>), mtxdb::storage::StorageError> {
+    ) -> Result<(Vec<Option<NodeData>>, Option<Vec<u64>>), mtxdb::storage::StorageError> {
         self.forward_get_many(collection, ids)
             .map(|found| (found, None))
     }
 
-    /// Stage a precondition that `collection`'s logical version is unchanged at
-    /// commit. See [`EdgeWriteTarget::edge_expect_version`].
-    fn forward_expect_version(
+    /// Stage a precondition that `node_id`'s write version is unchanged at
+    /// commit. See [`EdgeWriteTarget::edge_expect_record_version`].
+    fn forward_expect_record_version(
         &self,
         collection: &[u8; 16],
+        node_id: &NodeId,
         version: Option<u64>,
     ) -> Result<(), mtxdb::storage::StorageError> {
-        let _ = (collection, version);
+        let _ = (collection, node_id, version);
         Ok(())
     }
 }
@@ -259,23 +262,24 @@ impl ForwardWriteTarget for DatabaseTransaction<'_> {
         .map_err(mtxdb::storage::StorageError::Io)
     }
 
-    fn forward_get_versioned(
+    fn forward_get_record_versions(
         &self,
         collection: &[u8; 16],
         ids: &[NodeId],
-    ) -> Result<(Vec<Option<NodeData>>, Option<u64>), mtxdb::storage::StorageError> {
-        self.get_with_collection_version(ShardType::Edges, collection, ids)
-            .map(|(found, version)| (found, Some(version)))
+    ) -> Result<(Vec<Option<NodeData>>, Option<Vec<u64>>), mtxdb::storage::StorageError> {
+        self.get_with_record_versions(ShardType::Edges, collection, ids)
+            .map(|(found, versions)| (found, Some(versions)))
     }
 
-    fn forward_expect_version(
+    fn forward_expect_record_version(
         &self,
         collection: &[u8; 16],
+        node_id: &NodeId,
         version: Option<u64>,
     ) -> Result<(), mtxdb::storage::StorageError> {
         match version {
             Some(version) => self
-                .expect_collection_version(ShardType::Edges, *collection, version)
+                .expect_record_version(ShardType::Edges, *collection, *node_id, version)
                 .map_err(mtxdb::storage::StorageError::Io),
             None => Ok(()),
         }
@@ -586,7 +590,7 @@ fn insert_event_locator(
 /// One optimistic edge-write attempt's result.
 enum EdgeOccOutcome {
     Done,
-    /// The commit was rejected because a collection version moved. Expectation
+    /// The commit was rejected because a required record version moved. Expectation
     /// validation runs before the append, so nothing was published and the
     /// body is safe to replay on a fresh transaction.
     Conflict,
@@ -596,7 +600,7 @@ enum EdgeOccOutcome {
 /// a retryable error the caller (Python) can back off on.
 const MAX_OCC_ATTEMPTS: usize = 16;
 
-/// Number of collection-version conflicts observed by the edge OCC path.
+/// Number of record-version conflicts observed by the edge OCC path.
 /// Exposed as a diagnostic so integration tests and operators can distinguish
 /// a successful uncontended write from one that required replay.
 static EDGE_OCC_CONFLICTS: AtomicU64 = AtomicU64::new(0);
@@ -632,8 +636,8 @@ pub fn event_edges_occ_conflicts() -> u64 {
 }
 
 /// Run a version-bound edge write in an optimistic loop. `body` reads each
-/// touched collection through `*_get_versioned`, stages an expectation for it,
-/// and stages its mutations; this commits the transaction and retries only on
+/// touched record through `*_get_record_versions`, stages an expectation for
+/// it, and stages its mutations; this commits the transaction and retries only on
 /// [`mtxdb::storage::StorageError::StaleRead`]. Every other commit failure is
 /// ambiguous -- the writes may or may not have published -- so it is
 /// propagated without retry, and `abort` is never called after a failed
@@ -657,7 +661,7 @@ fn run_edge_occ(
         }
     }
     Err(pyo3::exceptions::PyBlockingIOError::new_err(
-        "mtxdb edge write kept losing the collection-version race; retry",
+        "mtxdb edge write kept losing the record-version race; retry",
     ))
 }
 
@@ -694,9 +698,9 @@ pub fn event_edges_put(
         // three -- the same win `event_json_put`'s staging already has, see
         // `res/docs/2026-09-26-priorities.md` §1.4.
         //
-        // The merge is guarded optimistically: `write_edges` reads each
-        // touched PREV collection's logical version and stages an expectation,
-        // so a concurrent merge on the same room fails the commit with
+        // The merge is guarded optimistically: `write_edges` reads each touched
+        // forward node's write version and stages an expectation, so a
+        // concurrent merge into the same parent fails the commit with
         // `StaleRead` before publishing and is replayed -- replacing the room
         // lock, which existed only because mtxdb had no RMW conflict detection
         // (see `res/docs/2026-09-26-priorities.md` §0.4). Without a shared WAL
@@ -726,10 +730,10 @@ pub fn event_edges_put(
 /// The merge logic shared by a direct engine write and a staged transaction
 /// write: batch-read existing forward child lists, append/deduplicate new
 /// children, and write backward records, forward-list rewrites, and locators
-/// through `target`. A staged transaction binds each forward read to the
-/// collection's logical version and requires it at commit (see
-/// [`EdgeWriteTarget::edge_expect_version`]); a direct write has no clock and
-/// relies on the caller's room lock instead.
+/// through `target`. A staged transaction binds each forward node read to that
+/// node's write version and requires it at commit (see
+/// [`EdgeWriteTarget::edge_expect_record_version`]); a direct write has no
+/// clock and relies on the caller's room lock instead.
 fn write_edges(
     target: &impl EdgeWriteTarget,
     namespace: &str,
@@ -788,16 +792,21 @@ fn write_edges(
         // "one read per distinct node" true.
         node_ids.sort_unstable();
         node_ids.dedup();
-        // Read at a known collection version and require it to hold at commit:
-        // a concurrent merge into this room collection turns the commit into a
-        // `StaleRead` (validated before the append) that the caller replays,
-        // standing in for the room lock a direct write still needs.
-        let (found, version) = engine
-            .edge_get_versioned(collection, node_ids)
+        // Read each forward node at its known write version and require that
+        // version to hold at commit: a concurrent merge into the same parent
+        // turns the commit into a `StaleRead` (validated before the append)
+        // that the caller replays, standing in for the room lock a direct write
+        // still needs. Binding to the record rather than the whole collection
+        // lets merges into different parents of one room proceed in parallel.
+        let (found, versions) = engine
+            .edge_get_record_versions(collection, node_ids)
             .map_err(|e| map_transaction_error("get_many", e))?;
-        engine
-            .edge_expect_version(collection, version)
-            .map_err(|e| map_transaction_error("expect_version", e))?;
+        for (index, node_id) in node_ids.iter().enumerate() {
+            let version = versions.as_ref().map(|versions| versions[index]);
+            engine
+                .edge_expect_record_version(collection, node_id, version)
+                .map_err(|e| map_transaction_error("expect_record_version", e))?;
+        }
         for (forward_node, value) in node_ids.iter().zip(found) {
             let children = match value {
                 Some(data) if !data.bytes.is_empty() => decode_forward_edges(&data.bytes)?,
@@ -1461,15 +1470,19 @@ fn apply_forward_delta(
         .iter()
         .map(|parent| event_edges_forward_node_id(namespace, parent))
         .collect();
-    // Read at a known version and require it to hold at commit, so a
-    // concurrent merge into this generation is a `StaleRead` (validated before
-    // the append) rather than a lost update.
-    let (existing, version) = target
-        .forward_get_versioned(&collection, &node_ids)
+    // Read each parent's forward list at its known write version and require
+    // that version to hold at commit, so a concurrent merge into the same
+    // parent is a `StaleRead` (validated before the append) rather than a lost
+    // update, while merges into different parents do not conflict.
+    let (existing, versions) = target
+        .forward_get_record_versions(&collection, &node_ids)
         .map_err(|e| map_transaction_error("get_many", e))?;
-    target
-        .forward_expect_version(&collection, version)
-        .map_err(|e| map_transaction_error("expect_version", e))?;
+    for (index, node_id) in node_ids.iter().enumerate() {
+        let version = versions.as_ref().map(|versions| versions[index]);
+        target
+            .forward_expect_record_version(&collection, node_id, version)
+            .map_err(|e| map_transaction_error("expect_record_version", e))?;
+    }
 
     let mut puts = Vec::with_capacity(parents.len());
     for (parent, existing) in parents.into_iter().zip(existing) {
