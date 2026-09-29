@@ -424,20 +424,39 @@ small tables.
 
 ## Migration strategy
 
-Every migration should proceed in these steps:
+### Phase A — prototype (Path A: standalone PackfileStorage)
 
-1. Add a standalone `server_info` PackfileStorage, counters, and atomic
-   mutation primitives behind a feature flag.
-2. Implement `SIGN` first-seen-wins CAS in Rust, with cross-process writer
-   serialization and local locking only as a supplement.
-3. Publish the resolved `SIGN` record and corresponding `KEYS` blob
-   transactionally where possible; do not write either SQL table on the new
-   path.
-4. Add SQL fallback reads only for rows written before migration.
-5. Backfill SQL rows into mtxdb, resolving conflicts during the backfill.
-6. Run shadow comparisons and measure misses, stale reads, and refresh cost.
-7. After backfill and a clean restart/recovery cycle, remove SQL fallback
-   reads and stop maintaining the SQL tables.
+Path A opens `server_info` as a standalone `PackfileStorage` outside
+`SharedDatabase`. It has no transaction primitive; `SIGN` and `KEYS` are
+written sequentially, not atomically. This phase is prototype-only and does
+not satisfy the crash-safe joint-publication requirement.
+
+1. Add a standalone `server_info` `PackfileStorage` behind a feature flag.
+2. Implement `SIGN` first-seen-wins CAS in Rust (single mtxdb writer for
+   cross-process serialization; per-process mutex as a supplement only).
+3. Write `SIGN` first, then `KEYS`. A `KEYS` failure after a committed
+   `SIGN` leaves an inconsistency window; SQL fallback reads cover this.
+4. Do not write `server_keys_json` or `server_signature_keys` SQL rows on
+   the new path.
+5. Add SQL fallback reads for rows predating the migration.
+6. Backfill existing SQL rows into mtxdb; resolve conflicts during backfill.
+7. Measure misses, stale reads, refresh cost, and inconsistency-window hits.
+
+### Phase B — production (Path B: ShardType::ServerInfo in mtxdb)
+
+Path B adds `ShardType::ServerInfo` to mtxdb (`layout.rs`, `ShardType::ALL`,
+`PoolPolicies`, `SharedDatabase.pools`, `matrix_pool_policies()`). Only after
+this change can `begin_transaction()` span `SIGN` and `KEYS` atomically.
+Path A prototype work carries forward; Path B replaces the sequenced write
+with a proper transaction.
+
+8. Land `ShardType::ServerInfo` in mtxdb; update `SharedDatabase` and
+   `PoolPolicies`; bump the pinned mtxdb commit in `Cargo.toml`.
+9. Replace sequenced `SIGN`→`KEYS` writes with a single `DatabaseTransaction`
+   spanning both collections.
+10. Run crash/recovery tests confirming no inconsistency window.
+11. After a clean restart/recovery cycle, remove SQL fallback reads and stop
+    maintaining `server_keys_json` and `server_signature_keys`.
 
 ## Acceptance gates
 
