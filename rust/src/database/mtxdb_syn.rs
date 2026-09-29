@@ -1630,9 +1630,9 @@ pub(crate) fn forward_edges_room_id(room_id: &str, generation: u32) -> [u8; 16] 
     member_collection_id(MEMBER_NAMESPACE_FWD, &group_digest)
 }
 
-const ROOM_FORWARD_META_COLLECTION: [u8; 16] = *b"room-fwd-meta-v1";
+pub(crate) const ROOM_FORWARD_META_COLLECTION: [u8; 16] = *b"room-fwd-meta-v1";
 
-fn room_forward_meta_node_id(room_id: &str) -> NodeId {
+pub(crate) fn room_forward_meta_node_id(room_id: &str) -> NodeId {
     let mut hasher = Sha256::new();
     hasher.update(b"synapse:room-forward-meta:");
     hasher.update(room_id.as_bytes());
@@ -1642,7 +1642,10 @@ fn room_forward_meta_node_id(room_id: &str) -> NodeId {
         .expect("SHA-256 digest is at least 16 bytes")
 }
 
-fn encode_room_forward_meta(active_generation: u32, published_source_version: u64) -> [u8; 20] {
+pub(crate) fn encode_room_forward_meta(
+    active_generation: u32,
+    published_source_version: u64,
+) -> [u8; 20] {
     let mut bytes = [0u8; 20];
     bytes[0] = 1;
     bytes[4..8].copy_from_slice(&active_generation.to_be_bytes());

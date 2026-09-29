@@ -80,6 +80,7 @@ from synapse.storage.database import (
 )
 from synapse.storage.databases.main.embedded_common import ffi_count
 from synapse.storage.databases.main.embedded_event_edges import (
+    drain_edge_index_outbox,
     embedded_event_edges_is_writable,
     open_embedded_event_edges_engine,
 )
@@ -316,6 +317,13 @@ class EventsWorkerStore(SQLBaseStore):
         )
 
         if hs.config.worker.run_background_tasks:
+            if embedded_event_edges_is_writable(hs):
+                self.clock.looping_call(
+                    lambda: drain_edge_index_outbox(
+                        self, namespace=self._embedded_db_namespace
+                    ),
+                    Duration(seconds=1),
+                )
             # We periodically clean out old transaction ID mappings
             self.clock.looping_call(
                 self._cleanup_old_transaction_ids,

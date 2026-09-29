@@ -694,3 +694,116 @@ def get_event_edges_forward_batch(
         if status != "hit":
             raise RuntimeError(f"unexpected forward edge result: {status!r}")
         return dict(cast(list[tuple[str, list[str] | None]], payload[0]))
+
+
+async def drain_edge_index_outbox(
+    store: Any, limit: int = 256, *, namespace: str = "synapse"
+) -> bool:
+    """Publish one room's durable edge mutations into the active FWD generation.
+
+    SQL rows are acknowledged only after Rust commits both the FWD updates and
+    publication watermark in one mtxdb transaction. The worker lock is held
+    before the batch is re-read, preventing stale snapshots from racing a
+    second drainer or a generation swap.
+    """
+    if limit <= 0:
+        return False
+
+    def _room(txn: Any) -> str | None:
+        txn.execute(
+            "SELECT room_id FROM edge_index_outbox "
+            "ORDER BY room_id, source_version LIMIT 1"
+        )
+        row = txn.fetchone()
+        return None if row is None else str(row[0])
+
+    room_id = await store.db_pool.runInteraction("edge_outbox_room", _room)
+    if room_id is None:
+        return False
+
+    locks = store.hs.get_worker_locks_handler()
+    async with locks.acquire_lock("embedded_edge_index_outbox", room_id):
+        from synapse.synapse_rust.mtxdb_engine import (
+            event_edges_apply_forward_outbox,
+            room_forward_meta_get,
+        )
+
+        meta = _retry_on_contention(lambda: room_forward_meta_get(room_id))
+        generation, published = meta if meta is not None else (0, 0)
+
+        def _rows(txn: Any) -> list[tuple[str, int, str, str]]:
+            txn.execute(
+                "SELECT event_id, source_version, prev_event_id, operation "
+                "FROM edge_index_outbox "
+                "WHERE room_id = ? AND source_version > ? "
+                "ORDER BY source_version, event_id, prev_event_id, operation "
+                "LIMIT ?",
+                (room_id, published, limit),
+            )
+            rows = [(str(a), int(b), str(c), str(d)) for a, b, c, d in txn]
+            if not rows:
+                return []
+
+            # Never publish a watermark while only part of a source-version
+            # group has been applied: several edge rows intentionally share
+            # one room version. Complete the final group even if it takes the
+            # batch over `limit`.
+            max_version = max(row[1] for row in rows)
+            txn.execute(
+                "SELECT event_id, source_version, prev_event_id, operation "
+                "FROM edge_index_outbox "
+                "WHERE room_id = ? AND source_version > ? "
+                "AND source_version <= ? "
+                "ORDER BY source_version, event_id, prev_event_id, operation",
+                (room_id, published, max_version),
+            )
+            return [(str(a), int(b), str(c), str(d)) for a, b, c, d in txn]
+
+        rows = await store.db_pool.runInteraction("edge_outbox_rows", _rows)
+
+        def _ack_through(txn: Any, published_version: int) -> int:
+            now_ms = int(time.time() * 1000)
+            txn.execute(
+                "SELECT MIN(last_replayed_source_version) "
+                "FROM room_edge_rebuild_checkpoints "
+                "WHERE room_id = ? AND lease_expires_at_ms >= ?",
+                (room_id, now_ms),
+            )
+            row = txn.fetchone()
+            safe_version = (
+                published_version
+                if row is None or row[0] is None
+                else min(published_version, int(row[0]))
+            )
+            txn.execute(
+                "DELETE FROM edge_index_outbox "
+                "WHERE room_id = ? AND source_version <= ?",
+                (room_id, safe_version),
+            )
+            return txn.rowcount
+
+        if not rows:
+            # A process can crash after the mtxdb commit and before the SQL
+            # acknowledgement. The watermark makes those rows already
+            # published; remove them so they do not permanently block the
+            # room's queue.
+            deleted = await store.db_pool.runInteraction(
+                "edge_outbox_ack_stale",
+                _ack_through,
+                published,
+            )
+            return bool(deleted)
+
+        max_version = max(row[1] for row in rows)
+        ffi_rows = [
+            (event_id, prev_id, operation) for event_id, _, prev_id, operation in rows
+        ]
+        _retry_on_contention(
+            lambda: event_edges_apply_forward_outbox(
+                namespace, room_id, generation, max_version, ffi_rows
+            )
+        )
+
+        await store.db_pool.runInteraction("edge_outbox_ack", _ack_through, max_version)
+        ffi_count("event_edges_outbox_rows", len(rows))
+        return True

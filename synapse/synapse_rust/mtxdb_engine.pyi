@@ -68,6 +68,13 @@ def event_edges_get_forward_gated(
     expected_source_version: int,
     prev_event_ids: list[str],
 ) -> tuple[str, list[tuple[str, list[str] | None]]] | tuple[str, int, int]: ...
+def event_edges_apply_forward_outbox(
+    namespace: str,
+    room_id: str,
+    generation: int,
+    published_source_version: int,
+    rows: Iterable[tuple[str, str, str]],
+) -> None: ...
 def room_forward_meta_get(room_id: str) -> tuple[int, int] | None: ...
 def room_forward_meta_put(
     room_id: str, active_generation: int, published_source_version: int

@@ -24,9 +24,10 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 use sha2::{Digest, Sha256};
 
 use super::mtxdb_syn::{
-    assert_writable, auth_chain_db, begin_internal_transaction, event_locator_collection_id,
-    event_node_id, forward_edges_room_id, map_read_storage_error, map_transaction_error,
-    prev_edges_room_id, read_room_forward_meta,
+    assert_writable, auth_chain_db, begin_internal_transaction, encode_room_forward_meta,
+    event_locator_collection_id, event_node_id, forward_edges_room_id, map_read_storage_error,
+    map_transaction_error, prev_edges_room_id, read_room_forward_meta, room_forward_meta_node_id,
+    ROOM_FORWARD_META_COLLECTION,
 };
 
 /// The read/write surface `event_edges_put` needs, common to a direct engine
@@ -88,6 +89,103 @@ impl EdgeWriteTarget for DatabaseTransaction<'_> {
                 .map_err(mtxdb::storage::StorageError::Io)?;
         }
         Ok(())
+    }
+}
+
+trait ForwardWriteTarget {
+    fn forward_get_many(
+        &self,
+        collection: &[u8; 16],
+        ids: &[NodeId],
+    ) -> Result<Vec<Option<NodeData>>, mtxdb::storage::StorageError>;
+    fn forward_put_many(
+        &self,
+        collection: [u8; 16],
+        pairs: Vec<(NodeId, NodeData)>,
+    ) -> Result<(), mtxdb::storage::StorageError>;
+    fn forward_put_meta(
+        &self,
+        room_id: &str,
+        generation: u32,
+        published_source_version: u64,
+    ) -> Result<(), mtxdb::storage::StorageError>;
+}
+
+impl ForwardWriteTarget for mtxdb::PackfileStorage {
+    fn forward_get_many(
+        &self,
+        collection: &[u8; 16],
+        ids: &[NodeId],
+    ) -> Result<Vec<Option<NodeData>>, mtxdb::storage::StorageError> {
+        StorageEngine::get_many(self, collection, ids)
+    }
+
+    fn forward_put_many(
+        &self,
+        collection: [u8; 16],
+        pairs: Vec<(NodeId, NodeData)>,
+    ) -> Result<(), mtxdb::storage::StorageError> {
+        StorageEngine::put_many(self, &collection, &pairs).map(|_| ())
+    }
+
+    fn forward_put_meta(
+        &self,
+        room_id: &str,
+        generation: u32,
+        published_source_version: u64,
+    ) -> Result<(), mtxdb::storage::StorageError> {
+        StorageEngine::put_many(
+            self,
+            &ROOM_FORWARD_META_COLLECTION,
+            &[(
+                room_forward_meta_node_id(room_id),
+                NodeData::from_slice(&encode_room_forward_meta(
+                    generation,
+                    published_source_version,
+                )),
+            )],
+        )
+        .map(|_| ())
+    }
+}
+
+impl ForwardWriteTarget for DatabaseTransaction<'_> {
+    fn forward_get_many(
+        &self,
+        collection: &[u8; 16],
+        ids: &[NodeId],
+    ) -> Result<Vec<Option<NodeData>>, mtxdb::storage::StorageError> {
+        self.get(ShardType::Edges, collection, ids)
+    }
+
+    fn forward_put_many(
+        &self,
+        collection: [u8; 16],
+        pairs: Vec<(NodeId, NodeData)>,
+    ) -> Result<(), mtxdb::storage::StorageError> {
+        for (node, data) in pairs {
+            self.put(ShardType::Edges, collection, node, &data)
+                .map_err(mtxdb::storage::StorageError::Io)?;
+        }
+        Ok(())
+    }
+
+    fn forward_put_meta(
+        &self,
+        room_id: &str,
+        generation: u32,
+        published_source_version: u64,
+    ) -> Result<(), mtxdb::storage::StorageError> {
+        self.put(
+            ShardType::Edges,
+            ROOM_FORWARD_META_COLLECTION,
+            room_forward_meta_node_id(room_id),
+            &NodeData::from_slice(&encode_room_forward_meta(
+                generation,
+                published_source_version,
+            )),
+        )
+        .map_err(mtxdb::storage::StorageError::Io)
     }
 }
 
@@ -916,6 +1014,121 @@ pub fn event_edges_get_forward_gated(
     }
 }
 
+/// Apply one room's outbox delta to its active generation and publish the
+/// watermark in the same mtxdb transaction. Replaying the same rows is safe:
+/// inserts are deduplicated and deletes are idempotent.
+#[pyfunction]
+pub fn event_edges_apply_forward_outbox(
+    py: Python<'_>,
+    namespace: String,
+    room_id: String,
+    generation: u32,
+    published_source_version: u64,
+    rows: Vec<(String, String, String)>, // (event_id, prev_event_id, operation)
+) -> PyResult<()> {
+    assert_writable()?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    py.detach(|| {
+        let room_collection = forward_edges_room_id(&room_id, generation);
+        let _guards = lock_rooms([room_collection]);
+
+        match begin_internal_transaction()? {
+            Some(txn) => {
+                apply_forward_outbox(
+                    &txn,
+                    &namespace,
+                    &room_id,
+                    generation,
+                    published_source_version,
+                    rows,
+                )?;
+                txn.commit().map_err(|e| map_transaction_error("commit", e))
+            }
+            None => {
+                let engine = auth_chain_db()?;
+                apply_forward_outbox(
+                    engine.as_ref(),
+                    &namespace,
+                    &room_id,
+                    generation,
+                    published_source_version,
+                    rows,
+                )
+            }
+        }
+    })
+}
+
+fn apply_forward_outbox(
+    target: &impl ForwardWriteTarget,
+    namespace: &str,
+    room_id: &str,
+    generation: u32,
+    published_source_version: u64,
+    rows: Vec<(String, String, String)>,
+) -> PyResult<()> {
+    let collection = forward_edges_room_id(room_id, generation);
+    let mut deltas: HashMap<String, (HashSet<String>, HashSet<String>)> = HashMap::new();
+    for (event_id, prev_event_id, operation) in rows {
+        let (additions, removals) = deltas.entry(prev_event_id).or_default();
+        match operation.as_str() {
+            "insert" => {
+                additions.insert(event_id);
+            }
+            "delete" => {
+                removals.insert(event_id);
+            }
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "unknown edge-index outbox operation: {other}"
+                )));
+            }
+        }
+    }
+
+    let mut parents: Vec<String> = deltas.keys().cloned().collect();
+    parents.sort_unstable();
+    let node_ids: Vec<NodeId> = parents
+        .iter()
+        .map(|parent| event_edges_forward_node_id(namespace, parent))
+        .collect();
+    let existing = target
+        .forward_get_many(&collection, &node_ids)
+        .map_err(|e| map_transaction_error("get_many", e))?;
+
+    let mut puts = Vec::with_capacity(parents.len());
+    for (parent, existing) in parents.into_iter().zip(existing) {
+        let (additions, removals) = deltas
+            .remove(&parent)
+            .expect("every sorted parent has a delta");
+        let mut children = match existing {
+            Some(data) if !data.bytes.is_empty() => decode_forward_edges(&data.bytes)?,
+            _ => Vec::new(),
+        };
+        children.retain(|child| !removals.contains(child));
+        for child in additions {
+            if !children.iter().any(|existing| existing == &child) {
+                children.push(child);
+            }
+        }
+        puts.push((
+            event_edges_forward_node_id(namespace, &parent),
+            NodeData::new(bytes::Bytes::from(encode_forward_edges(&children))),
+        ));
+    }
+
+    target
+        .forward_put_many(collection, puts)
+        .map_err(|e| map_transaction_error("put_many", e))?;
+    target
+        .forward_put_meta(room_id, generation, published_source_version)
+        .map_err(|e| map_transaction_error("put_metadata", e))?;
+    Ok(())
+}
+
 /// Tombstone backward edges for purged events.
 ///
 /// Deliberately does NOT touch parents' forward lists. Splicing a purged
@@ -1071,6 +1284,7 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(event_edges_get_backward, m)?)?;
     m.add_function(wrap_pyfunction!(event_edges_get_forward, m)?)?;
     m.add_function(wrap_pyfunction!(event_edges_get_forward_gated, m)?)?;
+    m.add_function(wrap_pyfunction!(event_edges_apply_forward_outbox, m)?)?;
     m.add_function(wrap_pyfunction!(event_edges_delete, m)?)?;
     Ok(())
 }
