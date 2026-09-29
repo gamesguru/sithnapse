@@ -3367,6 +3367,55 @@ impl PyMtxdbTransaction {
             .map_err(|error| map_transaction_io_error("stage version expectation", error))
     }
 
+    /// Read records and each record's write version from one visibility
+    /// boundary. Every returned version is covered by the returned data, so a
+    /// caller can stage per-record preconditions instead of the coarser
+    /// collection version. Pool tags and id widths match
+    /// `get_with_collection_version`; versions are returned in `node_ids`
+    /// order as `0` for a legacy frame with no recorded write version.
+    pub fn get_with_record_versions(
+        &self,
+        py: Python<'_>,
+        pool_tag: u8,
+        collection_id: Vec<u8>,
+        node_ids: Vec<Vec<u8>>,
+    ) -> PyResult<(Vec<Option<Vec<u8>>>, Vec<u64>)> {
+        let pool = parse_pool_tag(pool_tag)?;
+        let collection_id = parse_collection_id(collection_id)?;
+        let node_ids = parse_node_ids(node_ids)?;
+        py.detach(|| {
+            let (records, versions) = self
+                .inner
+                .get_with_record_versions(pool, &collection_id, &node_ids)
+                .map_err(map_versioned_storage_error)?;
+            Ok((
+                records
+                    .into_iter()
+                    .map(|record| record.map(|data| data.bytes.to_vec()))
+                    .collect(),
+                versions,
+            ))
+        })
+    }
+
+    /// Require a single record's write version to remain unchanged through
+    /// commit. A conflict raises `StaleReadError`, with `(message, pool,
+    /// collection_id, expected, actual)` in its args.
+    pub fn expect_record_version(
+        &self,
+        pool_tag: u8,
+        collection_id: Vec<u8>,
+        node_id: Vec<u8>,
+        expected: u64,
+    ) -> PyResult<()> {
+        let pool = parse_pool_tag(pool_tag)?;
+        let collection_id = parse_collection_id(collection_id)?;
+        let node_id = parse_node_ids(vec![node_id])?[0];
+        self.inner
+            .expect_record_version(pool, collection_id, node_id, expected)
+            .map_err(|error| map_transaction_io_error("stage record version expectation", error))
+    }
+
     /// Stage an arbitrary 16-byte-keyed record in the selected pool.
     pub fn put(
         &self,

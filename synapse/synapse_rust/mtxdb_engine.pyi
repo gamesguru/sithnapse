@@ -170,6 +170,15 @@ class MtxdbTransaction:
     def expect_collection_version(
         self, pool_tag: int, collection_id: bytes, expected: int
     ) -> None: ...
+    def get_with_record_versions(
+        self,
+        pool_tag: int,
+        collection_id: bytes,
+        node_ids: list[bytes],
+    ) -> tuple[list[bytes | None], list[int]]: ...
+    def expect_record_version(
+        self, pool_tag: int, collection_id: bytes, node_id: bytes, expected: int
+    ) -> None: ...
     def put(
         self,
         pool_tag: int,
