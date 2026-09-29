@@ -228,31 +228,15 @@ the mtxdb layer needs an atomic compare-and-set/upsert primitive, or a single
 serialized mtxdb writer that owns the resolution. A standalone pool without
 such a primitive cannot safely claim MSC4499 concurrency compliance.
 
-`SIGN` and `KEYS` publication should be one mtxdb transaction where possible.
+`SIGN` and `KEYS` publication are atomic within a single `DatabaseTransaction` across the shared pools.
 An accepted `SIGN` binding with a failed `KEYS` blob write would leave the
-authoritative collections inconsistent. A per-process mutex may protect local
-threads, but cross-process serialization must come from mtxdb's writer or
-transaction mechanism; the mutex alone is not sufficient.
+authoritative collections inconsistent; using `SharedDatabase` guarantees joint publication across all four pools.
 
-**`DatabaseTransaction` constraint (verified from mtxdb source):**
-`DatabaseTransaction` is owned by `SharedDatabase` and spans exactly the three
-pools in `ShardType::ALL` via a fixed `[Arc<PackfileStorage>; 3]` array. A
-standalone `PackfileStorage` opened outside `SharedDatabase` (Path A) has no
-transaction primitive — only per-record group-commit batching. Joint `SIGN`+`KEYS`
-atomicity therefore requires one of:
+**`DatabaseTransaction` and Pool Layout Integration:**
+Rather than building an un-transactional Path A prototype, `server_info` is integrated directly as a fourth physical pool (`ShardType::ServerInfo` / `mtpl-server-info`) in mtxdb.
 
-- **Path B**: add `ShardType::ServerInfo` to mtxdb, include it in
-  `SharedDatabase` and `PoolPolicies`, and use `begin_transaction()` spanning
-  all four pools. This is the correct long-term design and a prerequisite for
-  crash-safe joint publication.
-- **Path A with sequenced writes**: write `SIGN` first (serialized by the
-  single mtxdb writer), then write `KEYS`. If `KEYS` fails, `SIGN` is committed
-  but the blob is absent; readers must tolerate a missing `KEYS` record and fall
-  back to SQL. Acceptable as a prototype but not crash-safe.
-
-Path B is required before claiming full atomicity. Path A sequenced writes are
-acceptable as a migration-phase prototype, with the inconsistency window
-documented and covered by the SQL fallback read path.
+- **Transaction Scope**: `ShardType::ALL` includes `ServerInfo`. `SharedDatabase` and `PoolPolicies` manage all 4 pools under shared WAL and single `begin_transaction()` semantics.
+- **Layout Migration**: Existing mtxdb database roots automatically create/upgrade the `mtpl-server-info` pool directory when opening `DatabaseLayout`, ensuring backwards compatibility without re-initializing the database as fresh.
 
 ## Phase 3: event and room-state fan-out
 
@@ -424,39 +408,16 @@ small tables.
 
 ## Migration strategy
 
-### Phase A — prototype (Path A: standalone PackfileStorage)
+The migration goes directly to the production `ShardType::ServerInfo` integration in `SharedDatabase` (avoiding temporary standalone non-transactional prototype work):
 
-Path A opens `server_info` as a standalone `PackfileStorage` outside
-`SharedDatabase`. It has no transaction primitive; `SIGN` and `KEYS` are
-written sequentially, not atomically. This phase is prototype-only and does
-not satisfy the crash-safe joint-publication requirement.
-
-1. Add a standalone `server_info` `PackfileStorage` behind a feature flag.
-2. Implement `SIGN` first-seen-wins CAS in Rust (single mtxdb writer for
-   cross-process serialization; per-process mutex as a supplement only).
-3. Write `SIGN` first, then `KEYS`. A `KEYS` failure after a committed
-   `SIGN` leaves an inconsistency window; SQL fallback reads cover this.
-4. Do not write `server_keys_json` or `server_signature_keys` SQL rows on
-   the new path.
-5. Add SQL fallback reads for rows predating the migration.
-6. Backfill existing SQL rows into mtxdb; resolve conflicts during backfill.
-7. Measure misses, stale reads, refresh cost, and inconsistency-window hits.
-
-### Phase B — production (Path B: ShardType::ServerInfo in mtxdb)
-
-Path B adds `ShardType::ServerInfo` to mtxdb (`layout.rs`, `ShardType::ALL`,
-`PoolPolicies`, `SharedDatabase.pools`, `matrix_pool_policies()`). Only after
-this change can `begin_transaction()` span `SIGN` and `KEYS` atomically.
-Path A prototype work carries forward; Path B replaces the sequenced write
-with a proper transaction.
-
-8. Land `ShardType::ServerInfo` in mtxdb; update `SharedDatabase` and
-   `PoolPolicies`; bump the pinned mtxdb commit in `Cargo.toml`.
-9. Replace sequenced `SIGN`→`KEYS` writes with a single `DatabaseTransaction`
-   spanning both collections.
-10. Run crash/recovery tests confirming no inconsistency window.
-11. After a clean restart/recovery cycle, remove SQL fallback reads and stop
-    maintaining `server_keys_json` and `server_signature_keys`.
+1. Land `ShardType::ServerInfo` (`mtpl-server-info`) in mtxdb (`layout.rs`, `ShardType::ALL`, `PoolPolicies`, `SharedDatabase.pools`, `matrix_pool_policies()`), including automatic layout upgrade for existing mtxdb database roots.
+2. Expose `server_info` KEYS/SIGN Rust collections and PyO3 functions in `mtxdb_syn.rs`.
+3. Implement MSC4499 `SIGN` first-seen-wins CAS directly in the shared `DatabaseTransaction` spanning `SIGN` and `KEYS` atomically.
+4. Wire Synapse `store_server_keys_response` writes directly to mtxdb (no steady-state SQL dual writes).
+5. Add mtxdb-first reads (`KEYS`/`SIGN`) with temporary SQL fallback for pre-migration rows.
+6. Backfill existing SQL `server_keys_json` and `server_signature_keys` rows into mtxdb.
+7. Run crash/recovery and concurrent MSC4499 verification tests.
+8. Remove SQL fallback reads and stop maintaining `server_keys_json` and `server_signature_keys` SQL tables after validation.
 
 ## Acceptance gates
 
