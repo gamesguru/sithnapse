@@ -1133,43 +1133,64 @@ pub fn event_edges_get_forward_gated(
     expected_source_version: u64,
     prev_event_ids: Vec<String>,
 ) -> PyResult<Py<PyAny>> {
+    const READ_ATTEMPTS: usize = 8;
     enum ReadResult {
         VersionMismatch { published: u64, expected: u64 },
         Hit(Vec<(String, Option<Vec<String>>)>),
     }
 
     let read_result = py.detach(|| -> PyResult<ReadResult> {
-        let Some((generation, published_version)) = read_room_forward_meta(&room_id)? else {
-            return Ok(ReadResult::VersionMismatch {
-                published: 0,
-                expected: expected_source_version,
-            });
-        };
-        if published_version != expected_source_version {
-            return Ok(ReadResult::VersionMismatch {
-                published: published_version,
-                expected: expected_source_version,
-            });
-        }
-
         let engine = auth_chain_db()?;
-        let collection = forward_edges_room_id(&room_id, generation);
         let node_ids: Vec<NodeId> = prev_event_ids
             .iter()
             .map(|id| event_edges_forward_node_id(&namespace, id))
             .collect();
-        let found = engine
-            .get_read_committed(&collection, &node_ids)
-            .map_err(map_read_storage_error)?;
-        let mut rows = Vec::with_capacity(prev_event_ids.len());
-        for (event_id, value) in prev_event_ids.into_iter().zip(found) {
-            let children = value
-                .filter(|data| !data.bytes.is_empty())
-                .map(|data| decode_forward_edges(&data.bytes))
-                .transpose()?;
-            rows.push((event_id, children));
+        let mut last_published = 0;
+        for _ in 0..READ_ATTEMPTS {
+            let Some((generation, published_version)) = read_room_forward_meta(&room_id)? else {
+                return Ok(ReadResult::VersionMismatch {
+                    published: 0,
+                    expected: expected_source_version,
+                });
+            };
+            last_published = published_version;
+            if published_version != expected_source_version {
+                return Ok(ReadResult::VersionMismatch {
+                    published: published_version,
+                    expected: expected_source_version,
+                });
+            }
+
+            let collection = forward_edges_room_id(&room_id, generation);
+            let found = engine
+                .get_read_committed(&collection, &node_ids)
+                .map_err(map_read_storage_error)?;
+            let Some((end_generation, end_published_version)) = read_room_forward_meta(&room_id)?
+            else {
+                continue;
+            };
+            if (end_generation, end_published_version) != (generation, published_version) {
+                continue;
+            }
+
+            let mut rows = Vec::with_capacity(prev_event_ids.len());
+            for (event_id, value) in prev_event_ids.iter().zip(found) {
+                let children = value
+                    .filter(|data| !data.bytes.is_empty())
+                    .map(|data| decode_forward_edges(&data.bytes))
+                    .transpose()?;
+                rows.push((event_id.clone(), children));
+            }
+            return Ok(ReadResult::Hit(rows));
         }
-        Ok(ReadResult::Hit(rows))
+        // A coherent (metadata, payload) snapshot was never observed under
+        // sustained writer or rebuild contention. Report it as a mismatch
+        // rather than raising: the Python caller treats `version_mismatch` as
+        // a cue to answer from SQL, so a busy room degrades instead of failing.
+        Ok(ReadResult::VersionMismatch {
+            published: last_published,
+            expected: expected_source_version,
+        })
     })?;
 
     match read_result {
