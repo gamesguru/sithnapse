@@ -1133,7 +1133,10 @@ pub fn event_edges_get_forward_gated(
     expected_source_version: u64,
     prev_event_ids: Vec<String>,
 ) -> PyResult<Py<PyAny>> {
-    const READ_ATTEMPTS: usize = 8;
+    // The normal path is one metadata/FWD/metadata sample. A second attempt
+    // handles a concurrent publication; beyond that, SQL fallback is faster
+    // and more predictable than holding a traversal request in a retry loop.
+    const READ_ATTEMPTS: usize = 2;
     enum ReadResult {
         VersionMismatch { published: u64, expected: u64 },
         Hit(Vec<(String, Option<Vec<String>>)>),
