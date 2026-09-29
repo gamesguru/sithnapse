@@ -21,6 +21,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use mtxdb::{DatabaseTransaction, NodeData, NodeId, ShardType, StorageEngine};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
+use pyo3::IntoPyObjectExt;
 use sha2::{Digest, Sha256};
 
 use super::mtxdb_syn::{
@@ -992,23 +993,32 @@ pub fn event_edges_get_forward_gated(
             published,
             expected,
         } => {
-            let result = PyTuple::empty(py);
-            result.set_item(0, "version_mismatch")?;
-            result.set_item(1, published)?;
-            result.set_item(2, expected)?;
+            let result = PyTuple::new(
+                py,
+                [
+                    "version_mismatch".into_bound_py_any(py)?,
+                    published.into_bound_py_any(py)?,
+                    expected.into_bound_py_any(py)?,
+                ],
+            )?;
             Ok(result.unbind().into())
         }
         ReadResult::Hit(rows) => {
             let py_rows = PyList::empty(py);
             for (event_id, children) in rows {
-                let item = PyTuple::empty(py);
-                item.set_item(0, event_id)?;
-                item.set_item(1, children)?;
+                let item = PyTuple::new(
+                    py,
+                    [
+                        event_id.into_bound_py_any(py)?,
+                        children.into_bound_py_any(py)?,
+                    ],
+                )?;
                 py_rows.append(item)?;
             }
-            let result = PyTuple::empty(py);
-            result.set_item(0, "hit")?;
-            result.set_item(1, py_rows)?;
+            let result = PyTuple::new(
+                py,
+                ["hit".into_bound_py_any(py)?, py_rows.into_bound_py_any(py)?],
+            )?;
             Ok(result.unbind().into())
         }
     }
