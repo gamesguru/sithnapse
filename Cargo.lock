@@ -968,7 +968,7 @@ dependencies = [
 [[package]]
 name = "mtxdb"
 version = "0.1.0-beta.2"
-source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=refactor%2Fpack-id-store-layout#2f4c5845e48681a2a4a69d9523f1aee0d272a3e7"
+source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=refactor%2Fpack-id-store-layout#f66bec3e7019badbbe9db3c1598e083df842b2d8"
 dependencies = [
  "arc-swap",
  "blake3",
@@ -1382,7 +1382,7 @@ dependencies = [
 [[package]]
 name = "rezzy"
 version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#fd2ffc6d7f000d932a915a3b1926075c542a43fd"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#ef86c151319af2b50c1cc60fb24b0869b921ff7b"
 dependencies = [
  "imbl",
  "rz-core",
@@ -1498,7 +1498,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "rz-core"
 version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#fd2ffc6d7f000d932a915a3b1926075c542a43fd"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#ef86c151319af2b50c1cc60fb24b0869b921ff7b"
 dependencies = [
  "base64 0.22.1",
  "blake2",
@@ -1514,7 +1514,7 @@ dependencies = [
 [[package]]
 name = "rz-json"
 version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#fd2ffc6d7f000d932a915a3b1926075c542a43fd"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#ef86c151319af2b50c1cc60fb24b0869b921ff7b"
 dependencies = [
  "ryu",
 ]
@@ -1522,7 +1522,7 @@ dependencies = [
 [[package]]
 name = "rz-reconcile"
 version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#fd2ffc6d7f000d932a915a3b1926075c542a43fd"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#ef86c151319af2b50c1cc60fb24b0869b921ff7b"
 dependencies = [
  "base64 0.22.1",
  "sha2",
