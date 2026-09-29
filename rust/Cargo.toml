@@ -105,7 +105,7 @@ tokio = { version = "1.44.2", features = ["rt", "rt-multi-thread"] }
 once_cell = "1.18.0"
 lru = "0.12"
 rezzy = { git = "https://gitlab.com/gamesguru/rezzy.git", branch = "alpha" }
-mtxdb = { git = "https://gitlab.com/wombat-foundation/mtxdb.git", rev = "1df3043e67f4ed81fe8efa35b080aea05de28fb4", features = ["multi-reader"] }
+mtxdb = { git = "https://gitlab.com/wombat-foundation/mtxdb.git", rev = "516370e8799f59bbe480611238c9dc435105ec87", features = ["multi-reader"] }
 
 [build-dependencies]
 blake2 = "0.10.4"
