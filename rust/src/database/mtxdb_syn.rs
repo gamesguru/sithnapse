@@ -1672,6 +1672,30 @@ fn decode_room_forward_meta(bytes: &[u8]) -> PyResult<(u32, u64)> {
     ))
 }
 
+#[cfg(test)]
+mod room_forward_meta_tests {
+    use super::{decode_room_forward_meta, encode_room_forward_meta};
+
+    #[test]
+    fn compact_encoding_and_legacy_width_are_readable() {
+        let encoded = encode_room_forward_meta(7, 0x0102_0304_0506_0708);
+        assert_eq!(encoded.len(), 16);
+        assert_eq!(
+            decode_room_forward_meta(&encoded).unwrap(),
+            (7, 0x0102_0304_0506_0708)
+        );
+
+        let mut legacy = [0; 20];
+        legacy[..16].copy_from_slice(&encoded);
+        assert_eq!(
+            decode_room_forward_meta(&legacy).unwrap(),
+            (7, 0x0102_0304_0506_0708)
+        );
+        legacy[19] = 1;
+        assert!(decode_room_forward_meta(&legacy).is_err());
+    }
+}
+
 pub(crate) fn read_room_forward_meta(room_id: &str) -> PyResult<Option<(u32, u64)>> {
     let value = auth_chain_db()?
         .get_read_committed(
