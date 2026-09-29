@@ -1654,7 +1654,14 @@ pub(crate) fn encode_room_forward_meta(
 }
 
 fn decode_room_forward_meta(bytes: &[u8]) -> PyResult<(u32, u64)> {
-    if bytes.len() != 16 || bytes[0] != 1 || bytes[1..4] != [0, 0, 0] {
+    // Version 1 was first written as a 20-byte value with four reserved
+    // trailing zero bytes. Accept those values while writing the compact
+    // 16-byte representation so existing databases remain readable.
+    if !matches!(bytes.len(), 16 | 20)
+        || bytes[0] != 1
+        || bytes[1..4] != [0, 0, 0]
+        || (bytes.len() == 20 && bytes[16..20] != [0, 0, 0, 0])
+    {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
             "malformed room forward metadata",
         ));
