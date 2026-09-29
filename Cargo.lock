@@ -968,7 +968,7 @@ dependencies = [
 [[package]]
 name = "mtxdb"
 version = "0.1.0-beta.2"
-source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=refactor%2Fpack-id-store-layout#f66bec3e7019badbbe9db3c1598e083df842b2d8"
+source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=refactor%2Fpack-id-store-layout#f38367ca7e8a88c7106d6ff2e938d856506c33ff"
 dependencies = [
  "arc-swap",
  "blake3",
@@ -1382,10 +1382,34 @@ dependencies = [
 [[package]]
 name = "rezzy"
 version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#ef86c151319af2b50c1cc60fb24b0869b921ff7b"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#5182eab532037af002077969a1838d05cd142619"
 dependencies = [
+ "base64 0.22.1",
+ "blake2",
+ "hashbrown 0.15.5",
  "imbl",
- "rz-core",
+ "rezzy-json",
+ "rezzy-recon",
+ "roaring",
+ "sha2",
+ "sha3",
+]
+
+[[package]]
+name = "rezzy-json"
+version = "0.6.0-rc.0"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#5182eab532037af002077969a1838d05cd142619"
+dependencies = [
+ "ryu",
+]
+
+[[package]]
+name = "rezzy-recon"
+version = "0.6.0-rc.0"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#5182eab532037af002077969a1838d05cd142619"
+dependencies = [
+ "base64 0.22.1",
+ "sha2",
 ]
 
 [[package]]
@@ -1494,39 +1518,6 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
-
-[[package]]
-name = "rz-core"
-version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#ef86c151319af2b50c1cc60fb24b0869b921ff7b"
-dependencies = [
- "base64 0.22.1",
- "blake2",
- "hashbrown 0.15.5",
- "imbl",
- "roaring",
- "rz-json",
- "rz-reconcile",
- "sha2",
- "sha3",
-]
-
-[[package]]
-name = "rz-json"
-version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#ef86c151319af2b50c1cc60fb24b0869b921ff7b"
-dependencies = [
- "ryu",
-]
-
-[[package]]
-name = "rz-reconcile"
-version = "0.6.0-rc.0"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#ef86c151319af2b50c1cc60fb24b0869b921ff7b"
-dependencies = [
- "base64 0.22.1",
- "sha2",
-]
 
 [[package]]
 name = "schannel"
