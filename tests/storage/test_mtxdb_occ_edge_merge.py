@@ -43,52 +43,62 @@ import threading
 from synapse.synapse_rust import mtxdb_engine as m
 
 m.open_client(sys.argv[1])
-conflicts_before = m.event_edges_occ_conflicts()
 
 namespace = "test-occ-edge-merge"
-room_id = "!occ-merge:test"
-parent = "$parent"
-children = [f"$child-{index:02d}" for index in range(16)]
+conflicts_before = m.event_edges_occ_conflicts()
+observed_conflict = False
 
-# Align every writer on one barrier so they read the same forward-list version
-# and race the same commit instead of serializing by chance.
-barrier = threading.Barrier(len(children))
-failures = []
+# Retry the barrier burst: on a fast multi-core machine the OS can schedule
+# every writer cleanly enough that no CAS collision happens in a given run, so
+# a conflict is not guaranteed by a single burst. Each burst uses its own
+# forward list and still asserts merge completeness, so a lost update fails
+# immediately instead of depending on the schedule.
+for burst in range(3):
+    room_id = f"!occ-merge:test-{burst}"
+    parent = f"$parent-{burst}"
+    children = [f"$child-{burst:02d}-{index:02d}" for index in range(16)]
 
+    # Align every writer on one barrier so they read the same forward-list
+    # version and race the same commit instead of serializing by chance.
+    barrier = threading.Barrier(len(children))
+    failures = []
 
-def worker(child):
-    try:
-        barrier.wait()
-        # Mirror the production caller's `_retry_on_contention` contract: an
-        # exhausted optimistic loop surfaces a retryable `BlockingIOError`.
-        for attempt in range(5):
-            try:
-                m.event_edges_put(namespace, [(room_id, child, parent, False)])
-                return
-            except BlockingIOError:
-                if attempt == 4:
-                    raise
-    except BaseException as error:
-        failures.append(repr(error))
+    def worker(child):
+        try:
+            barrier.wait()
+            # Mirror the production caller's `_retry_on_contention` contract:
+            # an exhausted optimistic loop surfaces a retryable
+            # `BlockingIOError`.
+            for attempt in range(5):
+                try:
+                    m.event_edges_put(namespace, [(room_id, child, parent, False)])
+                    return
+                except BlockingIOError:
+                    if attempt == 4:
+                        raise
+        except BaseException as error:
+            failures.append(repr(error))
 
+    threads = [threading.Thread(target=worker, args=(child,)) for child in children]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
 
-threads = [threading.Thread(target=worker, args=(child,)) for child in children]
-for thread in threads:
-    thread.start()
-for thread in threads:
-    thread.join()
+    assert not failures, (burst, failures)
 
-assert not failures, failures
+    forward = dict(m.event_edges_get_forward(namespace, [parent]))
+    merged = forward.get(parent)
+    assert merged is not None, (burst, forward)
+    # No child lost and none duplicated: a torn merge would drop a racer.
+    assert sorted(merged) == sorted(children), (burst, sorted(merged), sorted(children))
 
-forward = dict(m.event_edges_get_forward(namespace, [parent]))
-merged = forward.get(parent)
-assert merged is not None, forward
-# No child lost and none duplicated: a torn merge would drop a racer.
-assert sorted(merged) == sorted(children), (sorted(merged), sorted(children))
-conflicts_after = m.event_edges_occ_conflicts()
-assert conflicts_after > conflicts_before, (
+    if m.event_edges_occ_conflicts() > conflicts_before:
+        observed_conflict = True
+
+assert observed_conflict, (
     "the race did not exercise EdgeOccOutcome::Conflict and run_edge_occ replay: "
-    f"before={conflicts_before}, after={conflicts_after}"
+    f"before={conflicts_before}, after={m.event_edges_occ_conflicts()}"
 )
 """
 
