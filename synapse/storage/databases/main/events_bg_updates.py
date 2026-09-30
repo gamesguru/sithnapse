@@ -47,7 +47,10 @@ from synapse.storage.database import (
 )
 from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
 from synapse.storage.databases.main.embedded_common import Pool, SyncTier, maybe_sync
-from synapse.storage.databases.main.embedded_event_edges import put_event_edges_batch
+from synapse.storage.databases.main.embedded_event_edges import (
+    put_event_edges_batch,
+    rebuild_room_forward_index,
+)
 from synapse.storage.databases.main.embedded_event_json import (
     get_event_json_batch,
     put_event_json_batch,
@@ -2066,6 +2069,60 @@ class EventsBackgroundUpdatesStore(
             )
             return 0
 
+        # The legacy pass mirrors backward records and its unversioned forward
+        # lists. The read gate, however, uses a generation-scoped FWD
+        # collection selected by ROOM_FORWARD_META. Do not declare this update
+        # complete until every room has also had that representation rebuilt
+        # and published. Keeping the phase in progress_json makes an
+        # interrupted rebuild resumable without ever enabling a partial FWD
+        # generation.
+        if progress.get("fwd_rebuild"):
+            last_room_id = progress.get("fwd_last_room_id", "")
+
+            def next_room_txn(txn: LoggingTransaction) -> str | None:
+                txn.execute(
+                    """
+                    SELECT ev.room_id
+                    FROM event_edges AS ee
+                    JOIN events AS ev ON ev.event_id = ee.event_id
+                    WHERE ev.room_id > ?
+                    GROUP BY ev.room_id
+                    ORDER BY ev.room_id
+                    LIMIT 1
+                    """,
+                    (last_room_id,),
+                )
+                row = txn.fetchone()
+                return str(row[0]) if row else None
+
+            room_id = await self.db_pool.runInteraction(
+                "migrate_event_edges_mtxdb_next_fwd_room", next_room_txn
+            )
+            if room_id is None:
+                await self.db_pool.updates._end_background_update(
+                    _BackgroundUpdates.EVENT_EDGES_MIGRATE_MTXDB
+                )
+                return batch_size
+
+            await rebuild_room_forward_index(
+                self,
+                room_id,
+                batch_size=batch_size,
+                namespace=self._embedded_db_namespace,
+            )
+            await self.db_pool.runInteraction(
+                "migrate_event_edges_mtxdb_fwd_progress",
+                lambda txn: self.db_pool.updates._background_update_progress_txn(
+                    txn,
+                    _BackgroundUpdates.EVENT_EDGES_MIGRATE_MTXDB,
+                    {
+                        "fwd_rebuild": True,
+                        "fwd_last_room_id": room_id,
+                    },
+                ),
+            )
+            return batch_size
+
         last_event_id = progress.get("last_event_id", "")
 
         def migrate_txn(
@@ -2132,8 +2189,13 @@ class EventsBackgroundUpdatesStore(
             put_event_edges_batch(self._embedded_db_namespace, rows)
 
         if done:
-            await self.db_pool.updates._end_background_update(
-                _BackgroundUpdates.EVENT_EDGES_MIGRATE_MTXDB
+            await self.db_pool.runInteraction(
+                "migrate_event_edges_mtxdb_begin_fwd_rebuild",
+                lambda txn: self.db_pool.updates._background_update_progress_txn(
+                    txn,
+                    _BackgroundUpdates.EVENT_EDGES_MIGRATE_MTXDB,
+                    {"fwd_rebuild": True, "fwd_last_room_id": ""},
+                ),
             )
             return len(rows) or batch_size
 
