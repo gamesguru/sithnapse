@@ -231,7 +231,7 @@ async def resolve_events_with_store(
             )
 
     # Attempt to run high-performance state resolution in Rust via rezzy's lattice fold
-    if room_version.state_res == StateResolutionVersions.V2:
+    if room_version.state_res == StateResolutionVersions.V2 and conflict_cache is None:
         try:
             import synapse.synapse_rust.state_res as rust_res
 
