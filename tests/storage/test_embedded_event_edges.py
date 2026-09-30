@@ -41,7 +41,6 @@ from synapse.storage.databases.main.embedded_common import (
     suppress_diagnostic_timings,
 )
 from synapse.storage.databases.main.embedded_event_edges import (
-    EventEdgesMigrationIncompleteError,
     _retry_on_contention,
     check_event_edges_migration_complete,
     delete_event_edges_batch,
@@ -1886,135 +1885,63 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
 
 
 class EventEdgesMigrationGateTestCase(EventEdgesStorageIntegrationTestCase):
-    """`check_event_edges_migration_complete`: while embedded edges are enabled
-    and the SQL `event_edges` table still exists, mtxdb must have published
-    every SQL mutation (source-version watermark + empty outbox)."""
+    """`check_event_edges_migration_complete`: Blocker 1's hard precondition
+    for the (not-yet-shipped) release that removes the SQL `event_edges`
+    insert -- `res/docs/2026-09-28-event-edges-sql-removal-plan.md`.
 
-    def _check(self) -> None:
-        self.get_success(check_event_edges_migration_complete(self.hs))
+    Reuses `EventEdgesStorageIntegrationTestCase.prepare` for a homeserver
+    with the embedded edges engine enabled and writable.
+    """
 
-    def _check_raises(self, *fragments: str) -> None:
-        failure = self.get_failure(
-            check_event_edges_migration_complete(self.hs),
-            EventEdgesMigrationIncompleteError,
-        )
-        for fragment in fragments:
-            self.assertIn(fragment, str(failure.value))
-
-    def _clear_outbox(self) -> None:
+    def _make_migration_incomplete(self) -> None:
+        """Reinsert `event_edges_migrate_mtxdb` as pending, matching the
+        idiom in `test_migrate_mtxdb_background_update_is_retired_noop`."""
         self.get_success(
-            self.store.db_pool.simple_delete(
-                "edge_index_outbox", {"room_id": self.room_id}, "t"
+            self.store.db_pool.simple_insert(
+                table="background_updates",
+                values={
+                    "update_name": "event_edges_migrate_mtxdb",
+                    "progress_json": "{}",
+                },
             )
         )
-
-    def _no_drain(self) -> Any:
-        return mock.patch.object(
-            embedded_event_edges_module,
-            "drain_edge_index_outbox",
-            mock.AsyncMock(return_value=False),
+        self.store.db_pool.updates._all_done = False
+        self.store.db_pool.updates._completed_background_updates.discard(
+            "event_edges_migrate_mtxdb"
         )
 
-    def test_passes_once_outbox_drained(self) -> None:
-        """The check drains the outbox itself, then finds mtxdb caught up."""
-        self._check()
+    def test_no_op_while_flag_false(self) -> None:
+        """`EVENT_EDGES_SQL_INSERT_REMOVED` is False today: the check must
+        never raise, regardless of migration state, since there is nothing
+        to protect yet (the SQL fallback still exists)."""
+        self._make_migration_incomplete()
+
+        self.get_success(check_event_edges_migration_complete(self.hs))
 
     @mock.patch.object(
         embedded_event_edges_module, "EVENT_EDGES_SQL_INSERT_REMOVED", True
     )
-    def test_skipped_once_sql_insert_removed(self) -> None:
-        self.get_success(
-            self.store.db_pool.simple_delete(
-                "room_edge_source_version", {"room_id": self.room_id}, "t"
-            )
-        )
-        self._check()
+    def test_no_raise_when_writer_and_migration_complete(self) -> None:
+        """With the flag on and the migration already complete (the default
+        state of a fresh test homeserver -- every background update is
+        marked done), the check must be silent."""
+        self.get_success(check_event_edges_migration_complete(self.hs))
 
+    @mock.patch.object(
+        embedded_event_edges_module, "EVENT_EDGES_SQL_INSERT_REMOVED", True
+    )
     def test_no_op_for_non_writer_process(self) -> None:
-        self.get_success(
-            self.store.db_pool.simple_delete(
-                "room_edge_source_version", {"room_id": self.room_id}, "t"
-            )
-        )
+        """With the flag on and the migration incomplete, a process that
+        isn't the events-stream writer must not be blocked -- it never
+        writes event_edges itself, so it has nothing to protect against.
+        `embedded_event_edges_is_writable` is config-derived (not a store
+        attribute), so it's mocked directly rather than mutated on the
+        store."""
+        self._make_migration_incomplete()
+
         with mock.patch.object(
             embedded_event_edges_module,
             "embedded_event_edges_is_writable",
             return_value=False,
         ):
-            self._check()
-
-    def test_fails_for_legacy_room_without_source_version(self) -> None:
-        self.get_success(
-            self.store.db_pool.simple_delete(
-                "room_edge_source_version", {"room_id": self.room_id}, "t"
-            )
-        )
-        self._check_raises(self.room_id, "unmigrated")
-
-    def test_fails_when_mtxdb_behind_sql(self) -> None:
-        self._clear_outbox()
-        with (
-            self._no_drain(),
-            mock.patch(
-                "synapse.synapse_rust.mtxdb_engine.room_forward_meta_get",
-                return_value=(1, 0),
-            ),
-        ):
-            self._check_raises(self.room_id, "behind")
-
-    def test_fails_when_mtxdb_has_no_room_meta(self) -> None:
-        self._clear_outbox()
-        with (
-            self._no_drain(),
-            mock.patch(
-                "synapse.synapse_rust.mtxdb_engine.room_forward_meta_get",
-                return_value=None,
-            ),
-        ):
-            self._check_raises(self.room_id, "no mtxdb forward metadata")
-
-    def test_passes_when_mtxdb_ahead_of_sql(self) -> None:
-        version = self.get_success(
-            self.store.db_pool.simple_select_one_onecol(
-                "room_edge_source_version",
-                {"room_id": self.room_id},
-                "source_version",
-            )
-        )
-        with (
-            self._no_drain(),
-            mock.patch(
-                "synapse.synapse_rust.mtxdb_engine.room_forward_meta_get",
-                return_value=(1, version + 5),
-            ),
-        ):
-            self.get_success(
-                self.store.db_pool.simple_delete(
-                    "edge_index_outbox", {"room_id": self.room_id}, "t"
-                )
-            )
-            self._check()
-
-    def test_fails_when_drain_raises(self) -> None:
-        with mock.patch.object(
-            embedded_event_edges_module,
-            "drain_edge_index_outbox",
-            mock.AsyncMock(side_effect=RuntimeError("boom")),
-        ):
-            self._check_raises("Failed to drain", "boom")
-
-    def test_fails_on_pending_outbox(self) -> None:
-        self.get_success(
-            self.store.db_pool.simple_insert(
-                "edge_index_outbox",
-                {
-                    "room_id": "!other:test",
-                    "source_version": 1,
-                    "event_id": "$e",
-                    "prev_event_id": "$p",
-                    "operation": "put",
-                },
-            )
-        )
-        with self._no_drain():
-            self._check_raises("!other:test", "pending outbox")
+            self.get_success(check_event_edges_migration_complete(self.hs))
