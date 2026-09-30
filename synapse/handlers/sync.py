@@ -2476,14 +2476,16 @@ class SyncHandler:
                     # We don't use a cache here as for non-lazy sync we always
                     # send changes and/or fields the client asked for, if relevant
                     # as above joined condition.
-                    fields = (
-                        profile_fields
-                        if other_user_id in joined_room_user_ids
-                        else set(updated_user_fields.get(other_user_id, []))
-                    )
-                    fields = set(profile_data.keys()).intersection(fields)
+                    if other_user_id in joined_room_user_ids:
+                        # Only send the fields the user actually has a value for.
+                        fields = set(profile_data.keys()).intersection(profile_fields)
+                    else:
+                        # Send every field that was updated, even if it has since
+                        # been cleared. A cleared field is absent from
+                        # `profile_data`, so we use `.get()` to report it as `null`.
+                        fields = set(updated_user_fields.get(other_user_id, []))
                     for field_name in fields:
-                        per_user_updates[field_name] = profile_data[field_name]
+                        per_user_updates[field_name] = profile_data.get(field_name)
 
                 if per_user_updates:
                     profile_updates[other_user_id] = per_user_updates

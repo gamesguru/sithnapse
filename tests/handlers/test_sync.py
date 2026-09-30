@@ -1496,6 +1496,61 @@ class SyncProfileUpdatesTestCase(tests.unittest.HomeserverTestCase):
         )
 
     @override_config({"include_profile_updates_in_sync": True})
+    def test_incremental_sync_cleared_profile_field_is_sent_as_null(self) -> None:
+        """Test that with MSC4429 enabled a profile field that is cleared (via
+        `DELETE`, which removes the field from the profile) is reported to
+        interested users as an explicit `null` in the incremental sync
+        response."""
+        filter_collection = FilterCollection(
+            hs=self.hs,
+            filter_json={
+                "org.matrix.msc4429.profile_fields": {"ids": ["m.status"]},
+            },
+        )
+        requester = create_requester(self.user)
+        initial_result = self.get_success(
+            self.sync_handler.wait_for_sync_for_user(
+                requester,
+                sync_config=generate_sync_config(
+                    user_id=self.user,
+                    filter_collection=filter_collection,
+                ),
+                request_key=generate_request_key(),
+            )
+        )
+
+        # Set, then clear, the field on the other user.
+        self.get_success(
+            self.store.set_profile_field(
+                user_id=UserID.from_string(self.other_user),
+                field_name="m.status",
+                new_value={"text": "On holiday"},
+            )
+        )
+        self.get_success(
+            self.store.delete_profile_field(
+                user_id=UserID.from_string(self.other_user),
+                field_name="m.status",
+            )
+        )
+
+        incremental_result = self.get_success(
+            self.sync_handler.wait_for_sync_for_user(
+                requester,
+                since_token=initial_result.next_batch,
+                sync_config=generate_sync_config(
+                    user_id=self.user,
+                    filter_collection=filter_collection,
+                ),
+                request_key=generate_request_key(),
+            )
+        )
+        other_user_updates = incremental_result.profile_updates["@other_user:test"]
+        assert other_user_updates is not None
+        self.assertIn("m.status", other_user_updates)
+        self.assertIsNone(other_user_updates["m.status"])
+
+    @override_config({"include_profile_updates_in_sync": True})
     def test_incremental_sync_does_not_filter_profile_updates_when_lazy_loading(
         self,
     ) -> None:
