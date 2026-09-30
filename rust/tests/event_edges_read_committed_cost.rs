@@ -28,8 +28,9 @@ use std::process::{Child, Command, ExitStatus};
 use std::time::{Duration, Instant};
 
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use synapse::database::embedded_edges::{event_edges_get_forward, event_edges_put};
-use synapse::database::mtxdb_syn::{open_client, open_client_read_only, sync};
+use synapse::database::mtxdb_syn::{open_client, open_client_read_only, stats, sync};
 
 const NAMESPACE: &str = "bench-edges-read-committed-cost";
 const ROOM: &str = "!bench-edges-read-committed-cost:example.org";
@@ -41,6 +42,35 @@ fn percentiles(mut samples: Vec<f64>) -> (f64, f64) {
     let p50 = samples[samples.len() / 2];
     let p99 = samples[(samples.len() * 99) / 100];
     (p50 * 1e6, p99 * 1e6)
+}
+
+/// Event-DAG pool `(read_refreshes, read_refresh_bytes)`.
+///
+/// These are the always-on counters `refresh_read_journal` bumps
+/// (`read_journal.rs:807,703`), so a read run's rescan frequency and scanned
+/// volume can be attributed without enabling the opt-in logical counters.
+fn event_dag_refresh_counters(py: Python<'_>) -> (u64, u64) {
+    let all = stats(py).expect("stats");
+    let all = all.bind(py);
+    let pool = all
+        .get_item("event_dag")
+        .expect("get event_dag")
+        .expect("event_dag present")
+        .cast_into::<PyDict>()
+        .expect("event_dag is a dict");
+    let refreshes = pool
+        .get_item("read_refreshes")
+        .expect("get read_refreshes")
+        .expect("read_refreshes present")
+        .extract::<u64>()
+        .expect("read_refreshes is u64");
+    let bytes = pool
+        .get_item("read_refresh_bytes")
+        .expect("get read_refresh_bytes")
+        .expect("read_refresh_bytes present")
+        .extract::<u64>()
+        .expect("read_refresh_bytes is u64");
+    (refreshes, bytes)
 }
 
 /// Returns `(parents, leaf_children)`. `parents` are real hits: each has a
@@ -91,13 +121,18 @@ fn writer_reads_its_own_writes_no_regression() {
         open_client(py, dir.path().to_string_lossy().into_owned()).expect("open writer");
         let (parents, leaf_children) = populate(py);
 
+        let (refreshes_before, bytes_before) = event_dag_refresh_counters(py);
         let (hit_p50, hit_p99) = time_reads(py, &parents);
         let (miss_p50, miss_p99) = time_reads(py, &leaf_children);
+        let (refreshes_after, bytes_after) = event_dag_refresh_counters(py);
 
         println!(
             "writer (own writes, no read-journal overlay): \
              hit  p50={hit_p50:8.1}us p99={hit_p99:8.1}us | \
-             miss p50={miss_p50:8.1}us p99={miss_p99:8.1}us"
+             miss p50={miss_p50:8.1}us p99={miss_p99:8.1}us | \
+             refresh_reads={} refresh_bytes={}",
+            refreshes_after - refreshes_before,
+            bytes_after - bytes_before,
         );
     });
 }
@@ -157,21 +192,34 @@ fn worker_phase(py: Python<'_>, dir: &str) {
         .collect();
     let leaf_children: Vec<String> = (0..N_PARENTS).map(|i| format!("$cost-child-{i}")).collect();
 
-    // First pass: cold, this process has never read these keys before.
+    // First pass: cold, this process has never read these keys before. The
+    // first sample is already after `open_client_read_only` installed the
+    // overlay, so it captures the refreshes that open itself performed; the
+    // deltas below are the refreshes the timed reads add.
+    let (refreshes_before, bytes_before) = event_dag_refresh_counters(py);
     let (hit_p50, hit_p99) = time_reads(py, &parents);
     let (miss_p50, miss_p99) = time_reads(py, &leaf_children);
+    let (refreshes_mid, bytes_mid) = event_dag_refresh_counters(py);
     // Second pass over the exact same keys: isolates a one-time cold-cache/
     // index-load cost (would drop sharply here) from a genuine per-call cost
     // the overlay-refresh check pays every time (would stay flat).
     let (hit_p50_warm, hit_p99_warm) = time_reads(py, &parents);
     let (miss_p50_warm, miss_p99_warm) = time_reads(py, &leaf_children);
+    let (refreshes_after, bytes_after) = event_dag_refresh_counters(py);
 
     fs::write(
         marker_path(dir, "worker_result"),
         format!(
             "hit_p50={hit_p50} hit_p99={hit_p99} miss_p50={miss_p50} miss_p99={miss_p99} \
              hit_p50_warm={hit_p50_warm} hit_p99_warm={hit_p99_warm} \
-             miss_p50_warm={miss_p50_warm} miss_p99_warm={miss_p99_warm}"
+             miss_p50_warm={miss_p50_warm} miss_p99_warm={miss_p99_warm} \
+             open_refreshes={refreshes_before} open_refresh_bytes={bytes_before} \
+             cold_refreshes={} cold_refresh_bytes={} \
+             warm_refreshes={} warm_refresh_bytes={}",
+            refreshes_mid - refreshes_before,
+            bytes_mid - bytes_before,
+            refreshes_after - refreshes_mid,
+            bytes_after - bytes_mid,
         ),
     )
     .expect("write worker_result marker");
