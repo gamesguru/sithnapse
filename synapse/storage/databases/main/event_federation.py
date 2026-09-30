@@ -2688,24 +2688,14 @@ class EventFederationWorkerStore(
         """
         started = time.monotonic()
 
-        # Gated on the event_edges_migrate_mtxdb background update (mirrors
-        # pre-existing SQL-only event_edges rows into mtxdb -- unrelated to
-        # Matrix federation backfill, which this function's caller feeds
-        # into), not just on the engine being enabled. event_edges_put only
-        # ever appends to a forward list: a parent whose children are a mix
-        # of pre-enable (SQL-only) and post-enable (mirrored) events would
-        # give a non-empty-but-*incomplete* mtxdb hit, which the miss-
-        # triggered fallback below cannot detect (a hit is not a miss). Until
-        # the background update has finished mirroring every pre-existing
-        # row, mtxdb cannot be trusted as complete, so this takes the same
-        # all-SQL path as if the engine were disabled entirely.
-        # has_completed_background_update caches internally once true, so
-        # this is a cheap check after the first one.
-        if getattr(
-            self, "_embedded_event_edges_enabled", False
-        ) and await self.db_pool.updates.has_completed_background_update(
-            "event_edges_migrate_mtxdb"
-        ):
+        # A warm FWD generation is not proof of completeness. Only the
+        # offline verifier may grant this authority marker; until then SQL is
+        # the source of truth and FWD remains a write-side projection.
+        from synapse.storage.databases.main.embedded_event_edges import (
+            event_edges_fwd_is_authoritative,
+        )
+
+        if await event_edges_fwd_is_authoritative(self):
             from synapse.storage.databases.main.embedded_event_edges import (
                 get_event_edges_forward_batch,
                 repair_edge_index_from_sql,

@@ -47,10 +47,6 @@ from synapse.storage.database import (
 )
 from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
 from synapse.storage.databases.main.embedded_common import Pool, SyncTier, maybe_sync
-from synapse.storage.databases.main.embedded_event_edges import (
-    put_event_edges_batch,
-    rebuild_room_forward_index,
-)
 from synapse.storage.databases.main.embedded_event_json import (
     get_event_json_batch,
     put_event_json_batch,
@@ -2038,178 +2034,17 @@ class EventsBackgroundUpdatesStore(
     async def _background_migrate_event_edges_mtxdb(
         self, progress: JsonDict, batch_size: int
     ) -> int:
-        """Mirror pre-existing `event_edges` rows into the embedded engine.
+        """Retire the legacy online edge migration.
 
-        `event_edges_put` (`embedded_event_edges.put_event_edges_batch`) has
-        mirrored every *new* row since the embedded edges engine was enabled,
-        but rows written before that point -- or on a server that enables the
-        engine after already running for a while -- only exist in SQL. Two
-        read sites (`get_successor_events`, `is_event_next_to_forward_gap`)
-        already lazily repair a miss into mtxdb on read, but that only covers
-        rows that get read; this background update covers the rest, so the
-        SQL `event_edges` insert can eventually be dropped without an mtxdb
-        miss silently returning nothing for a legacy row nobody has read yet.
-
-        A no-op (ends immediately) unless the embedded edges engine is both
-        enabled and writable on this process -- there is nothing to migrate
-        into otherwise, and only the events-stream writer may write it.
-
-        Same windowed-batch shape as `_background_drop_invalid_event_edges_rows`:
-        ordered by `event_id` (covered by the `event_edges_event_id_prev_event_id_idx`
-        unique index), progress tracked as the last `event_id` processed.
-        `put_event_edges_batch` is idempotent (a forward-list append
-        deduplicates, a backward record overwrite is identical), so retrying
-        a batch after a partial failure is safe.
+        FWD authority now requires a stopped-writer offline rebuild and exact
+        SQL verification. This handler remains registered solely to clear
+        update rows created by earlier schemas; completion never enables the
+        embedded read gate.
         """
-        if not getattr(self, "_embedded_event_edges_enabled", False) or not getattr(
-            self, "_embedded_event_edges_writable", False
-        ):
-            await self.db_pool.updates._end_background_update(
-                _BackgroundUpdates.EVENT_EDGES_MIGRATE_MTXDB
-            )
-            return 0
-
-        # The legacy pass mirrors backward records and its unversioned forward
-        # lists. The read gate, however, uses a generation-scoped FWD
-        # collection selected by ROOM_FORWARD_META. Do not declare this update
-        # complete until every room has also had that representation rebuilt
-        # and published. Keeping the phase in progress_json makes an
-        # interrupted rebuild resumable without ever enabling a partial FWD
-        # generation.
-        if progress.get("fwd_rebuild"):
-            last_room_id = progress.get("fwd_last_room_id", "")
-
-            def next_room_txn(txn: LoggingTransaction) -> str | None:
-                txn.execute(
-                    """
-                    SELECT ev.room_id
-                    FROM event_edges AS ee
-                    JOIN events AS ev ON ev.event_id = ee.event_id
-                    WHERE ev.room_id > ?
-                    GROUP BY ev.room_id
-                    ORDER BY ev.room_id
-                    LIMIT 1
-                    """,
-                    (last_room_id,),
-                )
-                row = txn.fetchone()
-                return str(row[0]) if row else None
-
-            room_id = await self.db_pool.runInteraction(
-                "migrate_event_edges_mtxdb_next_fwd_room", next_room_txn
-            )
-            if room_id is None:
-                await self.db_pool.updates._end_background_update(
-                    _BackgroundUpdates.EVENT_EDGES_MIGRATE_MTXDB
-                )
-                return batch_size
-
-            await rebuild_room_forward_index(
-                self,
-                room_id,
-                batch_size=batch_size,
-                namespace=self._embedded_db_namespace,
-            )
-            await self.db_pool.runInteraction(
-                "migrate_event_edges_mtxdb_fwd_progress",
-                lambda txn: self.db_pool.updates._background_update_progress_txn(
-                    txn,
-                    _BackgroundUpdates.EVENT_EDGES_MIGRATE_MTXDB,
-                    {
-                        "fwd_rebuild": True,
-                        "fwd_last_room_id": room_id,
-                    },
-                ),
-            )
-            return batch_size
-
-        last_event_id = progress.get("last_event_id", "")
-
-        def migrate_txn(
-            txn: LoggingTransaction,
-        ) -> tuple[bool, list[tuple[str, str, str, bool]]]:
-            """Returns (done, rows) for this batch."""
-
-            # Find this batch's endpoint the same way
-            # `_background_drop_invalid_event_edges_rows` does: order by
-            # event_id, skip batch_size-1 rows, and take the next one.
-            txn.execute(
-                """
-                SELECT event_id FROM event_edges
-                WHERE event_id > ?
-                ORDER BY event_id
-                LIMIT 1 OFFSET ?
-                """,
-                (last_event_id, batch_size),
-            )
-            row = txn.fetchone()
-            endpoint = row[0] if row else None
-
-            where_clause = "ee.event_id > ?"
-            args: list[object] = [last_event_id]
-            if endpoint is not None:
-                where_clause += " AND ee.event_id <= ?"
-                args.append(endpoint)
-
-            # event_edges.room_id itself is never populated on write
-            # (`_handle_mult_prev_events` inserts only event_id/prev_event_id;
-            # is_state defaults false, room_id stays NULL) -- join `events`
-            # for it instead, the same way
-            # `_background_drop_invalid_event_edges_rows` above joins it to
-            # validate the row. The event_edges_event_id_fkey (validated by
-            # that same background update) guarantees every event_id here
-            # has a matching events row, so an inner join can't silently drop
-            # rows the way a NULL room_id column would.
-            txn.execute(
-                f"""
-                SELECT ee.event_id, ee.prev_event_id, ev.room_id, ee.is_state
-                FROM event_edges ee
-                JOIN events ev ON ev.event_id = ee.event_id
-                WHERE {where_clause}
-                ORDER BY ee.event_id
-                """,
-                args,
-            )
-            rows = [
-                (room_id, event_id, prev_event_id, bool(is_state))
-                for event_id, prev_event_id, room_id, is_state in txn
-            ]
-            return endpoint is None, rows
-
-        done, rows = await self.db_pool.runInteraction(
-            desc="migrate_event_edges_mtxdb_read", func=migrate_txn
+        await self.db_pool.updates._end_background_update(
+            _BackgroundUpdates.EVENT_EDGES_MIGRATE_MTXDB
         )
-
-        if rows:
-            # Outside the SQL transaction: the mirror write is not
-            # transactional with SQL, but it's idempotent and this is a
-            # read-only backfill (nothing in SQL changes), so a crash between
-            # the SQL read and this write only means the batch is repeated,
-            # not corrupted.
-            put_event_edges_batch(self._embedded_db_namespace, rows)
-
-        if done:
-            await self.db_pool.runInteraction(
-                "migrate_event_edges_mtxdb_begin_fwd_rebuild",
-                lambda txn: self.db_pool.updates._background_update_progress_txn(
-                    txn,
-                    _BackgroundUpdates.EVENT_EDGES_MIGRATE_MTXDB,
-                    {"fwd_rebuild": True, "fwd_last_room_id": ""},
-                ),
-            )
-            return len(rows) or batch_size
-
-        last_event_id = rows[-1][1] if rows else last_event_id
-        await self.db_pool.runInteraction(
-            desc="migrate_event_edges_mtxdb_progress",
-            func=lambda txn: self.db_pool.updates._background_update_progress_txn(
-                txn,
-                _BackgroundUpdates.EVENT_EDGES_MIGRATE_MTXDB,
-                {"last_event_id": last_event_id},
-            ),
-        )
-
-        return len(rows) or batch_size
+        return 0
 
     async def _background_events_populate_state_key_rejections(
         self, progress: JsonDict, batch_size: int

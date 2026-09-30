@@ -1,0 +1,11 @@
+-- Offline-verified authority markers for embedded projections.
+-- A marker is written only after maintenance has rebuilt and verified the
+-- projection against its SQL source while all writers are stopped.
+CREATE TABLE embedded_db_cutovers (
+    component TEXT NOT NULL,
+    namespace TEXT NOT NULL,
+    layout_version INTEGER NOT NULL,
+    verified_at_ts BIGINT NOT NULL,
+    verified_records BIGINT NOT NULL,
+    PRIMARY KEY (component, namespace)
+);

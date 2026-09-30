@@ -418,12 +418,52 @@ def embedded_event_edges_is_writable(hs: HomeServer) -> bool:
 # needs it) rather than during synchronous schema prep.
 EVENT_EDGES_SQL_INSERT_REMOVED = False
 
+# The FWD layout is only authoritative after an offline rebuild has compared
+# every room against SQL and recorded this layout version. A completed legacy
+# background update is not sufficient: it can build a generation while live
+# writes continue, which is useful as a cache warm-up but is not proof that a
+# non-empty FWD result is complete.
+EVENT_EDGES_FWD_LAYOUT_VERSION = 1
+EVENT_EDGES_CUTOVER_COMPONENT = "event_edges_fwd"
+
+
+async def event_edges_fwd_is_authoritative(store: Any) -> bool:
+    """Whether an offline-verified FWD cutover authorizes embedded reads.
+
+    SQL remains authoritative until the maintenance command writes this
+    marker. This deliberately does not consult the legacy
+    ``event_edges_migrate_mtxdb`` background update.
+    """
+    if not getattr(store, "_embedded_event_edges_enabled", False):
+        return False
+
+    # The marker is written only during stopped-writer maintenance, so it is
+    # immutable for a running store. Avoid a SQL lookup on every successor or
+    # forward-gap check.
+    cached = getattr(store, "_embedded_event_edges_fwd_authoritative", None)
+    if cached is not None:
+        return bool(cached)
+
+    layout_version = await store.db_pool.simple_select_one_onecol(
+        table="embedded_db_cutovers",
+        keyvalues={
+            "component": EVENT_EDGES_CUTOVER_COMPONENT,
+            "namespace": store._embedded_db_namespace,
+        },
+        retcol="layout_version",
+        allow_none=True,
+        desc="event_edges_fwd_cutover_marker",
+    )
+    authoritative = layout_version == EVENT_EDGES_FWD_LAYOUT_VERSION
+    store._embedded_event_edges_fwd_authoritative = authoritative
+    return authoritative
+
 
 class EventEdgesMigrationIncompleteError(Exception):
     """Raised by `check_event_edges_migration_complete` when this process is
     the events-stream writer, the SQL `event_edges` insert has been removed
     (`EVENT_EDGES_SQL_INSERT_REMOVED = True`), and
-    `event_edges_migrate_mtxdb` has not finished on this server.
+    no offline-verified FWD cutover marker exists.
 
     Deliberately a plain exception, not a process exit: the caller (expected
     to be a fatal startup check, e.g. `synapse.app._base.start`) decides how
@@ -436,7 +476,7 @@ class EventEdgesMigrationIncompleteError(Exception):
 async def check_event_edges_migration_complete(hs: HomeServer) -> None:
     """Fatal precondition for the release that removes the SQL `event_edges`
     insert: refuse to let this process act as the events-stream writer
-    unless `event_edges_migrate_mtxdb` has already finished on this server.
+    unless offline maintenance has verified the FWD cutover on this server.
 
     A no-op today (`EVENT_EDGES_SQL_INSERT_REMOVED` is False) and a no-op on
     every process that isn't the events-stream writer -- workers don't write
@@ -446,27 +486,23 @@ async def check_event_edges_migration_complete(hs: HomeServer) -> None:
 
     Raises:
         EventEdgesMigrationIncompleteError: if this process is the writer,
-            the SQL insert has been removed, and the migration is incomplete.
+        the SQL insert has been removed, and the verified cutover is absent.
     """
     if not EVENT_EDGES_SQL_INSERT_REMOVED:
         return
     if not embedded_event_edges_is_writable(hs):
         return
 
-    store = hs.get_datastores().main
-    if await store.db_pool.updates.has_completed_background_update(
-        "event_edges_migrate_mtxdb"
-    ):
+    if await event_edges_fwd_is_authoritative(hs.get_datastores().main):
         return
 
     raise EventEdgesMigrationIncompleteError(
-        "This server has not finished migrating event_edges rows into the "
-        "embedded mtxdb engine (background update 'event_edges_migrate_mtxdb'), "
-        "but this release no longer writes event_edges to SQL. Starting "
-        "would leave rows written from this point on with no SQL fallback "
-        "and no proof mtxdb already has everything written before it.\n\n"
-        "Run the migration to completion before starting this version:\n"
-        "    update_synapse_database --run-background-updates"
+        "This server has no offline-verified event-edge FWD cutover marker, "
+        "but this release no longer writes event_edges to SQL. Starting would "
+        "leave rows written from this point on with no SQL fallback and no "
+        "proof that mtxdb contains a complete forward index.\n\n"
+        "Stop all writers and run the event-edge offline maintenance command "
+        "before starting this version."
     )
 
 
