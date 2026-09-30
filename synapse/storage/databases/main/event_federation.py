@@ -51,7 +51,7 @@ from synapse.storage.database import (
     LoggingTransaction,
 )
 from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
-from synapse.storage.databases.main.embedded_common import ffi_count
+from synapse.storage.databases.main.embedded_common import ffi_count, ffi_timing
 from synapse.storage.databases.main.events_worker import EventsWorkerStore
 from synapse.storage.databases.main.signatures import SignatureWorkerStore
 from synapse.storage.engines import PostgresEngine, Sqlite3Engine
@@ -2686,6 +2686,8 @@ class EventFederationWorkerStore(
         Args:
             event_id: The event to search for as a prev_event.
         """
+        started = time.monotonic()
+
         # Gated on the event_edges_migrate_mtxdb background update (mirrors
         # pre-existing SQL-only event_edges rows into mtxdb -- unrelated to
         # Matrix federation backfill, which this function's caller feeds
@@ -2709,6 +2711,7 @@ class EventFederationWorkerStore(
                 repair_edge_index_from_sql,
             )
 
+            sql_started = time.monotonic()
             room_id = await self.db_pool.simple_select_one_onecol(
                 table="events",
                 keyvalues={"event_id": event_id},
@@ -2716,8 +2719,13 @@ class EventFederationWorkerStore(
                 allow_none=True,
                 desc="get_successor_events_room_id",
             )
+            ffi_timing(
+                "event_edges_successor_room_lookup", time.monotonic() - sql_started
+            )
             if room_id is None:
+                ffi_timing("event_edges_successor_total", time.monotonic() - started)
                 return []
+            sql_started = time.monotonic()
             source_version = await self.db_pool.simple_select_one_onecol(
                 table="room_edge_source_version",
                 keyvalues={"room_id": room_id},
@@ -2725,26 +2733,41 @@ class EventFederationWorkerStore(
                 allow_none=True,
                 desc="get_successor_events_source_version",
             )
+            ffi_timing(
+                "event_edges_successor_source_version",
+                time.monotonic() - sql_started,
+            )
+            embedded_started = time.monotonic()
             forward_map = get_event_edges_forward_batch(
                 self._embedded_db_namespace,
                 room_id,
                 int(source_version or 0),
                 [event_id],
             )
+            ffi_timing(
+                "event_edges_successor_embedded_read",
+                time.monotonic() - embedded_started,
+            )
             successors = forward_map.get(event_id)
             if successors is not None:
                 ffi_count("event_edges_successor_hits", 1)
+                ffi_timing("event_edges_successor_total", time.monotonic() - started)
                 return successors
 
             ffi_count("event_edges_successor_fallbacks", 1)
+            sql_started = time.monotonic()
             sql_res = await self.db_pool.simple_select_onecol(
                 table="event_edges",
                 keyvalues={"prev_event_id": event_id},
                 retcol="event_id",
                 desc="get_successor_events",
             )
+            ffi_timing(
+                "event_edges_successor_sql_fallback", time.monotonic() - sql_started
+            )
             if sql_res and getattr(self, "_embedded_event_edges_writable", False):
                 try:
+                    repair_started = time.monotonic()
                     room_id = await self.db_pool.simple_select_one_onecol(
                         table="events",
                         keyvalues={"event_id": event_id},
@@ -2761,18 +2784,27 @@ class EventFederationWorkerStore(
                             sql_res,
                         )
                         ffi_count("event_edges_successor_repairs", len(sql_res))
+                    ffi_timing(
+                        "event_edges_successor_repair",
+                        time.monotonic() - repair_started,
+                    )
                 except Exception:
                     logger.debug(
                         "Failed to repair forward edge for %s", event_id, exc_info=True
                     )
+            ffi_timing("event_edges_successor_total", time.monotonic() - started)
             return sql_res
 
-        return await self.db_pool.simple_select_onecol(
+        sql_started = time.monotonic()
+        sql_res = await self.db_pool.simple_select_onecol(
             table="event_edges",
             keyvalues={"prev_event_id": event_id},
             retcol="event_id",
             desc="get_successor_events",
         )
+        ffi_timing("event_edges_successor_sql_only", time.monotonic() - sql_started)
+        ffi_timing("event_edges_successor_total", time.monotonic() - started)
+        return sql_res
 
     @wrap_as_background_process("delete_old_forward_extrem_cache")
     async def _delete_old_forward_extrem_cache(self) -> None:
