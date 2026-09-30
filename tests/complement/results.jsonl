@@ -511,7 +511,7 @@
 {"Action":"fail","Test":"TestMessagesPaginationStress/NoDuplicates/Messy_room_activity"}
 {"Action":"skip","Test":"TestMessagesPaginationStress/NoDuplicates/Messy_room_activity/limit=1"}
 {"Action":"fail","Test":"TestMessagesPaginationStress/NoDuplicates/Messy_room_activity/limit=3"}
-{"Action":"pass","Test":"TestMessagesPaginationStress/NoDuplicates/Messy_room_activity/limit=50"}
+{"Action":"fail","Test":"TestMessagesPaginationStress/NoDuplicates/Messy_room_activity/limit=50"}
 {"Action":"fail","Test":"TestMessagesPaginationStress/NoDuplicates/Messy_room_activity/limit=7"}
 {"Action":"pass","Test":"TestMessagesPaginationStress/NoDuplicates/Re-join_with_activity_during_absence"}
 {"Action":"pass","Test":"TestMessagesPaginationStress/NoDuplicates/Re-join_with_activity_during_absence/limit=1"}
@@ -631,9 +631,9 @@
 {"Action":"pass","Test":"TestPublicRooms/Name/topic_keys_are_correct/Creating_room_with_alias_publicroomalias_with_name_topic"}
 {"Action":"pass","Test":"TestPublicRooms/Name/topic_keys_are_correct/Creating_room_with_alias_publicroomalias_with_topic"}
 {"Action":"pass","Test":"TestPushRuleCacheHealth"}
-{"Action":"fail","Test":"TestPushRuleRoomUpgrade"}
-{"Action":"fail","Test":"TestPushRuleRoomUpgrade/parallel"}
-{"Action":"fail","Test":"TestPushRuleRoomUpgrade/parallel/joining_a_remote_manually_upgraded_room_carries_over_existing_push_rules"}
+{"Action":"pass","Test":"TestPushRuleRoomUpgrade"}
+{"Action":"pass","Test":"TestPushRuleRoomUpgrade/parallel"}
+{"Action":"pass","Test":"TestPushRuleRoomUpgrade/parallel/joining_a_remote_manually_upgraded_room_carries_over_existing_push_rules"}
 {"Action":"pass","Test":"TestPushRuleRoomUpgrade/parallel/joining_a_remote_upgraded_room_carries_over_existing_push_rules"}
 {"Action":"skip","Test":"TestPushRuleRoomUpgrade/parallel/manually_upgrading_a_room_carries_over_existing_push_rules_for_local_users"}
 {"Action":"pass","Test":"TestPushRuleRoomUpgrade/parallel/upgrading_a_room_carries_over_existing_push_rules_for_local_users"}
