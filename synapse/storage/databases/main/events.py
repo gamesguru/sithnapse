@@ -82,7 +82,7 @@ from synapse.storage.databases.main.embedded_event_edges import (
     bump_room_edge_source_version,
     embedded_event_edges_is_writable,
     open_embedded_event_edges_engine,
-    queue_edge_write,
+    put_event_edges_batch,
 )
 from synapse.storage.databases.main.embedded_event_json import (
     get_event_json_batch,
@@ -4537,10 +4537,19 @@ class PersistEventsStore:
                 for e_id in ev.prev_event_ids()
             ]
             if edge_rows:
+                # MTXDB is authoritative when embedded event edges are
+                # enabled: the event is visible once this transaction commits,
+                # so its edges must be committed to MTXDB too.  Write the batch
+                # directly instead of enqueueing it on the coalescer --
+                # `put_event_edges_batch(sync=True)` drains the EVENT_DAG pool,
+                # which calls back into the edge queue's flush path, so routing
+                # this through `flush_edge_writes()` would try to re-take the
+                # non-reentrant per-namespace flush lock and self-deadlock.
                 txn.call_after(
-                    queue_edge_write,
+                    put_event_edges_batch,
                     self._embedded_db_namespace,
                     edge_rows,
+                    sync=True,
                 )
                 txn.call_after(mark_dirty, Pool.EVENT_DAG)
 

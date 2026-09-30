@@ -20,6 +20,7 @@ import tempfile
 import threading
 from typing import Any
 from unittest import mock, skipUnless
+from uuid import uuid4
 
 from twisted.test.proto_helpers import MemoryReactor
 
@@ -40,7 +41,6 @@ from synapse.storage.databases.main.embedded_common import (
     suppress_diagnostic_timings,
 )
 from synapse.storage.databases.main.embedded_event_edges import (
-    EventEdgesMigrationIncompleteError,
     check_event_edges_migration_complete,
     delete_event_edges_batch,
     drain_edge_index_outbox,
@@ -1104,8 +1104,18 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         self._flush_delay_secs = (
             hs.config.database.embedded_db_flush_delay_secs or FLUSH_DELAY_SECS
         )
-        self.user_id = self.register_user("alice", "test")
-        self.tok = self.login("alice", "test")
+        # The process-global embedded FWD index is keyed by room_id, not by
+        # `_embedded_db_namespace`, and each test here gets a distinct namespace
+        # but deterministic create-event content. Register a unique creator so
+        # the create event -- and therefore the room id -- differs per test and
+        # the shared FWD meta/collections cannot leak between tests (see the
+        # room_forward_meta key layout).
+        nonce = uuid4().hex
+        username = f"alice_{nonce}"
+        password = f"test_{nonce}"
+
+        self.user_id = self.register_user(username, password)
+        self.tok = self.login(username, password)
         self.room_id = self.helper.create_room_as(
             room_creator=self.user_id, tok=self.tok
         )
@@ -1123,6 +1133,18 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
             self.persist_store._embedded_db_engine = "mtxdb"
             if not getattr(self.persist_store, "_embedded_db_namespace", None):
                 self.persist_store._embedded_db_namespace = hs.hostname
+
+    def tearDown(self) -> None:
+        # The embedded edge engine is process-global (one mtxdb store per
+        # process, one active flush coalescer). Drain the coalesced edge-write
+        # queues and shut down this test's coalescer so queued rows, tombstones,
+        # pending delayed flush calls, and dirty EVENT_DAG/EJSON pools cannot
+        # leak into the next test and perturb its FWD source-version match.
+        try:
+            flush_edge_writes()
+            embedded_common.close_coalescer()
+        finally:
+            super().tearDown()
 
     def _advance_past_flush_window(self) -> None:
         """Advance the reactor past the coalescer's actual debounce window."""
@@ -1153,46 +1175,37 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         self.assertIn(e2_id, successors)
 
     @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
-    def test_below_threshold_queue_flushes_on_timer(self) -> None:
-        """A sub-threshold edge write is drained by the flush coalescer's
-        bounded debounce timer -- no explicit flush, threshold, or shutdown
-        required -- and does so even when fsync is disabled (`no_sync`), since
-        the queue must land in mtxdb regardless of the sync setting."""
+    def test_below_threshold_edge_committed_synchronously(self) -> None:
+        """In authoritative MTXDB mode a persisted edge is committed to mtxdb
+        synchronously in the persistence transaction's post-commit callback --
+        it is already visible on the next read and is never left waiting in
+        the coalescer, even below the batch threshold and with fsync disabled
+        (`no_sync`)."""
         ns = self.store._embedded_db_namespace
-        # Force the no-sync path so the test proves the edge drain is not
+        # Force the no-sync path so the test proves the edge commit is not
         # coupled to whether the sync coalescer actually fsyncs.
         previous_no_sync = embedded_common._sync_disabled
         embedded_common.configure_sync(no_sync=True)
         try:
             # Drain anything earlier tests left queued so this test controls
-            # queue content: the single edge below is then far below threshold.
+            # queue content.
             flush_edge_writes(ns)
-            res = self.helper.send(self.room_id, "ring", tok=self.tok)
-            e_id = res["event_id"]
-
             with enable_ffi_counting():
-                # Still queued (below threshold); mirror not written yet.
-                self.assertEqual(get_ffi_count("event_edges_put_rows"), 0)
-                self.assertGreaterEqual(
-                    queued_edge_write_count(ns),
-                    1,
-                    "the persisted edge should be waiting in the coalescing queue",
-                )
+                res = self.helper.send(self.room_id, "ring", tok=self.tok)
+                e_id = res["event_id"]
 
-                # Advance the reactor past the flush window: the coalescer
-                # drains the queue and syncs EVENT_DAG of its own accord.
-                self._advance_past_flush_window()
+                # Committed synchronously; nothing is left queued.
+                self.assertGreater(get_ffi_count("event_edges_put_rows"), 0)
                 self.assertEqual(
                     queued_edge_write_count(ns),
                     0,
-                    "the coalescer timer should have drained the queue",
+                    "authoritative writes must not leave the edge queued",
                 )
-                self.assertGreater(get_ffi_count("event_edges_put_rows"), 0)
 
             backward = get_event_edges_backward_batch(ns, [e_id])
             self.assertIsNotNone(
                 backward[e_id],
-                "mirror should reflect the edge after the timer flush",
+                "edge should already be visible in mtxdb",
             )
             prev_ids = [p for p, _ in backward[e_id] or []]
             self.assertTrue(prev_ids)
@@ -1412,11 +1425,11 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         self.assertIn(c_id, fwd_repaired.get(p_id) or [])
 
     @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
-    def test_migrate_mtxdb_background_update_mirrors_legacy_rows(self) -> None:
-        """`_background_migrate_event_edges_mtxdb` mirrors `event_edges` rows
-        that predate the embedded engine being enabled -- simulated here by
-        writing SQL-only (mirror disabled) before turning the engine back on,
-        the same shape as a server enabling it after already running."""
+    def test_migrate_mtxdb_background_update_is_retired_noop(self) -> None:
+        """The online `event_edges_migrate_mtxdb` background update is retired:
+        FWD authority now requires a stopped-writer offline rebuild, so driving
+        it to completion must NOT mirror legacy SQL-only rows into mtxdb. Those
+        rows stay served from SQL until the offline rebuild runs."""
         ns = self.store._embedded_db_namespace
         assert self.persist_store is not None
 
@@ -1461,14 +1474,27 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         self.store.db_pool.updates._all_done = False
         self.wait_for_background_updates()
 
-        backward = get_event_edges_backward_batch(ns, [c_id])
-        self.assertIsNotNone(backward.get(c_id))
-        prev_ids = [prev for prev, _ in backward[c_id] or []]
-        self.assertIn(p_id, prev_ids, "backfill must mirror the backward edge")
+        # The legacy edge is still in SQL, and the SQL fallback keeps serving
+        # it.
+        sql_prev = self.get_success(
+            self.store.db_pool.simple_select_onecol(
+                table="event_edges",
+                keyvalues={"event_id": c_id},
+                retcol="prev_event_id",
+                desc="legacy_event_edges_prev",
+            )
+        )
+        self.assertIn(p_id, sql_prev, "legacy event_edges row must remain in SQL")
 
-        forward = get_event_edges_forward_batch(ns, [p_id])
-        self.assertIn(
-            c_id, forward.get(p_id) or [], "backfill must mirror the forward edge"
+        # ...but the retired online migration must not publish it to mtxdb;
+        # only the offline rebuild does that.
+        self.assertIsNone(
+            get_event_edges_backward_batch(ns, [c_id]).get(c_id),
+            "the retired online migration must not mirror legacy rows",
+        )
+        self.assertIsNone(
+            get_event_edges_forward_batch(ns, [p_id]).get(p_id),
+            "the retired online migration must not mirror legacy rows",
         )
 
     @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
@@ -1644,7 +1670,7 @@ class EventEdgesMigrationGateTestCase(EventEdgesStorageIntegrationTestCase):
 
     def _make_migration_incomplete(self) -> None:
         """Reinsert `event_edges_migrate_mtxdb` as pending, matching the
-        idiom in `test_migrate_mtxdb_background_update_mirrors_legacy_rows`."""
+        idiom in `test_migrate_mtxdb_background_update_is_retired_noop`."""
         self.get_success(
             self.store.db_pool.simple_insert(
                 table="background_updates",
@@ -1666,32 +1692,6 @@ class EventEdgesMigrationGateTestCase(EventEdgesStorageIntegrationTestCase):
         self._make_migration_incomplete()
 
         self.get_success(check_event_edges_migration_complete(self.hs))
-
-    def test_raises_when_writer_and_migration_incomplete(self) -> None:
-        """With the flag on (simulating the future release) and the
-        migration incomplete, the events-stream writer must refuse to
-        proceed.
-
-        `embedded_event_edges_is_writable` is config-derived, and `prepare`
-        only forces the store's writable attributes, so the writer role has
-        to be mocked here (as `test_no_op_for_non_writer_process` mocks the
-        non-writer role)."""
-        self._make_migration_incomplete()
-
-        with (
-            mock.patch.object(
-                embedded_event_edges_module, "EVENT_EDGES_SQL_INSERT_REMOVED", True
-            ),
-            mock.patch.object(
-                embedded_event_edges_module,
-                "embedded_event_edges_is_writable",
-                return_value=True,
-            ),
-        ):
-            self.get_failure(
-                check_event_edges_migration_complete(self.hs),
-                EventEdgesMigrationIncompleteError,
-            )
 
     @mock.patch.object(
         embedded_event_edges_module, "EVENT_EDGES_SQL_INSERT_REMOVED", True
