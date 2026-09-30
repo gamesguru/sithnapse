@@ -733,7 +733,9 @@ class StickyEventsWorkerStore(StateGroupWorkerStore, CacheInvalidationWorkerStor
                 possibly_soft_failed_ids,
             )
             for eid, (m, _, _) in found.items():
-                meta_by_id[eid] = db_to_json(m).get("soft_failed", False) if m else False
+                meta_by_id[eid] = (
+                    db_to_json(m).get("soft_failed", False) if m else False
+                )
 
         return [
             event_id
