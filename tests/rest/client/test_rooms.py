@@ -45,7 +45,6 @@ from synapse.api.constants import (
     RoomTypes,
 )
 from synapse.api.errors import Codes, HttpResponseException
-from synapse.api.room_versions import RoomVersions
 from synapse.appservice import ApplicationService
 from synapse.events import EventBase, make_event_from_dict
 from synapse.events.snapshot import EventContext
@@ -507,7 +506,8 @@ class RoomPermissionsTestCase(RoomBase):
             )
         )
         assert pl_event is not None
-        self.assertEqual(50, pl_event.content.get("m.call.invite"))
+        self.assertEqual(50, pl_event.content.get("events", {}).get("m.call.invite"))
+        self.assertEqual(50, pl_event.content.get("events", {}).get("m.room.name"))
 
         private_pl_event = self.get_success(
             self.store_controllers.state.get_current_state_event(
@@ -515,7 +515,9 @@ class RoomPermissionsTestCase(RoomBase):
             )
         )
         assert private_pl_event is not None
-        self.assertEqual(None, private_pl_event.content.get("m.call.invite"))
+        self.assertEqual(
+            None, private_pl_event.content.get("events", {}).get("m.call.invite")
+        )
 
 
 class RoomStateTestCase(RoomBase):
@@ -1936,7 +1938,8 @@ class RoomPowerLevelOverridesTestCase(RoomBase):
     def test_default_power_levels_with_room_override(self) -> None:
         """
         Create a room, providing power level overrides.
-        Confirm that the room's power levels reflect the overrides.
+        When the `power_level_content_override` was provided, it should replace the
+        default power levels.
 
         See https://github.com/matrix-org/matrix-spec/issues/492
         - currently we overwrite each key of power_level_content_override
@@ -1965,9 +1968,9 @@ class RoomPowerLevelOverridesTestCase(RoomBase):
     )
     def test_power_levels_with_server_override(self) -> None:
         """
-        With a server configured to modify the room-level defaults,
-        Create a room, without providing any extra power level overrides.
-        Confirm that the room's power levels reflect the server-level overrides.
+        With a server configured `default_power_level_content_override`, creating a room
+        without `power_level_content_override` should result in the server-level overrides
+        being applied.
 
         Similar to https://github.com/matrix-org/matrix-spec/issues/492,
         we overwrite each key of power_level_content_override completely.
@@ -2573,9 +2576,9 @@ class RoomDelayedEventTestCase(RoomBase):
             ).encode("ascii"),
             {"body": "test", "msgtype": "m.text"},
         )
-        self.assertEqual(HTTPStatus.FORBIDDEN, channel.code, channel.result)
+        self.assertEqual(HTTPStatus.BAD_REQUEST, channel.code, channel.result)
         self.assertEqual(
-            Codes.FORBIDDEN,
+            "ORG.MATRIX.MSC4140_DELAY_TOO_LARGE",
             channel.json_body.get("errcode"),
             channel.json_body,
         )
@@ -4806,6 +4809,9 @@ class MSC4293RedactOnBanKickTestCase(unittest.FederatingHomeserverTestCase):
         self.creator = self.register_user("creator", "test")
         self.creator_tok = self.login("creator", "test")
 
+        self.good_admin = self.register_user("good_admin", "test")
+        self.good_admin_tok = self.login("good_admin", "test")
+
         self.bad_user_id = self.register_user("bad", "test")
         self.bad_tok = self.login("bad", "test")
 
@@ -4817,6 +4823,8 @@ class MSC4293RedactOnBanKickTestCase(unittest.FederatingHomeserverTestCase):
         self.federation_event_handler = self.hs.get_federation_event_handler()
 
         self.hs.config.experimental.msc4293_enabled = True
+
+        self.room_version = self.hs.config.server.default_room_version
 
     def _check_redactions(
         self,
@@ -4925,16 +4933,13 @@ class MSC4293RedactOnBanKickTestCase(unittest.FederatingHomeserverTestCase):
         bad_user = "@remote_bad_user:" + self.OTHER_SERVER_NAME
         channel = self.make_signed_federation_request(
             "GET",
-            f"/_matrix/federation/v1/make_join/{self.room_id}/{bad_user}?ver=11",
+            f"/_matrix/federation/v1/make_join/{self.room_id}/{bad_user}?ver={self.room_version.identifier}",
         )
         self.assertEqual(channel.code, HTTPStatus.OK, channel.json_body)
         join_result = channel.json_body
 
         join_event_dict = join_result["event"]
-        self.add_hashes_and_signatures_from_other_server(
-            join_event_dict,
-            RoomVersions.V11,
-        )
+        self.add_hashes_and_signatures_from_other_server(join_event_dict)
         channel = self.make_signed_federation_request(
             "PUT",
             f"/_matrix/federation/v2/send_join/{self.room_id}/x",
@@ -4949,7 +4954,6 @@ class MSC4293RedactOnBanKickTestCase(unittest.FederatingHomeserverTestCase):
         self.assertEqual(r[("m.room.member", bad_user)].membership, "join")
 
         auth_ids = [
-            r[("m.room.create", "")].event_id,
             r[("m.room.power_levels", "")].event_id,
             r[("m.room.member", "@remote_bad_user:other.example.com")].event_id,
         ]
@@ -4968,7 +4972,7 @@ class MSC4293RedactOnBanKickTestCase(unittest.FederatingHomeserverTestCase):
                         "prev_events": auth_ids,
                     }
                 ),
-                room_version=RoomVersions.V11,
+                room_version=self.room_version,
             )
 
             self.get_success(
@@ -5019,7 +5023,7 @@ class MSC4293RedactOnBanKickTestCase(unittest.FederatingHomeserverTestCase):
                         "prev_events": auth_ids,
                     }
                 ),
-                room_version=RoomVersions.V11,
+                room_version=self.room_version,
             )
 
             self.get_success(
@@ -5044,16 +5048,13 @@ class MSC4293RedactOnBanKickTestCase(unittest.FederatingHomeserverTestCase):
         bad_user = "@remote_bad_user:" + self.OTHER_SERVER_NAME
         channel = self.make_signed_federation_request(
             "GET",
-            f"/_matrix/federation/v1/make_join/{self.room_id}/{bad_user}?ver=11",
+            f"/_matrix/federation/v1/make_join/{self.room_id}/{bad_user}?ver={self.room_version.identifier}",
         )
         self.assertEqual(channel.code, HTTPStatus.OK, channel.json_body)
         join_result = channel.json_body
 
         join_event_dict = join_result["event"]
-        self.add_hashes_and_signatures_from_other_server(
-            join_event_dict,
-            RoomVersions.V11,
-        )
+        self.add_hashes_and_signatures_from_other_server(join_event_dict)
         channel = self.make_signed_federation_request(
             "PUT",
             f"/_matrix/federation/v2/send_join/{self.room_id}/x",
@@ -5068,7 +5069,6 @@ class MSC4293RedactOnBanKickTestCase(unittest.FederatingHomeserverTestCase):
         self.assertEqual(r[("m.room.member", bad_user)].membership, "join")
 
         auth_ids = [
-            r[("m.room.create", "")].event_id,
             r[("m.room.power_levels", "")].event_id,
             r[("m.room.member", "@remote_bad_user:other.example.com")].event_id,
         ]
@@ -5087,7 +5087,7 @@ class MSC4293RedactOnBanKickTestCase(unittest.FederatingHomeserverTestCase):
                         "prev_events": auth_ids,
                     }
                 ),
-                room_version=RoomVersions.V11,
+                room_version=self.room_version,
             )
 
             self.get_success(
@@ -5128,16 +5128,13 @@ class MSC4293RedactOnBanKickTestCase(unittest.FederatingHomeserverTestCase):
         # user should be able to join again
         channel = self.make_signed_federation_request(
             "GET",
-            f"/_matrix/federation/v1/make_join/{self.room_id}/{bad_user}?ver=11",
+            f"/_matrix/federation/v1/make_join/{self.room_id}/{bad_user}?ver={self.room_version.identifier}",
         )
         self.assertEqual(channel.code, HTTPStatus.OK, channel.json_body)
         join_result = channel.json_body
 
         join_event_dict = join_result["event"]
-        self.add_hashes_and_signatures_from_other_server(
-            join_event_dict,
-            RoomVersions.V10,
-        )
+        self.add_hashes_and_signatures_from_other_server(join_event_dict)
         channel = self.make_signed_federation_request(
             "PUT",
             f"/_matrix/federation/v2/send_join/{self.room_id}/x",
@@ -5155,7 +5152,6 @@ class MSC4293RedactOnBanKickTestCase(unittest.FederatingHomeserverTestCase):
             self._storage_controllers.state.get_current_state(self.room_id)
         )
         auth_ids = [
-            new_state[("m.room.create", "")].event_id,
             new_state[("m.room.power_levels", "")].event_id,
             new_state[("m.room.member", "@remote_bad_user:other.example.com")].event_id,
         ]
@@ -5176,7 +5172,7 @@ class MSC4293RedactOnBanKickTestCase(unittest.FederatingHomeserverTestCase):
                         "prev_events": auth_ids,
                     }
                 ),
-                room_version=RoomVersions.V11,
+                room_version=self.room_version,
             )
 
             self.get_success(
@@ -5198,13 +5194,16 @@ class MSC4293RedactOnBanKickTestCase(unittest.FederatingHomeserverTestCase):
     def test_redaction_flag_ignored_for_user_if_banner_lacks_redaction_power(
         self,
     ) -> None:
-        # change power levels so creator can ban but not redact
+        # change power levels so room admin can ban but not redact. Do not use the
+        # room's creator, as the power level they hold is not consistently definable
+        # after msc4289(creator has infinite power level).
         self.helper.send_state(
             self.room_id,
             "m.room.power_levels",
-            {"events_default": 0, "redact": 100, "users": {self.creator: 75}},
+            {"events_default": 0, "redact": 100, "users": {self.good_admin: 75}},
             tok=self.creator_tok,
         )
+        self.helper.join(self.room_id, self.good_admin, tok=self.good_admin_tok)
         self.helper.join(self.room_id, self.bad_user_id, tok=self.bad_tok)
 
         # bad user sends some messages
@@ -5226,11 +5225,11 @@ class MSC4293RedactOnBanKickTestCase(unittest.FederatingHomeserverTestCase):
         }
         self.helper.change_membership(
             self.room_id,
-            self.creator,
+            self.good_admin,
             self.bad_user_id,
             "ban",
             content,
-            self.creator_tok,
+            self.good_admin_tok,
         )
 
         filter = json.dumps({"types": [EventTypes.Message]})
@@ -5290,16 +5289,13 @@ class MSC4293RedactOnBanKickTestCase(unittest.FederatingHomeserverTestCase):
         bad_user = "@remote_bad_user:" + self.OTHER_SERVER_NAME
         channel = self.make_signed_federation_request(
             "GET",
-            f"/_matrix/federation/v1/make_join/{self.room_id}/{bad_user}?ver=11",
+            f"/_matrix/federation/v1/make_join/{self.room_id}/{bad_user}?ver={self.room_version.identifier}",
         )
         self.assertEqual(channel.code, HTTPStatus.OK, channel.json_body)
         join_result = channel.json_body
 
         join_event_dict = join_result["event"]
-        self.add_hashes_and_signatures_from_other_server(
-            join_event_dict,
-            RoomVersions.V11,
-        )
+        self.add_hashes_and_signatures_from_other_server(join_event_dict)
         channel = self.make_signed_federation_request(
             "PUT",
             f"/_matrix/federation/v2/send_join/{self.room_id}/x",
@@ -5314,7 +5310,6 @@ class MSC4293RedactOnBanKickTestCase(unittest.FederatingHomeserverTestCase):
         self.assertEqual(r[("m.room.member", bad_user)].membership, "join")
 
         auth_ids = [
-            r[("m.room.create", "")].event_id,
             r[("m.room.power_levels", "")].event_id,
             r[("m.room.member", "@remote_bad_user:other.example.com")].event_id,
         ]
@@ -5333,7 +5328,7 @@ class MSC4293RedactOnBanKickTestCase(unittest.FederatingHomeserverTestCase):
                         "prev_events": auth_ids,
                     }
                 ),
-                room_version=RoomVersions.V11,
+                room_version=self.room_version,
             )
 
             self.get_success(
@@ -5384,7 +5379,7 @@ class MSC4293RedactOnBanKickTestCase(unittest.FederatingHomeserverTestCase):
                         "prev_events": auth_ids,
                     }
                 ),
-                room_version=RoomVersions.V11,
+                room_version=self.room_version,
             )
 
             self.get_success(
@@ -5406,16 +5401,13 @@ class MSC4293RedactOnBanKickTestCase(unittest.FederatingHomeserverTestCase):
         bad_user = "@remote_bad_user:" + self.OTHER_SERVER_NAME
         channel = self.make_signed_federation_request(
             "GET",
-            f"/_matrix/federation/v1/make_join/{self.room_id}/{bad_user}?ver=11",
+            f"/_matrix/federation/v1/make_join/{self.room_id}/{bad_user}?ver={self.room_version.identifier}",
         )
         self.assertEqual(channel.code, HTTPStatus.OK, channel.json_body)
         join_result = channel.json_body
 
         join_event_dict = join_result["event"]
-        self.add_hashes_and_signatures_from_other_server(
-            join_event_dict,
-            RoomVersions.V11,
-        )
+        self.add_hashes_and_signatures_from_other_server(join_event_dict)
         channel = self.make_signed_federation_request(
             "PUT",
             f"/_matrix/federation/v2/send_join/{self.room_id}/x",
@@ -5430,7 +5422,6 @@ class MSC4293RedactOnBanKickTestCase(unittest.FederatingHomeserverTestCase):
         self.assertEqual(r[("m.room.member", bad_user)].membership, "join")
 
         auth_ids = [
-            r[("m.room.create", "")].event_id,
             r[("m.room.power_levels", "")].event_id,
             r[("m.room.member", "@remote_bad_user:other.example.com")].event_id,
         ]
@@ -5449,7 +5440,7 @@ class MSC4293RedactOnBanKickTestCase(unittest.FederatingHomeserverTestCase):
                         "prev_events": auth_ids,
                     }
                 ),
-                room_version=RoomVersions.V11,
+                room_version=self.room_version,
             )
 
             self.get_success(
@@ -5485,16 +5476,13 @@ class MSC4293RedactOnBanKickTestCase(unittest.FederatingHomeserverTestCase):
         # user re-joins after kick
         channel = self.make_signed_federation_request(
             "GET",
-            f"/_matrix/federation/v1/make_join/{self.room_id}/{bad_user}?ver=11",
+            f"/_matrix/federation/v1/make_join/{self.room_id}/{bad_user}?ver={self.room_version.identifier}",
         )
         self.assertEqual(channel.code, HTTPStatus.OK, channel.json_body)
         join_result = channel.json_body
 
         join_event_dict = join_result["event"]
-        self.add_hashes_and_signatures_from_other_server(
-            join_event_dict,
-            RoomVersions.V11,
-        )
+        self.add_hashes_and_signatures_from_other_server(join_event_dict)
         channel = self.make_signed_federation_request(
             "PUT",
             f"/_matrix/federation/v2/send_join/{self.room_id}/x",
@@ -5512,7 +5500,6 @@ class MSC4293RedactOnBanKickTestCase(unittest.FederatingHomeserverTestCase):
             self._storage_controllers.state.get_current_state(self.room_id)
         )
         auth_ids = [
-            new_state[("m.room.create", "")].event_id,
             new_state[("m.room.power_levels", "")].event_id,
             new_state[("m.room.member", "@remote_bad_user:other.example.com")].event_id,
         ]
@@ -5533,7 +5520,7 @@ class MSC4293RedactOnBanKickTestCase(unittest.FederatingHomeserverTestCase):
                         "prev_events": auth_ids,
                     }
                 ),
-                room_version=RoomVersions.V11,
+                room_version=self.room_version,
             )
 
             self.get_success(
@@ -5555,13 +5542,16 @@ class MSC4293RedactOnBanKickTestCase(unittest.FederatingHomeserverTestCase):
     def test_redaction_flag_ignored_for_user_if_kicker_lacks_redaction_power(
         self,
     ) -> None:
-        # change power levels so creator can kick but not redact
+        # change power levels so room admin can kick but not redact. Do not use the
+        # room's creator, as the power level they hold is not consistently definable
+        # after msc4289(creator has infinite power level).
         self.helper.send_state(
             self.room_id,
             "m.room.power_levels",
-            {"events_default": 0, "redact": 100, "users": {self.creator: 75}},
+            {"events_default": 0, "redact": 100, "users": {self.good_admin: 75}},
             tok=self.creator_tok,
         )
+        self.helper.join(self.room_id, self.good_admin, tok=self.good_admin_tok)
         self.helper.join(self.room_id, self.bad_user_id, tok=self.bad_tok)
 
         # bad user sends some messages
@@ -5583,11 +5573,11 @@ class MSC4293RedactOnBanKickTestCase(unittest.FederatingHomeserverTestCase):
         }
         self.helper.change_membership(
             self.room_id,
-            self.creator,
+            self.good_admin,
             self.bad_user_id,
             "kick",
             content,
-            self.creator_tok,
+            self.good_admin_tok,
         )
 
         filter = json.dumps({"types": [EventTypes.Message]})

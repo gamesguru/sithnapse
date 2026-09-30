@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use pyo3::prelude::*;
 use pyo3::types::{PyModule, PyModuleMethods};
 use rezzy::{
@@ -133,14 +133,14 @@ impl TypedRoot {
 }
 
 fn typed_subtree_key(room_key: &[u8; 32], event_type: &str) -> [u8; 32] {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(room_key).expect("HMAC key is valid");
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(room_key).expect("HMAC key is valid");
     mac.update(b"typed-state-subtree:");
     mac.update(event_type.as_bytes());
     mac.finalize().into_bytes().into()
 }
 
 fn typed_root_hash(room_key: &[u8; 32], directory: &[(String, StructuralHash)]) -> StructuralHash {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(room_key).expect("HMAC key is valid");
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(room_key).expect("HMAC key is valid");
     mac.update(b"typed-state-root:");
     for (event_type, hash) in directory {
         mac.update(&(event_type.len() as u32).to_le_bytes());

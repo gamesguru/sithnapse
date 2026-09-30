@@ -34,13 +34,14 @@ name = "synapse.synapse_rust"
 [dependencies]
 async-trait = "0.1.89"
 anyhow = "1.0.63"
-base64 = "0.22.1"
+base64 = "0.23.1"
 bytes = "1.6.0"
-hmac = "0.12.1"
+hmac = "0.13.0"
 headers = "0.4.0"
 hex = "0.4.3"
 http = "1.1.0"
 lazy_static = "1.4.0"
+libc = "0.2.174"
 log = "0.4.17"
 mime = "0.3.17"
 pyo3 = { version = "0.29.0", features = [
@@ -55,7 +56,7 @@ pyo3 = { version = "0.29.0", features = [
 pyo3-log = "0.13.4"
 pythonize = { version = "0.29.0", features = ["arbitrary_precision"] }
 regex = "1.6.0"
-sha2 = "0.10.8"
+sha2 = "0.11.0"
 serde = { version = "1.0.144", features = ["derive", "rc"] }
 serde_json = { version = "1.0.85", features = [
     "raw_value",
@@ -64,7 +65,7 @@ serde_json = { version = "1.0.85", features = [
     # precision integers).
     "arbitrary_precision",
 ] }
-ulid = "1.1.2"
+ulid = "3.0.0"
 # Keep the shared ICU 2.x graph compatible with CI's Rust 1.87 MSRV.  A loose
 # `2.0` requirement otherwise resolves to ICU 2.3, which requires Rust 1.88.
 # icu_provider/icu_locale_core are transitive-only (pulled in via idna ->
@@ -108,7 +109,7 @@ rezzy = { git = "https://gitlab.com/gamesguru/rezzy.git", branch = "alpha" }
 mtxdb = { git = "https://gitlab.com/wombat-foundation/mtxdb.git", branch = "refactor/pack-id-store-layout", features = ["multi-reader"] }
 
 [build-dependencies]
-blake2 = "0.10.4"
+blake2 = "0.11.0"
 hex = "0.4.3"
 rustc_version = "0.4.1"
 
@@ -121,5 +122,5 @@ harness = false
 ignored = ["icu_provider", "icu_locale_core", "getrandom"]
 
 [dev-dependencies]
-itertools = "0.14.0"
+itertools = "0.15.0"
 tempfile = "3.27.0"

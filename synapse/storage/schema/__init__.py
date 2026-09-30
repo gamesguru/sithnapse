@@ -175,7 +175,8 @@ Changes in SCHEMA_VERSION = 93
 Changes in SCHEMA_VERSION = 94
     - Add `recheck` column (boolean, default true) to the `redactions` table.
     - MSC4242: Add state DAG tables.
-    - MSC4429: Track updates to user profile fields via a new stream.
+    - MSC4429/MSC4262: Track updates to user profile fields via a new stream.
+    - Add an `inserted_ts` column to the `state_groups_persisting` table.
 
 Changes in SCHEMA_VERSION = 95
     - Add tables to store HAMT roots and shared nodes for state groups.
@@ -190,7 +191,6 @@ Changes in SCHEMA_VERSION = 95
 Changes in SCHEMA_VERSION = 96
     - Add room edge source versions and a durable outbox for the embedded
       forward-edge index publication bridge.
-
 """
 
 

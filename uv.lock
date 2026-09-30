@@ -1161,7 +1161,7 @@ wheels = [
 
 [[package]]
 name = "matrix-synapse"
-version = "1.159.0"
+version = "1.162.0"
 source = { editable = "." }
 dependencies = [
     { name = "attrs" },
@@ -1343,6 +1343,10 @@ dev = [
     { name = "types-requests" },
     { name = "types-setuptools" },
 ]
+docs = [
+    { name = "gitpython" },
+    { name = "packaging" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -1421,8 +1425,8 @@ requires-dist = [
     { name = "tornado", marker = "extra == 'opentracing'", specifier = ">=6.0" },
     { name = "treq", specifier = ">=21.5.0" },
     { name = "twisted", extras = ["tls"], specifier = ">=21.2.0,<26.0.0" },
-    { name = "txredisapi", marker = "extra == 'all'", specifier = ">=1.4.7" },
-    { name = "txredisapi", marker = "extra == 'redis'", specifier = ">=1.4.7" },
+    { name = "txredisapi", marker = "extra == 'all'", specifier = ">=1.4.12" },
+    { name = "txredisapi", marker = "extra == 'redis'", specifier = ">=1.4.12" },
     { name = "typing-extensions", specifier = ">=4.14.1" },
     { name = "unpaddedbase64", specifier = ">=2.1.0" },
     { name = "urllib3", specifier = ">=1.26.5" },
@@ -1498,6 +1502,10 @@ dev = [
     { name = "types-pyyaml", specifier = ">=5.4.10" },
     { name = "types-requests", specifier = ">=2.26.0" },
     { name = "types-setuptools", specifier = ">=57.4.0" },
+]
+docs = [
+    { name = "gitpython", specifier = ">=3.1.20" },
+    { name = "packaging", specifier = ">=20.0" },
 ]
 
 [[package]]
@@ -2932,15 +2940,15 @@ tls = [
 
 [[package]]
 name = "txredisapi"
-version = "1.4.11"
+version = "1.4.12"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "six" },
     { name = "twisted" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/6b/9d/89b3af8dbb2e48f3ddbb80909bfc835cae206a1c12b15f2b709a2f05cee0/txredisapi-1.4.11.tar.gz", hash = "sha256:3eb1af99aefdefb59eb877b1dd08861efad60915e30ad5bf3d5bf6c5cedcdbc6", size = 55726, upload-time = "2025-04-11T11:56:36.943Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/03/a2/083bc92fbb2ffd5398032b1c6dc430011e013660233e96979f31f3aa7605/txredisapi-1.4.12.tar.gz", hash = "sha256:98e2440ff2e297c9048c5f9d516e7b1302d447cd9cd4568c986c35a8523de3c7", size = 57811, upload-time = "2026-05-06T20:07:54.49Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/58/f3/edb8fee5aff88096cbbfaf7f60efe6c4ee5fc5bb148e1a7e65b30e425f56/txredisapi-1.4.11-py3-none-any.whl", hash = "sha256:ac64d7a9342b58edca13ef267d4fa7637c1aa63f8595e066801c1e8b56b22d0b", size = 31064, upload-time = "2025-04-11T11:56:35.429Z" },
+    { url = "https://files.pythonhosted.org/packages/2e/ee/da2a0055b57339941ddc77e2417d517215bb2c4d3699658dc27ab8a26780/txredisapi-1.4.12-py3-none-any.whl", hash = "sha256:c698fff24a0b82e8932ef18c5623496b0a8b5195e4e94bf8524800a00ca6b7c1", size = 31705, upload-time = "2026-05-06T20:07:52.365Z" },
 ]
 
 [[package]]
