@@ -10,6 +10,7 @@
 #
 # See the GNU Affero General Public License for more details:
 # <https://www.gnu.org/licenses/agpl-3.0.html>.
+import json
 import logging
 import random
 from collections.abc import Set
@@ -33,7 +34,10 @@ from synapse.storage.database import (
     make_in_list_sql_clause,
 )
 from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
-from synapse.storage.databases.main.embedded_event_json import get_event_json_batch
+from synapse.storage.databases.main.embedded_event_json import (
+    get_event_json_batch,
+    put_event_json_batch,
+)
 from synapse.storage.databases.main.events import DeltaState
 from synapse.storage.databases.main.state import StateGroupWorkerStore
 from synapse.storage.engines import PostgresEngine, Sqlite3Engine
@@ -699,18 +703,43 @@ class StickyEventsWorkerStore(StateGroupWorkerStore, CacheInvalidationWorkerStor
         # tractable, as we can't realistically apply any LIMIT here.
         txn.execute(
             f"""
-            SELECT se.event_id
+            SELECT se.event_id, {expr_soft_failed} AS "soft_failed"
             FROM sticky_events se
-            INNER JOIN event_json ej USING (event_id)
+            LEFT JOIN event_json ej USING (event_id)
             WHERE
                 se.room_id = ?
                 AND ? < se.expires_at
-                AND {expr_soft_failed}
                 {sender_clause}
             """,
             (room_id, self.clock.time_msec(), *sender_args),
         )
-        return [event_id for (event_id,) in txn]
+        rows = list(txn)
+
+        # With embedded event-JSON the SQL `event_json` mirror can lag or be
+        # absent altogether (rows live only in the embedded store), so a plain
+        # SQL filter on `soft_failed` would silently miss soft-failed sticky
+        # events. Consult the embedded store for rows whose SQL metadata is
+        # absent or says not-soft-failed, then filter in Python.
+        possibly_soft_failed_ids = [
+            event_id for event_id, soft_failed in rows if not soft_failed
+        ]
+        meta_by_id: dict[str, bool] = {}
+        if possibly_soft_failed_ids and getattr(
+            self, "_embedded_event_json_enabled", False
+        ):
+            found = get_event_json_batch(
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
+                possibly_soft_failed_ids,
+            )
+            for eid, (m, _, _) in found.items():
+                meta_by_id[eid] = db_to_json(m).get("soft_failed", False) if m else False
+
+        return [
+            event_id
+            for event_id, soft_failed in rows
+            if meta_by_id.get(event_id, bool(soft_failed))
+        ]
 
     def un_soft_fail_sticky_events_txn(
         self, txn: LoggingTransaction, sticky_event_ids: Set[str]
@@ -752,6 +781,43 @@ class StickyEventsWorkerStore(StateGroupWorkerStore, CacheInvalidationWorkerStor
                 """,
                 event_id_in_list_args,
             )
+
+        # Under embedded event-JSON (embedded-exclusive mode) the SQL
+        # `event_json` row updated above may not exist, so also clear the
+        # soft-failed flag in the embedded mirror; otherwise reads that fall
+        # back to the embedded store still see the event as soft-failed.
+        if getattr(self, "_embedded_event_json_enabled", False):
+            found = get_event_json_batch(
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
+                list(sticky_event_ids),
+            )
+            mirror_rows: list[tuple[str, str, str, str, int | None]] = []
+            for event_id, (
+                internal_metadata,
+                json_str,
+                format_version,
+            ) in found.items():
+                room_id = self.db_pool.simple_select_one_onecol_txn(
+                    txn,
+                    table="events",
+                    keyvalues={"event_id": event_id},
+                    retcol="room_id",
+                    allow_none=True,
+                )
+                if room_id is None:
+                    continue
+                metadata = db_to_json(internal_metadata)
+                metadata["soft_failed"] = False
+                mirror_rows.append(
+                    (event_id, room_id, json.dumps(metadata), json_str, format_version)
+                )
+            if mirror_rows:
+                put_event_json_batch(
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
+                    mirror_rows,
+                )
 
         # Invalidate caches as a result
         for event_id in sticky_event_ids:
