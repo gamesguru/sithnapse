@@ -403,19 +403,11 @@ def embedded_event_edges_is_writable(hs: HomeServer) -> bool:
 # Flip to True only in the same release that actually removes the SQL
 # ``event_edges`` INSERT (``_handle_mult_prev_events``,
 # ``synapse/storage/databases/main/events.py``) and the SQL fallback reads in
-# ``get_successor_events``/``is_event_next_to_forward_gap``. Until then this
-# stays False and `check_event_edges_migration_complete` is a deliberate
-# no-op -- there is nothing to protect yet, since the SQL fallback still
-# covers every server regardless of migration progress. See
-# `res/docs/2026-09-28-event-edges-sql-removal-plan.md`'s "Blocker 1":
-# a server that upgrades to the insert-dropping release while still
-# mid-migration would have rows that exist only in mtxdb, with nothing left
-# to fall back to -- this is the hard precondition that catches that,
-# modeled on `prepare_database.py`'s worker schema-version check
-# (`UpgradeDatabaseException`/`OUTDATED_SCHEMA_ON_WORKER_ERROR`), but for the
-# events-stream writer specifically rather than every worker, and checked
-# after the async datastore layer is up (`has_completed_background_update`
-# needs it) rather than during synchronous schema prep.
+# ``get_successor_events``/``is_event_next_to_forward_gap``. While False, the
+# SQL table is still a live source and `check_event_edges_migration_complete`
+# verifies that mtxdb has caught up with it at startup. Once True (the table is
+# dropped) there is no legacy source left to compare and the check is skipped.
+# See `res/docs/2026-09-28-event-edges-sql-removal-plan.md`'s "Blocker 1".
 EVENT_EDGES_SQL_INSERT_REMOVED = False
 
 
@@ -429,52 +421,106 @@ async def event_edges_fwd_is_authoritative(store: Any) -> bool:
 
 
 class EventEdgesMigrationIncompleteError(Exception):
-    """Raised by `check_event_edges_migration_complete` when this process is
-    the events-stream writer, the SQL `event_edges` insert has been removed
-    (`EVENT_EDGES_SQL_INSERT_REMOVED = True`), and embedded event edges are
-    not enabled for this store.
+    """Raised by `check_event_edges_migration_complete` when mtxdb does not
+    provably contain every SQL `event_edges` mutation.
 
-    Deliberately a plain exception, not a process exit: the caller (expected
-    to be a fatal startup check, e.g. `synapse.app._base.start`) decides how
-    to fail the process. Keeping the decision here pure and the exit
-    mechanism at the call site is what makes this testable without a real
-    `sys.exit` in the test run.
+    Deliberately a plain exception, not a process exit: the caller (a fatal
+    startup check, `synapse.app._base.start`) decides how to fail the
+    process, which keeps this testable without a real `sys.exit`.
     """
+
+
+_MIGRATION_CHECK_MAX_DRAIN_ROUNDS = 100_000
+_MIGRATION_CHECK_REPORT_LIMIT = 10
 
 
 async def check_event_edges_migration_complete(hs: HomeServer) -> None:
-    """Fatal precondition for the release that removes the SQL `event_edges`
-    insert: refuse to let this process act as the events-stream writer
-    unless embedded event edges are enabled (and therefore authoritative) for
-    this store.
+    """Fatal startup check: while embedded event edges are enabled and the SQL
+    `event_edges` table is still a live source, mtxdb must have published every
+    SQL mutation.
 
-    A no-op today (`EVENT_EDGES_SQL_INSERT_REMOVED` is False) and a no-op on
-    every process that isn't the events-stream writer -- workers don't write
-    `event_edges` themselves, and a schema-version mismatch on an outdated
-    worker is already caught elsewhere
-    (`prepare_database.py`'s `OUTDATED_SCHEMA_ON_WORKER_ERROR`).
+    O(rooms), no edge scan. For every room with SQL edges it requires:
+
+    - a `room_edge_source_version` row (else the room is unmigrated/legacy);
+    - a `room_forward_meta` record in mtxdb whose `published_source_version` is
+      ``>=`` the SQL source version. Not equality: mtxdb may legitimately be
+      ahead, and extra edges are neutralised at read time;
+    - no pending `edge_index_outbox` rows (drained synchronously first, since
+      the periodic drainer has not started by the time this runs).
+
+    Runs only on the events-stream writer, and is skipped once
+    `EVENT_EDGES_SQL_INSERT_REMOVED` is set (the SQL table is gone).
 
     Raises:
-        EventEdgesMigrationIncompleteError: if this process is the writer,
-        the SQL insert has been removed, and embedded event edges are not
-        enabled.
+        EventEdgesMigrationIncompleteError: on any violation, or if draining
+        the outbox fails.
     """
-    if not EVENT_EDGES_SQL_INSERT_REMOVED:
+    if EVENT_EDGES_SQL_INSERT_REMOVED:
         return
     if not embedded_event_edges_is_writable(hs):
         return
 
-    if await event_edges_fwd_is_authoritative(hs.get_datastores().main):
+    store = hs.get_datastores().main
+    if not await event_edges_fwd_is_authoritative(store):
         return
 
-    raise EventEdgesMigrationIncompleteError(
-        "This server has not enabled authoritative embedded event edges, but "
-        "this release no longer writes event_edges to SQL. Starting would "
-        "leave rows written from this point on with no SQL fallback and no "
-        "proof that mtxdb contains a complete forward index.\n\n"
-        "Import and validate existing edges, then enable the embedded event "
-        "edges backend before starting this version."
+    from synapse.synapse_rust.mtxdb_engine import room_forward_meta_get
+
+    namespace = store._embedded_db_namespace
+    # Same namespace and per-room worker lock as the background drainer, so a
+    # concurrent tick serialises per room rather than racing this drain.
+    try:
+        for _ in range(_MIGRATION_CHECK_MAX_DRAIN_ROUNDS):
+            if not await drain_edge_index_outbox(store, namespace=namespace):
+                break
+    except Exception as e:
+        raise EventEdgesMigrationIncompleteError(
+            f"Failed to drain the edge index outbox before the migration check: {e!r}"
+        ) from e
+
+    def _load(txn: Any) -> tuple[list[str], dict[str, int], list[str]]:
+        txn.execute(
+            "SELECT DISTINCT e.room_id FROM event_edges AS ee "
+            "INNER JOIN events AS e ON e.event_id = ee.event_id"
+        )
+        rooms = sorted(str(r[0]) for r in txn.fetchall())
+        txn.execute("SELECT room_id, source_version FROM room_edge_source_version")
+        versions = {str(r[0]): int(r[1]) for r in txn.fetchall()}
+        txn.execute("SELECT DISTINCT room_id FROM edge_index_outbox")
+        pending = sorted(str(r[0]) for r in txn.fetchall())
+        return rooms, versions, pending
+
+    rooms, versions, pending = await store.db_pool.runInteraction(
+        "check_event_edges_migration_complete", _load
     )
+
+    problems: list[str] = [f"{r}: pending outbox mutations" for r in pending]
+    for room_id in rooms:
+        source_version = versions.get(room_id)
+        if source_version is None:
+            problems.append(f"{room_id}: SQL edges but no source version (unmigrated)")
+            continue
+        meta = _retry_on_contention(lambda: room_forward_meta_get(room_id))
+        if meta is None:
+            problems.append(f"{room_id}: no mtxdb forward metadata (unmigrated)")
+        elif meta[1] < source_version:
+            problems.append(
+                f"{room_id}: mtxdb published version {meta[1]} is behind "
+                f"SQL source version {source_version}"
+            )
+
+    if problems:
+        shown = "\n".join(f"  {p}" for p in problems[:_MIGRATION_CHECK_REPORT_LIMIT])
+        more = len(problems) - _MIGRATION_CHECK_REPORT_LIMIT
+        raise EventEdgesMigrationIncompleteError(
+            f"Embedded event edges are enabled but mtxdb is not caught up with "
+            f"the SQL event_edges table for {len(problems)} room(s):\n{shown}"
+            + (f"\n  ... and {more} more" if more > 0 else "")
+            + "\n\nImport/stream the existing edges (stop writers for the "
+            "final reconciliation) before starting this version. Once "
+            "migration is verified, drop the SQL table and set "
+            "EVENT_EDGES_SQL_INSERT_REMOVED to disable this check."
+        )
 
 
 def put_event_edges_batch(
