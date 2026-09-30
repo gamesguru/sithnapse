@@ -58,6 +58,7 @@ from synapse.util.clock import Clock
 
 from tests import unittest
 from tests.server import ThreadedMemoryReactorClock
+from tests.test_utils.event_injection import create_event
 from tests.unittest import HomeserverTestCase
 from tests.utils import EMBEDDED_DB_ENGINE, EMBEDDED_DB_PATH
 
@@ -1094,7 +1095,8 @@ class ContentionRetryCounterTestCase(unittest.TestCase):
     """`_retry_on_contention` makes journal/checkpoint contention observable."""
 
     def test_counts_retries_then_succeeds(self) -> None:
-        calls = iter([BlockingIOError(), BlockingIOError(), "ok"])
+        values: list[str | Exception] = [BlockingIOError(), BlockingIOError(), "ok"]
+        calls = iter(values)
 
         def flaky() -> str:
             item = next(calls)
@@ -1241,6 +1243,74 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
             self.assertTrue(prev_ids)
         finally:
             embedded_common.configure_sync(no_sync=previous_no_sync)
+
+    def _persist_message(
+        self, *, rejected: str | None = None, **internal_metadata: Any
+    ) -> str:
+        """Persist a message on top of the room's latest event; return its id."""
+        latest = self.get_success(self.store.get_latest_event_ids_in_room(self.room_id))
+        event, context = self.get_success(
+            create_event(
+                self.hs,
+                prev_event_ids=list(latest),
+                type="m.room.message",
+                sender=self.user_id,
+                room_id=self.room_id,
+                content={"msgtype": "m.text", "body": "x"},
+                internal_metadata=internal_metadata,
+            )
+        )
+        if rejected is not None:
+            context.rejected = rejected
+        persistence = self.hs.get_storage_controllers().persistence
+        assert persistence is not None
+        self.get_success(persistence.persist_event(event, context))
+        flush_edge_writes(self.store._embedded_db_namespace)
+        return str(event.event_id)
+
+    def _edge_views(self, event_id: str) -> tuple[list[str], list[str]]:
+        """The event's prev edges as recorded in SQL and in mtxdb."""
+        sql = self.get_success(
+            self.store.db_pool.simple_select_onecol(
+                "event_edges", {"event_id": event_id}, "prev_event_id"
+            )
+        )
+        backward = get_event_edges_backward_batch(
+            self.store._embedded_db_namespace, [event_id]
+        )
+        return sorted(sql), sorted(p for p, _ in backward.get(event_id) or [])
+
+    def test_soft_failed_event_gets_edges(self) -> None:
+        """Soft-failed is not rejected: the event keeps its edges."""
+        event_id = self._persist_message(soft_failed=True)
+
+        sql, mtxdb = self._edge_views(event_id)
+        self.assertTrue(sql)
+        self.assertEqual(sql, mtxdb)
+
+    def test_outlier_event_gets_edges(self) -> None:
+        """Outliers are not filtered from edge writes."""
+        event_id = self._persist_message(outlier=True)
+
+        sql, mtxdb = self._edge_views(event_id)
+        self.assertTrue(sql)
+        self.assertEqual(sql, mtxdb)
+
+    def test_rejected_event_gets_no_edges(self) -> None:
+        """A rejected event is stored and recorded in `rejections`, but the
+        rejected-events filter runs before edge writes, so it has no edges in
+        SQL or mtxdb."""
+        event_id = self._persist_message(rejected="test rejection")
+
+        rejection = self.get_success(
+            self.store.db_pool.simple_select_one_onecol(
+                "rejections", {"event_id": event_id}, "reason", allow_none=True
+            )
+        )
+        self.assertEqual(rejection, "test rejection")
+        sql, mtxdb = self._edge_views(event_id)
+        self.assertEqual(sql, [])
+        self.assertEqual(mtxdb, [])
 
     def test_event_edges_purge_cleans_forward_edges(self) -> None:
         """Purging an event removes it from its parents' forward lists in mtxdb."""
