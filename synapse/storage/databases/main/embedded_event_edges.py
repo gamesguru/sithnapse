@@ -418,14 +418,6 @@ def embedded_event_edges_is_writable(hs: HomeServer) -> bool:
 # needs it) rather than during synchronous schema prep.
 EVENT_EDGES_SQL_INSERT_REMOVED = False
 
-# The FWD layout is only authoritative after an offline rebuild has compared
-# every room against SQL and recorded this layout version. A completed legacy
-# background update is not sufficient: it can build a generation while live
-# writes continue, which is useful as a cache warm-up but is not proof that a
-# non-empty FWD result is complete.
-EVENT_EDGES_FWD_LAYOUT_VERSION = 1
-EVENT_EDGES_CUTOVER_COMPONENT = "event_edges_fwd"
-
 
 async def event_edges_fwd_is_authoritative(store: Any) -> bool:
     """Whether embedded MTXDB event edges are enabled for this store.
@@ -439,8 +431,8 @@ async def event_edges_fwd_is_authoritative(store: Any) -> bool:
 class EventEdgesMigrationIncompleteError(Exception):
     """Raised by `check_event_edges_migration_complete` when this process is
     the events-stream writer, the SQL `event_edges` insert has been removed
-    (`EVENT_EDGES_SQL_INSERT_REMOVED = True`), and
-    no offline-verified FWD cutover marker exists.
+    (`EVENT_EDGES_SQL_INSERT_REMOVED = True`), and embedded event edges are
+    not enabled for this store.
 
     Deliberately a plain exception, not a process exit: the caller (expected
     to be a fatal startup check, e.g. `synapse.app._base.start`) decides how
@@ -453,7 +445,8 @@ class EventEdgesMigrationIncompleteError(Exception):
 async def check_event_edges_migration_complete(hs: HomeServer) -> None:
     """Fatal precondition for the release that removes the SQL `event_edges`
     insert: refuse to let this process act as the events-stream writer
-    unless offline maintenance has verified the FWD cutover on this server.
+    unless embedded event edges are enabled (and therefore authoritative) for
+    this store.
 
     A no-op today (`EVENT_EDGES_SQL_INSERT_REMOVED` is False) and a no-op on
     every process that isn't the events-stream writer -- workers don't write
@@ -463,7 +456,8 @@ async def check_event_edges_migration_complete(hs: HomeServer) -> None:
 
     Raises:
         EventEdgesMigrationIncompleteError: if this process is the writer,
-        the SQL insert has been removed, and the verified cutover is absent.
+        the SQL insert has been removed, and embedded event edges are not
+        enabled.
     """
     if not EVENT_EDGES_SQL_INSERT_REMOVED:
         return
@@ -474,12 +468,12 @@ async def check_event_edges_migration_complete(hs: HomeServer) -> None:
         return
 
     raise EventEdgesMigrationIncompleteError(
-        "This server has no offline-verified event-edge FWD cutover marker, "
-        "but this release no longer writes event_edges to SQL. Starting would "
+        "This server has not enabled authoritative embedded event edges, but "
+        "this release no longer writes event_edges to SQL. Starting would "
         "leave rows written from this point on with no SQL fallback and no "
         "proof that mtxdb contains a complete forward index.\n\n"
-        "Stop all writers and run the event-edge offline maintenance command "
-        "before starting this version."
+        "Import and validate existing edges, then enable the embedded event "
+        "edges backend before starting this version."
     )
 
 
