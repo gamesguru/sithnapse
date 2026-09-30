@@ -2768,22 +2768,18 @@ class EventFederationWorkerStore(
             if sql_res and getattr(self, "_embedded_event_edges_writable", False):
                 try:
                     repair_started = time.monotonic()
-                    room_id = await self.db_pool.simple_select_one_onecol(
-                        table="events",
-                        keyvalues={"event_id": event_id},
-                        retcol="room_id",
-                        allow_none=True,
-                        desc="get_successor_events_room_id",
+                    # The gated path already resolved this event's immutable
+                    # room id before reading the source-version watermark.
+                    # Reusing it avoids a second SQL round trip on every
+                    # repair-triggering miss.
+                    await repair_edge_index_from_sql(
+                        self,
+                        self._embedded_db_namespace,
+                        room_id,
+                        event_id,
+                        sql_res,
                     )
-                    if room_id:
-                        await repair_edge_index_from_sql(
-                            self,
-                            self._embedded_db_namespace,
-                            room_id,
-                            event_id,
-                            sql_res,
-                        )
-                        ffi_count("event_edges_successor_repairs", len(sql_res))
+                    ffi_count("event_edges_successor_repairs", len(sql_res))
                     ffi_timing(
                         "event_edges_successor_repair",
                         time.monotonic() - repair_started,
