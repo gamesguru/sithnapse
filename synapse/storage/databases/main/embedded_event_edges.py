@@ -428,35 +428,12 @@ EVENT_EDGES_CUTOVER_COMPONENT = "event_edges_fwd"
 
 
 async def event_edges_fwd_is_authoritative(store: Any) -> bool:
-    """Whether an offline-verified FWD cutover authorizes embedded reads.
+    """Whether embedded MTXDB event edges are enabled for this store.
 
-    SQL remains authoritative until the maintenance command writes this
-    marker. This deliberately does not consult the legacy
-    ``event_edges_migrate_mtxdb`` background update.
+    Operators are responsible for importing and validating existing edges
+    before enabling MTXDB. Once enabled, MTXDB is authoritative.
     """
-    if not getattr(store, "_embedded_event_edges_enabled", False):
-        return False
-
-    # The marker is written only during stopped-writer maintenance, so it is
-    # immutable for a running store. Avoid a SQL lookup on every successor or
-    # forward-gap check.
-    cached = getattr(store, "_embedded_event_edges_fwd_authoritative", None)
-    if cached is not None:
-        return bool(cached)
-
-    layout_version = await store.db_pool.simple_select_one_onecol(
-        table="embedded_db_cutovers",
-        keyvalues={
-            "component": EVENT_EDGES_CUTOVER_COMPONENT,
-            "namespace": store._embedded_db_namespace,
-        },
-        retcol="layout_version",
-        allow_none=True,
-        desc="event_edges_fwd_cutover_marker",
-    )
-    authoritative = layout_version == EVENT_EDGES_FWD_LAYOUT_VERSION
-    store._embedded_event_edges_fwd_authoritative = authoritative
-    return authoritative
+    return bool(getattr(store, "_embedded_event_edges_enabled", False))
 
 
 class EventEdgesMigrationIncompleteError(Exception):
