@@ -20,12 +20,14 @@
 
 import itertools
 from typing import (
+    Any,
     Collection,
     Iterable,
     Mapping,
     Sequence,
     TypeVar,
 )
+from unittest import mock
 
 import attr
 from parameterized import parameterized
@@ -63,6 +65,14 @@ MEMBERSHIP_CONTENT_BAN = {"membership": Membership.BAN}
 
 
 ORIGIN_SERVER_TS = 0
+
+
+try:
+    import synapse.synapse_rust.state_res as _rust_state_res  # noqa: F401
+
+    HAVE_RUST_STATE_RES = True
+except Exception:
+    HAVE_RUST_STATE_RES = False
 
 
 class FakeClock:
@@ -625,6 +635,78 @@ class StateTestCase(unittest.TestCase):
         cold = self._resolve_with_cache(V21_ROOM, conflicting, conflict_cache)
         self.assertNotEqual(warm[ZARA_KEY], agreed_result[ZARA_KEY])
         self.assertEqual(warm, cold)
+
+    @unittest.skip_unless(HAVE_RUST_STATE_RES, "synapse_rust.state_res unavailable")
+    def test_rust_used_on_miss_skipped_on_hit(self) -> None:
+        """A v2 conflict-cache miss invokes the Rust lattice fold; subsequent
+        hits (including when only unrelated unconflicted state differs) do not,
+        while a different base state does."""
+        import synapse.synapse_rust.state_res as rust_res
+
+        self._build_cache_scenario()
+        conflict_cache: dict[bytes, StateMap[str]] = {}
+
+        with_zara = [self._state("PA", "T1"), self._state("PA", "T2")]
+        without_zara = [
+            {key: value for key, value in state.items() if key != ZARA_KEY}
+            for state in with_zara
+        ]
+        # Same conflicted set, but the power levels (part of the base state)
+        # differ.
+        under_ipower = [self._state("T1"), self._state("T2")]
+
+        real = rust_res.resolve_v2_via_lattice_fold
+        calls: list[Any] = []
+
+        def spy(*args: Any, **kwargs: Any) -> Any:
+            calls.append(args)
+            return real(*args, **kwargs)
+
+        with mock.patch.object(rust_res, "resolve_v2_via_lattice_fold", spy):
+            self._resolve_with_cache(V2_ROOM, with_zara, conflict_cache)
+            self.assertEqual(len(calls), 1, "cache miss should invoke Rust")
+
+            self._resolve_with_cache(V2_ROOM, without_zara, conflict_cache)
+            self.assertEqual(
+                len(calls),
+                1,
+                "cache hit with unrelated unconflicted state must not invoke Rust",
+            )
+
+            self._resolve_with_cache(V2_ROOM, under_ipower, conflict_cache)
+            self.assertEqual(
+                len(calls), 2, "a different base state must be a cache miss"
+            )
+
+        self.assertEqual(len(conflict_cache), 2)
+
+    @unittest.skip_unless(HAVE_RUST_STATE_RES, "synapse_rust.state_res unavailable")
+    def test_rust_result_matches_python(self) -> None:
+        """With the Rust entry point forced to raise, the Python fallback must
+        produce the same resolved state as the Rust path."""
+        import synapse.synapse_rust.state_res as rust_res
+
+        self._build_cache_scenario()
+        state_sets = [self._state("PA", "T1"), self._state("PA", "T2")]
+
+        # Separate caches so both calls are cache misses and actually run their
+        # respective implementations (a shared cache would make the second call
+        # a hit and skip the Python path entirely).
+        rust_cache: dict[bytes, StateMap[str]] = {}
+        rust_result = self._resolve_with_cache(V2_ROOM, state_sets, rust_cache)
+
+        def explode(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("forced fallback for the Rust/Python parity test")
+
+        python_cache: dict[bytes, StateMap[str]] = {}
+        with mock.patch.object(rust_res, "resolve_v2_via_lattice_fold", explode):
+            python_result = self._resolve_with_cache(V2_ROOM, state_sets, python_cache)
+
+        # The fallback deliberately raises, so trial must not treat the
+        # resulting error log as an unflushed failure.
+        self.flushLoggedErrors(RuntimeError)
+
+        self.assertEqual(dict(rust_result), dict(python_result))
 
     def build_event_graph(
         self,

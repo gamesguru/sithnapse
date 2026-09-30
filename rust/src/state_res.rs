@@ -512,16 +512,23 @@ fn py_to_lean_event(py_ev: &Bound<'_, PyAny>) -> PyResult<LeanEvent<String, Reso
     })
 }
 
+/// Resolve the conflicted set on top of `base_state` using the v2 lattice fold.
+///
+/// `base_state` is the starting state the conflicted events are applied to (for
+/// v2 this is the restricted `base_state` the Python resolver also uses, not the
+/// full unconflicted state). The returned mapping is `base_state` with the
+/// conflicted events that pass auth applied over it; callers layer the full
+/// unconflicted state on top.
 #[pyfunction]
-#[pyo3(text_signature = "(unconflicted_state, conflicted_event_ids, event_map, /)")]
+#[pyo3(text_signature = "(base_state, conflicted_event_ids, event_map, /)")]
 pub fn resolve_v2_via_lattice_fold<'py>(
     py: Python<'py>,
-    unconflicted_state: Bound<'py, PyDict>,
+    base_state: Bound<'py, PyDict>,
     conflicted_event_ids: Bound<'py, PyAny>,
     event_map: Bound<'py, PyDict>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let parsed_events = parse_event_map(event_map)?;
-    resolve_v2_from_parsed_events(py, unconflicted_state, conflicted_event_ids, &parsed_events)
+    resolve_v2_from_parsed_events(py, base_state, conflicted_event_ids, &parsed_events)
 }
 
 fn parse_event_map(
@@ -542,15 +549,15 @@ fn parse_event_map(
 
 fn resolve_v2_from_parsed_events<'py>(
     py: Python<'py>,
-    unconflicted_state: Bound<'py, PyDict>,
+    base_state: Bound<'py, PyDict>,
     conflicted_event_ids: Bound<'py, PyAny>,
     parsed_events: &HashMap<String, LeanEvent<String, ResolverContent>>,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let mut unconf_state = SharedState::new();
-    for (k, v) in unconflicted_state.iter() {
+    let mut base_state_map = SharedState::new();
+    for (k, v) in base_state.iter() {
         let (type_str, state_key): (String, String) = k.extract()?;
         let val: String = v.extract()?;
-        unconf_state.insert((EventType::from(type_str), state_key), val);
+        base_state_map.insert((EventType::from(type_str), state_key), val);
     }
 
     let conflicted_ids: Vec<String> = conflicted_event_ids.extract()?;
@@ -562,7 +569,7 @@ fn resolve_v2_from_parsed_events<'py>(
     }
 
     let resolved = resolve_semilattice_fold(
-        &unconf_state,
+        &base_state_map,
         &conflicted_events,
         parsed_events,
         StateResVersion::V2,

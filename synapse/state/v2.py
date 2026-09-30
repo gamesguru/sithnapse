@@ -230,35 +230,6 @@ async def resolve_events_with_store(
                 )
             )
 
-    # Attempt to run high-performance state resolution in Rust via rezzy's lattice fold
-    if room_version.state_res == StateResolutionVersions.V2 and conflict_cache is None:
-        try:
-            import synapse.synapse_rust.state_res as rust_res
-
-            resolve_v2_via_lattice_fold = rust_res.resolve_v2_via_lattice_fold
-
-            logger.debug("Resolving state v2 via Rust rezzy lattice fold")
-
-            _gg_rust_res_start = time.monotonic()
-            resolved_state_rust: StateMap[str] = resolve_v2_via_lattice_fold(
-                dict(unconflicted_state),
-                list(full_conflicted_set),
-                event_map,
-            )
-            logger.debug(
-                "[gg-state-timing] state_v2_rust_resolve "
-                "conflicted=%d event_map=%d elapsed_ms=%.1f",
-                len(full_conflicted_set),
-                len(event_map),
-                (time.monotonic() - _gg_rust_res_start) * 1000,
-            )
-            return resolved_state_rust
-        except Exception as e:
-            logger.exception(
-                "Failed to run Rust state resolution via lattice fold, falling back to python",
-                exc_info=e,
-            )
-
     full_conflicted_set = {eid for eid in full_conflicted_set if eid in event_map}
 
     logger.debug("%d full_conflicted_set entries", len(full_conflicted_set))
@@ -291,6 +262,7 @@ async def resolve_events_with_store(
         }
 
     resolved_state: StateMap[str] | None = None
+    cache_key: bytes | None = None
     if conflict_cache is not None:
         cache_key = _conflict_cache_key(
             room_id, room_version, full_conflicted_set, base_state
@@ -298,7 +270,7 @@ async def resolve_events_with_store(
         resolved_state = conflict_cache.get(cache_key)
 
     if resolved_state is None:
-        resolved_state = await _resolve_conflicted_set(
+        resolved_state = await _resolve_conflicted_set_with_rust(
             clock,
             room_id,
             room_version,
@@ -307,7 +279,7 @@ async def resolve_events_with_store(
             event_map,
             state_res_store,
         )
-        if conflict_cache is not None:
+        if conflict_cache is not None and cache_key is not None:
             conflict_cache[cache_key] = resolved_state
     else:
         logger.debug(
@@ -456,6 +428,72 @@ async def _resolve_conflicted_set(
     logger.debug("resolved")
 
     return resolved_state
+
+
+async def _resolve_conflicted_set_with_rust(
+    clock: Clock,
+    room_id: str,
+    room_version: RoomVersion,
+    full_conflicted_set: set[str],
+    base_state: StateMap[str],
+    event_map: dict[str, EventBase],
+    state_res_store: StateResolutionStore,
+) -> StateMap[str]:
+    """Resolve the conflicted set on top of `base_state`, preferring Rust for v2.
+
+    Both the Rust and Python implementations below start from `base_state` and
+    return the resolved state derived from it: `base_state` with the conflicted
+    events that pass auth applied over it. The caller layers the full
+    unconflicted state over the result.
+
+    Keeping the Rust input restricted to `base_state` (rather than the full
+    unconflicted state) is what makes the result independent of the unrelated
+    unconflicted keys, so it can be cached under
+    `_conflict_cache_key(..., base_state)` without leaking one caller's
+    unconflicted state into another's result.
+
+    Falls back to the Python implementation if the Rust extension is
+    unavailable or raises. The fallback is logged at error level so a genuine
+    Rust/Python divergence is not silently masked.
+    """
+    if room_version.state_res == StateResolutionVersions.V2:
+        try:
+            import synapse.synapse_rust.state_res as rust_res
+
+            logger.debug("Resolving state v2 via Rust rezzy lattice fold")
+
+            _gg_rust_res_start = time.monotonic()
+            resolved_state_rust: StateMap[str] = rust_res.resolve_v2_via_lattice_fold(
+                dict(base_state),
+                list(full_conflicted_set),
+                event_map,
+            )
+            logger.debug(
+                "[gg-state-timing] state_v2_rust_resolve "
+                "conflicted=%d event_map=%d elapsed_ms=%.1f",
+                len(full_conflicted_set),
+                len(event_map),
+                (time.monotonic() - _gg_rust_res_start) * 1000,
+            )
+            return resolved_state_rust
+        except Exception as e:
+            # `logger.exception` logs at ERROR: until the Rust/Python parity is
+            # well established we want a divergence to be loudly visible, not
+            # hidden behind a routine-looking fallback.
+            logger.exception(
+                "Failed to run Rust state resolution via lattice fold, falling back to python",
+                exc_info=e,
+            )
+
+    return await _resolve_conflicted_set(
+        clock,
+        room_id,
+        room_version,
+        full_conflicted_set,
+        base_state,
+        event_map,
+        state_res_store,
+    )
 
 
 async def _get_power_level_for_sender(
