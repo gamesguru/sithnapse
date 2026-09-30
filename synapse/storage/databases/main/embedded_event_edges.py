@@ -724,7 +724,9 @@ def _retry_on_contention(call: "Callable[[], _T]") -> "_T":
         try:
             return call()
         except BlockingIOError:
+            ffi_count("event_edges_contention_retries", 1)
             if attempt == _MAX_READ_CONTENTION_ATTEMPTS:
+                ffi_count("event_edges_contention_exhausted", 1)
                 raise
     raise AssertionError("unreachable: loop always returns or raises")
 

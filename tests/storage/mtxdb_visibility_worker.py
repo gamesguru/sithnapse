@@ -38,6 +38,9 @@ import sys
 # Synapse's prometheus-client floor just to dodge one log line, or trying
 # to guess every logger name that might fire during import.
 logging.disable(logging.CRITICAL)
+from synapse.storage.databases.main.embedded_event_edges import (  # noqa: E402
+    get_event_edges_forward_batch,
+)
 from synapse.storage.databases.main.embedded_event_json import (  # noqa: E402
     get_event_json_batch,
     put_event_json_batch,
@@ -46,9 +49,12 @@ from synapse.synapse_rust import mtxdb_engine  # noqa: E402
 
 logging.disable(logging.NOTSET)
 
-# The worker's stdout is a line protocol; `get_event_json_batch` logs a trace
-# that must not land between replies.
+# The worker's stdout is a line protocol; `get_event_json_batch` and the
+# event-edges helpers log traces that must not land between replies.
 logging.getLogger("synapse.storage.databases.main.embedded_event_json").setLevel(
+    logging.WARNING
+)
+logging.getLogger("synapse.storage.databases.main.embedded_event_edges").setLevel(
     logging.WARNING
 )
 
@@ -125,6 +131,28 @@ def main() -> None:
                 assert transaction is not None
                 transaction.abort()
                 reply = "ok"
+            elif command == "edges_publish":
+                # edges_publish <room_id> <generation> <published_version>
+                #                <event_id> <prev_event_id>
+                room_id, generation, published, event_id, prev_event_id = args
+                mtxdb_engine.event_edges_apply_forward_outbox(
+                    namespace,
+                    room_id,
+                    int(generation),
+                    int(published),
+                    [(event_id, prev_event_id, "insert")],
+                )
+                reply = "ok"
+            elif command == "edges_get":
+                # edges_get <room_id> <expected_version> <prev_event_id>
+                room_id, expected, prev_event_id = args
+                forward = get_event_edges_forward_batch(
+                    namespace,
+                    room_id,
+                    int(expected),
+                    [prev_event_id],
+                )
+                reply = json.dumps(forward)
             elif command == "fsyncs":
                 reply = str(_fsyncs())
             elif command == "exit":

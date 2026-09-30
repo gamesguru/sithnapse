@@ -42,6 +42,7 @@ from synapse.storage.databases.main.embedded_common import (
 )
 from synapse.storage.databases.main.embedded_event_edges import (
     EventEdgesMigrationIncompleteError,
+    _retry_on_contention,
     check_event_edges_migration_complete,
     delete_event_edges_batch,
     drain_edge_index_outbox,
@@ -1087,6 +1088,34 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
         self.assertEqual(back["$old"], [("$older", False)])
         fwd = get_event_edges_forward_batch(ns, ["$older"])
         self.assertEqual(fwd["$older"], ["$old"])
+
+
+class ContentionRetryCounterTestCase(unittest.TestCase):
+    """`_retry_on_contention` makes journal/checkpoint contention observable."""
+
+    def test_counts_retries_then_succeeds(self) -> None:
+        calls = iter([BlockingIOError(), BlockingIOError(), "ok"])
+
+        def flaky() -> str:
+            item = next(calls)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        with enable_ffi_counting():
+            self.assertEqual(_retry_on_contention(flaky), "ok")
+            self.assertEqual(get_ffi_count("event_edges_contention_retries"), 2)
+            self.assertEqual(get_ffi_count("event_edges_contention_exhausted"), 0)
+
+    def test_counts_exhaustion(self) -> None:
+        def always() -> None:
+            raise BlockingIOError()
+
+        with enable_ffi_counting():
+            with self.assertRaises(BlockingIOError):
+                _retry_on_contention(always)
+            self.assertGreaterEqual(get_ffi_count("event_edges_contention_retries"), 1)
+            self.assertEqual(get_ffi_count("event_edges_contention_exhausted"), 1)
 
 
 class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):

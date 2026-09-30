@@ -94,6 +94,27 @@ class _Process:
         value: str | None = json.loads(self.call(f"event_json_get {event_id}"))
         return value
 
+    def edges_publish(
+        self,
+        room_id: str,
+        generation: int,
+        published_version: int,
+        event_id: str,
+        prev_event_id: str,
+    ) -> None:
+        self.call(
+            f"edges_publish {room_id} {generation} {published_version} "
+            f"{event_id} {prev_event_id}"
+        )
+
+    def edges_get(
+        self, room_id: str, expected_version: int, prev_event_id: str
+    ) -> dict[str, list[str] | None]:
+        value: dict[str, list[str] | None] = json.loads(
+            self.call(f"edges_get {room_id} {expected_version} {prev_event_id}")
+        )
+        return value
+
     def close(self) -> None:
         try:
             if self._proc.poll() is None:
@@ -226,4 +247,73 @@ class MtxdbEventJsonVisibilityTestCase(unittest.TestCase):
 
         self.writer.call("txn_abort")
         self.assertIsNone(reader.event_json_get("$ej4:test"))
+        self.assertEqual(self.writer.call("fsyncs"), "0")
+
+
+_EDGES_ROOM = "!vis-edges:test"
+_EDGES_NS = "vis-event-edges"
+
+
+class MtxdbEventEdgesVisibilityTestCase(unittest.TestCase):
+    """The real event-edges forward read path across processes.
+
+    `get_event_edges_forward_batch` (the gated helper behind
+    `get_successor_events` and `is_event_next_to_forward_gap`) reads mtxdb's
+    `room_forward_meta` watermark and the generation-selected forward
+    collection. A worker opened *before* the writer publishes must not treat
+    the unpublished index as a hit, and must see a later publication through
+    the journal overlay without reopening. This is the production Python read
+    path, not the raw engine.
+    """
+
+    def setUp(self) -> None:
+        self.store_dir = tempfile.mkdtemp(prefix="test-mtxdb-edges-vis-")
+        self.addCleanup(shutil.rmtree, self.store_dir, ignore_errors=True)
+        self.writer = _Process("writer", self.store_dir, _EDGES_NS)
+        self.addCleanup(self.writer.close)
+
+    def _reader(self) -> _Process:
+        reader = _Process("reader", self.store_dir, _EDGES_NS)
+        self.addCleanup(reader.close)
+        return reader
+
+    def test_unpublished_index_is_not_a_hit(self) -> None:
+        """A worker must not serve an unpublished forward index as complete."""
+        reader = self._reader()
+
+        self.assertEqual(
+            reader.edges_get(_EDGES_ROOM, 1, "$pe1:test"),
+            {},
+            "an unpublished forward index must be a miss, not a hit",
+        )
+
+    def test_published_edge_visible_to_stale_worker_without_fsync(self) -> None:
+        """A worker opened before the write sees the published edge, no fsync."""
+        reader = self._reader()
+
+        self.writer.edges_publish(_EDGES_ROOM, 0, 1, "$child1:test", "$pe2:test")
+
+        self.assertEqual(
+            reader.edges_get(_EDGES_ROOM, 1, "$pe2:test"),
+            {"$pe2:test": ["$child1:test"]},
+        )
+        self.assertEqual(self.writer.call("fsyncs"), "0")
+
+    def test_repeat_publish_visible_to_same_reader(self) -> None:
+        """Appending to an existing parent is visible without reopening.
+
+        A reader that refreshed once and then cached a stale generation would
+        pass the single-write case but fail this one.
+        """
+        reader = self._reader()
+
+        self.writer.edges_publish(_EDGES_ROOM, 0, 1, "$child1:test", "$pe3:test")
+        self.assertEqual(
+            reader.edges_get(_EDGES_ROOM, 1, "$pe3:test"),
+            {"$pe3:test": ["$child1:test"]},
+        )
+
+        self.writer.edges_publish(_EDGES_ROOM, 0, 2, "$child2:test", "$pe3:test")
+        children = reader.edges_get(_EDGES_ROOM, 2, "$pe3:test").get("$pe3:test") or []
+        self.assertEqual(set(children), {"$child1:test", "$child2:test"})
         self.assertEqual(self.writer.call("fsyncs"), "0")
