@@ -968,7 +968,7 @@ dependencies = [
 [[package]]
 name = "mtxdb"
 version = "0.1.0-beta.2"
-source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=refactor%2Fpack-id-store-layout#f605d9cec092c1ed43a9003089fc2ccf5f228c70"
+source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=refactor%2Fpack-id-store-layout#7450e54964d92a32995abb607a2037e01d264331"
 dependencies = [
  "arc-swap",
  "blake3",

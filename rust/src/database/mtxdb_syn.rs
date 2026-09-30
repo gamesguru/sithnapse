@@ -1728,7 +1728,7 @@ pub(crate) fn encode_room_forward_meta(
     bytes
 }
 
-fn decode_room_forward_meta(bytes: &[u8]) -> PyResult<(u32, u64)> {
+pub(crate) fn decode_room_forward_meta(bytes: &[u8]) -> PyResult<(u32, u64)> {
     // Version 1 was first written as a 20-byte value with four reserved
     // trailing zero bytes. Accept those values while writing the compact
     // 16-byte representation so existing databases remain readable.

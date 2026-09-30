@@ -27,9 +27,9 @@ use pyo3::IntoPyObjectExt;
 use sha2::{Digest, Sha256};
 
 use super::mtxdb_syn::{
-    assert_writable, auth_chain_db, begin_internal_transaction, encode_room_forward_meta,
-    event_locator_collection_id, event_node_id, forward_edges_room_id, map_read_storage_error,
-    map_transaction_error, map_transaction_io_error, prev_edges_room_id, read_room_forward_meta,
+    assert_writable, auth_chain_db, begin_internal_transaction, decode_room_forward_meta,
+    encode_room_forward_meta, event_locator_collection_id, event_node_id, forward_edges_room_id,
+    map_read_storage_error, map_transaction_error, map_transaction_io_error, prev_edges_room_id,
     room_forward_meta_node_id, room_forward_meta_put, ROOM_FORWARD_META_COLLECTION,
 };
 
@@ -1144,10 +1144,6 @@ pub fn event_edges_get_forward_gated(
     expected_source_version: u64,
     prev_event_ids: Vec<String>,
 ) -> PyResult<Py<PyAny>> {
-    // The normal path is one metadata/FWD/metadata sample. A second attempt
-    // handles a concurrent publication; beyond that, SQL fallback is faster
-    // and more predictable than holding a traversal request in a retry loop.
-    const READ_ATTEMPTS: usize = 2;
     enum ReadResult {
         VersionMismatch { published: u64, expected: u64 },
         Hit(Vec<(String, Option<Vec<String>>)>),
@@ -1159,52 +1155,45 @@ pub fn event_edges_get_forward_gated(
             .iter()
             .map(|id| event_edges_forward_node_id(&namespace, id))
             .collect();
-        let mut last_published = 0;
-        for _ in 0..READ_ATTEMPTS {
-            let Some((generation, published_version)) = read_room_forward_meta(&room_id)? else {
-                return Ok(ReadResult::VersionMismatch {
-                    published: 0,
-                    expected: expected_source_version,
-                });
-            };
-            last_published = published_version;
-            if published_version != expected_source_version {
-                return Ok(ReadResult::VersionMismatch {
-                    published: published_version,
-                    expected: expected_source_version,
-                });
-            }
-
-            let collection = forward_edges_room_id(&room_id, generation);
-            let found = engine
-                .get_read_committed(&collection, &node_ids)
-                .map_err(map_read_storage_error)?;
-            let Some((end_generation, end_published_version)) = read_room_forward_meta(&room_id)?
-            else {
-                continue;
-            };
-            if (end_generation, end_published_version) != (generation, published_version) {
-                continue;
-            }
-
-            let mut rows = Vec::with_capacity(prev_event_ids.len());
-            for (event_id, value) in prev_event_ids.iter().zip(found) {
-                let children = value
-                    .filter(|data| !data.bytes.is_empty())
-                    .map(|data| decode_forward_edges(&data.bytes))
-                    .transpose()?;
-                rows.push((event_id.clone(), children));
-            }
-            return Ok(ReadResult::Hit(rows));
+        // Pin one overlay boundary while resolving metadata and its
+        // generation-selected FWD collection. The former meta -> FWD -> meta
+        // seqlock could exhaust under a rebuild swap and spuriously force SQL
+        // fallback; this snapshot cannot straddle that publication.
+        let snapshot = engine.read_snapshot().map_err(map_read_storage_error)?;
+        let meta_node = room_forward_meta_node_id(&room_id);
+        let meta = snapshot
+            .get(&ROOM_FORWARD_META_COLLECTION, &[meta_node])
+            .map_err(map_read_storage_error)?
+            .into_iter()
+            .next()
+            .flatten();
+        let Some(meta) = meta else {
+            return Ok(ReadResult::VersionMismatch {
+                published: 0,
+                expected: expected_source_version,
+            });
+        };
+        let (generation, published_version) = decode_room_forward_meta(&meta.bytes)?;
+        if published_version != expected_source_version {
+            return Ok(ReadResult::VersionMismatch {
+                published: published_version,
+                expected: expected_source_version,
+            });
         }
-        // A coherent (metadata, payload) snapshot was never observed under
-        // sustained writer or rebuild contention. Report it as a mismatch
-        // rather than raising: the Python caller treats `version_mismatch` as
-        // a cue to answer from SQL, so a busy room degrades instead of failing.
-        Ok(ReadResult::VersionMismatch {
-            published: last_published,
-            expected: expected_source_version,
-        })
+
+        let collection = forward_edges_room_id(&room_id, generation);
+        let found = snapshot
+            .get(&collection, &node_ids)
+            .map_err(map_read_storage_error)?;
+        let mut rows = Vec::with_capacity(prev_event_ids.len());
+        for (event_id, value) in prev_event_ids.iter().zip(found) {
+            let children = value
+                .filter(|data| !data.bytes.is_empty())
+                .map(|data| decode_forward_edges(&data.bytes))
+                .transpose()?;
+            rows.push((event_id.clone(), children));
+        }
+        Ok(ReadResult::Hit(rows))
     })?;
 
     match read_result {
