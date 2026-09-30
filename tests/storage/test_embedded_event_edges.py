@@ -1425,6 +1425,132 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         self.assertIn(c_id, fwd_repaired.get(p_id) or [])
 
     @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
+    def test_outbox_recovers_edge_publication_after_simulated_crash(self) -> None:
+        """Crash between the SQL commit and the post-commit mtxdb edge write.
+
+        The SQL transaction commits the event, its authoritative `event_edges`
+        row, and a durable `edge_index_outbox` row. If the process dies before
+        the post-commit mtxdb write lands, the publication worker must recover
+        the forward index from the outbox, and it must acknowledge (delete) the
+        outbox rows only after the mtxdb commit -- never before.
+        """
+        from synapse.storage.database import LoggingTransaction
+
+        ns = self.store._embedded_db_namespace
+        room_id = self.room_id
+
+        def _sql_scalar(query: str, args: tuple[Any, ...]) -> Any:
+            def _txn(txn: LoggingTransaction) -> Any:
+                txn.execute(query, args)
+                row = txn.fetchone()
+                assert row is not None
+                return row[0]
+
+            return self.get_success(
+                self.store.db_pool.runInteraction("crash_injection_sql", _txn)
+            )
+
+        outbox_count_query = "SELECT COUNT(*) FROM edge_index_outbox WHERE room_id = ?"
+
+        with (
+            # Model the crash: the post-commit mtxdb write is attempted, but it
+            # never lands. The SQL transaction still commits the event and its
+            # durable outbox row.
+            mock.patch(
+                "synapse.storage.databases.main.events.put_event_edges_batch"
+            ) as direct_write,
+            # Keep the background publication loop from draining the outbox
+            # before the test has inspected it; the real drainer is invoked
+            # explicitly below.
+            mock.patch(
+                "synapse.storage.databases.main.events_worker.drain_edge_index_outbox"
+            ),
+        ):
+            res1 = self.helper.send(room_id, "parent", tok=self.tok)
+            p_id = res1["event_id"]
+            res2 = self.helper.send(room_id, "child", tok=self.tok)
+            c_id = res2["event_id"]
+
+            self.assertTrue(
+                direct_write.called,
+                "the post-commit mtxdb write should have been attempted",
+            )
+
+            # Step 1: SQL is authoritative and the outbox row is durable.
+            self.assertEqual(
+                _sql_scalar(
+                    "SELECT COUNT(*) FROM event_edges "
+                    "WHERE event_id = ? AND prev_event_id = ?",
+                    (c_id, p_id),
+                ),
+                1,
+                "the authoritative SQL edge must be committed",
+            )
+            self.assertGreater(
+                _sql_scalar(outbox_count_query, (room_id,)),
+                0,
+                "the event transaction must commit a durable outbox row",
+            )
+
+            source_version = int(
+                _sql_scalar(
+                    "SELECT source_version FROM room_edge_source_version "
+                    "WHERE room_id = ?",
+                    (room_id,),
+                )
+            )
+
+            # Step 2: the crash left mtxdb unpublished -- the gated read is a
+            # version mismatch, not a (possibly partial) hit.
+            self.assertEqual(
+                get_event_edges_forward_batch(ns, room_id, source_version, [p_id]),
+                {},
+                "an unpublished forward index must not be served as a hit",
+            )
+
+            # Step 3: run the publication worker.
+            self.assertTrue(
+                self.get_success(
+                    drain_edge_index_outbox(self.store, namespace=ns, room_id=room_id)
+                ),
+                "the drainer should have had outbox rows to apply",
+            )
+
+            # Step 4: the forward index is now complete and published, and only
+            # now have the outbox rows been acknowledged.
+            self.assertIn(
+                c_id,
+                (
+                    get_event_edges_forward_batch(
+                        ns, room_id, source_version, [p_id]
+                    ).get(p_id)
+                    or []
+                ),
+                "the drainer must publish the pending forward edge",
+            )
+            self.assertEqual(
+                _sql_scalar(outbox_count_query, (room_id,)),
+                0,
+                "outbox rows must be acknowledged only after mtxdb publication",
+            )
+
+        # The gated production read path now serves a complete, published hit
+        # rather than falling back to SQL.
+        with enable_ffi_counting():
+            successors = self.get_success(self.store.get_successor_events(p_id))
+            self.assertIn(c_id, successors)
+            self.assertEqual(
+                get_ffi_count("event_edges_successor_hits"),
+                1,
+                "expected the recovered read to be an embedded hit",
+            )
+            self.assertEqual(
+                get_ffi_count("event_edges_successor_fallbacks"),
+                0,
+                "expected no SQL fallback after the outbox drained",
+            )
+
+    @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
     def test_migrate_mtxdb_background_update_is_retired_noop(self) -> None:
         """The online `event_edges_migrate_mtxdb` background update is retired:
         FWD authority now requires a stopped-writer offline rebuild, so driving
