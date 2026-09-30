@@ -33,6 +33,11 @@ use super::mtxdb_syn::{
     room_forward_meta_node_id, room_forward_meta_put, ROOM_FORWARD_META_COLLECTION,
 };
 
+/// Records read together with the per-record write versions the caller must
+/// still observe at commit; `None` when the write target has no logical clock.
+type VersionedEdgeRead =
+    Result<(Vec<Option<NodeData>>, Option<Vec<u64>>), mtxdb::storage::StorageError>;
+
 /// The read/write surface `event_edges_put` needs, common to a direct engine
 /// write and a staged transaction write, so the merge logic below (batch-read
 /// existing forward lists, append, re-encode) is written once and used by
@@ -55,11 +60,7 @@ trait EdgeWriteTarget {
     /// write has no logical clock and relies on its caller's room lock, so it
     /// reports `None`; a staged transaction reports the per-record versions it
     /// will require at commit. See `write_edges`.
-    fn edge_get_record_versions(
-        &self,
-        collection: &[u8; 16],
-        ids: &[NodeId],
-    ) -> Result<(Vec<Option<NodeData>>, Option<Vec<u64>>), mtxdb::storage::StorageError> {
+    fn edge_get_record_versions(&self, collection: &[u8; 16], ids: &[NodeId]) -> VersionedEdgeRead {
         self.edge_get_many(collection, ids)
             .map(|found| (found, None))
     }
@@ -119,11 +120,7 @@ impl EdgeWriteTarget for DatabaseTransaction<'_> {
         Ok(())
     }
 
-    fn edge_get_record_versions(
-        &self,
-        collection: &[u8; 16],
-        ids: &[NodeId],
-    ) -> Result<(Vec<Option<NodeData>>, Option<Vec<u64>>), mtxdb::storage::StorageError> {
+    fn edge_get_record_versions(&self, collection: &[u8; 16], ids: &[NodeId]) -> VersionedEdgeRead {
         self.get_with_record_versions(ShardType::Edges, collection, ids)
             .map(|(found, versions)| (found, Some(versions)))
     }
@@ -167,7 +164,7 @@ trait ForwardWriteTarget {
         &self,
         collection: &[u8; 16],
         ids: &[NodeId],
-    ) -> Result<(Vec<Option<NodeData>>, Option<Vec<u64>>), mtxdb::storage::StorageError> {
+    ) -> VersionedEdgeRead {
         self.forward_get_many(collection, ids)
             .map(|found| (found, None))
     }
@@ -266,7 +263,7 @@ impl ForwardWriteTarget for DatabaseTransaction<'_> {
         &self,
         collection: &[u8; 16],
         ids: &[NodeId],
-    ) -> Result<(Vec<Option<NodeData>>, Option<Vec<u64>>), mtxdb::storage::StorageError> {
+    ) -> VersionedEdgeRead {
         self.get_with_record_versions(ShardType::Edges, collection, ids)
             .map(|(found, versions)| (found, Some(versions)))
     }

@@ -3320,6 +3320,10 @@ pub(crate) fn map_transaction_error(context: &str, error: StorageError) -> PyErr
     }
 }
 
+/// Records and their covered per-record write versions, as returned across the
+/// PyO3 boundary by `get_with_record_versions`.
+type PyRecordVersions = PyResult<(Vec<Option<Vec<u8>>>, Vec<u64>)>;
+
 #[pymethods]
 impl PyMtxdbTransaction {
     /// Read records and the collection's logical version from one visibility
@@ -3379,7 +3383,7 @@ impl PyMtxdbTransaction {
         pool_tag: u8,
         collection_id: Vec<u8>,
         node_ids: Vec<Vec<u8>>,
-    ) -> PyResult<(Vec<Option<Vec<u8>>>, Vec<u64>)> {
+    ) -> PyRecordVersions {
         let pool = parse_pool_tag(pool_tag)?;
         let collection_id = parse_collection_id(collection_id)?;
         let node_ids = parse_node_ids(node_ids)?;
