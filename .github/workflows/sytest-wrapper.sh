@@ -3,6 +3,7 @@
 set -e
 
 MODE="$1" # "frozen", "upgrade", or "offline"
+shift
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SYTEST_DIR="${SYTEST_DIR:-$REPO_ROOT/.sytest}"
 SYTEST_VENV_DIR="${SYTEST_VENV_DIR:-$REPO_ROOT/.venv}"
@@ -18,7 +19,9 @@ export SYTEST_LOG_DIR
 export SYTEST_SOURCE_DIR
 export SYTEST_RUNTIME_DIR
 export SYTEST_PERL_DIR
+export SYTEST_COVERAGE="${SYTEST_COVERAGE:-1}"
 export PATH="$SYTEST_PERL_DIR/bin:$PATH"
+export COVERAGE_FILE="$SYTEST_WORK_DIR/.coverage"
 export PERL5LIB="$SYTEST_PERL_DIR/lib/perl5${PERL5LIB:+:$PERL5LIB}"
 export PERL_LOCAL_LIB_ROOT="$SYTEST_PERL_DIR${PERL_LOCAL_LIB_ROOT:+:$PERL_LOCAL_LIB_ROOT}"
 export PERL_MB_OPT="--install_base \"$SYTEST_PERL_DIR\""
@@ -74,7 +77,7 @@ tar -C "$SYTEST_DIR" --strip-components=1 -xf sytest.tar.gz
 export SYTEST_LIB="$SYTEST_DIR/lib"
 
 echo "--- Patching SyTest's SQLite DB clearing to remove WAL and SHM files"
-sed -i 's/unlink $db if -f $db;/unlink $db if -f $db;\n    unlink "$db-wal" if -f "$db-wal";\n    unlink "$db-shm" if -f "$db-shm";/g' "$SYTEST_DIR/lib/SyTest/Homeserver.pm"
+sed -i "s/unlink \$db if -f \$db;/unlink \$db if -f \$db;\n    unlink \"\$db-wal\" if -f \"\$db-wal\";\n    unlink \"\$db-shm\" if -f \"\$db-shm\";/g" "$SYTEST_DIR/lib/SyTest/Homeserver.pm"
 
 echo "--- Patching /sytest/scripts/synapse_sytest.sh to pre-create sytest_template database"
 # Create sytest_template database to quiet speculative DBI connect noise and errors
@@ -143,6 +146,25 @@ content = content.replace('/venv/bin/pip install --no-deps --no-index --find-lin
 assert 'poetry install -vv --extras all' not in content, 'Failed to replace poetry install command'
 assert '/synapse[all]' not in content, 'Failed to replace legacy pip install command'
 
+# SyTest's --coverage flag makes each homeserver run through ``coverage run``.
+# Keep coverage enabled by default for CI, but allow fast local runs to use the
+# interpreter directly (and avoid the large first-startup delay).
+coverage_switch = '''
+if [ "$SYTEST_COVERAGE" = "0" ]; then
+    RUN_TESTS_WITHOUT_COVERAGE=()
+    for RUN_TEST_ARG in "${RUN_TESTS[@]}"; do
+        if [ "$RUN_TEST_ARG" != "--coverage" ]; then
+            RUN_TESTS_WITHOUT_COVERAGE+=("$RUN_TEST_ARG")
+        fi
+    done
+    RUN_TESTS=("${RUN_TESTS_WITHOUT_COVERAGE[@]}")
+    unset COVERAGE_PROCESS_START
+fi
+'''
+anchor = 'if [ -n "$ASYNCIO_REACTOR" ]; then'
+assert anchor in content, 'Could not find SyTest run-tests options anchor'
+content = content.replace(anchor, coverage_switch + '\n' + anchor, 1)
+
 with open(os.environ['SYTEST_DIR'] + '/scripts/synapse_sytest.sh', 'w') as f:
     f.write(content)
 PY
@@ -163,6 +185,11 @@ with open(os.environ['SYTEST_DIR'] + '/lib/SyTest/Homeserver/Synapse.pm', 'r') a
     content = f.read()
 
 anchor = '        databases => \\%db_configs,'
+content = content.replace(
+    '"PATH" => $ENV{PATH},',
+    '"PATH" => $ENV{PATH},\n'
+    '      "COVERAGE_FILE" => $ENV{COVERAGE_FILE},',
+)
 injection = '''        databases => \\%db_configs,
         # SyTest deliberately fires rapid-succession failure/retry scenarios
         # (e.g. tests/50federation/01keys.pl) against the same reused fake
@@ -190,4 +217,4 @@ with open(os.environ['SYTEST_DIR'] + '/lib/SyTest/Homeserver/Synapse.pm', 'w') a
 PY
 
 echo "--- Executing SyTest via synapse_sytest.sh"
-exec "$SYTEST_DIR/scripts/synapse_sytest.sh"
+exec "$SYTEST_DIR/scripts/synapse_sytest.sh" "$@"
