@@ -76,6 +76,7 @@ from synapse.storage.types import Cursor
 from synapse.storage.util.sequence import build_sequence_generator
 from synapse.types import MutableStateMap, StateKey, StateMap
 from synapse.types.state import StateFilter
+from synapse.util.caches import intern_string
 from synapse.util.caches.dictionary_cache import DictionaryCache
 from synapse.util.cancellation import cancellable
 from synapse.util.duration import Duration
@@ -714,9 +715,86 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         # cross-connection visibility race to poll for here: a caller-side
         # retry loop could never observe a corrupt group without the inner
         # txn having already raised on the very first attempt.
-        chunks = [groups[i : i + 100] for i in range(0, len(groups), 100)]
         _gg_sql_start = time.monotonic()
         results: dict[int, StateMap[str]] = {}
+        # Same unit the transactional path uses, so each FFI call stays as
+        # bounded as each transaction it replaces.
+        chunk_size = 100
+        chunks = [groups[i : i + chunk_size] for i in range(0, len(groups), chunk_size)]
+
+        # When the embedded state store has every requested root, avoid
+        # checking out a SQL connection and opening a transaction merely to
+        # discover roots that mtxdb can resolve in one read-committed batch.
+        # Any chunk that misses falls through to the transactional path below,
+        # which retains SQL fallback, stale-index refresh and corruption
+        # handling semantics -- at the cost of re-reading what the fast path
+        # already fetched, which is rare and cheap.
+        if self._embedded_db_engine and groups:
+            engine = get_embedded_engine(self._embedded_db_engine)
+            namespace = self._embedded_db_namespace
+            exact_keys = (
+                list(state_filter.concrete_types())
+                if not state_filter.has_wildcards()
+                else None
+            )
+            fast_results: dict[int, StateMap[str]] = {}
+            fast_hit = True
+            for chunk in chunks:
+                # Root lookup plus materialisation in a single span, so
+                # `state_read_embedded` keeps covering the same work as the
+                # one `_get_state_groups_from_hamt_txn` records per call.
+                _ee_start = time.monotonic()
+                roots = engine.get_state_hamt_roots_bulk(namespace, chunk)
+                # `get_state_hamt_roots_bulk` returns exactly one entry per
+                # input group, in input order. Assert rather than assume: a
+                # short result would zip down to fewer groups than requested
+                # and hand back partial state as if it were complete.
+                materialized: list[list[tuple[str, str, str]]] = []
+                if len(roots) == len(chunk) and all(root is not None for root in roots):
+                    chunk_roots = [root for _, root in zip(chunk, roots)]
+                    if exact_keys is None:
+                        _et = time.monotonic()
+                        materialized = engine.materialize_state_hamts(
+                            namespace, chunk_roots
+                        )
+                        ffi_timing("ffi_materialize_hamts", time.monotonic() - _et)
+                    else:
+                        queries = [
+                            (
+                                room_prefix,
+                                root_hash,
+                                self._room_structural_key(room_id),
+                                exact_keys,
+                            )
+                            for _, (room_prefix, root_hash, room_id) in zip(
+                                chunk, chunk_roots
+                            )
+                        ]
+                        _et = time.monotonic()
+                        materialized = engine.lookup_state_hamts(namespace, queries)
+                        ffi_timing("ffi_lookup_hamts", time.monotonic() - _et)
+                _state_timing("state_read_embedded", time.monotonic() - _ee_start)
+
+                if len(materialized) != len(chunk):
+                    fast_hit = False
+                    break
+                for group, entries in zip(chunk, materialized):
+                    state_map: MutableStateMap[str] = {}
+                    for typ, state_key, event_id in entries:
+                        state_map[(intern_string(typ), intern_string(state_key))] = (
+                            event_id
+                        )
+                    fast_results[group] = dict(state_filter.filter_state(state_map))
+
+            if fast_hit:
+                logger.debug(
+                    "[gg-state-timing] _get_state_groups_from_groups embedded_fast "
+                    "groups=%d elapsed_ms=%.1f",
+                    len(groups),
+                    (time.monotonic() - _gg_sql_start) * 1000,
+                )
+                return fast_results
+
         for chunk in chunks:
             res = await self.db_pool.runInteraction(
                 "_get_state_groups_from_groups",
