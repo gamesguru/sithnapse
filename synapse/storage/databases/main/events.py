@@ -1383,6 +1383,34 @@ class PersistEventsStore:
             txn, events_and_contexts=events_and_contexts
         )
 
+        # De-outliering removes an event before _store_event_txn, so its JSON
+        # would otherwise not be republished to the embedded event-dag mirror.
+        # Rewrite the idempotent record in this transaction: the mtxdb JSON
+        # must become visible before the SQL event row can be observed.
+        if self._embedded_event_json_enabled and de_outliered_events:
+            put_event_json_batch(
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
+                [
+                    (
+                        event.event_id,
+                        event.room_id,
+                        json_encoder.encode(event.internal_metadata.get_dict()),
+                        json_encoder.encode(
+                            {
+                                key: value
+                                for key, value in event.get_dict_for_persistence().items()
+                                if key not in ("redacted", "redacted_because")
+                            }
+                        ),
+                        event.format_version,
+                    )
+                    for event, _ in de_outliered_events
+                ],
+                sync=False,
+                transaction=mtxdb_txn,
+            )
+
         # From this point onwards the events are only events that we haven't
         # seen before.
 
@@ -1396,7 +1424,7 @@ class PersistEventsStore:
         # which every event is rejected would look as though it wrote no JSON
         # and skip the durability barrier for it.
         wrote_event_json = self._embedded_event_json_enabled and bool(
-            events_and_contexts
+            events_and_contexts or de_outliered_events
         )
         self._store_event_txn(
             txn, events_and_contexts=events_and_contexts, mtxdb_txn=mtxdb_txn
