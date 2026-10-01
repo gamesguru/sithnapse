@@ -795,25 +795,34 @@ class StickyEventsWorkerStore(StateGroupWorkerStore, CacheInvalidationWorkerStor
                 list(sticky_event_ids),
             )
             mirror_rows: list[tuple[str, str, str, str, int | None]] = []
-            for event_id, (
-                internal_metadata,
-                json_str,
-                format_version,
-            ) in found.items():
-                room_id = self.db_pool.simple_select_one_onecol_txn(
-                    txn,
-                    table="events",
-                    keyvalues={"event_id": event_id},
-                    retcol="room_id",
-                    allow_none=True,
+            if found:
+                room_id_clause, room_id_args = make_in_list_sql_clause(
+                    txn.database_engine, "event_id", list(found)
                 )
-                if room_id is None:
-                    continue
-                metadata = db_to_json(internal_metadata)
-                metadata["soft_failed"] = False
-                mirror_rows.append(
-                    (event_id, room_id, json.dumps(metadata), json_str, format_version)
+                txn.execute(
+                    f"SELECT event_id, room_id FROM events WHERE {room_id_clause}",
+                    room_id_args,
                 )
+                room_ids: dict[str, str] = dict(txn)
+                for event_id, (
+                    internal_metadata,
+                    json_str,
+                    format_version,
+                ) in found.items():
+                    room_id = room_ids.get(event_id)
+                    if room_id is None:
+                        continue
+                    metadata = db_to_json(internal_metadata)
+                    metadata["soft_failed"] = False
+                    mirror_rows.append(
+                        (
+                            event_id,
+                            room_id,
+                            json.dumps(metadata),
+                            json_str,
+                            format_version,
+                        )
+                    )
             if mirror_rows:
                 put_event_json_batch(
                     self._embedded_db_engine,
