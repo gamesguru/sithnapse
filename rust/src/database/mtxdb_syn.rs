@@ -3607,7 +3607,8 @@ pub fn event_json_get(
             let mut found = engine
                 .get_read_committed(&collection, &node_ids_only)
                 .map_err(map_read_storage_error)?;
-            if found.iter().any(|value| value.is_none()) {
+            if matches!(WRITE_MODE.get(), Some(false)) && found.iter().any(|value| value.is_none())
+            {
                 engine.refresh_collection(&collection).map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
                         "mtxdb refresh_collection error: {e}"
@@ -3658,7 +3659,8 @@ pub fn event_json_get(
             let mut found = engine
                 .get_read_committed(&collection, &node_ids_only)
                 .map_err(map_read_storage_error)?;
-            if found.iter().any(|value| value.is_none()) {
+            if matches!(WRITE_MODE.get(), Some(false)) && found.iter().any(|value| value.is_none())
+            {
                 engine.refresh_collection(&collection).map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
                         "mtxdb refresh_collection error: {e}"
