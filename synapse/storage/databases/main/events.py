@@ -1390,6 +1390,14 @@ class PersistEventsStore:
             txn, events_and_contexts=events_and_contexts
         )
 
+        if de_outliered_events:
+            logger.info(
+                "_persist_events_and_batches_txn: de-outliered %d events: %s with prev_events: %s",
+                len(de_outliered_events),
+                [ev.event_id for ev, _ in de_outliered_events],
+                [(ev.event_id, ev.prev_event_ids()) for ev, _ in de_outliered_events],
+            )
+
         # De-outliering removes an event before _store_event_txn, so its JSON
         # would otherwise not be republished to the embedded event-dag mirror.
         # Rewrite the idempotent record in this transaction: the mtxdb JSON

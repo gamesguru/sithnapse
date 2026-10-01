@@ -218,10 +218,10 @@ class EventsTestCase(HomeserverTestCase):
             # left to the coalescer, so there is no barrier.
             de_outlier_barrier.assert_not_called()
         else:
-            # A de-outlier writes only a state mapping, so only STATE is synced,
-            # in the transaction, before it commits.
+            # A de-outlier writes a state mapping and republishes event JSON,
+            # so both pools are synced in the transaction before it commits.
             de_outlier_barrier.assert_called_once_with(
-                SyncTier.DURABLE, pools=[Pool.STATE]
+                SyncTier.DURABLE, pools=[Pool.STATE, Pool.EVENT_DAG]
             )
 
     @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")

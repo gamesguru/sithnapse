@@ -758,6 +758,14 @@ def get_event_edges_forward_batch(
         ffi_batch_size("event_edges_get_forward", len(prev_event_ids))
 
         status, *payload = gated_results
+        logger.info(
+            "get_event_edges_forward_batch: room_id=%s expected_source_version=%s prev_event_ids=%s status=%s payload=%s",
+            room_id,
+            expected_source_version,
+            prev_event_ids,
+            status,
+            payload,
+        )
         if status == "version_mismatch":
             ffi_count("event_edges_version_mismatches", 1)
             return {}
