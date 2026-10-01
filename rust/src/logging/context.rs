@@ -553,7 +553,8 @@ impl LoggingContext {
             // The generator is being unwound (GeneratorExit); the context is
             // not recoverable, but the caller is done with it either way -- mark
             // it finished instead of leaving it permanently active.
-            if !exc_type.is_none() && exc_type.as_ptr() == py.get_type::<PyGeneratorExit>().as_ptr()
+            if !exc_type.is_none()
+                && std::ptr::eq(exc_type.as_ptr(), py.get_type::<PyGeneratorExit>().as_ptr())
             {
                 slf.borrow_mut().finished = true;
                 return Ok(());
