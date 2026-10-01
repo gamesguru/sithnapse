@@ -1037,9 +1037,24 @@ pub fn get_state_hamt_roots_bulk(
                 .collect();
             // Refresh on a miss so roots for state groups the writer appended
             // after this worker opened are resolved instead of reported absent.
-            let response_records = engine
+            // The bulk fast path must preserve the same cross-process
+            // read-visibility contract as the explicit refresh helper below:
+            // a stale collection index is a cache miss, not proof that the
+            // SQL state group has no embedded root.
+            let mut response_records = engine
                 .get_read_committed(&room_id, &node_ids)
                 .map_err(map_read_storage_error)?;
+
+            if response_records.iter().any(|record| record.is_none()) {
+                engine.refresh_collection(&room_id).map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "mtxdb refresh_collection error: {e}"
+                    ))
+                })?;
+                response_records = engine
+                    .get_read_committed(&room_id, &node_ids)
+                    .map_err(map_read_storage_error)?;
+            }
 
             for ((index, _), record) in room_groups.into_iter().zip(response_records) {
                 if let Some(record) = record.filter(|record| !record.bytes.is_empty()) {
