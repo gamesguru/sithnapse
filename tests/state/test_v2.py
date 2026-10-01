@@ -19,6 +19,7 @@
 #
 
 import itertools
+from collections import UserDict
 from typing import (
     Any,
     Collection,
@@ -1335,6 +1336,153 @@ class AuthChainDifferenceTestCase(unittest.TestCase):
                     want_pl,
                     f"wrong pl for {user_id} with no PL event on v{room_version.identifier}",
                 )
+
+
+@unittest.skip_unless(HAVE_RUST_STATE_RES, "synapse_rust.state_res unavailable")
+class RustAuthChainDifferenceInputTestCase(unittest.TestCase):
+    """Input-shape coverage for the Rust auth-difference fast path.
+
+    The Rust entry point has to copy every Python object it needs *before* it
+    releases the GIL, so `state_sets` is only ever inspected during that copy
+    and then never touched again. These cases feed one logical graph through
+    several container shapes and assert the answer never changes, which keeps
+    both the exact-`dict` fast path and the `values()` fallback honest.
+    """
+
+    def setUp(self) -> None:
+        # A -> B -> C, all present in the event map. The production caller only
+        # takes this path when every state-set ID *and its whole auth chain* is
+        # in `event_map` (see the `complete_event_graph` check), so the graph
+        # handed to Rust here is closed by construction.
+        self.a = FakeEvent(
+            id="A",
+            sender=ALICE,
+            type=EventTypes.Member,
+            state_key="",
+            content={},
+        ).to_event([], [])
+        self.b = FakeEvent(
+            id="B",
+            sender=ALICE,
+            type=EventTypes.Member,
+            state_key="",
+            content={},
+        ).to_event([self.a.event_id], [])
+        self.c = FakeEvent(
+            id="C",
+            sender=ALICE,
+            type=EventTypes.Member,
+            state_key="",
+            content={},
+        ).to_event([self.b.event_id], [])
+        self.event_map = {event.event_id: event for event in (self.a, self.b, self.c)}
+        self.state_sets = [
+            {("a", ""): self.a.event_id},
+            {("b", ""): self.b.event_id},
+            {("c", ""): self.c.event_id},
+        ]
+        # Each state set's auth chain includes itself, so the three chains are
+        # {A}, {A, B} and {A, B, C}: union - intersection is {B, C}.
+        self.expected = {self.b.event_id, self.c.event_id}
+
+    def rust_difference(self, state_sets: Any) -> set[str]:
+        import synapse.synapse_rust.state_res as rust_res
+
+        return rust_res.get_auth_chain_difference_from_event_graph(
+            state_sets, self.event_map
+        )
+
+    def python_difference(self, state_sets: Sequence[StateMap[str]]) -> set[str]:
+        """Run the pure-Python/store path on the identical inputs."""
+        difference = _get_auth_chain_difference(
+            ROOM_ID,
+            state_sets,
+            self.event_map,
+            TestStateResolutionStore({}),
+            None,
+            complete_event_graph=False,
+        )
+        return self.successResultOf(defer.ensureDeferred(difference))
+
+    def test_plain_dicts(self) -> None:
+        self.assertEqual(self.rust_difference(self.state_sets), self.expected)
+
+    def test_matches_python_path(self) -> None:
+        """The Rust fast path must agree with the path it replaced."""
+        self.assertEqual(
+            self.rust_difference(self.state_sets),
+            self.python_difference(self.state_sets),
+        )
+
+    def test_generator(self) -> None:
+        """`state_sets` is consumed with `try_iter`, so a generator works."""
+        self.assertEqual(
+            self.rust_difference(s for s in self.state_sets), self.expected
+        )
+
+    def test_state_sets_without_len(self) -> None:
+        """The container must never be asked for `len()`.
+
+        `len()` on an arbitrary iterable runs Python code whose exceptions are
+        only ever used for a capacity hint, so measuring the input is a
+        regression even if the answer comes out the same.
+        """
+
+        class IterableOnly:
+            def __init__(self, items: Sequence[StateMap[str]]) -> None:
+                self._items = items
+
+            def __iter__(self) -> Any:
+                return iter(self._items)
+
+            def __len__(self) -> int:
+                raise AssertionError("state_sets must not be measured with len()")
+
+        self.assertEqual(
+            self.rust_difference(IterableOnly(self.state_sets)), self.expected
+        )
+
+    def test_non_dict_mapping(self) -> None:
+        """A mapping that is not a `dict` still goes through `values()`."""
+        state_sets = [UserDict(s) for s in self.state_sets]
+        self.assertEqual(self.rust_difference(state_sets), self.expected)
+
+    def test_lengthless_values_iterable(self) -> None:
+        """The values fallback accepts an iterable without `__len__`."""
+
+        class LengthlessMapping(UserDict):
+            def values(self) -> Any:
+                return iter(super().values())
+
+        state_sets = [LengthlessMapping(s) for s in self.state_sets]
+        self.assertEqual(self.rust_difference(state_sets), self.expected)
+
+    def test_dict_subclass_honours_values(self) -> None:
+        """A `dict` subclass must reach its overridden `values()`.
+
+        The exact-`dict` fast path deliberately stops at plain dictionaries so
+        that an overridden `values()` is not silently bypassed; this is the
+        test that keeps that restriction in place.
+        """
+        values_calls: list[str] = []
+
+        class RecordingDict(dict):
+            def values(self) -> Any:
+                values_calls.append("called")
+                return super().values()
+
+        state_sets = [RecordingDict(s) for s in self.state_sets]
+        self.assertEqual(self.rust_difference(state_sets), self.expected)
+        self.assertEqual(len(values_calls), len(self.state_sets))
+
+    def test_empty(self) -> None:
+        """No state sets means no difference, not an error."""
+        self.assertEqual(self.rust_difference([]), set())
+        self.assertEqual(self.rust_difference(iter(())), set())
+
+    def test_single_state_set(self) -> None:
+        """With one set the intersection equals the union, so nothing differs."""
+        self.assertEqual(self.rust_difference(self.state_sets[:1]), set())
 
 
 T = TypeVar("T")

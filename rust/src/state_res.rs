@@ -30,6 +30,34 @@ use serde_json::Value;
 
 use crate::events::{json_object::JsonObject, Event, EventResolverData};
 
+/// Collect the event IDs out of one state set.
+///
+/// State sets are state maps (`dict[(type, state_key), event_id]`). Reading an
+/// exact `dict` directly skips `values()`' Python method dispatch; any other
+/// object (a mapping, a `dict` subclass, a test double) keeps the original
+/// `values()` call path so an overridden `values()` is still honoured.
+fn state_set_ids_of(state_set: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
+    if state_set.is_exact_instance_of::<PyDict>() {
+        // The exact-type check makes this cast infallible; keeping the
+        // assertion here also avoids accidentally applying this fast path to
+        // dict subclasses whose values() method may be overridden.
+        let dict = state_set
+            .cast::<PyDict>()
+            .expect("exact dict must cast to PyDict");
+        let mut ids = Vec::with_capacity(dict.len());
+        for (_key, value) in dict.iter() {
+            ids.push(value.extract()?);
+        }
+        return Ok(ids);
+    }
+    let values = state_set.call_method0("values")?;
+    let mut ids = Vec::new();
+    for value in values.try_iter()? {
+        ids.push(value?.extract()?);
+    }
+    Ok(ids)
+}
+
 #[pyfunction]
 #[pyo3(text_signature = "(state_sets, event_map, /)")]
 pub fn get_auth_chain_difference_from_event_graph<'py>(
@@ -65,40 +93,45 @@ pub fn get_auth_chain_difference_from_event_graph<'py>(
             },
         );
     }
-    let auth_graph = AuthGraph::build(&auth_graph_events);
-
-    let mut union: Option<HashSet<String>> = None;
-    let mut intersection: HashSet<String> = HashSet::new();
-
+    // Materialize all Python state-set values before releasing the GIL. The
+    // graph walk below is entirely Rust-owned and can otherwise block every
+    // Python worker while resolving a large DAG. `state_sets` may be any
+    // iterable (including a generator), so `state_set_ids` is grown without
+    // asking it for a `len()` -- that would run Python code and silently
+    // discard its exceptions for nothing more than a capacity hint.
+    let mut state_set_ids = Vec::new();
     for state_set in state_sets.try_iter()? {
-        let state_set = state_set?;
-        let values = state_set.call_method0("values")?;
-        let mut state_set_ids = Vec::with_capacity(values.len()?);
-        for value in values.try_iter()? {
-            state_set_ids.push(value?.extract()?);
-        }
-        let closure: HashSet<String> = auth_graph
-            .auth_difference(&[], &state_set_ids)
-            .into_iter()
-            .collect();
-
-        match &mut union {
-            None => {
-                intersection = closure.clone();
-                union = Some(closure);
-            }
-            Some(union) => {
-                union.extend(closure.iter().cloned());
-                intersection = intersection.intersection(&closure).cloned().collect();
-            }
-        }
+        state_set_ids.push(state_set_ids_of(&state_set?)?);
     }
 
-    let Some(union) = union else {
-        return PySet::empty(py);
-    };
+    let result = py.detach(move || {
+        let auth_graph = AuthGraph::build(&auth_graph_events);
+        let mut union: Option<HashSet<String>> = None;
+        let mut intersection: HashSet<String> = HashSet::new();
 
-    let result: HashSet<String> = union.difference(&intersection).cloned().collect();
+        for ids in state_set_ids {
+            let closure: HashSet<String> =
+                auth_graph.auth_difference(&[], &ids).into_iter().collect();
+
+            match &mut union {
+                None => {
+                    intersection = closure.clone();
+                    union = Some(closure);
+                }
+                Some(union) => {
+                    union.extend(closure.iter().cloned());
+                    intersection = intersection.intersection(&closure).cloned().collect();
+                }
+            }
+        }
+
+        let Some(union) = union else {
+            return HashSet::new();
+        };
+        union.difference(&intersection).cloned().collect()
+    });
+
+    // `PySet::new` handles the empty case, so no separate branch is needed.
     PySet::new(py, result)
 }
 
@@ -568,12 +601,16 @@ fn resolve_v2_from_parsed_events<'py>(
         }
     }
 
-    let resolved = resolve_semilattice_fold(
-        &base_state_map,
-        &conflicted_events,
-        parsed_events,
-        StateResVersion::V2,
-    );
+    // Auth checking over the conflicted subgraph is pure Rust on owned data;
+    // release the GIL so other Python workers keep running while it resolves.
+    let resolved = py.detach(|| {
+        resolve_semilattice_fold(
+            &base_state_map,
+            &conflicted_events,
+            parsed_events,
+            StateResVersion::V2,
+        )
+    });
 
     let py_resolved = PyDict::new(py);
     for ((type_, state_key), event_id) in resolved {
