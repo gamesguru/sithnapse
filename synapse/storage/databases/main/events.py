@@ -300,6 +300,13 @@ class NewEventChainLinks:
     links: list[tuple[int, int]] = attr.Factory(list)
 
 
+def _event_dict_for_embedded_json(event: EventBase) -> JsonDict:
+    d = event.get_dict_for_persistence()
+    d.pop("redacted", None)
+    d.pop("redacted_because", None)
+    return d
+
+
 class PersistEventsStore:
     """Contains all the functions for writing events to the database.
 
@@ -1396,13 +1403,7 @@ class PersistEventsStore:
                         event.event_id,
                         event.room_id,
                         json_encoder.encode(event.internal_metadata.get_dict()),
-                        json_encoder.encode(
-                            {
-                                key: value
-                                for key, value in event.get_dict_for_persistence().items()
-                                if key not in ("redacted", "redacted_because")
-                            }
-                        ),
+                        json_encoder.encode(_event_dict_for_embedded_json(event)),
                         event.format_version,
                     )
                     for event, _ in de_outliered_events
@@ -1410,6 +1411,9 @@ class PersistEventsStore:
                 sync=False,
                 transaction=mtxdb_txn,
             )
+
+            if publishes_at_commit():
+                txn.call_after(mark_dirty, Pool.EVENT_DAG)
 
         # From this point onwards the events are only events that we haven't
         # seen before.
@@ -1590,7 +1594,8 @@ class PersistEventsStore:
                     txn.call_after(mark_dirty, Pool.EVENT_DAG)
             elif self._embedded_event_json_enabled and needs_state_barrier:
                 if barrier_in_txn:
-                    # A de-outlier writes only a state mapping: no event JSON.
+                    # A de-outlier writes a state mapping and republishes event
+                    # JSON to the embedded engine.
                     maybe_sync(
                         SyncTier.DURABLE,
                         pools=[Pool.STATE]
@@ -3464,18 +3469,12 @@ class PersistEventsStore:
             # nothing to do here
             return
 
-        def event_dict(event: EventBase) -> JsonDict:
-            d = event.get_dict_for_persistence()
-            d.pop("redacted", None)
-            d.pop("redacted_because", None)
-            return d
-
         event_json_rows = [
             (
                 event.event_id,
                 event.room_id,
                 json_encoder.encode(event.internal_metadata.get_dict()),
-                json_encoder.encode(event_dict(event)),
+                json_encoder.encode(_event_dict_for_embedded_json(event)),
                 event.format_version,
             )
             for event, _ in events_and_contexts
