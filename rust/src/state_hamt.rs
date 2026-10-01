@@ -883,6 +883,42 @@ pub(crate) fn materialize_from_node_map(
     Ok(entries)
 }
 
+/// Materialize directly into the packed wire representation, avoiding the
+/// intermediate vector of owned Rust strings used by the compatibility API.
+fn pack_materialized_from_node_map(
+    root_hash: &StructuralHash,
+    node_map: &HashMap<StructuralHash, Arc<HamtNode<String, String>>>,
+) -> Result<Vec<u8>, String> {
+    let root_node = node_map
+        .get(root_hash)
+        .cloned()
+        .ok_or_else(|| format!("Missing persisted HAMT root node: {:02x?}", root_hash))?;
+    let mut output = vec![PACKED_ENTRIES_FORMAT, 0, 0, 0, 0];
+    let mut count = 0u32;
+    let mut resolver = |hash: &StructuralHash| {
+        node_map
+            .get(hash)
+            .cloned()
+            .ok_or_else(|| format!("Missing persisted HAMT node: {:02x?}", hash))
+    };
+    root_node.visit_entries(&mut resolver, &mut |key, value| {
+        let (event_type, state_key): (String, String) = serde_json::from_str(key)
+            .map_err(|e| format!("Failed to decode HAMT state key: {e}"))?;
+        for field in [&event_type, &state_key, value] {
+            let length = u32::try_from(field.len())
+                .map_err(|_| "state entry field is too long".to_owned())?;
+            output.extend_from_slice(&length.to_le_bytes());
+            output.extend_from_slice(field.as_bytes());
+        }
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| "too many state entries".to_owned())?;
+        Ok::<(), String>(())
+    })?;
+    output[1..5].copy_from_slice(&count.to_le_bytes());
+    Ok(output)
+}
+
 pub(crate) fn lookup_from_node_map(
     root_hash: &StructuralHash,
     structural_key: &[u8],
@@ -1130,9 +1166,21 @@ pub fn materialize_state_entries(
     root_node_bytes: Vec<u8>,
     nodes: Vec<(Vec<u8>, Vec<u8>)>,
 ) -> PyResult<Vec<PyStateEntry>> {
-    let mut root_hash = None;
-    let mut node_map: HashMap<StructuralHash, Arc<HamtNode<String, String>>> = HashMap::new();
+    let (root_hash, node_map) = parse_materialization_nodes(&root_node_bytes, nodes)?;
 
+    materialize_from_node_map(&root_hash, &node_map)
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+}
+
+fn parse_materialization_nodes(
+    root_node_bytes: &[u8],
+    nodes: Vec<(Vec<u8>, Vec<u8>)>,
+) -> PyResult<(
+    StructuralHash,
+    HashMap<StructuralHash, Arc<HamtNode<String, String>>>,
+)> {
+    let mut root_hash = None;
+    let mut node_map = HashMap::new();
     for (hash_bytes, node_bytes) in nodes {
         let hash = structural_hash_from_bytes(hash_bytes)?;
         if node_bytes == root_node_bytes {
@@ -1142,13 +1190,10 @@ pub fn materialize_state_entries(
             .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
         node_map.insert(hash, node);
     }
-
     let root_hash = root_hash.ok_or_else(|| {
         pyo3::exceptions::PyValueError::new_err("root_node_bytes not found in nodes list")
     })?;
-
-    materialize_from_node_map(&root_hash, &node_map)
-        .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    Ok((root_hash, node_map))
 }
 
 /// Materialize entries into a compact versioned byte buffer. The buffer is
@@ -1160,8 +1205,10 @@ pub fn materialize_state_entries_packed(
     root_node_bytes: Vec<u8>,
     nodes: Vec<(Vec<u8>, Vec<u8>)>,
 ) -> PyResult<Py<PyBytes>> {
-    let entries = materialize_state_entries(root_node_bytes, nodes)?;
-    Python::attach(|py| Ok(PyBytes::new(py, &pack_state_entries(&entries)?).unbind()))
+    let (root_hash, node_map) = parse_materialization_nodes(&root_node_bytes, nodes)?;
+    let packed = pack_materialized_from_node_map(&root_hash, &node_map)
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+    Python::attach(|py| Ok(PyBytes::new(py, &packed).unbind()))
 }
 
 /// Look up a set of `(event_type, state_key)` entries in a room's HAMT,

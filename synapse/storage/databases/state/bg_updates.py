@@ -55,6 +55,35 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _decode_packed_state_entries(packed: bytes) -> list[tuple[str, str, str]]:
+    """Decode the versioned Rust HAMT entry buffer."""
+    if not packed or packed[0] != 1:
+        raise RuntimeError("unsupported packed state HAMT format")
+    offset = 1
+    if len(packed) < offset + 4:
+        raise RuntimeError("truncated packed state HAMT header")
+    (count,) = struct.unpack_from("<I", packed, offset)
+    offset += 4
+    entries: list[tuple[str, str, str]] = []
+    for _ in range(count):
+        fields: list[str] = []
+        for _ in range(3):
+            if len(packed) < offset + 4:
+                raise RuntimeError("truncated packed state HAMT field length")
+            (length,) = struct.unpack_from("<I", packed, offset)
+            offset += 4
+            end = offset + length
+            if end > len(packed):
+                raise RuntimeError("truncated packed state HAMT field")
+            fields.append(packed[offset:end].decode("utf-8"))
+            offset = end
+        entries.append((fields[0], fields[1], fields[2]))
+    if offset != len(packed):
+        raise RuntimeError("trailing bytes in packed state HAMT response")
+    return entries
+
+
 # ── mtxdb-vs-SQL timing (opt-in via SYNAPSE_PG_TIMINGS=1) ───────────────
 # Read once at import time. `_state_timing`/`_state_counter` are called from
 # every state-group read/write -- including the plain-SQL fallback branches,
@@ -1079,9 +1108,11 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
                             seen_hashes.add(child_hash)
                             to_fetch.add(child_hash)
 
-        entries = state_hamt.materialize_state_entries(
-            node_bytes_by_hash[root_structural_hash],
-            list(node_bytes_by_hash.items()),
+        entries = _decode_packed_state_entries(
+            state_hamt.materialize_state_entries_packed(
+                node_bytes_by_hash[root_structural_hash],
+                list(node_bytes_by_hash.items()),
+            )
         )
         logger.debug(
             "[gg-state-timing] _materialize_state_hamt_from_postgres_txn "
@@ -1146,9 +1177,11 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
 
         for group, root_hash in roots.items():
             root_bytes = node_bytes_by_hash[root_hash]
-            results[group] = state_hamt.materialize_state_entries(
-                root_bytes,
-                list(node_bytes_by_hash.items()),
+            results[group] = _decode_packed_state_entries(
+                state_hamt.materialize_state_entries_packed(
+                    root_bytes,
+                    list(node_bytes_by_hash.items()),
+                )
             )
         return results
 
@@ -1192,12 +1225,13 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
         root_bytes = bytes(root_node)
         nodes: dict[bytes, bytes] = {root_hash: root_bytes}
         while True:
-            entries, missing = state_hamt.lookup_state_entries(
+            packed_entries, missing = state_hamt.lookup_state_entries_packed(
                 room_id,
                 root_bytes,
                 list(nodes.items()),
                 keys,
             )
+            entries = _decode_packed_state_entries(packed_entries)
             missing = [
                 bytes(node_hash) for node_hash in missing if node_hash not in nodes
             ]
@@ -1278,12 +1312,13 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
             already fetched -- defensive, mirrors the single-group loop)."""
             still_missing: set[bytes] = set()
             for group, root_hash in roots.items():
-                entries, missing = state_hamt.lookup_state_entries(
+                packed_entries, missing = state_hamt.lookup_state_entries_packed(
                     room_ids[group],
                     node_bytes_by_hash[root_hash],
                     list(node_bytes_by_hash.items()),
                     keys,
                 )
+                entries = _decode_packed_state_entries(packed_entries)
                 results[group] = entries
                 still_missing.update(
                     bytes(node_hash)
