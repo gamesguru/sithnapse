@@ -3604,9 +3604,19 @@ pub fn event_json_get(
             // Read-only workers hold an open-time index; refresh on a miss so
             // locators for events the writer appended after this worker opened
             // resolve instead of reporting the event absent.
-            let found = engine
+            let mut found = engine
                 .get_read_committed(&collection, &node_ids_only)
                 .map_err(map_read_storage_error)?;
+            if found.iter().any(|value| value.is_none()) {
+                engine.refresh_collection(&collection).map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "mtxdb refresh_collection error: {e}"
+                    ))
+                })?;
+                found = engine
+                    .get_read_committed(&collection, &node_ids_only)
+                    .map_err(map_read_storage_error)?;
+            }
             for ((position, _), value) in ids.into_iter().zip(found) {
                 if let Some(data) = value {
                     if !data.bytes.is_empty() {
@@ -3645,9 +3655,19 @@ pub fn event_json_get(
             let node_ids_only: Vec<NodeId> = ids.iter().map(|(_, _, id)| *id).collect();
             // Refresh on a miss so event bodies/metadata the writer appended
             // after this worker opened are visible to the read.
-            let found = engine
+            let mut found = engine
                 .get_read_committed(&collection, &node_ids_only)
                 .map_err(map_read_storage_error)?;
+            if found.iter().any(|value| value.is_none()) {
+                engine.refresh_collection(&collection).map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "mtxdb refresh_collection error: {e}"
+                    ))
+                })?;
+                found = engine
+                    .get_read_committed(&collection, &node_ids_only)
+                    .map_err(map_read_storage_error)?;
+            }
             for ((position, kind, _), value) in ids.into_iter().zip(found) {
                 if let Some(data) = value {
                     if !data.bytes.is_empty() {
