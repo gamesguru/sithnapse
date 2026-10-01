@@ -223,13 +223,21 @@ pub(crate) fn begin_internal_transaction() -> PyResult<Option<DatabaseTransactio
 
 const RETRYABLE_READ_ERROR_PREFIX: &str = "__MTXDB_RETRYABLE_READ__: ";
 
+/// Journal/checkpoint contention: either mtxdb's dedicated `WouldBlock`
+/// variant (e.g. read-committed reload failed or checkpoint coverage
+/// advanced) or an I/O `WouldBlock`. Corruption is never contention.
+fn is_retryable_contention(error: &StorageError) -> bool {
+    matches!(error, StorageError::WouldBlock(_))
+        || matches!(
+            error,
+            StorageError::Io(io_error) if io_error.kind() == std::io::ErrorKind::WouldBlock
+        )
+}
+
 /// Preserve journal contention as a retryable Python I/O error. Other storage
 /// failures remain runtime errors so corruption is never retried as contention.
 pub(crate) fn map_read_storage_error(error: StorageError) -> PyErr {
-    let retryable = matches!(
-        &error,
-        StorageError::Io(io_error) if io_error.kind() == std::io::ErrorKind::WouldBlock
-    );
+    let retryable = is_retryable_contention(&error);
     let message = format!("mtxdb get_read_committed error: {error}");
     if retryable {
         pyo3::exceptions::PyBlockingIOError::new_err(message)
@@ -241,11 +249,10 @@ pub(crate) fn map_read_storage_error(error: StorageError) -> PyErr {
 /// The generic HAMT NodeStore API carries string errors. Prefix transient
 /// journal contention so its Python boundary can restore the retryable type.
 fn storage_error_to_hamt_string(error: StorageError) -> String {
-    match &error {
-        StorageError::Io(io_error) if io_error.kind() == std::io::ErrorKind::WouldBlock => {
-            format!("{RETRYABLE_READ_ERROR_PREFIX}{error}")
-        }
-        _ => error.to_string(),
+    if is_retryable_contention(&error) {
+        format!("{RETRYABLE_READ_ERROR_PREFIX}{error}")
+    } else {
+        error.to_string()
     }
 }
 
