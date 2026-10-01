@@ -12,7 +12,7 @@ use mtxdb::{
     PackfileStorage, PayloadPolicy, RecordIdentityRule, ShardType, StorageEngine,
     MEMBER_NAMESPACE_FWD, MEMBER_NAMESPACE_INTL,
 };
-use mtxdb::{DatabaseTransaction, SharedDatabase};
+use mtxdb::{Database, DatabaseTransaction};
 use once_cell::sync::OnceCell;
 use pyo3::{create_exception, exceptions::PyException, prelude::*, PyTypeInfo};
 use sha2::{Digest, Sha256};
@@ -99,7 +99,7 @@ struct MtxdbPools {
     event_dag: Arc<PackfileStorage>,
     auth_chain: Arc<PackfileStorage>,
     server_info: Arc<PackfileStorage>,
-    shared_database: Option<SharedDatabase>,
+    shared_database: Option<Database>,
 }
 
 /// Base directory for the state_group -> room_prefix room-index file (see
@@ -218,7 +218,7 @@ pub(crate) fn begin_internal_transaction() -> PyResult<Option<DatabaseTransactio
     Ok(pools()?
         .shared_database
         .as_ref()
-        .map(SharedDatabase::begin_transaction))
+        .map(Database::begin_transaction))
 }
 
 const RETRYABLE_READ_ERROR_PREFIX: &str = "__MTXDB_RETRYABLE_READ__: ";
@@ -1986,6 +1986,8 @@ fn wal_enabled_from(wal: Option<&str>) -> bool {
 
 #[cfg(test)]
 mod wal_env_tests {
+    use mtxdb::ShardType;
+
     use super::wal_enabled_from;
 
     #[test]
@@ -2032,7 +2034,7 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
         // event-dag/auth-chain pools (JSON-ish payloads) keep compression on.
         let shared_database = if wal_enabled() {
             Some(
-                SharedDatabase::open_with_policies(
+                Database::open_with_policies(
                     std::path::PathBuf::from(&path),
                     mtxdb::matrix_pool_policies(),
                 )
