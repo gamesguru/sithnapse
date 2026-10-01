@@ -1,3 +1,4 @@
+import struct
 from typing import Any
 from unittest import SkipTest
 
@@ -33,6 +34,41 @@ def test_state_hamt_benchmark_fixture_round_trips() -> None:
     actual = {(typ, state_key): event_id for typ, state_key, event_id in result}
     assert actual == fixture.state
     assert len([key for key in actual if key[0] == EventTypes.Member]) == 20
+
+
+def test_state_hamt_packed_round_trip_matches_tuple_api() -> None:
+    fixture = _make_state_fixture(20, other_state_count=8, mutation_count=4)
+    entries = [
+        (typ, state_key, event_id)
+        for (typ, state_key), event_id in fixture.state.items()
+    ]
+    root, nodes = state_hamt.build_root_handle(fixture.room_id, entries)
+    node_map = {bytes(node_hash): bytes(blob) for node_hash, blob in nodes}
+    packed = state_hamt.materialize_state_entries_packed(
+        node_map[bytes(root[0])], list(node_map.items())
+    )
+
+    offset = 0
+    assert packed[offset] == 1
+    offset += 1
+    (count,) = struct.unpack_from("<I", packed, offset)
+    offset += 4
+    unpacked = []
+    for _ in range(count):
+        fields = []
+        for _ in range(3):
+            (length,) = struct.unpack_from("<I", packed, offset)
+            offset += 4
+            fields.append(packed[offset : offset + length].decode())
+            offset += length
+        unpacked.append(tuple(fields))
+
+    assert offset == len(packed)
+    assert set(unpacked) == set(
+        state_hamt.materialize_state_entries(
+            node_map[bytes(root[0])], list(node_map.items())
+        )
+    )
 
 
 def test_state_hamt_benchmark_fixture_is_deterministic() -> None:

@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use hmac::{Hmac, KeyInit, Mac};
 use pyo3::prelude::*;
-use pyo3::types::{PyModule, PyModuleMethods};
+use pyo3::types::{PyBytes, PyModule, PyModuleMethods};
 use rezzy::{
     hamt::{HamtNode, NodeRef, PersistedInternalNode, RootHandle, StateGroupId, StructuralHash},
     LtHash,
@@ -52,6 +52,30 @@ type PyReachabilityAudit = (Vec<Vec<u8>>, Vec<Vec<u8>>);
 type PyStateLookup = (Vec<PyStateEntry>, Vec<Vec<u8>>);
 
 const TYPED_ROOT_FORMAT: u8 = 0x02;
+const PACKED_ENTRIES_FORMAT: u8 = 1;
+
+fn pack_state_entries(entries: &[PyStateEntry]) -> PyResult<Vec<u8>> {
+    let mut output = Vec::new();
+    output.push(PACKED_ENTRIES_FORMAT);
+    output.extend_from_slice(
+        &u32::try_from(entries.len())
+            .map_err(|_| pyo3::exceptions::PyValueError::new_err("too many state entries"))?
+            .to_le_bytes(),
+    );
+    for (event_type, state_key, event_id) in entries {
+        for field in [event_type, state_key, event_id] {
+            output.extend_from_slice(
+                &u32::try_from(field.len())
+                    .map_err(|_| {
+                        pyo3::exceptions::PyValueError::new_err("state entry field is too long")
+                    })?
+                    .to_le_bytes(),
+            );
+            output.extend_from_slice(field.as_bytes());
+        }
+    }
+    Ok(output)
+}
 
 /// The compact directory at the root of a typed state HAMT. The directory is
 /// sorted by event type and points at one state_key -> event_id HAMT per type.
@@ -1127,6 +1151,19 @@ pub fn materialize_state_entries(
         .map_err(pyo3::exceptions::PyRuntimeError::new_err)
 }
 
+/// Materialize entries into a compact versioned byte buffer. The buffer is
+/// `[version:u8][count:u32][len:u32][utf8]...`, with three fields per entry:
+/// event type, state key, and event ID.
+#[pyfunction]
+#[pyo3(text_signature = "(root_node_bytes, nodes, /)")]
+pub fn materialize_state_entries_packed(
+    root_node_bytes: Vec<u8>,
+    nodes: Vec<(Vec<u8>, Vec<u8>)>,
+) -> PyResult<Py<PyBytes>> {
+    let entries = materialize_state_entries(root_node_bytes, nodes)?;
+    Python::attach(|py| Ok(PyBytes::new(py, &pack_state_entries(&entries)?).unbind()))
+}
+
 /// Look up a set of `(event_type, state_key)` entries in a room's HAMT,
 /// given a pool of already-fetched `(hash, node_bytes)` pairs.
 ///
@@ -1269,6 +1306,25 @@ pub fn lookup_state_entries(
     ))
 }
 
+/// Lookup state entries and return the same compact representation as
+/// [`materialize_state_entries_packed`], followed by missing node hashes.
+#[pyfunction]
+#[pyo3(text_signature = "(room_id, root_node_bytes, nodes, keys, /)")]
+pub fn lookup_state_entries_packed(
+    room_id: &str,
+    root_node_bytes: Vec<u8>,
+    nodes: Vec<(Vec<u8>, Vec<u8>)>,
+    keys: Vec<(String, String)>,
+) -> PyResult<(Py<PyBytes>, Vec<Vec<u8>>)> {
+    let (entries, missing) = lookup_state_entries(room_id, root_node_bytes, nodes, keys)?;
+    Python::attach(|py| {
+        Ok((
+            PyBytes::new(py, &pack_state_entries(&entries)?).unbind(),
+            missing,
+        ))
+    })
+}
+
 #[pyfunction]
 #[pyo3(text_signature = "(node_bytes, /)")]
 pub fn node_child_hashes(node_bytes: Vec<u8>) -> PyResult<Vec<Vec<u8>>> {
@@ -1381,7 +1437,15 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     child_module.add_function(wrap_pyfunction!(apply_typed_state_updates, &child_module)?)?;
     child_module.add_function(wrap_pyfunction!(decode_typed_root, &child_module)?)?;
     child_module.add_function(wrap_pyfunction!(materialize_state_entries, &child_module)?)?;
+    child_module.add_function(wrap_pyfunction!(
+        materialize_state_entries_packed,
+        &child_module
+    )?)?;
     child_module.add_function(wrap_pyfunction!(lookup_state_entries, &child_module)?)?;
+    child_module.add_function(wrap_pyfunction!(
+        lookup_state_entries_packed,
+        &child_module
+    )?)?;
     child_module.add_function(wrap_pyfunction!(node_child_hashes, &child_module)?)?;
     child_module.add_function(wrap_pyfunction!(reachability_audit, &child_module)?)?;
     child_module.add_function(wrap_pyfunction!(unreachable_node_hashes, &child_module)?)?;
