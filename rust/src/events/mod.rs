@@ -142,6 +142,7 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     child_module.add_function(wrap_pyfunction!(filter::event_visible_to_server_py, m)?)?;
     child_module.add_function(wrap_pyfunction!(redact_event_py, m)?)?;
     child_module.add_function(wrap_pyfunction!(redact_event_dict, m)?)?;
+    child_module.add_function(wrap_pyfunction!(sha256_canonical_json, m)?)?;
     child_module.add_function(wrap_pyfunction!(serialize::serialize_events, m)?)?;
     child_module.add_function(wrap_pyfunction!(serialize::format_event_raw, m)?)?;
     child_module.add_function(wrap_pyfunction!(serialize::format_event_for_client_v1, m)?)?;
@@ -160,6 +161,21 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
         .set_item("synapse.synapse_rust.events", child_module)?;
 
     Ok(())
+}
+
+/// Canonicalize a Python JSON-compatible value and return its SHA-256 digest.
+/// The conversion happens once in Rust; the canonical serializer streams
+/// directly into the hasher without creating an intermediate JSON string.
+#[pyfunction]
+#[pyo3(text_signature = "(value, /)")]
+fn sha256_canonical_json(value: Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+    let value: Value = depythonize(&value)?;
+    crate::canonical_json::sha256_canonical(
+        &value,
+        crate::canonical_json::CanonicalizationOptions::relaxed(),
+    )
+    .map(|digest| digest.to_vec())
+    .map_err(|err| PyValueError::new_err(err.to_string()))
 }
 
 /// The Rust-side representation of a Matrix event, exposed to Python.
