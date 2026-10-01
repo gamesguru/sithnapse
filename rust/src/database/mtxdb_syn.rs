@@ -2005,9 +2005,9 @@ mod wal_env_tests {
     #[test]
     fn wal_matrix_pool_policies_disables_state_compression() {
         let policies = mtxdb::matrix_pool_policies();
-        assert!(!policies.state.compress);
-        assert!(policies.event_dag.compress);
-        assert!(policies.edges.compress);
+        assert!(!policies.for_shard(ShardType::State).compress);
+        assert!(policies.for_shard(ShardType::EventDag).compress);
+        assert!(policies.for_shard(ShardType::Edges).compress);
     }
 }
 
@@ -4315,10 +4315,6 @@ fn stats_to_dict(
         od.set_item(
             "persisted_stats_restore_us",
             ot.persisted_stats_restore.as_micros() as u64,
-        )?;
-        od.set_item(
-            "store_meta_write_us",
-            ot.store_meta_write.as_micros() as u64,
         )?;
         od.set_item(
             "pool_meta_persist_us",
