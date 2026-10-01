@@ -729,7 +729,13 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         # which retains SQL fallback, stale-index refresh and corruption
         # handling semantics -- at the cost of re-reading what the fast path
         # already fetched, which is rare and cheap.
-        if self._embedded_db_engine and groups:
+        # A read-only worker can have a stale in-process mtxdb collection
+        # index while the SQL transaction stream is already current. Keep the
+        # optimization on the single state writer, where the sidecar overlay
+        # and SQL commit are ordered by the same process; readers retain the
+        # transactional path until cross-process publication has a stronger
+        # read barrier.
+        if self._embedded_db_engine and self._embedded_db_is_writer and groups:
             engine = get_embedded_engine(self._embedded_db_engine)
             namespace = self._embedded_db_namespace
             exact_keys = (
