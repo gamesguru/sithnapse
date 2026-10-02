@@ -1447,19 +1447,39 @@ class PersistEventsStore:
         # to the embedded index as well, otherwise the SQL source version can
         # move ahead of the embedded forward index.
         if self._embedded_event_edges_writable and de_outliered_events:
-            edge_rows = [
-                (event.room_id, event.event_id, prev_event_id, False)
-                for event, _ in de_outliered_events
-                for prev_event_id in event.prev_event_ids()
-            ]
-            if edge_rows:
-                txn.call_after(
-                    put_event_edges_batch,
-                    self._embedded_db_namespace,
-                    edge_rows,
-                    sync=True,
+            edges_by_room: dict[str, list[tuple[str, str]]] = collections.defaultdict(
+                list
+            )
+            for event, _ in de_outliered_events:
+                edges_by_room[event.room_id].extend(
+                    (event.event_id, prev_event_id)
+                    for prev_event_id in event.prev_event_ids()
                 )
-                txn.call_after(mark_dirty, Pool.EVENT_DAG)
+
+            # The SQL edges already exist for an outlier. Re-enqueue them at a
+            # fresh source version so the normal drainer republishes them and
+            # advances room_forward_meta.published_source_version.
+            for room_id, room_edges in edges_by_room.items():
+                room_edges = list(dict.fromkeys(room_edges))
+                if not room_edges:
+                    continue
+                source_version = bump_room_edge_source_version(txn, room_id)
+                self.db_pool.simple_insert_many_txn(
+                    txn,
+                    table="edge_index_outbox",
+                    keys=(
+                        "room_id",
+                        "source_version",
+                        "event_id",
+                        "prev_event_id",
+                        "operation",
+                    ),
+                    values=[
+                        (room_id, source_version, event_id, prev_event_id, "insert")
+                        for event_id, prev_event_id in room_edges
+                    ],
+                )
+            txn.call_after(mark_dirty, Pool.EVENT_DAG)
 
         if new_forward_extremities:
             self._update_forward_extremities_txn(
