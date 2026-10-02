@@ -2463,6 +2463,23 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
         # because we always need an upper bound when querying the events stream (as
         # otherwise we'll potentially pick up events that are not fully persisted).
 
+        # Backfilled events can have topological positions which move backwards
+        # as history is extended. A forward request starting from such a token
+        # cannot use the global topological ordering predicate: the next event
+        # may have a smaller topological position. Stream ordering remains
+        # monotonic for persisted events and is the correct continuation order.
+        if direction == Direction.FORWARDS and from_key.topological is not None:
+            stream_to_key = (
+                RoomStreamToken(stream=to_key.stream) if to_key is not None else None
+            )
+            return await self.paginate_room_events_by_stream_ordering(
+                room_id=room_id,
+                from_key=RoomStreamToken(stream=from_key.stream),
+                to_key=stream_to_key,
+                direction=direction,
+                limit=limit,
+            )
+
         # We have these checks outside of the transaction function (txn) to save getting
         # a DB connection and switching threads if we don't need to.
         #
