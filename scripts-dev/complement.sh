@@ -1030,21 +1030,19 @@ record_result() {
   jq -nc --arg Action "$action" --arg Test "$test_name" \
     '{Action: $Action, Test: $Test}' >>"$staged_results_file"
 
-  if [ "$action" != "skip" ]; then
-    # Truncate only the printed name (the full name is still recorded
-    # above) so a long subtest path doesn't wrap the summary line.
-    local _display_name="$test_name"
-    if [ "${#_display_name}" -gt 80 ]; then
-      _display_name="${_display_name:0:79}…"
-    fi
-    # `printf %-80s` measures UTF-8 bytes, not terminal characters. A name
-    # containing `§` (as in the MSC4499 tests) would therefore make the
-    # duration appear one column early. Bash's `${#var}` is character-based
-    # under the UTF-8 locale used by the test runner, so pad explicitly.
-    local _name_padding=$((80 - ${#_display_name}))
-    printf '%-6s  %s%*s  %8s\n' \
-      "${action^^}" "$_display_name" "$_name_padding" "" "$elapsed" >&2
+  # Truncate only the printed name (the full name is still recorded
+  # above) so a long subtest path doesn't wrap the summary line.
+  local _display_name="$test_name"
+  if [ "${#_display_name}" -gt 80 ]; then
+    _display_name="${_display_name:0:79}…"
   fi
+  # `printf %-80s` measures UTF-8 bytes, not terminal characters. A name
+  # containing `§` (as in the MSC4499 tests) would therefore make the
+  # duration appear one column early. Bash's `${#var}` is character-based
+  # under the UTF-8 locale used by the test runner, so pad explicitly.
+  local _name_padding=$((80 - ${#_display_name}))
+  printf '%-6s  %s%*s  %8s\n' \
+    "${action^^}" "$_display_name" "$_name_padding" "" "$elapsed" >&2
 }
 
 # ── run_one_pattern: one go test invocation per -run alternative ─────────────
