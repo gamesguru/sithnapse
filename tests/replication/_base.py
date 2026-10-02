@@ -27,6 +27,7 @@ from twisted.internet.testing import MemoryReactor
 from twisted.python.failure import Failure
 from twisted.web.resource import Resource
 
+from synapse.app._base import max_request_body_size
 from synapse.app.generic_worker import GenericWorkerServer
 from synapse.config.workers import InstanceTcpLocationConfig, InstanceUnixLocationConfig
 from synapse.http.site import SynapseRequest, SynapseSite
@@ -425,7 +426,7 @@ class BaseMultiWorkerStreamTestCase(unittest.HomeserverTestCase):
             config=worker_hs.config.server.listeners[0],
             resource=resource,
             server_version_string="1",
-            max_request_body_size=8192,
+            max_request_body_size=max_request_body_size(worker_hs.config),
             reactor=self.reactor,
             hs=worker_hs,
         )

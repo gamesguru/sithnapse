@@ -66,6 +66,7 @@ from twisted.web.server import Request
 from synapse import events
 from synapse.api.constants import EventTypes
 from synapse.api.room_versions import KNOWN_ROOM_VERSIONS, RoomVersion
+from synapse.app._base import max_request_body_size
 from synapse.config._base import Config, RootConfig
 from synapse.config.homeserver import HomeServerConfig
 from synapse.config.server import DEFAULT_ROOM_VERSION
@@ -206,14 +207,17 @@ def make_homeserver_config_obj(config: dict[str, Any]) -> HomeServerConfig:
     to avoid validating the whole configuration every time.
     """
     # embedded_db (mtxdb) supports a single writer process. Strip it when
-    # the config declares multiple sharded event writers (which cannot use mtxdb)
+    # the config declares a non-main background tasks worker or non-main event writers
     # to avoid the guard in WorkerConfig.read_config.
     config = dict(config)
     stream_writers = config.get("stream_writers") or {}
     event_writers = (
         stream_writers.get("events") if isinstance(stream_writers, dict) else []
     )
-    if event_writers and len(event_writers) > 1:
+    background_tasks_instance = config.get("run_background_tasks_on") or "main"
+    if background_tasks_instance != "main" or (
+        event_writers and event_writers != ["main"]
+    ):
         config.pop("embedded_db", None)
     config_obj = _parse_config_dict(json.dumps(config, sort_keys=True))
     return deepcopy_config(config_obj)
@@ -596,7 +600,7 @@ class HomeserverTestCase(TestCase):
             config=self.hs.config.server.listeners[0],
             resource=self.resource,
             server_version_string="1",
-            max_request_body_size=4096,
+            max_request_body_size=max_request_body_size(self.hs.config),
             reactor=self.reactor,
             hs=self.hs,
         )
