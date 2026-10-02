@@ -154,23 +154,41 @@ def record_edge_index_repairs_txn(
     if not event_ids:
         return None
 
-    source_version = bump_room_edge_source_version(txn, room_id)
-    db_pool.simple_insert_many_txn(
-        txn,
-        table="edge_index_outbox",
-        keys=(
-            "room_id",
-            "source_version",
-            "event_id",
-            "prev_event_id",
-            "operation",
-        ),
-        values=[
-            (room_id, source_version, event_id, prev_event_id, "insert")
-            for event_id in event_ids
-        ],
+    source_versions = record_edge_index_inserts_txn(
+        db_pool, txn, {room_id: [(event_id, prev_event_id) for event_id in event_ids]}
     )
-    return source_version
+    return source_versions.get(room_id)
+
+
+def record_edge_index_inserts_txn(
+    db_pool: Any,
+    txn: Any,
+    rows_by_room: dict[str, list[tuple[str, str]]],
+) -> dict[str, int]:
+    """Record forward-index inserts in the ordered outbox."""
+    source_versions = {}
+    for room_id, rows in rows_by_room.items():
+        rows = list(dict.fromkeys(rows))
+        if not rows:
+            continue
+        source_version = bump_room_edge_source_version(txn, room_id)
+        db_pool.simple_insert_many_txn(
+            txn,
+            table="edge_index_outbox",
+            keys=(
+                "room_id",
+                "source_version",
+                "event_id",
+                "prev_event_id",
+                "operation",
+            ),
+            values=[
+                (room_id, source_version, event_id, prev_event_id, "insert")
+                for event_id, prev_event_id in rows
+            ],
+        )
+        source_versions[room_id] = source_version
+    return source_versions
 
 
 # ---------------------------------------------------------------------------

@@ -83,6 +83,7 @@ from synapse.storage.databases.main.embedded_event_edges import (
     embedded_event_edges_is_writable,
     open_embedded_event_edges_engine,
     put_event_edges_batch,
+    record_edge_index_inserts_txn,
 )
 from synapse.storage.databases.main.embedded_event_json import (
     get_event_json_batch,
@@ -1459,26 +1460,7 @@ class PersistEventsStore:
             # The SQL edges already exist for an outlier. Re-enqueue them at a
             # fresh source version so the normal drainer republishes them and
             # advances room_forward_meta.published_source_version.
-            for room_id, room_edges in edges_by_room.items():
-                room_edges = list(dict.fromkeys(room_edges))
-                if not room_edges:
-                    continue
-                source_version = bump_room_edge_source_version(txn, room_id)
-                self.db_pool.simple_insert_many_txn(
-                    txn,
-                    table="edge_index_outbox",
-                    keys=(
-                        "room_id",
-                        "source_version",
-                        "event_id",
-                        "prev_event_id",
-                        "operation",
-                    ),
-                    values=[
-                        (room_id, source_version, event_id, prev_event_id, "insert")
-                        for event_id, prev_event_id in room_edges
-                    ],
-                )
+            record_edge_index_inserts_txn(self.db_pool, txn, edges_by_room)
             txn.call_after(mark_dirty, Pool.EVENT_DAG)
 
         if new_forward_extremities:
