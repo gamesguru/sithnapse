@@ -1089,6 +1089,9 @@ run_one_pattern() {
     packages=(./tests/...)
     echo "No matching Complement package found for $pattern; using ${packages[0]}" >&2
   fi
+  if [ "$pattern" = "." ]; then
+    echo "Selected package(s) for full Complement run: ${packages[*]}" >&2
+  fi
 
   local -a flags=(
     -tags "$test_tags"
