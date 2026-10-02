@@ -959,14 +959,11 @@ async def repair_edge_index_from_sql(
             store.db_pool, txn, room_id, prev_event_id, event_ids_to_repair
         )
 
-    source_version = await store.db_pool.runInteraction(
-        "record_edge_index_repair", _enqueue_repair
+    await store.db_pool.runInteraction("record_edge_index_repair", _enqueue_repair)
+    queue_edge_write(
+        namespace,
+        [(room_id, event_id, prev_event_id, False) for event_id in event_ids],
     )
-    if source_version is not None:
-        queue_edge_write(
-            namespace,
-            [(room_id, event_id, prev_event_id, False) for event_id in event_ids],
-        )
     # The ordinary worker continues draining other rooms. Target this room so
     # a pending or newly-created repair can make the next gated read an
     # embedded hit now.

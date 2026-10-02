@@ -19,7 +19,6 @@
 #
 #
 
-from unittest.mock import patch
 
 from twisted.internet.testing import MemoryReactor
 
@@ -61,24 +60,8 @@ class EventPersisterShardTestCase(BaseMultiWorkerStreamTestCase):
         }
         return conf
 
-    def _create_room(self, room_id: str, user_id: str, tok: str) -> None:
-        """Create a room with given room_id"""
-
-        # We control the room ID generation by patching out the
-        # `_generate_room_id` method
-        with patch(
-            "synapse.handlers.room.RoomCreationHandler._generate_room_id"
-        ) as mock:
-            mock.side_effect = lambda: room_id
-            self.helper.create_room_as(user_id, tok=tok)
-
     def test_basic(self) -> None:
-        """Ensure rooms assigned to each shard are persisted by that instance.
-
-        The room IDs are deliberately chosen rather than generated randomly: a
-        random sample can, however rarely, all hash to the same shard and make
-        this test flaky.
-        """
+        """Ensure rooms assigned to each shard are persisted by that instance."""
 
         self.make_worker_hs(
             "synapse.app.generic_worker",
@@ -95,9 +78,13 @@ class EventPersisterShardTestCase(BaseMultiWorkerStreamTestCase):
         user_id = self.register_user("user", "pass")
         access_token = self.login("user", "pass")
 
+        room_generation_results = self._generate_rooms_on_worker(user_id, access_token)
+        room_id1 = room_generation_results["worker1"]
+        room_id2 = room_generation_results["worker2"]
+
         rooms = (
-            ("!foo:test", "worker1"),
-            ("!baz:test", "worker2"),
+            (room_id1, "worker1"),
+            (room_id2, "worker2"),
         )
         for room_id, expected_instance in rooms:
             self.assertEqual(
@@ -105,7 +92,6 @@ class EventPersisterShardTestCase(BaseMultiWorkerStreamTestCase):
                 expected_instance,
             )
 
-            self._create_room(room_id, user_id, access_token)
             self.helper.join(
                 room=room_id, user=self.other_user_id, tok=self.other_access_token
             )

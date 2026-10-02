@@ -122,6 +122,16 @@ class BaseStreamTestCase(unittest.HomeserverTestCase):
         config = self.default_config()
         config["worker_app"] = "synapse.app.generic_worker"
         config["instance_map"] = {"main": {"host": "testserv", "port": 8765}}
+        if hasattr(self, "hs") and getattr(
+            self.hs.config.database, "embedded_db_engine", None
+        ):
+            config["embedded_db"] = {
+                "engine": self.hs.config.database.embedded_db_engine,
+                "path": self.hs.config.database.embedded_db_path,
+                "namespace": self.hs.config.database.embedded_db_namespace,
+                "no_sync": self.hs.config.database.embedded_db_no_sync,
+                "flush_delay_secs": self.hs.config.database.embedded_db_flush_delay_secs,
+            }
         return config
 
     def _build_replication_data_handler(self) -> "TestReplicationDataHandler":
@@ -426,6 +436,16 @@ class BaseMultiWorkerStreamTestCase(unittest.HomeserverTestCase):
 
     def _get_worker_hs_config(self) -> dict:
         config = self.default_config()
+        if hasattr(self, "hs") and getattr(
+            self.hs.config.database, "embedded_db_engine", None
+        ):
+            config["embedded_db"] = {
+                "engine": self.hs.config.database.embedded_db_engine,
+                "path": self.hs.config.database.embedded_db_path,
+                "namespace": self.hs.config.database.embedded_db_namespace,
+                "no_sync": self.hs.config.database.embedded_db_no_sync,
+                "flush_delay_secs": self.hs.config.database.embedded_db_flush_delay_secs,
+            }
         return config
 
     def replicate(self) -> None:
