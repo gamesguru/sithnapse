@@ -940,7 +940,9 @@ async def repair_edge_index_from_sql(
             (room_id, prev_event_id, *event_ids),
         )
         pending = {str(row[0]) for row in txn}
-        event_ids_to_repair = [event_id for event_id in event_ids if event_id not in pending]
+        event_ids_to_repair = [
+            event_id for event_id in event_ids if event_id not in pending
+        ]
         if not event_ids_to_repair:
             return None
         return record_edge_index_repairs_txn(
@@ -950,15 +952,14 @@ async def repair_edge_index_from_sql(
     source_version = await store.db_pool.runInteraction(
         "record_edge_index_repair", _enqueue_repair
     )
-    if source_version is None:
-        return
-
-    queue_edge_write(
-        namespace,
-        [(room_id, event_id, prev_event_id, False) for event_id in event_ids],
-    )
+    if source_version is not None:
+        queue_edge_write(
+            namespace,
+            [(room_id, event_id, prev_event_id, False) for event_id in event_ids],
+        )
     # The ordinary worker continues draining other rooms. Target this room so
-    # a successful repair can make the next gated read an embedded hit now.
+    # a pending or newly-created repair can make the next gated read an
+    # embedded hit now.
     # Any incomplete backlog remains durable in SQL and is picked up by the
     # regular worker; the current request already has its correct SQL result.
     await drain_edge_index_outbox(store, namespace=namespace, room_id=room_id)
