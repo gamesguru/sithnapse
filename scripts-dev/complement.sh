@@ -809,7 +809,11 @@ main() {
     if [ "${#raw_alts[@]}" -gt 1 ] && [ "$_all_flat" -eq 1 ]; then
       local _combined
       _combined="$(IFS='|'; echo "${raw_alts[*]}")"
-      ALT_PATTERNS=("^(${_combined})\$")
+      # Top-level test selectors are prefixes: TestMessages also selects
+      # TestMessagesOverFederation and TestMessagesPaginationStress. Keep the
+      # combined form unanchored at the end, matching the single-selector
+      # behavior below.
+      ALT_PATTERNS=("^(${_combined})")
       echo "All alternatives are flat top-level names; combined into one go test invocation:" >&2
       echo "  ${ALT_PATTERNS[0]}" >&2
     else
