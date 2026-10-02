@@ -682,11 +682,20 @@ class PaginationHandler:
         # In that case we do not return end, to tell the client
         # there is no need for further queries.
         if not limited and not events:
+            start_token = from_token
+            if pagin_config.direction == Direction.BACKWARDS:
+                earliest_token = await self.store.get_earliest_topological_token(
+                    room_id
+                )
+                if earliest_token is not None:
+                    start_token = from_token.copy_and_replace(
+                        StreamKeyType.ROOM, earliest_token
+                    )
             return GetMessagesResult(
                 messages_chunk=[],
                 bundled_aggregations={},
                 state=None,
-                start_token=from_token,
+                start_token=start_token,
                 end_token=None,
             )
 
