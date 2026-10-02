@@ -256,7 +256,12 @@ class FederationHandler:
     @trace
     @tag_args
     async def maybe_backfill(
-        self, room_id: str, current_depth: int, limit: int, record_time: bool = True
+        self,
+        room_id: str,
+        current_depth: int,
+        limit: int,
+        record_time: bool = True,
+        force: bool = False,
     ) -> bool:
         """Checks the database to see if we should backfill before paginating,
         and if so do.
@@ -270,6 +275,8 @@ class FederationHandler:
                 return. This is used as part of the heuristic to decide if we
                 should back paginate.
             record_time: Whether to record the time it takes to backfill.
+            force: Whether to force backfilling even if the depth heuristic would
+                otherwise skip it (e.g. when there are not enough local events).
 
         Returns:
             True if we actually tried to backfill something, otherwise False.
@@ -296,6 +303,7 @@ class FederationHandler:
                     current_depth,
                     limit,
                     processing_start_time=processing_start_time,
+                    force=force,
                 )
 
     @trace
@@ -307,6 +315,7 @@ class FederationHandler:
         limit: int,
         *,
         processing_start_time: int | None,
+        force: bool = False,
     ) -> bool:
         """
         Checks whether the `current_depth` is at or approaching any backfill
@@ -407,6 +416,7 @@ class FederationHandler:
                 MAX_DEPTH,
                 limit,
                 processing_start_time=processing_start_time,
+                force=force,
             )
 
         # Even after recursing with `MAX_DEPTH`, we didn't find any
@@ -427,7 +437,7 @@ class FederationHandler:
         # much larger factor will result in triggering a backfill request much
         # earlier than necessary.
         max_depth_of_backfill_points = sorted_backfill_points[0].depth
-        if current_depth - 2 * limit > max_depth_of_backfill_points:
+        if not force and current_depth - 2 * limit > max_depth_of_backfill_points:
             logger.debug(
                 "Not backfilling as we don't need to. %d < %d - 2 * %d",
                 max_depth_of_backfill_points,

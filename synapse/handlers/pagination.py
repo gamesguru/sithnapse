@@ -649,6 +649,7 @@ class PaginationHandler:
                     room_id,
                     backfill_depth,
                     limit=pagin_config.limit,
+                    force=True,
                 )
 
                 # If we did backfill something, refetch the events from the database to
