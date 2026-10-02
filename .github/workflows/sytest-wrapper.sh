@@ -212,6 +212,48 @@ injection = '''        databases => \\%db_configs,
 assert anchor in content, 'Could not find databases anchor in Synapse.pm'
 content = content.replace(anchor, injection, 1)
 
+# SyTest's generic readiness check only observes that the TCP socket accepts a
+# connection. Synapse can accept that socket briefly before its TLS listener is
+# ready, so verify the actual TLS handshake before returning from start().
+tls_probe = '''        return $self->SUPER::start->then( sub {
+      my $tls_target = $self->{bind_host} . ":" . $self->secure_port;
+      my $tls_ready = 0;
+      open my $tls_stdin, "<", "/dev/null" or die "Unable to open /dev/null: $!";
+      local *STDIN = $tls_stdin;
+      for ( 1 .. 40 ) {
+         $tls_ready = system(
+            "openssl", "s_client", "-brief", "-quiet",
+            "-connect", $tls_target,
+            "-CAfile", $ENV{SYTEST_DIR} . "/keys/ca.crt",
+            "-verify_return_error",
+         ) == 0;
+         last if $tls_ready;
+         select undef, undef, undef, 0.25;
+      }
+      die "Synapse TLS listener did not become ready" unless $tls_ready;
+'''
+tls_probe = '''      return $self->_start_synapse( env => $env )->then( sub {
+         my $tls_ready = 0;
+         for ( 1 .. 40 ) {
+            if ( open my $log_fh, "<", $self->{paths}{log} ) {
+               while ( my $line = <$log_fh> ) {
+                  if ( $line =~ /Synapse now listening on TCP port .* \(TLS\)/ ) {
+                     $tls_ready = 1;
+                     last;
+                  }
+               }
+               close $log_fh;
+            }
+            last if $tls_ready;
+            select undef, undef, undef, 0.25;
+         }
+         die "Synapse TLS listener did not report readiness" unless $tls_ready;
+         return Future->done;
+      })'''
+original_tls_start = '      $self->_start_synapse( env => $env )\n'
+assert original_tls_start in content, 'Could not find Synapse start readiness hook'
+content = content.replace(original_tls_start, tls_probe, 1)
+
 with open(os.environ['SYTEST_DIR'] + '/lib/SyTest/Homeserver/Synapse.pm', 'w') as f:
     f.write(content)
 PY
