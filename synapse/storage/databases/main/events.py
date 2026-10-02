@@ -4605,7 +4605,10 @@ class PersistEventsStore:
                     put_event_edges_batch,
                     self._embedded_db_namespace,
                     edge_rows,
-                    sync=True,
+                    # The post-commit write is visible immediately; durability
+                    # is handled by the EVENT_DAG coalescer according to the
+                    # configured sync mode.
+                    sync=False,
                 )
                 txn.call_after(mark_dirty, Pool.EVENT_DAG)
 

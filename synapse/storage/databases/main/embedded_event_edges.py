@@ -932,8 +932,19 @@ async def repair_edge_index_from_sql(
     """
 
     def _enqueue_repair(txn: Any) -> int | None:
+        placeholders = ", ".join("?" for _ in event_ids)
+        txn.execute(
+            f"SELECT event_id FROM edge_index_outbox "
+            f"WHERE room_id = ? AND prev_event_id = ? "
+            f"AND operation = 'insert' AND event_id IN ({placeholders})",
+            (room_id, prev_event_id, *event_ids),
+        )
+        pending = {str(row[0]) for row in txn}
+        event_ids_to_repair = [event_id for event_id in event_ids if event_id not in pending]
+        if not event_ids_to_repair:
+            return None
         return record_edge_index_repairs_txn(
-            store.db_pool, txn, room_id, prev_event_id, event_ids
+            store.db_pool, txn, room_id, prev_event_id, event_ids_to_repair
         )
 
     source_version = await store.db_pool.runInteraction(
