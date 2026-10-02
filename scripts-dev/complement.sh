@@ -1461,7 +1461,9 @@ trap '_kill_active_producer; cleanup_pg_log_watcher; exit 130' INT
 trap '_kill_active_producer; cleanup_pg_log_watcher; exit 143' TERM
 trap '_kill_active_producer; cleanup_pg_log_watcher; exit 129' HUP
 
-# ── Run all patterns ──────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# Run all patterns.
+# -----------------------------------------------------------------------------
 for _pattern in "${ALT_PATTERNS[@]}"; do
   set +e
   run_one_pattern "$_pattern"
