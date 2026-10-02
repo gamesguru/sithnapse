@@ -1442,6 +1442,25 @@ class PersistEventsStore:
             txn, events_and_contexts=events_and_contexts, mtxdb_txn=mtxdb_txn
         )
 
+        # De-outliering removes the event from ``events_and_contexts`` before
+        # _store_event_txn, but its SQL edge already exists. Publish that edge
+        # to the embedded index as well, otherwise the SQL source version can
+        # move ahead of the embedded forward index.
+        if self._embedded_event_edges_writable and de_outliered_events:
+            edge_rows = [
+                (event.room_id, event.event_id, prev_event_id, False)
+                for event, _ in de_outliered_events
+                for prev_event_id in event.prev_event_ids()
+            ]
+            if edge_rows:
+                txn.call_after(
+                    put_event_edges_batch,
+                    self._embedded_db_namespace,
+                    edge_rows,
+                    sync=True,
+                )
+                txn.call_after(mark_dirty, Pool.EVENT_DAG)
+
         if new_forward_extremities:
             self._update_forward_extremities_txn(
                 txn,
