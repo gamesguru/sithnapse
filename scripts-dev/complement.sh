@@ -749,6 +749,11 @@ main() {
   echo "\$main_results_file: $main_results_file" >&2
   echo "\$staged_log_file: $staged_log_file" >&2
   echo "\$RUN_TESTS: $RUN_TESTS" >&2
+  if [ "${COMPLEMENT_ENABLE_DIRTY_RUNS:-0}" = "1" ]; then
+    echo "Complement dirty runs: enabled (eligible deployments reused)" >&2
+  else
+    echo "Complement dirty runs: disabled (fresh deployments)" >&2
+  fi
   echo "" >&2
 
   # Baseline for the run header (scripts-dev/run_header.py); the timing
