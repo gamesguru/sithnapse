@@ -12,6 +12,10 @@
 #
 # See the GNU Affero General Public License for more details:
 # <https://www.gnu.org/licenses/agpl-3.0.html>.
+
+# joserfc exposes this registry through a private module which is not present
+# in every type-checking environment.
+# mypy: disable-error-code=import-not-found
 #
 # Originally licensed under the Apache License, Version 2.0:
 # <http://www.apache.org/licenses/LICENSE-2.0>.
@@ -44,9 +48,12 @@ from authlib.oidc.core import CodeIDToken, UserInfo
 from authlib.oidc.discovery import OpenIDProviderMetadata, get_well_known_url
 
 try:
-    from joserfc._rfc7519.claims import InvalidClaimError, JWTClaimsRegistry
+    from joserfc._rfc7519.claims import (
+        InvalidClaimError,
+        JWTClaimsRegistry,
+    )
 
-    class _SynapseJWTClaimsRegistry(JWTClaimsRegistry):
+    class _SynapseJWTClaimsRegistry(JWTClaimsRegistry):  # type: ignore[misc, unused-ignore]
         def validate_sub(self, value: Any) -> None:
             if isinstance(value, bool) or not isinstance(value, (str, int)):
                 raise InvalidClaimError(
