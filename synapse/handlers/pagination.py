@@ -25,7 +25,7 @@ import attr
 
 from twisted.python.failure import Failure
 
-from synapse.api.constants import Direction, EventTypes, Membership
+from synapse.api.constants import MAX_DEPTH, Direction, EventTypes, Membership
 from synapse.api.errors import SynapseError
 from synapse.api.filtering import Filter
 from synapse.events import EventBase
@@ -641,9 +641,15 @@ class PaginationHandler:
                 or not_enough_events_to_fill_response
                 or pagin_config.limit == 1
             ):
+                # A terminal page at the room boundary is special: the current
+                # depth may be far away from the backfill point, so
+                # ``maybe_backfill`` would otherwise defer the search to a
+                # background process and we would return a terminal token
+                # before the history is available to the client.
+                backfill_depth = MAX_DEPTH if not limited else curr_topo
                 did_backfill = await self.hs.get_federation_handler().maybe_backfill(
                     room_id,
-                    curr_topo,
+                    backfill_depth,
                     limit=pagin_config.limit,
                 )
 
