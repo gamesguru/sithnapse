@@ -390,24 +390,14 @@ class FederationHandler:
                 return False
 
             logger.debug(
-                "_maybe_backfill_inner: all backfill points are *after* current depth. Trying again with later backfill points."
+                "_maybe_backfill_inner: all backfill points are *after* current depth. Retrying synchronously with later backfill points."
             )
-            self.hs.run_as_background_process(
-                "_maybe_backfill_inner_anyway_with_max_depth",
-                self.maybe_backfill,
-                room_id=room_id,
-                # We use `MAX_DEPTH` so that we find all backfill points next
-                # time (all events are below the `MAX_DEPTH`)
-                current_depth=MAX_DEPTH,
-                limit=limit,
-                # We don't want to start another timing observation from this
-                # nested recursive call. The top-most call can record the time
-                # overall otherwise the smaller one will throw off the results.
-                record_time=False,
+            return await self._maybe_backfill_inner(
+                room_id,
+                MAX_DEPTH,
+                limit,
+                processing_start_time=processing_start_time,
             )
-            # We return `False` because we're backfilling in the background and there is
-            # no new events immediately for the caller to know about yet.
-            return False
 
         # Even after recursing with `MAX_DEPTH`, we didn't find any
         # backward extremities to backfill from.
