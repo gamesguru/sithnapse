@@ -405,25 +405,16 @@ fn build_root_handle_nodes_and_lattice(
 /// into [`apply_flat_state_updates_impl`] to apply further incremental
 /// updates; the digest alone cannot be "un-collapsed".
 fn lattice_to_bytes(lattice: &LtHash) -> Vec<u8> {
-    let mut out = Vec::with_capacity(2048);
-    for lane in lattice.0.iter() {
-        out.extend_from_slice(&lane.to_le_bytes());
-    }
-    out
+    lattice.to_bytes()
 }
 
 fn lattice_from_bytes(bytes: &[u8]) -> Result<LtHash, String> {
-    if bytes.len() != 2048 {
-        return Err(format!(
+    LtHash::from_bytes(bytes).ok_or_else(|| {
+        format!(
             "LtHash lattice must be exactly 2048 bytes, got {}",
             bytes.len()
-        ));
-    }
-    let mut lanes = [0u16; 1024];
-    for (lane, chunk) in lanes.iter_mut().zip(bytes.chunks_exact(2)) {
-        *lane = u16::from_le_bytes([chunk[0], chunk[1]]);
-    }
-    Ok(LtHash(lanes))
+        )
+    })
 }
 
 /// Like [`collect_persisted_nodes`], but skips any subtree whose structural

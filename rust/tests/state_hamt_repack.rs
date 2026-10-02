@@ -30,7 +30,7 @@ fn test_root_value(room_id: &str, room_prefix: &[u8]) -> Vec<u8> {
 
 fn test_state_group_id() -> Vec<u8> {
     let lattice = [u16::from_le_bytes([0x04, 0x04]); 1024];
-    state_group_id_from_lthash(&LtHash(lattice)).to_vec()
+    state_group_id_from_lthash(&LtHash::from_lanes(lattice)).to_vec()
 }
 
 #[test]

@@ -413,7 +413,7 @@ fn state_group_id_from_root_value(value: &[u8]) -> Result<[u8; 32], String> {
         lattice[index] = u16::from_le_bytes([chunk[0], chunk[1]]);
     }
     Ok(rezzy::hamt::state_group_id_from_lthash(
-        &rezzy::state::LtHash(lattice),
+        &rezzy::state::LtHash::from_lanes(lattice),
     ))
 }
 
