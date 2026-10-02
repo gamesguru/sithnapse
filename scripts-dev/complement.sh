@@ -342,10 +342,9 @@ main() {
     ./tests
   )
   while IFS= read -r test_package; do
-    # MSC4500 is implemented by Congruent, but not by this Synapse tree yet.
-    # Keep it out of the default all-MSC run until its state accumulator
-    # implementation is ported.
-    if [[ "${test_package##*/}" == "msc4500" ]]; then
+    # These MSCs are not implemented by this Synapse tree yet. Keep them out
+    # of the default all-MSC run until their implementations are ported.
+    if [[ "${test_package##*/}" == "msc2836" || "${test_package##*/}" == "msc4500" ]]; then
       echo "Skipping unsupported Complement test package: $test_package" >&2
       continue
     fi
