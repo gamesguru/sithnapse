@@ -1977,25 +1977,6 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
         )
         return row[0][0] if row else 0
 
-    async def get_earliest_topological_token(
-        self, room_id: str
-    ) -> RoomStreamToken | None:
-        """Return a token immediately before the earliest persisted room event."""
-
-        def _get(txn: LoggingTransaction) -> RoomStreamToken | None:
-            txn.execute(
-                "SELECT topological_ordering, stream_ordering "
-                "FROM events WHERE room_id = ? AND NOT outlier "
-                "ORDER BY topological_ordering ASC, stream_ordering ASC LIMIT 1",
-                (room_id,),
-            )
-            row = txn.fetchone()
-            if row is None:
-                return None
-            return generate_next_token(Direction.BACKWARDS, int(row[0]), int(row[1]))
-
-        return await self.db_pool.runInteraction("get_earliest_topological_token", _get)
-
     def _get_max_topological_txn(self, txn: LoggingTransaction, room_id: str) -> int:
         txn.execute(
             "SELECT MAX(topological_ordering) FROM events WHERE room_id = ?",
@@ -2430,19 +2411,6 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
         else:
             # TODO (erikj): We should work out what to do here instead.
             next_token = to_token if to_token else from_token
-
-        logger.info(
-            "paginate room=%s direction=%s from=%s fetched=%s next=%s limited=%s",
-            room_id,
-            direction,
-            from_token,
-            [
-                (event_id, topological_ordering, stream_ordering)
-                for event_id, _, topological_ordering, stream_ordering in fetched_rows
-            ],
-            next_token,
-            limited,
-        )
 
         return rows, next_token, limited
 

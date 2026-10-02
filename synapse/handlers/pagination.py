@@ -25,7 +25,7 @@ import attr
 
 from twisted.python.failure import Failure
 
-from synapse.api.constants import MAX_DEPTH, Direction, EventTypes, Membership
+from synapse.api.constants import Direction, EventTypes, Membership
 from synapse.api.errors import SynapseError
 from synapse.api.filtering import Filter
 from synapse.events import EventBase
@@ -641,15 +641,9 @@ class PaginationHandler:
                 or not_enough_events_to_fill_response
                 or pagin_config.limit == 1
             ):
-                # A terminal page at the room boundary is special: the current
-                # depth may be far away from the backfill point, so
-                # ``maybe_backfill`` would otherwise defer the search to a
-                # background process and we would return a terminal token
-                # before the history is available to the client.
-                backfill_depth = MAX_DEPTH if not limited else curr_topo
                 did_backfill = await self.hs.get_federation_handler().maybe_backfill(
                     room_id,
-                    backfill_depth,
+                    curr_topo,
                     limit=pagin_config.limit,
                 )
 
@@ -688,20 +682,11 @@ class PaginationHandler:
         # In that case we do not return end, to tell the client
         # there is no need for further queries.
         if not limited and not events:
-            start_token = from_token
-            if pagin_config.direction == Direction.BACKWARDS:
-                earliest_token = await self.store.get_earliest_topological_token(
-                    room_id
-                )
-                if earliest_token is not None:
-                    start_token = from_token.copy_and_replace(
-                        StreamKeyType.ROOM, earliest_token
-                    )
             return GetMessagesResult(
                 messages_chunk=[],
                 bundled_aggregations={},
                 state=None,
-                start_token=start_token,
+                start_token=from_token,
                 end_token=None,
             )
 
