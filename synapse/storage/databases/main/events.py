@@ -83,7 +83,6 @@ from synapse.storage.databases.main.embedded_event_edges import (
     embedded_event_edges_is_writable,
     open_embedded_event_edges_engine,
     put_event_edges_batch,
-    record_edge_index_inserts_txn,
 )
 from synapse.storage.databases.main.embedded_event_json import (
     get_event_json_batch,
@@ -1443,25 +1442,14 @@ class PersistEventsStore:
             txn, events_and_contexts=events_and_contexts, mtxdb_txn=mtxdb_txn
         )
 
-        # De-outliering removes the event from ``events_and_contexts`` before
-        # _store_event_txn, but its SQL edge already exists. Publish that edge
-        # to the embedded index as well, otherwise the SQL source version can
-        # move ahead of the embedded forward index.
-        if self._embedded_event_edges_writable and de_outliered_events:
-            edges_by_room: dict[str, list[tuple[str, str]]] = collections.defaultdict(
-                list
+        # De-outliered events were not passed to _store_event_txn, so their
+        # edges have not been written to SQL event_edges or the embedded engine.
+        # Record and publish their edges now.
+        if de_outliered_events:
+            self._handle_mult_prev_events(
+                txn,
+                events=[ev for ev, _ in de_outliered_events],
             )
-            for event, _ in de_outliered_events:
-                edges_by_room[event.room_id].extend(
-                    (event.event_id, prev_event_id)
-                    for prev_event_id in event.prev_event_ids()
-                )
-
-            # The SQL edges already exist for an outlier. Re-enqueue them at a
-            # fresh source version so the normal drainer republishes them and
-            # advances room_forward_meta.published_source_version.
-            record_edge_index_inserts_txn(self.db_pool, txn, edges_by_room)
-            txn.call_after(mark_dirty, Pool.EVENT_DAG)
 
         if new_forward_extremities:
             self._update_forward_extremities_txn(
@@ -3353,6 +3341,7 @@ class PersistEventsStore:
 
                 sql = "UPDATE events SET outlier = FALSE WHERE event_id = ?"
                 txn.execute(sql, (event.event_id,))
+                event.internal_metadata.outlier = False
 
                 # Update the event_backward_extremities table now that this
                 # event isn't an outlier any more.
@@ -4541,14 +4530,24 @@ class PersistEventsStore:
         For the given event, update the event edges table and forward and
         backward extremities tables.
         """
-        self.db_pool.simple_insert_many_txn(
-            txn,
-            table="event_edges",
-            keys=("event_id", "prev_event_id"),
-            values=[
+        edge_values = list(
+            dict.fromkeys(
                 (ev.event_id, e_id) for ev in events for e_id in ev.prev_event_ids()
-            ],
+            )
         )
+        if edge_values:
+            if isinstance(self.database_engine, PostgresEngine):
+                sql = (
+                    "INSERT INTO event_edges (event_id, prev_event_id) "
+                    "VALUES ? ON CONFLICT (event_id, prev_event_id) DO NOTHING"
+                )
+                txn.execute_values(sql, edge_values, fetch=False)
+            else:
+                sql = (
+                    "INSERT INTO event_edges (event_id, prev_event_id) "
+                    "VALUES (?, ?) ON CONFLICT (event_id, prev_event_id) DO NOTHING"
+                )
+                txn.executemany(sql, edge_values)
 
         # Keep the authoritative SQL edge write, its per-room source version,
         # and the embedded-index publication mutations in one transaction.

@@ -41,7 +41,7 @@ from signedjson.sign import verify_signed_json
 from typing_extensions import assert_never
 from unpaddedbase64 import decode_base64
 
-from twisted.internet.defer import CancelledError
+from twisted.internet.defer import CancelledError, Deferred
 
 from synapse import event_auth
 from synapse.api.constants import (
@@ -80,7 +80,7 @@ from synapse.federation.federation_base import (
 from synapse.federation.federation_client import InvalidResponseError
 from synapse.handlers.pagination import PURGE_PAGINATION_LOCK_NAME
 from synapse.http.servlet import assert_params_in_dict
-from synapse.logging.context import nested_logging_context
+from synapse.logging.context import make_deferred_yieldable, nested_logging_context
 from synapse.logging.opentracing import SynapseTags, set_tag, tag_args, trace
 from synapse.metrics import SERVER_NAME_LABEL
 from synapse.module_api import NOT_SPAM
@@ -226,6 +226,7 @@ class FederationHandler:
         # Partial state syncs currently only run on the main process, so it's okay to
         # track them in-memory for now.
         self._active_partial_state_syncs: set[str] = set()
+        self._active_partial_state_sync_deferreds: dict[str, Deferred[None]] = {}
         # Tracks partial state syncs we may want to restart.
         # A dictionary mapping room IDs to (initial destination, other destinations)
         # tuples.
@@ -276,6 +277,15 @@ class FederationHandler:
         # Starting the processing time here so we can include the room backfill
         # linearizer lock queue in the timing
         processing_start_time = self.clock.time_msec() if record_time else 0
+
+        # If a partial state resync is currently active for this room, wait for it
+        # to complete so the backward extremities from the join event are persisted.
+        sync_deferred = self._active_partial_state_sync_deferreds.get(room_id)
+        if sync_deferred is not None and not sync_deferred.called:
+            try:
+                await make_deferred_yieldable(sync_deferred)
+            except Exception:
+                pass
 
         async with self._room_backfill.queue(room_id):
             async with self._worker_locks.acquire_read_write_lock(
@@ -2410,6 +2420,9 @@ class FederationHandler:
             room_id: room to be resynced
         """
 
+        if room_id not in self._active_partial_state_sync_deferreds:
+            self._active_partial_state_sync_deferreds[room_id] = Deferred()
+
         async def _sync_partial_state_room_wrapper() -> None:
             if room_id in self._active_partial_state_syncs:
                 # Another local user has joined the room while there is already a
@@ -2468,6 +2481,12 @@ class FederationHandler:
                     room_id
                 )
                 self._active_partial_state_syncs.remove(room_id)
+
+                sync_deferred = self._active_partial_state_sync_deferreds.pop(
+                    room_id, None
+                )
+                if sync_deferred is not None and not sync_deferred.called:
+                    sync_deferred.callback(None)
 
                 restart_params = self._partial_state_syncs_maybe_needing_restart.pop(
                     room_id, None
