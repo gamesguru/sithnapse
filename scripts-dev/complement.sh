@@ -333,25 +333,19 @@ main() {
     return 0
   fi
 
-  # Default set of Complement tests to run from the Complement repo
-  #
-  # We pick and choose the specific MSC's that Synapse supports.
+  # Default set of Complement tests to run from the Complement repo.
+  # Include every MSC package present in the checkout so new MSCs do not need
+  # to be added here manually. The paths are kept relative to the Complement
+  # module because they are passed directly to `go test`.
   default_complement_test_packages=(
     ./tests/csapi
     ./tests
-    ./tests/msc3874
-    ./tests/msc3890
-    ./tests/msc3391
-    ./tests/msc3757
-    ./tests/msc3930
-    ./tests/msc3902
-    ./tests/msc3967
-    ./tests/msc4140
-    ./tests/msc4155
-    ./tests/msc4306
-    ./tests/msc4222
-    ./tests/msc4429
-    ./tests/msc4499
+  )
+  while IFS= read -r test_package; do
+    default_complement_test_packages+=("$test_package")
+  done < <(
+    find "$COMPLEMENT_DIR/tests" -mindepth 1 -maxdepth 1 -type d -name 'msc*' \
+      -printf './tests/%f\n' | sort -V
   )
 
   available_complement_test_packages=()
@@ -1085,6 +1079,15 @@ run_one_pattern() {
         echo "Selected package(s) for $pattern: ${packages[*]}" >&2
       fi
     fi
+  fi
+
+  # A selector may not match any package (for example when a test was moved
+  # to a newer MSC package). Never invoke `go test` with an empty package
+  # list: that makes Go test the current directory instead of the Complement
+  # module's full test tree.
+  if [ "${#packages[@]}" -eq 0 ]; then
+    packages=(./tests/...)
+    echo "No matching Complement package found for $pattern; using ${packages[0]}" >&2
   fi
 
   local -a flags=(
