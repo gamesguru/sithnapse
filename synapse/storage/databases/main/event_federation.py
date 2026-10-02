@@ -2929,7 +2929,7 @@ class EventFederationWorkerStore(
                 "event_edges_successor_embedded_read",
                 time.monotonic() - embedded_started,
             )
-            successors = forward_map.get(event_id)
+            successors = forward_map.get(event_id) if forward_map is not None else None
             logger.info(
                 "get_successor_events: event_id=%s room_id=%s source_version=%s forward_map=%s",
                 event_id,

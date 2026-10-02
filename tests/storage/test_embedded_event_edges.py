@@ -1603,7 +1603,7 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
             # version mismatch, not a (possibly partial) hit.
             self.assertEqual(
                 get_event_edges_forward_batch(ns, room_id, source_version, [p_id]),
-                {},
+                None,
                 "an unpublished forward index must not be served as a hit",
             )
 

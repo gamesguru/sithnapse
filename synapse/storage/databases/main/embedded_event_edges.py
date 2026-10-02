@@ -733,10 +733,12 @@ def get_event_edges_forward_batch(
     room_id_or_prev_event_ids: str | list[str],
     expected_source_version: int | None = None,
     prev_event_ids: list[str] | None = None,
-) -> dict[str, list[str] | None]:
+) -> dict[str, list[str] | None] | None:
     """Reads forward child edges for `prev_event_ids`.
 
-    Returns `prev_event_id -> [child_event_id]` or `None` if missing.
+    Returns `prev_event_id -> [child_event_id]` or `None` if the index is stale.
+    A missing key in a successful result means that the queried event is not
+    present in the index; it must not be confused with a version mismatch.
     """
     if prev_event_ids is None:
         # Keep the established helper contract for benchmarks and tests. The
@@ -786,7 +788,7 @@ def get_event_edges_forward_batch(
         )
         if status == "version_mismatch":
             ffi_count("event_edges_version_mismatches", 1)
-            return {}
+            return None
         if status != "hit":
             raise RuntimeError(f"unexpected forward edge result: {status!r}")
         return dict(cast(list[tuple[str, list[str] | None]], payload[0]))
