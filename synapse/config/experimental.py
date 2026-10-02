@@ -159,6 +159,11 @@ class ExperimentalConfig(Config):
         # MSC3912: Relation-based redactions.
         self.msc3912_enabled: bool = experimental.get("msc3912_enabled", False)
 
+        # MSC3389: Protect relation information from redaction.
+        self.msc3389_enabled: bool = experimental.get("msc3389_enabled", False)
+        if self.msc3389_enabled:
+            KNOWN_ROOM_VERSIONS.add_room_version(RoomVersions.MSC3389v10)
+
         # MSC1767 and friends: Extensible Events
         self.msc1767_enabled: bool = experimental.get("msc1767_enabled", False)
         if self.msc1767_enabled:
