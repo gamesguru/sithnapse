@@ -66,6 +66,14 @@ logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 
 
+class ForwardEdgeMap(dict[str, list[str] | None]):
+    """Forward edges plus whether the embedded index was stale."""
+
+    def __init__(self, *args: Any, stale: bool = False, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.stale = stale
+
+
 def bump_room_edge_source_version(txn: Any, room_id: str) -> int:
     """Atomically increment and return a room's edge source version.
 
@@ -733,12 +741,12 @@ def get_event_edges_forward_batch(
     room_id_or_prev_event_ids: str | list[str],
     expected_source_version: int | None = None,
     prev_event_ids: list[str] | None = None,
-) -> dict[str, list[str] | None] | None:
+) -> ForwardEdgeMap:
     """Reads forward child edges for `prev_event_ids`.
 
-    Returns `prev_event_id -> [child_event_id]` or `None` if the index is stale.
-    A missing key in a successful result means that the queried event is not
-    present in the index; it must not be confused with a version mismatch.
+    ``stale`` is set when the embedded index cannot satisfy the requested
+    source version. A missing key in a non-stale result means that the queried
+    event is not present in the index.
     """
     if prev_event_ids is None:
         # Keep the established helper contract for benchmarks and tests. The
@@ -746,14 +754,14 @@ def get_event_edges_forward_batch(
         # source-version context.
         legacy_prev_event_ids = cast(list[str], room_id_or_prev_event_ids)
         if not legacy_prev_event_ids:
-            return {}
+            return ForwardEdgeMap()
         with mirror_timing("event_edges_get_forward"):
             from synapse.synapse_rust.mtxdb_engine import event_edges_get_forward
 
             results = _retry_on_contention(
                 lambda: event_edges_get_forward(namespace, legacy_prev_event_ids)
             )
-            return dict(results)
+            return ForwardEdgeMap(results)
 
     if (
         not isinstance(room_id_or_prev_event_ids, str)
@@ -762,7 +770,7 @@ def get_event_edges_forward_batch(
         raise TypeError("room_id and expected_source_version are required together")
     room_id = room_id_or_prev_event_ids
     if not prev_event_ids:
-        return {}
+        return ForwardEdgeMap()
 
     with mirror_timing("event_edges_get_forward"):
         from synapse.synapse_rust.mtxdb_engine import event_edges_get_forward_gated
@@ -788,10 +796,10 @@ def get_event_edges_forward_batch(
         )
         if status == "version_mismatch":
             ffi_count("event_edges_version_mismatches", 1)
-            return None
+            return ForwardEdgeMap(stale=True)
         if status != "hit":
             raise RuntimeError(f"unexpected forward edge result: {status!r}")
-        return dict(cast(list[tuple[str, list[str] | None]], payload[0]))
+        return ForwardEdgeMap(cast(list[tuple[str, list[str] | None]], payload[0]))
 
 
 async def drain_edge_index_outbox(

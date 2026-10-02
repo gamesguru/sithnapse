@@ -1601,9 +1601,10 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
 
             # Step 2: the crash left mtxdb unpublished -- the gated read is a
             # version mismatch, not a (possibly partial) hit.
-            self.assertEqual(
-                get_event_edges_forward_batch(ns, room_id, source_version, [p_id]),
-                None,
+            self.assertTrue(
+                get_event_edges_forward_batch(
+                    ns, room_id, source_version, [p_id]
+                ).stale,
                 "an unpublished forward index must not be served as a hit",
             )
 

@@ -2698,7 +2698,7 @@ class EventsWorkerStore(SQLBaseStore):
                     [event.event_id],
                 )
                 children = (
-                    forward_map.get(event.event_id) if forward_map is not None else None
+                    None if forward_map.stale else forward_map.get(event.event_id)
                 )
                 if children is not None:
                     ffi_count("event_edges_gap_hits", 1)
