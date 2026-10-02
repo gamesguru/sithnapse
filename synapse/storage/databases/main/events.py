@@ -1449,6 +1449,7 @@ class PersistEventsStore:
             self._handle_mult_prev_events(
                 txn,
                 events=[ev for ev, _ in de_outliered_events],
+                update_backward_extremities=False,
             )
 
         if new_forward_extremities:
@@ -4524,7 +4525,10 @@ class PersistEventsStore:
         )
 
     def _handle_mult_prev_events(
-        self, txn: LoggingTransaction, events: list[EventBase]
+        self,
+        txn: LoggingTransaction,
+        events: list[EventBase],
+        update_backward_extremities: bool = True,
     ) -> None:
         """
         For the given event, update the event edges table and forward and
@@ -4539,7 +4543,7 @@ class PersistEventsStore:
             if isinstance(self.database_engine, PostgresEngine):
                 sql = (
                     "INSERT INTO event_edges (event_id, prev_event_id) "
-                    "VALUES ? ON CONFLICT (event_id, prev_event_id) DO NOTHING"
+                    "VALUES ? ON CONFLICT DO NOTHING"
                 )
                 txn.execute_values(sql, edge_values, fetch=False)
             else:
@@ -4611,7 +4615,8 @@ class PersistEventsStore:
                 )
                 txn.call_after(mark_dirty, Pool.EVENT_DAG)
 
-        self._update_backward_extremeties(txn, events)
+        if update_backward_extremities:
+            self._update_backward_extremeties(txn, events)
 
     def _update_backward_extremeties(
         self, txn: LoggingTransaction, events: list[EventBase]

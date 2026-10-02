@@ -214,9 +214,16 @@ def make_homeserver_config_obj(config: dict[str, Any]) -> HomeServerConfig:
     event_writers = (
         stream_writers.get("events") if isinstance(stream_writers, dict) else []
     )
-    background_tasks_instance = config.get("run_background_tasks_on") or "main"
-    if background_tasks_instance != "main" or (
-        event_writers and event_writers != ["main"]
+    background_tasks_instance = config.get("run_background_tasks_on") or "master"
+    if isinstance(event_writers, str):
+        event_writers = [event_writers]
+    if background_tasks_instance not in ("main", "master") or (
+        event_writers
+        and set(event_writers)
+        not in (
+            {"main"},
+            {"master"},
+        )
     ):
         config.pop("embedded_db", None)
     config_obj = _parse_config_dict(json.dumps(config, sort_keys=True))

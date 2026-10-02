@@ -818,7 +818,7 @@ main() {
       # TestMessagesOverFederation and TestMessagesPaginationStress. Keep the
       # combined form unanchored at the end, matching the single-selector
       # behavior below.
-      ALT_PATTERNS=("^(${_combined})")
+      ALT_PATTERNS=("^(${_combined})(/|$)")
       echo "All alternatives are flat top-level names; combined into one go test invocation:" >&2
       echo "  ${ALT_PATTERNS[0]}" >&2
     else

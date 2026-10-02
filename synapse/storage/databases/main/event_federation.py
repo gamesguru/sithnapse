@@ -2930,12 +2930,12 @@ class EventFederationWorkerStore(
                 time.monotonic() - embedded_started,
             )
             successors = None if forward_map.stale else forward_map.get(event_id)
-            logger.info(
-                "get_successor_events: event_id=%s room_id=%s source_version=%s forward_map=%s",
+            logger.debug(
+                "get_successor_events: event_id=%s room_id=%s source_version=%s hit=%s",
                 event_id,
                 room_id,
                 source_version,
-                forward_map,
+                successors is not None,
             )
             if successors is not None:
                 ffi_count("event_edges_successor_hits", 1)
@@ -2950,10 +2950,10 @@ class EventFederationWorkerStore(
                 retcol="event_id",
                 desc="get_successor_events",
             )
-            logger.info(
-                "get_successor_events fallback: event_id=%s sql_res=%s",
+            logger.debug(
+                "get_successor_events fallback: event_id=%s successor_count=%s",
                 event_id,
-                sql_res,
+                len(sql_res),
             )
             ffi_timing(
                 "event_edges_successor_sql_fallback", time.monotonic() - sql_started

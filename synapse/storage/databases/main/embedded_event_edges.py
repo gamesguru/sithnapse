@@ -46,6 +46,7 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Any, Callable, Iterable, TypeVar, cast
 
+from synapse.storage.database import make_in_list_sql_clause
 from synapse.storage.databases.main.embedded_common import (
     Pool,
     ffi_batch_size,
@@ -786,13 +787,12 @@ def get_event_edges_forward_batch(
         ffi_batch_size("event_edges_get_forward", len(prev_event_ids))
 
         status, *payload = gated_results
-        logger.info(
-            "get_event_edges_forward_batch: room_id=%s expected_source_version=%s prev_event_ids=%s status=%s payload=%s",
+        logger.debug(
+            "get_event_edges_forward_batch: room_id=%s expected_source_version=%s count=%s status=%s",
             room_id,
             expected_source_version,
-            prev_event_ids,
+            len(prev_event_ids),
             status,
-            payload,
         )
         if status == "version_mismatch":
             ffi_count("event_edges_version_mismatches", 1)
@@ -942,12 +942,14 @@ async def repair_edge_index_from_sql(
     """
 
     def _enqueue_repair(txn: Any) -> int | None:
-        placeholders = ", ".join("?" for _ in event_ids)
+        clause, clause_args = make_in_list_sql_clause(
+            txn.database_engine, "event_id", event_ids
+        )
         txn.execute(
             f"SELECT event_id FROM edge_index_outbox "
             f"WHERE room_id = ? AND prev_event_id = ? "
-            f"AND operation = 'insert' AND event_id IN ({placeholders})",
-            (room_id, prev_event_id, *event_ids),
+            f"AND operation = 'insert' AND {clause}",
+            (room_id, prev_event_id, *clause_args),
         )
         pending = {str(row[0]) for row in txn}
         event_ids_to_repair = [
@@ -960,9 +962,15 @@ async def repair_edge_index_from_sql(
         )
 
     await store.db_pool.runInteraction("record_edge_index_repair", _enqueue_repair)
+    rows = await store.db_pool.simple_select_list(
+        table="event_edges",
+        keyvalues={"prev_event_id": prev_event_id},
+        retcols=("event_id", "is_state"),
+        desc="repair_edge_index_from_sql",
+    )
     queue_edge_write(
         namespace,
-        [(room_id, event_id, prev_event_id, False) for event_id in event_ids],
+        [(room_id, event_id, prev_event_id, is_state) for event_id, is_state in rows],
     )
     # The ordinary worker continues draining other rooms. Target this room so
     # a pending or newly-created repair can make the next gated read an

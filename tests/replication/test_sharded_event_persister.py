@@ -78,7 +78,9 @@ class EventPersisterShardTestCase(BaseMultiWorkerStreamTestCase):
         user_id = self.register_user("user", "pass")
         access_token = self.login("user", "pass")
 
-        room_generation_results = self._generate_rooms_on_worker(user_id, access_token)
+        room_generation_results = self._generate_rooms_on_worker(
+            user_id, access_token, try_at_most_count=128
+        )
         room_id1 = room_generation_results["worker1"]
         room_id2 = room_generation_results["worker2"]
 

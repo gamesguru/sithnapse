@@ -48,7 +48,7 @@ try:
 
     class _SynapseJWTClaimsRegistry(JWTClaimsRegistry):
         def validate_sub(self, value: Any) -> None:
-            if not isinstance(value, (str, int)):
+            if isinstance(value, bool) or not isinstance(value, (str, int)):
                 raise InvalidClaimError(
                     "sub", "Claim 'sub' must be a StringOrURI value"
                 )

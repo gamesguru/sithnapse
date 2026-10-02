@@ -635,9 +635,10 @@ class PaginationHandler:
             )
             not_enough_events_to_fill_response = len(events) < pagin_config.limit
 
-            backfill_depth = (
-                min(event.depth for event in events) if events else curr_topo
-            )
+            # Keep the pagination cursor as the backfill point. Using the
+            # shallowest event in a sparse page can advance past a gap attached
+            # to a newer event in the same page.
+            backfill_depth = curr_topo
 
             if (
                 found_big_gap

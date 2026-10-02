@@ -76,7 +76,8 @@ book/
 *.cnf
 *.srl
 .sytest/
-*.tar*
+*.tar
+*.tar.*
 
 # complement
 /complement-*
