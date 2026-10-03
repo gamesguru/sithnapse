@@ -127,9 +127,8 @@ injection = '''        databases => \\%db_configs,
         key_fetch_backoff_floor => ( length( $ENV{SYNAPSE_KEY_FETCH_BACKOFF_FLOOR} // '' ) ? $ENV{SYNAPSE_KEY_FETCH_BACKOFF_FLOOR} : "0s" ),
         ( do {
             my $engine = $ENV{SYNAPSE_EMBEDDED_DB_ENGINE} // '';
-            my $path = $ENV{SYNAPSE_EMBEDDED_DB_PATH} // '';
-            ( length($engine) && length($path) )
-                ? ( embedded_db => { engine => $engine, path => $path } )
+            length($engine)
+                ? ( embedded_db => { engine => $engine, path => "$hs_dir/embedded_db" } )
                 : ();
         } ),'''
 
@@ -139,6 +138,9 @@ content = content.replace(anchor, injection, 1)
 with open('/sytest/lib/SyTest/Homeserver/Synapse.pm', 'w') as f:
     f.write(content)
 PY
+
+# Unset global SYNAPSE_EMBEDDED_DB_PATH so homeservers use their per-instance $hs_dir/embedded_db
+unset SYNAPSE_EMBEDDED_DB_PATH
 
 echo "--- Executing SyTest via synapse_sytest.sh"
 exec /sytest/scripts/synapse_sytest.sh

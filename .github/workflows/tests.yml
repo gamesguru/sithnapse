@@ -715,7 +715,6 @@ jobs:
         WORKERS: ${{ matrix.job.workers && 1 }}
         BLACKLIST: ${{ matrix.job.workers && 'synapse-blacklist-with-workers' }}
         SYNAPSE_EMBEDDED_DB_ENGINE: ${{ matrix.job.embedded_db && 'mtxdb' }}
-        SYNAPSE_EMBEDDED_DB_PATH: ${{ matrix.job.embedded_db && '/tmp/synapse-embedded-db' }}
         TOP: ${{ github.workspace }}
 
     strategy:
