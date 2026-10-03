@@ -378,7 +378,7 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
         args = [*receipts_args, user_id, user_id]
 
         receipts_cte = f"""
-            WITH all_receipts AS (
+            all_receipts AS (
                 SELECT room_id, thread_id, MAX(event_stream_ordering) AS max_receipt_stream_ordering
                 FROM receipts_linearized
                 WHERE
@@ -404,8 +404,8 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
         """
 
         pending_receipts_cte = f"""
-            WITH pending_receipts AS (
-                SELECT DISTINCT room_id, thread_id
+            pending_receipts AS (
+                SELECT room_id, thread_id
                 FROM receipts_linearized
                 WHERE user_id = ?
                     AND stream_id > (
@@ -439,8 +439,8 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
             )"""
 
         sql = f"""
-            {pending_receipts_cte}
-            {receipts_cte.removeprefix("WITH ")}
+            WITH {pending_receipts_cte}
+            {receipts_cte}
             SELECT eps.room_id, eps.thread_id, notif_count
             FROM event_push_summary AS eps
             {receipts_joins}
@@ -472,7 +472,7 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
         # Now get any event push actions that haven't been rotated using the same OR
         # join and filter by receipt and event push summary rotated up to stream ordering.
         sql = f"""
-            {receipts_cte}
+            WITH {receipts_cte}
             SELECT epa.room_id, epa.thread_id, COUNT(CASE WHEN epa.notif = 1 THEN 1 END) AS notif_count
             FROM event_push_actions AS epa
             {receipts_joins}
@@ -496,7 +496,7 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
         # has arrived but not been rotated meaning the summary table is out of date, so we
         # go back to the push actions table.
         sql = f"""
-            {receipts_cte}
+            WITH {receipts_cte}
             SELECT epa.room_id, epa.thread_id, COUNT(CASE WHEN epa.notif = 1 THEN 1 END) AS notif_count
             FROM event_push_actions AS epa
             {receipts_joins}
@@ -649,7 +649,7 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
         txn.execute(
             f"""
                 WITH pending_receipts AS (
-                    SELECT DISTINCT room_id, thread_id
+                    SELECT room_id, thread_id
                     FROM receipts_linearized
                     WHERE user_id = ?
                         AND room_id = ?
