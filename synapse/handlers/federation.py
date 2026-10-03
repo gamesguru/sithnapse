@@ -98,6 +98,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+PARTIAL_STATE_ROOM_LOCK_NAME = "partial_state_room_lock"
+
 # A partial-state room must eventually be resynchronised. In particular, a
 # transient database error late in the resync must not leave the room partial
 # forever, since several client endpoints wait for that flag to clear.
@@ -294,17 +296,20 @@ class FederationHandler:
             except Exception:
                 pass
 
-        async with self._room_backfill.queue(room_id):
-            async with self._worker_locks.acquire_read_write_lock(
-                PURGE_PAGINATION_LOCK_NAME, room_id, write=False
-            ):
-                return await self._maybe_backfill_inner(
-                    room_id,
-                    current_depth,
-                    limit,
-                    processing_start_time=processing_start_time,
-                    force=force,
-                )
+        async with self._worker_locks.acquire_read_write_lock(
+            PARTIAL_STATE_ROOM_LOCK_NAME, room_id, write=False
+        ):
+            async with self._room_backfill.queue(room_id):
+                async with self._worker_locks.acquire_read_write_lock(
+                    PURGE_PAGINATION_LOCK_NAME, room_id, write=False
+                ):
+                    return await self._maybe_backfill_inner(
+                        room_id,
+                        current_depth,
+                        limit,
+                        processing_start_time=processing_start_time,
+                        force=force,
+                    )
 
     @trace
     @tag_args
@@ -2470,11 +2475,14 @@ class FederationHandler:
 
             sync_failed = False
             try:
-                await self._sync_partial_state_room(
-                    initial_destination=initial_destination,
-                    other_destinations=other_destinations,
-                    room_id=room_id,
-                )
+                async with self._worker_locks.acquire_read_write_lock(
+                    PARTIAL_STATE_ROOM_LOCK_NAME, room_id, write=True
+                ):
+                    await self._sync_partial_state_room(
+                        initial_destination=initial_destination,
+                        other_destinations=other_destinations,
+                        room_id=room_id,
+                    )
             except Exception:
                 # A failure here can happen after we have fetched and applied all
                 # state but before clearing the partial-state flag (for example,
