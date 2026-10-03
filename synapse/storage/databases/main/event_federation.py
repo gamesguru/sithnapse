@@ -2900,47 +2900,53 @@ class EventFederationWorkerStore(
                 allow_none=True,
                 desc="get_successor_events_room_id",
             )
+            if room_id is None:
+                room_id = await self.db_pool.simple_select_one_onecol(
+                    table="event_backward_extremities",
+                    keyvalues={"event_id": event_id},
+                    retcol="room_id",
+                    allow_none=True,
+                    desc="get_successor_events_backward_extremity_room_id",
+                )
             ffi_timing(
                 "event_edges_successor_room_lookup", time.monotonic() - sql_started
             )
-            if room_id is None:
-                ffi_timing("event_edges_successor_total", time.monotonic() - started)
-                return []
-            sql_started = time.monotonic()
-            source_version = await self.db_pool.simple_select_one_onecol(
-                table="room_edge_source_version",
-                keyvalues={"room_id": room_id},
-                retcol="source_version",
-                allow_none=True,
-                desc="get_successor_events_source_version",
-            )
-            ffi_timing(
-                "event_edges_successor_source_version",
-                time.monotonic() - sql_started,
-            )
-            embedded_started = time.monotonic()
-            forward_map = get_event_edges_forward_batch(
-                self._embedded_db_namespace,
-                room_id,
-                int(source_version or 0),
-                [event_id],
-            )
-            ffi_timing(
-                "event_edges_successor_embedded_read",
-                time.monotonic() - embedded_started,
-            )
-            successors = None if forward_map.stale else forward_map.get(event_id)
-            logger.debug(
-                "get_successor_events: event_id=%s room_id=%s source_version=%s hit=%s",
-                event_id,
-                room_id,
-                source_version,
-                successors is not None,
-            )
-            if successors is not None:
-                ffi_count("event_edges_successor_hits", 1)
-                ffi_timing("event_edges_successor_total", time.monotonic() - started)
-                return successors
+            if room_id is not None:
+                sql_started = time.monotonic()
+                source_version = await self.db_pool.simple_select_one_onecol(
+                    table="room_edge_source_version",
+                    keyvalues={"room_id": room_id},
+                    retcol="source_version",
+                    allow_none=True,
+                    desc="get_successor_events_source_version",
+                )
+                ffi_timing(
+                    "event_edges_successor_source_version",
+                    time.monotonic() - sql_started,
+                )
+                embedded_started = time.monotonic()
+                forward_map = get_event_edges_forward_batch(
+                    self._embedded_db_namespace,
+                    room_id,
+                    int(source_version or 0),
+                    [event_id],
+                )
+                ffi_timing(
+                    "event_edges_successor_embedded_read",
+                    time.monotonic() - embedded_started,
+                )
+                successors = None if forward_map.stale else forward_map.get(event_id)
+                logger.debug(
+                    "get_successor_events: event_id=%s room_id=%s source_version=%s hit=%s",
+                    event_id,
+                    room_id,
+                    source_version,
+                    successors is not None,
+                )
+                if successors is not None:
+                    ffi_count("event_edges_successor_hits", 1)
+                    ffi_timing("event_edges_successor_total", time.monotonic() - started)
+                    return successors
 
             ffi_count("event_edges_successor_fallbacks", 1)
             sql_started = time.monotonic()
@@ -2959,28 +2965,37 @@ class EventFederationWorkerStore(
                 "event_edges_successor_sql_fallback", time.monotonic() - sql_started
             )
             if sql_res and getattr(self, "_embedded_event_edges_writable", False):
-                try:
-                    repair_started = time.monotonic()
-                    # The gated path already resolved this event's immutable
-                    # room id before reading the source-version watermark.
-                    # Reusing it avoids a second SQL round trip on every
-                    # repair-triggering miss.
-                    await repair_edge_index_from_sql(
-                        self,
-                        self._embedded_db_namespace,
-                        room_id,
-                        event_id,
-                        sql_res,
+                if room_id is None:
+                    room_id = await self.db_pool.simple_select_one_onecol(
+                        table="events",
+                        keyvalues={"event_id": sql_res[0]},
+                        retcol="room_id",
+                        allow_none=True,
+                        desc="get_successor_events_repair_room_id",
                     )
-                    ffi_count("event_edges_successor_repairs", len(sql_res))
-                    ffi_timing(
-                        "event_edges_successor_repair",
-                        time.monotonic() - repair_started,
-                    )
-                except Exception:
-                    logger.debug(
-                        "Failed to repair forward edge for %s", event_id, exc_info=True
-                    )
+                if room_id is not None:
+                    try:
+                        repair_started = time.monotonic()
+                        # The gated path already resolved this event's immutable
+                        # room id before reading the source-version watermark.
+                        # Reusing it avoids a second SQL round trip on every
+                        # repair-triggering miss.
+                        await repair_edge_index_from_sql(
+                            self,
+                            self._embedded_db_namespace,
+                            room_id,
+                            event_id,
+                            sql_res,
+                        )
+                        ffi_count("event_edges_successor_repairs", len(sql_res))
+                        ffi_timing(
+                            "event_edges_successor_repair",
+                            time.monotonic() - repair_started,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Failed to repair forward edge for %s", event_id, exc_info=True
+                        )
             ffi_timing("event_edges_successor_total", time.monotonic() - started)
             return sql_res
 
