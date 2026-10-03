@@ -415,11 +415,10 @@ def _filter_results(
 
         else:
             # If these are live tokens we compare the stream ordering against the
-            # writer's stream position if explicitly mapped.
-            lower_pos = lower_token.instance_map.get(instance_name)
-            if lower_pos is None and instance_name == "master":
-                lower_pos = lower_token.stream
-            if lower_pos is not None and stream_ordering <= lower_pos:
+            # writers stream position.
+            if stream_ordering <= lower_token.get_stream_pos_for_instance(
+                instance_name
+            ):
                 return False
 
     if upper_token:
@@ -427,10 +426,7 @@ def _filter_results(
             if upper_token.as_historical_tuple() < event_historical_tuple:
                 return False
         else:
-            upper_pos = upper_token.instance_map.get(instance_name)
-            if upper_pos is None and instance_name == "master":
-                upper_pos = upper_token.stream
-            if upper_pos is not None and upper_pos < stream_ordering:
+            if upper_token.get_stream_pos_for_instance(instance_name) < stream_ordering:
                 return False
 
     return True
