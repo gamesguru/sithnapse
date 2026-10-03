@@ -352,18 +352,27 @@ class SlidingSyncExtensionHandler:
                 events=[],
             )
 
+        # The replication cursor can lag behind the database on a worker.  In
+        # that case using it as the upper bound makes a freshly queued message
+        # invisible until the next replication update is processed.
+        current_to_device_key = max(
+            to_token.to_device_key,
+            self.store.get_to_device_stream_token(),
+            await self.store.get_max_to_device_stream_id(),
+        )
+
         since_stream_id = 0
         if to_device_request.since is not None:
             # We've already validated this is an int.
             since_stream_id = int(to_device_request.since)
 
-            if to_token.to_device_key < since_stream_id:
+            if current_to_device_key < since_stream_id:
                 # The since token is ahead of our current token, so we return an
                 # empty response.
                 logger.warning(
                     "Got to-device.since from the future. since token: %r is ahead of our current to_device stream position: %r",
                     since_stream_id,
-                    to_token.to_device_key,
+                    current_to_device_key,
                 )
                 return SlidingSyncResult.Extensions.ToDeviceExtension(
                     next_batch=to_device_request.since,
@@ -389,7 +398,7 @@ class SlidingSyncExtensionHandler:
             user_id=user_id,
             device_id=device_id,
             from_stream_id=since_stream_id,
-            to_stream_id=to_token.to_device_key,
+            to_stream_id=current_to_device_key,
             limit=min(to_device_request.limit, 100),  # Limit to at most 100 events
         )
 

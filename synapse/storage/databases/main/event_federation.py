@@ -2572,6 +2572,7 @@ class EventFederationWorkerStore(
         )
 
         event_id_results: set[str] = set()
+        queued_event_ids: set[str] = set()
 
         # In a PriorityQueue, the lowest valued entries are retrieved first.
         # We're using depth as the priority in the queue and tie-break based on
@@ -2590,12 +2591,15 @@ class EventFederationWorkerStore(
                     "type",
                     "depth",
                     "stream_ordering",
+                    "outlier",
                 ),
                 allow_none=True,
             )
 
             if event_lookup_result is not None:
-                event_type, depth, stream_ordering = event_lookup_result
+                event_type, depth, stream_ordering, outlier = event_lookup_result
+                if outlier:
+                    continue
                 logger.debug(
                     "_get_backfill_events(room_id=%s): seed_event_id=%s depth=%s stream_ordering=%s type=%s",
                     room_id,
@@ -2605,7 +2609,8 @@ class EventFederationWorkerStore(
                     event_type,
                 )
 
-                if depth:
+                if depth and seed_event_id not in queued_event_ids:
+                    queued_event_ids.add(seed_event_id)
                     queue.put((-depth, -stream_ordering, seed_event_id, event_type))
 
         while not queue.empty() and len(event_id_results) < limit:
@@ -2633,7 +2638,12 @@ class EventFederationWorkerStore(
             for (
                 connected_prev_event_backfill_item
             ) in connected_prev_event_backfill_results:
-                if connected_prev_event_backfill_item.event_id not in event_id_results:
+                if (
+                    connected_prev_event_backfill_item.event_id not in event_id_results
+                    and connected_prev_event_backfill_item.event_id
+                    not in queued_event_ids
+                ):
+                    queued_event_ids.add(connected_prev_event_backfill_item.event_id)
                     queue.put(
                         (
                             -connected_prev_event_backfill_item.depth,
@@ -2945,7 +2955,9 @@ class EventFederationWorkerStore(
                 )
                 if successors is not None:
                     ffi_count("event_edges_successor_hits", 1)
-                    ffi_timing("event_edges_successor_total", time.monotonic() - started)
+                    ffi_timing(
+                        "event_edges_successor_total", time.monotonic() - started
+                    )
                     return successors
 
             ffi_count("event_edges_successor_fallbacks", 1)
@@ -2994,7 +3006,9 @@ class EventFederationWorkerStore(
                         )
                     except Exception:
                         logger.debug(
-                            "Failed to repair forward edge for %s", event_id, exc_info=True
+                            "Failed to repair forward edge for %s",
+                            event_id,
+                            exc_info=True,
                         )
             ffi_timing("event_edges_successor_total", time.monotonic() - started)
             return sql_res

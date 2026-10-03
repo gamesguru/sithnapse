@@ -190,6 +190,23 @@ class DeviceInboxWorkerStore(SQLBaseStore):
     def get_to_device_stream_token(self) -> int:
         return self._to_device_msg_id_gen.get_current_token()
 
+    async def get_max_to_device_stream_id(self) -> int:
+        """Return the greatest to-device stream ID currently visible in the DB.
+
+        The in-process ID generator is normally kept up to date by replication,
+        but a worker may serve a request before it has consumed the corresponding
+        replication row.  The inbox itself is therefore the authoritative upper
+        bound when reading messages for a client.
+        """
+
+        result = await self.db_pool.simple_select_one_onecol(
+            table="device_inbox",
+            keyvalues={},
+            retcol="COALESCE(MAX(stream_id), 0)",
+            desc="get_max_to_device_stream_id",
+        )
+        return int(result)
+
     def get_to_device_id_generator(self) -> MultiWriterIdGenerator:
         return self._to_device_msg_id_gen
 
