@@ -687,6 +687,17 @@ class PaginationHandler:
 
         next_token = from_token.copy_and_replace(StreamKeyType.ROOM, next_key)
 
+        logger.info(
+            "get_messages: room_id=%s dir=%s from_key=%s to_room_key=%s next_key=%s limited=%s events_before_filter=%s",
+            room_id,
+            pagin_config.direction,
+            from_token.room_key,
+            to_room_key,
+            next_key,
+            limited,
+            [e.event_id for e in events],
+        )
+
         # if no events are returned from pagination (this page is empty)
         # and there aren't any more pages (not limited),
         # that implies we have reached the end of the available events.
@@ -713,6 +724,13 @@ class PaginationHandler:
             )
         else:
             filtered_events = [FilteredEvent.admin_override(e) for e in events]
+
+        logger.info(
+            "get_messages: room_id=%s dir=%s events_after_filter=%s",
+            room_id,
+            pagin_config.direction,
+            [e.event.event_id for e in filtered_events],
+        )
 
         # if after the filter applied there are no more events
         # return immediately - but there might be more in next_token batch
