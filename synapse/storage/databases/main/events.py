@@ -3344,6 +3344,11 @@ class PersistEventsStore:
                 txn.execute(sql, (event.event_id,))
                 event.internal_metadata.outlier = False
 
+                self.store.invalidate_get_event_cache_after_txn(txn, event.event_id)
+                self.store._send_invalidation_to_replication(
+                    txn, "_get_event_cache", (event.event_id,)
+                )
+
                 # Update the event_backward_extremities table now that this
                 # event isn't an outlier any more.
                 self._update_backward_extremeties(txn, [event])
