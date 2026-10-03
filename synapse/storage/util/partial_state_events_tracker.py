@@ -162,6 +162,17 @@ class PartialCurrentStateTracker:
             for o in observers:
                 o.callback(None)
 
+    def notify_resync_abandoned(self, room_id: str) -> None:
+        """Wake anything waiting on this room without it having full state.
+
+        Called when we stop trying to resynchronise the room, so that waiters
+        can re-check the room's partial-state flag instead of waiting forever.
+
+        Args:
+            room_id: the room whose resync we have given up on.
+        """
+        self.notify_un_partial_stated(room_id)
+
     @trace_with_opname("PartialCurrentStateTracker.await_full_state")
     @cancellable
     async def await_full_state(self, room_id: str) -> None:

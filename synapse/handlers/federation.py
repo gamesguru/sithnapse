@@ -41,7 +41,6 @@ from signedjson.sign import verify_signed_json
 from typing_extensions import assert_never
 from unpaddedbase64 import decode_base64
 
-from twisted.internet import defer
 from twisted.internet.defer import CancelledError
 
 from synapse import event_auth
@@ -92,7 +91,6 @@ from synapse.types.state import StateFilter
 from synapse.util.async_helpers import (
     Linearizer,
     concurrently_execute,
-    timeout_deferred,
 )
 from synapse.util.duration import Duration
 from synapse.util.retryutils import NotRetryingDestination
@@ -116,7 +114,6 @@ logger = logging.getLogger(__name__)
 _PARTIAL_STATE_SYNC_INITIAL_BACKOFF = Duration(seconds=1)
 _PARTIAL_STATE_SYNC_MAX_BACKOFF = Duration(hours=1)
 _PARTIAL_STATE_SYNC_MAX_CONSECUTIVE_FAILURES = 10
-_PARTIAL_STATE_FULL_STATE_WAIT_TIMEOUT = Duration(minutes=2)
 
 
 # Added to debug performance and track progress on optimizations
@@ -292,20 +289,14 @@ class FederationHandler:
 
         # If a partial state resync is currently active for this room, wait for it
         # to complete so the backward extremities from the join event are persisted.
-        try:
-            await timeout_deferred(
-                deferred=defer.ensureDeferred(
-                    self._storage_controllers.state._partial_state_room_tracker.await_full_state(
-                        room_id
-                    )
-                ),
-                timeout=_PARTIAL_STATE_FULL_STATE_WAIT_TIMEOUT,
-                clock=self.clock,
-            )
-        except defer.TimeoutError:
+        await self._storage_controllers.state._partial_state_room_tracker.await_full_state(
+            room_id
+        )
+        if await self.store.is_partial_state_room(room_id):
+            # The resync was abandoned (or has not finished), so the backward
+            # extremities from the join event may not be persisted yet.
             logger.warning(
-                "Timed out waiting for partial-state resynchronization in room %s; "
-                "skipping backfill",
+                "Room %s is still partial-state; skipping backfill",
                 room_id,
             )
             return False
@@ -2559,6 +2550,13 @@ class FederationHandler:
                         )
                 else:
                     self._partial_state_sync_failure_counts.pop(room_id, None)
+
+                if sync_failed and retry_delay is None and is_still_partial_state_room:
+                    # We're not going to retry, so don't leave anything (such as
+                    # backfill) waiting for the room to become full-state.
+                    self._storage_controllers.state._partial_state_room_tracker.notify_resync_abandoned(
+                        room_id
+                    )
 
                 if retry_delay is not None:
                     if restart_params is not None:
