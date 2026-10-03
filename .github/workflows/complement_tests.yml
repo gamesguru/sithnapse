@@ -31,8 +31,13 @@ jobs:
       # homeserver, while its integrated database is still queryable.
       COMPLEMENT_POST_TEST_SCRIPT: ${{ startsWith(matrix.database, 'Postgres') && format('{0}/synapse/.ci/scripts/dump_complement_postgres_stats.sh', github.workspace) || '' }}
       COMPLEMENT_POSTGRES_STATS_DIR: /tmp/complement-postgres-stats
-      # Packages/tests run in parallel by `go test` (-p / -parallel).
-      COMPLEMENT_PARALLEL: 4
+      # Packages/tests run in parallel by `go test` (-p / -parallel). Keep this
+      # at complement.sh's default: a GitHub runner has 4 vCPUs and every test
+      # deploys two homeservers (each is postgres, redis, nginx and a dozen
+      # synapse processes in workers mode), so raising it starves homeserver
+      # startup and fails deployments with "timed out checking for homeserver
+      # to be up".
+      COMPLEMENT_PARALLEL: 2
 
     strategy:
       fail-fast: false
