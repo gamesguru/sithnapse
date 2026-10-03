@@ -163,7 +163,9 @@ class EventToStateGroupMigrationTests(HomeserverTestCase):
 
     def test_sql_fallback_stops_once_sql_rows_are_migrated(self) -> None:
         self._insert_sql_mapping("$gone", 9401)
-        self.assertTrue(self.get_success(self.store._embedded_sql_state_groups_remain()))
+        self.assertTrue(
+            self.get_success(self.store._embedded_sql_state_groups_remain())
+        )
 
         self._migrate()
 
@@ -179,9 +181,7 @@ class EventToStateGroupMigrationTests(HomeserverTestCase):
     def test_state_reads_fall_back_to_sql_before_migration(self) -> None:
         self._insert_sql_mapping("$unmigrated", 9301)
 
-        res = self.get_success(
-            self.store._get_state_group_for_events(["$unmigrated"])
-        )
+        res = self.get_success(self.store._get_state_group_for_events(["$unmigrated"]))
         self.assertEqual(res, {"$unmigrated": 9301})
         # Only SQL-referenced, so reference lookups must still see it.
         self.assertEqual(
