@@ -30,7 +30,7 @@ export UV_PROJECT_ENVIRONMENT=/venv
 
 # Pin a known-good commit of SyTest for determinism in CI.
 # To update, run: git ls-remote https://github.com/matrix-org/sytest.git refs/heads/develop
-SYTEST_PINNED_REV="c4da260e19a25d4ef86e07409ffd0fda5b2c2eb8"
+SYTEST_PINNED_REV="747315856d24eee846c6923b696fff9fae55ca0f"
 
 if [ -n "$SYTEST_BRANCH" ]; then
 	branch_name="$SYTEST_BRANCH"
