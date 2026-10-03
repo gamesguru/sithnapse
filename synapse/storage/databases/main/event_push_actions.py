@@ -403,6 +403,18 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
             ) AS unthreaded_receipts USING (room_id)
         """
 
+        pending_receipts_cte = f"""
+            WITH pending_receipts AS (
+                SELECT DISTINCT room_id, thread_id
+                FROM receipts_linearized
+                WHERE user_id = ?
+                    AND stream_id > (
+                        SELECT stream_id FROM event_push_summary_last_receipt_stream_id
+                    )
+                    AND {receipt_types_clause}
+            ),
+        """
+
         # First get summary counts by room / thread for the user. We use the max receipt
         # stream ordering of both threaded & unthreaded receipts to compare against the
         # summary table.
@@ -427,7 +439,8 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
             )"""
 
         sql = f"""
-            {receipts_cte}
+            {pending_receipts_cte}
+            {receipts_cte.removeprefix("WITH ")}
             SELECT eps.room_id, eps.thread_id, notif_count
             FROM event_push_summary AS eps
             {receipts_joins}
@@ -438,20 +451,15 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
                     OR last_receipt_stream_ordering = {max_clause}
                 )
                 AND NOT EXISTS (
-                    SELECT 1 FROM receipts_linearized AS pending
-                    WHERE pending.user_id = ?
-                        AND pending.room_id = eps.room_id
-                        AND pending.stream_id > (
-                            SELECT stream_id FROM event_push_summary_last_receipt_stream_id
-                        )
-                        AND {receipt_types_clause}
+                    SELECT 1 FROM pending_receipts AS pending
+                    WHERE pending.room_id = eps.room_id
                         AND (
                             pending.thread_id IS NULL
                             OR pending.thread_id = eps.thread_id
                         )
                 )
         """
-        txn.execute(sql, args + [user_id, *receipts_args])
+        txn.execute(sql, [user_id, *receipts_args] + args)
 
         # The (room ID, thread ID) pairs we found an up-to-date summary for.
         seen_room_thread_ids = set()
@@ -640,6 +648,16 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
         # pending, and we fall back to counting `event_push_actions` instead.
         txn.execute(
             f"""
+                WITH pending_receipts AS (
+                    SELECT DISTINCT room_id, thread_id
+                    FROM receipts_linearized
+                    WHERE user_id = ?
+                        AND room_id = ?
+                        AND stream_id > (
+                            SELECT stream_id FROM event_push_summary_last_receipt_stream_id
+                        )
+                        AND {receipt_types_clause}
+                )
                 SELECT notif_count, COALESCE(unread_count, 0), thread_id
                 FROM event_push_summary
                 LEFT JOIN (
@@ -658,32 +676,24 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
                     OR last_receipt_stream_ordering = COALESCE(threaded_receipt_stream_ordering, ?)
                 )
                 AND NOT EXISTS (
-                    SELECT 1 FROM receipts_linearized AS pending
-                    WHERE pending.user_id = ?
-                        AND pending.room_id = ?
-                        AND pending.stream_id > (
-                            SELECT stream_id FROM event_push_summary_last_receipt_stream_id
-                        )
-                        AND {receipt_types_clause}
-                        AND (
-                            pending.thread_id IS NULL
-                            OR pending.thread_id = event_push_summary.thread_id
-                        )
+                    SELECT 1 FROM pending_receipts AS pending
+                    WHERE pending.thread_id IS NULL
+                        OR pending.thread_id = event_push_summary.thread_id
                 )
                 AND (notif_count != 0 OR COALESCE(unread_count, 0) != 0)
             """,
             (
                 user_id,
                 room_id,
+                *receipts_args,
+                user_id,
+                room_id,
                 unthreaded_receipt_stream_ordering,
                 *receipts_args,
                 room_id,
                 user_id,
                 unthreaded_receipt_stream_ordering,
                 unthreaded_receipt_stream_ordering,
-                user_id,
-                room_id,
-                *receipts_args,
             ),
         )
         summarised_threads = set()
