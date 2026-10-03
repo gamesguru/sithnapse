@@ -111,22 +111,6 @@ class LockStore(SQLBaseStore):
 
         self.clock.looping_call(self._reap_stale_read_write_locks, _LOCK_REAP_INTERVAL)
 
-        # On startup, clean up any locks left behind by a previous run of this instance
-        # (e.g. if the process crashed or was hard-killed without running shutdown handlers).
-        # This is done synchronously, before anything can acquire a lock, so that we
-        # can't delete locks taken by this run.
-        txn = db_conn.cursor(txn_name="cleanup_instance_locks")
-        txn.execute(
-            "DELETE FROM worker_read_write_locks WHERE instance_name = ?",
-            (self._instance_name,),
-        )
-        txn.execute(
-            "DELETE FROM worker_locks WHERE instance_name = ?",
-            (self._instance_name,),
-        )
-        txn.close()
-        db_conn.commit()
-
     @wrap_as_background_process("LockStore._on_shutdown")
     async def _on_shutdown(self) -> None:
         """Called when the server is shutting down"""
