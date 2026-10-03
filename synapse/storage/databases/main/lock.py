@@ -113,28 +113,19 @@ class LockStore(SQLBaseStore):
 
         # On startup, clean up any locks left behind by a previous run of this instance
         # (e.g. if the process crashed or was hard-killed without running shutdown handlers).
-        hs.run_as_background_process(
-            "LockStore._cleanup_instance_locks",
-            self._cleanup_instance_locks,
+        # This is done synchronously, before anything can acquire a lock, so that we
+        # can't delete locks taken by this run.
+        txn = db_conn.cursor(txn_name="cleanup_instance_locks")
+        txn.execute(
+            "DELETE FROM worker_read_write_locks WHERE instance_name = ?",
+            (self._instance_name,),
         )
-
-    @wrap_as_background_process("LockStore._cleanup_instance_locks")
-    async def _cleanup_instance_locks(self) -> None:
-        def cleanup_instance_locks_txn(txn: LoggingTransaction) -> None:
-            txn.execute(
-                "DELETE FROM worker_read_write_locks WHERE instance_name = ?",
-                (self._instance_name,),
-            )
-            txn.execute(
-                "DELETE FROM worker_locks WHERE instance_name = ?",
-                (self._instance_name,),
-            )
-
-        await self.db_pool.runInteraction(
-            "cleanup_instance_locks",
-            cleanup_instance_locks_txn,
-            db_autocommit=True,
+        txn.execute(
+            "DELETE FROM worker_locks WHERE instance_name = ?",
+            (self._instance_name,),
         )
+        txn.close()
+        db_conn.commit()
 
     @wrap_as_background_process("LockStore._on_shutdown")
     async def _on_shutdown(self) -> None:
