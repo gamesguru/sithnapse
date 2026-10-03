@@ -2591,15 +2591,12 @@ class EventFederationWorkerStore(
                     "type",
                     "depth",
                     "stream_ordering",
-                    "outlier",
                 ),
                 allow_none=True,
             )
 
             if event_lookup_result is not None:
-                event_type, depth, stream_ordering, outlier = event_lookup_result
-                if outlier:
-                    continue
+                event_type, depth, stream_ordering = event_lookup_result
                 logger.debug(
                     "_get_backfill_events(room_id=%s): seed_event_id=%s depth=%s stream_ordering=%s type=%s",
                     room_id,
