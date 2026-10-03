@@ -416,7 +416,11 @@ class FederationHandler:
                 MAX_DEPTH,
                 limit,
                 processing_start_time=processing_start_time,
-                force=force,
+                # This is a fallback probe for extremities newer than the
+                # pagination cursor. Do not carry foreground pagination's
+                # force flag into it, or an unrelated newer extremity can
+                # make the request block on federation.
+                force=False,
             )
 
         # Even after recursing with `MAX_DEPTH`, we didn't find any
@@ -2487,20 +2491,36 @@ class FederationHandler:
                 # Normally, the partial state flag will be gone. If it isn't, then we
                 # may find ourselves in scenario 2a or 2b as described in the comment
                 # above, where we want to restart the partial state sync.
-                is_still_partial_state_room = await self.store.is_partial_state_room(
-                    room_id
-                )
-                self._active_partial_state_syncs.remove(room_id)
+                try:
+                    is_still_partial_state_room = (
+                        await self.store.is_partial_state_room(room_id)
+                    )
+                except Exception:
+                    # Cleanup below must still run if this diagnostic read
+                    # fails. Treat the room as still partial so that the
+                    # normal retry handling remains conservative.
+                    is_still_partial_state_room = True
+                    logger.exception(
+                        "Failed to check partial-state flag for room %s", room_id
+                    )
+                finally:
+                    self._active_partial_state_syncs.remove(room_id)
 
-                sync_deferred = self._active_partial_state_sync_deferreds.pop(
-                    room_id, None
-                )
-                if sync_deferred is not None and not sync_deferred.called:
-                    sync_deferred.callback(None)
+                    restart_params = (
+                        self._partial_state_syncs_maybe_needing_restart.pop(
+                            room_id, None
+                        )
+                    )
 
-                restart_params = self._partial_state_syncs_maybe_needing_restart.pop(
-                    room_id, None
-                )
+                    # Keep the notification pending if a join queued another
+                    # sync. The caller must not backfill until that restarted
+                    # sync has completed too.
+                    if restart_params is None:
+                        sync_deferred = self._active_partial_state_sync_deferreds.pop(
+                            room_id, None
+                        )
+                        if sync_deferred is not None and not sync_deferred.called:
+                            sync_deferred.callback(None)
 
                 # Determine whether to schedule a retry and with what delay.
                 # On success, reset the failure counter. On failure, compute an

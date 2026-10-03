@@ -35,7 +35,7 @@ from typing_extensions import TypeGuard
 
 from twisted.conch.ssh.keys import Key
 
-from synapse.api.room_versions import KNOWN_ROOM_VERSIONS
+from synapse.api.room_versions import KNOWN_ROOM_VERSIONS, RoomVersions
 from synapse.types import JsonDict, StrSequence
 from synapse.util.duration import Duration
 from synapse.util.module_loader import load_module
@@ -624,6 +624,13 @@ class ServerConfig(Config):
             )
 
         default_room_version = config.get("default_room_version", DEFAULT_ROOM_VERSION)
+
+        # ExperimentalConfig is parsed after ServerConfig, but an experimental
+        # room version may still be selected as the default. Register MSC3389
+        # early enough for the validation below to see it.
+        experimental_features = config.get("experimental_features") or {}
+        if experimental_features.get("msc3389_enabled"):
+            KNOWN_ROOM_VERSIONS.add_room_version(RoomVersions.MSC3389v10)
 
         # Ensure room version is a str
         default_room_version = str(default_room_version)
