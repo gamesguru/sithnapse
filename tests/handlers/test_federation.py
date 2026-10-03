@@ -635,16 +635,19 @@ class PartialJoinTestCase(unittest.FederatingHomeserverTestCase):
         ):
             # Start the partial state sync.
             fed_handler._start_partial_state_room_sync("hs1", {"hs2"}, "room_id")
+            self.pump()
             self.assertEqual(mock_sync_partial_state_room.call_count, 1)
 
             # Try to start another partial state sync.
             # Nothing should happen.
             fed_handler._start_partial_state_room_sync("hs3", {"hs2"}, "room_id")
+            self.pump()
             self.assertEqual(mock_sync_partial_state_room.call_count, 1)
 
             # End the partial state sync
             is_partial_state = False
             end_sync.callback(None)
+            self.pump()
 
             # The partial state sync should not be restarted.
             self.assertEqual(mock_sync_partial_state_room.call_count, 1)
@@ -652,6 +655,7 @@ class PartialJoinTestCase(unittest.FederatingHomeserverTestCase):
             # The next attempt to start the partial state sync should work.
             is_partial_state = True
             fed_handler._start_partial_state_room_sync("hs3", {"hs2"}, "room_id")
+            self.pump()
             self.assertEqual(mock_sync_partial_state_room.call_count, 2)
 
     def test_partial_state_room_sync_restart(self) -> None:
@@ -690,15 +694,18 @@ class PartialJoinTestCase(unittest.FederatingHomeserverTestCase):
         ):
             # Start the partial state sync.
             fed_handler._start_partial_state_room_sync("hs1", {"hs2"}, "room_id")
+            self.pump()
             self.assertEqual(mock_sync_partial_state_room.call_count, 1)
 
             # Fail the partial state sync.
             # The retry is delayed to avoid a tight failure loop.
             fed_handler._start_partial_state_room_sync("hs3", {"hs2"}, "room_id")
             end_sync.errback(Exception("Failed to request /state_ids"))
+            self.pump()
             self.assertEqual(mock_sync_partial_state_room.call_count, 1)
 
             self.reactor.advance(1)
+            self.pump()
             self.assertEqual(mock_sync_partial_state_room.call_count, 2)
             mock_sync_partial_state_room.assert_called_with(
                 initial_destination="hs3",
