@@ -308,18 +308,40 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             # elsewhere" question (that's get_referenced_state_groups,
             # backed by the separate refcount).
             all_purge_event_ids = [event_id for event_id, _should_delete in event_rows]
+
+            # The SQL rows are retained by the SQL -> mtxdb migration, so they
+            # may reference state groups too (including for events not yet
+            # migrated). Delete them *before* consulting mtxdb: the delete
+            # takes the row locks the migration batch also takes, so the
+            # migration either finishes first (and the lookup below sees what
+            # it wrote) or can no longer select these rows. Otherwise it could
+            # re-insert a stale mapping for a purged event. It also stops
+            # turning the embedded engine off from resurrecting the mapping.
+            txn.execute(
+                """
+                SELECT DISTINCT state_group FROM events_to_purge
+                INNER JOIN event_to_state_groups USING (event_id)
+            """
+            )
+            referenced_state_groups = {sg for (sg,) in txn}
+            logger.info("[purge] removing events from event_to_state_groups")
+            txn.execute(
+                "DELETE FROM event_to_state_groups "
+                "WHERE event_id IN (SELECT event_id from events_to_purge)"
+            )
+
+            # Only mtxdb entries are refcounted, so only those are decremented.
             event_id_to_state_group = get_state_group_for_events_batch(
                 self._embedded_db_engine,
                 self._embedded_db_namespace,
                 all_purge_event_ids,
                 purpose="purge_traversal",
             )
-            referenced_state_groups = set(event_id_to_state_group.values())
+            referenced_state_groups.update(event_id_to_state_group.values())
             logger.info(
                 "[purge] found %i referenced state groups", len(referenced_state_groups)
             )
 
-            logger.info("[purge] removing events from event_to_state_groups")
             delete_event_to_state_group_batch(
                 self._embedded_db_engine,
                 self._embedded_db_namespace,

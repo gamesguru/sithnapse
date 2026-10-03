@@ -777,6 +777,27 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             )
             res = dict(rows)
 
+        if getattr(self, "_embedded_event_json_enabled", False):
+            # Until the SQL -> mtxdb migration has copied a row over, mtxdb
+            # genuinely has no mapping for it. The SQL rows are retained, so
+            # fall back to them for any miss (purge deletes them too, so a
+            # purged event can't be resurrected from here).
+            sql_missing = set(event_ids).difference(res)
+            if sql_missing:
+                res = dict(res)
+                rows = cast(
+                    list[tuple[str, int]],
+                    await self.db_pool.simple_select_many_batch(
+                        table="event_to_state_groups",
+                        column="event_id",
+                        iterable=sql_missing,
+                        keyvalues={},
+                        retcols=("event_id", "state_group"),
+                        desc="_get_state_group_for_events_sql_fallback",
+                    ),
+                )
+                res.update(rows)
+
         missing = set(event_ids).difference(res)
         if missing and raise_on_missing:
             # A scalar read can already have populated the per-event cache
@@ -822,11 +843,26 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             # count instead -- see embedded_event_to_state_group.py's
             # module docstring for why a count (not an event-list index)
             # keeps this O(1) per write regardless of room activity.
-            return get_referenced_state_groups_batch(
+            state_groups = list(state_groups)
+            referenced = get_referenced_state_groups_batch(
                 self._embedded_db_engine,
                 self._embedded_db_namespace,
-                list(state_groups),
+                state_groups,
             )
+            # Rows not yet migrated from SQL aren't in the refcount, but still
+            # reference their state group.
+            remaining = set(state_groups) - referenced
+            if remaining:
+                rows = await self.db_pool.simple_select_many_batch(
+                    table="event_to_state_groups",
+                    column="state_group",
+                    iterable=remaining,
+                    keyvalues={},
+                    retcols=("DISTINCT state_group",),
+                    desc="get_referenced_state_groups_sql_fallback",
+                )
+                referenced = referenced | {row[0] for row in rows}
+            return referenced
 
         rows = cast(
             list[tuple[int]],
@@ -902,7 +938,18 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
                 [(event.event_id, state_group)],
             )
             old_state_group = old.get(event.event_id)
-            if old_state_group is not None and old_state_group != state_group:
+            if old_state_group is None:
+                # No mtxdb mapping yet: the event is either brand new or its
+                # SQL row hasn't been migrated. Refcounts only count mtxdb
+                # entries, and the migration skips events mtxdb already has,
+                # so the old group was never counted (nothing to decrement)
+                # while the new one must be.
+                increment_state_group_refcounts_batch(
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
+                    [state_group],
+                )
+            elif old_state_group != state_group:
                 decrement_state_group_refcounts_batch(
                     self._embedded_db_engine,
                     self._embedded_db_namespace,

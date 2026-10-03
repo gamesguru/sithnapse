@@ -463,22 +463,64 @@ class EventsBackgroundUpdatesStore(
         for the same reasoning).
         """
         last_event_id = progress.get("last_event_id", "")
+        # Lock the selected rows (Postgres; SQLite serialises writers anyway)
+        # and do the mtxdb writes in the same transaction. Purge deletes these
+        # rows before touching mtxdb, so it either waits for this batch and sees
+        # its mappings, or deletes first and this batch never selects them --
+        # a purged event's mapping can't be re-inserted from a stale read.
+        lock_clause = (
+            "FOR UPDATE" if isinstance(self.database_engine, PostgresEngine) else ""
+        )
 
-        def get_batch_txn(txn: LoggingTransaction) -> list[tuple[str, int]]:
+        def migrate_batch_txn(txn: LoggingTransaction) -> list[tuple[str, int]]:
             txn.execute(
-                """
+                f"""
                 SELECT event_id, state_group FROM event_to_state_groups
                 WHERE event_id > ?
                 ORDER BY event_id
                 LIMIT ?
+                {lock_clause}
                 """,
                 (last_event_id, batch_size),
             )
-            return cast(list[tuple[str, int]], txn.fetchall())
+            rows = cast(list[tuple[str, int]], txn.fetchall())
+            if not rows:
+                return rows
+
+            # The mtxdb put below only copies rows mtxdb doesn't have, because
+            # the refcount increment is not idempotent: if this batch is
+            # reprocessed after a crash between these writes and the progress
+            # update, an unguarded increment would double-count every event
+            # already migrated last time. An already-present mapping is also
+            # either a replay or newer than this (now stale) SQL row, e.g. a
+            # partial-state event rewritten after the engine was turned on.
+            already_migrated = get_state_group_for_events_batch(
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
+                [event_id for event_id, _state_group in rows],
+                purpose="migration_probe",
+            )
+            new_rows = [
+                (event_id, state_group)
+                for event_id, state_group in rows
+                if event_id not in already_migrated
+            ]
+            put_event_to_state_group_batch(
+                self._embedded_db_engine, self._embedded_db_namespace, new_rows
+            )
+            increment_state_group_refcounts_batch(
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
+                [state_group for _event_id, state_group in new_rows],
+            )
+            # One sync for the whole batch (put + increment above), not one per
+            # helper call -- see put_event_to_state_group_batch's docstring.
+            maybe_sync(SyncTier.DURABLE, pools=[Pool.STATE])
+            return rows
 
         rows = await self.db_pool.runInteraction(
-            f"{self.EMBEDDED_EVENT_TO_STATE_GROUP_MIGRATION_UPDATE_NAME}_select",
-            get_batch_txn,
+            f"{self.EMBEDDED_EVENT_TO_STATE_GROUP_MIGRATION_UPDATE_NAME}_migrate",
+            migrate_batch_txn,
         )
 
         if not rows:
@@ -486,35 +528,6 @@ class EventsBackgroundUpdatesStore(
                 self.EMBEDDED_EVENT_TO_STATE_GROUP_MIGRATION_UPDATE_NAME
             )
             return 0
-
-        # The mtxdb put below is idempotent (an overwrite), but the refcount
-        # increment is not: if this batch is reprocessed after a crash
-        # between the writes here and the progress update below, an
-        # unguarded increment would double-count every event already
-        # migrated last time. Only increment for event_ids this batch
-        # hasn't already written to mtxdb.
-        already_migrated = get_state_group_for_events_batch(
-            self._embedded_db_engine,
-            self._embedded_db_namespace,
-            [event_id for event_id, _state_group in rows],
-            purpose="migration_probe",
-        )
-        new_rows = [
-            (event_id, state_group)
-            for event_id, state_group in rows
-            if event_id not in already_migrated
-        ]
-        put_event_to_state_group_batch(
-            self._embedded_db_engine, self._embedded_db_namespace, rows
-        )
-        increment_state_group_refcounts_batch(
-            self._embedded_db_engine,
-            self._embedded_db_namespace,
-            [state_group for _event_id, state_group in new_rows],
-        )
-        # One sync for the whole batch (put + increment above), not one per
-        # helper call -- see put_event_to_state_group_batch's docstring.
-        maybe_sync(SyncTier.DURABLE, pools=[Pool.STATE])
 
         await self.db_pool.updates._background_update_progress(
             self.EMBEDDED_EVENT_TO_STATE_GROUP_MIGRATION_UPDATE_NAME,

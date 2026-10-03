@@ -324,6 +324,55 @@ class PurgeTests(HomeserverTestCase):
         self.store._invalidate_local_get_event_cache(first["event_id"])
         self.get_failure(self.store.get_event(first["event_id"]), NotFoundError)
 
+    def test_purge_history_deletes_unmigrated_sql_state_group_rows(self) -> None:
+        """A purged event whose `event_to_state_groups` row is still SQL-only
+        (the SQL -> mtxdb migration retains SQL rows and may not have reached
+        it) must lose that row too, or the migration -- or turning the
+        embedded engine off -- would resurrect the purged event's mapping."""
+        from synapse.storage.databases.main.embedded_event_to_state_group import (
+            delete_event_to_state_group_batch,
+            get_state_group_for_events_batch,
+        )
+
+        engine, namespace = self._enable_embedded_engine()
+        room_id = self.helper.create_room_as(self.user_id)
+        first = self.helper.send(room_id, body="unmigrated")
+        last = self.helper.send(room_id, body="last")
+        first_id = first["event_id"]
+
+        # Turn `first`'s mapping back into the pre-migration shape: present in
+        # SQL only.
+        state_group = get_state_group_for_events_batch(engine, namespace, [first_id])[
+            first_id
+        ]
+        delete_event_to_state_group_batch(engine, namespace, [first_id])
+        self.get_success(
+            self.store.db_pool.simple_upsert(
+                table="event_to_state_groups",
+                keyvalues={"event_id": first_id},
+                values={"state_group": state_group},
+            )
+        )
+
+        token = self.get_success(
+            self.store.get_topological_token_for_event(last["event_id"])
+        )
+        token_str = self.get_success(token.to_string(self.hs.get_datastores().main))
+        self.get_success(
+            self._storage_controllers.purge_events.purge_history(
+                room_id, token_str, True
+            )
+        )
+
+        rows = self.get_success(
+            self.store.db_pool.simple_select_list(
+                table="event_to_state_groups",
+                keyvalues={"event_id": first_id},
+                retcols=("state_group",),
+            )
+        )
+        self.assertEqual(rows, [])
+
     def test_purge_history_deletes_state_groups(self) -> None:
         """Test that unreferenced state groups get cleaned up after purge"""
 
