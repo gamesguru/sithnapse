@@ -142,6 +142,10 @@ class PartialCurrentStateTracker:
         # un-partial-stated.
         self._observers: dict[str, set[Deferred[None]]] = defaultdict(set)
 
+        # The subset of the above which have opted in to being woken when we give up
+        # on resynchronising the room, rather than only when it has full state.
+        self._abandon_observers: set[Deferred[None]] = set()
+
     def notify_un_partial_stated(self, room_id: str) -> None:
         """Notify that we now have full current state for a given room
 
@@ -163,23 +167,52 @@ class PartialCurrentStateTracker:
                 o.callback(None)
 
     def notify_resync_abandoned(self, room_id: str) -> None:
-        """Wake anything waiting on this room without it having full state.
+        """Wake waiters which opted in via `return_if_abandoned`, without the room
+        having full state.
 
-        Called when we stop trying to resynchronise the room, so that waiters
-        can re-check the room's partial-state flag instead of waiting forever.
+        Called when we stop trying to resynchronise the room, so that those waiters
+        can re-check the room's partial-state flag instead of waiting forever. Other
+        waiters need full state and keep waiting.
 
         Args:
             room_id: the room whose resync we have given up on.
         """
-        self.notify_un_partial_stated(room_id)
+        observers = {
+            o for o in self._observers.get(room_id, ()) if o in self._abandon_observers
+        }
+        if not observers:
+            return
+        logger.info(
+            "Notifying %i things waiting on abandoned resync of room %s",
+            len(observers),
+            room_id,
+        )
+        with PreserveLoggingContext():
+            for o in observers:
+                self._observers[room_id].discard(o)
+                self._abandon_observers.discard(o)
+                o.callback(None)
+        if not self._observers[room_id]:
+            del self._observers[room_id]
 
     @trace_with_opname("PartialCurrentStateTracker.await_full_state")
     @cancellable
-    async def await_full_state(self, room_id: str) -> None:
+    async def await_full_state(
+        self, room_id: str, return_if_abandoned: bool = False
+    ) -> None:
+        """Wait for the room to have full current state.
+
+        Args:
+            room_id: the room to wait on.
+            return_if_abandoned: also return if we give up resynchronising the room.
+                The room may then still be partial-state, so the caller must re-check.
+        """
         # We add the deferred immediately so that the DB call to check for
         # partial state doesn't race when we unpartial the room.
         d: Deferred[None] = Deferred()
         self._observers.setdefault(room_id, set()).add(d)
+        if return_if_abandoned:
+            self._abandon_observers.add(d)
 
         try:
             # Check if the room has partial current state or not.
@@ -198,6 +231,7 @@ class PartialCurrentStateTracker:
             logger.info("Room has un-partial-stated")
         finally:
             # Remove the added observer, and remove the room entry if its empty.
+            self._abandon_observers.discard(d)
             ds = self._observers.get(room_id)
             if ds is not None:
                 ds.discard(d)

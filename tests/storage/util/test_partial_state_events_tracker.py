@@ -151,18 +151,24 @@ class PartialCurrentStateTrackerTestCase(TestCase):
         self.tracker.notify_un_partial_stated("room_id")
         self.successResultOf(d)
 
-    def test_resync_abandoned_unblocks_waiters(self) -> None:
-        # Giving up on a resync must wake waiters, even though the room is
-        # still partial-state, so that they can re-check and carry on.
+    def test_resync_abandoned_unblocks_opted_in_waiters_only(self) -> None:
+        # Giving up on a resync wakes waiters which opted in (so that they can
+        # re-check and carry on), but not those which need full state.
         self.mock_store.is_partial_state_room.return_value = True
 
-        d1 = ensureDeferred(self.tracker.await_full_state("room_id"))
+        d1 = ensureDeferred(
+            self.tracker.await_full_state("room_id", return_if_abandoned=True)
+        )
         d2 = ensureDeferred(self.tracker.await_full_state("room_id"))
         self.assertNoResult(d1)
         self.assertNoResult(d2)
 
         self.tracker.notify_resync_abandoned("room_id")
         self.successResultOf(d1)
+        self.assertNoResult(d2)
+
+        # The remaining waiter is still woken by full state arriving.
+        self.tracker.notify_un_partial_stated("room_id")
         self.successResultOf(d2)
 
     def test_un_partial_state_race(self) -> None:

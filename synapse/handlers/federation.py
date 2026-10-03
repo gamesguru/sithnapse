@@ -290,7 +290,7 @@ class FederationHandler:
         # If a partial state resync is currently active for this room, wait for it
         # to complete so the backward extremities from the join event are persisted.
         await self._storage_controllers.state._partial_state_room_tracker.await_full_state(
-            room_id
+            room_id, return_if_abandoned=True
         )
         if await self.store.is_partial_state_room(room_id):
             # The resync was abandoned (or has not finished), so the backward

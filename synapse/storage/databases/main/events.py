@@ -4453,7 +4453,7 @@ class PersistEventsStore:
 
         # Partial and outlier events can legitimately have no state group.
         # `event_to_state_groups.state_group` is NOT NULL, so exclude those
-        # mappings from the SQL safety copy as well as from the embedded map.
+        # mappings from the SQL table as well as from the embedded map.
         non_null_state_groups: dict[str, int] = {
             event_id: state_group_id
             for event_id, state_group_id in state_groups.items()

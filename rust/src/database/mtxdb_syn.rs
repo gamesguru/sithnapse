@@ -691,7 +691,13 @@ pub fn put_state_hamt_roots(
         let committed = engine.put_many(&room_id, &pairs).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {}", e))
         })?;
-        debug_assert_eq!(committed, pairs.len());
+        if committed != pairs.len() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "mtxdb put_many committed {} of {} entries",
+                committed,
+                pairs.len()
+            )));
+        }
         Ok(())
     })
 }
@@ -862,7 +868,13 @@ pub fn delete_state_hamt_roots_for_room(
         let committed = engine.put_many(&room_id, &pairs).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb delete error: {}", e))
         })?;
-        debug_assert_eq!(committed, pairs.len());
+        if committed != pairs.len() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "mtxdb put_many committed {} of {} entries",
+                committed,
+                pairs.len()
+            )));
+        }
         Ok(())
     })
 }
@@ -2722,7 +2734,13 @@ pub fn auth_chain_edges_put(
         let committed = engine.put_many(&collection, &pairs).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {}", e))
         })?;
-        debug_assert_eq!(committed, pairs.len());
+        if committed != pairs.len() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "mtxdb put_many committed {} of {} entries",
+                committed,
+                pairs.len()
+            )));
+        }
         Ok(())
     })
 }
