@@ -190,22 +190,19 @@ class DeviceInboxWorkerStore(SQLBaseStore):
     def get_to_device_stream_token(self) -> int:
         return self._to_device_msg_id_gen.get_current_token()
 
-    async def get_max_to_device_stream_id(self) -> int:
-        """Return the greatest to-device stream ID currently visible in the DB.
+    async def get_to_device_persisted_positions(self) -> list[tuple[str, int]]:
+        """Each to-device writer's persisted stream position.
 
-        The in-process ID generator is normally kept up to date by replication,
-        but a worker may serve a request before it has consumed the corresponding
-        replication row.  The inbox itself is therefore the authoritative upper
-        bound when reading messages for a client.
+        Writers update `stream_positions` as part of persisting, so these are
+        safe bounds (no uncommitted gaps) for a worker to wait for replication on.
         """
-
-        result = await self.db_pool.simple_select_one_onecol(
-            table="device_inbox",
-            keyvalues={},
-            retcol="COALESCE(MAX(stream_id), 0)",
-            desc="get_max_to_device_stream_id",
+        rows = await self.db_pool.simple_select_list(
+            table="stream_positions",
+            keyvalues={"stream_name": "to_device"},
+            retcols=("instance_name", "stream_id"),
+            desc="get_to_device_persisted_positions",
         )
-        return int(result)
+        return [(instance_name, stream_id) for instance_name, stream_id in rows]
 
     def get_to_device_id_generator(self) -> MultiWriterIdGenerator:
         return self._to_device_msg_id_gen
