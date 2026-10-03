@@ -446,7 +446,7 @@ class FederationHandler:
         # much larger factor will result in triggering a backfill request much
         # earlier than necessary.
         max_depth_of_backfill_points = sorted_backfill_points[0].depth
-        if not force and current_depth - 2 * limit > max_depth_of_backfill_points:
+        if current_depth != MAX_DEPTH and not force and current_depth - 2 * limit > max_depth_of_backfill_points:
             logger.debug(
                 "Not backfilling as we don't need to. %d < %d - 2 * %d",
                 max_depth_of_backfill_points,
