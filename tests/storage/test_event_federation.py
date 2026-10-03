@@ -1354,6 +1354,73 @@ class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
 
         return _BackfillSetupInfo(room_id=room_id, depth_map=depth_map)
 
+    def test_get_backfill_events_withholds_outlier_seed(self) -> None:
+        """An outlier seed has no state, so we can't check the requester may see
+        it: it's walked back from but not returned, while its (non-outlier)
+        predecessors are."""
+        room_id = "!backfill-outlier:test"
+
+        def populate_db(txn: LoggingTransaction) -> None:
+            self.store.db_pool.simple_insert_txn(
+                txn,
+                "rooms",
+                {
+                    "room_id": room_id,
+                    "creator": "room_creator_user_id",
+                    "is_public": True,
+                    "room_version": "6",
+                },
+            )
+            for depth, event_id, outlier in [
+                (1, "$e1", False),
+                (2, "$e2", False),
+                (3, "$e3", True),
+            ]:
+                self.store.db_pool.simple_insert_txn(
+                    txn,
+                    table="events",
+                    values={
+                        "event_id": event_id,
+                        "type": "m.room.message",
+                        "room_id": room_id,
+                        "depth": depth,
+                        "topological_ordering": depth,
+                        "stream_ordering": depth,
+                        "processed": True,
+                        "outlier": outlier,
+                    },
+                )
+            for event_id, prev_event_id in [("$e2", "$e1"), ("$e3", "$e2")]:
+                self.store.db_pool.simple_insert_txn(
+                    txn,
+                    table="event_edges",
+                    values={
+                        "event_id": event_id,
+                        "prev_event_id": prev_event_id,
+                        "room_id": room_id,
+                    },
+                )
+
+        self.get_success(
+            self.store.db_pool.runInteraction("populate_backfill_outlier", populate_db)
+        )
+
+        def backfill(seed: str) -> set[str]:
+            return self.get_success(
+                self.store.db_pool.runInteraction(
+                    "get_backfill_events",
+                    self.store._get_backfill_events,
+                    room_id,
+                    [seed],
+                    100,
+                )
+            )
+
+        # The outlier seed itself is withheld, but backfill still walks back.
+        self.assertEqual(backfill("$e3"), {"$e2", "$e1"})
+        # A non-outlier seed is returned as before.
+        self.assertEqual(backfill("$e2"), {"$e2", "$e1"})
+
     def test_get_backfill_points_in_room(self) -> None:
         """
         Test to make sure only backfill points that are older and come before
