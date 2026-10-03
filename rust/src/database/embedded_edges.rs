@@ -597,6 +597,25 @@ enum EdgeOccOutcome {
 /// a retryable error the caller (Python) can back off on.
 const MAX_OCC_ATTEMPTS: usize = 16;
 
+/// Classify a read/stage-phase failure inside an OCC body. Nothing has been
+/// committed yet, so a retryable read failure (`BlockingIOError`: record
+/// versions kept advancing under the reader) is safe to replay on a fresh
+/// transaction, exactly like a stale commit. Never use this on `commit`, whose
+/// failures are ambiguous.
+fn replay_read_contention(result: PyResult<()>) -> PyResult<Option<EdgeOccOutcome>> {
+    match result {
+        Ok(()) => Ok(None),
+        Err(error)
+            if pyo3::Python::attach(|py| {
+                error.is_instance_of::<pyo3::exceptions::PyBlockingIOError>(py)
+            }) =>
+        {
+            Ok(Some(EdgeOccOutcome::Conflict))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Number of record-version conflicts observed by the edge OCC path.
 /// Exposed as a diagnostic so integration tests and operators can distinguish
 /// a successful uncontended write from one that required replay.
@@ -706,7 +725,11 @@ pub fn event_edges_put(
         match begin_internal_transaction()? {
             Some(txn) => {
                 let mut body = |txn: &DatabaseTransaction<'static>| {
-                    write_edges(txn, &namespace, &rows)?;
+                    if let Some(outcome) =
+                        replay_read_contention(write_edges(txn, &namespace, &rows))?
+                    {
+                        return Ok(outcome);
+                    }
                     match txn.commit() {
                         Ok(()) => Ok(EdgeOccOutcome::Done),
                         Err(error) if error.is_stale_read() => Ok(EdgeOccOutcome::Conflict),
@@ -1252,7 +1275,11 @@ pub fn event_edges_apply_forward_outbox(
         // set so one room's watermark write can't conflict with another's.
         Some(txn) => {
             let mut body = |txn: &DatabaseTransaction<'static>| {
-                apply_forward_delta(txn, &namespace, &room_id, generation, &rows)?;
+                if let Some(outcome) = replay_read_contention(apply_forward_delta(
+                    txn, &namespace, &room_id, generation, &rows,
+                ))? {
+                    return Ok(outcome);
+                }
                 txn.forward_put_meta(&room_id, generation, published_source_version)
                     .map_err(|e| map_transaction_error("put_metadata", e))?;
                 match txn.commit() {
@@ -1294,7 +1321,11 @@ pub fn event_edges_apply_forward_generation_delta(
     py.detach(|| match begin_internal_transaction()? {
         Some(txn) => {
             let mut body = |txn: &DatabaseTransaction<'static>| {
-                apply_forward_delta(txn, &namespace, &room_id, generation, &rows)?;
+                if let Some(outcome) = replay_read_contention(apply_forward_delta(
+                    txn, &namespace, &room_id, generation, &rows,
+                ))? {
+                    return Ok(outcome);
+                }
                 match txn.commit() {
                     Ok(()) => Ok(EdgeOccOutcome::Done),
                     Err(error) if error.is_stale_read() => Ok(EdgeOccOutcome::Conflict),
@@ -2124,5 +2155,20 @@ mod tests {
             .expect("put to an unrelated room must not block behind room A's held lock");
         handle.join().expect("thread did not panic");
         drop(_held);
+    }
+
+    #[test]
+    fn read_contention_replays_only_retryable_errors() {
+        use pyo3::exceptions::{PyBlockingIOError, PyRuntimeError};
+
+        pyo3::Python::initialize();
+
+        assert!(matches!(replay_read_contention(Ok(())), Ok(None)));
+        assert!(matches!(
+            replay_read_contention(Err(PyBlockingIOError::new_err("versions kept advancing"))),
+            Ok(Some(EdgeOccOutcome::Conflict))
+        ));
+        // Anything else is a real failure and must reach the caller.
+        assert!(replay_read_contention(Err(PyRuntimeError::new_err("boom"))).is_err());
     }
 }

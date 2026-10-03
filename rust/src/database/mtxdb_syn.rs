@@ -319,6 +319,15 @@ fn parse_node_key(key: &[u8]) -> Option<([u8; ROOM_PREFIX_LEN], [u8; 32])> {
 /// ids from non-hash-shaped keys. Distinct from any real structural-hash
 /// node id in that collection with overwhelming probability, the same
 /// margin already relied on for kv_node_id's own use.
+/// Operational root *pointer*: the room's integer state-group key addressed to
+/// the canonical `StateGroupId`, not to the encoded root itself.
+///
+/// The encoded root (an `MTHR` record whose 2 KiB state-group lattice dominates
+/// the value) is stored exactly once per `StateGroupId`, under
+/// [`state_group_root_node_id`]. This record is the cheap 32-byte hop that lets
+/// several state groups -- including state groups in other rooms that resolved
+/// to identical state -- share that single copy, and it is what
+/// `get_state_hamt_roots_for_room` follows to find the root.
 fn root_node_id(namespace: &str, state_group: i64) -> [u8; 16] {
     let mut buf = Vec::with_capacity(b"hamt:root:".len() + namespace.len() + 8);
     buf.extend_from_slice(b"hamt:root:");
@@ -330,9 +339,8 @@ fn root_node_id(namespace: &str, state_group: i64) -> [u8; 16] {
     id
 }
 
-/// Semantic root index key. The integer state-group key remains an operational
-/// compatibility alias, but this key addresses the room's canonical
-/// LtHash-derived state identity.
+/// Semantic root index key, addressing the room's canonical LtHash-derived state
+/// identity to the single encoded root stored for it.
 fn state_group_root_node_id(namespace: &str, state_group_id: &[u8; 32]) -> [u8; 16] {
     let namespace_len = u32::try_from(namespace.len()).expect("namespace length fits u32");
     let mut buf = Vec::with_capacity(b"hamt:root-id:v1:".len() + 4 + namespace.len() + 32);
@@ -353,19 +361,6 @@ fn state_group_refcount_node_id(namespace: &str, state_group_id: &[u8; 32]) -> [
     buf.extend_from_slice(&namespace_len.to_be_bytes());
     buf.extend_from_slice(namespace.as_bytes());
     buf.extend_from_slice(state_group_id);
-    let hash = Sha256::digest(&buf);
-    let mut id = [0u8; 16];
-    id.copy_from_slice(&hash[..16]);
-    id
-}
-
-fn state_group_id_alias_node_id(namespace: &str, state_group: i64) -> [u8; 16] {
-    let namespace_len = u32::try_from(namespace.len()).expect("namespace length fits u32");
-    let mut buf = Vec::with_capacity(b"hamt:root-map:v1:".len() + 4 + namespace.len() + 8);
-    buf.extend_from_slice(b"hamt:root-map:v1:");
-    buf.extend_from_slice(&namespace_len.to_be_bytes());
-    buf.extend_from_slice(namespace.as_bytes());
-    buf.extend_from_slice(&state_group.to_be_bytes());
     let hash = Sha256::digest(&buf);
     let mut id = [0u8; 16];
     id.copy_from_slice(&hash[..16]);
@@ -562,48 +557,39 @@ pub fn put_state_hamt_roots(
         .map(|(state_group, (state_group_id, value))| (state_group, value, state_group_id))
         .collect();
     let semantic_ids: Vec<[u8; 32]> = semantic_values.keys().copied().collect();
-    let pairs: Vec<(NodeId, NodeData)> = validated_roots
-        .iter()
-        .flat_map(|(state_group, value, state_group_id)| {
-            vec![
-                (
-                    root_node_id(&namespace, *state_group),
-                    NodeData::new(bytes::Bytes::from(value.clone())),
-                ),
-                (
-                    state_group_id_alias_node_id(&namespace, *state_group),
-                    NodeData::new(bytes::Bytes::copy_from_slice(state_group_id)),
-                ),
-            ]
-        })
-        .chain(semantic_values.into_iter().map(|(state_group_id, value)| {
-            (
-                state_group_root_node_id(&namespace, &state_group_id),
-                NodeData::new(bytes::Bytes::from(value)),
-            )
-        }))
-        .collect();
+
     py.detach(|| {
         let _write_guard = STATE_HAMT_ROOT_WRITE_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
             .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("root write lock poisoned"))?;
         let engine = state_db()?;
+
+        // What each state group already points at, so re-persisting an unchanged
+        // root writes nothing at all.
+        let pointer_node_ids: Vec<NodeId> = validated_roots
+            .iter()
+            .map(|(state_group, _, _)| root_node_id(&namespace, *state_group))
+            .collect();
+        let existing_pointers = engine
+            .get_read_committed(&room_id, &pointer_node_ids)
+            .map_err(map_read_storage_error)?;
+
         let semantic_node_ids: Vec<NodeId> = semantic_ids
             .iter()
             .map(|id| state_group_root_node_id(&namespace, id))
             .collect();
-        let existing = engine
+        let existing_semantics = engine
             .get_read_committed(&room_id, &semantic_node_ids)
             .map_err(map_read_storage_error)?;
-        let mut semantic_exists = HashMap::with_capacity(semantic_ids.len());
-        for (existing, expected_id) in existing.into_iter().zip(semantic_ids.iter()) {
-            let exists = existing.as_ref().is_some_and(|data| !data.bytes.is_empty());
-            semantic_exists.insert(*expected_id, exists);
-            if let Some(existing) = existing.as_ref().filter(|data| !data.bytes.is_empty()) {
-                let actual_id =
-                    state_group_id_from_root_value_for_room(&existing.bytes, &room_prefix)
-                        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+
+        let mut semantic_present: HashMap<[u8; 32], bool> = HashMap::new();
+        for (existing, expected_id) in existing_semantics.iter().zip(semantic_ids.iter()) {
+            let present = existing.as_ref().is_some_and(|data| !data.bytes.is_empty());
+            semantic_present.insert(*expected_id, present);
+            if let Some(data) = existing.as_ref().filter(|data| !data.bytes.is_empty()) {
+                let actual_id = state_group_id_from_root_value_for_room(&data.bytes, &room_prefix)
+                    .map_err(pyo3::exceptions::PyValueError::new_err)?;
                 if actual_id != *expected_id {
                     return Err(pyo3::exceptions::PyValueError::new_err(
                         "StateGroupId index collision detected",
@@ -611,22 +597,7 @@ pub fn put_state_hamt_roots(
                 }
             }
         }
-        let alias_node_ids: Vec<NodeId> = validated_roots
-            .iter()
-            .map(|(state_group, _, _)| state_group_id_alias_node_id(&namespace, *state_group))
-            .collect();
-        let aliases = engine
-            .get_read_committed(&room_id, &alias_node_ids)
-            .map_err(map_read_storage_error)?;
-        for ((_, _, expected_id), existing) in validated_roots.iter().zip(aliases.iter()) {
-            if let Some(existing) = existing.as_ref().filter(|data| !data.bytes.is_empty()) {
-                if existing.bytes.as_ref() != expected_id.as_slice() {
-                    return Err(pyo3::exceptions::PyValueError::new_err(
-                        "state_group alias collision detected",
-                    ));
-                }
-            }
-        }
+
         let refcount_node_ids: Vec<NodeId> = semantic_ids
             .iter()
             .map(|id| state_group_refcount_node_id(&namespace, id))
@@ -653,31 +624,61 @@ pub fn put_state_hamt_roots(
                 Ok::<([u8; 32], Option<u64>), PyErr>((id, count))
             })
             .collect::<PyResult<_>>()?;
-        let mut pairs = pairs;
-        for ((_, _, state_group_id), alias) in validated_roots.iter().zip(aliases.iter()) {
-            if alias
+
+        let mut pairs: Vec<(NodeId, NodeData)> = Vec::with_capacity(validated_roots.len() * 2);
+        for ((state_group, value, state_group_id), existing) in
+            validated_roots.iter().zip(existing_pointers.iter())
+        {
+            let already_points_here = existing
                 .as_ref()
                 .filter(|data| !data.bytes.is_empty())
-                .is_none()
-            {
-                let count = refcounts_by_id.entry(*state_group_id).or_default();
-                match count {
-                    Some(count) => {
-                        *count = count.checked_add(1).ok_or_else(|| {
-                            pyo3::exceptions::PyOverflowError::new_err(
-                                "StateGroupId reference count overflow",
-                            )
-                        })?;
-                    }
-                    None if semantic_exists.get(state_group_id).copied().unwrap_or(false) => {
-                        return Err(pyo3::exceptions::PyValueError::new_err(
-                            "cannot add alias for a semantic root with an uninitialized reference count",
-                        ));
-                    }
-                    None => *count = Some(1),
+                .is_some_and(|data| data.bytes.as_ref() == state_group_id.as_slice());
+            if already_points_here {
+                // This state group already resolves to this StateGroupId, so the
+                // single canonical copy is already stored. Re-writing the
+                // pointer and the 2 KiB root would be pure redundancy.
+                continue;
+            }
+            if let Some(data) = existing.as_ref().filter(|data| !data.bytes.is_empty()) {
+                if data.bytes.as_ref() != state_group_id.as_slice() {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "state_group pointer collision detected",
+                    ));
                 }
             }
+
+            let count = refcounts_by_id.entry(*state_group_id).or_default();
+            match count {
+                Some(count) => {
+                    *count = count.checked_add(1).ok_or_else(|| {
+                        pyo3::exceptions::PyOverflowError::new_err(
+                            "StateGroupId reference count overflow",
+                        )
+                    })?;
+                }
+                None if semantic_present.get(state_group_id).copied().unwrap_or(false) => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "cannot add pointer for a semantic root with an uninitialized reference count",
+                    ));
+                }
+                None => *count = Some(1),
+            }
+
+            // The encoded root is written only when it is not already stored
+            // under this StateGroupId; several state groups resolving to the
+            // same state share this one copy.
+            if !semantic_present.get(state_group_id).copied().unwrap_or(false) {
+                pairs.push((
+                    state_group_root_node_id(&namespace, state_group_id),
+                    NodeData::new(bytes::Bytes::from(value.clone())),
+                ));
+            }
+            pairs.push((
+                root_node_id(&namespace, *state_group),
+                NodeData::from_slice(state_group_id),
+            ));
         }
+
         for (state_group_id, count) in refcounts_by_id.into_iter().filter_map(|(id, count)| {
             count.map(|count| (id, count))
         }) {
@@ -686,8 +687,12 @@ pub fn put_state_hamt_roots(
                 NodeData::from_slice(&count.to_be_bytes()),
             ));
         }
+
         let pairs =
             deduplicate_root_node_pairs(pairs).map_err(pyo3::exceptions::PyValueError::new_err)?;
+        if pairs.is_empty() {
+            return Ok(());
+        }
         let committed = engine.put_many(&room_id, &pairs).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {}", e))
         })?;
@@ -736,61 +741,35 @@ pub fn delete_state_hamt_roots_for_room(
             .lock()
             .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("root write lock poisoned"))?;
         let engine = state_db()?;
-        let legacy_ids: Vec<NodeId> = state_groups
+        let pointer_ids: Vec<NodeId> = state_groups
             .iter()
             .map(|&state_group| root_node_id(&namespace, state_group))
             .collect();
-        let existing = engine
-            .get_read_committed(&room_id, &legacy_ids)
+        let pointers = engine
+            .get_read_committed(&room_id, &pointer_ids)
             .map_err(map_read_storage_error)?;
-        let alias_ids: Vec<NodeId> = state_groups
-            .iter()
-            .map(|&state_group| state_group_id_alias_node_id(&namespace, state_group))
-            .collect();
-        let alias_values = engine
-            .get_read_committed(&room_id, &alias_ids)
-            .map_err(map_read_storage_error)?;
-        let mut pairs: Vec<(NodeId, NodeData)> = state_groups
-            .iter()
-            .map(|&state_group| {
-                (
-                    root_node_id(&namespace, state_group),
-                    NodeData::new(bytes::Bytes::new()),
-                )
-            })
-            .collect();
-        let mut resolved = Vec::with_capacity(state_groups.len());
-        for ((state_group, alias), legacy) in state_groups.iter().zip(alias_values).zip(existing) {
-            let alias_id = if let Some(alias) = alias.filter(|data| !data.bytes.is_empty()) {
-                let id: [u8; 32] = alias.bytes.as_ref().try_into().map_err(|_| {
-                    pyo3::exceptions::PyValueError::new_err(
-                        "corrupt state_group alias: expected 32-byte StateGroupId",
-                    )
-                })?;
-                Some(id)
-            } else {
-                None
-            };
-            let legacy_id = legacy
+
+        let mut pairs: Vec<(NodeId, NodeData)> = Vec::with_capacity(state_groups.len());
+        let mut resolved: Vec<(i64, Option<[u8; 32]>)> = Vec::with_capacity(state_groups.len());
+        for (state_group, pointer) in state_groups.iter().zip(pointers.iter()) {
+            let state_group_id = pointer
                 .as_ref()
                 .filter(|data| !data.bytes.is_empty())
-                .map(|data| state_group_id_from_root_value_for_room(&data.bytes, &room_prefix))
-                .transpose()
-                .map_err(pyo3::exceptions::PyValueError::new_err)?;
-            if let (Some(alias_id), Some(legacy_id)) = (alias_id, legacy_id) {
-                if alias_id != legacy_id {
-                    return Err(pyo3::exceptions::PyValueError::new_err(
-                        "state_group alias disagrees with legacy root",
-                    ));
-                }
-            }
-            let state_group_id = alias_id.or(legacy_id);
+                .map(|data| {
+                    data.bytes.as_ref().try_into().map_err(|_| {
+                        pyo3::exceptions::PyValueError::new_err(
+                            "corrupt state_group pointer: expected 32-byte StateGroupId",
+                        )
+                    })
+                })
+                .transpose()?;
             resolved.push((*state_group, state_group_id));
             pairs.push((
-                state_group_id_alias_node_id(&namespace, *state_group),
+                root_node_id(&namespace, *state_group),
                 NodeData::new(bytes::Bytes::new()),
             ));
         }
+
         let semantic_ids: Vec<[u8; 32]> = resolved
             .iter()
             .filter_map(|(_, id)| *id)
@@ -858,10 +837,14 @@ pub fn delete_state_hamt_roots_for_room(
                     ));
                 }
                 None => {
-                    // Roots written before the reference index existed cannot
-                    // be proven unshared. Remove the operational aliases but
-                    // retain the semantic root rather than breaking another
-                    // state_group that may point at it.
+                    // Every pointer written by `put_state_hamt_roots` creates a
+                    // reference count in the same batch, so a live pointer
+                    // without one means the index is inconsistent. Freeing the
+                    // shared root here could strand another state group that
+                    // still points at it, so refuse instead.
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "cannot delete a state_group whose StateGroupId has no reference count",
+                    ));
                 }
             }
         }
@@ -892,31 +875,80 @@ pub fn get_state_hamt_roots_for_room(
     state_groups: Vec<i64>,
 ) -> PyResult<Vec<Option<Vec<u8>>>> {
     let room_id = room_id_from_prefix(&room_prefix);
-    let node_ids: Vec<NodeId> = state_groups
-        .iter()
-        .map(|&sg| root_node_id(&namespace, sg))
-        .collect();
     py.detach(|| {
         let engine = state_db()?;
         // Read-only workers hold an open-time collection index; refresh on a
         // miss so a state group root the writer appended after this worker
         // opened is visible (same pattern as `auth_chain_edges_get`).
-        let results = engine
-            .get_read_committed(&room_id, &node_ids)
-            .map_err(map_read_storage_error)?;
-        Ok(results
-            .into_iter()
-            .map(|res| {
-                res.and_then(|data| {
-                    if data.bytes.is_empty() {
-                        None
-                    } else {
-                        Some(data.bytes.to_vec())
-                    }
+        follow_root_pointers(engine, &room_id, &namespace, &state_groups)
+    })
+}
+
+/// Resolve `state_group` keys to their encoded roots by following the 32-byte
+/// operational pointer to the single canonical copy stored per `StateGroupId`.
+///
+/// Returns one entry per requested state group, in order, with `None` for a
+/// miss. A `StateGroupId` shared by several state groups is fetched once and the
+/// one copy is handed to each of them.
+fn follow_root_pointers(
+    engine: &PackfileStorage,
+    room_id: &[u8; 16],
+    namespace: &str,
+    state_groups: &[i64],
+) -> std::result::Result<Vec<Option<Vec<u8>>>, PyErr> {
+    let pointer_ids: Vec<NodeId> = state_groups
+        .iter()
+        .map(|&sg| root_node_id(namespace, sg))
+        .collect();
+    let pointers = engine
+        .get_read_committed(room_id, &pointer_ids)
+        .map_err(map_read_storage_error)?;
+
+    let mut resolved: Vec<Option<[u8; 32]>> = Vec::with_capacity(state_groups.len());
+    let mut wanted: Vec<[u8; 32]> = Vec::new();
+    for pointer in pointers {
+        let state_group_id = pointer
+            .as_ref()
+            .filter(|data| !data.bytes.is_empty())
+            .map(|data| {
+                data.bytes.as_ref().try_into().map_err(|_| {
+                    pyo3::exceptions::PyValueError::new_err(
+                        "corrupt state_group pointer: expected 32-byte StateGroupId",
+                    )
                 })
             })
-            .collect())
-    })
+            .transpose()?;
+        if let Some(id) = state_group_id {
+            if !wanted.contains(&id) {
+                wanted.push(id);
+            }
+        }
+        resolved.push(state_group_id);
+    }
+
+    let semantic_ids: Vec<NodeId> = wanted
+        .iter()
+        .map(|id| state_group_root_node_id(namespace, id))
+        .collect();
+    let values = engine
+        .get_read_committed(room_id, &semantic_ids)
+        .map_err(map_read_storage_error)?;
+    let by_id: HashMap<[u8; 32], Option<Vec<u8>>> = wanted
+        .iter()
+        .copied()
+        .zip(values)
+        .map(|(id, value)| {
+            let value = value
+                .filter(|data| !data.bytes.is_empty())
+                .map(|data| data.bytes.to_vec());
+            (id, value)
+        })
+        .collect();
+
+    Ok(resolved
+        .into_iter()
+        .map(|id| id.and_then(|id| by_id.get(&id).cloned().flatten()))
+        .collect())
 }
 
 /// Read a root by its room-scoped canonical LtHash-derived StateGroupId.
@@ -1043,34 +1075,34 @@ pub fn get_state_hamt_roots_bulk(
         let engine = state_db()?;
         for (room_prefix, room_groups) in groups_by_room {
             let room_id = room_id_from_prefix(&room_prefix);
-            let node_ids: Vec<NodeId> = room_groups
-                .iter()
-                .map(|(_, state_group)| root_node_id(&namespace, *state_group))
-                .collect();
             // Refresh on a miss so roots for state groups the writer appended
             // after this worker opened are resolved instead of reported absent.
             // The bulk fast path must preserve the same cross-process
             // read-visibility contract as the explicit refresh helper below:
             // a stale collection index is a cache miss, not proof that the
             // SQL state group has no embedded root.
-            let mut response_records = engine
-                .get_read_committed(&room_id, &node_ids)
-                .map_err(map_read_storage_error)?;
+            let mut wanted: Vec<i64> = room_groups
+                .iter()
+                .map(|(_, state_group)| *state_group)
+                .collect();
+            let mut found = follow_root_pointers(engine, &room_id, &namespace, &wanted)?;
 
-            if response_records.iter().any(|record| record.is_none()) {
+            if found.iter().any(Option::is_none) {
                 engine.refresh_collection(&room_id).map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
                         "mtxdb refresh_collection error: {e}"
                     ))
                 })?;
-                response_records = engine
-                    .get_read_committed(&room_id, &node_ids)
-                    .map_err(map_read_storage_error)?;
+                wanted = room_groups
+                    .iter()
+                    .map(|(_, state_group)| *state_group)
+                    .collect();
+                found = follow_root_pointers(engine, &room_id, &namespace, &wanted)?;
             }
 
-            for ((index, _), record) in room_groups.into_iter().zip(response_records) {
-                if let Some(record) = record.filter(|record| !record.bytes.is_empty()) {
-                    roots[index] = Some(decode_state_hamt_root(&record.bytes)?);
+            for ((index, _), record) in room_groups.into_iter().zip(found) {
+                if let Some(record) = record.filter(|record| !record.is_empty()) {
+                    roots[index] = Some(decode_state_hamt_root(record.as_slice())?);
                 }
             }
         }
@@ -4869,7 +4901,7 @@ pub(crate) mod auth_chain_closure_tests {
     }
 
     #[test]
-    fn state_root_rejects_existing_operational_alias_collision() {
+    fn state_root_rejects_existing_operational_pointer_collision() {
         ensure_open();
         let namespace = "ns-root-alias-collision";
         let room = "!root-alias-collision:example.org";
@@ -4881,13 +4913,13 @@ pub(crate) mod auth_chain_closure_tests {
                 room.as_bytes().to_vec(),
                 vec![(11, test_root_value(room, 2, 2))],
             )
-            .expect_err("reusing an operational id for another root must fail")
+            .expect_err("repointing an operational pointer at another StateGroupId must fail")
         });
-        assert!(error.to_string().contains("state_group alias collision"));
+        assert!(error.to_string().contains("state_group pointer collision"));
     }
 
     #[test]
-    fn state_root_delete_preserves_shared_semantic_root_until_last_alias() {
+    fn state_root_delete_preserves_shared_semantic_root_until_last_pointer() {
         ensure_open();
         let namespace = "ns-root-shared-semantic";
         let room = "!root-shared-semantic:example.org";
@@ -4945,7 +4977,7 @@ pub(crate) mod auth_chain_closure_tests {
     }
 
     #[test]
-    fn state_root_rejects_new_alias_when_refcount_is_uninitialized() {
+    fn state_root_rejects_new_pointer_when_refcount_is_uninitialized() {
         ensure_open();
         let namespace = "ns-root-uninitialized-refcount";
         let room = "!root-uninitialized-refcount:example.org";
@@ -4995,649 +5027,127 @@ pub(crate) mod auth_chain_closure_tests {
             .contains("room prefix does not match its collection"));
     }
 
+    /// Two state groups whose roots share a `StateGroupId` must store the
+    /// encoded root once, and each must still resolve to it.
     #[test]
-    fn state_root_delete_handles_alias_only_and_legacy_only_records() {
+    fn state_roots_sharing_a_state_group_id_store_one_copy() {
         ensure_open();
-        for (suffix, leave_legacy_missing) in [("alias-only", true), ("legacy-only", false)] {
-            let namespace = format!("ns-root-delete-{suffix}");
-            let room = format!("!root-delete-{suffix}:example.org");
-            let state_group = if leave_legacy_missing { 21 } else { 22 };
-            let value = test_root_value(&room, 5, 6);
-            let id = test_root_id(&value);
-            test_put_root(&namespace, &room, state_group, value);
+        let namespace = "ns-root-shared";
+        let room = "!root-shared:example.org";
+        let value = test_root_value(room, 0x33, 0x44);
+        let id = test_root_id(&value);
 
-            let room_id = room_id_from_prefix(room.as_bytes());
-            let node_id = if leave_legacy_missing {
-                root_node_id(&namespace, state_group)
-            } else {
-                state_group_id_alias_node_id(&namespace, state_group)
-            };
-            state_db()
-                .expect("state db")
-                .put_many(&room_id, &[(node_id, NodeData::new(bytes::Bytes::new()))])
-                .expect("remove one root alias");
-
-            pyo3::Python::attach(|py| {
-                delete_state_hamt_roots_for_room(
-                    py,
-                    namespace.clone(),
-                    room.as_bytes().to_vec(),
-                    vec![state_group],
-                )
-                .expect("delete should use whichever alias remains");
-                let roots = get_state_hamt_roots_by_state_group_id(
-                    py,
-                    namespace.clone(),
-                    room.as_bytes().to_vec(),
-                    vec![id.to_vec()],
-                )
-                .expect("semantic lookup after delete");
-                assert_eq!(roots, vec![None]);
-            });
-        }
-    }
-
-    #[test]
-    fn state_root_delete_rejects_disagreeing_alias_and_legacy_records() {
-        ensure_open();
-        let namespace = "ns-root-delete-disagree";
-        let room = "!root-delete-disagree:example.org";
-        let state_group = 31;
-        let value = test_root_value(room, 7, 8);
-        test_put_root(namespace, room, state_group, value.clone());
-
-        state_db()
-            .expect("state db")
-            .put_many(
-                &room_id_from_prefix(room.as_bytes()),
-                &[(
-                    state_group_id_alias_node_id(namespace, state_group),
-                    NodeData::from_slice(&[0xA5; 32]),
-                )],
+        pyo3::Python::attach(|py| {
+            put_state_hamt_roots(
+                py,
+                namespace.to_owned(),
+                room.as_bytes().to_vec(),
+                vec![(41, value.clone()), (42, value.clone())],
             )
-            .expect("corrupt alias");
+            .expect("write both state groups");
 
-        let error = pyo3::Python::attach(|py| {
+            // The operational records are 32-byte pointers, not 2 KiB roots.
+            let room_id = room_id_from_prefix(room.as_bytes());
+            for state_group in [41, 42] {
+                let stored = state_db()
+                    .expect("state db")
+                    .get_read_committed(&room_id, &[root_node_id(namespace, state_group)])
+                    .expect("read pointer")
+                    .remove(0)
+                    .expect("pointer present");
+                assert_eq!(stored.bytes.len(), 32, "pointer must not embed the root");
+                assert_eq!(stored.bytes.as_ref(), id.as_slice());
+            }
+
+            let roots = get_state_hamt_roots_for_room(
+                py,
+                namespace.to_owned(),
+                room.as_bytes().to_vec(),
+                vec![41, 42],
+            )
+            .expect("read both state groups");
+            assert_eq!(roots, vec![Some(value.clone()), Some(value.clone())]);
+
+            // Deleting one must leave the shared copy for the other.
             delete_state_hamt_roots_for_room(
                 py,
                 namespace.to_owned(),
                 room.as_bytes().to_vec(),
-                vec![state_group],
+                vec![41],
             )
-            .expect_err("disagreeing aliases must be rejected")
-        });
-        assert!(error
-            .to_string()
-            .contains("state_group alias disagrees with legacy root"));
+            .expect("delete one state group");
+            let roots = get_state_hamt_roots_for_room(
+                py,
+                namespace.to_owned(),
+                room.as_bytes().to_vec(),
+                vec![41, 42],
+            )
+            .expect("read after partial delete");
+            assert_eq!(roots, vec![None, Some(value.clone())]);
 
+            // Deleting the last referent releases the shared copy.
+            delete_state_hamt_roots_for_room(
+                py,
+                namespace.to_owned(),
+                room.as_bytes().to_vec(),
+                vec![42],
+            )
+            .expect("delete remaining state group");
+            let roots = get_state_hamt_roots_by_state_group_id(
+                py,
+                namespace.to_owned(),
+                room.as_bytes().to_vec(),
+                vec![id.to_vec()],
+            )
+            .expect("semantic lookup after full delete");
+            assert_eq!(roots, vec![None]);
+        });
+    }
+
+    /// Re-persisting a root that is already stored must write nothing, and must
+    /// not double-count the `StateGroupId` reference.
+    #[test]
+    fn state_root_reput_is_idempotent() {
+        ensure_open();
+        let namespace = "ns-root-reput";
+        let room = "!root-reput:example.org";
+        let value = test_root_value(room, 0x55, 0x66);
+        let id = test_root_id(&value);
+        test_put_root(namespace, room, 51, value.clone());
+
+        let room_id = room_id_from_prefix(room.as_bytes());
+        let refcount_before = state_db()
+            .expect("state db")
+            .get_read_committed(&room_id, &[state_group_refcount_node_id(namespace, &id)])
+            .expect("read refcount")
+            .remove(0)
+            .expect("refcount present");
+        assert_eq!(refcount_before.bytes.as_ref(), 1u64.to_be_bytes());
+
+        test_put_root(namespace, room, 51, value.clone());
+
+        let refcount_after = state_db()
+            .expect("state db")
+            .get_read_committed(&room_id, &[state_group_refcount_node_id(namespace, &id)])
+            .expect("read refcount")
+            .remove(0)
+            .expect("refcount present");
+        assert_eq!(
+            refcount_after.bytes.as_ref(),
+            1u64.to_be_bytes(),
+            "re-putting an unchanged root must not change the reference count"
+        );
+
+        // And the root still reads back.
         let roots = pyo3::Python::attach(|py| {
             get_state_hamt_roots_for_room(
                 py,
                 namespace.to_owned(),
                 room.as_bytes().to_vec(),
-                vec![state_group],
+                vec![51],
             )
-            .expect("legacy lookup")
+            .expect("read after re-put")
         });
         assert_eq!(roots, vec![Some(value)]);
-    }
-
-    #[test]
-    fn room_derived_ids_never_collide_across_rooms() {
-        ensure_open();
-        let a = auth_chain_closure_room_id("ns-collision", "!roomA:example.org");
-        let b = auth_chain_closure_room_id("ns-collision", "!roomB:example.org");
-        let c = auth_chain_closure_room_id("other-ns", "!roomA:example.org");
-        // Distinct rooms produce distinct member collection IDs (probabilistic domain separation).
-        assert_ne!(a, b);
-        // The authoritative entity canonical ID is the room ID itself:
-        assert_eq!(a, c);
-        // Member collections within the same room are domain-separated by their tags:
-        let ev = event_dag_room_id("ns-collision", "!roomA:example.org");
-        let prev = prev_edges_room_id("ns-collision", "!roomA:example.org");
-        let stat = state_hamt_room_id("!roomA:example.org");
-        assert_ne!(a, ev);
-        assert_ne!(a, prev);
-        assert_ne!(a, stat);
-        assert_ne!(ev, prev);
-        assert_ne!(ev, stat);
-        assert_ne!(prev, stat);
-    }
-
-    #[test]
-    fn get_or_create_short_ids_is_stable_and_room_scoped() {
-        ensure_open();
-        let ns = "ns-shortid";
-        let room_a = "!room-a:example.org";
-        let room_b = "!room-b:example.org";
-
-        let first = get_or_create_short_ids(
-            ns.to_string(),
-            room_a.to_string(),
-            vec!["$e1".to_string(), "$e2".to_string()],
-        )
-        .expect("alloc");
-        assert_eq!(first.len(), 2);
-        assert_ne!(first[0], first[1], "distinct events get distinct short ids");
-
-        // Same event ids, same room -> identical short ids (idempotent).
-        let second = get_or_create_short_ids(
-            ns.to_string(),
-            room_a.to_string(),
-            vec!["$e1".to_string(), "$e2".to_string()],
-        )
-        .expect("re-fetch");
-        assert_eq!(first, second);
-
-        // Same event id string, different room -> unrelated short id
-        // space (no cross-room collision guarantee implied by equal
-        // values, but the rooms must not share the same underlying
-        // collection).
-        let other_room =
-            get_or_create_short_ids(ns.to_string(), room_b.to_string(), vec!["$e1".to_string()])
-                .expect("alloc in other room");
-        // Reverse lookup in room_a must not resolve room_b's mapping and
-        // vice versa.
-        let resolved_in_a = pyo3::Python::attach(|py| {
-            resolve_short_ids_to_event_ids(
-                py,
-                ns.to_string(),
-                room_a.to_string(),
-                vec![other_room[0]],
-            )
-        });
-        // (room_a likely never allocated this exact short id to "$e1";
-        // this call must not panic and must return a well-formed result
-        // either way.)
-        assert!(resolved_in_a.is_ok());
-    }
-
-    #[test]
-    fn get_or_create_short_ids_reverse_mapping_stays_resolvable_across_repeat_calls() {
-        // The trait has no single-key delete, so a genuine crash-between-
-        // writes can't be injected from a test at this level; what's
-        // testable here is the invariant get_or_create_short_ids must
-        // uphold regardless: calling it again for an event whose forward
-        // mapping already exists must never leave the reverse mapping
-        // unresolvable.
-        ensure_open();
-        let ns = "ns-repair";
-        let room = "!room-repair:example.org";
-
-        let ids =
-            get_or_create_short_ids(ns.to_string(), room.to_string(), vec!["$e1".to_string()])
-                .expect("alloc");
-        let short_id = ids[0];
-
-        let _ = get_or_create_short_ids(ns.to_string(), room.to_string(), vec!["$e1".to_string()])
-            .expect("re-fetch (forward already exists)");
-        let resolved = pyo3::Python::attach(|py| {
-            resolve_short_ids_to_event_ids(py, ns.to_string(), room.to_string(), vec![short_id])
-                .expect("resolve")
-        });
-        assert_eq!(resolved, vec![Some("$e1".to_string())]);
-    }
-
-    #[test]
-    fn auth_chain_edges_round_trip_including_zero_count_leaf() {
-        ensure_open();
-        let ns = "ns-edges";
-        let room = "!room-edges:example.org";
-        let ids = get_or_create_short_ids(
-            ns.to_string(),
-            room.to_string(),
-            vec!["$leaf".to_string(), "$a1".to_string(), "$a2".to_string()],
-        )
-        .expect("alloc");
-        let (leaf, a1, a2) = (ids[0], ids[1], ids[2]);
-
-        pyo3::Python::attach(|py| {
-            auth_chain_edges_put(
-                py,
-                ns.to_string(),
-                room.to_string(),
-                vec![(leaf, vec![]), (a1, vec![a2])],
-            )
-            .expect("put edges");
-
-            let fetched =
-                auth_chain_edges_get(py, ns.to_string(), room.to_string(), vec![leaf, a1, a2])
-                    .expect("get edges");
-
-            // Leaf: present, zero edges -- distinguishable from "missing".
-            assert_eq!(fetched[0], Some(vec![]));
-            // a1: present, one edge.
-            assert_eq!(fetched[1], Some(vec![a2]));
-            // a2: never written -- missing, the cold-import signal.
-            assert_eq!(fetched[2], None);
-        });
-    }
-
-    #[test]
-    fn auth_chain_children_append_dedupes_and_is_idempotent() {
-        ensure_open();
-        let ns = "ns-children";
-        let room = "!room-children:example.org";
-        let ids = get_or_create_short_ids(
-            ns.to_string(),
-            room.to_string(),
-            vec!["$parent".to_string(), "$c1".to_string(), "$c2".to_string()],
-        )
-        .expect("alloc");
-        let (parent, c1, c2) = (ids[0], ids[1], ids[2]);
-
-        // No children recorded yet.
-        let none_yet = pyo3::Python::attach(|py| {
-            auth_chain_children_get(py, ns.to_string(), room.to_string(), vec![parent])
-        })
-        .expect("get children (empty)");
-        assert_eq!(none_yet, vec![None]);
-
-        auth_chain_children_append(ns.to_string(), room.to_string(), vec![(parent, vec![c1])])
-            .expect("append c1");
-        // Appending c1 again, plus a new child c2, must dedupe c1 and add c2
-        // exactly once -- both idempotency and accumulation in one append.
-        auth_chain_children_append(
-            ns.to_string(),
-            room.to_string(),
-            vec![(parent, vec![c1, c2])],
-        )
-        .expect("append c1 (dup) + c2");
-
-        let children = pyo3::Python::attach(|py| {
-            auth_chain_children_get(py, ns.to_string(), room.to_string(), vec![parent])
-                .expect("get children")
-        });
-        let mut got = children[0].clone().expect("children present");
-        got.sort_unstable();
-        let mut want = vec![c1, c2];
-        want.sort_unstable();
-        assert_eq!(got, want);
-    }
-
-    #[test]
-    fn auth_chain_children_append_same_parent_twice_in_one_call() {
-        // Two rows for the same parent in a single call must both survive:
-        // the append batches its puts, so without per-parent aggregation the
-        // second row would read stale (un-put) children and its later put for
-        // the same key would clobber the first row's.
-        ensure_open();
-        let ns = "ns-children-twice";
-        let room = "!room-children-twice:example.org";
-        let ids = get_or_create_short_ids(
-            ns.to_string(),
-            room.to_string(),
-            vec!["$parent".to_string(), "$c1".to_string(), "$c2".to_string()],
-        )
-        .expect("alloc");
-        let (parent, c1, c2) = (ids[0], ids[1], ids[2]);
-
-        auth_chain_children_append(
-            ns.to_string(),
-            room.to_string(),
-            vec![
-                (parent, vec![c1]),
-                (parent, vec![c2]),
-                (parent, vec![c1]), // dup across rows, must dedupe
-            ],
-        )
-        .expect("append two rows for one parent");
-
-        let children = pyo3::Python::attach(|py| {
-            auth_chain_children_get(py, ns.to_string(), room.to_string(), vec![parent])
-                .expect("get children")
-        });
-        let mut got = children[0].clone().expect("children present");
-        got.sort_unstable();
-        let mut want = vec![c1, c2];
-        want.sort_unstable();
-        assert_eq!(got, want);
-    }
-
-    #[test]
-    fn auth_chain_purge_room_removes_only_that_room() {
-        ensure_open();
-        let ns = "ns-purge";
-        let room_keep = "!room-keep:example.org";
-        let room_gone = "!room-gone:example.org";
-
-        let keep_ids = get_or_create_short_ids(
-            ns.to_string(),
-            room_keep.to_string(),
-            vec!["$k1".to_string()],
-        )
-        .expect("alloc keep");
-        let gone_ids = get_or_create_short_ids(
-            ns.to_string(),
-            room_gone.to_string(),
-            vec!["$g1".to_string()],
-        )
-        .expect("alloc gone");
-
-        pyo3::Python::attach(|py| {
-            auth_chain_purge_room(py, ns.to_string(), room_gone.to_string()).expect("purge");
-
-            let still_resolves = resolve_short_ids_to_event_ids(
-                py,
-                ns.to_string(),
-                room_keep.to_string(),
-                vec![keep_ids[0]],
-            )
-            .expect("resolve keep");
-            assert_eq!(still_resolves, vec![Some("$k1".to_string())]);
-
-            let purged_resolves = resolve_short_ids_to_event_ids(
-                py,
-                ns.to_string(),
-                room_gone.to_string(),
-                vec![gone_ids[0]],
-            )
-            .expect("resolve gone (post-purge)");
-            assert_eq!(purged_resolves, vec![None]);
-        });
-    }
-}
-
-#[cfg(test)]
-mod event_json_mirror_tests {
-    //! Same isolation contract as `auth_chain_closure_tests`: `DBS` is
-    //! process-global, so engine-backed tests use their own unique
-    //! namespace/room ids.
-
-    use super::*;
-
-    /// Raw engine view of a node: non-empty value stored?
-    fn node_present(collection: &[u8; 16], node: &NodeId) -> bool {
-        let engine = event_dag_db().expect("db");
-        matches!(engine.get(collection, node), Ok(Some(data)) if !data.bytes.is_empty())
-    }
-
-    #[test]
-    fn event_node_id_is_16_bytes_and_domain_separated() {
-        let a = event_node_id("ns-ev", "$e1");
-        let b = event_node_id("ns-ev", "$e2");
-        let c = event_node_id("other-ns", "$e1");
-        assert_eq!(a.len(), 16);
-        assert_ne!(a, b);
-        assert_ne!(a, c);
-        assert_eq!(event_node_id("ns-ev", "$e1"), a, "deterministic");
-    }
-
-    #[test]
-    fn event_dag_room_id_is_domain_separated_and_distinct() {
-        let a = event_dag_room_id("ns-ev", "!ra:example.org");
-        let b = event_dag_room_id("ns-ev", "!rb:example.org");
-        let c = event_dag_room_id("other-ns", "!ra:example.org");
-        // Distinct room canonical IDs produce distinct member collection IDs:
-        assert_ne!(a, b);
-        // Room ID is the authoritative entity canonical identity:
-        assert_eq!(a, c);
-
-        // Cross-domain tags within the same room entity produce distinct physical collection IDs:
-        let prev = prev_edges_room_id("ns-ev", "!ra:example.org");
-        let auth = auth_chain_closure_room_id("ns-ev", "!ra:example.org");
-        let stat = state_hamt_room_id("!ra:example.org");
-        assert_ne!(a, prev);
-        assert_ne!(a, auth);
-        assert_ne!(a, stat);
-        assert_ne!(prev, auth);
-    }
-
-    #[test]
-    fn group_and_member_derivations_are_deterministic() {
-        let room = "!canonical-room:example.org";
-        let group_id_1 = group_full_logical_id(room.as_bytes());
-        let group_id_2 = group_full_logical_id(room.as_bytes());
-        assert_eq!(group_id_1, group_id_2);
-
-        let evnt_col = member_collection_id(*b"EVNT", &group_id_1);
-        let prev_col = member_collection_id(*b"PREV", &group_id_1);
-        let auth_col = member_collection_id(*b"AUTH", &group_id_1);
-        let stat_col = member_collection_id(*b"STAT", &group_id_1);
-
-        assert_ne!(evnt_col, prev_col);
-        assert_ne!(evnt_col, auth_col);
-        assert_ne!(evnt_col, stat_col);
-        assert_ne!(prev_col, auth_col);
-        assert_ne!(prev_col, stat_col);
-        assert_ne!(auth_col, stat_col);
-
-        // Verification against constructor helpers:
-        assert_eq!(evnt_col, event_dag_room_id("", room));
-        assert_eq!(prev_col, prev_edges_room_id("", room));
-        assert_eq!(auth_col, auth_chain_closure_room_id("", room));
-        assert_eq!(stat_col, state_hamt_room_id(room));
-    }
-
-    #[test]
-    fn locator_collections_spread_and_are_deterministic() {
-        let ns = "ns-ev-loc";
-        let mut seen: HashSet<[u8; 16]> = HashSet::new();
-        for i in 0..512u32 {
-            let node = event_node_id(ns, &format!("$ev-{i}"));
-            seen.insert(event_locator_collection_id(ns, &node));
-        }
-        assert!(
-            seen.len() >= 8,
-            "512 ids must spread across many of the {} locator buckets",
-            EVENT_LOCATOR_BUCKETS
-        );
-        for i in 0..256u32 {
-            let key = format!("$ev-{i}");
-            let node = event_node_id(ns, &key);
-            let again = event_locator_collection_id(ns, &event_node_id(ns, &key));
-            assert_eq!(
-                again,
-                event_locator_collection_id(ns, &node),
-                "deterministic"
-            );
-        }
-    }
-
-    #[test]
-    fn put_get_cross_bucket_delete_and_purge_round_trip() {
-        super::auth_chain_closure_tests::ensure_open();
-        let ns = "ns-ev-roundtrip";
-        let room = "!room-ev-roundtrip:example.org";
-        let meta_a: Vec<u8> = b"META-A".to_vec();
-        let body_a: Vec<u8> = b"BODY-A".to_vec();
-        let meta_b: Vec<u8> = b"META-B".to_vec();
-        let body_b: Vec<u8> = b"BODY-B".to_vec();
-        let id_a = event_node_id(ns, "$ev-a");
-        let id_b = event_node_id(ns, "$ev-b");
-        assert_ne!(
-            event_locator_collection_id(ns, &id_a),
-            event_locator_collection_id(ns, &id_b),
-            "the two ids must land in different locator buckets"
-        );
-        let dag = event_dag_room_id(ns, room);
-
-        pyo3::Python::attach(|py| {
-            event_json_put(
-                py,
-                ns.to_string(),
-                vec![
-                    (
-                        room.to_string(),
-                        "$ev-a".to_string(),
-                        meta_a.clone(),
-                        body_a.clone(),
-                    ),
-                    (
-                        room.to_string(),
-                        "$ev-b".to_string(),
-                        meta_b.clone(),
-                        body_b.clone(),
-                    ),
-                ],
-            )
-            .expect("put");
-
-            let got = event_json_get(
-                py,
-                ns.to_string(),
-                vec![
-                    "$ev-a".to_string(),
-                    "$ev-b".to_string(),
-                    "$ev-none".to_string(),
-                ],
-            )
-            .expect("get");
-            assert_eq!(got[0].1.as_deref(), Some(&meta_a[..]));
-            assert_eq!(got[0].2.as_deref(), Some(&body_a[..]));
-            assert_eq!(got[1].1.as_deref(), Some(&meta_b[..]));
-            assert_eq!(got[1].2.as_deref(), Some(&body_b[..]));
-            assert_eq!(got[2].1, None);
-            assert_eq!(got[2].2, None);
-
-            // Point deletion removes the payload (both records) AND the locator.
-            event_json_delete(py, ns.to_string(), vec!["$ev-a".to_string()]).expect("delete");
-            let after_delete = event_json_get(
-                py,
-                ns.to_string(),
-                vec!["$ev-a".to_string(), "$ev-b".to_string()],
-            )
-            .expect("get after delete");
-            assert_eq!(after_delete[0].1, None);
-            assert_eq!(after_delete[0].2, None);
-            assert_eq!(after_delete[1].1.as_deref(), Some(&meta_b[..]));
-            assert_eq!(after_delete[1].2.as_deref(), Some(&body_b[..]));
-            assert!(
-                !node_present(&event_locator_collection_id(ns, &id_a), &id_a),
-                "locator must be tombstoned too"
-            );
-            assert!(
-                !node_present(&dag, &event_node_id(ns, "$ev-a")),
-                "room-local body must be tombstoned too"
-            );
-            assert!(
-                !node_present(&dag, &event_meta_node_id(ns, "$ev-a")),
-                "room-local metadata must be tombstoned too"
-            );
-
-            event_json_purge_room(py, ns.to_string(), room.to_string()).expect("purge room");
-            let after_purge = event_json_get(py, ns.to_string(), vec!["$ev-b".to_string()])
-                .expect("get after purge");
-            assert_eq!(after_purge[0].1, None);
-            assert_eq!(after_purge[0].2, None);
-        });
-    }
-
-    #[test]
-    fn overwrite_replaces_body_in_place() {
-        super::auth_chain_closure_tests::ensure_open();
-        let ns = "ns-ev-overwrite";
-        let room = "!room-ev-overwrite:example.org";
-        pyo3::Python::attach(|py| {
-            event_json_put(
-                py,
-                ns.to_string(),
-                vec![(
-                    room.to_string(),
-                    "$e1".to_string(),
-                    b"META-1".to_vec(),
-                    b"BODY-1".to_vec(),
-                )],
-            )
-            .expect("put");
-            // Censoring/expiry/re-signing replace the body in place through
-            // the same call: one record per event, latest wins.
-            event_json_put(
-                py,
-                ns.to_string(),
-                vec![(
-                    room.to_string(),
-                    "$e1".to_string(),
-                    b"META-2".to_vec(),
-                    b"BODY-2".to_vec(),
-                )],
-            )
-            .expect("overwrite");
-
-            let got = event_json_get(py, ns.to_string(), vec!["$e1".to_string()]).expect("get");
-            assert_eq!(got[0].1.as_deref(), Some(&b"META-2"[..]));
-            assert_eq!(got[0].2.as_deref(), Some(&b"BODY-2"[..]));
-            let dag = event_dag_room_id(ns, room);
-            assert!(
-                node_present(&dag, &event_node_id(ns, "$e1")),
-                "a single body record"
-            );
-            assert!(
-                node_present(&dag, &event_meta_node_id(ns, "$e1")),
-                "a single metadata record"
-            );
-        });
-    }
-
-    #[test]
-    fn room_purge_is_isolated_and_stale_locator_misses() {
-        super::auth_chain_closure_tests::ensure_open();
-        let ns = "ns-ev-isolation";
-        let room_gone = "!room-gone:example.org";
-        let room_keep = "!room-keep:example.org";
-        let id_gone = event_node_id(ns, "$gone");
-        let dag_gone = event_dag_room_id(ns, room_gone);
-        let dag_keep = event_dag_room_id(ns, room_keep);
-        let locator_gone = event_locator_collection_id(ns, &id_gone);
-
-        pyo3::Python::attach(|py| {
-            event_json_put(
-                py,
-                ns.to_string(),
-                vec![(
-                    room_gone.to_string(),
-                    "$gone".to_string(),
-                    b"META-GONE".to_vec(),
-                    b"BODY-GONE".to_vec(),
-                )],
-            )
-            .expect("put gone");
-            event_json_put(
-                py,
-                ns.to_string(),
-                vec![(
-                    room_keep.to_string(),
-                    "$keep".to_string(),
-                    b"META-KEEP".to_vec(),
-                    b"BODY-KEEP".to_vec(),
-                )],
-            )
-            .expect("put keep");
-
-            event_json_purge_room(py, ns.to_string(), room_gone.to_string()).expect("purge");
-
-            // The surviving room is untouched.
-            let keep =
-                event_json_get(py, ns.to_string(), vec!["$keep".to_string()]).expect("get keep");
-            assert_eq!(keep[0].1.as_deref(), Some(&b"META-KEEP"[..]));
-            assert_eq!(keep[0].2.as_deref(), Some(&b"BODY-KEEP"[..]));
-
-            // The purged room misses even though its locator still points at
-            // the now-empty collection -- a stale locator is a miss, not an
-            // error, and the caller's SQL fallback takes over.
-            assert!(
-                node_present(&locator_gone, &id_gone),
-                "purge alone leaves the locator (Python removes it with point deletes)"
-            );
-            assert!(dag_gone != dag_keep);
-            let gone =
-                event_json_get(py, ns.to_string(), vec!["$gone".to_string()]).expect("get gone");
-            assert_eq!(gone[0].1, None);
-            assert_eq!(gone[0].2, None);
-        });
-    }
-
-    #[test]
-    fn get_with_no_locator_is_a_plain_miss() {
-        super::auth_chain_closure_tests::ensure_open();
-        let ns = "ns-ev-no-locator";
-        // No writes at all for this id: no legacy fallback exists any more,
-        // so an id with no locator entry is just (None, None).
-        pyo3::Python::attach(|py| {
-            let got = event_json_get(py, ns.to_string(), vec!["$never-written".to_string()])
-                .expect("get");
-            assert_eq!(got[0].1, None);
-            assert_eq!(got[0].2, None);
-        });
     }
 }

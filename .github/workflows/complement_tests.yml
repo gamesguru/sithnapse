@@ -31,6 +31,8 @@ jobs:
       # homeserver, while its integrated database is still queryable.
       COMPLEMENT_POST_TEST_SCRIPT: ${{ startsWith(matrix.database, 'Postgres') && format('{0}/synapse/.ci/scripts/dump_complement_postgres_stats.sh', github.workspace) || '' }}
       COMPLEMENT_POSTGRES_STATS_DIR: /tmp/complement-postgres-stats
+      # Packages/tests run in parallel by `go test` (-p / -parallel).
+      COMPLEMENT_PARALLEL: 4
 
     strategy:
       fail-fast: false
