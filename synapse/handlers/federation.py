@@ -41,6 +41,7 @@ from signedjson.sign import verify_signed_json
 from typing_extensions import assert_never
 from unpaddedbase64 import decode_base64
 
+from twisted.internet import defer
 from twisted.internet.defer import CancelledError
 
 from synapse import event_auth
@@ -88,7 +89,11 @@ from synapse.storage.databases.main.events_worker import EventRedactBehaviour
 from synapse.storage.invite_rule import InviteRule
 from synapse.types import JsonDict, StrCollection, get_domain_from_id
 from synapse.types.state import StateFilter
-from synapse.util.async_helpers import Linearizer, concurrently_execute
+from synapse.util.async_helpers import (
+    Linearizer,
+    concurrently_execute,
+    timeout_deferred,
+)
 from synapse.util.duration import Duration
 from synapse.util.retryutils import NotRetryingDestination
 from synapse.visibility import filter_events_for_server
@@ -111,6 +116,7 @@ logger = logging.getLogger(__name__)
 _PARTIAL_STATE_SYNC_INITIAL_BACKOFF = Duration(seconds=1)
 _PARTIAL_STATE_SYNC_MAX_BACKOFF = Duration(hours=1)
 _PARTIAL_STATE_SYNC_MAX_CONSECUTIVE_FAILURES = 10
+_PARTIAL_STATE_FULL_STATE_WAIT_TIMEOUT = Duration(minutes=2)
 
 
 # Added to debug performance and track progress on optimizations
@@ -286,9 +292,23 @@ class FederationHandler:
 
         # If a partial state resync is currently active for this room, wait for it
         # to complete so the backward extremities from the join event are persisted.
-        await self._storage_controllers.state._partial_state_room_tracker.await_full_state(
-            room_id
-        )
+        try:
+            await timeout_deferred(
+                deferred=defer.ensureDeferred(
+                    self._storage_controllers.state._partial_state_room_tracker.await_full_state(
+                        room_id
+                    )
+                ),
+                timeout=_PARTIAL_STATE_FULL_STATE_WAIT_TIMEOUT,
+                clock=self.clock,
+            )
+        except defer.TimeoutError:
+            logger.warning(
+                "Timed out waiting for partial-state resynchronization in room %s; "
+                "skipping backfill",
+                room_id,
+            )
+            return False
 
         async with self._room_backfill.queue(room_id):
             async with self._worker_locks.acquire_read_write_lock(
