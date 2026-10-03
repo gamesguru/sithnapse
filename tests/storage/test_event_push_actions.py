@@ -672,6 +672,66 @@ class EventPushActionsStoreTestCase(HomeserverTestCase):
         self.get_success(self.store._rotate_notifs())
         _assert_counts(1, 1, 0)
 
+    def test_old_push_actions_kept_for_pending_receipt(self) -> None:
+        """Old rotated push actions after a receipt that hasn't been processed
+        yet must survive deletion: until the receipt is folded into the summary
+        the counts come from `event_push_actions` alone, so deleting them would
+        undercount the badge."""
+        user_id, token, _, other_token, room_id = self._create_users_and_room()
+
+        event_ids = [
+            self.helper.send(room_id, body="msg", tok=other_token)["event_id"]
+            for _ in range(3)
+        ]
+
+        def _badge() -> int:
+            badge = self.get_success(
+                self.store.db_pool.runInteraction(
+                    "get-aggregate-unread-counts",
+                    self.store._get_unread_counts_by_room_for_user_txn,
+                    user_id,
+                )
+            )
+            return badge.get(room_id, 0)
+
+        self.assertEqual(_badge(), 3)
+        self.get_success(self.store._rotate_notifs())
+        self.assertEqual(_badge(), 3)
+
+        # A receipt lands, but rotation hasn't processed it yet.
+        self.get_success(
+            self.store.insert_receipt(
+                room_id,
+                "m.read",
+                user_id=user_id,
+                event_ids=[event_ids[0]],
+                thread_id=None,
+                data={},
+            )
+        )
+        self.assertEqual(_badge(), 2)
+
+        # Everything is now old enough to delete, but the pending receipt needs
+        # the rows after it.
+        # (Don't `pump`: that would also run the rotation loop and process the
+        # receipt.)
+        self.store.stream_ordering_day_ago = self.store.get_room_max_stream_ordering()
+        self.get_success(self.store._remove_old_push_actions_that_have_rotated())
+        remaining = self.get_success(
+            self.store.db_pool.simple_select_list(
+                table="event_push_actions",
+                keyvalues={"1": 1},
+                retcols=("event_id",),
+                desc="",
+            )
+        )
+        self.assertTrue(set(event_ids[1:]).issubset({row[0] for row in remaining}))
+        self.assertEqual(_badge(), 2)
+
+        # Once the receipt is processed the count is unchanged.
+        self.get_success(self.store._rotate_notifs())
+        self.assertEqual(_badge(), 2)
+
     def test_count_aggregation_threads(self) -> None:
         """
         This is essentially the same test as test_count_aggregation, but adds

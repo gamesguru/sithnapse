@@ -1828,6 +1828,26 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
                 # rows to delete than there actually are.
                 txn.execute("SET LOCAL enable_seqscan=off")
 
+            # A receipt that hasn't been folded into the summary yet is counted
+            # from `event_push_actions` alone (the summary can't be trusted until
+            # it is processed), so keep the rows after it. Rows at or before it
+            # are read and safe to delete.
+            last_receipt_stream_id = self.db_pool.simple_select_one_onecol_txn(
+                txn,
+                table="event_push_summary_last_receipt_stream_id",
+                keyvalues={},
+                retcol="stream_id",
+            )
+            txn.execute(
+                "SELECT MIN(event_stream_ordering) FROM receipts_linearized"
+                " WHERE stream_id > ?",
+                (last_receipt_stream_id,),
+            )
+            delete_bound = max_stream_ordering_to_delete
+            row = txn.fetchone()
+            if row is not None and row[0] is not None:
+                delete_bound = min(delete_bound, row[0])
+
             txn.execute(
                 """
                 SELECT stream_ordering FROM event_push_actions
@@ -1835,7 +1855,7 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
                 ORDER BY stream_ordering ASC LIMIT 1 OFFSET ?
                 """,
                 (
-                    max_stream_ordering_to_delete,
+                    delete_bound,
                     batch_size,
                 ),
             )
@@ -1844,7 +1864,7 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
             if stream_row:
                 (stream_ordering,) = stream_row
             else:
-                stream_ordering = max_stream_ordering_to_delete
+                stream_ordering = delete_bound
 
             # We need to use a inclusive bound here to handle the case where a
             # single stream ordering has more than `batch_size` rows.
