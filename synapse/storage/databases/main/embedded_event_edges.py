@@ -968,9 +968,13 @@ async def repair_edge_index_from_sql(
         retcols=("event_id", "is_state"),
         desc="repair_edge_index_from_sql",
     )
+    # SQLite stores BOOLEAN as 0/1, and `event_edges_put` wants a real bool.
     queue_edge_write(
         namespace,
-        [(room_id, event_id, prev_event_id, is_state) for event_id, is_state in rows],
+        [
+            (room_id, event_id, prev_event_id, bool(is_state))
+            for event_id, is_state in rows
+        ],
     )
     # The ordinary worker continues draining other rooms. Target this room so
     # a pending or newly-created repair can make the next gated read an
