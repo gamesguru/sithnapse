@@ -457,14 +457,14 @@ class EventsBackgroundUpdatesStore(
         New writes never need this; they already go straight to the
         configured engine exclusively.
 
-        Existing SQL rows are left in place rather than deleted: harmless
-        once migrated, and means turning the embedded engine back off
-        doesn't lose data (see the equivalent HAMT migration's docstring
-        for the same reasoning).
+        Each batch's SQL rows are deleted in the same transaction that copies
+        them, so once a row is migrated mtxdb is its only copy. Turning the
+        embedded engine back off therefore needs a reverse migration; the SQL
+        table no longer holds the mappings.
         """
         last_event_id = progress.get("last_event_id", "")
         # Lock the selected rows (Postgres; SQLite serialises writers anyway)
-        # and do the mtxdb writes in the same transaction. Purge deletes these
+        # and do the mtxdb writes and the SQL delete in the same transaction. Purge deletes these
         # rows before touching mtxdb, so it either waits for this batch and sees
         # its mappings, or deletes first and this batch never selects them --
         # a purged event's mapping can't be re-inserted from a stale read.
@@ -516,6 +516,17 @@ class EventsBackgroundUpdatesStore(
             # One sync for the whole batch (put + increment above), not one per
             # helper call -- see put_event_to_state_group_batch's docstring.
             maybe_sync(SyncTier.DURABLE, pools=[Pool.STATE])
+
+            # Only now that the copy is durable, drop the SQL rows (still
+            # holding their locks). If this transaction fails the rows stay
+            # and the batch replays; the probe above keeps that idempotent.
+            self.db_pool.simple_delete_many_txn(
+                txn,
+                table="event_to_state_groups",
+                column="event_id",
+                values=[event_id for event_id, _state_group in rows],
+                keyvalues={},
+            )
             return rows
 
         rows = await self.db_pool.runInteraction(

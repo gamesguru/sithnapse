@@ -15,8 +15,8 @@
 # <http://www.apache.org/licenses/LICENSE-2.0>.
 
 """Tests for the SQL -> mtxdb `event_to_state_groups` migration and its
-interaction with purge. The SQL rows are retained by the migration, so every
-case checks both stores."""
+interaction with purge. The migration deletes each SQL row as it copies it, so
+every case checks both stores."""
 
 import shutil
 import struct
@@ -128,8 +128,9 @@ class EventToStateGroupMigrationTests(HomeserverTestCase):
         self.assertEqual(self._mtxdb_mapping("$sqlonly3"), 9002)
         self.assertEqual(self._refcount(9001), 2)
         self.assertEqual(self._refcount(9002), 1)
-        # Migrated SQL rows are retained.
-        self.assertEqual(self._sql_mapping("$sqlonly1"), 9001)
+        # mtxdb is now the only copy: migrated SQL rows are deleted.
+        for event_id in ("$sqlonly1", "$sqlonly2", "$sqlonly3"):
+            self.assertIsNone(self._sql_mapping(event_id), event_id)
 
     def test_migration_does_not_overwrite_existing_mtxdb_mapping(self) -> None:
         # mtxdb has a newer mapping (e.g. a partial-state rewrite after the
@@ -147,6 +148,8 @@ class EventToStateGroupMigrationTests(HomeserverTestCase):
         # counted a second time.
         self.assertEqual(self._refcount(9101), 0)
         self.assertEqual(self._refcount(9102), 1)
+        # The stale SQL row is still dropped, so it can't be read back later.
+        self.assertIsNone(self._sql_mapping("$rewritten"))
 
     def test_migration_replay_does_not_double_count(self) -> None:
         self._insert_sql_mapping("$replayed", 9201)
@@ -157,6 +160,21 @@ class EventToStateGroupMigrationTests(HomeserverTestCase):
 
         self.assertEqual(self._mtxdb_mapping("$replayed"), 9201)
         self.assertEqual(self._refcount(9201), 1)
+
+    def test_sql_fallback_stops_once_sql_rows_are_migrated(self) -> None:
+        self._insert_sql_mapping("$gone", 9401)
+        self.assertTrue(self.get_success(self.store._embedded_sql_state_groups_remain()))
+
+        self._migrate()
+
+        self.assertFalse(
+            self.get_success(self.store._embedded_sql_state_groups_remain())
+        )
+        # Reads are served from mtxdb alone from here on.
+        self.assertEqual(
+            self.get_success(self.store._get_state_group_for_events(["$gone"])),
+            {"$gone": 9401},
+        )
 
     def test_state_reads_fall_back_to_sql_before_migration(self) -> None:
         self._insert_sql_mapping("$unmigrated", 9301)

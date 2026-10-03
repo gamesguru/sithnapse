@@ -309,14 +309,13 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             # backed by the separate refcount).
             all_purge_event_ids = [event_id for event_id, _should_delete in event_rows]
 
-            # The SQL rows are retained by the SQL -> mtxdb migration, so they
-            # may reference state groups too (including for events not yet
-            # migrated). Delete them *before* consulting mtxdb: the delete
+            # Rows not yet migrated from SQL (the migration deletes each row once
+            # copied) may reference state groups too. Delete them *before*
+            # consulting mtxdb: the delete
             # takes the row locks the migration batch also takes, so the
             # migration either finishes first (and the lookup below sees what
             # it wrote) or can no longer select these rows. Otherwise it could
-            # re-insert a stale mapping for a purged event. It also stops
-            # turning the embedded engine off from resurrecting the mapping.
+            # re-insert a stale mapping for a purged event.
             txn.execute(
                 """
                 SELECT DISTINCT state_group FROM events_to_purge

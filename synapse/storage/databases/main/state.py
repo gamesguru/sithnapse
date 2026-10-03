@@ -716,6 +716,27 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             desc="_get_state_group_for_event",
         )
 
+    async def _embedded_sql_state_groups_remain(self) -> bool:
+        """Whether any not-yet-migrated `event_to_state_groups` SQL rows remain.
+
+        With the embedded engine on, nothing writes this table and the
+        migration deletes rows as it copies them, so once it has been seen
+        empty it stays empty and the SQL fallbacks can be skipped.
+        """
+        if getattr(self, "_embedded_sql_state_groups_empty", False):
+            return False
+
+        def txn_fn(txn: LoggingTransaction) -> bool:
+            txn.execute("SELECT 1 FROM event_to_state_groups LIMIT 1")
+            return txn.fetchone() is not None
+
+        if await self.db_pool.runInteraction(
+            "embedded_sql_state_groups_remain", txn_fn
+        ):
+            return True
+        self._embedded_sql_state_groups_empty = True
+        return False
+
     async def _get_state_group_for_events(
         self, event_ids: Collection[str], raise_on_missing: bool = True
     ) -> Mapping[str, int]:
@@ -778,12 +799,11 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             res = dict(rows)
 
         if getattr(self, "_embedded_event_json_enabled", False):
-            # Until the SQL -> mtxdb migration has copied a row over, mtxdb
-            # genuinely has no mapping for it. The SQL rows are retained, so
-            # fall back to them for any miss (purge deletes them too, so a
-            # purged event can't be resurrected from here).
+            # Until the SQL -> mtxdb migration has copied a row over (and
+            # deleted it), mtxdb genuinely has no mapping for it, so fall back
+            # to SQL for any miss while rows remain there.
             sql_missing = set(event_ids).difference(res)
-            if sql_missing:
+            if sql_missing and await self._embedded_sql_state_groups_remain():
                 res = dict(res)
                 rows = cast(
                     list[tuple[str, int]],
@@ -852,7 +872,7 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             # Rows not yet migrated from SQL aren't in the refcount, but still
             # reference their state group.
             remaining = set(state_groups) - referenced
-            if remaining:
+            if remaining and await self._embedded_sql_state_groups_remain():
                 rows = await self.db_pool.simple_select_many_batch(
                     table="event_to_state_groups",
                     column="state_group",
