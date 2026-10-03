@@ -30,7 +30,7 @@ export UV_PROJECT_ENVIRONMENT=/venv
 
 # Pin a known-good commit of SyTest for determinism in CI.
 # To update, run: git ls-remote https://github.com/matrix-org/sytest.git refs/heads/develop
-SYTEST_PINNED_REV="c4da260e19a25d4ef86e07409ffd0fda5b2c2eb8"
+SYTEST_PINNED_REV="747315856d24eee846c6923b696fff9fae55ca0f"
 
 if [ -n "$SYTEST_BRANCH" ]; then
 	branch_name="$SYTEST_BRANCH"
@@ -101,8 +101,8 @@ with open('/sytest/scripts/synapse_sytest.sh', 'w') as f:
 PY
 
 echo "--- Patching /sytest/lib/SyTest/Homeserver/Synapse.pm to inject config"
-# When SYNAPSE_EMBEDDED_HAMT_ENGINE/SYNAPSE_EMBEDDED_HAMT_PATH are set, add an
-# `embedded_hamt` block to the homeserver config that sytest generates, so
+# When SYNAPSE_EMBEDDED_DB_ENGINE/SYNAPSE_EMBEDDED_DB_PATH are set, add an
+# `embedded_db` block to the homeserver config that sytest generates, so
 # the HAMT state backend runs against a real mtxdb database (mirrors
 # trial-mtxdb / complement-mtxdb). Synapse also reads these as plain
 # environment variables directly (see synapse/config/database.py), but
@@ -126,10 +126,9 @@ injection = '''        databases => \\%db_configs,
         # if a test specifically wants to exercise backoff behaviour.
         key_fetch_backoff_floor => ( length( $ENV{SYNAPSE_KEY_FETCH_BACKOFF_FLOOR} // '' ) ? $ENV{SYNAPSE_KEY_FETCH_BACKOFF_FLOOR} : "0s" ),
         ( do {
-            my $engine = $ENV{SYNAPSE_EMBEDDED_HAMT_ENGINE} // '';
-            my $path = $ENV{SYNAPSE_EMBEDDED_HAMT_PATH} // '';
-            ( length($engine) && length($path) )
-                ? ( embedded_hamt => { engine => $engine, path => $path } )
+            my $engine = $ENV{SYNAPSE_EMBEDDED_DB_ENGINE} // '';
+            length($engine)
+                ? ( embedded_db => { engine => $engine, path => "$hs_dir/embedded_db" } )
                 : ();
         } ),'''
 
@@ -139,6 +138,9 @@ content = content.replace(anchor, injection, 1)
 with open('/sytest/lib/SyTest/Homeserver/Synapse.pm', 'w') as f:
     f.write(content)
 PY
+
+# Unset global SYNAPSE_EMBEDDED_DB_PATH so homeservers use their per-instance $hs_dir/embedded_db
+unset SYNAPSE_EMBEDDED_DB_PATH
 
 echo "--- Executing SyTest via synapse_sytest.sh"
 exec /sytest/scripts/synapse_sytest.sh

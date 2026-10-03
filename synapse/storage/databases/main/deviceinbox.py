@@ -190,6 +190,20 @@ class DeviceInboxWorkerStore(SQLBaseStore):
     def get_to_device_stream_token(self) -> int:
         return self._to_device_msg_id_gen.get_current_token()
 
+    async def get_to_device_persisted_positions(self) -> list[tuple[str, int]]:
+        """Each to-device writer's persisted stream position.
+
+        Writers update `stream_positions` as part of persisting, so these are
+        safe bounds (no uncommitted gaps) for a worker to wait for replication on.
+        """
+        rows = await self.db_pool.simple_select_list(
+            table="stream_positions",
+            keyvalues={"stream_name": "to_device"},
+            retcols=("instance_name", "stream_id"),
+            desc="get_to_device_persisted_positions",
+        )
+        return [(instance_name, stream_id) for instance_name, stream_id in rows]
+
     def get_to_device_id_generator(self) -> MultiWriterIdGenerator:
         return self._to_device_msg_id_gen
 

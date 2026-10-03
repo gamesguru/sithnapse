@@ -19,22 +19,28 @@
 #
 
 import itertools
+from collections import UserDict
 from typing import (
+    Any,
     Collection,
     Iterable,
     Mapping,
+    Sequence,
     TypeVar,
 )
+from unittest import mock
 
 import attr
+from parameterized import parameterized
 
 from twisted.internet import defer
 
 from synapse.api.constants import EventTypes, JoinRules, Membership
-from synapse.api.room_versions import RoomVersions
+from synapse.api.room_versions import RoomVersion, RoomVersions
 from synapse.event_auth import auth_types_for_event
 from synapse.events import EventBase
 from synapse.state.v2 import (
+    ConflictCache,
     _get_auth_chain_difference,
     _get_power_level_for_sender,
     lexicographical_topological_sort,
@@ -60,6 +66,14 @@ MEMBERSHIP_CONTENT_BAN = {"membership": Membership.BAN}
 
 
 ORIGIN_SERVER_TS = 0
+
+
+try:
+    import synapse.synapse_rust.state_res as _rust_state_res  # noqa: F401
+
+    HAVE_RUST_STATE_RES = True
+except Exception:
+    HAVE_RUST_STATE_RES = False
 
 
 class FakeClock:
@@ -180,6 +194,59 @@ INITIAL_EVENTS = [
 ]
 
 INITIAL_EDGES = ["START", "IMZ", "IMC", "IMB", "IJR", "IPOWER", "IMA", "CREATE"]
+
+ZARA_KEY = (EventTypes.Member, ZARA)
+TOPIC_KEY = (EventTypes.Topic, "")
+
+
+def _member(node_id: str, sender: str, state_key: str, content: dict) -> FakeEvent:
+    return FakeEvent(
+        id=node_id,
+        sender=sender,
+        type=EventTypes.Member,
+        state_key=state_key,
+        content=content,
+    )
+
+
+# Events for the conflict cache tests. All branch off START.
+#
+# PA is a power levels event that gives Bob PL 50. T1 and T2 are topic changes
+# by Bob. Bob has no power under IPOWER, so they only pass auth if PA is in the
+# state.
+#
+# ZJ1 and ZJ2 are Zara re-joining on two branches, and INV1 and INV2 are
+# invites she sends to Evelyn on each branch. The invites pull the joins into
+# the auth chain difference (see `test_conflict_cache_key_repartitioned`).
+CACHE_TEST_CASE_EVENTS = [
+    FakeEvent(
+        id="PA",
+        sender=ALICE,
+        type=EventTypes.PowerLevels,
+        state_key="",
+        content={"users": {ALICE: 100, BOB: 50}},
+    ),
+    FakeEvent(id="T1", sender=BOB, type=EventTypes.Topic, state_key="", content={}),
+    FakeEvent(id="T2", sender=BOB, type=EventTypes.Topic, state_key="", content={}),
+    _member("ZJ1", ZARA, ZARA, MEMBERSHIP_CONTENT_JOIN),
+    _member("ZJ2", ZARA, ZARA, MEMBERSHIP_CONTENT_JOIN),
+    _member("INV1", ZARA, EVELYN, {"membership": Membership.INVITE}),
+    _member("INV2", ZARA, EVELYN, {"membership": Membership.INVITE}),
+]
+
+CACHE_TEST_CASE_EDGES = [
+    ["PA", "START"],
+    ["T1", "START"],
+    ["T2", "START"],
+    ["INV1", "ZJ1", "START"],
+    ["INV2", "ZJ2", "START"],
+]
+
+# Room versions that use v2 and v2.1 state resolution respectively. Both have
+# the same auth rules. The difference is that v2.1 starts the iterative auth
+# checks from empty state rather than from the unconflicted state.
+V2_ROOM = RoomVersions.V11
+V21_ROOM = RoomVersions.HydraV11
 
 
 class StateTestCase(unittest.TestCase):
@@ -453,21 +520,209 @@ class StateTestCase(unittest.TestCase):
 
         self.do_check(events, edges, expected_state_ids)
 
-    def do_check(
+    # Helpers for the conflict cache tests. These use a plain dict as the
+    # cache, so `len(conflict_cache)` after a call tells us whether it was a
+    # hit or a miss.
+
+    def _build_cache_scenario(self) -> None:
+        self.event_map, self.state_at_event = self.build_event_graph(
+            CACHE_TEST_CASE_EVENTS, CACHE_TEST_CASE_EDGES
+        )
+
+    def _state(self, *node_ids: str) -> StateMap[str]:
+        """The state at START with the given events applied on top."""
+        state = dict(self.state_at_event["START"])
+        for node_id in node_ids:
+            event = self.event_map[EventID(node_id, "example.com").to_string()]
+            state[(event.type, event.state_key)] = event.event_id
+        return state
+
+    def _resolve_with_cache(
+        self,
+        room_version: RoomVersion,
+        state_sets: Sequence[StateMap[str]],
+        conflict_cache: ConflictCache,
+    ) -> StateMap[str]:
+        return self.successResultOf(
+            defer.ensureDeferred(
+                resolve_events_with_store(
+                    FakeClock(),
+                    ROOM_ID,
+                    room_version,
+                    state_sets,
+                    event_map=None,
+                    state_res_store=TestStateResolutionStore(self.event_map),
+                    conflict_cache=conflict_cache,
+                )
+            )
+        )
+
+    @parameterized.expand((V2_ROOM, V21_ROOM))
+    def test_conflict_cache_shared_across_unconflicted_state(
+        self, room_version: RoomVersion
+    ) -> None:
+        """Test that two resolutions with the same conflicted set but different
+        unconflicted state share a cache entry, and that each result still
+        includes its own unconflicted state.
+
+        The unconflicted state differs on Zara's membership. The topic events
+        aren't authed against that, so under v2 it isn't part of the cache key.
+        """
+        self._build_cache_scenario()
+        conflict_cache: dict[bytes, StateMap[str]] = {}
+
+        with_zara = [self._state("PA", "T1"), self._state("PA", "T2")]
+        without_zara = [
+            {key: value for key, value in state.items() if key != ZARA_KEY}
+            for state in with_zara
+        ]
+
+        first = self._resolve_with_cache(room_version, with_zara, conflict_cache)
+        second = self._resolve_with_cache(room_version, without_zara, conflict_cache)
+        self.assertEqual(len(conflict_cache), 1, "expected a cache hit")
+
+        self.assertIn(ZARA_KEY, first)
+        self.assertNotIn(ZARA_KEY, second)
+
+        # Everything else agrees.
+        self.assertEqual({k: v for k, v in first.items() if k != ZARA_KEY}, second)
+
+    def test_conflict_cache_keys_on_base_state(self) -> None:
+        """Test that under v2 the cache key includes the unconflicted state the
+        auth checks depend on. Changing the power levels is a cache miss and
+        gives a different result."""
+        self._build_cache_scenario()
+
+        powerless = [self._state("T1"), self._state("T2")]
+        powered = [self._state("PA", "T1"), self._state("PA", "T2")]
+
+        conflict_cache: dict[bytes, StateMap[str]] = {}
+        under_ipower = self._resolve_with_cache(V2_ROOM, powerless, conflict_cache)
+        under_pa = self._resolve_with_cache(V2_ROOM, powered, conflict_cache)
+        self.assertEqual(len(conflict_cache), 2, "expected a cache miss")
+
+        # Bob's topics fail auth under IPOWER and pass under PA.
+        self.assertNotIn(TOPIC_KEY, under_ipower)
+        self.assertIn(TOPIC_KEY, under_pa)
+
+    def test_conflict_cache_key_repartitioned(self) -> None:
+        """Test that a cached result is correct when the same conflicted set is
+        split differently between conflicted and unconflicted keys.
+
+        In the first call Zara's membership is unconflicted, but ZJ1 and ZJ2 are
+        in the auth chain difference (via the invites) and so are in the
+        conflicted set. In the second call Zara's membership is itself
+        conflicted. Both calls have the same cache key, so the cached result
+        must include the resolved Zara membership, even though the first call
+        overrides it with its unconflicted state.
+        """
+        self._build_cache_scenario()
+
+        agreed = [self._state("INV1"), self._state("INV2")]
+        conflicting = [self._state("ZJ1", "INV1"), self._state("ZJ2", "INV2")]
+
+        conflict_cache: dict[bytes, StateMap[str]] = {}
+        agreed_result = self._resolve_with_cache(V21_ROOM, agreed, conflict_cache)
+        warm = self._resolve_with_cache(V21_ROOM, conflicting, conflict_cache)
+        self.assertEqual(len(conflict_cache), 1, "expected a cache hit")
+
+        # The first call's unconflicted state takes precedence over the cached
+        # resolution.
+        self.assertEqual(agreed_result[ZARA_KEY], self._state()[ZARA_KEY])
+
+        # The second call gets the winner from the cached resolution, the same
+        # one it computes from cold.
+        conflict_cache.clear()
+        cold = self._resolve_with_cache(V21_ROOM, conflicting, conflict_cache)
+        self.assertNotEqual(warm[ZARA_KEY], agreed_result[ZARA_KEY])
+        self.assertEqual(warm, cold)
+
+    @unittest.skip_unless(HAVE_RUST_STATE_RES, "synapse_rust.state_res unavailable")
+    def test_rust_used_on_miss_skipped_on_hit(self) -> None:
+        """A v2 conflict-cache miss invokes the Rust lattice fold; subsequent
+        hits (including when only unrelated unconflicted state differs) do not,
+        while a different base state does."""
+        import synapse.synapse_rust.state_res as rust_res
+
+        self._build_cache_scenario()
+        conflict_cache: dict[bytes, StateMap[str]] = {}
+
+        with_zara = [self._state("PA", "T1"), self._state("PA", "T2")]
+        without_zara = [
+            {key: value for key, value in state.items() if key != ZARA_KEY}
+            for state in with_zara
+        ]
+        # Same conflicted set, but the power levels (part of the base state)
+        # differ.
+        under_ipower = [self._state("T1"), self._state("T2")]
+
+        real = rust_res.resolve_v2_via_lattice_fold
+        calls: list[Any] = []
+
+        def spy(*args: Any, **kwargs: Any) -> Any:
+            calls.append(args)
+            return real(*args, **kwargs)
+
+        with mock.patch.object(rust_res, "resolve_v2_via_lattice_fold", spy):
+            self._resolve_with_cache(V2_ROOM, with_zara, conflict_cache)
+            self.assertEqual(len(calls), 1, "cache miss should invoke Rust")
+
+            self._resolve_with_cache(V2_ROOM, without_zara, conflict_cache)
+            self.assertEqual(
+                len(calls),
+                1,
+                "cache hit with unrelated unconflicted state must not invoke Rust",
+            )
+
+            self._resolve_with_cache(V2_ROOM, under_ipower, conflict_cache)
+            self.assertEqual(
+                len(calls), 2, "a different base state must be a cache miss"
+            )
+
+        self.assertEqual(len(conflict_cache), 2)
+
+    @unittest.skip_unless(HAVE_RUST_STATE_RES, "synapse_rust.state_res unavailable")
+    def test_rust_result_matches_python(self) -> None:
+        """With the Rust entry point forced to raise, the Python fallback must
+        produce the same resolved state as the Rust path."""
+        import synapse.synapse_rust.state_res as rust_res
+
+        self._build_cache_scenario()
+        state_sets = [self._state("PA", "T1"), self._state("PA", "T2")]
+
+        # Separate caches so both calls are cache misses and actually run their
+        # respective implementations (a shared cache would make the second call
+        # a hit and skip the Python path entirely).
+        rust_cache: dict[bytes, StateMap[str]] = {}
+        rust_result = self._resolve_with_cache(V2_ROOM, state_sets, rust_cache)
+
+        def explode(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("forced fallback for the Rust/Python parity test")
+
+        python_cache: dict[bytes, StateMap[str]] = {}
+        with mock.patch.object(rust_res, "resolve_v2_via_lattice_fold", explode):
+            python_result = self._resolve_with_cache(V2_ROOM, state_sets, python_cache)
+
+        # The fallback deliberately raises, so trial must not treat the
+        # resulting error log as an unflushed failure.
+        self.flushLoggedErrors(RuntimeError)
+
+        self.assertEqual(dict(rust_result), dict(python_result))
+
+    def build_event_graph(
         self,
         events: list[FakeEvent],
         edges: list[list[str]],
-        expected_state_ids: list[str],
-    ) -> None:
-        """Take a list of events and edges and calculate the state of the
-        graph at END, and asserts it matches `expected_state_ids`
+    ) -> tuple[dict[str, EventBase], dict[str, StateMap[str]]]:
+        """Build the graph of `INITIAL_EVENTS` plus `events`.
 
         Args:
             events
             edges: A list of chains of event edges, e.g.
                 `[[A, B, C]]` are edges A->B and B->C.
-            expected_state_ids: The expected state at END, (excluding
-                the keys that haven't changed since START).
+
+        Returns:
+            The events by event ID, and the state after each node ID.
         """
         # We want to sort the events into topological order for processing.
         graph: dict[str, set[str]] = {}
@@ -538,6 +793,26 @@ class StateTestCase(unittest.TestCase):
 
             state_at_event[node_id] = state_after
             event_map[event_id] = event
+
+        return event_map, state_at_event
+
+    def do_check(
+        self,
+        events: list[FakeEvent],
+        edges: list[list[str]],
+        expected_state_ids: list[str],
+    ) -> None:
+        """Take a list of events and edges and calculate the state of the
+        graph at END, and asserts it matches `expected_state_ids`
+
+        Args:
+            events
+            edges: A list of chains of event edges, e.g.
+                `[[A, B, C]]` are edges A->B and B->C.
+            expected_state_ids: The expected state at END, (excluding
+                the keys that haven't changed since START).
+        """
+        event_map, state_at_event = self.build_event_graph(events, edges)
 
         expected_state = {}
         for node_id in expected_state_ids:
@@ -1061,6 +1336,153 @@ class AuthChainDifferenceTestCase(unittest.TestCase):
                     want_pl,
                     f"wrong pl for {user_id} with no PL event on v{room_version.identifier}",
                 )
+
+
+@unittest.skip_unless(HAVE_RUST_STATE_RES, "synapse_rust.state_res unavailable")
+class RustAuthChainDifferenceInputTestCase(unittest.TestCase):
+    """Input-shape coverage for the Rust auth-difference fast path.
+
+    The Rust entry point has to copy every Python object it needs *before* it
+    releases the GIL, so `state_sets` is only ever inspected during that copy
+    and then never touched again. These cases feed one logical graph through
+    several container shapes and assert the answer never changes, which keeps
+    both the exact-`dict` fast path and the `values()` fallback honest.
+    """
+
+    def setUp(self) -> None:
+        # A -> B -> C, all present in the event map. The production caller only
+        # takes this path when every state-set ID *and its whole auth chain* is
+        # in `event_map` (see the `complete_event_graph` check), so the graph
+        # handed to Rust here is closed by construction.
+        self.a = FakeEvent(
+            id="A",
+            sender=ALICE,
+            type=EventTypes.Member,
+            state_key="",
+            content={},
+        ).to_event([], [])
+        self.b = FakeEvent(
+            id="B",
+            sender=ALICE,
+            type=EventTypes.Member,
+            state_key="",
+            content={},
+        ).to_event([self.a.event_id], [])
+        self.c = FakeEvent(
+            id="C",
+            sender=ALICE,
+            type=EventTypes.Member,
+            state_key="",
+            content={},
+        ).to_event([self.b.event_id], [])
+        self.event_map = {event.event_id: event for event in (self.a, self.b, self.c)}
+        self.state_sets = [
+            {("a", ""): self.a.event_id},
+            {("b", ""): self.b.event_id},
+            {("c", ""): self.c.event_id},
+        ]
+        # Each state set's auth chain includes itself, so the three chains are
+        # {A}, {A, B} and {A, B, C}: union - intersection is {B, C}.
+        self.expected = {self.b.event_id, self.c.event_id}
+
+    def rust_difference(self, state_sets: Any) -> set[str]:
+        import synapse.synapse_rust.state_res as rust_res
+
+        return rust_res.get_auth_chain_difference_from_event_graph(
+            state_sets, self.event_map
+        )
+
+    def python_difference(self, state_sets: Sequence[StateMap[str]]) -> set[str]:
+        """Run the pure-Python/store path on the identical inputs."""
+        difference = _get_auth_chain_difference(
+            ROOM_ID,
+            state_sets,
+            self.event_map,
+            TestStateResolutionStore({}),
+            None,
+            complete_event_graph=False,
+        )
+        return self.successResultOf(defer.ensureDeferred(difference))
+
+    def test_plain_dicts(self) -> None:
+        self.assertEqual(self.rust_difference(self.state_sets), self.expected)
+
+    def test_matches_python_path(self) -> None:
+        """The Rust fast path must agree with the path it replaced."""
+        self.assertEqual(
+            self.rust_difference(self.state_sets),
+            self.python_difference(self.state_sets),
+        )
+
+    def test_generator(self) -> None:
+        """`state_sets` is consumed with `try_iter`, so a generator works."""
+        self.assertEqual(
+            self.rust_difference(s for s in self.state_sets), self.expected
+        )
+
+    def test_state_sets_without_len(self) -> None:
+        """The container must never be asked for `len()`.
+
+        `len()` on an arbitrary iterable runs Python code whose exceptions are
+        only ever used for a capacity hint, so measuring the input is a
+        regression even if the answer comes out the same.
+        """
+
+        class IterableOnly:
+            def __init__(self, items: Sequence[StateMap[str]]) -> None:
+                self._items = items
+
+            def __iter__(self) -> Any:
+                return iter(self._items)
+
+            def __len__(self) -> int:
+                raise AssertionError("state_sets must not be measured with len()")
+
+        self.assertEqual(
+            self.rust_difference(IterableOnly(self.state_sets)), self.expected
+        )
+
+    def test_non_dict_mapping(self) -> None:
+        """A mapping that is not a `dict` still goes through `values()`."""
+        state_sets = [UserDict(s) for s in self.state_sets]
+        self.assertEqual(self.rust_difference(state_sets), self.expected)
+
+    def test_lengthless_values_iterable(self) -> None:
+        """The values fallback accepts an iterable without `__len__`."""
+
+        class LengthlessMapping(UserDict):
+            def values(self) -> Any:
+                return iter(super().values())
+
+        state_sets = [LengthlessMapping(s) for s in self.state_sets]
+        self.assertEqual(self.rust_difference(state_sets), self.expected)
+
+    def test_dict_subclass_honours_values(self) -> None:
+        """A `dict` subclass must reach its overridden `values()`.
+
+        The exact-`dict` fast path deliberately stops at plain dictionaries so
+        that an overridden `values()` is not silently bypassed; this is the
+        test that keeps that restriction in place.
+        """
+        values_calls: list[str] = []
+
+        class RecordingDict(dict):
+            def values(self) -> Any:
+                values_calls.append("called")
+                return super().values()
+
+        state_sets = [RecordingDict(s) for s in self.state_sets]
+        self.assertEqual(self.rust_difference(state_sets), self.expected)
+        self.assertEqual(len(values_calls), len(self.state_sets))
+
+    def test_empty(self) -> None:
+        """No state sets means no difference, not an error."""
+        self.assertEqual(self.rust_difference([]), set())
+        self.assertEqual(self.rust_difference(iter(())), set())
+
+    def test_single_state_set(self) -> None:
+        """With one set the intersection equals the union, so nothing differs."""
+        self.assertEqual(self.rust_difference(self.state_sets[:1]), set())
 
 
 T = TypeVar("T")

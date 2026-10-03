@@ -39,6 +39,7 @@ use serde_json::{
     value::RawValue,
     Number, Value,
 };
+use sha2::{Digest, Sha256};
 
 /// The minimum integer that can be used in canonical JSON.
 pub const MIN_VALID_INTEGER: i64 = -(2i64.pow(53)) + 1;
@@ -131,6 +132,32 @@ where
     let json_string = String::from_utf8(vec).expect("valid utf8");
 
     Ok(json_string)
+}
+
+/// Serialize canonical JSON directly into a SHA-256 hasher, avoiding the
+/// intermediate UTF-8 `String` used by callers that only need an event hash.
+pub fn sha256_canonical<T>(
+    value: &T,
+    options: CanonicalizationOptions,
+) -> Result<[u8; 32], serde_json::Error>
+where
+    T: Serialize + ?Sized,
+{
+    struct HashWriter(Sha256);
+    impl Write for HashWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut serializer = CanonicalSerializer::new(HashWriter(Sha256::new()), options);
+    value.serialize(&mut serializer)?;
+    Ok(serializer.inner.into_inner().0.finalize().into())
 }
 
 /// A helper function that asserts that an integer is in the valid range.

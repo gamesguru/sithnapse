@@ -25,7 +25,7 @@ import traceback
 from collections import deque
 from ipaddress import IPv4Address, IPv6Address, ip_address
 from math import floor
-from typing import Callable, Optional
+from typing import Callable, Optional, cast
 
 import attr
 from zope.interface import implementer
@@ -128,7 +128,7 @@ class RemoteHandler(logging.Handler):
         if _reactor is None:
             from twisted.internet import reactor
 
-            _reactor = reactor  # type: ignore[assignment]
+            _reactor = cast(IReactorTime, reactor)
 
         try:
             ip = ip_address(self.host)

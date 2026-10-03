@@ -32,10 +32,10 @@ from typing import (
 )
 
 import attr
-from immutabledict import immutabledict
 from prometheus_client import Counter, Histogram
 
 from synapse.api.constants import EventTypes
+from synapse.api.errors import PartialStateConflictError
 from synapse.api.room_versions import KNOWN_ROOM_VERSIONS, StateResolutionVersions
 from synapse.events import EventBase
 from synapse.events.py_protocol import supports_msc4242_state_dag
@@ -52,6 +52,7 @@ from synapse.storage.databases.main.event_federation import StateDifference
 from synapse.storage.databases.main.events_worker import EventRedactBehaviour
 from synapse.types import StateMap, StrCollection
 from synapse.types.state import StateFilter
+from synapse.util import MutableOverlayMapping
 from synapse.util.async_helpers import Linearizer
 from synapse.util.caches.expiringcache import ExpiringCache
 from synapse.util.duration import Duration
@@ -112,18 +113,13 @@ class _StateCacheEntry:
         #
         # This can be None if we have a `state_group` (as then we can fetch the
         # state from the DB.)
-        self._state: StateMap[str] | None = (
-            immutabledict(state) if state is not None else None
-        )
-
+        self._state = state
         # the ID of a state group if one and only one is involved.
         # otherwise, None otherwise?
         self.state_group = state_group
 
         self.prev_group = prev_group
-        self.delta_ids: StateMap[str] | None = (
-            immutabledict(delta_ids) if delta_ids is not None else None
-        )
+        self.delta_ids = delta_ids
 
     async def get_state(
         self,
@@ -173,12 +169,27 @@ class _StateCacheEntry:
         length = 0
 
         if self._state:
-            length += len(self._state)
+            length += _state_map_size(self._state)
 
         if self.delta_ids:
-            length += len(self.delta_ids)
+            length += _state_map_size(self.delta_ids)
 
         return length or 1  # Make sure its not 0.
+
+
+def _state_map_size(state_map: Mapping[Any, Any]) -> int:
+    """Estimate a proxy for the memory a state map holds, for sizing caches.
+
+    Since state maps are often combinations of `ChainMap` and
+    `MutableOverlayMapping`, we look at the total number of entries across all
+    layers rather than just the number of distinct keys. This is both faster and
+    a more accurate proxy for memory usage.
+    """
+    if isinstance(state_map, ChainMap):
+        return sum(_state_map_size(layer) for layer in state_map.maps)
+    if isinstance(state_map, MutableOverlayMapping):
+        return state_map.total_entries()
+    return len(state_map)
 
 
 class StateHandler:
@@ -252,14 +263,17 @@ class StateHandler:
             The hosts in the room at the given events
         """
         if len(event_ids) > 1:
-            rows = await self.store.db_pool.simple_select_many_batch(
-                table="event_to_state_groups",
-                column="event_id",
-                iterable=event_ids,
-                retcols=("event_id",),
-                desc="get_hosts_in_room_at_events_filter_outliers",
+            # Drop stateless outliers (e.g. out-of-band invites) before
+            # resolving, since they have no state group and would otherwise
+            # make `resolve_state_groups_for_events` raise. This must go
+            # through the store's embedded-aware lookup rather than querying
+            # `event_to_state_groups` directly: under the mtxdb-exclusive
+            # engine that SQL table is intentionally empty, so a direct query
+            # silently filters nothing and the resolution fails.
+            state_groups = await self.store._get_state_group_for_events(
+                event_ids, raise_on_missing=False
             )
-            non_outlier_event_ids = {r[0] for r in rows}
+            non_outlier_event_ids = set(state_groups)
             if non_outlier_event_ids:
                 event_ids = non_outlier_event_ids
 
@@ -359,11 +373,21 @@ class StateHandler:
                 if non_outlier_prev_events:
                     state_prev_event_ids = frozenset(non_outlier_prev_events)
 
-            entry = await self.resolve_state_groups_for_events(
-                event.room_id,
-                state_prev_event_ids,
-                await_full_state=False,
-            )
+            try:
+                entry = await self.resolve_state_groups_for_events(
+                    event.room_id,
+                    state_prev_event_ids,
+                    await_full_state=False,
+                )
+            except RuntimeError as e:
+                # If resolving state groups fails because the room is undergoing a
+                # partial-state transition or un-partial-stating race, raise
+                # PartialStateConflictError so the caller's retry loop can re-attempt.
+                if partial_state or await self.store.is_partial_state_room(
+                    event.room_id
+                ):
+                    raise PartialStateConflictError() from e
+                raise
 
             # Ensure we still have the state groups we're relying on, and bump
             # their usage time to avoid them being deleted from under us.
@@ -664,6 +688,31 @@ class StateResolutionHandler:
             )
         )
 
+        # The result of resolving a conflicted set of state, keyed on a digest
+        # of the inputs to `_resolve_conflicted_set`. See
+        # `v2._conflict_cache_key`.
+        #
+        # This is different to `_state_cache` above, which caches the resolved
+        # state based on the state groups. This cache aims to address the case
+        # where resolving across different state groups often produces the same
+        # conflicted set, which we can then cache.
+        #
+        # We bound the size of the cache based on the size calculated by
+        # `_state_map_size`, which calculates a proxy for a rough estimate of
+        # the memory footprint of a state map.
+        self._conflict_resolution_cache: ExpiringCache[bytes, StateMap[str]] = (
+            ExpiringCache(
+                cache_name="state_conflict_resolution_cache",
+                server_name=self.server_name,
+                hs=hs,
+                clock=self.clock,
+                max_len=100000,
+                expiry_ms=EVICTION_TIMEOUT_SECONDS * 1000,
+                size_callback=_state_map_size,
+                reset_expiry_on_get=True,
+            )
+        )
+
         #
         # stuff for tracking time spent on state-res by room
         #
@@ -826,6 +875,7 @@ class StateResolutionHandler:
                         state_sets,
                         event_map,
                         state_res_store,
+                        conflict_cache=self._conflict_resolution_cache,
                     )
         finally:
             self._record_state_res_metrics(room_id, m.get_resource_usage())

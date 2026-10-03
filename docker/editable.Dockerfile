@@ -53,7 +53,7 @@ COPY rust /editable-src/rust/
 COPY pyproject.toml uv.lock README.rst build_rust.py Cargo.toml Cargo.lock /editable-src/
 
 RUN pip install uv
-RUN cd /editable-src && UV_PROJECT_ENVIRONMENT=/usr/local uv sync --all-extras --frozen
+RUN cd /editable-src && UV_PROJECT_ENVIRONMENT=/usr/local uv sync --all-extras --no-dev --frozen
 
 # Make copies of useful things for inspection:
 # - the Rust module (must be copied to the editable source tree before startup)

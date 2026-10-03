@@ -22,6 +22,7 @@
 
 import argparse
 import logging
+import os
 from typing import Any
 
 import attr
@@ -210,6 +211,13 @@ class OutboundFederationRestrictedTo:
         # `outbound_federation_restricted_to` is not configured, then any instance can
         # talk to federation (no restrictions so always return `True`).
         return self.instances is None or instance in self.instances
+
+
+def _unsafe_mtxdb_off_allowed() -> bool:
+    """Whether this process has explicitly opted into `off` for a test or
+    diagnostic run (SYNAPSE_TEST_MTXDB_ALLOW_UNSAFE_OFF)."""
+    value = os.environ.get("SYNAPSE_TEST_MTXDB_ALLOW_UNSAFE_OFF", "").strip().lower()
+    return value not in ("", "0", "false", "no", "off")
 
 
 class WorkerConfig(Config):
@@ -436,7 +444,7 @@ class WorkerConfig(Config):
                 "Must specify at least one instance to handle `quarantined_media_changes` messages."
             )
 
-        # Reject embedded_hamt (mtxdb) + *sharded-events* multi-worker
+        # Reject embedded_db (mtxdb) + *sharded-events* multi-worker
         # deployments specifically, not multi-worker deployments in
         # general. A worker process's mtxdb index is built once at open
         # time by scanning shard files on disk, and only ever updated by
@@ -458,23 +466,23 @@ class WorkerConfig(Config):
         # forwarding each writer's HAMT deltas to a single designated
         # mtxdb-writer instance over replication, or partitioning mtxdb
         # itself per writer -- neither exists yet.
-        embedded_hamt_engine = self.root.database.embedded_hamt_engine
-        if embedded_hamt_engine and len(self.writers.events) > 1:
+        embedded_db_engine = self.root.database.embedded_db_engine
+        if embedded_db_engine and len(self.writers.events) > 1:
             raise ConfigError(
-                f"embedded_hamt.engine is set to {embedded_hamt_engine!r}, but "
+                f"embedded_db.engine is set to {embedded_db_engine!r}, but "
                 f"writers.events names {len(self.writers.events)} instances "
-                f"({self.writers.events!r}). The embedded HAMT engine supports "
+                f"({self.writers.events!r}). The embedded DB engine supports "
                 "exactly one writer process at a time (see "
                 "StateGroupDataStore.__init__'s writer/read-only split): with "
                 "more than one events writer, each would independently open "
                 "the store writable and immediately hit mtxdb's own exclusive-"
                 "lock rejection. Configure a single events writer, or remove "
-                "embedded_hamt.engine."
+                "embedded_db.engine."
             )
 
         # A second, independent constraint on the same feature: the
-        # embedded-HAMT-to-SQL backfill migration (state/store.py's
-        # EMBEDDED_HAMT_MIGRATION_UPDATE_NAME) runs through Synapse's
+        # embedded-db-to-SQL backfill migration (state/store.py's
+        # EMBEDDED_DB_MIGRATION_UPDATE_NAME) runs through Synapse's
         # generic background-updates framework, whose poll loop is always
         # started unconditionally by the *main* process
         # (synapse/app/homeserver.py's start() -- generic_worker.py never
@@ -504,38 +512,105 @@ class WorkerConfig(Config):
         # BackgroundUpdater/do_next_background_update). So this deployment
         # shape needs *no* background-updates-capable instance other than
         # main to exist: require `run_background_tasks_on` to be unset or
-        # explicitly "main" too, whenever embedded_hamt is in play in a
+        # explicitly "main" too, whenever embedded_db is in play in a
         # worker deployment.
         background_tasks_instance = (
             config.get("run_background_tasks_on") or MAIN_PROCESS_INSTANCE_NAME
         )
-        if embedded_hamt_engine and (
+        if embedded_db_engine and (
             self.worker_app is not None or len(self.instance_map) > 0
         ):
             if self.writers.events != [MAIN_PROCESS_INSTANCE_NAME]:
                 raise ConfigError(
-                    f"embedded_hamt.engine is set to {embedded_hamt_engine!r} in a "
+                    f"embedded_db.engine is set to {embedded_db_engine!r} in a "
                     "worker deployment, but writers.events is "
                     f"{self.writers.events!r}, not just the main process. The "
-                    "embedded-HAMT background migration always runs on the main "
+                    "embedded-db background migration always runs on the main "
                     "process (Synapse's background-updates poll loop is only "
                     "ever started there), so main must also be the sole mtxdb "
                     "writer or that migration crashes trying to write through a "
                     "read-only-opened store. Make the main process the sole "
-                    "events writer, or remove embedded_hamt.engine."
+                    "events writer, or remove embedded_db.engine."
                 )
             if background_tasks_instance != MAIN_PROCESS_INSTANCE_NAME:
                 raise ConfigError(
-                    f"embedded_hamt.engine is set to {embedded_hamt_engine!r} in a "
+                    f"embedded_db.engine is set to {embedded_db_engine!r} in a "
                     f"worker deployment, but run_background_tasks_on is "
                     f"{background_tasks_instance!r}, not the main process. That "
                     "instance would run its own independent background-updates "
                     "poll loop (see events_bg_updates.py's run_background_tasks-"
                     "gated enqueue calls), concurrently with main's own "
-                    "unconditional one, racing on the same embedded-HAMT-writing "
+                    "unconditional one, racing on the same embedded-db-writing "
                     "rows with no cross-instance coordination. Leave "
                     "run_background_tasks_on unset (or set it to the main "
-                    "process), or remove embedded_hamt.engine."
+                    "process), or remove embedded_db.engine."
+                )
+
+            # A third, independent constraint: with no SQL fallback for the
+            # data the embedded engine owns (event_json/state/auth-chain),
+            # a read-only worker's get_many_with_refresh gate can, under a
+            # deferred index checkpoint rewrite, keep reporting a committed
+            # write as absent for up to the checkpoint rewrite budget --
+            # far longer than any client-facing retry/timeout. The write-
+            # ahead journal's get_read_committed overlay is the only read
+            # path that closes that window independently of the checkpoint
+            # rewrite, because its journal group is appended by the
+            # writer's sync whether or not the index checkpoint rewrite is
+            # deferred. This is a *visibility* requirement, not a
+            # durability one -- the journal changes which file receives
+            # the sync fsync (the journal segment instead of the packfile
+            # shards), not when it happens, so a write that hasn't reached
+            # the flush coalescer's periodic sync is still lost on crash
+            # either way, and durable acknowledgment still needs an
+            # explicit sync regardless of WAL. It's required only in a
+            # worker deployment because a single process never goes
+            # through this cross-process gate at all: the writer always
+            # sees its own live in-memory state directly.
+            #
+            # SYNAPSE_MTXDB_WAL is also what
+            # rust/src/database/mtxdb_syn.rs's wal_enabled()/
+            # wal_enabled_from() reads to decide whether the Rust engine
+            # actually attaches the journal on open -- this check exists
+            # so a misconfigured process fails loudly at startup instead
+            # of the Rust side silently opening without the journal it
+            # was told to require. The truthy/falsey parsing below must
+            # stay in sync with that function's (same set: ""/0/false/
+            # no/off, case-insensitive, trimmed); if that set ever
+            # changes on the Rust side, update it here too, or this
+            # validation can pass while the Rust driver doesn't actually
+            # attach a journal.
+            wal_env = os.environ.get("SYNAPSE_MTXDB_WAL", "").strip()
+            wal_enabled = wal_env.lower() not in ("", "0", "false", "no", "off")
+            if not wal_enabled:
+                raise ConfigError(
+                    f"embedded_db.engine is set to {embedded_db_engine!r} in "
+                    "a worker deployment, but SYNAPSE_MTXDB_WAL is not set. "
+                    "Without the write-ahead journal, a committed write can be "
+                    "reported absent by another worker until a checkpoint "
+                    "rewrite refreshes that worker's index (and that rewrite "
+                    "can be deferred for the checkpoint rewrite budget). The "
+                    "journal's read-committed overlay is the only read path "
+                    "that closes that window independently of the checkpoint "
+                    "rewrite. Set SYNAPSE_MTXDB_WAL=1 to enable it, or remove "
+                    "the worker deployment (worker_app / instance_map)."
+                )
+
+            database = self.root.database
+            if (
+                database.embedded_db_sync_mode == "off" or database.embedded_db_no_sync
+            ) and not _unsafe_mtxdb_off_allowed():
+                raise ConfigError(
+                    f"embedded_db.engine is set to {embedded_db_engine!r} in "
+                    "a worker deployment with durability turned off "
+                    "(embedded_db.sync_mode: off, no_sync, SYNAPSE_MTXDB_SYNC=off "
+                    "or SYNAPSE_MTXDB_NO_SYNC). With durability off nothing bounds "
+                    "how much a crash can lose, while other workers may already "
+                    "have read what the writer then loses: the event JSON and "
+                    "state mappings have no SQL copy, so a committed SQL row can "
+                    "be left permanently without its embedded record. Use "
+                    "sync_mode: interval (a bounded crash window) or always. "
+                    "For a test or diagnostic run only, set "
+                    "SYNAPSE_TEST_MTXDB_ALLOW_UNSAFE_OFF=1 to allow it."
                 )
 
         self.events_shard_config = RoutableShardedWorkerHandlingConfig(

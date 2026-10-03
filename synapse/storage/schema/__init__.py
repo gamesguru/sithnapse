@@ -175,7 +175,8 @@ Changes in SCHEMA_VERSION = 93
 Changes in SCHEMA_VERSION = 94
     - Add `recheck` column (boolean, default true) to the `redactions` table.
     - MSC4242: Add state DAG tables.
-    - MSC4429: Track updates to user profile fields via a new stream.
+    - MSC4429/MSC4262: Track updates to user profile fields via a new stream.
+    - Add an `inserted_ts` column to the `state_groups_persisting` table.
 
 Changes in SCHEMA_VERSION = 95
     - Add tables to store HAMT roots and shared nodes for state groups.
@@ -186,14 +187,17 @@ Changes in SCHEMA_VERSION = 95
       room purge commits.
     - Change `delayed_events` primary key to be globally unique rather than
       scoped to a user localpart (MSC4140).
+    - Add the durable publication and rebuild-checkpoint tables for the
+      embedded forward-edge index.
 
 """
 
 
 SCHEMA_COMPAT_VERSION = (
     # HAMT state roots are authoritative in the embedded engine when one is
-    # configured, and delayed-event IDs are globally unique rather than
-    # scoped to a user localpart.
+    # configured, delayed-event IDs are globally unique rather than scoped to
+    # a user localpart, and the embedded forward-edge publication bridge is
+    # present.
     95
 )
 """Limit on how far the synapse codebase can be rolled back without breaking db compat

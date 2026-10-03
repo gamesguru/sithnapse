@@ -18,17 +18,22 @@
 #
 #
 
+import hashlib
 import heapq
 import itertools
+import json
 import logging
 import time
+from collections import ChainMap
 from typing import (
+    AbstractSet,
     Any,
     Awaitable,
     Callable,
     Generator,
     Iterable,
     Literal,
+    MutableMapping,
     Protocol,
     Sequence,
     cast,
@@ -41,7 +46,8 @@ from synapse.api.errors import AuthError
 from synapse.api.room_versions import RoomVersion, StateResolutionVersions
 from synapse.events import EventBase, is_creator
 from synapse.storage.databases.main.event_federation import StateDifference
-from synapse.types import MutableStateMap, StateMap, StrCollection
+from synapse.types import MutableStateMap, StateKey, StateMap, StrCollection
+from synapse.util import MutableOverlayMapping
 from synapse.util.async_helpers import yieldable_gather_results
 from synapse.util.duration import Duration
 
@@ -89,6 +95,7 @@ async def resolve_events_with_store(
     state_sets: Sequence[StateMap[str]],
     event_map: dict[str, EventBase] | None,
     state_res_store: StateResolutionStore,
+    conflict_cache: "ConflictCache | None" = None,
 ) -> StateMap[str]:
     """Resolves the state using the v2 state resolution algorithm
 
@@ -107,6 +114,10 @@ async def resolve_events_with_store(
             If None, all events will be fetched via state_res_store.
 
         state_res_store:
+        conflict_cache:
+            if given, the resolution of the conflicted set is looked up here
+            before it is computed, and stored here afterwards. See
+            `_conflict_cache_key` for what the key covers.
 
     Returns:
         A map from (type, state_key) to event_id.
@@ -219,39 +230,149 @@ async def resolve_events_with_store(
                 )
             )
 
-    # Attempt to run high-performance state resolution in Rust via rezzy's lattice fold
-    if room_version.state_res == StateResolutionVersions.V2:
-        try:
-            import synapse.synapse_rust.state_res as rust_res
-
-            resolve_v2_via_lattice_fold = rust_res.resolve_v2_via_lattice_fold
-
-            logger.debug("Resolving state v2 via Rust rezzy lattice fold")
-
-            _gg_rust_res_start = time.monotonic()
-            resolved_state_rust: StateMap[str] = resolve_v2_via_lattice_fold(
-                dict(unconflicted_state),
-                list(full_conflicted_set),
-                event_map,
-            )
-            logger.debug(
-                "[gg-state-timing] state_v2_rust_resolve "
-                "conflicted=%d event_map=%d elapsed_ms=%.1f",
-                len(full_conflicted_set),
-                len(event_map),
-                (time.monotonic() - _gg_rust_res_start) * 1000,
-            )
-            return resolved_state_rust
-        except Exception as e:
-            logger.exception(
-                "Failed to run Rust state resolution via lattice fold, falling back to python",
-                exc_info=e,
-            )
-
-    _gg_python_res_start = time.monotonic()
     full_conflicted_set = {eid for eid in full_conflicted_set if eid in event_map}
 
     logger.debug("%d full_conflicted_set entries", len(full_conflicted_set))
+
+    # Calculate the base state.
+    #
+    # v2 uses the unconflicted state as the base state, but v2.1 uses the empty
+    # set.
+    base_state: StateMap[str] = {}
+    if room_version.state_res != StateResolutionVersions.V2_1:
+        # Resolving conflicted sets requires the following types from the base
+        # state:
+        #   - the `auth_types_for_event(..)` of the conflicted events for
+        #     `_iterative_auth_checks`
+        #   - the power levels for `_mainline_sort`
+        #
+        # We can therefore safely restrict the base state to those keys, which
+        # keeps keys that cannot affect the outcome out of the cache key. The
+        # rest of the unconflicted state is layered back on below.
+        base_state_keys = {(EventTypes.PowerLevels, "")}
+        for event_id in full_conflicted_set:
+            base_state_keys.update(
+                event_auth.auth_types_for_event(room_version, event_map[event_id])
+            )
+
+        base_state = {
+            key: unconflicted_state[key]
+            for key in base_state_keys
+            if key in unconflicted_state
+        }
+
+    resolved_state: StateMap[str] | None = None
+    cache_key: bytes | None = None
+    if conflict_cache is not None:
+        cache_key = _conflict_cache_key(
+            room_id, room_version, full_conflicted_set, base_state
+        )
+        resolved_state = conflict_cache.get(cache_key)
+
+    if resolved_state is None:
+        resolved_state = await _resolve_conflicted_set_with_rust(
+            clock,
+            room_id,
+            room_version,
+            full_conflicted_set,
+            base_state,
+            event_map,
+            state_res_store,
+        )
+        if conflict_cache is not None and cache_key is not None:
+            conflict_cache[cache_key] = resolved_state
+    else:
+        logger.debug(
+            "Reusing the resolution of %d conflicted events",
+            len(full_conflicted_set),
+        )
+
+    logger.debug("done")
+
+    # Finally, we copy the unconflicted state over the resolved state.
+    #
+    # We use a `ChainMap` here to avoid a copy.
+    #
+    # `ChainMap` expects mutable mappings as it is a mutable mapping. However,
+    # the return type of this function is an immutable mapping so it is safe to
+    # cast the underlying mappings to mutable mappings to satify `ChainMap`'s
+    # signature.
+    return ChainMap(
+        cast(MutableMapping[StateKey, str], unconflicted_state),
+        cast(MutableMapping[StateKey, str], resolved_state),
+    )
+
+
+class ConflictCache(Protocol):
+    """What `resolve_events_with_store` needs from a `conflict_cache`.
+
+    Satisfied by a plain `dict` and by `ExpiringCache`.
+
+    Mainly used to allow unit tests to pass a `dict` rather than building a full
+    cache.
+    """
+
+    def get(self, key: bytes) -> StateMap[str] | None: ...
+
+    def __setitem__(self, key: bytes, value: StateMap[str]) -> None: ...
+
+
+def _conflict_cache_key(
+    room_id: str,
+    room_version: RoomVersion,
+    full_conflicted_set: AbstractSet[str],
+    base_state: StateMap[str],
+) -> bytes:
+    """Create a key for the conflict cache. Incorporates everything
+    that would affect the result of `_resolve_conflicted_set`.
+
+    We use a digest as the key as the inputs can be very large.
+    """
+
+    # We use JSON as the serialization format for ease, we could use a
+    # hand-rolled format but one has to be careful to ensure that you can't get
+    # collisions (given in some room versions the room ID is arbitrary bytes
+    # rather than a hash).
+    key_material = json.dumps(
+        {
+            "room_id": room_id,
+            "room_version": room_version.identifier,
+            "conflicted_set": sorted(full_conflicted_set),
+            "base_state": sorted(base_state.values()),
+        }
+    )
+    return hashlib.sha256(key_material.encode("utf-8")).digest()
+
+
+async def _resolve_conflicted_set(
+    clock: Clock,
+    room_id: str,
+    room_version: RoomVersion,
+    full_conflicted_set: set[str],
+    base_state: StateMap[str],
+    event_map: dict[str, EventBase],
+    state_res_store: StateResolutionStore,
+) -> MutableStateMap[str]:
+    """Apply the conflicted events to the base state.
+
+    This is the expensive part of `resolve_events_with_store`: the reverse
+    topological power sort, the two iterative auth check passes and the
+    mainline sort.
+
+    Args:
+        clock
+        room_id: the room we are working in
+        room_version: the room version
+        full_conflicted_set: the conflicted events plus the auth chain
+            difference. All must be present in `event_map`.
+        base_state: the state to apply the conflicted events to
+        event_map: updated in place with the events fetched along the way
+        state_res_store
+
+    Returns:
+        The base state with the conflicted events that passed auth applied
+        over it. The unconflicted state is not merged in.
+    """
 
     # Get and sort all the power events (kicks/bans/etc)
     power_events = (
@@ -263,17 +384,6 @@ async def resolve_events_with_store(
     )
 
     logger.debug("sorted %d power events", len(sorted_power_events))
-
-    # v2.1 starts iterative auth checks from the empty set and not the unconflicted state.
-    # It relies on IAC behaviour which populates the base state with the events from auth_events
-    # if the state tuple is missing from the base state. This ensures the base state is only
-    # populated from auth_events rather than whatever the unconflicted state is (which could be
-    # completely bogus).
-    base_state = (
-        {}
-        if room_version.state_res == StateResolutionVersions.V2_1
-        else unconflicted_state
-    )
 
     # Now sequentially auth each one
     resolved_state = await _iterative_auth_checks(
@@ -317,20 +427,73 @@ async def resolve_events_with_store(
 
     logger.debug("resolved")
 
-    # We make sure that unconflicted state always still applies.
-    resolved_state.update(unconflicted_state)
-
-    logger.debug(
-        "[gg-state-timing] state_v2_python_resolve "
-        "conflicted=%d event_map=%d elapsed_ms=%.1f",
-        len(full_conflicted_set),
-        len(event_map),
-        (time.monotonic() - _gg_python_res_start) * 1000,
-    )
-
-    logger.debug("done")
-
     return resolved_state
+
+
+async def _resolve_conflicted_set_with_rust(
+    clock: Clock,
+    room_id: str,
+    room_version: RoomVersion,
+    full_conflicted_set: set[str],
+    base_state: StateMap[str],
+    event_map: dict[str, EventBase],
+    state_res_store: StateResolutionStore,
+) -> StateMap[str]:
+    """Resolve the conflicted set on top of `base_state`, preferring Rust for v2.
+
+    Both the Rust and Python implementations below start from `base_state` and
+    return the resolved state derived from it: `base_state` with the conflicted
+    events that pass auth applied over it. The caller layers the full
+    unconflicted state over the result.
+
+    Keeping the Rust input restricted to `base_state` (rather than the full
+    unconflicted state) is what makes the result independent of the unrelated
+    unconflicted keys, so it can be cached under
+    `_conflict_cache_key(..., base_state)` without leaking one caller's
+    unconflicted state into another's result.
+
+    Falls back to the Python implementation if the Rust extension is
+    unavailable or raises. The fallback is logged at error level so a genuine
+    Rust/Python divergence is not silently masked.
+    """
+    if room_version.state_res == StateResolutionVersions.V2:
+        try:
+            import synapse.synapse_rust.state_res as rust_res
+
+            logger.debug("Resolving state v2 via Rust rezzy lattice fold")
+
+            _gg_rust_res_start = time.monotonic()
+            resolved_state_rust: StateMap[str] = rust_res.resolve_v2_via_lattice_fold(
+                dict(base_state),
+                list(full_conflicted_set),
+                event_map,
+            )
+            logger.debug(
+                "[gg-state-timing] state_v2_rust_resolve "
+                "conflicted=%d event_map=%d elapsed_ms=%.1f",
+                len(full_conflicted_set),
+                len(event_map),
+                (time.monotonic() - _gg_rust_res_start) * 1000,
+            )
+            return resolved_state_rust
+        except Exception as e:
+            # `logger.exception` logs at ERROR: until the Rust/Python parity is
+            # well established we want a divergence to be loudly visible, not
+            # hidden behind a routine-looking fallback.
+            logger.exception(
+                "Failed to run Rust state resolution via lattice fold, falling back to python",
+                exc_info=e,
+            )
+
+    return await _resolve_conflicted_set(
+        clock,
+        room_id,
+        room_version,
+        full_conflicted_set,
+        base_state,
+        event_map,
+        state_res_store,
+    )
 
 
 async def _get_power_level_for_sender(
@@ -843,7 +1006,7 @@ async def _iterative_auth_checks(
     Returns:
         Returns the final updated state
     """
-    resolved_state = dict(base_state)
+    resolved_state = MutableOverlayMapping(base_state)
 
     for idx, event_id in enumerate(event_ids, start=1):
         event = event_map[event_id]

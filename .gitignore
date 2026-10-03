@@ -36,6 +36,7 @@ __pycache__/
 /uploads
 /homeserver-config-overrides.d
 tmp/
+.tmp/
 
 # For direnv users
 /.envrc
@@ -73,6 +74,10 @@ book/
 *.crt
 *.csr
 *.cnf
+*.srl
+.sytest/
+*.tar
+*.tar.*
 
 # complement
 /complement-*
@@ -82,7 +87,7 @@ tests/complement/*
 *.jsonl
 
 # rust
-/target/
+target/
 /synapse/*.so
 *.bin
 *.pack

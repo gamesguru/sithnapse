@@ -38,7 +38,7 @@ jobs:
       linting_readme: ${{ !startsWith(github.ref, 'refs/pull/') || steps.filter.outputs.linting_readme }}
       golangci: ${{ !startsWith(github.ref, 'refs/pull/') || steps.filter.outputs.golangci }}
     steps:
-      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         # We only check on PRs
         if: startsWith(github.ref, 'refs/pull/')
@@ -109,10 +109,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # master
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: ${{ env.RUST_VERSION }}
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
           python-version: "3.12"
@@ -191,10 +191,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # master
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: ${{ env.RUST_VERSION }}
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
@@ -261,11 +261,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # master
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           components: clippy
           toolchain: ${{ env.RUST_VERSION }}
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - run: cargo clippy --locked -- -D warnings
 
@@ -280,11 +280,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # master
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: ${{ env.RUST_NIGHTLY_VERSION }}
           components: clippy
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - run: cargo clippy --locked --all-features -- -D warnings
 
@@ -298,10 +298,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # master
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: ${{ env.RUST_VERSION }}
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
@@ -345,13 +345,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # master
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           # We use nightly so that we can use some unstable options that we use in
           # `.rustfmt.toml`.
           toolchain: ${{ env.RUST_NIGHTLY_VERSION }}
           components: rustfmt
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - run: cargo fmt --check
 
@@ -463,10 +463,10 @@ jobs:
             postgres:${{ matrix.job.postgres-version }}
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # master
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: ${{ env.RUST_VERSION }}
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
@@ -501,8 +501,8 @@ jobs:
           SYNAPSE_POSTGRES_HOST: /var/run/postgresql
           SYNAPSE_POSTGRES_USER: postgres
           SYNAPSE_POSTGRES_PASSWORD: postgres
-          SYNAPSE_TEST_EMBEDDED_HAMT_ENGINE: ${{ matrix.job.database == 'mtxdb' && 'mtxdb' || '' }}
-          SYNAPSE_TEST_EMBEDDED_HAMT_PATH: ${{ matrix.job.database == 'mtxdb' && '/tmp/synapse-embedded-hamt' || '' }}
+          SYNAPSE_TEST_EMBEDDED_DB_ENGINE: ${{ matrix.job.database == 'mtxdb' && 'mtxdb' || '' }}
+          SYNAPSE_TEST_EMBEDDED_DB_PATH: ${{ matrix.job.database == 'mtxdb' && '/tmp/synapse-embedded-db' || '' }}
       - name: Dump PostgreSQL statistics
         if: ${{ always() && matrix.job.database == 'postgres' }}
         run: .ci/scripts/dump_postgres_stats.sh /tmp/postgres-stats.txt || true
@@ -532,7 +532,7 @@ jobs:
 
   trial-mtxdb:
     # Runs the trial suite with the embedded mtxdb engine for HAMT state
-    # storage (see embedded_hamt_engine in synapse/config/database.py), so
+    # storage (see embedded_db_engine in synapse/config/database.py), so
     # tests that exercise it -- e.g.
     # test_state_group_hamt_corruption_does_not_fallback_to_sql in
     # tests/storage/test_state.py -- actually run against mtxdb rather than
@@ -572,8 +572,8 @@ jobs:
           done
       - run: uv run trial --jobs="$(nproc)" tests
         env:
-          SYNAPSE_TEST_EMBEDDED_HAMT_ENGINE: mtxdb
-          SYNAPSE_TEST_EMBEDDED_HAMT_PATH: /tmp/synapse-embedded-hamt
+          SYNAPSE_TEST_EMBEDDED_DB_ENGINE: mtxdb
+          SYNAPSE_TEST_EMBEDDED_DB_PATH: /tmp/synapse-embedded-db
       - name: Dump logs
         # Logs are most useful when the command fails, always include them.
         if: ${{ always() }}
@@ -598,10 +598,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # master
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: ${{ env.RUST_VERSION }}
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       # There aren't wheels for some of the older deps, so we need to install
       # their build dependencies
@@ -706,14 +706,15 @@ jobs:
         # If this is a pull request to a release branch, use that branch as default branch for sytest, else use develop
         # This works because the release script always create a branch on the sytest repo with the same name as the release branch
         SYTEST_DEFAULT_BRANCH: ${{ startsWith(github.base_ref, 'release-') && github.base_ref || 'develop' }}
-        SYTEST_BRANCH: ${{ github.head_ref }}
+        # Use the pinned SyTest revision from sytest-wrapper.sh. A branch-specific
+        # SyTest checkout can contain fixtures which lag the room versions
+        # supported by this Synapse checkout.
         POSTGRES: ${{ matrix.job.postgres && 1}}
         MULTI_POSTGRES: ${{ (matrix.job.postgres == 'multi-postgres') || '' }}
         ASYNCIO_REACTOR: ${{ (matrix.job.reactor == 'asyncio') || '' }}
         WORKERS: ${{ matrix.job.workers && 1 }}
         BLACKLIST: ${{ matrix.job.workers && 'synapse-blacklist-with-workers' }}
-        SYNAPSE_EMBEDDED_HAMT_ENGINE: ${{ matrix.job.embedded_hamt && 'mtxdb' }}
-        SYNAPSE_EMBEDDED_HAMT_PATH: ${{ matrix.job.embedded_hamt && '/tmp/synapse-embedded-hamt' }}
+        SYNAPSE_EMBEDDED_DB_ENGINE: ${{ matrix.job.embedded_db && 'mtxdb' }}
         TOP: ${{ github.workspace }}
 
     strategy:
@@ -727,10 +728,10 @@ jobs:
         run: cat sytest-blacklist .ci/worker-blacklist > synapse-blacklist-with-workers
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # master
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: ${{ env.RUST_VERSION }}
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Install clang (for mtxdb-sys bindgen)
         run: |
@@ -919,10 +920,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # master
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: ${{ env.RUST_VERSION }}
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - run: cargo test --locked
 
@@ -940,10 +941,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # master
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: ${{ env.RUST_NIGHTLY_VERSION }}
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - run: cargo bench --locked --no-run
 

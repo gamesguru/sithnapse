@@ -19,22 +19,35 @@
 #
 #
 
+import json
 import logging
+from collections.abc import Iterable
+from unittest import mock
 
 from twisted.internet.testing import MemoryReactor
 
 from synapse.api.constants import EventTypes, Membership
+from synapse.api.errors import NotFoundError
 from synapse.api.room_versions import RoomVersions
 from synapse.events import EventBase
+from synapse.events.snapshot import EventContext
 from synapse.rest import admin
 from synapse.rest.client import login, room
 from synapse.server import HomeServer
+from synapse.storage.database import LoggingTransaction
+from synapse.storage.databases.main import (
+    embedded_common,
+    embedded_event_json,
+    events as events_module,
+    state as state_module,
+)
+from synapse.storage.databases.main.embedded_common import Pool, SyncTier
 from synapse.types import StateMap
 from synapse.util.clock import Clock
 
-from tests.test_utils.event_builders import make_test_pdu_event
+from tests.test_utils.event_builders import make_test_event, make_test_pdu_event
 from tests.unittest import HomeserverTestCase, skip_unless
-from tests.utils import EMBEDDED_HAMT_ENGINE
+from tests.utils import EMBEDDED_DB_ENGINE
 
 logger = logging.getLogger(__name__)
 
@@ -51,10 +64,10 @@ class EventsTestCase(HomeserverTestCase):
     ) -> None:
         self._store = self.hs.get_datastores().main
 
-    @skip_unless(bool(EMBEDDED_HAMT_ENGINE), "requires embedded HAMT engine")
+    @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
     def test_get_event_via_embedded_mtxdb_engine(self) -> None:
         """`_store_event_txn` mirrors event_json into mtxdb when
-        embedded_hamt_engine is configured; `_fetch_event_json_for_ids_txn`
+        embedded_db_engine is configured; `_fetch_event_json_for_ids_txn`
         reads it back on the `get_event` path. Deleting the SQL
         `event_json` row entirely and still fetching the event correctly
         proves the embedded-engine fast path is actually taken, not a
@@ -80,9 +93,9 @@ class EventsTestCase(HomeserverTestCase):
         persist_store = self.hs.get_datastores().persist_events
         assert persist_store is not None
         persist_store._embedded_event_json_enabled = True
-        persist_store._embedded_hamt_engine = "mtxdb"
+        persist_store._embedded_db_engine = "mtxdb"
         self._store._embedded_event_json_enabled = True
-        self._store._embedded_hamt_engine = "mtxdb"
+        self._store._embedded_db_engine = "mtxdb"
 
         user = self.register_user("embedded_event_json_user", "pass")
         token = self.login("embedded_event_json_user", "pass")
@@ -106,6 +119,505 @@ class EventsTestCase(HomeserverTestCase):
         event = self.get_success(self._store.get_event(event_id))
         self.assertEqual(event.event_id, event_id)
         self.assertEqual(event.content.get("body"), "hello embedded mtxdb")
+
+    def _check_de_outlier_state_barrier(self, *, publish_at_commit: bool) -> None:
+        """De-outliering an already-persisted outlier must schedule an immediate
+        STATE barrier: a publish when `sync_mode` publishes at commit, else a
+        synchronous `sync_now`.
+
+        The ex-outlier pass writes the event's embedded event->state-group
+        mapping on this writer; the HAMT root for the referenced state group
+        normally already exists. Another worker -- e.g. the next event in the
+        same /send transaction, whose prev is this event -- reads the mapping
+        back as soon as it arrives, well inside the coalescer's 250-500ms flush
+        window. Because `_update_outliers_txn` removes the de-outliered event
+        from the normal persist list, the publishing barrier used to miss it and
+        only `mark_dirty` the STATE pool; in the mtxdb-exclusive engine there is
+        no SQL fallback, so that is a hard miss on the reader. Regression guard
+        for that gap.
+        """
+        persistence = self.hs.get_storage_controllers().persistence
+        assert persistence is not None
+
+        # `SYNAPSE_TEST_MTXDB` makes the test harness configure and open the
+        # embedded engine on the homeserver's stores (see tests.utils.
+        # default_config), so the engine path here is the real one, not a
+        # private client opened behind the store's back.
+        persist_store = self.hs.get_datastores().persist_events
+        assert persist_store is not None
+        self.assertTrue(persist_store._embedded_event_json_enabled)
+        self.assertEqual(persist_store._embedded_db_engine, "mtxdb")
+
+        user = self.register_user("de_outlier_user", "pass")
+        token = self.login("de_outlier_user", "pass")
+        room_id = self.helper.create_room_as(user, tok=token)
+        room_version = self.get_success(self._store.get_room_version(room_id))
+
+        anchor = self.helper.send(room_id, "anchor", tok=token)["event_id"]
+        state_group = self.get_success(
+            self.hs.get_storage_controllers().state.get_state_group_for_events([anchor])
+        )[anchor]
+        self.assertIsNotNone(state_group)
+
+        event = make_test_event(
+            room_version=room_version,
+            type="m.room.message",
+            room_id=room_id,
+            sender=user,
+            content={"body": "de-outlier me"},
+            prev_events=[anchor],
+            depth=1,
+            origin_server_ts=1,
+        )
+        event.internal_metadata.outlier = True
+
+        # Persist it as an outlier first: the shape a partial-state resync pull
+        # leaves behind. This only coalesces STATE, so it must not sync that
+        # pool (its event JSON may still get a barrier of its own).
+        with (
+            mock.patch.object(
+                events_module,
+                "publishes_at_commit",
+                return_value=publish_at_commit,
+            ),
+            mock.patch.object(events_module, "maybe_sync") as outlier_barrier,
+        ):
+            self.get_success(
+                persistence.persist_event(
+                    event,
+                    EventContext.for_outlier(self.hs.get_storage_controllers()),
+                )
+            )
+        for call in outlier_barrier.call_args_list:
+            self.assertNotIn(Pool.STATE, call.kwargs.get("pools", []))
+
+        # Now the live copy arrives and de-outliers it. Its embedded mapping
+        # must be visible before this returns.
+        event.internal_metadata.outlier = False
+        live_context = EventContext.with_state(
+            storage=self.hs.get_storage_controllers(),
+            state_group=state_group,
+            state_group_before_event=state_group,
+            state_delta_due_to_event=None,
+            partial_state=False,
+            state_group_deltas={},
+        )
+
+        with (
+            mock.patch.object(
+                events_module,
+                "publishes_at_commit",
+                return_value=publish_at_commit,
+            ),
+            mock.patch.object(events_module, "maybe_sync") as de_outlier_barrier,
+        ):
+            self.get_success(persistence.persist_event(event, live_context))
+
+        if publish_at_commit:
+            # The mapping is visible as soon as it is journaled; durability is
+            # left to the coalescer, so there is no barrier.
+            de_outlier_barrier.assert_not_called()
+        else:
+            # A de-outlier writes a state mapping and republishes event JSON,
+            # so both pools are synced in the transaction before it commits.
+            de_outlier_barrier.assert_called_once_with(
+                SyncTier.DURABLE, pools=[Pool.STATE, Pool.EVENT_DAG]
+            )
+
+    @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
+    def test_de_outlier_syncs_state_barrier_by_default(self) -> None:
+        self._check_de_outlier_state_barrier(publish_at_commit=False)
+
+    @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
+    def test_de_outlier_leaves_durability_to_the_coalescer_at_commit(
+        self,
+    ) -> None:
+        self._check_de_outlier_state_barrier(publish_at_commit=True)
+
+    def _persist_message_recording_event_json_sync(
+        self, *, publish_at_commit: bool, action: str = "message"
+    ) -> tuple[list[tuple[str, tuple[object, ...]]], list[object]]:
+        """Persist one message, recording what the EVENT_DAG write path does.
+
+        Returns `(calls, put_kwargs)`: an ordered log of barriers and of
+        `call_after` registrations, and the keyword arguments each
+        `put_event_json_batch` call received.
+        """
+        user = self.register_user("json_sync_user", "pass")
+        token = self.login("json_sync_user", "pass")
+        room_id = self.helper.create_room_as(user, tok=token)
+        joiner = self.register_user("json_sync_joiner", "pass")
+        joiner_token = self.login("json_sync_joiner", "pass")
+
+        calls: list[tuple[str, tuple[object, ...]]] = []
+        put_kwargs: list[object] = []
+        real_put = events_module.put_event_json_batch
+        real_call_after = LoggingTransaction.call_after
+
+        def fake_sync(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
+            calls.append(("sync", tuple(pools or ())))
+
+        def recording_put(*args: object, **kwargs: object) -> None:
+            put_kwargs.append(kwargs.get("sync"))
+            real_put(*args, **kwargs)  # type: ignore[arg-type]
+
+        def recording_call_after(
+            txn: LoggingTransaction, callback: object, *args: object, **kwargs: object
+        ) -> None:
+            if callback is events_module.mark_dirty:
+                calls.append(("call_after_mark_dirty", args))
+            elif callback is embedded_common.sync_now:
+                calls.append(("call_after_sync_now", args))
+            real_call_after(txn, callback, *args, **kwargs)  # type: ignore[arg-type]
+
+        with (
+            mock.patch.object(
+                events_module, "publishes_at_commit", return_value=publish_at_commit
+            ),
+            mock.patch.object(
+                events_module, "maybe_sync", mock.Mock(side_effect=fake_sync)
+            ),
+            mock.patch.object(events_module, "put_event_json_batch", recording_put),
+            mock.patch.object(
+                LoggingTransaction,
+                "call_after",
+                autospec=True,
+                side_effect=recording_call_after,
+            ),
+        ):
+            if action == "join":
+                # A membership event is an auth-chain event: it takes the
+                # auth barrier, which other workers read back immediately.
+                self.helper.join(room_id, joiner, tok=joiner_token)
+            else:
+                self.helper.send(room_id, "event json sync mode", tok=token)
+        return calls, put_kwargs
+
+    @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
+    def test_default_mode_issues_one_in_txn_barrier_per_persist(self) -> None:
+        """`always` pays one fsync per persist: a single barrier, in the transaction.
+
+        The pools share one journal, so a barrier covers every pool's pending
+        records. Issuing it once at the end of the transaction (after the event
+        JSON, the state mapping and any auth-chain links are written) replaces
+        the old pair -- an event-JSON sync mid-transaction plus a post-commit
+        `sync_now` for whatever was written after it -- and, being in the
+        transaction, it runs on the database thread instead of the reactor.
+        """
+        calls, put_kwargs = self._persist_message_recording_event_json_sync(
+            publish_at_commit=False
+        )
+
+        # No per-put sync: the end-of-transaction barrier covers the JSON.
+        self.assertTrue(put_kwargs)
+        self.assertTrue(all(sync is False for sync in put_kwargs), put_kwargs)
+
+        barriers = [call for call in calls if call[0] == "sync"]
+        self.assertEqual(
+            barriers,
+            [("sync", (Pool.STATE, Pool.EVENT_DAG))],
+            "expected exactly one barrier covering the state and event-DAG writes",
+        )
+        # Nothing is left for the reactor thread.
+        self.assertNotIn(("call_after_sync_now", ([Pool.STATE],)), calls)
+        self.assertFalse([call for call in calls if call[0] == "call_after_sync_now"])
+        # In the transaction: the barrier is issued before the post-commit
+        # durability marks that the same block registers. (An earlier
+        # `mark_dirty(EVENT_DAG)` is the edge writes' own coalescing.)
+        self.assertLess(
+            calls.index(barriers[0]),
+            calls.index(("call_after_mark_dirty", (Pool.AUTH_CHAIN,))),
+        )
+
+    @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
+    def test_auth_event_leaves_durability_to_the_coalescer_at_commit(self) -> None:
+        """`interval`/`off` do not `sync_now` for an auth event's writes.
+
+        Auth-chain events (create, membership, power levels) are read back by
+        another worker straight away, which needs no barrier: mtxdb publishes
+        each write as it is journaled. Under `off`, `sync_now` is a no-op and
+        under `interval` it would fsync on the reactor thread, so durability
+        goes through the coalescer instead.
+        """
+        calls, _ = self._persist_message_recording_event_json_sync(
+            publish_at_commit=True, action="join"
+        )
+
+        for pool in (Pool.STATE, Pool.AUTH_CHAIN, Pool.EVENT_DAG):
+            self.assertIn(
+                ("call_after_mark_dirty", (pool,)),
+                calls,
+                f"{pool} was never marked for the coalescer",
+            )
+        self.assertFalse(
+            [call for call in calls if call[0] == "call_after_sync_now"],
+            "auth barrier is still a reactor-thread sync_now, a no-op under `off`",
+        )
+        self.assertFalse([call for call in calls if call[0] == "sync"])
+
+    @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
+    def test_auth_event_takes_one_in_txn_barrier_by_default(self) -> None:
+        """`always` covers an auth event with one barrier over all three pools."""
+        calls, _ = self._persist_message_recording_event_json_sync(
+            publish_at_commit=False, action="join"
+        )
+
+        self.assertEqual(
+            [call for call in calls if call[0] == "sync"],
+            [("sync", (Pool.STATE, Pool.AUTH_CHAIN, Pool.EVENT_DAG))],
+        )
+        self.assertFalse([call for call in calls if call[0] == "call_after_sync_now"])
+
+    def _rewrite_partial_state_mapping(
+        self, *, publish_at_commit: bool
+    ) -> tuple[mock.Mock, mock.Mock]:
+        """Run the partial-state rewrite of an event's state group.
+
+        Returns the `(sync_now, mark_dirty)` mocks it used.
+        """
+        user = self.register_user("partial_state_user", "pass")
+        token = self.login("partial_state_user", "pass")
+        room_id = self.helper.create_room_as(user, tok=token)
+        event_id = self.helper.send(room_id, "rewrite me", tok=token)["event_id"]
+        event = self.get_success(self._store.get_event(event_id))
+        state_group = self.get_success(
+            self.hs.get_storage_controllers().state.get_state_group_for_events(
+                [event_id]
+            )
+        )[event_id]
+        context = EventContext.with_state(
+            storage=self.hs.get_storage_controllers(),
+            state_group=state_group,
+            state_group_before_event=state_group,
+            state_delta_due_to_event=None,
+            partial_state=False,
+            state_group_deltas={},
+        )
+        # The rewrite un-partial-states the event, so it has to be recorded as
+        # one first (the function deletes its `partial_state_events` row, which
+        # references a partial-state room).
+        self.get_success(
+            self._store.store_partial_state_room(
+                room_id=room_id,
+                servers={"remote.example.org"},
+                device_lists_stream_id=0,
+                joined_via="remote.example.org",
+            )
+        )
+        self.get_success(
+            self._store.db_pool.simple_insert(
+                table="partial_state_events",
+                values={"room_id": room_id, "event_id": event_id},
+                desc="test_mark_event_partial_state",
+            )
+        )
+
+        with (
+            mock.patch.object(
+                state_module, "publishes_at_commit", return_value=publish_at_commit
+            ),
+            mock.patch.object(state_module, "sync_now") as sync,
+            mock.patch.object(state_module, "mark_dirty") as dirty,
+        ):
+            self.get_success(
+                self._store.update_state_for_partial_state_event(event, context)
+            )
+        return sync, dirty
+
+    @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
+    def test_partial_state_rewrite_defers_durability_when_publishing_at_commit(
+        self,
+    ) -> None:
+        """`interval`/`off`: leave fsync of the rewritten mapping to the
+        coalescer. A `sync_now` here fsyncs on the reactor thread under
+        `interval` and does nothing at all under `off`, so workers never saw the
+        rewrite (the resync tests then fail to find the event)."""
+        sync, dirty = self._rewrite_partial_state_mapping(publish_at_commit=True)
+
+        dirty.assert_called_once_with(Pool.STATE)
+        sync.assert_not_called()
+
+    @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
+    def test_partial_state_rewrite_syncs_by_default(self) -> None:
+        """`always` keeps the strict barrier."""
+        sync, dirty = self._rewrite_partial_state_mapping(publish_at_commit=False)
+
+        sync.assert_called_once_with([Pool.STATE])
+        dirty.assert_not_called()
+
+    @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
+    def test_event_json_is_written_unsynced_and_marked_dirty_at_commit(
+        self,
+    ) -> None:
+        """`interval`/`off` write EVENT_DAG unsynced and leave durability to the
+        coalescer.
+
+        The JSON is journaled, and so visible, inside the transaction, before
+        the SQL row can be seen: a worker that finds the row also finds its JSON
+        (there is no SQL copy to fall back to). Nothing is synced per put, and
+        the coalescer is told the pool is dirty after commit.
+        """
+        calls, put_kwargs = self._persist_message_recording_event_json_sync(
+            publish_at_commit=True
+        )
+
+        self.assertTrue(put_kwargs)
+        self.assertTrue(all(sync is False for sync in put_kwargs), put_kwargs)
+        self.assertIn(("call_after_mark_dirty", (Pool.EVENT_DAG,)), calls)
+        self.assertFalse(
+            [call for call in calls if call[0] in ("sync", "call_after_sync_now")]
+        )
+
+    @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
+    def test_rolled_back_event_json_leaves_unreachable_orphan(self) -> None:
+        """A rolled-back persist can leave event JSON that no reader serves.
+
+        Exclusive event JSON is journaled, and so visible, inside the
+        transaction (to avoid a committed-row/missing-JSON window), so the
+        failure mode of a rollback is a visible-but-unreferenced JSON record
+        rather than an invisible write. That orphan is acceptable because it is unreachable: every
+        event-JSON read is driven by ids discovered from committed SQL
+        ``events`` rows, so a record whose row rolled back is never looked up.
+        This pins both halves -- the record really is in mtxdb, and the read
+        path that learns an id (``get_event``) cannot find it.
+        """
+        self.assertTrue(self._store._embedded_event_json_enabled)
+        namespace = self._store._embedded_db_namespace
+        engine = self._store._embedded_db_engine
+        user = self.register_user("orphan_json_user", "pass")
+        token = self.login("orphan_json_user", "pass")
+        room_id = self.helper.create_room_as(user, tok=token)
+        event_id = f"$orphan_json_{self.clock.time()}:test"
+        body = json.dumps({"body": "orphan"})
+
+        def bad_txn(txn: LoggingTransaction) -> None:
+            # Attempt the SQL row too: the `get_event` miss afterwards then
+            # proves the transaction rolled the row back, rather than the row
+            # never having been written.
+            self._store.db_pool.simple_insert_txn(
+                txn,
+                table="events",
+                values={
+                    "instance_name": "master",
+                    "stream_ordering": 999999,
+                    "topological_ordering": 1,
+                    "depth": 1,
+                    "event_id": event_id,
+                    "room_id": room_id,
+                    "type": "m.room.message",
+                    "processed": True,
+                    "outlier": False,
+                    "origin_server_ts": int(self.clock.time_msec()),
+                    "received_ts": int(self.clock.time_msec()),
+                    "sender": user,
+                    "contains_url": False,
+                },
+            )
+            embedded_event_json.put_event_json_batch(
+                engine, namespace, [(event_id, room_id, "{}", body, 1)], sync=False
+            )
+            raise RuntimeError("simulated persist rollback")
+
+        failure = self.get_failure(
+            self._store.db_pool.runInteraction("test_orphan_json", bad_txn),
+            RuntimeError,
+        )
+        self.assertEqual(str(failure.value), "simulated persist rollback")
+
+        # The JSON record survives the rollback in mtxdb ...
+        found = embedded_event_json.get_event_json_batch(engine, namespace, [event_id])
+        self.assertEqual(found[event_id][1], body)
+
+        # ... but is unreachable: with no committed row there is no id for a
+        # reader to discover, and `get_event` is how a reader learns one. It
+        # reports a missing event by raising, not by returning None.
+        self.get_failure(self._store.get_event(event_id), NotFoundError)
+
+    def _stage_json_in_persist(self, event_id: str, *, fail: bool) -> None:
+        """Run `_persist_events_txn` with a body that stages one event's JSON in
+        the transaction it is given, then raises if `fail`. Waits for it, and
+        expects the `RuntimeError` when `fail`."""
+        persist_store = self.hs.get_datastores().persist_events
+        assert persist_store is not None
+        namespace = persist_store._embedded_db_namespace
+        room_id = "!staged:test"
+
+        def body(txn: LoggingTransaction, **kwargs: object) -> None:
+            embedded_event_json.put_event_json_batch(
+                "mtxdb",
+                namespace,
+                [(event_id, room_id, "{}", json.dumps({"body": event_id}), 1)],
+                transaction=kwargs["mtxdb_txn"],  # type: ignore[arg-type]
+            )
+            if fail:
+                raise RuntimeError("simulated persist failure")
+
+        def run(txn: LoggingTransaction) -> None:
+            persist_store._persist_events_txn(
+                txn,
+                room_id=room_id,
+                events_and_contexts=[],
+                inhibit_local_membership_updates=False,
+                state_delta_for_room=None,
+                new_forward_extremities=None,
+                new_event_links={},
+                sliding_sync_table_changes=None,
+            )
+
+        with (
+            mock.patch.object(
+                embedded_common, "publishes_at_commit", return_value=True
+            ),
+            mock.patch.object(
+                persist_store, "_persist_events_txn_body", side_effect=body
+            ),
+        ):
+            deferred = self._store.db_pool.runInteraction("staged_json", run)
+            if fail:
+                self.get_failure(deferred, RuntimeError)
+            else:
+                self.get_success(deferred)
+
+    def _json_present(self, event_id: str) -> bool:
+        persist_store = self.hs.get_datastores().persist_events
+        assert persist_store is not None
+        found = embedded_event_json.get_event_json_batch(
+            "mtxdb", persist_store._embedded_db_namespace, [event_id]
+        )
+        return event_id in found
+
+    @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
+    def test_failed_persist_leaves_no_event_json(self) -> None:
+        """A persist that raises after staging its event JSON leaves nothing.
+
+        The JSON is staged in an mtxdb transaction that `_persist_events_txn`
+        aborts on any error, so unlike a direct write there is no orphan record
+        for the failed attempt.
+        """
+        with mock.patch.object(
+            embedded_common, "publishes_at_commit", return_value=True
+        ):
+            if embedded_common.begin_embedded_transaction() is None:
+                self.skipTest("needs the shared WAL")
+        event_id = f"$never_committed_{self.clock.time()}:test"
+        self._stage_json_in_persist(event_id, fail=True)
+        self.assertFalse(self._json_present(event_id))
+
+    @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
+    def test_each_persist_attempt_gets_its_own_transaction(self) -> None:
+        """A failed attempt does not leak its writes into the next one, and a
+        successful attempt commits its JSON before the SQL transaction ends."""
+        with mock.patch.object(
+            embedded_common, "publishes_at_commit", return_value=True
+        ):
+            if embedded_common.begin_embedded_transaction() is None:
+                self.skipTest("needs the shared WAL")
+        failed = f"$attempt_one_{self.clock.time()}:test"
+        committed = f"$attempt_two_{self.clock.time()}:test"
+        self._stage_json_in_persist(failed, fail=True)
+        self._stage_json_in_persist(committed, fail=False)
+        self.assertFalse(self._json_present(failed))
+        self.assertTrue(self._json_present(committed))
 
     def test_get_senders_for_event_ids(self) -> None:
         """Tests the `get_senders_for_event_ids` storage function."""

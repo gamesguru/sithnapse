@@ -370,15 +370,15 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
     def _get_unread_counts_by_room_for_user_txn(
         self, txn: LoggingTransaction, user_id: str
     ) -> dict[str, int]:
-        receipt_types_clause, args = make_in_list_sql_clause(
+        receipt_types_clause, receipts_args = make_in_list_sql_clause(
             self.database_engine,
             "receipt_type",
             (ReceiptTypes.READ, ReceiptTypes.READ_PRIVATE),
         )
-        args.extend([user_id, user_id])
+        args = [*receipts_args, user_id, user_id]
 
         receipts_cte = f"""
-            WITH all_receipts AS (
+            all_receipts AS (
                 SELECT room_id, thread_id, MAX(event_stream_ordering) AS max_receipt_stream_ordering
                 FROM receipts_linearized
                 WHERE
@@ -403,9 +403,26 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
             ) AS unthreaded_receipts USING (room_id)
         """
 
+        pending_receipts_cte = f"""
+            pending_receipts AS (
+                SELECT room_id, thread_id
+                FROM receipts_linearized
+                WHERE user_id = ?
+                    AND stream_id > (
+                        SELECT stream_id FROM event_push_summary_last_receipt_stream_id
+                    )
+                    AND {receipt_types_clause}
+            ),
+        """
+
         # First get summary counts by room / thread for the user. We use the max receipt
         # stream ordering of both threaded & unthreaded receipts to compare against the
         # summary table.
+        #
+        # As well as the comparison below, a summary is only usable once every receipt
+        # which affects it has been folded into it by
+        # `_handle_new_receipts_for_notifs_txn`: `event_push_summary_last_receipt_stream_id`
+        # is the (inclusive) receipt position that has been processed so far.
         #
         # PostgreSQL and SQLite differ in comparing scalar numerics.
         if isinstance(self.database_engine, PostgresEngine):
@@ -422,6 +439,7 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
             )"""
 
         sql = f"""
+            WITH {pending_receipts_cte}
             {receipts_cte}
             SELECT eps.room_id, eps.thread_id, notif_count
             FROM event_push_summary AS eps
@@ -432,20 +450,29 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
                     (last_receipt_stream_ordering IS NULL AND stream_ordering > {max_clause})
                     OR last_receipt_stream_ordering = {max_clause}
                 )
+                AND NOT EXISTS (
+                    SELECT 1 FROM pending_receipts AS pending
+                    WHERE pending.room_id = eps.room_id
+                        AND (
+                            pending.thread_id IS NULL
+                            OR pending.thread_id = eps.thread_id
+                        )
+                )
         """
-        txn.execute(sql, args)
+        txn.execute(sql, [user_id, *receipts_args] + args)
 
-        seen_thread_ids = set()
+        # The (room ID, thread ID) pairs we found an up-to-date summary for.
+        seen_room_thread_ids = set()
         room_to_count: dict[str, int] = defaultdict(int)
 
         for room_id, thread_id, notif_count in txn:
             room_to_count[room_id] += notif_count
-            seen_thread_ids.add(thread_id)
+            seen_room_thread_ids.add((room_id, thread_id))
 
         # Now get any event push actions that haven't been rotated using the same OR
         # join and filter by receipt and event push summary rotated up to stream ordering.
         sql = f"""
-            {receipts_cte}
+            WITH {receipts_cte}
             SELECT epa.room_id, epa.thread_id, COUNT(CASE WHEN epa.notif = 1 THEN 1 END) AS notif_count
             FROM event_push_actions AS epa
             {receipts_joins}
@@ -460,35 +487,31 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
 
         for room_id, thread_id, notif_count in txn:
             # Note: only count push actions we have valid summaries for with up to date receipt.
-            if thread_id not in seen_thread_ids:
+            if (room_id, thread_id) not in seen_room_thread_ids:
                 continue
             room_to_count[room_id] += notif_count
 
-        thread_id_clause, thread_ids_args = make_in_list_sql_clause(
-            self.database_engine, "epa.thread_id", seen_thread_ids
-        )
-
-        # Finally re-check event_push_actions for any rooms not in the summary, ignoring
-        # the rotated up-to position. This handles the case where a read receipt has arrived
-        # but not been rotated meaning the summary table is out of date, so we go back to
-        # the push actions table.
+        # Finally re-check event_push_actions for any room/threads not in the summary,
+        # ignoring the rotated up-to position. This handles the case where a read receipt
+        # has arrived but not been rotated meaning the summary table is out of date, so we
+        # go back to the push actions table.
         sql = f"""
-            {receipts_cte}
-            SELECT epa.room_id, COUNT(CASE WHEN epa.notif = 1 THEN 1 END) AS notif_count
+            WITH {receipts_cte}
+            SELECT epa.room_id, epa.thread_id, COUNT(CASE WHEN epa.notif = 1 THEN 1 END) AS notif_count
             FROM event_push_actions AS epa
             {receipts_joins}
             WHERE user_id = ?
-            AND NOT {thread_id_clause}
             AND epa.notif = 1
             AND (threaded_receipt_stream_ordering IS NULL OR stream_ordering > threaded_receipt_stream_ordering)
             AND (unthreaded_receipt_stream_ordering IS NULL OR stream_ordering > unthreaded_receipt_stream_ordering)
-            GROUP BY epa.room_id
+            GROUP BY epa.room_id, epa.thread_id
         """
 
-        args.extend(thread_ids_args)
         txn.execute(sql, args)
 
-        for room_id, notif_count in txn:
+        for room_id, thread_id, notif_count in txn:
+            if (room_id, thread_id) in seen_room_thread_ids:
+                continue
             room_to_count[room_id] += notif_count
 
         return room_to_count
@@ -611,8 +634,30 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
         # (as the row was written by an older version of Synapse that
         # updated `event_push_summary` synchronously when persisting a new read
         # receipt).
+        #
+        # Neither of the checks above can be evaluated against a receipt that
+        # `_handle_new_receipts_for_notifs_txn` hasn't seen yet: the receipts
+        # CTE deliberately drops every receipt at or before the unthreaded
+        # receipt (so a brand new unthreaded receipt hides *all* receipts,
+        # including itself), which makes a summary written by rotation look
+        # current when it isn't.  Receipts are only folded into
+        # `event_push_summary` once `event_push_summary_last_receipt_stream_id`
+        # has advanced past them, so use that position as the freshness check:
+        # a summary row is stale if any receipt which affects it (an
+        # unthreaded receipt affects every thread in the room) is still
+        # pending, and we fall back to counting `event_push_actions` instead.
         txn.execute(
             f"""
+                WITH pending_receipts AS (
+                    SELECT room_id, thread_id
+                    FROM receipts_linearized
+                    WHERE user_id = ?
+                        AND room_id = ?
+                        AND stream_id > (
+                            SELECT stream_id FROM event_push_summary_last_receipt_stream_id
+                        )
+                        AND {receipt_types_clause}
+                )
                 SELECT notif_count, COALESCE(unread_count, 0), thread_id
                 FROM event_push_summary
                 LEFT JOIN (
@@ -629,9 +674,18 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
                 AND (
                     (last_receipt_stream_ordering IS NULL AND threaded_receipt_stream_ordering IS NULL AND stream_ordering > ?)
                     OR last_receipt_stream_ordering = COALESCE(threaded_receipt_stream_ordering, ?)
-                ) AND (notif_count != 0 OR COALESCE(unread_count, 0) != 0)
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM pending_receipts AS pending
+                    WHERE pending.thread_id IS NULL
+                        OR pending.thread_id = event_push_summary.thread_id
+                )
+                AND (notif_count != 0 OR COALESCE(unread_count, 0) != 0)
             """,
             (
+                user_id,
+                room_id,
+                *receipts_args,
                 user_id,
                 room_id,
                 unthreaded_receipt_stream_ordering,

@@ -1084,12 +1084,12 @@ class BundledAggregationsTestCase(BaseRelationsTestCase):
         """Pick the expected DB transaction count for the active state
         backend.
 
-        The embedded HAMT engine (mtxdb) serves state HAMT nodes/roots from
+        The embedded DB engine (mtxdb) serves state HAMT nodes/roots from
         an in-process store, so a SQL-only configuration issues one extra DB
         transaction per state lookup (the SQL `state_hamt_roots`/`nodes`
         fallback) relative to mtxdb.
         """
-        return mtxdb if self.hs.config.database.embedded_hamt_engine else sql
+        return mtxdb if self.hs.config.database.embedded_db_engine else sql
 
     def _test_bundled_aggregations(
         self,

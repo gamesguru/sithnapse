@@ -15,7 +15,7 @@ enable_registration_without_verification: true
 bcrypt_rounds: 4
 url_preview_enabled: true
 url_preview_ip_range_blacklist: []
-# MSC4429 Profile updates down legacy /sync
+# MSC4429 and MSC4262 Profile updates down sync
 include_profile_updates_in_sync: true
 
 ## Registration ##
@@ -108,6 +108,10 @@ rc_user_directory:
   per_second: 9999
   burst_count: 9999
 
+rc_profile:
+  per_second: 9999
+  burst_count: 9999
+
 federation_rr_transactions_per_room_per_second: 9999
 
 allow_device_name_lookup_over_federation: true
@@ -115,6 +119,8 @@ allow_device_name_lookup_over_federation: true
 ## Experimental Features ##
 
 experimental_features:
+  # MSC3389: relation-preserving redactions and room version.
+  msc3389_enabled: true
   # Enable support for polls
   msc3381_polls_enabled: true
   # Enable deleting device-specific notification settings stored in account data

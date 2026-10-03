@@ -92,11 +92,11 @@ def resolve_namespace(store: object) -> str | None:
     `embedded_event_auth_chain_links.resolve_namespace` -- kept as a
     separate function (not reused directly) because this feature has its
     own opt-in gate in principle, even though today it shares the same
-    `embedded_hamt_engine`/`embedded_hamt_namespace` config surface.
+    `embedded_db_engine`/`embedded_db_namespace` config surface.
     """
     return (
-        store._embedded_hamt_namespace  # type: ignore[attr-defined]
-        if getattr(store, "_embedded_hamt_engine", None)
+        store._embedded_db_namespace  # type: ignore[attr-defined]
+        if getattr(store, "_embedded_db_engine", None)
         else None
     )
 
@@ -268,7 +268,7 @@ class ClosureCache:
 
     Not thread-safe beyond the GIL's own serialization of individual
     dict/OrderedDict operations -- matches the rest of the embedded-engine
-    code, which assumes single-process (`embedded_hamt_engine` rejects
+    code, which assumes single-process (`embedded_db_engine` rejects
     multi-worker deployments). A race between two callers computing the
     same closure just duplicates work (both compute the same
     content-deterministic bitmap); the last one to insert into the LRU

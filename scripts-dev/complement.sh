@@ -333,25 +333,25 @@ main() {
     return 0
   fi
 
-  # Default set of Complement tests to run from the Complement repo
-  #
-  # We pick and choose the specific MSC's that Synapse supports.
+  # Default set of Complement tests to run from the Complement repo.
+  # Include every MSC package present in the checkout so new MSCs do not need
+  # to be added here manually. The paths are kept relative to the Complement
+  # module because they are passed directly to `go test`.
   default_complement_test_packages=(
     ./tests/csapi
     ./tests
-    ./tests/msc3874
-    ./tests/msc3890
-    ./tests/msc3391
-    ./tests/msc3757
-    ./tests/msc3930
-    ./tests/msc3902
-    ./tests/msc3967
-    ./tests/msc4140
-    ./tests/msc4155
-    ./tests/msc4306
-    ./tests/msc4222
-    ./tests/msc4429
-    ./tests/msc4499
+  )
+  while IFS= read -r test_package; do
+    # These MSCs are not implemented by this Synapse tree yet. Keep them out
+    # of the default all-MSC run until their implementations are ported.
+    if [[ "${test_package##*/}" == "msc2836" || "${test_package##*/}" == "msc4500" ]]; then
+      echo "Skipping unsupported Complement test package: $test_package" >&2
+      continue
+    fi
+    default_complement_test_packages+=("$test_package")
+  done < <(
+    find "$COMPLEMENT_DIR/tests" -mindepth 1 -maxdepth 1 -type d -name 'msc*' \
+      -printf './tests/%f\n' | sort -V
   )
 
   available_complement_test_packages=()
@@ -468,26 +468,141 @@ main() {
   export PASS_SYNAPSE_LOG_TESTING=1
 
   # Only TEST-scoped controls may enter Complement containers. In particular,
-  # never inherit a developer's production embedded-HAMT path: a path without
+  # never inherit a developer's production embedded-db path: a path without
   # its engine is an invalid Synapse config, and a path with its engine could
   # mutate a real local store.
   SYNAPSE_MTXDB="${SYNAPSE_TEST_MTXDB:-}"
-  SYNAPSE_EMBEDDED_HAMT_ENGINE="${SYNAPSE_TEST_EMBEDDED_HAMT_ENGINE:-}"
-  SYNAPSE_EMBEDDED_HAMT_PATH="${SYNAPSE_TEST_EMBEDDED_HAMT_PATH:-}"
+  SYNAPSE_EMBEDDED_DB_ENGINE="${SYNAPSE_TEST_EMBEDDED_DB_ENGINE:-}"
+  SYNAPSE_EMBEDDED_DB_PATH="${SYNAPSE_TEST_EMBEDDED_DB_PATH:-}"
 
-  if [[ -n "${SYNAPSE_MTXDB:-}" && -z "$SYNAPSE_EMBEDDED_HAMT_ENGINE" ]]; then
-    SYNAPSE_EMBEDDED_HAMT_ENGINE="mtxdb"
+  if [[ -n "${SYNAPSE_MTXDB:-}" && -z "$SYNAPSE_EMBEDDED_DB_ENGINE" ]]; then
+    SYNAPSE_EMBEDDED_DB_ENGINE="mtxdb"
   fi
 
-  if [[ -n "$SYNAPSE_EMBEDDED_HAMT_ENGINE" ]]; then
-    export PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE="$SYNAPSE_EMBEDDED_HAMT_ENGINE"
-    # SYNAPSE_EMBEDDED_HAMT_PATH is read inside the Complement container, not
+  if [[ -n "$SYNAPSE_EMBEDDED_DB_ENGINE" ]]; then
+    export PASS_SYNAPSE_EMBEDDED_DB_ENGINE="$SYNAPSE_EMBEDDED_DB_ENGINE"
+    # SYNAPSE_EMBEDDED_DB_PATH is read inside the Complement container, not
     # on the host -- a caller who just wants to turn mtxdb on shouldn't have
     # to know or care about that. Default it to a path that's always
     # writable there (the image's WORKDIR) rather than making them supply an
     # in-container path themselves.
-    SYNAPSE_EMBEDDED_HAMT_PATH="${SYNAPSE_EMBEDDED_HAMT_PATH:-/data/embedded_hamt}"
-    export PASS_SYNAPSE_EMBEDDED_HAMT_PATH="$SYNAPSE_EMBEDDED_HAMT_PATH"
+    SYNAPSE_EMBEDDED_DB_PATH="${SYNAPSE_EMBEDDED_DB_PATH:-/data/embedded_db}"
+
+    # Optional: keep every container's mtxdb store on a host directory (e.g. a
+    # large, slow disk) instead of Docker's overlay. Each container writes to
+    # its own subdirectory named after its hostname (@HOSTNAME@ is expanded
+    # by start_for_complement.sh), because hs1, hs2, etc. are separate logical
+    # Synapse databases. A shared directory would mix their data and leak one
+    # test's state into another. Nothing here deletes those directories; prune
+    # the host directory yourself.
+    if [[ -n "${COMPLEMENT_MTXDB_HOST_DIR:-}" ]]; then
+      mkdir -p "$COMPLEMENT_MTXDB_HOST_DIR"
+      export COMPLEMENT_HOST_MOUNTS="${COMPLEMENT_HOST_MOUNTS:+$COMPLEMENT_HOST_MOUNTS;}$COMPLEMENT_MTXDB_HOST_DIR:/mtxdb-host"
+      SYNAPSE_EMBEDDED_DB_PATH="/mtxdb-host/@HOSTNAME@"
+
+      # The Complement image starts as root and uses UID/GID to drop Synapse
+      # privileges. Pass through the invoking user's numeric identity so
+      # files created in the host-backed mtxdb mount belong to that user,
+      # rather than root. Allow explicit values for callers using a mapped
+      # container identity.
+      export PASS_UID="${PASS_UID:-$(id -u)}"
+      export PASS_GID="${PASS_GID:-$(id -g)}"
+    fi
+
+    export PASS_SYNAPSE_EMBEDDED_DB_PATH="$SYNAPSE_EMBEDDED_DB_PATH"
+  fi
+
+  # Test-only durability escape hatch, matching the engine/path controls
+  # above: Complement containers are destroyed after every test, so the
+  # durable fsync path buys nothing, but the engine deliberately defaults
+  # durability ON for production. Only the TEST_-scoped variable is
+  # honoured, so a developer's production SYNAPSE_MTXDB_NO_SYNC cannot leak
+  # into containers. Same value semantics as tests/utils.py: falsey
+  # (0/false/no/off/empty) leaves sync on, a truthy value disables it.
+  case "${SYNAPSE_TEST_MTXDB_NO_SYNC:-}" in
+    "" | 0 | false | False | no | No | off | Off) ;;
+    *)
+      export PASS_SYNAPSE_MTXDB_NO_SYNC=1
+      # Complement runs workers, and durability off is rejected for a worker
+      # deployment unless explicitly allowed. These containers are destroyed
+      # after every test, so a crash loses nothing that matters.
+      export PASS_SYNAPSE_TEST_MTXDB_ALLOW_UNSAFE_OFF=1
+      ;;
+  esac
+
+  # Persist sync mode for the containers: on | interval | off. Unset keeps
+  # the engine default (`interval`: publish at commit, coalesced fsyncs).
+  # `interval` and `off` publish writes at the commit boundary so workers still
+  # see them, and leave (or skip) fsync. Only the TEST_-scoped variable is
+  # honoured, for the same reason as the no-sync switch above.
+  case "${SYNAPSE_TEST_MTXDB_SYNC_MODE:-}" in
+    "") ;;
+    on) export PASS_SYNAPSE_MTXDB_SYNC=always ;;
+    interval) export PASS_SYNAPSE_MTXDB_SYNC=interval ;;
+    off)
+      export PASS_SYNAPSE_MTXDB_SYNC=off
+      export PASS_SYNAPSE_TEST_MTXDB_ALLOW_UNSAFE_OFF=1
+      ;;
+    *)
+      echo "SYNAPSE_TEST_MTXDB_SYNC_MODE must be one of: on, interval, off" >&2
+      exit 1
+      ;;
+  esac
+
+  # synapse/config/workers.py requires the write-ahead journal whenever the
+  # embedded engine is on *and* the deployment is multi-process (worker_app
+  # set or a non-empty instance_map -- i.e. WORKERS=1 runs, not every
+  # Complement run): with no SQL fallback for the data it owns, a committed
+  # write can be reported absent by a read-only worker until a checkpoint
+  # rewrite refreshes that worker's index, and that rewrite can be deferred.
+  # The WAL's read-committed overlay is the only read path that closes that
+  # window independently of the checkpoint rewrite. This is a visibility
+  # requirement, not a durability one -- neither mode fsyncs a write before
+  # the coalescer's next sync -- so a single-process run never actually needs
+  # it. Default WAL on whenever the engine is on anyway (single-process
+  # included), purely so every embedded-engine Complement run exercises the
+  # same journal path production uses by default. SYNAPSE_TEST_MTXDB_WAL can
+  # still force it off; under WORKERS=1 that now makes the container refuse
+  # to start (exercising the workers.py validation), but a non-worker run
+  # with it forced off is a legitimately supported single-process WAL-off
+  # configuration, not just a way to trigger the rejection. Same
+  # truthy/falsey semantics as above.
+  _default_mtxdb_wal=""
+  if [[ -n "$SYNAPSE_EMBEDDED_DB_ENGINE" ]]; then
+    _default_mtxdb_wal=1
+  fi
+  case "${SYNAPSE_TEST_MTXDB_WAL:-$_default_mtxdb_wal}" in
+    "" | 0 | false | False | no | No | off | Off) ;;
+    *) export PASS_SYNAPSE_MTXDB_WAL=1 ;;
+  esac
+
+  # THROWAWAY DIAGNOSTIC: force a synchronous EVENT_DAG fsync after every
+  # event_json write (see embedded_event_json._FORCE_SYNC_EVENT_JSON). This is
+  # the "forced sync" arm of the publication-timing experiment matrix; it
+  # answers whether the cross-process miss is a writer publication race or a
+  # persistent reader-refresh miss. Remove with the flag it forwards.
+  case "${SYNAPSE_TEST_MTXDB_FORCE_SYNC_EVENT_JSON:-}" in
+    "" | 0 | false | False | no | No | off | Off) ;;
+    *) export PASS_SYNAPSE_MTXDB_FORCE_SYNC_EVENT_JSON=1 ;;
+  esac
+
+  # Keep the test-only repack setting visible in Complement containers. The
+  # Trial harness consumes it between HomeserverTestCases; Complement itself
+  # has no Python test teardown hook, so this is inert there unless a
+  # container-side test harness explicitly uses it.
+  case "${SYNAPSE_TEST_MTXDB_REPACK_BETWEEN_TESTS:-}" in
+    "" | 0 | false | False | no | No | off | Off) ;;
+    *) export PASS_SYNAPSE_TEST_MTXDB_REPACK_BETWEEN_TESTS=1 ;;
+  esac
+
+  # Forward the diagnostic stats switch into the containers: with sync
+  # disabled the report is empty, so this is only useful on a sync-on lane,
+  # but it must reach the container or there is no way to size a sync's
+  # fsync/checkpoint split from a Complement run. Accept the normal local
+  # variable as well as the test-scoped alias; unlike database paths and
+  # durability controls, stats collection is read-only and safe to forward.
+  if [[ -n "${SYNAPSE_MTXDB_STATS:-${SYNAPSE_TEST_MTXDB_STATS:-}}" ]]; then
+    export PASS_SYNAPSE_MTXDB_STATS=1
   fi
 
   # Record the exact checkout that produced the image alongside the effective
@@ -496,7 +611,14 @@ main() {
   local synapse_revision
   synapse_revision="$(git -C "$repo_root" describe --tags --always --dirty 2>/dev/null || echo '<unknown>')"
   echo "Synapse revision: ${synapse_revision}" >&2
-  echo "Database: ${PASS_SYNAPSE_COMPLEMENT_DATABASE} (workers: ${PASS_SYNAPSE_COMPLEMENT_USE_WORKERS:-false}) | Embedded HAMT engine: ${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:-<none>}${PASS_SYNAPSE_EMBEDDED_HAMT_ENGINE:+ at ${PASS_SYNAPSE_EMBEDDED_HAMT_PATH:-<not set>}}" >&2
+  local mtxdb_location=""
+  if [[ -n "${PASS_SYNAPSE_EMBEDDED_DB_ENGINE:-}" ]]; then
+    mtxdb_location=" at ${PASS_SYNAPSE_EMBEDDED_DB_PATH:-<not set>}"
+    if [[ -n "${COMPLEMENT_MTXDB_HOST_DIR:-}" ]]; then
+      mtxdb_location+=" (host: ${COMPLEMENT_MTXDB_HOST_DIR%/}/<container-hostname>)"
+    fi
+  fi
+  echo "Database: ${PASS_SYNAPSE_COMPLEMENT_DATABASE} (workers: ${PASS_SYNAPSE_COMPLEMENT_USE_WORKERS:-false}) | Embedded DB engine: ${PASS_SYNAPSE_EMBEDDED_DB_ENGINE:-<none>}${mtxdb_location}${PASS_SYNAPSE_MTXDB_NO_SYNC:+ (no_sync)}${PASS_SYNAPSE_MTXDB_SYNC:+ (sync=$PASS_SYNAPSE_MTXDB_SYNC)}${PASS_SYNAPSE_MTXDB_WAL:+ (wal)}${PASS_SYNAPSE_MTXDB_STATS:+ (stats)}${PASS_SYNAPSE_MTXDB_FORCE_SYNC_EVENT_JSON:+ (force-sync-event-json)}" >&2
 
   # Complement's Destroy() force-removes every homeserver container
   # unconditionally, pass or fail -- there is no "keep failed containers"
@@ -509,6 +631,20 @@ main() {
 
   if [[ -n "${SYNAPSE_PG_TIMINGS:-}" ]]; then
     export PASS_SYNAPSE_PG_TIMINGS=1
+    # Same mechanism as trial (scripts-dev/trial_ctrlc.py): a private temp dir
+    # that the Synapse timing writers fill with per-process JSON snapshots,
+    # which `finish` aggregates on the host. Each container gets its own
+    # subdirectory (@HOSTNAME@ is expanded by start_for_complement.sh) so the
+    # small PIDs that every container's supervisord children share can't
+    # collide. The container path is a fixed string on purpose: it feeds the
+    # PASS_* blueprint-cache hash below, and a per-run path would rebuild the
+    # blueprints on every run. Writers snapshot periodically while running, so
+    # containers that Complement SIGKILLs still leave data behind.
+    mkdir -p "${repo_root}/.tmp/complement"
+    _TIMINGS_RUN_DIR="$(mktemp -d "${repo_root}/.tmp/complement/synapse-timings.XXXXXX")"
+    chmod 777 "$_TIMINGS_RUN_DIR"
+    export COMPLEMENT_HOST_MOUNTS="${COMPLEMENT_HOST_MOUNTS:+$COMPLEMENT_HOST_MOUNTS;}$_TIMINGS_RUN_DIR:/synapse-timings"
+    export PASS_SYNAPSE_TIMINGS_RUN_DIR="/synapse-timings/@HOSTNAME@"
     # Pass setup_timings_path="-" into the container so each Synapse process
     # prints its Databases.__init__ breakdown to stderr immediately after
     # setup() completes -- before any SIGTERM, so timing output is never lost
@@ -613,7 +749,21 @@ main() {
   echo "\$main_results_file: $main_results_file" >&2
   echo "\$staged_log_file: $staged_log_file" >&2
   echo "\$RUN_TESTS: $RUN_TESTS" >&2
+  if [ "${COMPLEMENT_ENABLE_DIRTY_RUNS:-0}" = "1" ]; then
+    echo "Complement dirty runs: enabled (eligible deployments reused)" >&2
+  else
+    echo "Complement dirty runs: disabled (fresh deployments)" >&2
+  fi
   echo "" >&2
+
+  # Baseline for the run header (scripts-dev/run_header.py); the timing
+  # aggregator in trial_ctrlc.py reads it back to report load and pressure over
+  # the run instead of over its own start-up.
+  export RUN_HEADER_STATE="${staging_dir}/run_header.${run_suffix}.${run_stamp}.json"
+  export RUN_HEADER_WORKERS="$test_parallel"
+  python3 "${repo_root}/scripts-dev/run_header.py" start "$RUN_HEADER_STATE" \
+    "workers=-p${test_parallel} (go test)" \
+    "sync mode=${PASS_SYNAPSE_MTXDB_SYNC:-(unset)}" >&2 || true
 
   # ── anchor_one: per-segment ^ anchoring so -run TestFoo doesn't match TestFooBar ──
   anchor_one() {
@@ -638,20 +788,49 @@ main() {
 
   # Split top-level | into separate go test invocations (go test's -run re-splits
   # on every /, silently dropping one side of alternations with differing depth).
+  #
+  # That depth-mismatch bug can only fire when the alternatives being OR'd
+  # together have differing "/" depth (e.g. `TestFoo|TestBar/SomeSubtest`).
+  # When every alternative is a single flat segment (no "/" at all -- no
+  # subtest is being targeted by any of them), depth is uniformly 1 and the
+  # bug cannot trigger, so there is nothing to protect against by splitting.
+  # In that case, combine everything into one `^(a|b|c)$`-style alternation
+  # and run go test once instead of once per name -- this is the common case
+  # for a targeted top-level test-name batch and the split's per-invocation
+  # process/container-churn overhead is otherwise paid for nothing.
   ALT_PATTERNS=()
   if [ "$RUN_TESTS" = "." ]; then
     ALT_PATTERNS=(".")
   else
     local -a raw_alts
     IFS='|' read -r -a raw_alts <<<"$RUN_TESTS"
+    local _all_flat=1
     for alt in "${raw_alts[@]}"; do
-      ALT_PATTERNS+=("$(anchor_one "$alt")")
+      if [[ "$alt" == */* ]]; then
+        _all_flat=0
+        break
+      fi
     done
-    if [ "${#ALT_PATTERNS[@]}" -gt 1 ]; then
-      echo "Anchored run regexes (one go test invocation each):" >&2
-      for alt in "${ALT_PATTERNS[@]}"; do echo "  $alt" >&2; done
+    if [ "${#raw_alts[@]}" -gt 1 ] && [ "$_all_flat" -eq 1 ]; then
+      local _combined
+      _combined="$(IFS='|'; echo "${raw_alts[*]}")"
+      # Top-level test selectors are prefixes: TestMessages also selects
+      # TestMessagesOverFederation and TestMessagesPaginationStress. Keep the
+      # combined form unanchored at the end, matching the single-selector
+      # behavior below.
+      ALT_PATTERNS=("^(${_combined})(/|$)")
+      echo "All alternatives are flat top-level names; combined into one go test invocation:" >&2
+      echo "  ${ALT_PATTERNS[0]}" >&2
     else
-      echo "Anchored run regex: ${ALT_PATTERNS[0]}" >&2
+      for alt in "${raw_alts[@]}"; do
+        ALT_PATTERNS+=("$(anchor_one "$alt")")
+      done
+      if [ "${#ALT_PATTERNS[@]}" -gt 1 ]; then
+        echo "Anchored run regexes (one go test invocation each):" >&2
+        for alt in "${ALT_PATTERNS[@]}"; do echo "  $alt" >&2; done
+      else
+        echo "Anchored run regex: ${ALT_PATTERNS[0]}" >&2
+      fi
     fi
   fi
 
@@ -856,21 +1035,19 @@ record_result() {
   jq -nc --arg Action "$action" --arg Test "$test_name" \
     '{Action: $Action, Test: $Test}' >>"$staged_results_file"
 
-  if [ "$action" != "skip" ]; then
-    # Truncate only the printed name (the full name is still recorded
-    # above) so a long subtest path doesn't wrap the summary line.
-    local _display_name="$test_name"
-    if [ "${#_display_name}" -gt 80 ]; then
-      _display_name="${_display_name:0:79}…"
-    fi
-    # `printf %-80s` measures UTF-8 bytes, not terminal characters. A name
-    # containing `§` (as in the MSC4499 tests) would therefore make the
-    # duration appear one column early. Bash's `${#var}` is character-based
-    # under the UTF-8 locale used by the test runner, so pad explicitly.
-    local _name_padding=$((80 - ${#_display_name}))
-    printf '%-6s  %s%*s  %8s\n' \
-      "${action^^}" "$_display_name" "$_name_padding" "" "$elapsed" >&2
+  # Truncate only the printed name (the full name is still recorded
+  # above) so a long subtest path doesn't wrap the summary line.
+  local _display_name="$test_name"
+  if [ "${#_display_name}" -gt 80 ]; then
+    _display_name="${_display_name:0:79}…"
   fi
+  # `printf %-80s` measures UTF-8 bytes, not terminal characters. A name
+  # containing `§` (as in the MSC4499 tests) would therefore make the
+  # duration appear one column early. Bash's `${#var}` is character-based
+  # under the UTF-8 locale used by the test runner, so pad explicitly.
+  local _name_padding=$((80 - ${#_display_name}))
+  printf '%-6s  %s%*s  %8s\n' \
+    "${action^^}" "$_display_name" "$_name_padding" "" "$elapsed" >&2
 }
 
 # ── run_one_pattern: one go test invocation per -run alternative ─────────────
@@ -885,15 +1062,25 @@ run_one_pattern() {
     packages=("${available_complement_test_packages[@]}")
   fi
 
-  if [[ "$pattern" != "." ]] && [[ "$pattern" =~ ^\^?(Test[[:alnum:]_]+)(/.*)?$ ]]; then
-    local _test_name="${BASH_REMATCH[1]}"
+  # A single flat name (`^TestFoo$`) or the combined-flat-batch form
+  # (`^(TestFoo|TestBar|...)$`, produced above when every alternative in the
+  # batch is a top-level name) both narrow packages the same way: union the
+  # package(s) each individual name's `func TestX` lives in.
+  local -a _batch_names=()
+  if [[ "$pattern" != "." ]] && [[ "$pattern" =~ ^\^\((Test[[:alnum:]_|]+)\)\$$ ]]; then
+    IFS='|' read -r -a _batch_names <<<"${BASH_REMATCH[1]}"
+  elif [[ "$pattern" != "." ]] && [[ "$pattern" =~ ^\^?(Test[[:alnum:]_]+)(/.*)?$ ]]; then
+    _batch_names=("${BASH_REMATCH[1]}")
+  fi
+
+  if [ "${#_batch_names[@]}" -gt 0 ]; then
     local _base_dir="$COMPLEMENT_DIR"
     if [ -n "$use_in_repo_tests" ]; then _base_dir="${repo_root}/complement"; fi
     if command -v rg &>/dev/null; then
       local -a matched_pkgs=()
       mapfile -t matched_pkgs < <(
         cd "$_base_dir" \
-          && rg -l --glob '*_test.go' "^func[[:space:]]+${_test_name}" tests 2>/dev/null \
+          && rg -l --glob '*_test.go' "^func[[:space:]]+(${_batch_names[0]}$(printf '|%s' "${_batch_names[@]:1}"))\\b" tests 2>/dev/null \
           | xargs -r -n1 dirname | sed 's#^#./#' | sort -u || true
       )
       if [ "${#matched_pkgs[@]}" -gt 0 ]; then
@@ -901,6 +1088,18 @@ run_one_pattern() {
         echo "Selected package(s) for $pattern: ${packages[*]}" >&2
       fi
     fi
+  fi
+
+  # A selector may not match any package (for example when a test was moved
+  # to a newer MSC package). Never invoke `go test` with an empty package
+  # list: that makes Go test the current directory instead of the Complement
+  # module's full test tree.
+  if [ "${#packages[@]}" -eq 0 ]; then
+    packages=(./tests/...)
+    echo "No matching Complement package found for $pattern; using ${packages[0]}" >&2
+  fi
+  if [ "$pattern" = "." ]; then
+    echo "Selected package(s) for full Complement run: ${packages[*]}" >&2
   fi
 
   local -a flags=(
@@ -1170,6 +1369,30 @@ for suite, total in sorted(suite_times.items(), key=lambda x: -x[1]):
     } >> "$GITHUB_STEP_SUMMARY"
   fi
 
+  # ── Aggregate per-process timing snapshots from all containers ───────────
+  # The aggregator prints the run header's load/pressure lines (through
+  # trial_ctrlc.py). When it does not run -- no SYNAPSE_PG_TIMINGS, or no
+  # snapshots -- print them here instead, so a run is never left without an
+  # end-of-run report. Exactly one of the two paths prints.
+  _run_header_end_printed=0
+  if [[ -n "${_TIMINGS_RUN_DIR:-}" ]] && [[ -d "$_TIMINGS_RUN_DIR" ]]; then
+    if [ -z "$(find "$_TIMINGS_RUN_DIR" -name '*.json' -print -quit)" ]; then
+      echo "warning: SYNAPSE_PG_TIMINGS is set but no timing snapshots were written under $_TIMINGS_RUN_DIR (containers not rebuilt, or the directory isn't writable by Synapse's user)" >&2
+    else
+      # Keep a copy next to the results: the report is otherwise only in the
+      # terminal scrollback.
+      _timings_report="${staged_results_file%.jsonl}.timings.txt"
+      uv run --no-sync python "${repo_root}/scripts-dev/trial_ctrlc.py" --aggregate-timings "$_TIMINGS_RUN_DIR" 2>&1 | tee "$_timings_report" >&2 || true
+      echo "timings report saved at $_timings_report" >&2
+      _run_header_end_printed=1
+    fi
+    rm -rf "$_TIMINGS_RUN_DIR"
+  fi
+  if [[ -n "${RUN_HEADER_STATE:-}" ]] && [[ "$_run_header_end_printed" -eq 0 ]]; then
+    python3 "${repo_root}/scripts-dev/run_header.py" end "$RUN_HEADER_STATE" >&2 || true
+  fi
+  rm -f "${RUN_HEADER_STATE:-}"
+
   # ── Extract timing from captured docker logs ─────────────────────────────
   if [[ -n "${SYNAPSE_PG_TIMINGS:-}" ]] && [[ -n "${_PG_TIMING_DIRS:-}" ]]; then
     local _found_timing=0
@@ -1238,7 +1461,9 @@ trap '_kill_active_producer; cleanup_pg_log_watcher; exit 130' INT
 trap '_kill_active_producer; cleanup_pg_log_watcher; exit 143' TERM
 trap '_kill_active_producer; cleanup_pg_log_watcher; exit 129' HUP
 
-# ── Run all patterns ──────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# Run all patterns.
+# -----------------------------------------------------------------------------
 for _pattern in "${ALT_PATTERNS[@]}"; do
   set +e
   run_one_pattern "$_pattern"

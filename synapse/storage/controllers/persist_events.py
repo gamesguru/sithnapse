@@ -22,6 +22,7 @@
 
 import itertools
 import logging
+import time
 from collections import deque
 from typing import (
     TYPE_CHECKING,
@@ -67,6 +68,11 @@ from synapse.logging.opentracing import (
 from synapse.metrics import SERVER_NAME_LABEL
 from synapse.storage.controllers.state import StateStorageController
 from synapse.storage.databases import Databases
+from synapse.storage.databases.main.embedded_common import (
+    maybe_log_mtxdb_snapshot,
+    record_mtxdb_persist_batch_timing,
+    record_mtxdb_persist_timing,
+)
 from synapse.storage.databases.main.events import DeltaState
 from synapse.storage.databases.main.events_worker import EventRedactBehaviour
 from synapse.types import (
@@ -392,7 +398,12 @@ class EventsPersistenceStorageController:
             NEW_EVENT_DURING_PURGE_LOCK_NAME, room_id, write=False
         ):
             if isinstance(task, _PersistEventsTask):
-                return await self._persist_event_batch(room_id, task)
+                batch_started = time.monotonic()
+                try:
+                    return await self._persist_event_batch(room_id, task)
+                finally:
+                    # Diagnostic: work time only, excluding queue wait.
+                    record_mtxdb_persist_batch_timing(time.monotonic() - batch_started)
             elif isinstance(task, _UpdateCurrentStateTask):
                 await self._update_current_state(room_id, task)
                 return {}
@@ -426,6 +437,7 @@ class EventsPersistenceStorageController:
             PartialStateConflictError: if attempting to persist a partial state event in
                 a room that has been un-partial stated.
         """
+        persist_started = time.monotonic()
         event_ids: list[str] = []
         partitioned: dict[str, list[EventPersistencePair]] = {}
         for event, ctx in events_and_contexts:
@@ -472,6 +484,12 @@ class EventsPersistenceStorageController:
                 )
             else:
                 persisted_events.append(event)
+
+        # Diagnostic: at most once a minute, log mtxdb store-growth metrics
+        # next to the persist work they might explain. No-op unless
+        # SYNAPSE_MTXDB_STATS is set.
+        record_mtxdb_persist_timing(time.monotonic() - persist_started)
+        maybe_log_mtxdb_snapshot()
 
         return (
             persisted_events,

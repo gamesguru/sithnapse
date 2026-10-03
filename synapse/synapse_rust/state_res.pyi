@@ -18,7 +18,7 @@ def get_auth_chain_difference_from_event_graph(
     event_map: dict[str, Any],
 ) -> set[str]: ...
 def resolve_v2_via_lattice_fold(
-    unconflicted_state: dict[tuple[str, str], str],
+    base_state: dict[tuple[str, str], str],
     conflicted_event_ids: Iterable[str],
     event_map: dict[str, Any],
 ) -> dict[tuple[str, str], str]: ...

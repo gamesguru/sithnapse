@@ -304,6 +304,50 @@ def _print_stage_breakdown(stats_py: RunStats, stats_rust: RunStats) -> None:
     print(format_stage("Rust", stats_rust))
 
 
+def _summarize(times: list[float]) -> tuple[float, float, float]:
+    """Return `(mean, p50, p95)` for `times` in seconds."""
+    ordered = sorted(times)
+
+    def pct(q: float) -> float:
+        idx = min(len(ordered) - 1, int(round(q * (len(ordered) - 1))))
+        return ordered[idx]
+
+    mean = sum(ordered) / len(ordered)
+    return mean, pct(0.5), pct(0.95)
+
+
+def _print_cache_results(
+    rows: list[tuple[str, list[float]]],
+    entries: int,
+) -> None:
+    """Print the conflict-cache timing comparison.
+
+    The first row is the baseline (speedup 1.0x).
+    """
+    baseline_mean, _, _ = _summarize(rows[0][1])
+
+    header = (
+        f"{'Path':<24} | {'mean (ms)':>10} | {'p50 (ms)':>9} | "
+        f"{'p95 (ms)':>9} | {'speedup':>8}"
+    )
+    print("\nConflict-cache benchmark (v2 state resolution, conflict_cache enabled):")
+    print(f"  - cache entries after a miss: {entries}")
+    print(f"  - iterations: {len(rows[0][1])}")
+    print(header)
+    print("-" * len(header))
+    for label, times in rows:
+        mean, p50, p95 = _summarize(times)
+        speedup = baseline_mean / mean if mean else float("inf")
+        print(
+            f"{label:<24} | {mean * 1e3:>10.3f} | {p50 * 1e3:>9.3f} | "
+            f"{p95 * 1e3:>9.3f} | {speedup:>7.1f}x"
+        )
+    print(
+        "\nNote: every call still recomputes the auth-chain difference and the "
+        "base state; the cache only elides the conflicted-set resolution."
+    )
+
+
 def _load_jsonl_events(path: str) -> tuple[dict[str, Any], list[MockEvent]]:
     print(f"Loading DAG from {path}...")
     event_map: dict[str, Any] = {}
@@ -390,6 +434,21 @@ async def main() -> None:
         type=int,
         default=20,
         help="Number of cProfile rows to print per run",
+    )
+    parser.add_argument(
+        "--cache-iters",
+        type=int,
+        default=0,
+        help=(
+            "If >0, benchmark conflict-cache misses (Rust resolver) vs hits and "
+            "exit. Only applies to the synthetic (non --jsonl) workload."
+        ),
+    )
+    parser.add_argument(
+        "--cache-warmup",
+        type=int,
+        default=3,
+        help="Warm-up iterations before the conflict-cache timing loops",
     )
     args = parser.parse_args()
     P = args.partitions
@@ -695,6 +754,58 @@ async def main() -> None:
 
         clock = MockClock()
         store = MockStateResolutionStore(bench_event_map)
+
+        if args.cache_iters > 0:
+            cache: dict[bytes, dict[tuple[str, str], str]] = {}
+
+            async def resolve_once(
+                conflict_cache: dict[bytes, dict[tuple[str, str], str]],
+            ) -> float:
+                start = time.perf_counter()
+                await v2.resolve_events_with_store(
+                    cast(Any, clock),
+                    room_id,
+                    cast(RoomVersion, room_version_rust),
+                    state_sets,
+                    bench_event_map,
+                    cast(Any, store),
+                    conflict_cache=cast(Any, conflict_cache),
+                )
+                return time.perf_counter() - start
+
+            print("Conflict-cache Benchmark Configuration:")
+            print(f"  - Partitions: {P}")
+            print(f"  - Conflicting events per partition: {N}")
+            print(f"  - Total events in map: {len(bench_event_map)}")
+            print(f"  - Warm-up iterations: {args.cache_warmup}")
+
+            # Warm up the Rust resolver and populate the shared hit cache.
+            for _ in range(args.cache_warmup):
+                await resolve_once(cache)
+
+            # Hits: the same conflicted set/base state reuses the cache entry.
+            hit_times = [await resolve_once(cache) for _ in range(args.cache_iters)]
+
+            # Rust misses: a fresh cache each iteration forces the resolver.
+            miss_times = [await resolve_once({}) for _ in range(args.cache_iters)]
+
+            # Pre-restore baseline: the same misses with the Rust resolver
+            # disabled, i.e. the Python implementation the interim guard forced
+            # on every cache miss.
+            with _disable_rust_lattice_fold_resolver():
+                python_miss_times = [
+                    await resolve_once({}) for _ in range(args.cache_iters)
+                ]
+
+            _print_cache_results(
+                [
+                    ("Python miss (no Rust)", python_miss_times),
+                    ("Rust miss", miss_times),
+                    ("Cache hit", hit_times),
+                ],
+                len(cache),
+            )
+            return
 
         print("Benchmark Configuration:")
         print(f"  - Partitions: {P}")

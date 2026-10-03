@@ -40,6 +40,7 @@ from synapse.config.homeserver import HomeServerConfig
 from synapse.config.server import DEFAULT_ROOM_VERSION
 from synapse.server import HomeServer
 from synapse.storage.database import LoggingDatabaseConnection
+from synapse.storage.databases.main import embedded_common
 from synapse.storage.engines import create_engine
 from synapse.storage.prepare_database import prepare_database
 
@@ -113,25 +114,25 @@ SQLITE_PERSIST_DB = os.environ.get("SYNAPSE_TEST_PERSIST_SQLITE_DB") is not None
 # it directly.
 #
 # Deliberately *not* falling back to the bare deployment switches
-# (SYNAPSE_EMBEDDED_HAMT_ENGINE / SYNAPSE_EMBEDDED_HAMT_PATH / SYNAPSE_MTXDB):
+# (SYNAPSE_EMBEDDED_DB_ENGINE / SYNAPSE_EMBEDDED_DB_PATH / SYNAPSE_MTXDB):
 # unit tests inherit the process environment, and a shell configured for
-# running a real homeserver (e.g. SYNAPSE_EMBEDDED_HAMT_PATH pointing at a
+# running a real homeserver (e.g. SYNAPSE_EMBEDDED_DB_PATH pointing at a
 # production store) must not have `trial` silently open and mutate that
 # store. Only the SYNAPSE_TEST_-prefixed, test-only variables are honoured
 # here. SYNAPSE_TEST_MTXDB is a shorthand alias for
 # the common case of just wanting the mtxdb engine, without spelling out the name.
-EMBEDDED_HAMT_ENGINE = os.environ.get("SYNAPSE_TEST_EMBEDDED_HAMT_ENGINE")
-if EMBEDDED_HAMT_ENGINE is None and os.environ.get("SYNAPSE_TEST_MTXDB"):
-    EMBEDDED_HAMT_ENGINE = "mtxdb"
+EMBEDDED_DB_ENGINE = os.environ.get("SYNAPSE_TEST_EMBEDDED_DB_ENGINE")
+if EMBEDDED_DB_ENGINE is None and os.environ.get("SYNAPSE_TEST_MTXDB"):
+    EMBEDDED_DB_ENGINE = "mtxdb"
 
-EMBEDDED_HAMT_PATH = os.environ.get("SYNAPSE_TEST_EMBEDDED_HAMT_PATH")
-_embedded_hamt_path_is_tmp = EMBEDDED_HAMT_PATH is None and EMBEDDED_HAMT_ENGINE
-if _embedded_hamt_path_is_tmp:
-    EMBEDDED_HAMT_PATH = tempfile.mkdtemp()
-elif EMBEDDED_HAMT_PATH is not None:
+EMBEDDED_DB_PATH = os.environ.get("SYNAPSE_TEST_EMBEDDED_DB_PATH")
+_embedded_db_path_is_tmp = EMBEDDED_DB_PATH is None and EMBEDDED_DB_ENGINE
+if _embedded_db_path_is_tmp:
+    EMBEDDED_DB_PATH = tempfile.mkdtemp()
+elif EMBEDDED_DB_PATH is not None:
     # `trial --jobs=N` (see .github/workflows/tests.yml's trial-mtxdb job)
     # forks N worker *processes* that all inherit the same
-    # SYNAPSE_TEST_EMBEDDED_HAMT_PATH env var. mtxdb takes an exclusive
+    # SYNAPSE_TEST_EMBEDDED_DB_PATH env var. mtxdb takes an exclusive
     # lock on its storage directory, so N workers all opening the literal
     # configured path meant only the first ever succeeded -- every other
     # worker's very first homeserver setup failed with "Failed to open
@@ -140,8 +141,8 @@ elif EMBEDDED_HAMT_PATH is not None:
     # subdirectory instead of racing for the same one; a single-process
     # run (no --jobs) just gets a `pid-<n>` subdir of the configured path,
     # which is harmless.
-    EMBEDDED_HAMT_PATH = os.path.join(EMBEDDED_HAMT_PATH, f"pid-{os.getpid()}")
-    os.makedirs(EMBEDDED_HAMT_PATH, exist_ok=True)
+    EMBEDDED_DB_PATH = os.path.join(EMBEDDED_DB_PATH, f"pid-{os.getpid()}")
+    os.makedirs(EMBEDDED_DB_PATH, exist_ok=True)
 
     # Reap stale pid-* subdirs left behind by dead trial workers (crashed
     # or SIGKILL'd before their own cleanup could run).  Only touches
@@ -149,7 +150,7 @@ elif EMBEDDED_HAMT_PATH is not None:
     # non-pid-* entries.
     import shutil
 
-    _parent_dir = os.path.dirname(EMBEDDED_HAMT_PATH)
+    _parent_dir = os.path.dirname(EMBEDDED_DB_PATH)
     _reaped = 0
     if os.path.isdir(_parent_dir):
         for _entry in os.listdir(_parent_dir):
@@ -168,25 +169,87 @@ elif EMBEDDED_HAMT_PATH is not None:
     if _reaped:
         print(f"Reaped {_reaped} stale pid-* dirs from {_parent_dir}", file=sys.stderr)
 
-if EMBEDDED_HAMT_ENGINE:
+# Durability (fsync) is pointless for the throwaway store trial gives each
+# test homeserver: it is created fresh and torn down on exit, so there is no
+# crash to recover from. Default `no_sync` on so tests don't pay thousands of
+# synchronous fsyncs. A truthy SYNAPSE_TEST_MTXDB_NO_SYNC keeps that on; a
+# falsey value (0/false/no/off/empty) turns it off when specifically exercising
+# the durable path (or writing a crash-recovery test). This is the same
+# variable and value semantics scripts-dev/complement.sh forwards into
+# Complement containers, so one rule covers both harnesses -- only the *unset*
+# default differs: trial defaults no_sync on (stores are torn down instantly),
+# Complement/production defaults sync on (it approximates a real deployment).
+_no_sync_env = os.environ.get("SYNAPSE_TEST_MTXDB_NO_SYNC")
+_no_sync_off = _no_sync_env is not None and _no_sync_env.strip().lower() in (
+    "",
+    "0",
+    "false",
+    "no",
+    "off",
+)
+EMBEDDED_DB_NO_SYNC = not _no_sync_off
+if EMBEDDED_DB_NO_SYNC:
+    # The test harness turns durability off on purpose (see above), which
+    # WorkerConfig otherwise rejects for a worker deployment because a crash
+    # could lose data that another worker already read. Trial's stores are
+    # thrown away, so opt in explicitly, exactly as a test-only run must.
+    os.environ.setdefault("SYNAPSE_TEST_MTXDB_ALLOW_UNSAFE_OFF", "1")
+
+# synapse/config/workers.py requires the write-ahead journal
+# (SYNAPSE_MTXDB_WAL) whenever the embedded engine is on *and* the
+# deployment is multi-process (worker_app set or a non-empty instance_map --
+# see WorkerConfig.read_config's embedded_db_engine guards): with no SQL
+# fallback for the data it owns, a committed write can be reported absent by
+# a read-only worker until a checkpoint rewrite refreshes its index (and
+# that rewrite can be deferred), and the WAL's get_read_committed overlay is
+# the only read path that closes that window independently of the
+# checkpoint rewrite. This is a visibility requirement, not a durability
+# one -- a single process never goes through that cross-process gate at
+# all, so the check is worker-conditional, not blanket.
+#
+# Trial's test homeservers are single-process, so that check never actually
+# requires this. Default WAL on anyway, the same rule
+# scripts-dev/complement.sh applies to containers, purely so every
+# embedded-engine trial run exercises the WAL path Complement and
+# production both use by default, not because leaving it off would fail
+# validation here. Only the TEST_-scoped variable is honoured; an explicit
+# falsey override clears any SYNAPSE_MTXDB_WAL this process inherited
+# (rather than merely skipping the on-default), so it's still possible to
+# exercise the single-process WAL-off path deterministically regardless of
+# the shell's own environment.
+_wal_env = os.environ.get("SYNAPSE_TEST_MTXDB_WAL")
+_wal_off = _wal_env is not None and _wal_env.strip().lower() in (
+    "",
+    "0",
+    "false",
+    "no",
+    "off",
+)
+if _wal_off:
+    os.environ.pop("SYNAPSE_MTXDB_WAL", None)
+elif EMBEDDED_DB_ENGINE:
+    os.environ["SYNAPSE_MTXDB_WAL"] = "1"
+
+if EMBEDDED_DB_ENGINE:
     print(
-        f"Embedded HAMT engine: {EMBEDDED_HAMT_ENGINE} at {EMBEDDED_HAMT_PATH}",
+        f"Embedded DB engine: {EMBEDDED_DB_ENGINE} at {EMBEDDED_DB_PATH}"
+        f"{' (no_sync)' if EMBEDDED_DB_NO_SYNC else ''}",
         file=sys.stderr,
     )
 
-if _embedded_hamt_path_is_tmp and not os.environ.get(
-    "SYNAPSE_TEST_KEEP_EMBEDDED_HAMT_PATH"
+if _embedded_db_path_is_tmp and not os.environ.get(
+    "SYNAPSE_TEST_KEEP_EMBEDDED_DB_PATH"
 ):
     # Clean up an auto-created store (set e.g. when debugging a failure and
     # you want to inspect the store afterwards). An explicitly-configured
-    # `SYNAPSE_TEST_EMBEDDED_HAMT_PATH` is never touched.
+    # `SYNAPSE_TEST_EMBEDDED_DB_PATH` is never touched.
     import shutil
 
-    def _cleanup_embedded_hamt(path: str) -> None:
+    def _cleanup_embedded_db(path: str) -> None:
         shutil.rmtree(path, ignore_errors=True)
 
-    assert EMBEDDED_HAMT_PATH is not None
-    atexit.register(_cleanup_embedded_hamt, EMBEDDED_HAMT_PATH)
+    assert EMBEDDED_DB_PATH is not None
+    atexit.register(_cleanup_embedded_db, EMBEDDED_DB_PATH)
 
 # the dbname we will connect to in order to create the base database.
 POSTGRES_DBNAME_FOR_INITIAL_CREATE = "postgres"
@@ -487,17 +550,25 @@ def default_config(
         "listeners": [{"port": 0, "type": "http"}],
     }
 
-    if EMBEDDED_HAMT_ENGINE and EMBEDDED_HAMT_PATH:
+    if EMBEDDED_DB_ENGINE and EMBEDDED_DB_PATH:
         # Many test homeservers (each with their own fresh SQL database, so
         # each restarting its state_group id sequence at 1) can share this
         # one mtxdb file across a whole trial worker process. Without a
         # unique namespace per homeserver, two different tests' state_group
         # 1 would collide on the same mtxdb keys and silently read each
         # other's data.
-        config_dict["embedded_hamt"] = {
-            "engine": EMBEDDED_HAMT_ENGINE,
-            "path": EMBEDDED_HAMT_PATH,
+        config_dict["embedded_db"] = {
+            "engine": EMBEDDED_DB_ENGINE,
+            "path": EMBEDDED_DB_PATH,
             "namespace": f"trial-{os.getpid()}-{uuid.uuid4().hex}",
+            "no_sync": EMBEDDED_DB_NO_SYNC,
+            # Tests rely on FLUSH_DELAY_SECS to know exactly how far to
+            # advance the reactor to drain the coalescer. Pin the runtime
+            # value to match it explicitly rather than letting production's
+            # rotational-disk auto-tuning (synapse.config.database) pick a
+            # different delay when SYNAPSE_TEST_EMBEDDED_DB_PATH happens to
+            # sit on a physical HDD.
+            "flush_delay_secs": embedded_common.FLUSH_DELAY_SECS,
         }
 
     if parse:

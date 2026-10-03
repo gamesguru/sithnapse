@@ -131,6 +131,10 @@ def materialize_state_entries(
     root_node_bytes: bytes,
     nodes: Sequence[tuple[bytes, bytes]],
 ) -> list[tuple[str, str, str]]: ...
+def materialize_state_entries_packed(
+    root_node_bytes: bytes,
+    nodes: Sequence[tuple[bytes, bytes]],
+) -> bytes: ...
 def lookup_state_entries(
     room_id: str,
     root_node_bytes: bytes,
@@ -145,6 +149,12 @@ def lookup_state_entries(
     until ``missing`` is empty before treating ``entries`` as complete.
     """
 
+def lookup_state_entries_packed(
+    room_id: str,
+    root_node_bytes: bytes,
+    nodes: Sequence[tuple[bytes, bytes]],
+    keys: Sequence[tuple[str, str]],
+) -> tuple[bytes, list[bytes]]: ...
 def node_child_hashes(node_bytes: bytes) -> list[bytes]: ...
 def reachability_audit(
     roots: Sequence[bytes],

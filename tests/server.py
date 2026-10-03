@@ -26,6 +26,7 @@ import logging
 import os
 import os.path
 import queue
+import select
 import sqlite3
 import sys
 import threading
@@ -74,6 +75,7 @@ from twisted.internet.interfaces import (
     IPushProducer,
     IReactorPluggableNameResolver,
     IReactorTime,
+    IReadDescriptor,
     IResolverSimple,
     ITCPTransport,
     ITransport,
@@ -259,6 +261,28 @@ _METADATA_TABLES_IGNORE = {
     "schema_compat_version",
 }
 
+# Tables `_RESEED_SQL` inserts singleton rows into. They are always truncated
+# alongside the data tables so those bare INSERTs can never collide with a row
+# that survived the previous reset.
+_RESEED_TABLES = {
+    "appservice_stream_position",
+    "event_push_summary_last_receipt_stream_id",
+    "event_push_summary_stream_ordering",
+    "stats_incremental_position",
+    "user_directory_stream_pos",
+    "federation_stream_position",
+    "device_lists_changes_in_room_max_pruned_stream_id",
+    "device_lists_changes_converted_stream_position",
+    "delayed_events_stream_pos",
+    "room_forgetter_stream_pos",
+    "scheduled_tasks",
+}
+
+
+def _quote_ident(identifier: str) -> str:
+    """Double-quote a table identifier for interpolation into test-only SQL."""
+    return '"' + identifier.replace('"', '""') + '"'
+
 
 _TABLES_TO_TRUNCATE_CACHE: list[str] | None = None
 
@@ -271,6 +295,7 @@ def _reset_recycled_postgres_db(
     """Reset a recycled test DB. Returns True on success."""
 
     _t0 = time.monotonic()
+    _phase = _t0
     try:
         conn = db_engine.module.connect(
             dbname=test_db,
@@ -281,7 +306,9 @@ def _reset_recycled_postgres_db(
         )
         db_engine.attempt_to_set_autocommit(conn, True)
         cur = conn.cursor()
+        _pg_timing("db_reset_connect", time.monotonic() - _phase, test_name=test_name)
 
+        _phase = time.monotonic()
         try:
             cur.execute(
                 "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
@@ -290,21 +317,37 @@ def _reset_recycled_postgres_db(
             )
         except Exception:
             pass
+        _pg_timing(
+            "db_reset_terminate_backends",
+            time.monotonic() - _phase,
+            test_name=test_name,
+        )
 
-        # Dirty-table tracking is process-global and SQL-shape-dependent, so it
-        # cannot safely determine which rows belong to this particular DB.
-        # Truncate every public table except schema identity metadata instead.
+        # A recycled DB is dedicated to one worker process and must be returned
+        # to the fresh-clone state after every test. Truncating all ~180 public
+        # tables each time costs ~120ms on an idle host (inherent per-relation
+        # Postgres TRUNCATE overhead -- 200 empty trivial tables cost ~100ms
+        # too), which dominated a full run's wall time.
         #
-        # The table *set* is schema-derived and identical for every recycled
-        # DB this worker process ever resets -- a DB that picked up DDL never
-        # reaches this function (it's dropped and replaced with a fresh clone
-        # instead, see the `had_ddl` branch in cleanup()). Cache the list
-        # after the first lookup so the recurring per-reset cost is just the
-        # TRUNCATE itself, not a repeated pg_tables catalog query too.
+        # Instead truncate only the relations that actually hold data. A table
+        # with committed rows always has a non-zero heap size, and TRUNCATE
+        # resets that size to zero, so `pg_relation_size > 0` is a superset of
+        # what this DB's previous test dirtied. Unlike the removed
+        # process-global, SQL-regex dirty tracking it reads the physical DB
+        # being reset, so attribution is exact and it cannot miss a table whose
+        # mutation form the regex didn't recognise. `_RESEED_TABLES` are always
+        # included so `_RESEED_SQL`'s bare INSERTs never hit a surviving
+        # primary key.
+        #
+        # The candidate *set* is schema-derived and identical for every
+        # recycled DB this process resets -- a DB that picked up DDL is dropped
+        # and replaced with a fresh clone instead (the `had_ddl` branch in
+        # cleanup()) -- so cache the list after the first lookup.
         global _TABLES_TO_TRUNCATE_CACHE
         if _TABLES_TO_TRUNCATE_CACHE is None:
+            _phase = time.monotonic()
             cur.execute(
-                "SELECT quote_ident(tablename) FROM pg_tables "
+                "SELECT tablename FROM pg_tables "
                 "WHERE schemaname = 'public' ORDER BY tablename"
             )
             _TABLES_TO_TRUNCATE_CACHE = [
@@ -312,19 +355,54 @@ def _reset_recycled_postgres_db(
                 for row in cur.fetchall()
                 if row[0] not in _METADATA_TABLES_IGNORE
             ]
-        tables_to_truncate = _TABLES_TO_TRUNCATE_CACHE
-        if tables_to_truncate:
-            cur.execute(
-                "TRUNCATE TABLE "
-                + ", ".join(tables_to_truncate)
-                + " RESTART IDENTITY CASCADE;"
+            _pg_timing(
+                "db_reset_catalog", time.monotonic() - _phase, test_name=test_name
             )
 
-        cur.execute(_RESEED_SQL)
+        _phase = time.monotonic()
+        cur.execute(
+            "SELECT c.relname FROM pg_class c "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = 'public' "
+            "AND c.relkind IN ('r', 'p') "
+            "AND (pg_relation_size(c.oid) > 0 OR EXISTS ("
+            "SELECT 1 FROM pg_depend d "
+            "JOIN pg_class seq ON seq.oid = d.objid AND seq.relkind = 'S' "
+            "WHERE d.classid = 'pg_class'::regclass "
+            "AND d.refclassid = 'pg_class'::regclass "
+            "AND d.refobjid = c.oid AND d.deptype IN ('a', 'i')))"
+        )
+        nonempty = {row[0] for row in cur.fetchall()}
+        _pg_timing(
+            "db_reset_dirty_scan", time.monotonic() - _phase, test_name=test_name
+        )
 
+        tables_to_truncate = sorted(
+            (nonempty & set(_TABLES_TO_TRUNCATE_CACHE)) | _RESEED_TABLES
+        )
+        if tables_to_truncate:
+            _phase = time.monotonic()
+            cur.execute(
+                "TRUNCATE TABLE "
+                + ", ".join(_quote_ident(t) for t in tables_to_truncate)
+                + " RESTART IDENTITY CASCADE;"
+            )
+            _pg_timing(
+                "db_reset_truncate", time.monotonic() - _phase, test_name=test_name
+            )
+
+        _phase = time.monotonic()
+        cur.execute(_RESEED_SQL)
+        _pg_timing("db_reset_reseed", time.monotonic() - _phase, test_name=test_name)
+
+        _phase = time.monotonic()
         cur.execute(_RESET_SEQUENCES_SQL)
+        _pg_timing("db_reset_sequences", time.monotonic() - _phase, test_name=test_name)
+
+        _phase = time.monotonic()
         cur.close()
         conn.close()
+        _pg_timing("db_reset_close", time.monotonic() - _phase, test_name=test_name)
         _pg_timing("db_recycle_reset", time.monotonic() - _t0, test_name=test_name)
         _pg_counter("recycle_reset_success")
         return True
@@ -669,6 +747,48 @@ def _print_pg_timings() -> None:
             f"    └── {'hs_unattributed':38s}  {unatt_wall * 1000:8.1f}ms  {wall_cnt:6d}  {(unatt_wall / wall_cnt) * 1000:10.3f}ms"
         )
 
+        # ── Database recycle reset phase breakdown ───────────────────────────
+        # `db_recycle_reset` is otherwise a single opaque span covering the
+        # whole reset; these sub-phases are what tells us whether the cost is
+        # connection setup, backend termination, the TRUNCATE itself, or the
+        # reseed/sequence bookkeeping that follows it.
+        if "db_recycle_reset" in timings:
+            _timings_print("\n=== Database Recycle Reset Phase Timings ===")
+            _timings_print("")
+            _timings_print(
+                f"  {'':44s}  {'total':>10s}  {'calls':>6s}  {'avg':>12s}  {'max':>12s}",
+            )
+            rr_s = timings["db_recycle_reset"]
+            rr_cnt = counts["db_recycle_reset"]
+            rr_max = maxs.get("db_recycle_reset", 0.0)
+            _timings_print(
+                f"  {'db_recycle_reset':44s}  {rr_s * 1000:8.1f}ms  {rr_cnt:6d}  {(rr_s / rr_cnt) * 1000:10.3f}ms  {rr_max * 1000:10.3f}ms"
+            )
+            reset_sub_tags = (
+                "db_reset_connect",
+                "db_reset_terminate_backends",
+                "db_reset_catalog",
+                "db_reset_dirty_scan",
+                "db_reset_truncate",
+                "db_reset_reseed",
+                "db_reset_sequences",
+                "db_reset_close",
+            )
+            sub_reset = 0.0
+            present_reset_tags = [t for t in reset_sub_tags if t in timings]
+            for sub_tag in present_reset_tags:
+                sub_s = timings[sub_tag]
+                sub_cnt = counts[sub_tag]
+                sub_max = maxs.get(sub_tag, 0.0)
+                sub_reset += sub_s
+                _timings_print(
+                    f"    ├── {sub_tag:38s}  {sub_s * 1000:8.1f}ms  {sub_cnt:6d}  {(sub_s / sub_cnt) * 1000:10.3f}ms  {sub_max * 1000:10.3f}ms"
+                )
+            reset_residual = max(0.0, rr_s - sub_reset)
+            _timings_print(
+                f"    └── {'db_reset_unattributed':38s}  {reset_residual * 1000:8.1f}ms  {rr_cnt:6d}  {(reset_residual / rr_cnt) * 1000:10.3f}ms"
+            )
+
         # ── Teardown phase breakdown ─────────────────────────────────────────
         teardown_tags = (
             "hs_shutdown",
@@ -757,6 +877,15 @@ def _print_pg_timings() -> None:
             "db_drop_terminate_backends",
             "db_drop_statement",
             "db_drop_retry_sleep",
+            "db_recycle_reset",
+            "db_reset_connect",
+            "db_reset_terminate_backends",
+            "db_reset_catalog",
+            "db_reset_dirty_scan",
+            "db_reset_truncate",
+            "db_reset_reseed",
+            "db_reset_sequences",
+            "db_reset_close",
         }
         for tag in sorted(timings):
             if tag not in known:
@@ -1428,7 +1557,7 @@ class ThreadedMemoryReactorClock(MemoryReactorClock):
         self,
         host: str,
         port: int,
-        factory: ClientFactory,
+        factory: "ClientFactory",
         timeout: float = 30,
         bindAddress: tuple[str, int] | None = None,
     ) -> IConnector:
@@ -1469,6 +1598,29 @@ class ThreadedMemoryReactorClock(MemoryReactorClock):
             # reactor.callFromThread to feed results back from the db functions to the
             # main thread.
             super().advance(0)
+
+        # Now poll anything registered with `addReader`. A real reactor does
+        # this in its poll loop, but `MemoryReactor` only stores the readers, so
+        # results from Rust futures (see `TwistedDispatch`) would never reach
+        # their deferreds. Firing those deferreds can in turn queue more
+        # callbacks hence the recursive `advance(0)`.
+        readable = self._poll_readers()
+        if readable:
+            for reader in readable:
+                reader.doRead()
+            self.advance(0)
+
+    def _poll_readers(self) -> list[IReadDescriptor]:
+        """The readers registered with `addReader` that have data waiting."""
+        readers = {reader.fileno(): reader for reader in self.getReaders()}
+        if not readers:
+            return []
+
+        # Now poll the readers to see if any have data waiting.
+        poller = select.poll()
+        for fileno in readers:
+            poller.register(fileno, select.POLLIN)
+        return [readers[fileno] for fileno, _event in poller.poll(0)]
 
 
 def cleanup_test_reactor_system_event_triggers(
@@ -1577,9 +1729,15 @@ def make_fake_db_pool(
 
     pool.runWithConnection = runWithConnection  # type: ignore[method-assign]
     pool.runInteraction = runInteraction  # type: ignore[assignment]
-    # Replace the thread pool with a threadless 'thread' pool
+
+    # First, stop the original thread pool.
+    pool.threadpool.stop()
+    # Then, replace it with a threadless 'thread' pool
     pool.threadpool = ThreadPool(reactor)
+
+    # Start it up.
     pool.running = True
+
     return pool
 
 
@@ -1864,6 +2022,7 @@ def connect_client(
     """
     factory = reactor.tcpClients.pop(client_id)[2]
     client = factory.buildProtocol(None)
+    assert client is not None
     server = AccumulatingProtocol()
     server.makeConnection(FakeTransport(client, reactor))
     client.makeConnection(FakeTransport(server, reactor))

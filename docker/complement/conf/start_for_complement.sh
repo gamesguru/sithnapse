@@ -4,6 +4,25 @@
 
 set -e
 
+# scripts-dev/complement.sh points the mtxdb store at a per-container
+# subdirectory of a host-mounted directory by passing a path containing
+# @HOSTNAME@. Expand it here (the container hostname is unique per container)
+# and hand the directory to whichever user owns /data, so Synapse can write it.
+if [[ "${SYNAPSE_EMBEDDED_DB_PATH:-}" == *@HOSTNAME@* ]]; then
+  export SYNAPSE_EMBEDDED_DB_PATH="${SYNAPSE_EMBEDDED_DB_PATH//@HOSTNAME@/$(hostname)}"
+  mkdir -p "$SYNAPSE_EMBEDDED_DB_PATH"
+  chown -R --reference=/data "$SYNAPSE_EMBEDDED_DB_PATH"
+fi
+
+# Per-container directory for the periodic timing snapshots (see the
+# SYNAPSE_PG_TIMINGS block in scripts-dev/complement.sh).
+if [[ "${SYNAPSE_TIMINGS_RUN_DIR:-}" == *@HOSTNAME@* ]]; then
+  export SYNAPSE_TIMINGS_RUN_DIR="${SYNAPSE_TIMINGS_RUN_DIR//@HOSTNAME@/$(hostname)}"
+  mkdir -p "$SYNAPSE_TIMINGS_RUN_DIR"
+  # Synapse drops to an arbitrary UID (PASS_UID), so make this writable by any.
+  chmod 777 "$SYNAPSE_TIMINGS_RUN_DIR"
+fi
+
 echo "Complement Synapse launcher"
 echo "  Args: $*"
 echo "  Env: SYNAPSE_COMPLEMENT_DATABASE=$SYNAPSE_COMPLEMENT_DATABASE SYNAPSE_COMPLEMENT_USE_WORKERS=$SYNAPSE_COMPLEMENT_USE_WORKERS SYNAPSE_COMPLEMENT_USE_ASYNCIO_REACTOR=$SYNAPSE_COMPLEMENT_USE_ASYNCIO_REACTOR"
@@ -53,24 +72,24 @@ if [[ -n "$SYNAPSE_COMPLEMENT_USE_WORKERS" ]]; then
   if [[ -z "$SYNAPSE_WORKER_TYPES" ]]; then
     # Under mtxdb, event persistence must stay on the main process, so no
     # dedicated event_persister workers are spawned at all. workers.py's
-    # embedded_hamt_engine validation requires BOTH that there is exactly
+    # embedded_db_engine validation requires BOTH that there is exactly
     # one events writer (a second persister would hit mtxdb's exclusive-lock
     # rejection at startup) AND that the sole writer is main itself (the
-    # embedded-HAMT background migration only ever runs on main, and would
+    # embedded-db background migration only ever runs on main, and would
     # crash writing through a read-only-opened store otherwise). Omitting
     # event_persister leaves stream_writers.events unset, which defaults to
     # ["main"] (see WriterLocations) and satisfies both checks; a single
     # event_persister would pass the first but fail the second.
     #
     # The background_worker goes for the same reason: its generated config
-    # sets run_background_tasks_on to itself, but the third embedded_hamt
+    # sets run_background_tasks_on to itself, but the third embedded_db
     # check requires background tasks to run on main (main's own
     # background-updates poll loop runs unconditionally, and mtxdb writes
     # have no cross-instance coordination to survive a second concurrent
     # loop). Without it, the setting defaults back to main.
     event_persister_entry="event_persister:2, "
     background_worker_entry="background_worker, "
-    if [[ -n "$SYNAPSE_EMBEDDED_HAMT_ENGINE" ]]; then
+    if [[ -n "$SYNAPSE_EMBEDDED_DB_ENGINE" ]]; then
       event_persister_entry=""
       background_worker_entry=""
     fi

@@ -153,6 +153,11 @@ sytest_tests = [
     },
     {
         "sytest-tag": "bookworm",
+        "postgres": "postgres",
+        "embedded_db": "mtxdb",
+    },
+    {
+        "sytest-tag": "bookworm",
         "postgres": "multi-postgres",
         "workers": "workers",
     },

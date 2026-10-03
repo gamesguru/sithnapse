@@ -47,6 +47,9 @@ class SQLBaseStore(metaclass=ABCMeta):
     """
 
     db_pool: DatabasePool
+    _embedded_db_engine: str | None
+    _embedded_db_namespace: str
+    _embedded_event_json_enabled: bool
 
     def __init__(
         self,
@@ -59,6 +62,13 @@ class SQLBaseStore(metaclass=ABCMeta):
         self.clock = hs.get_clock()  # nb must be called this for @cached
         self.database_engine = database.engine
         self.db_pool = database
+        self._embedded_db_engine = hs.config.database.embedded_db_engine
+        self._embedded_db_namespace = (
+            hs.config.database.embedded_db_namespace or hs.hostname
+        )
+        self._embedded_event_json_enabled = getattr(
+            self, "_embedded_event_json_enabled", False
+        )
 
         self.external_cached_functions: dict[str, CachedFunction] = {}
 
@@ -137,6 +147,7 @@ class SQLBaseStore(metaclass=ABCMeta):
         # Purge other caches based on room state.
         self._attempt_to_invalidate_cache("get_room_summary", (room_id,))
         self._attempt_to_invalidate_cache("get_partial_current_state_ids", (room_id,))
+        self._attempt_to_invalidate_cache("_get_current_state_event_id", (room_id,))
         self._attempt_to_invalidate_cache("get_room_type", (room_id,))
         self._attempt_to_invalidate_cache("get_room_encryption", (room_id,))
         self._attempt_to_invalidate_cache(
@@ -154,6 +165,7 @@ class SQLBaseStore(metaclass=ABCMeta):
             room_id: Room where state changed
         """
         self._attempt_to_invalidate_cache("get_partial_current_state_ids", (room_id,))
+        self._attempt_to_invalidate_cache("_get_current_state_event_id", (room_id,))
         self._attempt_to_invalidate_cache("get_users_in_room", (room_id,))
         self._attempt_to_invalidate_cache("is_host_invited", None)
         self._attempt_to_invalidate_cache("is_host_joined", None)

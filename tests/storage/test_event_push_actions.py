@@ -472,6 +472,206 @@ class EventPushActionsStoreTestCase(HomeserverTestCase):
         self.get_success(self.store._rotate_notifs())
         _assert_badge(1)
 
+    def test_count_aggregation_badge_recount_is_scoped_per_room(self) -> None:
+        """
+        Regression test: a room whose summary row is out of date must be recounted
+        from `event_push_actions`, even when another room has an up-to-date summary
+        for the same thread ID.
+
+        The set of threads a valid summary was found for used to be keyed on the
+        thread ID alone, so a single room with an up-to-date `main` summary excluded
+        `main` from the recount in *every* room, dropping those rooms' counts.
+        """
+        user_id, token, other_id, other_token, room_id = self._create_users_and_room()
+
+        stale_room_id = self.helper.create_room_as(user_id, tok=token)
+        self.helper.join(stale_room_id, other_id, tok=other_token)
+
+        def _send(room: str) -> str:
+            return self.helper.send_event(
+                room,
+                type="m.room.message",
+                content={"msgtype": "m.text", "body": "msg"},
+                tok=other_token,
+            )["event_id"]
+
+        def _read(room: str, event_id: str) -> None:
+            self.get_success(
+                self.store.insert_receipt(
+                    room,
+                    "m.read",
+                    user_id=user_id,
+                    event_ids=[event_id],
+                    thread_id=None,
+                    data={},
+                )
+            )
+
+        def _badge(room: str) -> int:
+            counts = self.get_success(
+                self.store.db_pool.runInteraction(
+                    "get-aggregate-unread-counts",
+                    self.store._get_unread_counts_by_room_for_user_txn,
+                    user_id,
+                )
+            )
+            return counts.get(room, 0)
+
+        # `room_id` keeps an up-to-date summary throughout, so its `main` thread is
+        # always one we found a valid summary for.
+        first = _send(room_id)
+        _send(room_id)
+
+        stale_first = _send(stale_room_id)
+        stale_second = _send(stale_room_id)
+        _send(stale_room_id)
+
+        # Read one event in each room and rotate, so that both summary rows record
+        # the receipt they were calculated against.
+        _read(room_id, first)
+        _read(stale_room_id, stale_first)
+        self.get_success(self.store._rotate_notifs())
+
+        self.assertEqual(_badge(room_id), 1)
+        self.assertEqual(_badge(stale_room_id), 2)
+
+        # A second receipt, which rotation has not processed yet: `stale_room_id`'s
+        # summary row no longer matches it, so its count has to be recovered from
+        # `event_push_actions`.
+        _read(stale_room_id, stale_second)
+
+        self.assertEqual(_badge(room_id), 1)
+        self.assertEqual(_badge(stale_room_id), 1)
+        # A new event, not yet rotated, while the summary row is still stale.
+        _send(stale_room_id)
+
+        self.assertEqual(_badge(room_id), 1)
+        self.assertEqual(_badge(stale_room_id), 2)
+
+    def test_count_aggregation_stale_summary_with_pending_receipt(self) -> None:
+        """
+        Regression test for the `TestThreadedReceipts` Complement failure.
+
+        Rotation writes `event_push_summary` rows with
+        `last_receipt_stream_ordering = NULL` (it never sees receipts), and
+        `_handle_new_receipts_for_notifs_txn` only runs as part of the 30s
+        rotation loop.  The summary freshness check used to accept such a row
+        whenever its `stream_ordering` was past the unthreaded receipt, but the
+        receipts CTE feeding that check filters
+        `event_stream_ordering > unthreaded_receipt`, so once an unthreaded
+        receipt lands every receipt (including itself) disappears from that CTE
+        and a stale row looks current: the counts stayed at 6 (3 main + 3
+        thread) instead of dropping to 2 (1 main + 1 thread).
+
+        A summary row is only trustworthy once
+        `event_push_summary_last_receipt_stream_id` has caught up with the
+        receipts which affect it.
+        """
+        user_id, token, _, other_token, room_id = self._create_users_and_room()
+
+        def _send(thread_root: str | None = None, highlight: bool = False) -> str:
+            content: JsonDict = {
+                "msgtype": "m.text",
+                "body": user_id if highlight else "msg",
+            }
+            if thread_root is not None:
+                content["m.relates_to"] = {
+                    "rel_type": RelationTypes.THREAD,
+                    "event_id": thread_root,
+                }
+            return self.helper.send_event(
+                room_id,
+                type="m.room.message",
+                content=content,
+                tok=other_token,
+            )["event_id"]
+
+        def _read(event_id: str, thread_id: str | None) -> None:
+            self.get_success(
+                self.store.insert_receipt(
+                    room_id,
+                    "m.read",
+                    user_id=user_id,
+                    event_ids=[event_id],
+                    thread_id=thread_id,
+                    data={},
+                )
+            )
+
+        def _assert_counts(
+            main_notif: int, thread_notif: int, thread_highlight: int
+        ) -> None:
+            counts = self.get_success(
+                self.store.db_pool.runInteraction(
+                    "get-unread-counts",
+                    self.store._get_unread_counts_by_receipt_txn,
+                    room_id,
+                    user_id,
+                )
+            )
+            self.assertEqual(
+                counts.main_timeline,
+                NotifCounts(notify_count=main_notif, unread_count=0, highlight_count=0),
+                f"main timeline was {counts.main_timeline}",
+            )
+            self.assertEqual(
+                counts.threads,
+                {
+                    thread_root: NotifCounts(
+                        notify_count=thread_notif,
+                        unread_count=0,
+                        highlight_count=thread_highlight,
+                    )
+                },
+                f"threads were {counts.threads}",
+            )
+
+            # The badge (push) query shares the same freshness logic.
+            badge = self.get_success(
+                self.store.db_pool.runInteraction(
+                    "get-aggregate-unread-counts",
+                    self.store._get_unread_counts_by_room_for_user_txn,
+                    user_id,
+                )
+            )
+            self.assertEqual(
+                badge.get(room_id, 0),
+                main_notif + thread_notif,
+                f"badge was {badge}",
+            )
+
+        thread_root = _send()  # main timeline
+        first_thread_event = _send(thread_root=thread_root)
+        _send(thread_root=thread_root, highlight=True)  # thread highlight
+        read_target = _send()  # main timeline, unthreaded receipt target
+        _send(thread_root=thread_root)
+        _send()  # main timeline
+
+        # 3 notifications on the main timeline, 3 in the thread (one highlight).
+        _assert_counts(3, 3, 1)
+
+        # Rotation summarises everything; it writes the summary rows with
+        # `last_receipt_stream_ordering = NULL`.
+        self.get_success(self.store._rotate_notifs())
+        _assert_counts(3, 3, 1)
+
+        # A threaded receipt on the thread root ...
+        _read(thread_root, MAIN_TIMELINE)
+        _assert_counts(2, 3, 1)
+        # ... and one on the first event of the thread.
+        _read(first_thread_event, thread_root)
+        _assert_counts(2, 2, 1)
+
+        # The unthreaded receipt covers both timelines (and the highlight).
+        # `_handle_new_receipts_for_notifs_txn` has not run yet, so the counts
+        # must come from `event_push_actions`, not the stale summary rows.
+        _read(read_target, None)
+        _assert_counts(1, 1, 0)
+
+        # Once rotation has processed the receipts the counts must not change.
+        self.get_success(self.store._rotate_notifs())
+        _assert_counts(1, 1, 0)
+
     def test_count_aggregation_threads(self) -> None:
         """
         This is essentially the same test as test_count_aggregation, but adds
