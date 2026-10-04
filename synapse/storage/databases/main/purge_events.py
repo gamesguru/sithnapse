@@ -341,18 +341,19 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
                 "[purge] found %i referenced state groups", len(referenced_state_groups)
             )
 
-            delete_event_to_state_group_batch(
+            txn.call_after(
+                delete_event_to_state_group_batch,
                 self._embedded_db_engine,
                 self._embedded_db_namespace,
                 list(event_id_to_state_group.keys()),
             )
-            decrement_state_group_refcounts_batch(
+            txn.call_after(
+                decrement_state_group_refcounts_batch,
                 self._embedded_db_engine,
                 self._embedded_db_namespace,
                 list(event_id_to_state_group.values()),
             )
-            # Immediate sync + clear dirty flags for the whole purge batch.
-            sync_now(pools=[Pool.STATE])
+            txn.call_after(sync_now, pools=[Pool.STATE])
         else:
             # Get all state groups that are referenced by events that are to be
             # deleted.
@@ -749,19 +750,21 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
                 room_event_ids,
                 purpose="purge_traversal",
             )
-            delete_event_to_state_group_batch(
+            txn.call_after(
+                delete_event_to_state_group_batch,
                 self._embedded_db_engine,
                 self._embedded_db_namespace,
                 list(event_id_to_state_group.keys()),
             )
-            decrement_state_group_refcounts_batch(
+            txn.call_after(
+                decrement_state_group_refcounts_batch,
                 self._embedded_db_engine,
                 self._embedded_db_namespace,
                 list(event_id_to_state_group.values()),
             )
             # One sync for the whole purge batch (event_json delete +
             # Immediate sync + clear dirty flags for event_dag and state.
-            sync_now(pools=[Pool.EVENT_DAG, Pool.STATE])
+            txn.call_after(sync_now, pools=[Pool.EVENT_DAG, Pool.STATE])
 
         # Other tables we do NOT need to clear out:
         #
