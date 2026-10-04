@@ -817,6 +817,29 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
                     ),
                 )
                 res.update(rows)
+                # A migration may have moved a row after the SQL fallback
+                # snapshot. Re-read mtxdb before trusting the SQL result.
+                refreshed = get_state_group_for_events_batch(
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
+                    list(sql_missing),
+                    purpose="state_mapping_fallback_recheck",
+                )
+                res.update(refreshed)
+                # A migration batch can commit (copy to mtxdb, delete from
+                # SQL) between the mtxdb read above and this SQL read, so the
+                # row is in neither result. Its mtxdb copy is committed before
+                # the SQL delete, so a second mtxdb read can't miss it.
+                still_missing = set(event_ids).difference(res)
+                if still_missing:
+                    res.update(
+                        get_state_group_for_events_batch(
+                            self._embedded_db_engine,
+                            self._embedded_db_namespace,
+                            list(still_missing),
+                            purpose="read_batch_after_sql_fallback",
+                        )
+                    )
 
         missing = set(event_ids).difference(res)
         if missing and raise_on_missing:
@@ -882,6 +905,24 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
                     desc="get_referenced_state_groups_sql_fallback",
                 )
                 referenced = referenced | {row[0] for row in rows}
+                # Migration can commit between the first mtxdb read and the
+                # SQL fallback. Recheck mtxdb so a newly migrated reference
+                # cannot be treated as unreferenced.
+                referenced |= get_referenced_state_groups_batch(
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
+                    list(remaining),
+                )
+                # A migration batch committing between the mtxdb lookup and the
+                # SQL read leaves the group in neither; its refcount is
+                # committed before the SQL rows go, so re-check mtxdb.
+                remaining = set(state_groups) - referenced
+                if remaining:
+                    referenced = referenced | get_referenced_state_groups_batch(
+                        self._embedded_db_engine,
+                        self._embedded_db_namespace,
+                        list(remaining),
+                    )
             return referenced
 
         rows = cast(
@@ -946,6 +987,17 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             # incremented again (that would double-count the old group's
             # reference forever, since a partial-state event's placeholder
             # group is never otherwise decremented).
+            # Drop any not-yet-migrated SQL row first. A migration batch holds
+            # a row lock on it (`FOR UPDATE` on Postgres) while it copies the
+            # row to mtxdb, so this waits for that batch to commit, or makes it
+            # skip the row: it can't overwrite the rewrite with the stale
+            # placeholder group. It must precede the mtxdb read below, which
+            # then sees the migrated mapping if the batch won.
+            self.db_pool.simple_delete_txn(
+                txn,
+                table="event_to_state_groups",
+                keyvalues={"event_id": event.event_id},
+            )
             old = get_state_group_for_events_batch(
                 self._embedded_db_engine,
                 self._embedded_db_namespace,
