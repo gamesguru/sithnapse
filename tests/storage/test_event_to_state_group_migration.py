@@ -18,6 +18,7 @@
 interaction with purge. The migration deletes each SQL row as it copies it, so
 every case checks both stores."""
 
+import atexit
 import shutil
 import struct
 import tempfile
@@ -36,6 +37,8 @@ from synapse.util.clock import Clock
 
 from tests.unittest import HomeserverTestCase
 
+_MTXDB_DIR: str | None = None
+
 
 class EventToStateGroupMigrationTests(HomeserverTestCase):
     user_id = "@red:server"
@@ -52,9 +55,15 @@ class EventToStateGroupMigrationTests(HomeserverTestCase):
         assert self.persist_store is not None
         self.controllers = hs.get_storage_controllers()
 
-        tmpdir = tempfile.mkdtemp(prefix="test-state-group-migration-")
-        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
-        mtxdb_engine.open_client(tmpdir)
+        # The engine is process-global and `open_client` only honours the first
+        # path, so the directory must outlive every test in the process.
+        global _MTXDB_DIR
+        if _MTXDB_DIR is None:
+            _MTXDB_DIR = tempfile.mkdtemp(prefix="test-state-group-migration-")
+            atexit.register(shutil.rmtree, _MTXDB_DIR, ignore_errors=True)
+        mtxdb_engine.open_client(_MTXDB_DIR)
+        # Isolate each test with its own namespace within the shared store.
+        tmpdir = tempfile.mkdtemp(prefix="ns-", dir=_MTXDB_DIR)
         self.mtxdb = mtxdb_engine
         # The engine is process-wide; a unique namespace isolates this test.
         self.engine = "mtxdb"
@@ -186,6 +195,49 @@ class EventToStateGroupMigrationTests(HomeserverTestCase):
         # Only SQL-referenced, so reference lookups must still see it.
         self.assertEqual(
             self.get_success(self.store.get_referenced_state_groups([9301])), {9301}
+        )
+
+    def _migrate_when_sql_is_read(self, desc: str, event_id: str, group: int) -> None:
+        """Make a migration batch commit just before the SQL fallback `desc`
+        runs: the row is copied to mtxdb and counted, then deleted from SQL."""
+        db_pool = self.store.db_pool
+        original = db_pool.simple_select_many_batch
+
+        async def racing(*args: object, **kwargs: object) -> object:
+            if kwargs.get("desc") == desc:
+                put_event_to_state_group_batch(
+                    self.engine, self.namespace, [(event_id, group)]
+                )
+                increment_state_group_refcounts_batch(
+                    self.engine, self.namespace, [group]
+                )
+                await db_pool.simple_delete(
+                    table="event_to_state_groups",
+                    keyvalues={"event_id": event_id},
+                    desc="test_migrate_during_read",
+                )
+            return await original(*args, **kwargs)  # type: ignore[arg-type]
+
+        db_pool.simple_select_many_batch = racing  # type: ignore[method-assign,assignment]
+        self.addCleanup(setattr, db_pool, "simple_select_many_batch", original)
+
+    def test_state_read_survives_migration_between_mtxdb_and_sql_reads(self) -> None:
+        self._insert_sql_mapping("$racing", 9401)
+        self._migrate_when_sql_is_read(
+            "_get_state_group_for_events_sql_fallback", "$racing", 9401
+        )
+
+        res = self.get_success(self.store._get_state_group_for_events(["$racing"]))
+        self.assertEqual(res, {"$racing": 9401})
+
+    def test_referenced_groups_survive_migration_between_reads(self) -> None:
+        self._insert_sql_mapping("$racing2", 9402)
+        self._migrate_when_sql_is_read(
+            "get_referenced_state_groups_sql_fallback", "$racing2", 9402
+        )
+
+        self.assertEqual(
+            self.get_success(self.store.get_referenced_state_groups([9402])), {9402}
         )
 
     def _prepare_purgeable_room(self) -> tuple[str, str, str, str]:
