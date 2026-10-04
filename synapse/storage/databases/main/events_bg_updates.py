@@ -458,16 +458,23 @@ class EventsBackgroundUpdatesStore(
         configured engine exclusively.
 
         Each batch's SQL rows are deleted in the same transaction that copies
-        them, so once a row is migrated mtxdb is its only copy. Turning the
-        embedded engine back off therefore needs a reverse migration; the SQL
-        table no longer holds the mappings.
+        them, and before the copy, so the per-event lock also covers the mtxdb
+        probe and write; once a row is migrated mtxdb is its only copy. Turning
+        the embedded engine back off therefore needs a reverse migration; the
+        SQL table no longer holds the mappings.
         """
         last_event_id = progress.get("last_event_id", "")
-        # Lock the selected rows (Postgres; SQLite serialises writers anyway)
-        # and do the mtxdb writes and the SQL delete in the same transaction. Purge deletes these
-        # rows before touching mtxdb, so it either waits for this batch and sees
-        # its mappings, or deletes first and this batch never selects them --
-        # a purged event's mapping can't be re-inserted from a stale read.
+        # `FOR UPDATE` locks the batch on Postgres as soon as it is selected;
+        # a plain SQLite SELECT holds no lock at all, so there the lock arrives
+        # with the DELETE below. Either way the per-event lock is taken before
+        # the mtxdb probe and held until this transaction commits, which is what
+        # serialises the batch against `update_state_for_partial_state_event`
+        # (state.py drops the same row first, then rewrites mtxdb) and against
+        # purge (which deletes these rows before consulting mtxdb): whoever
+        # gets the lock writes first, and the other side then either waits or
+        # no longer sees the row -- a purged event's mapping can't be
+        # re-inserted from a stale read, and a rewrite can't be overwritten
+        # here by the group this batch read.
         lock_clause = (
             "FOR UPDATE" if isinstance(self.database_engine, PostgresEngine) else ""
         )
@@ -487,22 +494,50 @@ class EventsBackgroundUpdatesStore(
             if not rows:
                 return rows
 
+            # Drop the SQL rows before reading or writing mtxdb. `RETURNING`
+            # hands back exactly the rows that still existed once the lock is
+            # held, so one that a concurrent purge or rewrite removed between
+            # the select above and here is simply not ours to migrate: copying
+            # the group selected above for it now would resurrect a purged
+            # mapping, or clobber the rewrite with a stale group, with no SQL
+            # row left to correct either. `rows` (not `migrated_rows`) still
+            # drives the progress cursor below, so a row lost to a purge here
+            # doesn't stall the batch.
+            clause, clause_args = make_in_list_sql_clause(
+                self.database_engine,
+                "event_id",
+                [event_id for event_id, _state_group in rows],
+            )
+            txn.execute(
+                f"""
+                DELETE FROM event_to_state_groups
+                WHERE {clause}
+                RETURNING event_id, state_group
+                """,
+                clause_args,
+            )
+            migrated_rows = cast(list[tuple[str, int]], txn.fetchall())
+
             # The mtxdb put below only copies rows mtxdb doesn't have, because
             # the refcount increment is not idempotent: if this batch is
             # reprocessed after a crash between these writes and the progress
             # update, an unguarded increment would double-count every event
             # already migrated last time. An already-present mapping is also
-            # either a replay or newer than this (now stale) SQL row, e.g. a
-            # partial-state event rewritten after the engine was turned on.
+            # either a replay or newer than the group this batch selected,
+            # e.g. a partial-state event rewritten after the engine was turned
+            # on -- rewriting the SQL row first means such a rewrite has either
+            # committed before the delete above (so its row is gone and it is
+            # not in `migrated_rows`) or is waiting on the lock and re-reads
+            # what this batch wrote.
             already_migrated = get_state_group_for_events_batch(
                 self._embedded_db_engine,
                 self._embedded_db_namespace,
-                [event_id for event_id, _state_group in rows],
+                [event_id for event_id, _state_group in migrated_rows],
                 purpose="migration_probe",
             )
             new_rows = [
                 (event_id, state_group)
-                for event_id, state_group in rows
+                for event_id, state_group in migrated_rows
                 if event_id not in already_migrated
             ]
             put_event_to_state_group_batch(
@@ -515,18 +550,12 @@ class EventsBackgroundUpdatesStore(
             )
             # One sync for the whole batch (put + increment above), not one per
             # helper call -- see put_event_to_state_group_batch's docstring.
+            # The copy has to be durable before this transaction commits: from
+            # then on mtxdb is the only copy. If it fails instead, the SQL rows
+            # come back next to whatever the mtxdb writes above managed, and the
+            # probe keeps replaying the batch idempotent.
             maybe_sync(SyncTier.DURABLE, pools=[Pool.STATE])
 
-            # Only now that the copy is durable, drop the SQL rows (still
-            # holding their locks). If this transaction fails the rows stay
-            # and the batch replays; the probe above keeps that idempotent.
-            self.db_pool.simple_delete_many_txn(
-                txn,
-                table="event_to_state_groups",
-                column="event_id",
-                values=[event_id for event_id, _state_group in rows],
-                keyvalues={},
-            )
             return rows
 
         rows = await self.db_pool.runInteraction(

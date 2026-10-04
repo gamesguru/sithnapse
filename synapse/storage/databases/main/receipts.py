@@ -935,14 +935,15 @@ class ReceiptsWorkerStore(SQLBaseStore):
         """
         assert self._can_write_to_receipts
 
-        # Coordinate with old-push-action cleanup: both operations use this
-        # singleton row as the receipt-processing watermark. Holding its row
-        # lock prevents cleanup from taking its pending-receipt snapshot and
-        # then racing a newly committed receipt before DELETE.
+        # Old-push-action cleanup takes this row FOR UPDATE while it reads its
+        # delete bound and runs the DELETE. Sharing it here means this receipt
+        # commits either before that bound is read or after the DELETE, never
+        # in between, while receipts still don't block each other: `FOR SHARE`
+        # locks are compatible with each other and conflict with `FOR UPDATE`.
         if isinstance(self.database_engine, PostgresEngine):
             txn.execute(
                 "SELECT stream_id FROM event_push_summary_last_receipt_stream_id"
-                " FOR UPDATE"
+                " FOR SHARE"
             )
 
         res = self.db_pool.simple_select_one_txn(

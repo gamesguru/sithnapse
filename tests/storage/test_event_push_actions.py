@@ -20,13 +20,19 @@
 #
 
 
+from typing import Any, Callable
+from unittest.case import SkipTest
+from unittest.mock import patch
+
 from twisted.internet.testing import MemoryReactor
 
 from synapse.api.constants import MAIN_TIMELINE, RelationTypes
 from synapse.rest import admin
 from synapse.rest.client import login, room
 from synapse.server import HomeServer
+from synapse.storage.database import LoggingTransaction
 from synapse.storage.databases.main.event_push_actions import NotifCounts
+from synapse.storage.engines import PostgresEngine
 from synapse.types import JsonDict
 from synapse.util.clock import Clock
 
@@ -731,6 +737,101 @@ class EventPushActionsStoreTestCase(HomeserverTestCase):
         # Once the receipt is processed the count is unchanged.
         self.get_success(self.store._rotate_notifs())
         self.assertEqual(_badge(), 2)
+
+    def _record_statements(self, run: Callable[[], Any]) -> list[str]:
+        """Run `run`, collecting every statement the store executes on the way."""
+        statements: list[str] = []
+        original_execute = LoggingTransaction.execute
+
+        def record_execute(
+            txn: LoggingTransaction, sql: str, *args: Any, **kwargs: Any
+        ) -> Any:
+            statements.append(sql)
+            return original_execute(txn, sql, *args, **kwargs)
+
+        with patch.object(LoggingTransaction, "execute", record_execute):
+            run()
+        return statements
+
+    def test_receipt_shares_watermark_lock(self) -> None:
+        """Receipt writes take the receipt watermark row `FOR SHARE`.
+
+        Cleanup takes it `FOR UPDATE`, which conflicts with `FOR SHARE` but not
+        with another `FOR SHARE`, so receipts are ordered against cleanup's
+        snapshot-and-delete without serializing against each other.
+        """
+        if not isinstance(self.store.database_engine, PostgresEngine):
+            raise SkipTest("row locks only apply to Postgres")
+
+        user_id, _, _, other_token, room_id = self._create_users_and_room()
+        event_id = self.helper.send(room_id, body="msg", tok=other_token)["event_id"]
+
+        statements = self._record_statements(
+            lambda: self.get_success(
+                self.store.insert_receipt(
+                    room_id,
+                    "m.read",
+                    user_id=user_id,
+                    event_ids=[event_id],
+                    thread_id=None,
+                    data={},
+                )
+            )
+        )
+
+        shared = [
+            sql
+            for sql in statements
+            if "event_push_summary_last_receipt_stream_id" in sql and "FOR SHARE" in sql
+        ]
+        self.assertEqual(len(shared), 1, statements)
+        # An exclusive lock here would make every receipt wait for every other.
+        exclusive = [
+            sql
+            for sql in statements
+            if "event_push_summary_last_receipt_stream_id" in sql
+            and "FOR UPDATE" in sql
+        ]
+        self.assertEqual(exclusive, [], statements)
+        # The lock is taken before the receipt row it protects is written.
+        self.assertLess(
+            statements.index(shared[0]),
+            next(
+                index
+                for index, sql in enumerate(statements)
+                if "receipts_linearized" in sql and "INSERT" in sql.upper()
+            ),
+            statements,
+        )
+
+    def test_cleanup_locks_watermark_before_bound_and_delete(self) -> None:
+        """Cleanup takes the watermark row `FOR UPDATE` before it reads the
+        bound it will delete to, and holds it through the delete, so no receipt
+        can commit in between the two."""
+        if not isinstance(self.store.database_engine, PostgresEngine):
+            raise SkipTest("row locks only apply to Postgres")
+
+        statements = self._record_statements(
+            lambda: self.get_success(
+                self.store._remove_old_push_actions_that_have_rotated()
+            )
+        )
+
+        def index_of(predicate: Callable[[str], bool]) -> int:
+            matches = [index for index, sql in enumerate(statements) if predicate(sql)]
+            self.assertEqual(len(matches), 1, statements)
+            return matches[0]
+
+        lock = index_of(
+            lambda sql: "event_push_summary_last_receipt_stream_id" in sql
+            and "FOR UPDATE" in sql
+        )
+        bound = index_of(lambda sql: "MIN(event_stream_ordering)" in sql)
+        delete = index_of(lambda sql: "DELETE FROM event_push_actions" in sql)
+        # The lock is taken before the watermark it guards is even read, and
+        # held across both the bound and the delete.
+        self.assertLess(lock, bound, statements)
+        self.assertLess(bound, delete, statements)
 
     def test_count_aggregation_threads(self) -> None:
         """

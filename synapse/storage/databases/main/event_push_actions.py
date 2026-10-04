@@ -103,6 +103,7 @@ from synapse.storage.database import (
 )
 from synapse.storage.databases.main.receipts import ReceiptsWorkerStore
 from synapse.storage.databases.main.stream import StreamWorkerStore
+from synapse.storage.engines._base import IsolationLevel
 from synapse.types import JsonDict, StrCollection
 from synapse.util.caches.descriptors import cached
 from synapse.util.duration import Duration
@@ -1833,6 +1834,10 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
             # it is processed), so keep the rows after it. Rows at or before it
             # are read and safe to delete.
             if isinstance(self.database_engine, PostgresEngine):
+                # Take the watermark row lock before reading the bound: receipt
+                # writes take it FOR SHARE before inserting, so none can commit
+                # between the bound and the DELETE below, though they don't
+                # serialize against each other.
                 txn.execute(
                     "SELECT stream_id FROM event_push_summary_last_receipt_stream_id"
                     " FOR UPDATE"
@@ -1886,9 +1891,14 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
             return txn.rowcount < batch_size
 
         while True:
+            # Read committed so that the bound is read with a fresh snapshot
+            # once the watermark row lock is held: repeatable read would keep
+            # the snapshot taken while we were waiting for an in-flight
+            # receipt to commit, leaving it out of the bound.
             done = await self.db_pool.runInteraction(
                 "_remove_old_push_actions_that_have_rotated",
                 remove_old_push_actions_that_have_rotated_txn,
+                isolation_level=IsolationLevel.READ_COMMITTED,
             )
             if done:
                 break
