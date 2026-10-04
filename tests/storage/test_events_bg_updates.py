@@ -14,6 +14,7 @@
 #
 
 
+import atexit
 import json
 import shutil
 import tempfile
@@ -40,6 +41,8 @@ from synapse.types.storage import _BackgroundUpdates
 from synapse.util.clock import Clock
 
 from tests.unittest import HomeserverTestCase, override_config
+
+_MTXDB_DIR: str | None = None
 
 
 class TestFixupMaxDepthCapBgUpdate(HomeserverTestCase):
@@ -477,11 +480,17 @@ class TestEventToStateGroupMigrationLockOrder(HomeserverTestCase):
 
         self.store = self.hs.get_datastores().main
 
-        tmpdir = tempfile.mkdtemp(prefix="test-esg-migration-lock-")
-        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
-        mtxdb_engine.open_client(tmpdir)
+        # The engine is process-global and `open_client` only honours the first
+        # path, so the directory must outlive every test in the process.
+        global _MTXDB_DIR
+        if _MTXDB_DIR is None:
+            _MTXDB_DIR = tempfile.mkdtemp(prefix="test-esg-migration-lock-")
+            atexit.register(shutil.rmtree, _MTXDB_DIR, ignore_errors=True)
+        mtxdb_engine.open_client(_MTXDB_DIR)
+        # Isolate each test with its own namespace within the shared store.
+        namespace = tempfile.mkdtemp(prefix="ns-", dir=_MTXDB_DIR)
         self.engine = "mtxdb"
-        self.namespace = tmpdir
+        self.namespace = namespace
         self.store._embedded_event_json_enabled = True
         self.store._embedded_db_engine = self.engine
         self.store._embedded_db_namespace = self.namespace

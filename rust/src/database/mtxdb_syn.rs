@@ -626,6 +626,9 @@ pub fn put_state_hamt_roots(
             .collect::<PyResult<_>>()?;
 
         let mut pairs: Vec<(NodeId, NodeData)> = Vec::with_capacity(validated_roots.len() * 2);
+        // Only counts bumped below are written back; the rest were read for
+        // validation and are unchanged.
+        let mut changed_counts: HashSet<[u8; 32]> = HashSet::new();
         for ((state_group, value, state_group_id), existing) in
             validated_roots.iter().zip(existing_pointers.iter())
         {
@@ -647,6 +650,7 @@ pub fn put_state_hamt_roots(
                 }
             }
 
+            changed_counts.insert(*state_group_id);
             let count = refcounts_by_id.entry(*state_group_id).or_default();
             match count {
                 Some(count) => {
@@ -680,7 +684,9 @@ pub fn put_state_hamt_roots(
         }
 
         for (state_group_id, count) in refcounts_by_id.into_iter().filter_map(|(id, count)| {
-            count.map(|count| (id, count))
+            count
+                .filter(|_| changed_counts.contains(&id))
+                .map(|count| (id, count))
         }) {
             pairs.push((
                 state_group_refcount_node_id(&namespace, &state_group_id),
