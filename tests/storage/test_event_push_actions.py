@@ -695,6 +695,7 @@ class EventPushActionsStoreTestCase(HomeserverTestCase):
             return badge.get(room_id, 0)
 
         self.assertEqual(_badge(), 3)
+        self.store.stream_ordering_day_ago = self.store.get_room_max_stream_ordering()
         self.get_success(self.store._rotate_notifs())
         self.assertEqual(_badge(), 3)
 
