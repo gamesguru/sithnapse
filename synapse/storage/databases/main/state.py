@@ -817,15 +817,6 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
                     ),
                 )
                 res.update(rows)
-                # A migration may have moved a row after the SQL fallback
-                # snapshot. Re-read mtxdb before trusting the SQL result.
-                refreshed = get_state_group_for_events_batch(
-                    self._embedded_db_engine,
-                    self._embedded_db_namespace,
-                    list(sql_missing),
-                    purpose="state_mapping_fallback_recheck",
-                )
-                res.update(refreshed)
                 # A migration batch can commit (copy to mtxdb, delete from
                 # SQL) between the mtxdb read above and this SQL read, so the
                 # row is in neither result. Its mtxdb copy is committed before
@@ -905,14 +896,6 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
                     desc="get_referenced_state_groups_sql_fallback",
                 )
                 referenced = referenced | {row[0] for row in rows}
-                # Migration can commit between the first mtxdb read and the
-                # SQL fallback. Recheck mtxdb so a newly migrated reference
-                # cannot be treated as unreferenced.
-                referenced |= get_referenced_state_groups_batch(
-                    self._embedded_db_engine,
-                    self._embedded_db_namespace,
-                    list(remaining),
-                )
                 # A migration batch committing between the mtxdb lookup and the
                 # SQL read leaves the group in neither; its refcount is
                 # committed before the SQL rows go, so re-check mtxdb.
