@@ -41,6 +41,7 @@ from synapse.storage.database import (
     LoggingTransaction,
     make_tuple_in_list_sql_clause,
 )
+from synapse.storage.engines import PostgresEngine
 from synapse.storage.engines._base import IsolationLevel
 from synapse.storage.util.id_generators import (
     MultiWriterIdGenerator,
@@ -933,6 +934,16 @@ class ReceiptsWorkerStore(SQLBaseStore):
                 (or 0 if the event is unknown)
         """
         assert self._can_write_to_receipts
+
+        # Coordinate with old-push-action cleanup: both operations use this
+        # singleton row as the receipt-processing watermark. Holding its row
+        # lock prevents cleanup from taking its pending-receipt snapshot and
+        # then racing a newly committed receipt before DELETE.
+        if isinstance(self.database_engine, PostgresEngine):
+            txn.execute(
+                "SELECT stream_id FROM event_push_summary_last_receipt_stream_id"
+                " FOR UPDATE"
+            )
 
         res = self.db_pool.simple_select_one_txn(
             txn,

@@ -1832,6 +1832,11 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
             # from `event_push_actions` alone (the summary can't be trusted until
             # it is processed), so keep the rows after it. Rows at or before it
             # are read and safe to delete.
+            if isinstance(self.database_engine, PostgresEngine):
+                txn.execute(
+                    "SELECT stream_id FROM event_push_summary_last_receipt_stream_id"
+                    " FOR UPDATE"
+                )
             last_receipt_stream_id = self.db_pool.simple_select_one_onecol_txn(
                 txn,
                 table="event_push_summary_last_receipt_stream_id",
