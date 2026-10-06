@@ -307,7 +307,9 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             # it is not the reverse "is state_group X still referenced
             # elsewhere" question (that's get_referenced_state_groups,
             # backed by the separate refcount).
-            all_purge_event_ids = [event_id for event_id, _should_delete in event_rows]
+            purge_event_ids = [
+                event_id for event_id, should_delete in event_rows if should_delete
+            ]
 
             # Rows not yet migrated from SQL (the migration deletes each row once
             # copied) may reference state groups too. Delete them *before*
@@ -326,14 +328,15 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             logger.info("[purge] removing events from event_to_state_groups")
             txn.execute(
                 "DELETE FROM event_to_state_groups "
-                "WHERE event_id IN (SELECT event_id from events_to_purge)"
+                "WHERE event_id IN (SELECT event_id from events_to_purge "
+                "WHERE should_delete)"
             )
 
             # Only mtxdb entries are refcounted, so only those are decremented.
             event_id_to_state_group = get_state_group_for_events_batch(
                 self._embedded_db_engine,
                 self._embedded_db_namespace,
-                all_purge_event_ids,
+                purge_event_ids,
                 purpose="purge_traversal",
             )
             referenced_state_groups.update(event_id_to_state_group.values())

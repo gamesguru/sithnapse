@@ -970,6 +970,16 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             # incremented again (that would double-count the old group's
             # reference forever, since a partial-state event's placeholder
             # group is never otherwise decremented).
+            # Preserve the SQL safety copy in case the embedded lookup misses.
+            # This is also the authoritative fallback while migration is in
+            # progress, and its value is needed to balance the refcounts.
+            old_state_group_sql = self.db_pool.simple_select_one_onecol_txn(
+                txn,
+                table="event_to_state_groups",
+                keyvalues={"event_id": event.event_id},
+                retcol="state_group",
+                allow_none=True,
+            )
             # Drop any not-yet-migrated SQL row first. A migration batch holds
             # a row lock on it (`FOR UPDATE` on Postgres) while it copies the
             # row to mtxdb, so this waits for that batch to commit, or makes it
@@ -994,11 +1004,10 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             )
             old_state_group = old.get(event.event_id)
             if old_state_group is None:
-                # No mtxdb mapping yet: the event is either brand new or its
-                # SQL row hasn't been migrated. Refcounts only count mtxdb
-                # entries, and the migration skips events mtxdb already has,
-                # so the old group was never counted (nothing to decrement)
-                # while the new one must be.
+                old_state_group = old_state_group_sql
+            if old_state_group is None:
+                # The event is brand new, so only the new mapping needs a
+                # reference.
                 increment_state_group_refcounts_batch(
                     self._embedded_db_engine,
                     self._embedded_db_namespace,
