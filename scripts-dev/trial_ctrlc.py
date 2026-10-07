@@ -629,7 +629,13 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
 
         if ffi_timings:
             out("\n=== FFI boundary timings ===")
-            has_hist = bool(ffi_latencies)
+            # Percentiles are meaningful alongside total/count only when all
+            # calls are represented in the bounded latency sample.
+            has_hist = any(
+                tag in ffi_latencies
+                and len(ffi_latencies[tag]) == ffi_counts.get(tag, 0)
+                for tag in ffi_timings
+            )
             if has_hist:
                 out(
                     f"  {'':50s}  {'total':>10s}  {'calls':>6s}  {'avg':>12s}  {'p50':>11s}  {'p95':>11s}  {'p99':>11s}"
@@ -648,13 +654,19 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                 count = ffi_counts[tag]
                 total_ms = total_s * 1000
                 avg_ms = (total_s / count) * 1000 if count else 0.0
-                if tag in ffi_latencies:
-                    s = sorted(ffi_latencies[tag])
-                    p50_ms = _pct(s, 0.50) * 1000
-                    p95_ms = _pct(s, 0.95) * 1000
-                    p99_ms = _pct(s, 0.99) * 1000
+                if has_hist:
+                    if tag in ffi_latencies and len(ffi_latencies[tag]) == count:
+                        s = sorted(ffi_latencies[tag])
+                        p50_ms = _pct(s, 0.50) * 1000
+                        p95_ms = _pct(s, 0.95) * 1000
+                        p99_ms = _pct(s, 0.99) * 1000
+                        percentiles = (
+                            f"{p50_ms:9.3f}ms  {p95_ms:9.3f}ms  {p99_ms:9.3f}ms"
+                        )
+                    else:
+                        percentiles = f"{'n/a':>9s}     {'n/a':>9s}     {'n/a':>9s}"
                     out(
-                        f"  {tag:50s}  {total_ms:8.1f}ms  {count:6d}  {avg_ms:10.3f}ms  {p50_ms:9.3f}ms  {p95_ms:9.3f}ms  {p99_ms:9.3f}ms"
+                        f"  {tag:50s}  {total_ms:8.1f}ms  {count:6d}  {avg_ms:10.3f}ms  {percentiles}"
                     )
                 else:
                     out(f"  {tag:50s}  {total_ms:8.1f}ms  {count:6d}  {avg_ms:10.3f}ms")

@@ -382,7 +382,13 @@ def _print_ffi_timings() -> None:
         return
 
     _ffi_timings_print("\n=== FFI boundary timings ===")
-    has_hist = bool(latencies)
+    # Percentiles are only comparable with total/count when the histogram
+    # contains every sample. The histogram is bounded, while totals/counts
+    # are not, so do not print a partial histogram as if it were complete.
+    has_hist = any(
+        tag in latencies and len(latencies[tag]) == counts.get(tag, 0)
+        for tag in timings
+    )
     if has_hist:
         _ffi_timings_print(
             f"  {'':50s}  {'total':>10s}  {'calls':>6s}  {'avg':>12s}  {'p50':>11s}  {'p95':>11s}  {'p99':>11s}",
@@ -404,13 +410,17 @@ def _print_ffi_timings() -> None:
         count = counts[tag]
         total_ms = total_s * 1000
         avg_ms = (total_s / count) * 1000 if count else 0.0
-        if tag in latencies:
-            s = latencies[tag]
-            p50_ms = _percentile(s, 0.50) * 1000
-            p95_ms = _percentile(s, 0.95) * 1000
-            p99_ms = _percentile(s, 0.99) * 1000
+        if has_hist:
+            if tag in latencies and len(latencies[tag]) == count:
+                s = latencies[tag]
+                p50_ms = _percentile(s, 0.50) * 1000
+                p95_ms = _percentile(s, 0.95) * 1000
+                p99_ms = _percentile(s, 0.99) * 1000
+                percentiles = f"{p50_ms:9.3f}ms  {p95_ms:9.3f}ms  {p99_ms:9.3f}ms"
+            else:
+                percentiles = f"{'n/a':>9s}     {'n/a':>9s}     {'n/a':>9s}"
             _ffi_timings_print(
-                f"  {tag:50s}  {total_ms:8.1f}ms  {count:6d}  {avg_ms:10.3f}ms  {p50_ms:9.3f}ms  {p95_ms:9.3f}ms  {p99_ms:9.3f}ms",
+                f"  {tag:50s}  {total_ms:8.1f}ms  {count:6d}  {avg_ms:10.3f}ms  {percentiles}",
             )
         else:
             _ffi_timings_print(
