@@ -58,6 +58,18 @@ class PurgeTests(HomeserverTestCase):
 
     def make_homeserver(self, reactor: MemoryReactor, clock: Clock) -> HomeServer:
         hs = self.setup_test_homeserver("server")
+        # The MTXDB client is process-global, while this test module creates a
+        # fresh SQL database for each test. Keep the embedded keys isolated by
+        # test method so state-group IDs from separate databases cannot collide.
+        namespace = f"{hs.hostname}:{self._testMethodName}"
+        persist_store = hs.get_datastores().persist_events
+        assert persist_store is not None
+        for store in (
+            hs.get_datastores().main,
+            persist_store,
+            hs.get_datastores().state,
+        ):
+            store._embedded_db_namespace = namespace
         return hs
 
     def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
