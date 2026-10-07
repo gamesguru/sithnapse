@@ -18,6 +18,8 @@
 #
 #
 
+import os
+
 from parameterized import parameterized
 
 from twisted.internet.testing import MemoryReactor
@@ -61,7 +63,7 @@ class PurgeTests(HomeserverTestCase):
         # The MTXDB client is process-global, while this test module creates a
         # fresh SQL database for each test. Keep the embedded keys isolated by
         # test method so state-group IDs from separate databases cannot collide.
-        namespace = f"{hs.hostname}:{self._testMethodName}"
+        namespace = f"{hs.hostname}:{os.getpid()}:{self._testMethodName}"
         persist_store = hs.get_datastores().persist_events
         assert persist_store is not None
         for store in (
