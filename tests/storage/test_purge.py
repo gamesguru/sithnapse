@@ -91,9 +91,14 @@ class PurgeTests(HomeserverTestCase):
 
         persist_store = self.hs.get_datastores().persist_events
         assert persist_store is not None
-        for store in (self.store, persist_store):
+        # `open_client` is process-global and becomes a no-op after the first
+        # call. Use the per-test directory as the namespace too, otherwise
+        # state-group IDs from separate tests collide in the shared client.
+        state_store = self.hs.get_datastores().state
+        for store in (self.store, persist_store, state_store):
             store._embedded_event_json_enabled = True
             store._embedded_db_engine = "mtxdb"
+            store._embedded_db_namespace = tmpdir
 
         engine = self.store._embedded_db_engine
         assert engine is not None
