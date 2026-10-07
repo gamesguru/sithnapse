@@ -322,21 +322,9 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
                 """
                 SELECT DISTINCT state_group FROM events_to_purge
                 INNER JOIN event_to_state_groups USING (event_id)
-                """
+            """
             )
             referenced_state_groups = {sg for (sg,) in txn}
-            # Capture the SQL mappings for events which have not yet been
-            # migrated to MTXDB. The SQL rows are removed below, so without
-            # this snapshot those events would be absent from the embedded
-            # lookup and their refcounts would never be decremented.
-            txn.execute(
-                """
-                SELECT event_id, state_group FROM events_to_purge
-                INNER JOIN event_to_state_groups USING (event_id)
-                WHERE should_delete
-                """
-            )
-            sql_event_id_to_state_group = dict(txn)
             logger.info("[purge] removing events from event_to_state_groups")
             txn.execute(
                 "DELETE FROM event_to_state_groups "
@@ -351,8 +339,6 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
                 purge_event_ids,
                 purpose="purge_traversal",
             )
-            sql_event_id_to_state_group.update(event_id_to_state_group)
-            event_id_to_state_group = sql_event_id_to_state_group
             referenced_state_groups.update(event_id_to_state_group.values())
             logger.info(
                 "[purge] found %i referenced state groups", len(referenced_state_groups)
