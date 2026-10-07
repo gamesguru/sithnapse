@@ -18,8 +18,6 @@
 #
 #
 
-import os
-
 from parameterized import parameterized
 
 from twisted.internet.testing import MemoryReactor
@@ -59,20 +57,7 @@ class PurgeTests(HomeserverTestCase):
     servlets = [room.register_servlets]
 
     def make_homeserver(self, reactor: MemoryReactor, clock: Clock) -> HomeServer:
-        hs = self.setup_test_homeserver("server")
-        # The MTXDB client is process-global, while this test module creates a
-        # fresh SQL database for each test. Keep the embedded keys isolated by
-        # test method so state-group IDs from separate databases cannot collide.
-        namespace = f"{hs.hostname}:{os.getpid()}:{self._testMethodName}"
-        persist_store = hs.get_datastores().persist_events
-        assert persist_store is not None
-        for store in (
-            hs.get_datastores().main,
-            persist_store,
-            hs.get_datastores().state,
-        ):
-            store._embedded_db_namespace = namespace
-        return hs
+        return self.setup_test_homeserver("server")
 
     def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
         self.room_id = self.helper.create_room_as(self.user_id)
@@ -105,14 +90,9 @@ class PurgeTests(HomeserverTestCase):
 
         persist_store = self.hs.get_datastores().persist_events
         assert persist_store is not None
-        # `open_client` is process-global and becomes a no-op after the first
-        # call. Use the per-test directory as the namespace too, otherwise
-        # state-group IDs from separate tests collide in the shared client.
-        state_store = self.hs.get_datastores().state
-        for store in (self.store, persist_store, state_store):
+        for store in (self.store, persist_store):
             store._embedded_event_json_enabled = True
             store._embedded_db_engine = "mtxdb"
-            store._embedded_db_namespace = tmpdir
 
         engine = self.store._embedded_db_engine
         assert engine is not None
@@ -573,8 +553,13 @@ class PurgeTests(HomeserverTestCase):
             self.room_id, "org.matrix.test", body={"number": 2}
         )
         # Create enough state events to require multiple batches of
-        # mark_unreferenced_state_groups_for_deletion_bg_update to be run.
-        for i in range(200):
+        # mark_unreferenced_state_groups_for_deletion_bg_update to be run. Sending
+        # events is the slow part, so shrink the batch size rather than send
+        # hundreds of events.
+        updates = self.store.db_pool.updates
+        updates.default_background_batch_size = 5
+        updates.minimum_background_batch_size = 1
+        for i in range(20):
             self.helper.send_state(self.room_id, "org.matrix.test", body={"number": i})
         self.helper.send(self.room_id, body="test4")
         last = self.helper.send(self.room_id, body="test5")
