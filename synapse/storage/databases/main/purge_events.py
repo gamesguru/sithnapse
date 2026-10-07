@@ -297,7 +297,7 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             [(room_id, event_id) for (event_id,) in new_backwards_extrems],
         )
 
-        logger.info("[purge] finding state groups referenced by deleted events")
+        logger.info("[purge] finding state groups referenced by purge-set events")
 
         if getattr(self, "_embedded_event_json_enabled", False):
             # Exclusive by configured engine, not a dual-write -- see
@@ -307,7 +307,7 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             # it is not the reverse "is state_group X still referenced
             # elsewhere" question (that's get_referenced_state_groups,
             # backed by the separate refcount).
-            purge_event_ids = [event_id for event_id, _should_delete in event_rows]
+            purge_set_event_ids = [event_id for event_id, _should_delete in event_rows]
 
             # Rows not yet migrated from SQL (the migration deletes each row once
             # copied) may reference state groups too. Delete them *before*
@@ -324,6 +324,8 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             )
             referenced_state_groups = {sg for (sg,) in txn}
             logger.info("[purge] removing events from event_to_state_groups")
+            # State events retained as outliers must also stop referencing their
+            # state groups, even though their event rows are kept.
             txn.execute(
                 "DELETE FROM event_to_state_groups "
                 "WHERE event_id IN (SELECT event_id from events_to_purge)"
@@ -333,7 +335,7 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             event_id_to_state_group = get_state_group_for_events_batch(
                 self._embedded_db_engine,
                 self._embedded_db_namespace,
-                purge_event_ids,
+                purge_set_event_ids,
                 purpose="purge_traversal",
             )
             referenced_state_groups.update(event_id_to_state_group.values())
