@@ -2084,76 +2084,30 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
         if check_pid_guard()? {
             return Ok(());
         }
-        let layout = DatabaseLayout::open(std::path::PathBuf::from(&path)).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("failed to open mtxdb layout: {}", e))
-        })?;
-        let state_dir = layout.pool_dir(ShardType::State)?;
-        let event_dag_dir = layout.pool_dir(ShardType::EventDag)?;
-        let auth_chain_dir = layout.pool_dir(ShardType::Edges)?;
-        let server_info_dir = layout.pool_dir(ShardType::ServerInfo)?;
         // State pool holds HAMT nodes, roots, and state-group sidecars --
         // dense structural hashes, not text. zstd never shrinks them (see
         // mtxdb's own compression bench), so every write there was still
         // paying the compressor's full match-finding pass for nothing.
-        // open_with_compression(.., false) skips the attempt entirely; the
-        // event-dag/auth-chain pools (JSON-ish payloads) keep compression on.
-        let shared_database = if wal_enabled() {
-            Some(
-                Database::open_with_policies(
-                    std::path::PathBuf::from(&path),
-                    mtxdb::matrix_pool_policies(),
-                )
-                .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "failed to open shared mtxdb database: {}",
-                        e
-                    ))
-                })?,
-            )
-        } else {
-            None
-        };
-
-        let (state, event_dag, auth_chain, server_info) =
-            if let Some(database) = shared_database.as_ref() {
-                (
-                    database.pool(ShardType::State).clone(),
-                    database.pool(ShardType::EventDag).clone(),
-                    database.pool(ShardType::Edges).clone(),
-                    database.pool(ShardType::ServerInfo).clone(),
-                )
-            } else {
-                (
-                    Arc::new(
-                        PackfileStorage::open_with_compression(state_dir.clone(), false).map_err(
-                            |e| {
-                                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                                    "failed to open mtxdb state pool: {}",
-                                    e
-                                ))
-                            },
-                        )?,
-                    ),
-                    Arc::new(PackfileStorage::open(event_dag_dir.clone()).map_err(|e| {
-                        pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "failed to open mtxdb event-dag pool: {}",
-                            e
-                        ))
-                    })?),
-                    Arc::new(PackfileStorage::open(auth_chain_dir.clone()).map_err(|e| {
-                        pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "failed to open mtxdb auth-chain pool: {}",
-                            e
-                        ))
-                    })?),
-                    Arc::new(PackfileStorage::open(server_info_dir.clone()).map_err(|e| {
-                        pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "failed to open mtxdb server-info pool: {}",
-                            e
-                        ))
-                    })?),
-                )
-            };
+        // The matrix pool policies disable compression for state while keeping
+        // it enabled for the event-DAG and auth-chain pools.
+        // The current MTXDB layout gives all pools beneath a database root one
+        // shared WAL and writer lock. Open the root once so each pool attaches
+        // as a shared member; opening the pools individually would make the
+        // second pool try to acquire the root lock a second time.
+        let shared_database = Database::open_with_policies(
+            std::path::PathBuf::from(&path),
+            mtxdb::matrix_pool_policies(),
+        )
+        .map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "failed to open shared mtxdb database: {}",
+                e
+            ))
+        })?;
+        let state = shared_database.pool(ShardType::State).clone();
+        let event_dag = shared_database.pool(ShardType::EventDag).clone();
+        let auth_chain = shared_database.pool(ShardType::Edges).clone();
+        let server_info = shared_database.pool(ShardType::ServerInfo).clone();
         // A single writer's in-memory index is authoritative for every key it
         // has written, so a negative lookup is a true miss: refreshing would
         // only spend a durable-fingerprint probe (and, after each checkpoint,
@@ -2169,10 +2123,7 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
         // cross-process read-after-write path. Every root uses one tagged
         // root-level segment; the layout marker is historical metadata.
         //
-        // Still gated on `wal_enabled()`: enabling it by default moves the
-        // sync fsync target onto the journal, which has not been
-        // A/B-verified on the writer + read-only-worker lane. Set
-        // SYNAPSE_MTXDB_WAL=1 to exercise the overlay.
+        // `Database` owns the root's tagged shared WAL.
         let min_interval_secs = std::env::var("SYNAPSE_MTXDB_CHECKPOINT_MIN_INTERVAL_SECS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -2192,7 +2143,7 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
             event_dag,
             auth_chain,
             server_info,
-            shared_database,
+            shared_database: Some(shared_database),
         });
         let _ = OPENER_PID.set(std::process::id());
         let _ = WRITE_MODE.set(true);
