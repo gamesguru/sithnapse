@@ -4416,10 +4416,6 @@ fn stats_to_dict(
             ot.pool_meta_persist.as_micros() as u64,
         )?;
         od.set_item(
-            "initial_pack_create_us",
-            ot.initial_pack_create.as_micros() as u64,
-        )?;
-        od.set_item(
             "metadata_unattributed_us",
             ot.metadata_unattributed.as_micros() as u64,
         )?;
