@@ -134,7 +134,6 @@ class FederationServerTests(unittest.FederatingHomeserverTestCase):
             room_version=room_version,
         )
         self.get_success(store.insert_received_event_to_staging(origin, first_event))
-        self.get_success(store.insert_received_event_to_staging(origin, second_event))
 
         lock = self.get_success(
             store.try_acquire_lock("federation_inbound_pdu", room_id)
@@ -145,10 +144,21 @@ class FederationServerTests(unittest.FederatingHomeserverTestCase):
 
         async def on_receive_pdu(_origin: str, event: EventBase) -> None:
             processed.append(event.event_id)
+            if event.event_id == first_event.event_id:
+                # Stage the successor while the drainer still owns the room
+                # lock. The producer must not strand it when its lock attempt
+                # loses the race with the current drainer.
+                self.get_success(
+                    store.insert_received_event_to_staging(origin, second_event)
+                )
+                self.assertIsNone(
+                    self.get_success(
+                        store.try_acquire_lock("federation_inbound_pdu", room_id)
+                    )
+                )
             if event.event_id == second_event.event_id:
-                # The first lock must have been released before looking for the
-                # second event. Otherwise a concurrently staged event can see
-                # that live lock, decline to start a drainer, and be stranded.
+                # The drainer must pick up the successor after the first event
+                # releases the lock and checks the queue atomically.
                 self.assertTrue(lock._dropped)
 
         with (

@@ -1594,6 +1594,21 @@ class FederationServer(FederationBase):
 
                         events_since_prune_check += len(staged_events)
 
+                        (
+                            queue_is_empty,
+                            lock_is_valid,
+                        ) = await self.store.release_inbound_pdu_lock_if_staging_empty(
+                            room_id, lock
+                        )
+                        if not lock_is_valid:
+                            logger.info(
+                                "Lost inbound PDU processing lock for room %s while draining",
+                                room_id,
+                            )
+                            return
+                        if queue_is_empty:
+                            return
+
                     # A declined or failed batch must fall through to the
                     # conservative single-event path below. In particular, do
                     # not remove the later staged events: they may be outliers,
@@ -1641,6 +1656,21 @@ class FederationServer(FederationBase):
                             **{SERVER_NAME_LABEL: self.server_name}
                         ).observe((self._clock.time_msec() - received_ts) / 1000)
                     events_since_prune_check += 1
+
+                    (
+                        queue_is_empty,
+                        lock_is_valid,
+                    ) = await self.store.release_inbound_pdu_lock_if_staging_empty(
+                        room_id, lock
+                    )
+                    if not lock_is_valid:
+                        logger.info(
+                            "Lost inbound PDU processing lock for room %s while draining",
+                            room_id,
+                        )
+                        return
+                    if queue_is_empty:
+                        return
 
             # The lock is deliberately released before this query. If a producer
             # staged an event before the release it will be found here; if it
