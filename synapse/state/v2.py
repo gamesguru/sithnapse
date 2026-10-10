@@ -142,7 +142,6 @@ async def resolve_events_with_store(
     if room_version.state_res == StateResolutionVersions.V2_1:
         # calculate the conflicted subgraph
         conflicted_set = set(itertools.chain.from_iterable(conflicted_state.values()))
-    conflicted_key_event_ids = conflicted_set
     complete_event_graph = room_version.state_res == StateResolutionVersions.V2 and all(
         event_id in event_map
         for state_set in state_sets
@@ -279,7 +278,6 @@ async def resolve_events_with_store(
             base_state,
             event_map,
             state_res_store,
-            conflicted_key_event_ids,
         )
         if conflict_cache is not None and cache_key is not None:
             conflict_cache[cache_key] = resolved_state
@@ -440,7 +438,6 @@ async def _resolve_conflicted_set_with_rust(
     base_state: StateMap[str],
     event_map: dict[str, EventBase],
     state_res_store: StateResolutionStore,
-    conflicted_key_event_ids: set[str] | None = None,
 ) -> StateMap[str]:
     """Resolve the conflicted set on top of `base_state`, preferring Rust for v2/v2.1.
 
@@ -479,9 +476,6 @@ async def _resolve_conflicted_set_with_rust(
                 list(full_conflicted_set),
                 event_map,
                 room_version.state_res,
-                sorted(conflicted_key_event_ids)
-                if conflicted_key_event_ids is not None
-                else None,
             )
             logger.debug(
                 "[gg-state-timing] state_v2_rust_resolve "
