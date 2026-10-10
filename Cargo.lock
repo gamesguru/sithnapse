@@ -127,9 +127,9 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cc"
-version = "1.6.0"
+version = "1.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f74872d07caf508b30a21f6836e7d7016a2eaf7d9ff4f48deaa58cd8a0407630"
+checksum = "50a649af8a827553c29fb0cb4bd4a6f1a0dd695bd3232b9bc98bd9c8a3ffbb8b"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -1000,7 +1000,7 @@ dependencies = [
 [[package]]
 name = "mtxdb"
 version = "0.1.0-beta.2"
-source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=refactor%2Fpack-id-store-layout#1ef68837de3a97079253c1e3f2ec762dfee71acd"
+source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=refactor%2Fpack-id-store-layout#9b154c6201828a8da19d0ac2c9c2ed075215a89c"
 dependencies = [
  "arc-swap",
  "blake3",
@@ -1362,7 +1362,7 @@ dependencies = [
 [[package]]
 name = "rezzy"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#74d8aabace81354fbe9f340985fbd79b8d469282"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#72b59188baac2be6d04b15194ae5e225195c4746"
 dependencies = [
  "base64 0.23.1",
  "blake3",
@@ -1375,7 +1375,7 @@ dependencies = [
 [[package]]
 name = "rezzy-json"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#74d8aabace81354fbe9f340985fbd79b8d469282"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#72b59188baac2be6d04b15194ae5e225195c4746"
 dependencies = [
  "ryu",
 ]
@@ -1383,7 +1383,7 @@ dependencies = [
 [[package]]
 name = "rezzy-recon"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#74d8aabace81354fbe9f340985fbd79b8d469282"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#72b59188baac2be6d04b15194ae5e225195c4746"
 dependencies = [
  "base64 0.23.1",
  "sha2",
