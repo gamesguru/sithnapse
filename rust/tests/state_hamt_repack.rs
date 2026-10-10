@@ -2,7 +2,7 @@ use std::sync::Once;
 
 use pyo3::prelude::*;
 use rezzy::hamt::state_group_id_from_lthash;
-use rezzy::state::LtHash;
+use rezzy::incremental::LtHash;
 use synapse::database::mtxdb_syn::{
     delete_state_hamt_roots_for_room, get_state_hamt_roots_by_state_group_id,
     get_state_hamt_roots_for_room, open_client, put_state_hamt_roots, repack,

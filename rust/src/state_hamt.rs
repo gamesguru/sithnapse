@@ -21,7 +21,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyModule, PyModuleMethods};
 use rezzy::{
     hamt::{HamtNode, NodeRef, PersistedInternalNode, RootHandle, StateGroupId, StructuralHash},
-    LtHash,
+    incremental::LtHash,
 };
 use sha2::{Digest, Sha256};
 
