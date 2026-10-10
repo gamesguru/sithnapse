@@ -24,7 +24,8 @@ use pythonize::depythonize;
 use rezzy::basespec::event_types::MAX_POWER_LEVEL_JSON;
 use rezzy::{
     auth::roaring::AuthGraph, basespec::event_types::EventType, is_valid_mxid,
-    resolve_semilattice_fold, EventContent, LeanEvent, RoomId, SharedState, StateResVersion,
+    resolve_semilattice_fold, resolve_semilattice_fold_with_conflicted_keys, EventContent,
+    LeanEvent, RoomId, SharedState, StateResVersion,
 };
 use serde_json::Value;
 
@@ -553,15 +554,32 @@ fn py_to_lean_event(py_ev: &Bound<'_, PyAny>) -> PyResult<LeanEvent<String, Reso
 /// conflicted events that pass auth applied over it; callers layer the full
 /// unconflicted state on top.
 #[pyfunction]
-#[pyo3(text_signature = "(base_state, conflicted_event_ids, event_map, /)")]
+#[pyo3(
+    signature = (
+        base_state,
+        conflicted_event_ids,
+        event_map,
+        state_res_version = 2,
+        conflicted_key_event_ids = None,
+    )
+)]
 pub fn resolve_v2_via_lattice_fold<'py>(
     py: Python<'py>,
     base_state: Bound<'py, PyDict>,
     conflicted_event_ids: Bound<'py, PyAny>,
     event_map: Bound<'py, PyDict>,
+    state_res_version: i32,
+    conflicted_key_event_ids: Option<Vec<String>>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let parsed_events = parse_event_map(event_map)?;
-    resolve_v2_from_parsed_events(py, base_state, conflicted_event_ids, &parsed_events)
+    resolve_v2_from_parsed_events(
+        py,
+        base_state,
+        conflicted_event_ids,
+        &parsed_events,
+        state_res_version,
+        conflicted_key_event_ids,
+    )
 }
 
 fn parse_event_map(
@@ -580,11 +598,23 @@ fn parse_event_map(
     Ok(parsed_events)
 }
 
+fn rezzy_state_res_version(version: i32) -> PyResult<StateResVersion> {
+    match version {
+        2 => Ok(StateResVersion::V2),
+        3 => Ok(StateResVersion::V2_1),
+        _ => Err(pyo3::exceptions::PyValueError::new_err(
+            "unsupported state resolution version",
+        )),
+    }
+}
+
 fn resolve_v2_from_parsed_events<'py>(
     py: Python<'py>,
     base_state: Bound<'py, PyDict>,
     conflicted_event_ids: Bound<'py, PyAny>,
     parsed_events: &HashMap<String, LeanEvent<String, ResolverContent>>,
+    state_res_version: i32,
+    conflicted_key_event_ids: Option<Vec<String>>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let mut base_state_map = SharedState::new();
     for (k, v) in base_state.iter() {
@@ -595,21 +625,45 @@ fn resolve_v2_from_parsed_events<'py>(
 
     let conflicted_ids: Vec<String> = conflicted_event_ids.extract()?;
     let mut conflicted_events = HashMap::with_capacity(conflicted_ids.len());
-    for id in conflicted_ids {
-        if let Some(ev) = parsed_events.get(&id) {
+    for id in &conflicted_ids {
+        if let Some(ev) = parsed_events.get(id) {
             conflicted_events.insert(id.clone(), ev.clone());
         }
     }
 
     // Auth checking over the conflicted subgraph is pure Rust on owned data;
     // release the GIL so other Python workers keep running while it resolves.
+    let rezzy_version = rezzy_state_res_version(state_res_version)?;
     let resolved = py.detach(|| {
-        resolve_semilattice_fold(
-            &base_state_map,
-            &conflicted_events,
-            parsed_events,
-            StateResVersion::V2,
-        )
+        if rezzy_version == StateResVersion::V2_1 {
+            let conflicted_keys = conflicted_key_event_ids
+                .as_deref()
+                .unwrap_or(&conflicted_ids)
+                .iter()
+                .filter_map(|id| parsed_events.get(id))
+                .map(|event| {
+                    (
+                        EventType::from(event.event_type.clone()),
+                        event.state_key.clone().unwrap_or_default(),
+                    )
+                })
+                .collect();
+
+            resolve_semilattice_fold_with_conflicted_keys(rezzy::ConflictedKeysInputs::new(
+                &base_state_map,
+                &conflicted_events,
+                parsed_events,
+                rezzy_version,
+                &conflicted_keys,
+            ))
+        } else {
+            resolve_semilattice_fold(
+                &base_state_map,
+                &conflicted_events,
+                parsed_events,
+                rezzy_version,
+            )
+        }
     });
 
     let py_resolved = PyDict::new(py);
