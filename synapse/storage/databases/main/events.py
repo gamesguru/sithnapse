@@ -22,7 +22,9 @@
 import collections
 import itertools
 import logging
+import time
 from collections import OrderedDict
+from collections.abc import Set
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -56,7 +58,6 @@ from synapse.events import (
 )
 from synapse.events.py_protocol import MSC4242Event, supports_msc4242_state_dag
 from synapse.events.snapshot import EventPersistencePair
-from synapse.events.utils import parse_stripped_state_event
 from synapse.logging.opentracing import trace
 from synapse.metrics import SERVER_NAME_LABEL
 from synapse.storage._base import db_to_json, make_in_list_sql_clause
@@ -66,13 +67,25 @@ from synapse.storage.database import (
     LoggingTransaction,
     make_tuple_in_list_sql_clause,
 )
-from synapse.storage.databases.main.embedded_common import Pool, mark_dirty
+from synapse.storage.databases.main.embedded_common import (
+    Pool,
+    SyncTier,
+    begin_embedded_transaction,
+    ffi_count,
+    ffi_timing,
+    mark_dirty,
+    maybe_sync,
+    publishes_at_commit,
+    record_commit_phases,
+)
 from synapse.storage.databases.main.embedded_event_edges import (
+    bump_room_edge_source_version,
     embedded_event_edges_is_writable,
     open_embedded_event_edges_engine,
-    queue_edge_write,
+    put_event_edges_batch,
 )
 from synapse.storage.databases.main.embedded_event_json import (
+    get_event_json_batch,
     open_embedded_event_json_engine,
     put_event_json_batch,
 )
@@ -81,18 +94,26 @@ from synapse.storage.databases.main.embedded_event_to_state_group import (
     increment_state_group_refcounts_batch,
     put_event_to_state_group_batch,
 )
+from synapse.storage.databases.main.embedded_redactions import (
+    put_redaction_batch,
+    set_have_censored_batch,
+)
+from synapse.storage.databases.main.embedded_rejections import put_rejection_batch
 from synapse.storage.databases.main.event_federation import EventFederationStore
 from synapse.storage.databases.main.events_worker import EventCacheEntry
 from synapse.storage.databases.main.search import SearchEntry
 from synapse.storage.engines import PostgresEngine
 from synapse.storage.util.id_generators import AbstractStreamIdGenerator
 from synapse.storage.util.sequence import SequenceGenerator
+from synapse.synapse_rust.events import redact_event
+from synapse.synapse_rust.room_versions import EventFormatVersions, RoomVersion
 from synapse.types import (
     JsonDict,
     MutableStateMap,
     StateMap,
     StrCollection,
     UserID,
+    get_domain_from_id,
 )
 from synapse.types.handlers import SLIDING_SYNC_DEFAULT_BUMP_EVENT_TYPES
 from synapse.types.state import StateFilter
@@ -104,6 +125,7 @@ from synapse.util.stringutils import non_null_str_or_none
 if TYPE_CHECKING:
     from synapse.server import HomeServer
     from synapse.storage.databases.main import DataStore
+    from synapse.synapse_rust.mtxdb_engine import MtxdbTransaction
 
 
 logger = logging.getLogger(__name__)
@@ -147,6 +169,23 @@ SLIDING_SYNC_RELEVANT_STATE_SET = (
     (EventTypes.Name, ""),
     # So we can fill in the `tombstone_successor_room_id` column
     (EventTypes.Tombstone, ""),
+)
+
+# Event types that participate in a room's auth chain (see
+# `synapse.event_auth.auth_types_for_event`). A state change to any of these
+# can be read back by a subsequent, non-retrying request from another worker
+# process -- make_join/make_knock fetch auth events, /sync and /join read the
+# membership -- so in the exclusive engine an unsynced write here is a hard
+# 404 rather than a slow SQL-fallback read. `_persist_events_txn` uses this to
+# decide which writes must be made durable before their response is returned.
+AUTH_CHAIN_EVENT_TYPES = frozenset(
+    {
+        EventTypes.Create,
+        EventTypes.Member,
+        EventTypes.JoinRules,
+        EventTypes.PowerLevels,
+        EventTypes.ThirdPartyInvite,
+    }
 )
 
 
@@ -261,6 +300,13 @@ class NewEventChainLinks:
     links: list[tuple[int, int]] = attr.Factory(list)
 
 
+def _event_dict_for_embedded_json(event: EventBase) -> JsonDict:
+    d = event.get_dict_for_persistence()
+    d.pop("redacted", None)
+    d.pop("redacted_because", None)
+    return d
+
+
 class PersistEventsStore:
     """Contains all the functions for writing events to the database.
 
@@ -284,7 +330,9 @@ class PersistEventsStore:
         self._clock = hs.get_clock()
         self._instance_name = hs.get_instance_name()
         self._msc4354_enabled = hs.config.experimental.msc4354_enabled
-        self._msc4429_enabled = hs.config.server.include_profile_updates_in_sync
+        self._include_profile_updates_in_sync = (
+            hs.config.server.include_profile_updates_in_sync
+        )
 
         self._ephemeral_messages_enabled = hs.config.server.enable_ephemeral_messages
         self.is_mine_id = hs.is_mine_id
@@ -292,9 +340,9 @@ class PersistEventsStore:
         self._embedded_event_json_enabled = open_embedded_event_json_engine(hs)
         self._embedded_event_edges_enabled = open_embedded_event_edges_engine(hs)
         self._embedded_event_edges_writable = embedded_event_edges_is_writable(hs)
-        self._embedded_hamt_engine = hs.config.database.embedded_hamt_engine
-        self._embedded_hamt_namespace = (
-            hs.config.database.embedded_hamt_namespace or hs.hostname
+        self._embedded_db_engine = hs.config.database.embedded_db_engine
+        self._embedded_db_namespace = (
+            hs.config.database.embedded_db_namespace or hs.hostname
         )
 
         # This should only exist on instances that are configured to write
@@ -400,6 +448,24 @@ class PersistEventsStore:
                     )
                 )
 
+            sticky_events_to_un_soft_fail: set[str] = set()
+            if self._msc4354_enabled and state_delta_for_room is not None:
+                # When we change the room's current state with `state_delta_for_room`,
+                # that might cause some previously soft-failed sticky events to now pass
+                # the state-dependent auth checks.
+                # In other words, the sticky events could have been valid if they had
+                # waited for these state changes.
+                # For that reason, we give sticky events a second chance.
+                # We compute them here and then un-soft-fail them atomically with the
+                # persistence of the events.
+                sticky_events_to_un_soft_fail = (
+                    await self.store.compute_sticky_events_to_un_soft_fail(
+                        room_id,
+                        events_and_contexts,
+                        state_delta_for_room,
+                    )
+                )
+
             await self.db_pool.runInteraction(
                 "persist_events",
                 self._persist_events_txn,
@@ -411,6 +477,7 @@ class PersistEventsStore:
                 new_event_links=new_event_links,
                 sliding_sync_table_changes=sliding_sync_table_changes,
                 new_state_dag_forward_extremities=new_state_dag_forward_extremities,
+                sticky_events_to_un_soft_fail=sticky_events_to_un_soft_fail,
             )
 
             persist_event_counter.labels(**{SERVER_NAME_LABEL: self.server_name}).inc(
@@ -422,7 +489,7 @@ class PersistEventsStore:
                 # stream_ordering.
                 synapse.metrics.event_persisted_position.labels(
                     **{SERVER_NAME_LABEL: self.server_name}
-                ).set(stream)
+                ).set(stream_orderings[-1])
 
             for event, context in events_and_contexts:
                 if context.app_service:
@@ -962,7 +1029,7 @@ class PersistEventsStore:
             event_to_types,
             event_to_auth_chain,
             resolve_namespace(self),
-            self._embedded_hamt_engine,
+            self._embedded_db_engine,
         )
 
     async def _get_events_which_are_prevs(self, event_ids: Iterable[str]) -> list[str]:
@@ -981,7 +1048,7 @@ class PersistEventsStore:
             txn: LoggingTransaction, batch: Collection[str]
         ) -> None:
             sql = """
-            SELECT prev_event_id, internal_metadata
+            SELECT prev_event_id, internal_metadata, event_id
             FROM event_edges
                 INNER JOIN events USING (event_id)
                 LEFT JOIN rejections USING (event_id)
@@ -997,7 +1064,28 @@ class PersistEventsStore:
             )
 
             txn.execute(sql + clause, args)
-            results.extend(r[0] for r in txn if not db_to_json(r[1]).get("soft_failed"))
+            rows = txn.fetchall()
+            if not rows:
+                return
+
+            missing_meta_ids = [event_id for _, meta, event_id in rows if meta is None]
+            meta_by_id = {}
+            if missing_meta_ids and getattr(
+                self, "_embedded_event_json_enabled", False
+            ):
+                found = get_event_json_batch(
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
+                    missing_meta_ids,
+                )
+                for eid, (m, _, _) in found.items():
+                    meta_by_id[eid] = m
+
+            for prev_event_id, meta, event_id in rows:
+                if meta is None:
+                    meta = meta_by_id.get(event_id)
+                if not meta or not db_to_json(meta).get("soft_failed"):
+                    results.append(prev_event_id)
 
         for chunk in batch_iter(event_ids, 100):
             await self.db_pool.runInteraction(
@@ -1056,13 +1144,33 @@ class PersistEventsStore:
                 )
 
                 txn.execute(sql + clause, args)
+                rows = txn.fetchall()
                 to_recursively_check = []
 
-                for _, prev_event_id, metadata, rejected in txn:
+                missing_meta_ids = [
+                    event_id for event_id, _, meta, _ in rows if meta is None
+                ]
+                meta_by_id = {}
+                if missing_meta_ids and getattr(
+                    self, "_embedded_event_json_enabled", False
+                ):
+                    found = get_event_json_batch(
+                        self._embedded_db_engine,
+                        self._embedded_db_namespace,
+                        missing_meta_ids,
+                    )
+                    for eid, (m, _, _) in found.items():
+                        meta_by_id[eid] = m
+
+                for event_id, prev_event_id, metadata, rejected in rows:
                     if prev_event_id in existing_prevs:
                         continue
+                    if metadata is None:
+                        metadata = meta_by_id.get(event_id)
 
-                    soft_failed = db_to_json(metadata).get("soft_failed")
+                    soft_failed = (
+                        db_to_json(metadata).get("soft_failed") if metadata else False
+                    )
                     if (include_soft_failed and soft_failed) or rejected:
                         to_recursively_check.append(prev_event_id)
                         existing_prevs.add(prev_event_id)
@@ -1086,6 +1194,102 @@ class PersistEventsStore:
         new_event_links: dict[str, NewEventChainLinks],
         sliding_sync_table_changes: SlidingSyncTableChanges | None,
         new_state_dag_forward_extremities: set[str] | None = None,
+        sticky_events_to_un_soft_fail: Set[str] = frozenset(),
+    ) -> None:
+        """Persist events, staging the embedded event-JSON writes in one mtxdb
+        transaction that commits with this SQL transaction.
+
+        The staged writes are invisible to every reader until `commit()`. They
+        are committed here, at the end of the body and before the SQL COMMIT,
+        so an event's JSON is visible before its row can be (exclusive mode has
+        no SQL copy to fall back to, so the reverse order would be a hard
+        event-not-found). Anything that raises first aborts the staged writes,
+        so a failed or retried attempt leaves nothing behind. The one window
+        left is the SQL COMMIT itself failing after mtxdb committed: that
+        leaves JSON with no row, which no reader asks for, because reads only
+        look up ids discovered from committed SQL rows.
+
+        This must not move to `txn.call_after`: after-commit callbacks
+        accumulate across retried attempts and all run on the final success, so
+        an earlier failed attempt's writes would be committed too, and they run
+        on the reactor thread after the row is already visible.
+
+        See `_persist_events_txn_body` for the arguments.
+        """
+        mtxdb_txn = (
+            begin_embedded_transaction() if self._embedded_event_json_enabled else None
+        )
+        if mtxdb_txn is None:
+            self._persist_events_txn_body(
+                txn,
+                room_id=room_id,
+                events_and_contexts=events_and_contexts,
+                inhibit_local_membership_updates=inhibit_local_membership_updates,
+                state_delta_for_room=state_delta_for_room,
+                new_forward_extremities=new_forward_extremities,
+                new_event_links=new_event_links,
+                sliding_sync_table_changes=sliding_sync_table_changes,
+                new_state_dag_forward_extremities=new_state_dag_forward_extremities,
+                sticky_events_to_un_soft_fail=sticky_events_to_un_soft_fail,
+                mtxdb_txn=None,
+            )
+            return
+
+        ffi_count("txn_begun", 1)
+        commit_started = False
+        try:
+            self._persist_events_txn_body(
+                txn,
+                room_id=room_id,
+                events_and_contexts=events_and_contexts,
+                inhibit_local_membership_updates=inhibit_local_membership_updates,
+                state_delta_for_room=state_delta_for_room,
+                new_forward_extremities=new_forward_extremities,
+                new_event_links=new_event_links,
+                sliding_sync_table_changes=sliding_sync_table_changes,
+                new_state_dag_forward_extremities=new_state_dag_forward_extremities,
+                sticky_events_to_un_soft_fail=sticky_events_to_un_soft_fail,
+                mtxdb_txn=mtxdb_txn,
+            )
+            commit_started = True
+            _ct = time.monotonic()
+            engine_seconds = mtxdb_txn.commit()
+            total_seconds = time.monotonic() - _ct
+            ffi_timing("ffi_txn_commit", total_seconds)
+            ffi_timing("ffi_txn_commit_engine", engine_seconds)
+            # What is left after the engine's own time: the wait to get the GIL
+            # (and a CPU) back once the commit returned.
+            ffi_timing(
+                "ffi_txn_commit_gil_wait", max(0.0, total_seconds - engine_seconds)
+            )
+            ffi_count("txn_committed", 1)
+            record_commit_phases()
+        except BaseException:
+            # After a failed commit the group may already be published, and
+            # aborting a published transaction is an error that would hide the
+            # real one, so only abort what is still purely staged.
+            if not commit_started:
+                ffi_count("txn_aborted", 1)
+                try:
+                    mtxdb_txn.abort()
+                except Exception:
+                    logger.exception("Failed to abort the mtxdb transaction")
+            raise
+
+    def _persist_events_txn_body(
+        self,
+        txn: LoggingTransaction,
+        *,
+        room_id: str,
+        events_and_contexts: list[EventPersistencePair],
+        inhibit_local_membership_updates: bool,
+        state_delta_for_room: DeltaState | None,
+        new_forward_extremities: set[str] | None,
+        new_event_links: dict[str, NewEventChainLinks],
+        sliding_sync_table_changes: SlidingSyncTableChanges | None,
+        new_state_dag_forward_extremities: set[str] | None,
+        sticky_events_to_un_soft_fail: Set[str] = frozenset(),
+        mtxdb_txn: "MtxdbTransaction | None",
     ) -> None:
         """Insert some number of room events into the necessary database tables.
 
@@ -1114,6 +1318,8 @@ class PersistEventsStore:
                 `sliding_sync_membership_snapshots` and `sliding_sync_joined_rooms` tables
                 derived from the given `delta_state` (see
                 `_calculate_sliding_sync_table_changes(...)`)
+            sticky_events_to_un_soft_fail:
+                Sticky events which will be un-soft-failed when persisting the events.
 
         Raises:
             PartialStateConflictError: if attempting to persist a partial state event in
@@ -1123,6 +1329,7 @@ class PersistEventsStore:
 
         min_stream_order = events_and_contexts[0][0].internal_metadata.stream_ordering
         max_stream_order = events_and_contexts[-1][0].internal_metadata.stream_ordering
+        room_version = events_and_contexts[0][0].room_version
 
         # We check that the room still exists for events we're trying to
         # persist. This is to protect against races with deleting a room.
@@ -1176,15 +1383,74 @@ class PersistEventsStore:
         )
 
         # _update_outliers_txn filters out any events which have already been
-        # persisted, and returns the filtered list.
-        events_and_contexts = self._update_outliers_txn(
+        # persisted, and returns the filtered list. It also returns the events it
+        # de-outliered: those are removed from the list but still wrote embedded
+        # state-group mappings, so the barrier below must consider them too.
+        events_and_contexts, de_outliered_events = self._update_outliers_txn(
             txn, events_and_contexts=events_and_contexts
         )
+
+        if de_outliered_events:
+            logger.info(
+                "_persist_events_and_batches_txn: de-outliered %d events: %s with prev_events: %s",
+                len(de_outliered_events),
+                [ev.event_id for ev, _ in de_outliered_events],
+                [(ev.event_id, ev.prev_event_ids()) for ev, _ in de_outliered_events],
+            )
+
+        # De-outliering removes an event before _store_event_txn, so its JSON
+        # would otherwise not be republished to the embedded event-dag mirror.
+        # Rewrite the idempotent record in this transaction: the mtxdb JSON
+        # must become visible before the SQL event row can be observed.
+        if self._embedded_event_json_enabled and de_outliered_events:
+            put_event_json_batch(
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
+                [
+                    (
+                        event.event_id,
+                        event.room_id,
+                        json_encoder.encode(event.internal_metadata.get_dict()),
+                        json_encoder.encode(_event_dict_for_embedded_json(event)),
+                        event.format_version,
+                    )
+                    for event, _ in de_outliered_events
+                ],
+                sync=False,
+                transaction=mtxdb_txn,
+            )
+
+            if publishes_at_commit():
+                txn.call_after(mark_dirty, Pool.EVENT_DAG)
 
         # From this point onwards the events are only events that we haven't
         # seen before.
 
-        self._store_event_txn(txn, events_and_contexts=events_and_contexts)
+        events_and_contexts = self._apply_existing_redaction_txn(
+            txn, room_id, room_version, events_and_contexts=events_and_contexts
+        )
+
+        # `_store_event_txn` writes the events and their JSON for every event,
+        # rejected ones included; `_store_rejected_events_txn` below then drops
+        # them from the list. Remember what was written *now*, or a persist in
+        # which every event is rejected would look as though it wrote no JSON
+        # and skip the durability barrier for it.
+        wrote_event_json = self._embedded_event_json_enabled and bool(
+            events_and_contexts or de_outliered_events
+        )
+        self._store_event_txn(
+            txn, events_and_contexts=events_and_contexts, mtxdb_txn=mtxdb_txn
+        )
+
+        # De-outliered events were not passed to _store_event_txn, so their
+        # edges have not been written to SQL event_edges or the embedded engine.
+        # Record and publish their edges now.
+        if de_outliered_events:
+            self._handle_mult_prev_events(
+                txn,
+                events=[ev for ev, _ in de_outliered_events],
+                update_backward_extremities=False,
+            )
 
         if new_forward_extremities:
             self._update_forward_extremities_txn(
@@ -1244,6 +1510,13 @@ class PersistEventsStore:
                 txn, [ev for ev, _ in events_and_contexts]
             )
 
+            # Un-soft-fail any sticky events that the state delta applied just above
+            # has made valid.
+            if sticky_events_to_un_soft_fail:
+                self.store.un_soft_fail_sticky_events_txn(
+                    txn, sticky_events_to_un_soft_fail
+                )
+
         # We only update the sliding sync tables for non-backfilled events.
         self._update_sliding_sync_tables_with_new_persisted_events_txn(
             txn, room_id, events_and_contexts
@@ -1252,9 +1525,122 @@ class PersistEventsStore:
         # Mark pools dirty after SQL commit via txn.call_after, so the
         # coalescer flushes only committed writes.  Gated on the embedded
         # engine being configured (same guard as the writes above).
-        if self._embedded_hamt_engine:
-            txn.call_after(mark_dirty, Pool.STATE)
-            txn.call_after(mark_dirty, Pool.AUTH_CHAIN)
+        #
+        # Exception: an auth-chain state change (membership, join rules, power
+        # levels, create, third-party invite) is read back by a subsequent,
+        # non-retrying request from another worker process -- make_join and
+        # make_knock fetch auth events, /sync and /join read the membership. In
+        # the exclusive engine there is no SQL fallback, so the coalescer's
+        # 250-500ms window is a hard 404 there. Make those writes durable before
+        # the response that depends on them is returned. Backfilled events are
+        # skipped -- no live request waits on them.
+        if self._embedded_db_engine:
+            needs_auth_chain_barrier = any(
+                ev.type in AUTH_CHAIN_EVENT_TYPES
+                and not ev.internal_metadata.is_outlier()
+                and ev.internal_metadata.stream_ordering is not None
+                and ev.internal_metadata.stream_ordering >= 0
+                for ev, _ in events_and_contexts
+            )
+            # Every live event with a state group can be read immediately by
+            # another worker (for example, when it becomes a prev event for a
+            # subsequent send). Deferring the mapping through the coalescer is
+            # therefore racy: the event can be visible in SQL before its
+            # embedded state-group mapping is visible to the reader. Do the
+            # targeted STATE durability barrier for all such
+            # events. Rejected events use state_group_before_event as their
+            # mapping, rather than ctx.state_group, so include those too.
+            # Auth-chain state changes still need the broader barrier
+            # below because their event-DAG and auth-chain records are also
+            # read by non-retrying worker requests.
+            needs_state_barrier = any(
+                (
+                    ctx.state_group is not None
+                    or (ctx.rejected and ctx.state_group_before_event is not None)
+                )
+                and not ev.internal_metadata.is_outlier()
+                and ev.internal_metadata.stream_ordering is not None
+                and ev.internal_metadata.stream_ordering >= 0
+                for ev, ctx in events_and_contexts
+            )
+            # A de-outliered event is excluded from `events_and_contexts` above (it
+            # was already in the events table) but its ex-outlier pass just wrote an
+            # event->state-group mapping on this writer (the referenced state group's
+            # HAMT root normally already exists). The next event in the same /send
+            # transaction reads that mapping back as a prev. `_update_outliers_txn`
+            # keeps the outlier's (often backfilled, negative) stream ordering, so the
+            # live-event filter above would skip it; a de-outlier is always a live
+            # operation, so it needs the STATE barrier regardless of stream ordering.
+            needs_state_barrier = needs_state_barrier or any(
+                (
+                    ctx.state_group is not None
+                    or (ctx.rejected and ctx.state_group_before_event is not None)
+                )
+                and not ev.internal_metadata.is_outlier()
+                for ev, ctx in de_outliered_events
+            )
+            # All three embedded pools share one write-ahead journal, so a
+            # single sync commits every pool's pending records: `sync_state`
+            # after writing to both the state and event-DAG pools costs one
+            # fsync, and a second or third barrier straight after it costs
+            # none. The number of fsyncs per persist therefore depends on how
+            # many *times* barriers are issued, not on how many pools they
+            # name, so `always` issues exactly one: here, at the end of the
+            # transaction after every embedded write, in the database thread
+            # (not from `call_after`, which runs on the reactor thread and
+            # would stall the whole process for each fsync). It is durable
+            # before the SQL commit, and concurrent transactions on other
+            # database threads coalesce on the same journal sync.
+            barrier_in_txn = (
+                self._embedded_event_json_enabled and not publishes_at_commit()
+            )
+            if self._embedded_event_json_enabled and needs_auth_chain_barrier:
+                if barrier_in_txn:
+                    maybe_sync(
+                        SyncTier.DURABLE,
+                        pools=[Pool.STATE, Pool.AUTH_CHAIN, Pool.EVENT_DAG],
+                    )
+                else:
+                    # `interval`/`off`: the reason for this barrier is that
+                    # another worker reads these writes back in a non-retrying
+                    # request, which is a visibility need, so publish them in
+                    # the transaction like the event JSON. Durability lands
+                    # through the coalescer, as the mode says. (A `sync_now`
+                    # from `call_after` would fsync on the reactor thread.)
+                    txn.call_after(mark_dirty, Pool.STATE)
+                    txn.call_after(mark_dirty, Pool.AUTH_CHAIN)
+                    txn.call_after(mark_dirty, Pool.EVENT_DAG)
+            elif self._embedded_event_json_enabled and needs_state_barrier:
+                if barrier_in_txn:
+                    # A de-outlier writes a state mapping and republishes event
+                    # JSON to the embedded engine.
+                    maybe_sync(
+                        SyncTier.DURABLE,
+                        pools=[Pool.STATE]
+                        + ([Pool.EVENT_DAG] if wrote_event_json else []),
+                    )
+                elif publishes_at_commit():
+                    # `sync_mode` is interval/off: publish the state-group
+                    # mapping at the commit boundary so a co-located read-only
+                    # worker sees it immediately, instead of waiting out the
+                    # coalescer's 250-500ms flush. Durability lands through the
+                    # coalescer (`mark_dirty`) and, for acknowledged auth
+                    # writes, the barrier above. Visibility is not durability.
+                    txn.call_after(mark_dirty, Pool.STATE)
+                # A live state event can also have written chain-cover links
+                # (see `calculate_chain_cover_index_for_events`) even when its
+                # type is not in `AUTH_CHAIN_EVENT_TYPES`. Those links have no
+                # SQL fallback, so keep them on the coalescer rather than
+                # dropping the AUTH_CHAIN dirty mark entirely.
+                txn.call_after(mark_dirty, Pool.AUTH_CHAIN)
+            else:
+                if barrier_in_txn and wrote_event_json:
+                    # Outliers and the like have no state barrier, but their
+                    # event JSON has no SQL copy, so it is still durable before
+                    # the row it belongs to commits.
+                    maybe_sync(SyncTier.DURABLE, pools=[Pool.EVENT_DAG])
+                txn.call_after(mark_dirty, Pool.STATE)
+                txn.call_after(mark_dirty, Pool.AUTH_CHAIN)
 
     def _persist_event_auth_chain_txn(
         self,
@@ -1272,7 +1658,7 @@ class PersistEventsStore:
                 self.db_pool,
                 new_event_links,
                 resolve_namespace(self),
-                self._embedded_hamt_engine,
+                self._embedded_db_engine,
                 sync=False,
             )
 
@@ -1307,8 +1693,8 @@ class PersistEventsStore:
         event_to_room_id: dict[str, str],
         event_to_types: dict[str, tuple[str, str]],
         event_to_auth_chain: dict[str, StrCollection],
-        embedded_hamt_namespace: str | None,
-        embedded_hamt_engine: str | None,
+        embedded_db_namespace: str | None,
+        embedded_db_engine: str | None,
     ) -> None:
         """Calculate and persist the chain cover index for the given events.
 
@@ -1317,12 +1703,12 @@ class PersistEventsStore:
             event_to_types: Event ID to type and state_key of the event
             event_to_auth_chain: Event ID to list of auth event IDs of the
                 event (events with no auth events can be excluded).
-            embedded_hamt_namespace: the caller's resolved namespace when the
+            embedded_db_namespace: the caller's resolved namespace when the
                 embedded engine is configured, `None` when it isn't -- a
                 `@classmethod` has no `self` of its own, so this can't be
                 recomputed here; see `embedded_event_auth_chain_links.py`.
-            embedded_hamt_engine: the engine name threaded alongside
-                `embedded_hamt_namespace` (same `@classmethod` constraint).
+            embedded_db_engine: the engine name threaded alongside
+                `embedded_db_namespace` (same `@classmethod` constraint).
         """
 
         new_event_links = cls._calculate_chain_cover_index(
@@ -1332,11 +1718,11 @@ class PersistEventsStore:
             event_to_room_id,
             event_to_types,
             event_to_auth_chain,
-            embedded_hamt_namespace,
-            embedded_hamt_engine,
+            embedded_db_namespace,
+            embedded_db_engine,
         )
         cls._persist_chain_cover_index(
-            txn, db_pool, new_event_links, embedded_hamt_namespace, embedded_hamt_engine
+            txn, db_pool, new_event_links, embedded_db_namespace, embedded_db_engine
         )
 
     @classmethod
@@ -1348,8 +1734,8 @@ class PersistEventsStore:
         event_to_room_id: dict[str, str],
         event_to_types: dict[str, tuple[str, str]],
         event_to_auth_chain: dict[str, StrCollection],
-        embedded_hamt_namespace: str | None,
-        embedded_hamt_engine: str | None,
+        embedded_db_namespace: str | None,
+        embedded_db_engine: str | None,
     ) -> dict[str, NewEventChainLinks]:
         """Calculate the chain cover index for the given events.
 
@@ -1543,8 +1929,8 @@ class PersistEventsStore:
         for links in EventFederationStore._get_chain_links(
             txn,
             {chain_id for chain_id, _ in chain_map.values()},
-            embedded_hamt_namespace,
-            embedded_hamt_engine,
+            embedded_db_namespace,
+            embedded_db_engine,
         ):
             for origin_chain_id, inner_links in links.items():
                 for (
@@ -1600,8 +1986,8 @@ class PersistEventsStore:
         txn: LoggingTransaction,
         db_pool: DatabasePool,
         new_event_links: dict[str, NewEventChainLinks],
-        embedded_hamt_namespace: str | None,
-        embedded_hamt_engine: str | None,
+        embedded_db_namespace: str | None,
+        embedded_db_engine: str | None,
         sync: bool = True,
     ) -> None:
         db_pool.simple_insert_many_txn(
@@ -1633,7 +2019,7 @@ class PersistEventsStore:
             for (target_chain_id, target_sequence_number) in new_links.links
         ]
 
-        if embedded_hamt_namespace is not None:
+        if embedded_db_namespace is not None:
             # Exclusive by configured engine, not a dual-write -- see
             # embedded_event_auth_chain_links.py.
             from synapse.storage.databases.main.embedded_event_auth_chain_links import (
@@ -1641,7 +2027,7 @@ class PersistEventsStore:
             )
 
             put_chain_links_batch(
-                embedded_hamt_engine, embedded_hamt_namespace, chain_links, sync=sync
+                embedded_db_engine, embedded_db_namespace, chain_links, sync=sync
             )
             return
 
@@ -1882,6 +2268,11 @@ class PersistEventsStore:
             stream_id: This is expected to be the minimum `stream_ordering` for the
                 batch of events that we are persisting; which means we do not end up in a
                 situation where workers see events before the `current_state_delta` updates.
+                Note that this stamps a row *before* its own event; readers that pair
+                deltas with the events in the same window bound each delta on its
+                event's position instead, see
+                `get_current_state_deltas_for_room_by_event_position(...)`, which stays
+                correct if this stamp is ever changed.
                 FIXME: However, this function also gets called with next upcoming
                 `stream_ordering` when we re-sync the state of a partial stated room (see
                 `update_current_state(...)`) which may be "correct" but it would be good to
@@ -2209,7 +2600,7 @@ class PersistEventsStore:
             txn, {m for m in members_to_cache_bust if not self.hs.is_mine_id(m)}
         )
 
-        if self._msc4429_enabled:
+        if self._include_profile_updates_in_sync:
             # Handle changes to the profile updates stream.
             # We've already done a bunch of work calculating the changes needed
             # for the sliding sync tables, so we may as well re-use that information
@@ -2271,7 +2662,13 @@ class PersistEventsStore:
         """
         Record updates into the profile updates stream for when a user leaves a room.
 
-        If this was the last shared room with a set of users, clear all old rows from
+        This handles two distinct cases when a user leaves a room:
+          1) we find users in the the room who no longer share rooms with the user that
+            left the room, and record a `LEFT_ROOM` action for them.
+          2) we check for the user who left the room if they no longer share rooms with
+            some users of the room that was left, and do the same in reverse.
+
+        In both cases, when recording a `LEFT_ROOM` action, we clear all old rows from
         the `profile_updates_per_user` table relating to those users, to avoid exposing
         any profile field changes past the point of not being in any common rooms with
         the user.
@@ -2323,13 +2720,37 @@ class PersistEventsStore:
             (*user_args, user_id.to_string()),
         )
 
-        # Now record the "left room" action in the stream
+        # Now record the "left room" action in the stream for each user
+        # in the room that no longer shares a room with the user who left the room.
         self.store.record_profile_updates_txn(
             txn=txn,
-            user_id=user_id,
+            users={user_id.to_string()},
             action=ProfileUpdateAction.LEFT_ROOM,
             field_names=[],
             target_users=users_no_longer_sharing_rooms,
+        )
+
+        # We also need to record things in reverse. The user, who left the
+        # room, needs to get profile update rows for every user they no longer
+        # share a room with.
+        # First clear old rows between these users.
+        txn.execute(
+            f"""
+                DELETE FROM profile_updates_per_user
+                    WHERE user_id = ?
+                    AND stream_id IN (
+                        SELECT stream_id FROM profile_updates WHERE {user_clause}
+                    )
+            """,
+            (user_id.to_string(), *user_args),
+        )
+        # Then add the left room action rows in the stream.
+        self.store.record_profile_updates_txn(
+            txn=txn,
+            users=users_no_longer_sharing_rooms,
+            action=ProfileUpdateAction.LEFT_ROOM,
+            field_names=[],
+            target_users={user_id.to_string()},
         )
 
     @classmethod
@@ -2466,7 +2887,7 @@ class PersistEventsStore:
             stripped_state_map: MutableStateMap[StrippedStateEvent] = {}
             if isinstance(unsigned_stripped_state_events, list):
                 for raw_stripped_event in unsigned_stripped_state_events:
-                    stripped_state_event = parse_stripped_state_event(
+                    stripped_state_event = StrippedStateEvent.from_json_dict(
                         raw_stripped_event
                     )
                     if stripped_state_event is not None:
@@ -2655,25 +3076,40 @@ class PersistEventsStore:
         """
 
         sql = """
-            SELECT json FROM event_json
-            INNER JOIN current_state_events USING (room_id, event_id)
+            SELECT event_id, json FROM current_state_events
+            LEFT JOIN event_json USING (room_id, event_id)
             WHERE room_id = ? AND type = ? AND state_key = ?
         """
         txn.execute(sql, (room_id, EventTypes.Create, ""))
         row = txn.fetchone()
         if row:
-            event_json = db_to_json(row[0])
-            content = event_json.get("content", {})
-            creator = content.get("creator")
-            room_version_id = content.get("room_version", RoomVersions.V1.identifier)
+            event_id, json_str = row
+            if json_str is None and getattr(
+                self, "_embedded_event_json_enabled", False
+            ):
+                found = get_event_json_batch(
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
+                    [event_id],
+                )
+                if event_id in found:
+                    json_str = found[event_id][1]
 
-            self.db_pool.simple_upsert_txn(
-                txn,
-                table="rooms",
-                keyvalues={"room_id": room_id},
-                values={"room_version": room_version_id},
-                insertion_values={"is_public": False, "creator": creator},
-            )
+            if json_str:
+                event_json = db_to_json(json_str)
+                content = event_json.get("content", {})
+                creator = content.get("creator")
+                room_version_id = content.get(
+                    "room_version", RoomVersions.V1.identifier
+                )
+
+                self.db_pool.simple_upsert_txn(
+                    txn,
+                    table="rooms",
+                    keyvalues={"room_id": room_id},
+                    values={"room_version": room_version_id},
+                    insertion_values={"is_public": False, "creator": creator},
+                )
 
     def _update_forward_extremities_txn(
         self,
@@ -2804,7 +3240,7 @@ class PersistEventsStore:
         self,
         txn: LoggingTransaction,
         events_and_contexts: list[EventPersistencePair],
-    ) -> list[EventPersistencePair]:
+    ) -> tuple[list[EventPersistencePair], list[EventPersistencePair]]:
         """Update any outliers with new event info.
 
         This turns outliers into ex-outliers (unless the new event was rejected), and
@@ -2815,7 +3251,11 @@ class PersistEventsStore:
             events_and_contexts: events we are persisting
 
         Returns:
-            new list, without events which are already in the events table.
+            A pair of lists: the events which are not already in the events table, and
+            the events which were de-outliered by this call. The latter are removed
+            from the first list but still need their embedded event->state-group
+            mapping made visible to other worker processes -- see the STATE barrier
+            in `_persist_events_txn`.
 
         Raises:
             PartialStateConflictError: if attempting to persist a partial state event in
@@ -2842,6 +3282,7 @@ class PersistEventsStore:
         )
 
         to_remove = set()
+        de_outliered: list[EventPersistencePair] = []
         for event, context in events_and_contexts:
             outlier_persisted = have_persisted.get(event.event_id)
             logger.debug(
@@ -2901,6 +3342,12 @@ class PersistEventsStore:
 
                 sql = "UPDATE events SET outlier = FALSE WHERE event_id = ?"
                 txn.execute(sql, (event.event_id,))
+                event.internal_metadata.outlier = False
+
+                self.store.invalidate_get_event_cache_after_txn(txn, event.event_id)
+                self.store._send_invalidation_to_replication(
+                    txn, "_get_event_cache", (event.event_id,)
+                )
 
                 # Update the event_backward_extremities table now that this
                 # event isn't an outlier any more.
@@ -2911,58 +3358,195 @@ class PersistEventsStore:
                     # we deliver this down /sync.
                     self.store.insert_sticky_events_txn(txn, [event])
 
-        return [ec for ec in events_and_contexts if ec[0] not in to_remove]
+                de_outliered.append((event, context))
+
+        return [
+            ec for ec in events_and_contexts if ec[0] not in to_remove
+        ], de_outliered
+
+    def _apply_existing_redaction_txn(
+        self,
+        txn: LoggingTransaction,
+        room_id: str,
+        room_version: RoomVersion,
+        events_and_contexts: list[EventPersistencePair],
+    ) -> list[EventPersistencePair]:
+        """
+        If we have any redactions for the events we're about to persist,
+        pre-applies those if they are appropriate.
+
+        Redaction events themselves won't be redacted immediately, to avoid
+        breaking circular redactions (which are tested in `test_circular_redaction`).
+
+        In general, applying redactions prior to persistence (like this method does)
+        is not required for correctness as `_maybe_redact_event_row` will do it on
+        the read path (and the event will eventually be 'censored' in the background).
+
+        However sticky events are an exception: redaction removes the field that makes
+        an event sticky (`msc4354_sticky`) and applying this prior to persistence
+        allows us to skip inserting the event into the sticky events stream.
+
+        Returns a copy of the `events_and_contexts` lists with redactions applied.
+        """
+
+        # Get all the event IDs, whilst also filtering out redaction events
+        # which we don't want to redact immediately anyway
+        event_ids = [
+            ev.event_id
+            for ev, _ in events_and_contexts
+            if ev.type != EventTypes.Redaction
+        ]
+
+        if not event_ids:
+            # nothing to do here
+            return events_and_contexts
+
+        events_by_id = {ev.event_id: ev for ev, _ in events_and_contexts}
+        event_id_in_list_clause, event_id_in_list_args = make_in_list_sql_clause(
+            txn.database_engine,
+            "redactions.redacts",
+            event_ids,
+        )
+        txn.execute(
+            f"""
+            SELECT redactions.event_id, redactions.redacts, redaction_events.sender, redactions.recheck
+            FROM redactions
+            INNER JOIN events AS redaction_events
+                ON redactions.event_id = redaction_events.event_id
+                AND redaction_events.room_id = ?
+            WHERE {event_id_in_list_clause}
+            """,
+            (room_id, *event_id_in_list_args),
+        )
+
+        # map from redacted event ID to the event ID that redacts it
+        redacted_event_id_map = {}
+        for (
+            redaction_event_id,
+            redaction_redacts_event_id,
+            redaction_event_sender,
+            redaction_event_needs_v3_recheck,
+        ) in txn:
+            if redaction_redacts_event_id in redacted_event_id_map:
+                # Already redacted
+                continue
+
+            event = events_by_id[redaction_redacts_event_id]
+            if (
+                redaction_event_needs_v3_recheck
+                # Normally v1/v2 don't ever need rechecks because the checks are part of auth rules.
+                # However the `recheck` column was only recently introduced as a retrofit,
+                # with a database-level default of `true`.
+                # For that reason, we can't `assert` on this condition as even v1/v2 rooms can appear
+                # with a `recheck` value of true, even though they don't need a recheck.
+                and room_version.event_format != EventFormatVersions.ROOM_V1_V2
+            ):
+                # Apply the same logic as `_maybe_redact_event_row`
+                if get_domain_from_id(redaction_event_sender) != get_domain_from_id(
+                    event.sender
+                ):
+                    # Sender servers don't match, so the event isn't actually redacted
+                    logger.debug(
+                        "redaction of %s by %s skipped as it required a v3 recheck and sender servers differ: %r != %r",
+                        redaction_redacts_event_id,
+                        redaction_event_id,
+                        redaction_event_sender,
+                        event.sender,
+                    )
+                    continue
+
+                # Unlike `_maybe_redact_event_row`, we _don't_ mutate the cached instance of the redaction event to set
+                # `recheck_redaction` to False here, as we don't actually load the redaction out of the database.
+
+            redacted_event_id_map[redaction_redacts_event_id] = redaction_event_id
+            logger.debug(
+                "%r redacted at persistence time by %r",
+                redaction_redacts_event_id,
+                redaction_event_id,
+            )
+
+        out: list[EventPersistencePair] = []
+        for event, context in events_and_contexts:
+            if redacted_by_event_id := redacted_event_id_map.get(event.event_id):
+                redacted_event = redact_event(event)
+                redacted_event.internal_metadata.redacted_by = redacted_by_event_id
+                out.append((redacted_event, context))
+            else:
+                out.append((event, context))
+
+        return out
 
     def _store_event_txn(
         self,
         txn: LoggingTransaction,
         events_and_contexts: Collection[EventPersistencePair],
+        mtxdb_txn: "MtxdbTransaction | None" = None,
     ) -> None:
         """Insert new events into the event, event_json, redaction and
         state_events tables.
+
+        With an `mtxdb_txn` the embedded event JSON is staged in it (committed
+        by `_persist_events_txn`) instead of written straight away.
         """
 
         if not events_and_contexts:
             # nothing to do here
             return
 
-        def event_dict(event: EventBase) -> JsonDict:
-            d = event.get_dict_for_persistence()
-            d.pop("redacted", None)
-            d.pop("redacted_because", None)
-            return d
-
         event_json_rows = [
             (
                 event.event_id,
                 event.room_id,
                 json_encoder.encode(event.internal_metadata.get_dict()),
-                json_encoder.encode(event_dict(event)),
+                json_encoder.encode(_event_dict_for_embedded_json(event)),
                 event.format_version,
             )
             for event, _ in events_and_contexts
         ]
 
-        self.db_pool.simple_insert_many_txn(
-            txn,
-            table="event_json",
-            keys=("event_id", "room_id", "internal_metadata", "json", "format_version"),
-            values=event_json_rows,
-        )
-
-        # Mirror into the embedded engine if configured -- event_json is
-        # the highest-disk-usage, highest-cache-miss table in a busy
-        # homeserver (see scripts-dev/benchmark_event_json_storage.py);
-        # Postgres stays authoritative, this is a read fast path.
-        if self._embedded_event_json_enabled:
+        if not self._embedded_event_json_enabled:
+            self.db_pool.simple_insert_many_txn(
+                txn,
+                table="event_json",
+                keys=(
+                    "event_id",
+                    "room_id",
+                    "internal_metadata",
+                    "json",
+                    "format_version",
+                ),
+                values=event_json_rows,
+            )
+        else:
+            # Exclusive by configured engine -- event_json writes go directly
+            # to mtxdb without duplicating the highest-disk-usage table in SQL.
             put_event_json_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
                 [
                     (event_id, room_id, internal_metadata, json, format_version)
                     for event_id, room_id, internal_metadata, json, format_version in event_json_rows
                 ],
+                # Not synced here: `_persist_events_txn` issues one barrier at
+                # the end of the transaction that covers this write together
+                # with the state and auth-chain writes that come after it, so
+                # the persist pays a single fsync instead of one per stage.
+                sync=False,
+                transaction=mtxdb_txn,
             )
+            if publishes_at_commit():
+                # Exclusive event JSON must be visible before its SQL row, never
+                # from `call_after`: a worker that finds the committed row but
+                # not its JSON has no SQL copy to fall back to, a hard
+                # event-not-found. With a transaction the JSON is staged here
+                # and `_persist_events_txn` commits it before the SQL COMMIT,
+                # and not at all if this attempt fails. Without one (no shared
+                # WAL) it was journaled above, and a rolled-back attempt can
+                # leave an orphan: unreachable, since reads only look up ids
+                # discovered from committed SQL rows (`_fetch_event_rows` ->
+                # `_fetch_event_json_for_ids_txn`). Durability lands through
+                # the coalescer (`mark_dirty`).
+                txn.call_after(mark_dirty, Pool.EVENT_DAG)
 
         self.db_pool.simple_insert_many_txn(
             txn,
@@ -3021,6 +3605,19 @@ class PersistEventsStore:
             unredacted_events,
         )
         txn.execute(sql + clause, args)
+
+        # Mirror the same reset into the embedded engine if configured. This
+        # is the "original event re-persisted unredacted after its redaction"
+        # path, so an existing mirror record (which may have been flipped to
+        # True by censoring) must be rewritten back to False; ids with no
+        # mirror record are skipped by set_have_censored_batch.
+        if unredacted_events and getattr(self, "_embedded_event_json_enabled", False):
+            set_have_censored_batch(
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
+                unredacted_events,
+                False,
+            )
 
         self.db_pool.simple_insert_many_txn(
             txn,
@@ -3253,6 +3850,19 @@ class PersistEventsStore:
         # The `redactions` emptiness cache is only ever invalidated by writes,
         # so make sure this one is reported once the transaction commits.
         self.db_pool.note_table_write_after(txn, "redactions")
+
+        # Mirror the new redaction into the embedded engine if configured.
+        # Keyed by the *redacted* event id so `have_censored_event` stays a
+        # point lookup -- see embedded_redactions.py's module docstring.
+        # `have_censored` starts False (matching the SQL column default); the
+        # censoring background job later flips it via
+        # set_have_censored_batch.
+        if getattr(self, "_embedded_event_json_enabled", False):
+            put_redaction_batch(
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
+                [(event.redacts, event.event_id, False)],
+            )
 
     def insert_labels_for_event_txn(
         self,
@@ -3740,6 +4350,7 @@ class PersistEventsStore:
     def _store_rejections_txn(
         self, txn: LoggingTransaction, event_id: str, reason: str
     ) -> None:
+        last_check = str(self._clock.time_msec())
         self.db_pool.simple_insert_txn(
             txn,
             table="rejections",
@@ -3749,9 +4360,18 @@ class PersistEventsStore:
                 # `last_check` is a TEXT column, so store the timestamp as a
                 # string rather than relying on the driver to coerce an int.
                 # (Ideally we'd fix the schema, but that is non-trivial)
-                "last_check": str(self._clock.time_msec()),
+                "last_check": last_check,
             },
         )
+
+        # Mirror into the embedded engine if configured -- flat point lookup,
+        # see embedded_rejections.py.
+        if getattr(self, "_embedded_event_json_enabled", False):
+            put_rejection_batch(
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
+                [(event_id, reason, last_check)],
+            )
 
     def _store_event_state_mappings_txn(
         self,
@@ -3833,7 +4453,7 @@ class PersistEventsStore:
 
         # Partial and outlier events can legitimately have no state group.
         # `event_to_state_groups.state_group` is NOT NULL, so exclude those
-        # mappings from the SQL safety copy as well as from the embedded map.
+        # mappings from the SQL table as well as from the embedded map.
         non_null_state_groups: dict[str, int] = {
             event_id: state_group_id
             for event_id, state_group_id in state_groups.items()
@@ -3849,8 +4469,8 @@ class PersistEventsStore:
             # event_ids are genuinely new before deciding what to
             # increment.
             existing = get_state_group_for_events_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
                 list(state_groups.keys()),
                 purpose="persist_existence_check",
             )
@@ -3858,38 +4478,21 @@ class PersistEventsStore:
                 event_id for event_id in state_groups if event_id not in existing
             ]
             put_event_to_state_group_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
                 list(non_null_state_groups.items()),
             )
-            # Keep SQL as the committed safety copy while embedded mapping
-            # publication remains coalesced. Readers can fall back to this
-            # row if a worker observes the event before mtxdb has refreshed.
-            self.db_pool.simple_upsert_many_txn(
-                txn,
-                table="event_to_state_groups",
-                key_names=["event_id"],
-                key_values=[[event_id] for event_id in non_null_state_groups],
-                value_names=["state_group"],
-                value_values=[
-                    [state_group_id]
-                    for state_group_id in non_null_state_groups.values()
-                ],
-            )
             increment_state_group_refcounts_batch(
-                self._embedded_hamt_engine,
-                self._embedded_hamt_namespace,
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
                 [
                     non_null_state_groups[event_id]
                     for event_id in new_event_ids
                     if event_id in non_null_state_groups
                 ],
             )
-            # No sync here: both call sites of this method are within
-            # `_persist_events_txn`'s scope, which does one combined sync
-            # at the very end covering this write plus the chain-links
-            # batch -- see the comment there and
-            # put_event_to_state_group_batch's docstring.
+            # `_persist_events_txn` publishes STATE immediately for live events
+            # with mappings, and otherwise marks it dirty for coalescing.
         else:
             self.db_pool.simple_upsert_many_txn(
                 txn,
@@ -3903,12 +4506,13 @@ class PersistEventsStore:
                 ],
             )
 
-        for event_id, state_group_id in state_groups.items():
-            txn.call_after(
-                self.store._get_state_group_for_event_sql.prefill,
-                (event_id,),
-                state_group_id,
-            )
+        if not getattr(self, "_embedded_event_json_enabled", False):
+            for event_id, state_group_id in state_groups.items():
+                txn.call_after(
+                    self.store._get_state_group_for_event_sql.prefill,
+                    (event_id,),
+                    state_group_id,
+                )
 
     def _update_min_depth_for_room_txn(
         self, txn: LoggingTransaction, room_id: str, depth: int
@@ -3926,20 +4530,69 @@ class PersistEventsStore:
         )
 
     def _handle_mult_prev_events(
-        self, txn: LoggingTransaction, events: list[EventBase]
+        self,
+        txn: LoggingTransaction,
+        events: list[EventBase],
+        update_backward_extremities: bool = True,
     ) -> None:
         """
         For the given event, update the event edges table and forward and
         backward extremities tables.
         """
-        self.db_pool.simple_insert_many_txn(
-            txn,
-            table="event_edges",
-            keys=("event_id", "prev_event_id"),
-            values=[
+        edge_values = list(
+            dict.fromkeys(
                 (ev.event_id, e_id) for ev in events for e_id in ev.prev_event_ids()
-            ],
+            )
         )
+        if edge_values:
+            if isinstance(self.database_engine, PostgresEngine):
+                sql = (
+                    "INSERT INTO event_edges (event_id, prev_event_id) "
+                    "VALUES ? ON CONFLICT DO NOTHING"
+                )
+                txn.execute_values(sql, edge_values, fetch=False)
+            else:
+                sql = (
+                    "INSERT INTO event_edges (event_id, prev_event_id) "
+                    "VALUES (?, ?) ON CONFLICT (event_id, prev_event_id) DO NOTHING"
+                )
+                txn.executemany(sql, edge_values)
+
+        # Keep the authoritative SQL edge write, its per-room source version,
+        # and the embedded-index publication mutations in one transaction.
+        # The outbox is deliberately populated even when the embedded engine
+        # is disabled: it makes enabling the publisher later a resumable,
+        # database-backed operation rather than a best-effort mirror.
+        edges_by_room: dict[str, list[tuple[str, str]]] = collections.defaultdict(list)
+        for event in events:
+            edges_by_room[event.room_id].extend(
+                (event.event_id, prev_event_id)
+                for prev_event_id in event.prev_event_ids()
+            )
+
+        for room_id, room_edges in edges_by_room.items():
+            if not room_edges:
+                continue
+
+            # Keep the outbox key idempotent if an input batch repeats an
+            # identical prev-event edge.
+            room_edges = list(dict.fromkeys(room_edges))
+            source_version = bump_room_edge_source_version(txn, room_id)
+            self.db_pool.simple_insert_many_txn(
+                txn,
+                table="edge_index_outbox",
+                keys=(
+                    "room_id",
+                    "source_version",
+                    "event_id",
+                    "prev_event_id",
+                    "operation",
+                ),
+                values=[
+                    (room_id, source_version, event_id, prev_event_id, "insert")
+                    for event_id, prev_event_id in room_edges
+                ],
+            )
 
         if self._embedded_event_edges_writable:
             edge_rows = [
@@ -3948,14 +4601,27 @@ class PersistEventsStore:
                 for e_id in ev.prev_event_ids()
             ]
             if edge_rows:
+                # MTXDB is authoritative when embedded event edges are
+                # enabled: the event is visible once this transaction commits,
+                # so its edges must be committed to MTXDB too.  Write the batch
+                # directly instead of enqueueing it on the coalescer --
+                # `put_event_edges_batch(sync=True)` drains the EVENT_DAG pool,
+                # which calls back into the edge queue's flush path, so routing
+                # this through `flush_edge_writes()` would try to re-take the
+                # non-reentrant per-namespace flush lock and self-deadlock.
                 txn.call_after(
-                    queue_edge_write,
-                    self._embedded_hamt_namespace,
+                    put_event_edges_batch,
+                    self._embedded_db_namespace,
                     edge_rows,
+                    # The post-commit write is visible immediately; durability
+                    # is handled by the EVENT_DAG coalescer according to the
+                    # configured sync mode.
+                    sync=False,
                 )
                 txn.call_after(mark_dirty, Pool.EVENT_DAG)
 
-        self._update_backward_extremeties(txn, events)
+        if update_backward_extremities:
+            self._update_backward_extremeties(txn, events)
 
     def _update_backward_extremeties(
         self, txn: LoggingTransaction, events: list[EventBase]

@@ -41,7 +41,7 @@ from typing_extensions import assert_never
 
 from twisted.internet import defer
 
-from synapse.api.constants import Direction, EventTypes
+from synapse.api.constants import Direction, EventTypes, Membership
 from synapse.api.errors import NotFoundError, SynapseError
 from synapse.api.room_versions import (
     KNOWN_ROOM_VERSIONS,
@@ -68,7 +68,12 @@ from synapse.metrics import SERVER_NAME_LABEL
 from synapse.metrics.background_process_metrics import (
     wrap_as_background_process,
 )
-from synapse.replication.tcp.streams import BackfillStream, UnPartialStatedEventStream
+from synapse.replication.tcp.streams import (
+    BackfillStream,
+    StickyEventsStream,
+    UnPartialStatedEventStream,
+)
+from synapse.replication.tcp.streams._base import StickyEventsStreamRow
 from synapse.replication.tcp.streams.events import EventsStream
 from synapse.replication.tcp.streams.partial_state import UnPartialStatedEventStreamRow
 from synapse.storage._base import SQLBaseStore, db_to_json, make_in_list_sql_clause
@@ -80,13 +85,16 @@ from synapse.storage.database import (
 )
 from synapse.storage.databases.main.embedded_common import ffi_count
 from synapse.storage.databases.main.embedded_event_edges import (
+    drain_edge_index_outbox,
     embedded_event_edges_is_writable,
+    gc_retired_forward_generations,
     open_embedded_event_edges_engine,
 )
 from synapse.storage.databases.main.embedded_event_json import (
     get_event_json_batch,
     open_embedded_event_json_engine,
 )
+from synapse.storage.databases.main.embedded_redactions import get_redactions_batch
 from synapse.storage.types import Cursor
 from synapse.storage.util.id_generators import (
     AbstractStreamIdGenerator,
@@ -248,15 +256,15 @@ class EventsWorkerStore(SQLBaseStore):
         self._embedded_event_json_enabled = open_embedded_event_json_engine(hs)
         self._embedded_event_edges_enabled = open_embedded_event_edges_engine(hs)
         self._embedded_event_edges_writable = embedded_event_edges_is_writable(hs)
-        self._embedded_hamt_engine = hs.config.database.embedded_hamt_engine
+        self._embedded_db_engine = hs.config.database.embedded_db_engine
         # Namespaces event_to_state_group/refcount keys in the embedded
         # engine -- see embedded_event_to_state_group.py's module docstring.
         # Independent from (but must agree with) the state datastore's own
         # hamt_namespace property: both default to the server name unless
-        # embedded_hamt.namespace is set in config, so they naturally agree
+        # embedded_db.namespace is set in config, so they naturally agree
         # without needing to share an instance.
-        self._embedded_hamt_namespace = (
-            hs.config.database.embedded_hamt_namespace or hs.hostname
+        self._embedded_db_namespace = (
+            hs.config.database.embedded_db_namespace or hs.hostname
         )
 
         txn = db_conn.cursor()
@@ -315,6 +323,17 @@ class EventsWorkerStore(SQLBaseStore):
         )
 
         if hs.config.worker.run_background_tasks:
+            if embedded_event_edges_is_writable(hs):
+                self.clock.looping_call(
+                    lambda: drain_edge_index_outbox(
+                        self, namespace=self._embedded_db_namespace
+                    ),
+                    Duration(seconds=1),
+                )
+                self.clock.looping_call(
+                    lambda: gc_retired_forward_generations(self),
+                    Duration(minutes=5),
+                )
             # We periodically clean out old transaction ID mappings
             self.clock.looping_call(
                 self._cleanup_old_transaction_ids,
@@ -414,6 +433,8 @@ class EventsWorkerStore(SQLBaseStore):
         finished (so we don't have to keep querying it every time)
         """
 
+        self._room_prejoin_state_types = hs.config.api.room_prejoin_state
+
     def get_un_partial_stated_events_token(self, instance_name: str) -> int:
         return (
             self._un_partial_stated_events_stream_id_gen.get_current_token_for_writer(
@@ -500,6 +521,15 @@ class EventsWorkerStore(SQLBaseStore):
                     # If the partial-stated event became rejected or unrejected
                     # when it wasn't before, we need to invalidate this cache.
                     self._invalidate_local_get_event_cache(row.event_id)
+        elif stream_name == StickyEventsStream.NAME:
+            for row in rows:
+                assert isinstance(row, StickyEventsStreamRow)
+
+                # A sticky event only gets a new row on this stream when it is first
+                # persisted (in which case there's nothing cached to invalidate) or when
+                # its soft-failure status changed, which is stored in the event's
+                # internal metadata, so invalidate the cached event.
+                self._invalidate_local_get_event_cache(row.event_id)
 
         super().process_replication_rows(stream_name, instance_name, token, rows)
 
@@ -524,6 +554,18 @@ class EventsWorkerStore(SQLBaseStore):
         Returns:
             True if the event has been censored, False otherwise.
         """
+        # Fast path: the embedded mirror, if configured, is a point lookup
+        # keyed by the redacted event id -- see embedded_redactions.py. A miss
+        # falls through to the authoritative SQL row below.
+        if getattr(self, "_embedded_event_json_enabled", False):
+            found = get_redactions_batch(
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
+                [event_id],
+            )
+            if event_id in found:
+                return found[event_id][1]
+
         censored_redactions_list = await self.db_pool.simple_select_onecol(
             table="redactions",
             keyvalues={"redacts": event_id},
@@ -1157,14 +1199,12 @@ class EventsWorkerStore(SQLBaseStore):
 
     async def get_stripped_room_state_from_event_context(
         self,
+        event: EventBase,
         context: EventContext,
-        state_keys_to_include: StateFilter,
-        membership_user_id: str | None = None,
     ) -> list[JsonDict]:
         """
         Retrieve the stripped state from a room, given an event context to retrieve state
-        from as well as the state types to include. Optionally, include the membership
-        events from a specific user.
+        from as well as the state types to include.
 
         "Stripped" state means that only the `type`, `state_key`, `content` and `sender` keys
         are included from each state event.
@@ -1172,35 +1212,60 @@ class EventsWorkerStore(SQLBaseStore):
         Args:
             context: The event context to retrieve state of the room from.
             state_keys_to_include: The state events to include, for each event type.
-            membership_user_id: An optional user ID to include the stripped membership state
-                events of. This is useful when generating the stripped state of a room for
-                invites. We want to send membership events of the inviter, so that the
-                invitee can display the inviter's profile information if the room lacks any.
 
         Returns:
             A list of dictionaries, each representing a stripped state event from the room.
         """
-        if membership_user_id:
+        selected_state_ids = await self.get_stripped_room_state_ids_from_event_context(
+            event, context
+        )
+
+        state_to_include = await self.get_events(selected_state_ids)
+
+        return [strip_event(e) for e in state_to_include.values()]
+
+    async def get_stripped_room_state_ids_from_event_context(
+        self,
+        event: EventBase,
+        context: EventContext,
+    ) -> list[str]:
+        """
+        Retrieve the stripped state IDs for an event, given an event context to retrieve state
+        from as well as the state types to include.
+
+        Args:
+            context: The event context to retrieve state of the room from.
+
+        Returns:
+            A list of event_ids, each representing the stripped state event to include for this event
+        """
+        # Start with the configured default set of stripped state to include
+        state_filter = self._room_prejoin_state_types
+
+        # MSC4319: We want to send membership events of the inviter, so that the invitee
+        # can display the inviter's profile information if the room lacks any.
+        is_invite_event = (
+            event.type == EventTypes.Member and event.membership == Membership.INVITE
+        )
+        if is_invite_event:
             types = chain(
-                state_keys_to_include.to_types(),
-                [(EventTypes.Member, membership_user_id)],
+                self._room_prejoin_state_types.to_types(),
+                [(EventTypes.Member, event.sender)],
             )
-            filter = StateFilter.from_types(types)
-        else:
-            filter = state_keys_to_include
-        selected_state_ids = await context.get_current_state_ids(filter)
+            state_filter = StateFilter.from_types(types)
+
+        # Get the relevant state
+        selected_state_ids = await context.get_current_state_ids(state_filter)
 
         # We know this event is not an outlier, so this must be
         # non-None.
         assert selected_state_ids is not None
 
-        # Confusingly, get_current_state_events may return events that are discarded by
-        # the filter, if they're in context._state_delta_due_to_event. Strip these away.
-        selected_state_ids = filter.filter_state(selected_state_ids)
+        # Confusingly, `get_current_state_ids` may return events that are discarded by
+        # the filter, if they're in `context._state_delta_due_to_event`. Strip these away.
+        selected_state_ids = state_filter.filter_state(selected_state_ids)
 
-        state_to_include = await self.get_events(selected_state_ids.values())
-
-        return [strip_event(e) for e in state_to_include.values()]
+        return list(selected_state_ids.values())
 
     def _maybe_start_fetch_thread(self) -> None:
         """Starts an event fetch thread if we are not yet at the maximum number."""
@@ -1290,6 +1355,17 @@ class EventsWorkerStore(SQLBaseStore):
                     for _, deferred in event_fetches_to_fail:
                         deferred.errback(exc)
 
+    def _event_fetch_pool_is_small(self) -> bool:
+        """Whether the connection pool has no thread to spare for fetch threads.
+
+        An idle fetch thread waits `EVENT_QUEUE_ITERATIONS * EVENT_QUEUE_TIMEOUT_S`
+        (about 0.4 s) for more requests while holding a database thread. With
+        no more pool threads than fetch threads, every other query queues behind
+        those waits: Complement runs workers with `cp_max: 3`, and a join sat
+        behind idle fetch loops for 400 ms.
+        """
+        return bool(self.db_pool._db_pool.max <= EVENT_QUEUE_THREADS)
+
     def _fetch_loop(self, conn: LoggingDatabaseConnection) -> None:
         """Takes a database connection and waits for requests for events from
         the _event_fetch_list queue.
@@ -1308,6 +1384,7 @@ class EventsWorkerStore(SQLBaseStore):
                     if (
                         not self.USE_DEDICATED_DB_THREADS_FOR_EVENT_FETCHING
                         or single_threaded
+                        or self._event_fetch_pool_is_small()
                         or i > EVENT_QUEUE_ITERATIONS
                     ):
                         return
@@ -1498,7 +1575,7 @@ class EventsWorkerStore(SQLBaseStore):
                 #
                 if d["type"] != EventTypes.Member:
                     raise InvalidEventError(
-                        "Room %s for event %s is unknown" % (d["room_id"], event_id)
+                        "Room %s for event %s is unknown" % (d.get("room_id"), event_id)
                     )
 
                 # so, assuming this is an out-of-band-invite that arrived before
@@ -1529,7 +1606,7 @@ class EventsWorkerStore(SQLBaseStore):
                     logger.warning(
                         "Event %s in room %s has unknown room version %s",
                         event_id,
-                        d["room_id"],
+                        d.get("room_id"),
                         room_version_id,
                     )
                     continue
@@ -1539,7 +1616,7 @@ class EventsWorkerStore(SQLBaseStore):
                         "Event %s in room %s with version %s has wrong format: "
                         "expected %s, was %s",
                         event_id,
-                        d["room_id"],
+                        d.get("room_id"),
                         room_version_id,
                         room_version.event_format,
                         format_version,
@@ -1568,7 +1645,7 @@ class EventsWorkerStore(SQLBaseStore):
                 # it's difficult to see what to do here. Pretty much all bets are off
                 # if Synapse cannot rely on the consistency of its database.
                 raise DatabaseCorruptionError(
-                    d["room_id"], event_id, original_ev.event_id
+                    d.get("room_id"), event_id, original_ev.event_id
                 )
 
             event_map[event_id] = original_ev
@@ -1631,7 +1708,10 @@ class EventsWorkerStore(SQLBaseStore):
         """Returns `event_id -> (internal_metadata, json, format_version)`
         for `event_ids`, preferring the embedded engine (a local point
         lookup, no SQL) and falling back to `event_json` in SQL for any id
-        it doesn't have.
+        it doesn't have. In embedded-exclusive mode the SQL `event_json`
+        table is never populated (see `_persist_events_txn`), so that
+        fallback finds nothing: a miss there means the id is absent from the
+        embedded engine, not that SQL will supply it.
 
         Deliberately does NOT write the SQL-fallback result back into mtxdb:
         `event_json` is mutable (censoring, expiry -- see
@@ -1652,7 +1732,7 @@ class EventsWorkerStore(SQLBaseStore):
         still_missing = event_ids
         if self._embedded_event_json_enabled:
             found = get_event_json_batch(
-                self._embedded_hamt_engine, self._embedded_hamt_namespace, event_ids
+                self._embedded_db_engine, self._embedded_db_namespace, event_ids
             )
             still_missing = [e for e in event_ids if e not in found]
 
@@ -1667,6 +1747,15 @@ class EventsWorkerStore(SQLBaseStore):
             )
             for event_id, internal_metadata, json_str, format_version in txn:
                 found[event_id] = (internal_metadata, json_str, format_version)
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[mtxdb-trace] event-json fetch requested=%d final=%d sql_fallback=%s missing=%s",
+                len(event_ids),
+                len(found),
+                still_missing,
+                [event_id for event_id in event_ids if event_id not in found],
+            )
 
         return found
 
@@ -1882,13 +1971,14 @@ class EventsWorkerStore(SQLBaseStore):
             # Starting in room version v3, some redactions need to be
             # rechecked if we didn't have the redacted event at the
             # time, so we recheck on read instead.
+            # NOTE: If this logic changes, need to update `_apply_existing_redaction_txn`
             if redaction_event.internal_metadata.need_to_check_redaction():
                 expected_domain = get_domain_from_id(original_ev.sender)
                 if get_domain_from_id(redaction_event.sender) == expected_domain:
                     # This redaction event is allowed. Mark as not needing a recheck.
                     redaction_event.internal_metadata.recheck_redaction = False
                 else:
-                    # Senders don't match, so the event isn't actually redacted
+                    # Sender servers don't match, so the event isn't actually redacted
                     logger.debug(
                         "%s was redacted by %s but the senders don't match",
                         original_ev.event_id,
@@ -2547,6 +2637,15 @@ class EventsWorkerStore(SQLBaseStore):
             "This function relies on `event_edges` and `event_forward_extremities` which won't be filled in for `outliers`."
         )
 
+        # Resolved before runInteraction: the txn closure below is sync. A
+        # completed legacy background update does not prove FWD completeness;
+        # only the offline verifier's marker can authorize this read path.
+        from synapse.storage.databases.main.embedded_event_edges import (
+            event_edges_fwd_is_authoritative,
+        )
+
+        embedded_edges_trustworthy = await event_edges_fwd_is_authoritative(self)
+
         def is_event_next_to_gap_txn(txn: LoggingTransaction) -> bool:
             # If the event in question is a forward extremity, we will just
             # consider any potential forward gap as not a gap since it's one of
@@ -2581,15 +2680,26 @@ class EventsWorkerStore(SQLBaseStore):
             if txn.fetchone():
                 return False
 
-            if self._embedded_event_edges_enabled:
+            if embedded_edges_trustworthy:
                 from synapse.storage.databases.main.embedded_event_edges import (
                     get_event_edges_forward_batch,
                 )
 
-                forward_map = get_event_edges_forward_batch(
-                    self._embedded_hamt_namespace, [event.event_id]
+                txn.execute(
+                    "SELECT source_version FROM room_edge_source_version WHERE room_id = ?",
+                    (event.room_id,),
                 )
-                children = forward_map.get(event.event_id)
+                source_version_row = txn.fetchone()
+                source_version = int(source_version_row[0]) if source_version_row else 0
+                forward_map = get_event_edges_forward_batch(
+                    self._embedded_db_namespace,
+                    event.room_id,
+                    source_version,
+                    [event.event_id],
+                )
+                children = (
+                    None if forward_map.stale else forward_map.get(event.event_id)
+                )
                 if children is not None:
                     ffi_count("event_edges_gap_hits", 1)
                     if not children:

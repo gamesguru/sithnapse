@@ -4,7 +4,7 @@ to refresh docs/development-gg/persistent-typed-hamt-architecture.md's
 comparison table with numbers that are actually reproducible today.
 
 fjall is intentionally NOT included here: it was fully removed in
-ab59dd8ba6 (crate, `fjall_engine` bindings, all embedded_hamt_engine=="fjall"
+ab59dd8ba6 (crate, `fjall_engine` bindings, all embedded_db_engine=="fjall"
 branches), so there is nothing left in this tree to benchmark. A "fjall + UDS
 Bridge" number specifically never existed anywhere -- no bridge/RPC/socket
 code for fjall was ever written, in any commit, reachable or dangling (see

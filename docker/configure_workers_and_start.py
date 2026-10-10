@@ -202,7 +202,7 @@ WORKERS_CONFIG: dict[str, dict[str, Any]] = {
             "^/_matrix/client/(api/v1|r0|v3|unstable)/keys/upload",
             "^/_matrix/client/(api/v1|r0|v3|unstable)/keys/device_signing/upload$",
             "^/_matrix/client/(api/v1|r0|v3|unstable)/keys/signatures/upload$",
-            "^/_matrix/client/unstable/org.matrix.msc4140/delayed_events(/.*/restart)?$",
+            "^/_matrix/client/unstable/org.matrix.msc4140/delayed_events(/[^/]+(/restart)?)?$",
         ],
         "shared_extra_conf": {},
         "worker_extra_conf": "",
@@ -1236,26 +1236,26 @@ def generate_worker_files(
                 "port": MAIN_PROCESS_REPLICATION_PORT,
             }
 
-    # Support for an embedded HAMT engine (mtxdb) in Complement integration
-    # tests doesn't need anything here -- SYNAPSE_EMBEDDED_HAMT_ENGINE/
-    # SYNAPSE_EMBEDDED_HAMT_PATH are read directly as environment variables
+    # Support for an embedded DB engine (mtxdb) in Complement integration
+    # tests doesn't need anything here -- SYNAPSE_EMBEDDED_DB_ENGINE/
+    # SYNAPSE_EMBEDDED_DB_PATH are read directly as environment variables
     # in synapse/config/database.py, independent of this generated
     # shared_config. Just set them on the container.
     #
-    # TODO: this generator has no awareness of embedded_hamt/mtxdb at all --
+    # TODO: this generator has no awareness of embedded_db/mtxdb at all --
     # it will happily emit a topology with an event_persister worker (or
-    # several) alongside SYNAPSE_EMBEDDED_HAMT_ENGINE=mtxdb. That invalid
+    # several) alongside SYNAPSE_EMBEDDED_DB_ENGINE=mtxdb. That invalid
     # combination is caught today, but only downstream, as a hard ConfigError
     # at Synapse startup (see synapse/config/workers.py's
-    # embedded_hamt_engine validation, which requires the sole events writer
+    # embedded_db_engine validation, which requires the sole events writer
     # to be the main process itself -- not merely a single persister worker
     # -- plus run_background_tasks_on to be main, which rules out a
     # background_worker too; and docker/complement/conf/
     # start_for_complement.sh, which omits both from the Complement
     # blueprint's defaults under mtxdb for exactly that reason). Consider
     # having this generator drop event_persister/background_worker workers
-    # (or refuse to start) when embedded_hamt.engine/
-    # SYNAPSE_EMBEDDED_HAMT_ENGINE is set, so real deployments get a clear
+    # (or refuse to start) when embedded_db.engine/
+    # SYNAPSE_EMBEDDED_DB_ENGINE is set, so real deployments get a clear
     # error from the generator up front instead of failing later at
     # Synapse's own config-validation step.
 

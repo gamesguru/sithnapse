@@ -372,10 +372,12 @@ def listen_manhole(
     )
 
 
+# These listener helpers do not inspect the factory's protocol type. Erase that
+# invariant type parameter, quoting the annotation for older Twisted versions.
 def listen_tcp(
     bind_addresses: StrCollection,
     port: int,
-    factory: ServerFactory,
+    factory: "ServerFactory",
     reactor: IReactorTCP = reactor,
     backlog: int = 50,
 ) -> list[Port]:
@@ -400,7 +402,7 @@ def listen_tcp(
 def listen_unix(
     path: str,
     mode: int,
-    factory: ServerFactory,
+    factory: "ServerFactory",
     reactor: IReactorUNIX = reactor,
     backlog: int = 50,
 ) -> list[Port]:
@@ -541,7 +543,7 @@ def listen_http(
 def listen_ssl(
     bind_addresses: StrCollection,
     port: int,
-    factory: ServerFactory,
+    factory: "ServerFactory",
     context_factory: IOpenSSLContextFactory,
     reactor: IReactorSSL = reactor,
     backlog: int = 50,
@@ -671,6 +673,20 @@ async def start(hs: "HomeServer", *, freeze: bool = True) -> None:
     """
     server_name = hs.hostname
     reactor = hs.get_reactor()
+
+    # Fatal precondition for the (not-yet-shipped) release that removes the
+    # SQL event_edges insert -- a no-op today, see
+    # embedded_event_edges.EVENT_EDGES_SQL_INSERT_REMOVED and
+    # res/docs/2026-09-28-event-edges-sql-removal-plan.md's "Blocker 1".
+    from synapse.storage.databases.main.embedded_event_edges import (
+        EventEdgesMigrationIncompleteError,
+        check_event_edges_migration_complete,
+    )
+
+    try:
+        await check_event_edges_migration_complete(hs)
+    except EventEdgesMigrationIncompleteError as e:
+        quit_with_error(str(e))
 
     # We want to use a separate thread pool for the resolver so that large
     # numbers of DNS requests don't starve out other users of the threadpool.

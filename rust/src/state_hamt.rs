@@ -16,12 +16,12 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use pyo3::prelude::*;
-use pyo3::types::{PyModule, PyModuleMethods};
+use pyo3::types::{PyBytes, PyModule, PyModuleMethods};
 use rezzy::{
     hamt::{HamtNode, NodeRef, PersistedInternalNode, RootHandle, StateGroupId, StructuralHash},
-    LtHash,
+    incremental::LtHash,
 };
 use sha2::{Digest, Sha256};
 
@@ -48,10 +48,66 @@ type PyBuiltTypedRootWithLattice = (
 );
 type PyApplyTypedOutcome = (Option<PyAppliedStateUpdate>, Vec<Vec<u8>>);
 type PyStateEntry = (String, String, String);
+type MaterializationNodes = HashMap<StructuralHash, Arc<HamtNode<String, String>>>;
 type PyReachabilityAudit = (Vec<Vec<u8>>, Vec<Vec<u8>>);
 type PyStateLookup = (Vec<PyStateEntry>, Vec<Vec<u8>>);
 
 const TYPED_ROOT_FORMAT: u8 = 0x02;
+const PACKED_ENTRIES_FORMAT: u8 = 1;
+
+trait StateEntrySink {
+    fn push(&mut self, event_type: &str, state_key: &str, event_id: &str) -> Result<(), String>;
+}
+
+struct TupleEntrySink {
+    entries: Vec<PyStateEntry>,
+}
+
+impl StateEntrySink for TupleEntrySink {
+    fn push(&mut self, event_type: &str, state_key: &str, event_id: &str) -> Result<(), String> {
+        self.entries.push((
+            event_type.to_owned(),
+            state_key.to_owned(),
+            event_id.to_owned(),
+        ));
+        Ok(())
+    }
+}
+
+struct PackedEntrySink {
+    bytes: Vec<u8>,
+    count: u32,
+}
+
+impl PackedEntrySink {
+    fn new() -> Self {
+        Self {
+            bytes: vec![PACKED_ENTRIES_FORMAT, 0, 0, 0, 0],
+            count: 0,
+        }
+    }
+
+    fn finish(mut self) -> Result<Vec<u8>, String> {
+        self.bytes[1..5].copy_from_slice(&self.count.to_le_bytes());
+        Ok(self.bytes)
+    }
+}
+
+impl StateEntrySink for PackedEntrySink {
+    fn push(&mut self, event_type: &str, state_key: &str, event_id: &str) -> Result<(), String> {
+        for field in [event_type, state_key, event_id] {
+            let length = u32::try_from(field.len())
+                .map_err(|_| "state entry field is too long".to_owned())?;
+            self.bytes.extend_from_slice(&length.to_le_bytes());
+            self.bytes.extend_from_slice(field.as_bytes());
+        }
+        self.count = self
+            .count
+            .checked_add(1)
+            .ok_or_else(|| "too many state entries".to_owned())?;
+        Ok(())
+    }
+}
 
 /// The compact directory at the root of a typed state HAMT. The directory is
 /// sorted by event type and points at one state_key -> event_id HAMT per type.
@@ -133,14 +189,14 @@ impl TypedRoot {
 }
 
 fn typed_subtree_key(room_key: &[u8; 32], event_type: &str) -> [u8; 32] {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(room_key).expect("HMAC key is valid");
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(room_key).expect("HMAC key is valid");
     mac.update(b"typed-state-subtree:");
     mac.update(event_type.as_bytes());
     mac.finalize().into_bytes().into()
 }
 
 fn typed_root_hash(room_key: &[u8; 32], directory: &[(String, StructuralHash)]) -> StructuralHash {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(room_key).expect("HMAC key is valid");
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(room_key).expect("HMAC key is valid");
     mac.update(b"typed-state-root:");
     for (event_type, hash) in directory {
         mac.update(&(event_type.len() as u32).to_le_bytes());
@@ -168,7 +224,7 @@ fn build_typed_root_nodes_and_lattice(
     room_id: &str,
     entries: Vec<(String, String, String)>,
 ) -> Result<(TypedRoot, LtHash, Vec<PersistedNodeBytes>), String> {
-    let room_key = room_structural_key_raw(room_id);
+    let room_key = room_typed_key(room_id);
     let mut by_type: std::collections::BTreeMap<String, Vec<(String, String)>> =
         std::collections::BTreeMap::new();
     // The state-group identity is the unkeyed LtHash lattice over every
@@ -209,9 +265,19 @@ fn build_typed_root_nodes_and_lattice(
 }
 
 #[must_use]
-pub fn room_structural_key_raw(room_id: &str) -> [u8; 32] {
-    let hash = Sha256::digest(room_id.as_bytes());
-    hash.into()
+/// Return the canonical rezzy structural namespace for a room.
+///
+/// Rezzy's HAMT API takes this namespace as caller-provided bytes. For the
+/// Matrix state HAMT it is the canonical room ID itself, not a digest of it.
+pub fn room_structural_key_raw(room_id: &str) -> Vec<u8> {
+    room_id.as_bytes().to_vec()
+}
+
+/// The typed-root directory uses HMAC-SHA256 as its private subtree namespace
+/// and therefore still needs a fixed-width key. This is separate from the
+/// canonical flat HAMT structural key above.
+fn room_typed_key(room_id: &str) -> [u8; 32] {
+    Sha256::digest(room_id.as_bytes()).into()
 }
 
 /// Derive a fixed-width, room-scoped prefix used to lay out this room's HAMT
@@ -259,7 +325,7 @@ pub fn room_hamt_prefix_raw(
         }
         prefix.copy_from_slice(&decoded[..PREFIX_LEN]);
     } else {
-        let full_key = room_structural_key_raw(room_id);
+        let full_key = room_typed_key(room_id);
         prefix.copy_from_slice(&full_key[..PREFIX_LEN]);
     }
 
@@ -339,25 +405,16 @@ fn build_root_handle_nodes_and_lattice(
 /// into [`apply_flat_state_updates_impl`] to apply further incremental
 /// updates; the digest alone cannot be "un-collapsed".
 fn lattice_to_bytes(lattice: &LtHash) -> Vec<u8> {
-    let mut out = Vec::with_capacity(2048);
-    for lane in lattice.0.iter() {
-        out.extend_from_slice(&lane.to_le_bytes());
-    }
-    out
+    lattice.to_bytes()
 }
 
 fn lattice_from_bytes(bytes: &[u8]) -> Result<LtHash, String> {
-    if bytes.len() != 2048 {
-        return Err(format!(
+    LtHash::from_bytes(bytes).ok_or_else(|| {
+        format!(
             "LtHash lattice must be exactly 2048 bytes, got {}",
             bytes.len()
-        ));
-    }
-    let mut lanes = [0u16; 1024];
-    for (lane, chunk) in lanes.iter_mut().zip(bytes.chunks_exact(2)) {
-        *lane = u16::from_le_bytes([chunk[0], chunk[1]]);
-    }
-    Ok(LtHash(lanes))
+        )
+    })
 }
 
 /// Like [`collect_persisted_nodes`], but skips any subtree whose structural
@@ -578,7 +635,7 @@ fn apply_typed_state_updates_impl(
     lattice_bytes: &[u8],
     updates: Vec<(String, String, Option<String>)>,
 ) -> Result<ApplyTypedOutcome, String> {
-    let room_key = room_structural_key_raw(room_id);
+    let room_key = room_typed_key(room_id);
     let mut lattice = lattice_from_bytes(lattice_bytes)?;
 
     let typed_root = TypedRoot::decode_v1(typed_root_bytes)?;
@@ -849,12 +906,63 @@ pub(crate) fn materialize_from_node_map(
     Ok(entries)
 }
 
+/// Materialize directly into the packed wire representation, avoiding the
+/// intermediate vector of owned Rust strings used by the compatibility API.
+fn pack_materialized_from_node_map(
+    root_hash: &StructuralHash,
+    node_map: &HashMap<StructuralHash, Arc<HamtNode<String, String>>>,
+) -> Result<Vec<u8>, String> {
+    let root_node = node_map
+        .get(root_hash)
+        .cloned()
+        .ok_or_else(|| format!("Missing persisted HAMT root node: {:02x?}", root_hash))?;
+    let mut output = vec![PACKED_ENTRIES_FORMAT, 0, 0, 0, 0];
+    let mut count = 0u32;
+    let mut resolver = |hash: &StructuralHash| {
+        node_map
+            .get(hash)
+            .cloned()
+            .ok_or_else(|| format!("Missing persisted HAMT node: {:02x?}", hash))
+    };
+    root_node.visit_entries(&mut resolver, &mut |key, value| {
+        let (event_type, state_key): (String, String) = serde_json::from_str(key)
+            .map_err(|e| format!("Failed to decode HAMT state key: {e}"))?;
+        for field in [&event_type, &state_key, value] {
+            let length = u32::try_from(field.len())
+                .map_err(|_| "state entry field is too long".to_owned())?;
+            output.extend_from_slice(&length.to_le_bytes());
+            output.extend_from_slice(field.as_bytes());
+        }
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| "too many state entries".to_owned())?;
+        Ok::<(), String>(())
+    })?;
+    output[1..5].copy_from_slice(&count.to_le_bytes());
+    Ok(output)
+}
+
+#[allow(dead_code)]
 pub(crate) fn lookup_from_node_map(
     root_hash: &StructuralHash,
     structural_key: &[u8],
     keys: &[(String, String)],
     node_map: &HashMap<StructuralHash, Arc<HamtNode<String, String>>>,
 ) -> Result<(Vec<PyStateEntry>, HashSet<StructuralHash>), String> {
+    let mut sink = TupleEntrySink {
+        entries: Vec::new(),
+    };
+    let missing = lookup_from_node_map_into(root_hash, structural_key, keys, node_map, &mut sink)?;
+    Ok((sink.entries, missing))
+}
+
+fn lookup_from_node_map_into<S: StateEntrySink>(
+    root_hash: &StructuralHash,
+    structural_key: &[u8],
+    keys: &[(String, String)],
+    node_map: &HashMap<StructuralHash, Arc<HamtNode<String, String>>>,
+    sink: &mut S,
+) -> Result<HashSet<StructuralHash>, String> {
     let encoded_keys = keys
         .iter()
         .map(|(event_type, state_key)| {
@@ -862,7 +970,14 @@ pub(crate) fn lookup_from_node_map(
                 .map_err(|e| format!("Failed to encode HAMT state key: {e}"))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    lookup_from_node_map_preencoded(root_hash, structural_key, keys, &encoded_keys, node_map)
+    lookup_from_node_map_preencoded_into(
+        root_hash,
+        structural_key,
+        keys,
+        &encoded_keys,
+        node_map,
+        sink,
+    )
 }
 
 /// Equivalent to [`lookup_from_node_map`], except callers retrying a lookup
@@ -874,12 +989,33 @@ pub(crate) fn lookup_from_node_map_preencoded(
     encoded_keys: &[String],
     node_map: &HashMap<StructuralHash, Arc<HamtNode<String, String>>>,
 ) -> Result<(Vec<PyStateEntry>, HashSet<StructuralHash>), String> {
+    let mut sink = TupleEntrySink {
+        entries: Vec::new(),
+    };
+    let missing = lookup_from_node_map_preencoded_into(
+        root_hash,
+        structural_key,
+        keys,
+        encoded_keys,
+        node_map,
+        &mut sink,
+    )?;
+    Ok((sink.entries, missing))
+}
+
+fn lookup_from_node_map_preencoded_into<S: StateEntrySink>(
+    root_hash: &StructuralHash,
+    structural_key: &[u8],
+    keys: &[(String, String)],
+    encoded_keys: &[String],
+    node_map: &HashMap<StructuralHash, Arc<HamtNode<String, String>>>,
+    sink: &mut S,
+) -> Result<HashSet<StructuralHash>, String> {
     debug_assert_eq!(keys.len(), encoded_keys.len());
     let root_node = node_map
         .get(root_hash)
         .cloned()
         .ok_or_else(|| format!("Missing persisted HAMT root node: {:02x?}", root_hash))?;
-    let mut entries = Vec::new();
     let mut missing = HashSet::new();
 
     for ((event_type, state_key), key) in keys.iter().zip(encoded_keys) {
@@ -889,11 +1025,11 @@ pub(crate) fn lookup_from_node_map_preencoded(
             })
         };
         if let Ok(Some(event_id)) = root_node.search(structural_key, key, &mut resolver) {
-            entries.push((event_type.clone(), state_key.clone(), event_id));
+            sink.push(event_type, state_key, &event_id)?;
         }
     }
 
-    Ok((entries, missing))
+    Ok(missing)
 }
 
 fn structural_hash_from_bytes(hash_bytes: Vec<u8>) -> Result<StructuralHash, PyErr> {
@@ -905,7 +1041,7 @@ fn structural_hash_from_bytes(hash_bytes: Vec<u8>) -> Result<StructuralHash, PyE
 #[pyfunction]
 #[pyo3(text_signature = "(room_id, /)")]
 pub fn room_structural_key(room_id: &str) -> PyResult<Vec<u8>> {
-    Ok(room_structural_key_raw(room_id).to_vec())
+    Ok(room_structural_key_raw(room_id))
 }
 
 /// See `room_hamt_prefix_raw` for the derivation. `msc4291_room_ids_as_hashes`
@@ -1096,9 +1232,18 @@ pub fn materialize_state_entries(
     root_node_bytes: Vec<u8>,
     nodes: Vec<(Vec<u8>, Vec<u8>)>,
 ) -> PyResult<Vec<PyStateEntry>> {
-    let mut root_hash = None;
-    let mut node_map: HashMap<StructuralHash, Arc<HamtNode<String, String>>> = HashMap::new();
+    let (root_hash, node_map) = parse_materialization_nodes(&root_node_bytes, nodes)?;
 
+    materialize_from_node_map(&root_hash, &node_map)
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+}
+
+fn parse_materialization_nodes(
+    root_node_bytes: &[u8],
+    nodes: Vec<(Vec<u8>, Vec<u8>)>,
+) -> PyResult<(StructuralHash, MaterializationNodes)> {
+    let mut root_hash = None;
+    let mut node_map = HashMap::new();
     for (hash_bytes, node_bytes) in nodes {
         let hash = structural_hash_from_bytes(hash_bytes)?;
         if node_bytes == root_node_bytes {
@@ -1108,13 +1253,25 @@ pub fn materialize_state_entries(
             .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
         node_map.insert(hash, node);
     }
-
     let root_hash = root_hash.ok_or_else(|| {
         pyo3::exceptions::PyValueError::new_err("root_node_bytes not found in nodes list")
     })?;
+    Ok((root_hash, node_map))
+}
 
-    materialize_from_node_map(&root_hash, &node_map)
-        .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+/// Materialize entries into a compact versioned byte buffer. The buffer is
+/// `[version:u8][count:u32][len:u32][utf8]...`, with three fields per entry:
+/// event type, state key, and event ID.
+#[pyfunction]
+#[pyo3(text_signature = "(root_node_bytes, nodes, /)")]
+pub fn materialize_state_entries_packed(
+    root_node_bytes: Vec<u8>,
+    nodes: Vec<(Vec<u8>, Vec<u8>)>,
+) -> PyResult<Py<PyBytes>> {
+    let (root_hash, node_map) = parse_materialization_nodes(&root_node_bytes, nodes)?;
+    let packed = pack_materialized_from_node_map(&root_hash, &node_map)
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+    Python::attach(|py| Ok(PyBytes::new(py, &packed).unbind()))
 }
 
 /// Look up a set of `(event_type, state_key)` entries in a room's HAMT,
@@ -1132,15 +1289,28 @@ pub fn materialize_state_entries(
 /// verification failure there is the real thing this function exists to
 /// catch: corrupted/substituted bytes for a node this room's own tree
 /// actually depends on.
-fn lookup_state_entries_impl(
-    structural_key: &[u8; 32],
+fn lookup_state_entries_impl<S: StateEntrySink>(
+    structural_key: &[u8],
+    typed_key: &[u8; 32],
     root_node_bytes: &[u8],
     nodes: Vec<(StructuralHash, Vec<u8>)>,
     keys: &[(String, String)],
-) -> Result<(Vec<PyStateEntry>, Vec<StructuralHash>), String> {
-    let root_node = decode_persisted_node_with_key(root_node_bytes, structural_key)?;
-    let root_hash = root_node.structural_hash;
-    let mut node_map = HashMap::from([(root_hash, root_node)]);
+    sink: &mut S,
+) -> Result<Vec<StructuralHash>, String> {
+    let typed_root = TypedRoot::decode_v1(root_node_bytes).ok();
+    let root_node = if typed_root.is_none() {
+        Some(decode_persisted_node_with_key(
+            root_node_bytes,
+            structural_key,
+        )?)
+    } else {
+        None
+    };
+    let root_hash = root_node.as_ref().map(|node| node.structural_hash);
+    let mut node_map = root_node
+        .as_ref()
+        .map(|node| HashMap::from([(node.structural_hash, node.clone())]))
+        .unwrap_or_default();
     let mut raw_bytes: HashMap<StructuralHash, Vec<u8>> = HashMap::new();
     for (hash, node_bytes) in nodes {
         let node = decode_persisted_node_unverified(&node_bytes, hash)?;
@@ -1148,11 +1318,37 @@ fn lookup_state_entries_impl(
         node_map.insert(hash, node);
     }
 
-    let (entries, missing) = lookup_from_node_map(&root_hash, structural_key, keys, &node_map)?;
-
-    if let Ok(typed_root) = TypedRoot::decode_v1(root_node_bytes) {
+    if let Some(typed_root) = typed_root {
+        let directory: HashMap<String, StructuralHash> =
+            typed_root.directory.iter().cloned().collect();
+        let mut missing = HashSet::new();
+        for (event_type, state_key) in keys {
+            let Some(subtree_root_hash) = directory.get(event_type) else {
+                continue;
+            };
+            // Typed subtrees are built from `(state_key, event_id)` pairs, so
+            // their HAMT key is the raw state key. The flat HAMT instead uses
+            // the JSON `(event_type, state_key)` tuple.
+            let encoded_key = state_key.clone();
+            let mut resolver = |hash: &StructuralHash| {
+                node_map.get(hash).cloned().ok_or_else(|| {
+                    missing.insert(*hash);
+                })
+            };
+            let Some(subtree_root) = node_map.get(subtree_root_hash) else {
+                missing.insert(*subtree_root_hash);
+                continue;
+            };
+            if let Ok(Some(event_id)) = subtree_root.search(
+                &typed_subtree_key(typed_key, event_type),
+                &encoded_key,
+                &mut resolver,
+            ) {
+                sink.push(event_type, state_key, &event_id)?;
+            }
+        }
         for (event_type, subtree_root_hash) in typed_root.directory {
-            let subtree_key = typed_subtree_key(structural_key, &event_type);
+            let subtree_key = typed_subtree_key(typed_key, &event_type);
             let mut seen = HashSet::from([subtree_root_hash]);
             let mut stack = vec![subtree_root_hash];
             while let Some(hash) = stack.pop() {
@@ -1169,7 +1365,10 @@ fn lookup_state_entries_impl(
                 }
             }
         }
+        Ok(missing.into_iter().collect())
     } else {
+        let root_hash = root_hash.expect("flat root was decoded above");
+        let missing = lookup_from_node_map_into(&root_hash, structural_key, keys, &node_map, sink)?;
         // A flat root uses the room structural key directly. As above, verify
         // only nodes actually reachable from this root: the fetched batch can
         // legitimately contain nodes for other rooms.
@@ -1188,9 +1387,8 @@ fn lookup_state_entries_impl(
                 }
             }
         }
+        Ok(missing.into_iter().collect())
     }
-
-    Ok((entries, missing.into_iter().collect()))
 }
 
 #[pyfunction]
@@ -1202,19 +1400,68 @@ pub fn lookup_state_entries(
     keys: Vec<(String, String)>,
 ) -> PyResult<PyStateLookup> {
     let structural_key = room_structural_key_raw(room_id);
+    let typed_key = room_typed_key(room_id);
     let nodes = nodes
         .into_iter()
         .map(|(hash_bytes, node_bytes)| {
             structural_hash_from_bytes(hash_bytes).map(|hash| (hash, node_bytes))
         })
         .collect::<PyResult<Vec<_>>>()?;
-    let (entries, missing) =
-        lookup_state_entries_impl(&structural_key, &root_node_bytes, nodes, &keys)
-            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+    let mut sink = TupleEntrySink {
+        entries: Vec::new(),
+    };
+    let missing = lookup_state_entries_impl(
+        &structural_key,
+        &typed_key,
+        &root_node_bytes,
+        nodes,
+        &keys,
+        &mut sink,
+    )
+    .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
     Ok((
-        entries,
+        sink.entries,
         missing.into_iter().map(|hash| hash.to_vec()).collect(),
     ))
+}
+
+/// Lookup state entries and return the same compact representation as
+/// [`materialize_state_entries_packed`], followed by missing node hashes.
+#[pyfunction]
+#[pyo3(text_signature = "(room_id, root_node_bytes, nodes, keys, /)")]
+pub fn lookup_state_entries_packed(
+    room_id: &str,
+    root_node_bytes: Vec<u8>,
+    nodes: Vec<(Vec<u8>, Vec<u8>)>,
+    keys: Vec<(String, String)>,
+) -> PyResult<(Py<PyBytes>, Vec<Vec<u8>>)> {
+    let structural_key = room_structural_key_raw(room_id);
+    let typed_key = room_typed_key(room_id);
+    let nodes = nodes
+        .into_iter()
+        .map(|(hash_bytes, node_bytes)| {
+            structural_hash_from_bytes(hash_bytes).map(|hash| (hash, node_bytes))
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let mut sink = PackedEntrySink::new();
+    let missing = lookup_state_entries_impl(
+        &structural_key,
+        &typed_key,
+        &root_node_bytes,
+        nodes,
+        &keys,
+        &mut sink,
+    )
+    .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+    let packed = sink
+        .finish()
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+    Python::attach(|py| {
+        Ok((
+            PyBytes::new(py, &packed).unbind(),
+            missing.into_iter().map(|hash| hash.to_vec()).collect(),
+        ))
+    })
 }
 
 #[pyfunction]
@@ -1329,7 +1576,15 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     child_module.add_function(wrap_pyfunction!(apply_typed_state_updates, &child_module)?)?;
     child_module.add_function(wrap_pyfunction!(decode_typed_root, &child_module)?)?;
     child_module.add_function(wrap_pyfunction!(materialize_state_entries, &child_module)?)?;
+    child_module.add_function(wrap_pyfunction!(
+        materialize_state_entries_packed,
+        &child_module
+    )?)?;
     child_module.add_function(wrap_pyfunction!(lookup_state_entries, &child_module)?)?;
+    child_module.add_function(wrap_pyfunction!(
+        lookup_state_entries_packed,
+        &child_module
+    )?)?;
     child_module.add_function(wrap_pyfunction!(node_child_hashes, &child_module)?)?;
     child_module.add_function(wrap_pyfunction!(reachability_audit, &child_module)?)?;
     child_module.add_function(wrap_pyfunction!(unreachable_node_hashes, &child_module)?)?;
@@ -1524,7 +1779,7 @@ mod tests {
             "initial directory should contain the removed event type"
         );
         let empty_subtree_hash = rezzy::hamt::build_hamt(
-            &typed_subtree_key(&room_structural_key_raw(room_id), "m.room.join_rules"),
+            &typed_subtree_key(&room_typed_key(room_id), "m.room.join_rules"),
             Vec::<(String, String)>::new(),
         )
         .expect("empty typed subtree should build")
@@ -1857,7 +2112,7 @@ mod tests {
 
         assert_eq!(key1, key2);
         assert_ne!(key1, other_key);
-        assert_eq!(key1.len(), 32);
+        assert_eq!(key1, room_id.as_bytes());
     }
 
     #[test]
@@ -1976,6 +2231,42 @@ mod tests {
             flat_state_group_id, [0u8; 32],
             "state_group_id must not be the digest of the zero lattice"
         );
+    }
+
+    #[test]
+    fn typed_root_lookup_uses_subtree_namespace_before_flat_decode() {
+        let room_id = "!typed-lookup:test.example";
+        let entries = vec![
+            (
+                "m.room.member".to_owned(),
+                "@alice:test.example".to_owned(),
+                "$member".to_owned(),
+            ),
+            ("m.room.name".to_owned(), String::new(), "$name".to_owned()),
+        ];
+        let (root, _lattice, nodes) =
+            build_typed_root_nodes_and_lattice(room_id, entries).expect("typed root builds");
+        let mut sink = TupleEntrySink {
+            entries: Vec::new(),
+        };
+        let result = lookup_state_entries_impl(
+            &room_structural_key_raw(room_id),
+            &room_typed_key(room_id),
+            &root.encode_v1().expect("typed root encodes"),
+            nodes.into_iter().collect(),
+            &[("m.room.member".to_owned(), "@alice:test.example".to_owned())],
+            &mut sink,
+        )
+        .expect("typed lookup succeeds");
+        assert_eq!(
+            sink.entries,
+            vec![(
+                "m.room.member".to_owned(),
+                "@alice:test.example".to_owned(),
+                "$member".to_owned()
+            )]
+        );
+        assert!(result.is_empty());
     }
 
     #[test]
@@ -2131,7 +2422,18 @@ mod tests {
             .1 = root_bytes.clone();
 
         let structural_key = room_structural_key_raw(room_id);
-        assert!(lookup_state_entries_impl(&structural_key, &root_bytes, nodes, &[]).is_err());
+        let typed_key = room_typed_key(room_id);
+        assert!(lookup_state_entries_impl(
+            &structural_key,
+            &typed_key,
+            &root_bytes,
+            nodes,
+            &[],
+            &mut TupleEntrySink {
+                entries: Vec::new()
+            },
+        )
+        .is_err());
     }
 
     #[test]
@@ -2174,16 +2476,24 @@ mod tests {
             nodes.into_iter().chain(other_nodes).collect();
 
         let structural_key = room_structural_key_raw(room_id);
+        let typed_key = room_typed_key(room_id);
         let keys = vec![("m.room.name".to_owned(), "".to_owned())];
 
-        let (entries, missing) =
-            lookup_state_entries_impl(&structural_key, &root_node_bytes, combined_nodes, &keys)
-                .expect(
-                    "lookup must not fail just because the batch also carries another room's nodes",
-                );
+        let mut sink = TupleEntrySink {
+            entries: Vec::new(),
+        };
+        let missing = lookup_state_entries_impl(
+            &structural_key,
+            &typed_key,
+            &root_node_bytes,
+            combined_nodes,
+            &keys,
+            &mut sink,
+        )
+        .expect("lookup must not fail just because the batch also carries another room's nodes");
         assert!(missing.is_empty());
         assert_eq!(
-            entries,
+            sink.entries,
             vec![("m.room.name".to_owned(), "".to_owned(), "$name".to_owned())]
         );
     }

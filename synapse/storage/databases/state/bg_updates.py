@@ -48,11 +48,41 @@ from synapse.types import MutableStateMap, StateMap
 from synapse.types.state import StateFilter
 from synapse.util.caches import intern_string
 from synapse.util.iterutils import batch_iter
+from synapse.util.timings_flush import register_periodic_flush
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
 
 logger = logging.getLogger(__name__)
+
+
+def _decode_packed_state_entries(packed: bytes) -> list[tuple[str, str, str]]:
+    """Decode the versioned Rust HAMT entry buffer."""
+    if not packed or packed[0] != 1:
+        raise RuntimeError("unsupported packed state HAMT format")
+    offset = 1
+    if len(packed) < offset + 4:
+        raise RuntimeError("truncated packed state HAMT header")
+    (count,) = struct.unpack_from("<I", packed, offset)
+    offset += 4
+    entries: list[tuple[str, str, str]] = []
+    for _ in range(count):
+        fields: list[str] = []
+        for _ in range(3):
+            if len(packed) < offset + 4:
+                raise RuntimeError("truncated packed state HAMT field length")
+            (length,) = struct.unpack_from("<I", packed, offset)
+            offset += 4
+            end = offset + length
+            if end > len(packed):
+                raise RuntimeError("truncated packed state HAMT field")
+            fields.append(packed[offset:end].decode("utf-8"))
+            offset = end
+        entries.append((fields[0], fields[1], fields[2]))
+    if offset != len(packed):
+        raise RuntimeError("trailing bytes in packed state HAMT response")
+    return entries
+
 
 # ── mtxdb-vs-SQL timing (opt-in via SYNAPSE_PG_TIMINGS=1) ───────────────
 # Read once at import time. `_state_timing`/`_state_counter` are called from
@@ -237,7 +267,9 @@ def _print_state_timings() -> None:
 
     run_dir = os.environ.get("SYNAPSE_TIMINGS_RUN_DIR")
     if run_dir:
-        tmp_path = os.path.join(run_dir, f"state_{os.getpid()}.tmp")
+        tmp_path = os.path.join(
+            run_dir, f"state_{os.getpid()}.{threading.get_ident()}.tmp"
+        )
         final_path = os.path.join(run_dir, f"state_{os.getpid()}.json")
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
@@ -324,7 +356,9 @@ def _print_node_write_stats() -> None:
 
     run_dir = os.environ.get("SYNAPSE_TIMINGS_RUN_DIR")
     if run_dir:
-        tmp_path = os.path.join(run_dir, f"node_writes_{os.getpid()}.tmp")
+        tmp_path = os.path.join(
+            run_dir, f"node_writes_{os.getpid()}.{threading.get_ident()}.tmp"
+        )
         final_path = os.path.join(run_dir, f"node_writes_{os.getpid()}.json")
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
@@ -390,7 +424,9 @@ def _print_root_write_stats() -> None:
         return
     run_dir = os.environ.get("SYNAPSE_TIMINGS_RUN_DIR")
     if run_dir:
-        tmp_path = os.path.join(run_dir, f"root_writes_{os.getpid()}.tmp")
+        tmp_path = os.path.join(
+            run_dir, f"root_writes_{os.getpid()}.{threading.get_ident()}.tmp"
+        )
         final_path = os.path.join(run_dir, f"root_writes_{os.getpid()}.json")
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
@@ -448,6 +484,9 @@ if _PG_TIMINGS_ENABLED:
     atexit.register(flush_state_timings)
     atexit.register(flush_node_write_stats)
     atexit.register(flush_root_write_stats)
+    register_periodic_flush(flush_state_timings)
+    register_periodic_flush(flush_node_write_stats)
+    register_periodic_flush(flush_root_write_stats)
 
     import signal as _signal
     from types import FrameType as _FrameType
@@ -670,7 +709,7 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
             existing_in_sql = {group for (group,) in existing_rows}
             if (
                 existing_in_sql
-                and getattr(self, "_embedded_hamt_engine", None) == "mtxdb"
+                and getattr(self, "_embedded_db_engine", None) == "mtxdb"
             ):
                 # In a multi-worker deployment, this worker's in-process
                 # mtxdb index may simply be stale rather than the group
@@ -688,8 +727,8 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
                     refresh_state_hamt_collections_for_groups,
                 )
 
-                namespace = getattr(self, "_embedded_hamt_namespace", None)
-                # __init__ always sets this alongside `_embedded_hamt_engine`
+                namespace = getattr(self, "_embedded_db_namespace", None)
+                # __init__ always sets this alongside `_embedded_db_engine`
                 # in the same branch (see store.py) -- reaching here with
                 # the engine set but not the namespace would be an init bug,
                 # not a normal runtime state.
@@ -922,7 +961,7 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
         # falling back to `state_hamt_roots`/`state_groups` SQL only for a
         # group it doesn't have. Always use the bulk path (it degrades to a
         # single-root fetch fine for len(groups) == 1).
-        use_embedded = bool(getattr(self, "_embedded_hamt_engine", None))
+        use_embedded = bool(getattr(self, "_embedded_db_engine", None))
 
         bulk_results: dict[int, list[tuple[str, str, str]] | None] | None = None
         bulk_selective_results: dict[int, list[tuple[str, str, str]] | None] | None = (
@@ -1069,9 +1108,11 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
                             seen_hashes.add(child_hash)
                             to_fetch.add(child_hash)
 
-        entries = state_hamt.materialize_state_entries(
-            node_bytes_by_hash[root_structural_hash],
-            list(node_bytes_by_hash.items()),
+        entries = _decode_packed_state_entries(
+            state_hamt.materialize_state_entries_packed(
+                node_bytes_by_hash[root_structural_hash],
+                list(node_bytes_by_hash.items()),
+            )
         )
         logger.debug(
             "[gg-state-timing] _materialize_state_hamt_from_postgres_txn "
@@ -1136,9 +1177,11 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
 
         for group, root_hash in roots.items():
             root_bytes = node_bytes_by_hash[root_hash]
-            results[group] = state_hamt.materialize_state_entries(
-                root_bytes,
-                list(node_bytes_by_hash.items()),
+            results[group] = _decode_packed_state_entries(
+                state_hamt.materialize_state_entries_packed(
+                    root_bytes,
+                    list(node_bytes_by_hash.items()),
+                )
             )
         return results
 
@@ -1182,12 +1225,13 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
         root_bytes = bytes(root_node)
         nodes: dict[bytes, bytes] = {root_hash: root_bytes}
         while True:
-            entries, missing = state_hamt.lookup_state_entries(
+            packed_entries, missing = state_hamt.lookup_state_entries_packed(
                 room_id,
                 root_bytes,
                 list(nodes.items()),
                 keys,
             )
+            entries = _decode_packed_state_entries(packed_entries)
             missing = [
                 bytes(node_hash) for node_hash in missing if node_hash not in nodes
             ]
@@ -1268,12 +1312,13 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
             already fetched -- defensive, mirrors the single-group loop)."""
             still_missing: set[bytes] = set()
             for group, root_hash in roots.items():
-                entries, missing = state_hamt.lookup_state_entries(
+                packed_entries, missing = state_hamt.lookup_state_entries_packed(
                     room_ids[group],
                     node_bytes_by_hash[root_hash],
                     list(node_bytes_by_hash.items()),
                     keys,
                 )
+                entries = _decode_packed_state_entries(packed_entries)
                 results[group] = entries
                 still_missing.update(
                     bytes(node_hash)
@@ -1329,7 +1374,7 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
         that is NOT silently re-fetched from SQL: once the embedded engine
         is configured it's the source of truth for new data, so a real miss
         means either genuine corruption or (the one legitimate exception)
-        that `EMBEDDED_HAMT_MIGRATION_UPDATE_NAME` hasn't finished copying
+        that `EMBEDDED_DB_MIGRATION_UPDATE_NAME` hasn't finished copying
         this group's pre-existing SQL row over yet -- see
         `_background_migrate_state_hamt_to_embedded`. Only in that bounded,
         explicit window does this fall back to SQL.
@@ -1341,8 +1386,8 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
         groups the reads by room, and decodes their records before returning
         to Python. This keeps the whole operation to one FFI crossing.
         """
-        engine = get_embedded_engine(getattr(self, "_embedded_hamt_engine", None))
-        namespace = getattr(self, "_embedded_hamt_namespace", None)
+        engine = get_embedded_engine(getattr(self, "_embedded_db_engine", None))
+        namespace = getattr(self, "_embedded_db_namespace", None)
         found: dict[int, tuple[bytes, bytes, str]] = {}
         still_missing: list[int] = []
 
@@ -1357,7 +1402,7 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
             return found
 
         migration_name = getattr(
-            self, "EMBEDDED_HAMT_MIGRATION_UPDATE_NAME", "state_hamt_embedded_migration"
+            self, "EMBEDDED_DB_MIGRATION_UPDATE_NAME", "state_hamt_embedded_migration"
         )
         txn.execute(
             "SELECT 1 FROM background_updates WHERE update_name = ?",
@@ -1412,11 +1457,11 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
         roots = self._fetch_hamt_roots_for_embedded_txn(txn, groups)
         if not roots:
             return results
-        engine = get_embedded_engine(getattr(self, "_embedded_hamt_engine", None))
+        engine = get_embedded_engine(getattr(self, "_embedded_db_engine", None))
         ordered_groups = list(roots.keys())
         _et = time.monotonic()
         materialized = engine.materialize_state_hamts(
-            getattr(self, "_embedded_hamt_namespace", None),
+            getattr(self, "_embedded_db_namespace", None),
             [roots[group] for group in ordered_groups],
         )
         ffi_timing("ffi_materialize_hamts", time.monotonic() - _et)
@@ -1436,7 +1481,7 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
         roots = self._fetch_hamt_roots_for_embedded_txn(txn, groups)
         if not roots:
             return results
-        engine = get_embedded_engine(getattr(self, "_embedded_hamt_engine", None))
+        engine = get_embedded_engine(getattr(self, "_embedded_db_engine", None))
         ordered_groups = list(roots.keys())
         queries = [
             (room_prefix, root_hash, self._room_structural_key(room_id), keys)
@@ -1444,7 +1489,7 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
         ]
         _et = time.monotonic()
         looked_up = engine.lookup_state_hamts(
-            getattr(self, "_embedded_hamt_namespace", None), queries
+            getattr(self, "_embedded_db_namespace", None), queries
         )
         ffi_timing("ffi_lookup_hamts", time.monotonic() - _et)
         for group, entries in zip(ordered_groups, looked_up):
@@ -1519,7 +1564,7 @@ class StateBackgroundUpdateStore(StateGroupBackgroundUpdateStore):
         # (see `_maybe_requeue_state_hamt_backfill`) when the source
         # database is missing roots for some rooms (e.g. an interrupted
         # source-side backfill, or -- historically -- a source that was
-        # TiKV-backed, back when that was a supported HAMT engine). Guard
+        # TiKV-backed, back when that was a supported embedded engine). Guard
         # the registration so constructing that composed `Store` doesn't
         # crash on the missing attribute.
         if hasattr(self, "_background_backfill_state_hamt_roots"):

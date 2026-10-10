@@ -47,7 +47,10 @@ from synapse.storage.database import (
 )
 from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
 from synapse.storage.databases.main.embedded_common import Pool, SyncTier, maybe_sync
-from synapse.storage.databases.main.embedded_event_json import put_event_json_batch
+from synapse.storage.databases.main.embedded_event_json import (
+    get_event_json_batch,
+    put_event_json_batch,
+)
 from synapse.storage.databases.main.embedded_event_to_state_group import (
     get_state_group_for_events_batch,
     increment_state_group_refcounts_batch,
@@ -241,7 +244,7 @@ class EventsBackgroundUpdatesStore(
             self._event_arbitrary_relations,
         )
 
-        if hs.config.database.embedded_hamt_engine == "mtxdb":
+        if hs.config.database.embedded_db_engine == "mtxdb":
             self.db_pool.updates.register_background_update_handler(
                 self.EMBEDDED_EVENT_TO_STATE_GROUP_MIGRATION_UPDATE_NAME,
                 self._background_migrate_event_to_state_groups_to_embedded,
@@ -328,6 +331,11 @@ class EventsBackgroundUpdatesStore(
             unique=True,
             # the old index which just covered event_id is now redundant.
             replaces_index="ev_edges_id",
+        )
+
+        self.db_pool.updates.register_background_update_handler(
+            _BackgroundUpdates.EVENT_EDGES_MIGRATE_MTXDB,
+            self._background_migrate_event_edges_mtxdb,
         )
 
         self.db_pool.updates.register_background_update_handler(
@@ -421,7 +429,7 @@ class EventsBackgroundUpdatesStore(
         `embedded_event_to_state_group.py` needs, since that never existed
         in SQL at all).
 
-        See `_enqueue_embedded_hamt_migration_if_needed`
+        See `_enqueue_embedded_db_migration_if_needed`
         (storage/databases/state/store.py) for why this can't just check
         `has_completed_background_update` -- the same `_all_done` fast-path
         problem applies here.
@@ -445,32 +453,114 @@ class EventsBackgroundUpdatesStore(
         (`embedded_event_to_state_group.py`'s
         `increment_state_group_refcounts_batch`) that backs
         `get_referenced_state_groups` once this table is embedded-exclusive
-        -- for data written before `embedded_hamt_engine` was turned on.
+        -- for data written before `embedded_db_engine` was turned on.
         New writes never need this; they already go straight to the
         configured engine exclusively.
 
-        Existing SQL rows are left in place rather than deleted: harmless
-        once migrated, and means turning the embedded engine back off
-        doesn't lose data (see the equivalent HAMT migration's docstring
-        for the same reasoning).
+        Each batch's SQL rows are deleted in the same transaction that copies
+        them, and before the copy, so the per-event lock also covers the mtxdb
+        probe and write; once a row is migrated mtxdb is its only copy. Turning
+        the embedded engine back off therefore needs a reverse migration; the
+        SQL table no longer holds the mappings.
         """
         last_event_id = progress.get("last_event_id", "")
+        # `FOR UPDATE` locks the batch on Postgres as soon as it is selected;
+        # a plain SQLite SELECT holds no lock at all, so there the lock arrives
+        # with the DELETE below. Either way the per-event lock is taken before
+        # the mtxdb probe and held until this transaction commits, which is what
+        # serialises the batch against `update_state_for_partial_state_event`
+        # (state.py drops the same row first, then rewrites mtxdb) and against
+        # purge (which deletes these rows before consulting mtxdb): whoever
+        # gets the lock writes first, and the other side then either waits or
+        # no longer sees the row -- a purged event's mapping can't be
+        # re-inserted from a stale read, and a rewrite can't be overwritten
+        # here by the group this batch read.
+        lock_clause = (
+            "FOR UPDATE" if isinstance(self.database_engine, PostgresEngine) else ""
+        )
 
-        def get_batch_txn(txn: LoggingTransaction) -> list[tuple[str, int]]:
+        def migrate_batch_txn(txn: LoggingTransaction) -> list[tuple[str, int]]:
             txn.execute(
-                """
+                f"""
                 SELECT event_id, state_group FROM event_to_state_groups
                 WHERE event_id > ?
                 ORDER BY event_id
                 LIMIT ?
+                {lock_clause}
                 """,
                 (last_event_id, batch_size),
             )
-            return cast(list[tuple[str, int]], txn.fetchall())
+            rows = cast(list[tuple[str, int]], txn.fetchall())
+            if not rows:
+                return rows
+
+            # Drop the SQL rows before reading or writing mtxdb. `RETURNING`
+            # hands back exactly the rows that still existed once the lock is
+            # held, so one that a concurrent purge or rewrite removed between
+            # the select above and here is simply not ours to migrate: copying
+            # the group selected above for it now would resurrect a purged
+            # mapping, or clobber the rewrite with a stale group, with no SQL
+            # row left to correct either. `rows` (not `migrated_rows`) still
+            # drives the progress cursor below, so a row lost to a purge here
+            # doesn't stall the batch.
+            clause, clause_args = make_in_list_sql_clause(
+                self.database_engine,
+                "event_id",
+                [event_id for event_id, _state_group in rows],
+            )
+            txn.execute(
+                f"""
+                DELETE FROM event_to_state_groups
+                WHERE {clause}
+                RETURNING event_id, state_group
+                """,
+                clause_args,
+            )
+            migrated_rows = cast(list[tuple[str, int]], txn.fetchall())
+
+            # The mtxdb put below only copies rows mtxdb doesn't have, because
+            # the refcount increment is not idempotent: if this batch is
+            # reprocessed after a crash between these writes and the progress
+            # update, an unguarded increment would double-count every event
+            # already migrated last time. An already-present mapping is also
+            # either a replay or newer than the group this batch selected,
+            # e.g. a partial-state event rewritten after the engine was turned
+            # on -- rewriting the SQL row first means such a rewrite has either
+            # committed before the delete above (so its row is gone and it is
+            # not in `migrated_rows`) or is waiting on the lock and re-reads
+            # what this batch wrote.
+            already_migrated = get_state_group_for_events_batch(
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
+                [event_id for event_id, _state_group in migrated_rows],
+                purpose="migration_probe",
+            )
+            new_rows = [
+                (event_id, state_group)
+                for event_id, state_group in migrated_rows
+                if event_id not in already_migrated
+            ]
+            put_event_to_state_group_batch(
+                self._embedded_db_engine, self._embedded_db_namespace, new_rows
+            )
+            increment_state_group_refcounts_batch(
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
+                [state_group for _event_id, state_group in new_rows],
+            )
+            # One sync for the whole batch (put + increment above), not one per
+            # helper call -- see put_event_to_state_group_batch's docstring.
+            # The copy has to be durable before this transaction commits: from
+            # then on mtxdb is the only copy. If it fails instead, the SQL rows
+            # come back next to whatever the mtxdb writes above managed, and the
+            # probe keeps replaying the batch idempotent.
+            maybe_sync(SyncTier.DURABLE, pools=[Pool.STATE])
+
+            return rows
 
         rows = await self.db_pool.runInteraction(
-            f"{self.EMBEDDED_EVENT_TO_STATE_GROUP_MIGRATION_UPDATE_NAME}_select",
-            get_batch_txn,
+            f"{self.EMBEDDED_EVENT_TO_STATE_GROUP_MIGRATION_UPDATE_NAME}_migrate",
+            migrate_batch_txn,
         )
 
         if not rows:
@@ -478,35 +568,6 @@ class EventsBackgroundUpdatesStore(
                 self.EMBEDDED_EVENT_TO_STATE_GROUP_MIGRATION_UPDATE_NAME
             )
             return 0
-
-        # The mtxdb put below is idempotent (an overwrite), but the refcount
-        # increment is not: if this batch is reprocessed after a crash
-        # between the writes here and the progress update below, an
-        # unguarded increment would double-count every event already
-        # migrated last time. Only increment for event_ids this batch
-        # hasn't already written to mtxdb.
-        already_migrated = get_state_group_for_events_batch(
-            self._embedded_hamt_engine,
-            self._embedded_hamt_namespace,
-            [event_id for event_id, _state_group in rows],
-            purpose="migration_probe",
-        )
-        new_rows = [
-            (event_id, state_group)
-            for event_id, state_group in rows
-            if event_id not in already_migrated
-        ]
-        put_event_to_state_group_batch(
-            self._embedded_hamt_engine, self._embedded_hamt_namespace, rows
-        )
-        increment_state_group_refcounts_batch(
-            self._embedded_hamt_engine,
-            self._embedded_hamt_namespace,
-            [state_group for _event_id, state_group in new_rows],
-        )
-        # One sync for the whole batch (put + increment above), not one per
-        # helper call -- see put_event_to_state_group_batch's docstring.
-        maybe_sync(SyncTier.DURABLE, pools=[Pool.STATE])
 
         await self.db_pool.updates._background_update_progress(
             self.EMBEDDED_EVENT_TO_STATE_GROUP_MIGRATION_UPDATE_NAME,
@@ -536,7 +597,7 @@ class EventsBackgroundUpdatesStore(
         self, progress: JsonDict, batch_size: int
     ) -> int:
         """Copy existing SQL `event_auth_chain_links` rows into the embedded
-        engine, for data written before `embedded_hamt_engine` was turned
+        engine, for data written before `embedded_db_engine` was turned
         on. New writes never need this; they already go straight to the
         configured engine exclusively (see `_persist_chain_cover_index` in
         events.py).
@@ -595,8 +656,8 @@ class EventsBackgroundUpdatesStore(
         )
 
         put_chain_links_batch(
-            self._embedded_hamt_engine,
-            self._embedded_hamt_namespace,
+            self._embedded_db_engine,
+            self._embedded_db_namespace,
             rows,
             sync=True,
         )
@@ -629,7 +690,7 @@ class EventsBackgroundUpdatesStore(
         def reindex_txn(txn: LoggingTransaction) -> int:
             sql = (
                 "SELECT stream_ordering, event_id, json FROM events"
-                " INNER JOIN event_json USING (event_id)"
+                " LEFT JOIN event_json USING (event_id)"
                 " WHERE ? <= stream_ordering AND stream_ordering < ?"
                 " ORDER BY stream_ordering DESC"
                 " LIMIT ?"
@@ -643,11 +704,29 @@ class EventsBackgroundUpdatesStore(
 
             min_stream_id = rows[-1][0]
 
+            missing_json_ids = [event_id for _, event_id, json in rows if json is None]
+            json_by_id = {}
+            if missing_json_ids and getattr(
+                self, "_embedded_event_json_enabled", False
+            ):
+                found = get_event_json_batch(
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
+                    missing_json_ids,
+                )
+                for eid, (_, j, _) in found.items():
+                    json_by_id[eid] = j
+
             update_rows = []
             for row in rows:
                 try:
                     event_id = row[1]
-                    event_json = db_to_json(row[2])
+                    raw_json = row[2]
+                    if raw_json is None:
+                        raw_json = json_by_id.get(event_id)
+                    if not raw_json:
+                        continue
+                    event_json = db_to_json(raw_json)
                     sender = event_json["sender"]
                     content = event_json["content"]
 
@@ -824,8 +903,32 @@ class EventsBackgroundUpdatesStore(
                 """,
                 (batch_size,),
             )
+            rows = txn.fetchall()
 
-            for prev_event_id, event_id, metadata, rejected, outlier in txn:
+            # The initial query's `event_json` join is SQL-only, but the
+            # embedded event-JSON backend (when enabled) is the read-path
+            # authority and leaves no SQL row. Pull the missing
+            # `internal_metadata` from it so soft-failed extremities are
+            # classified correctly -- same fallback the recursive query below
+            # already applies.
+            missing_meta_ids = [
+                event_id
+                for _, event_id, metadata, _, _ in rows
+                if event_id and metadata is None
+            ]
+            meta_by_id = {}
+            if missing_meta_ids and getattr(
+                self, "_embedded_event_json_enabled", False
+            ):
+                found = get_event_json_batch(
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
+                    missing_meta_ids,
+                )
+                for eid, (m, _, _) in found.items():
+                    meta_by_id[eid] = m
+
+            for prev_event_id, event_id, metadata, rejected, outlier in rows:
                 original_set.add(prev_event_id)
 
                 if not event_id or outlier:
@@ -835,9 +938,11 @@ class EventsBackgroundUpdatesStore(
 
                 graph.setdefault(event_id, set()).add(prev_event_id)
 
-                soft_failed = False
-                if metadata:
-                    soft_failed = db_to_json(metadata).get("soft_failed")
+                if metadata is None:
+                    metadata = meta_by_id.get(event_id)
+                soft_failed = (
+                    db_to_json(metadata).get("soft_failed") if metadata else False
+                )
 
                 if soft_failed or rejected:
                     soft_failed_events_to_lookup.add(event_id)
@@ -858,7 +963,7 @@ class EventsBackgroundUpdatesStore(
                     rejections.event_id IS NOT NULL
                     FROM event_edges
                     INNER JOIN events USING (event_id)
-                    INNER JOIN event_json USING (event_id)
+                    LEFT JOIN event_json USING (event_id)
                     LEFT JOIN rejections USING (event_id)
                     WHERE
                         NOT events.outlier
@@ -868,8 +973,24 @@ class EventsBackgroundUpdatesStore(
                     self.database_engine, "prev_event_id", to_check
                 )
                 txn.execute(sql + clause, list(args))
+                rows = txn.fetchall()
 
-                for prev_event_id, event_id, metadata, rejected in txn:
+                missing_meta_ids = [
+                    event_id for _, event_id, metadata, _ in rows if metadata is None
+                ]
+                meta_by_id = {}
+                if missing_meta_ids and getattr(
+                    self, "_embedded_event_json_enabled", False
+                ):
+                    found = get_event_json_batch(
+                        self._embedded_db_engine,
+                        self._embedded_db_namespace,
+                        missing_meta_ids,
+                    )
+                    for eid, (m, _, _) in found.items():
+                        meta_by_id[eid] = m
+
+                for prev_event_id, event_id, metadata, rejected in rows:
                     if event_id in graph:
                         # Already handled this event previously, but we still
                         # want to record the edge.
@@ -878,7 +999,11 @@ class EventsBackgroundUpdatesStore(
 
                     graph[event_id] = {prev_event_id}
 
-                    soft_failed = db_to_json(metadata).get("soft_failed")
+                    if metadata is None:
+                        metadata = meta_by_id.get(event_id)
+                    soft_failed = (
+                        db_to_json(metadata).get("soft_failed") if metadata else False
+                    )
                     if soft_failed or rejected:
                         soft_failed_events_to_lookup.add(event_id)
                     else:
@@ -1034,8 +1159,29 @@ class EventsBackgroundUpdatesStore(
             if not rows:
                 return 0
 
+            # The join is SQL-only; under the embedded event-JSON backend the
+            # `internal_metadata` lives solely in mtxdb, so pull the missing
+            # rows from the mirror before deciding `recheck` -- otherwise every
+            # row looks like metadata-free and gets forced to false.
+            missing_meta_ids = [
+                event_id for event_id, metadata in rows if metadata is None
+            ]
+            meta_by_id = {}
+            if missing_meta_ids and getattr(
+                self, "_embedded_event_json_enabled", False
+            ):
+                found = get_event_json_batch(
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
+                    missing_meta_ids,
+                )
+                for eid, (m, _, _) in found.items():
+                    meta_by_id[eid] = m
+
             updates = []
             for event_id, internal_metadata_json in rows:
+                if internal_metadata_json is None:
+                    internal_metadata_json = meta_by_id.get(event_id)
                 if internal_metadata_json is not None:
                     internal_metadata = db_to_json(internal_metadata_json)
                     recheck = bool(internal_metadata.get("recheck_redaction", False))
@@ -1108,21 +1254,51 @@ class EventsBackgroundUpdatesStore(
         last_event_id = progress.get("last_event_id", "")
 
         def _event_store_labels_txn(txn: LoggingTransaction) -> int:
+            # Paginate over `events`, not `event_json`: under the embedded
+            # event-JSON backend `event_json` has no SQL rows, so selecting
+            # from it would find nothing and end the update without storing a
+            # single label. `events` is backend-independent; `json` is pulled
+            # from `event_json` when SQL holds it and from mtxdb otherwise.
             txn.execute(
                 """
-                SELECT event_id, json FROM event_json
+                SELECT e.event_id, ej.json
+                FROM events AS e
+                LEFT JOIN event_json AS ej USING (event_id)
                 LEFT JOIN event_labels USING (event_id)
-                WHERE event_id > ? AND label IS NULL
-                ORDER BY event_id LIMIT ?
+                WHERE e.event_id > ? AND label IS NULL
+                ORDER BY e.event_id LIMIT ?
                 """,
                 (last_event_id, batch_size),
             )
 
             results = list(txn)
 
+            # The join above is SQL-only; pull the rows the embedded backend
+            # would otherwise leave NULL before reading each event's labels.
+            missing_json_ids = [event_id for event_id, raw in results if raw is None]
+            json_by_id: dict[str, str] = {}
+            if missing_json_ids and getattr(
+                self, "_embedded_event_json_enabled", False
+            ):
+                found = get_event_json_batch(
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
+                    missing_json_ids,
+                )
+                for event_id, (_meta, body, _format_version) in found.items():
+                    json_by_id[event_id] = body
+
             nbrows = 0
             last_row_event_id = ""
             for event_id, event_json_raw in results:
+                if event_json_raw is None:
+                    event_json_raw = json_by_id.get(event_id)
+                if event_json_raw is None:
+                    # JSON lives in neither backend (e.g. a purge race):
+                    # nothing to label, but still advance the cursor.
+                    nbrows += 1
+                    last_row_event_id = event_id
+                    continue
                 try:
                     event_json = db_to_json(event_json_raw)
 
@@ -1191,7 +1367,7 @@ class EventsBackgroundUpdatesStore(
                     state_events.event_id IS NOT NULL,
                     event_auth.event_id IS NOT NULL
                 FROM rejections
-                INNER JOIN event_json USING (event_id)
+                LEFT JOIN event_json USING (event_id)
                 LEFT JOIN rooms USING (room_id)
                 LEFT JOIN state_events USING (event_id)
                 LEFT JOIN event_auth USING (event_id)
@@ -1208,10 +1384,35 @@ class EventsBackgroundUpdatesStore(
                 ),
             )
 
-            return cast(
-                list[tuple[str, str, JsonDict, bool, bool]],
-                [(row[0], row[1], db_to_json(row[2]), row[3], row[4]) for row in txn],
-            )
+            rows = txn.fetchall()
+            if not rows:
+                return []
+
+            missing_json_ids = [row[0] for row in rows if row[2] is None]
+            json_by_id = {}
+            if missing_json_ids and getattr(
+                self, "_embedded_event_json_enabled", False
+            ):
+                found = get_event_json_batch(
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
+                    missing_json_ids,
+                )
+                for eid, (_, j, _) in found.items():
+                    json_by_id[eid] = j
+
+            results_list = []
+            for row in rows:
+                raw_json = row[2]
+                if raw_json is None:
+                    raw_json = json_by_id.get(row[0])
+                if not raw_json:
+                    continue
+                results_list.append(
+                    (row[0], row[1], db_to_json(raw_json), row[3], row[4])
+                )
+
+            return results_list
 
         results = await self.db_pool.runInteraction(
             desc="_rejected_events_metadata_get", func=get_rejected_events
@@ -1483,7 +1684,7 @@ class EventsBackgroundUpdatesStore(
             event_to_types,
             cast(dict[str, StrCollection], event_to_auth_chain),
             resolve_namespace(self),
-            self._embedded_hamt_engine,
+            self._embedded_db_engine,
         )
 
         return _CalculateChainCover(
@@ -1545,13 +1746,13 @@ class EventsBackgroundUpdatesStore(
                 resolve_namespace,
             )
 
-            embedded_hamt_namespace = resolve_namespace(self)
-            if embedded_hamt_namespace is not None:
+            embedded_db_namespace = resolve_namespace(self)
+            if embedded_db_namespace is not None:
                 # Exclusive by configured engine, not a dual-write -- see
                 # embedded_event_auth_chain_links.py.
                 delete_chain_links_batch(
-                    self._embedded_hamt_engine,
-                    embedded_hamt_namespace,
+                    self._embedded_db_engine,
+                    embedded_db_namespace,
                     unreferenced_chain_id_tuples,
                     sync=True,
                 )
@@ -1592,20 +1793,43 @@ class EventsBackgroundUpdatesStore(
 
         def _event_arbitrary_relations_txn(txn: LoggingTransaction) -> int:
             # Fetch events and then filter based on whether the event has a
-            # relation or not.
+            # relation or not. Enumerate from `events` rather than
+            # `event_json` directly: under the embedded event-JSON backend,
+            # `event_json` has no rows to page through at all (see
+            # events.py's `_embedded_event_json_enabled` gating), so a plain
+            # `event_json` scan silently processes nothing.
             txn.execute(
                 """
-                SELECT event_id, json FROM event_json
-                WHERE event_id > ?
-                ORDER BY event_id LIMIT ?
+                SELECT ev.event_id, event_json.json FROM events AS ev
+                LEFT JOIN event_json USING (event_id)
+                WHERE ev.event_id > ?
+                ORDER BY ev.event_id LIMIT ?
                 """,
                 (last_event_id, batch_size),
             )
 
             results = list(txn)
+
+            missing_json_ids = [event_id for event_id, json in results if json is None]
+            json_by_id = {}
+            if missing_json_ids and getattr(
+                self, "_embedded_event_json_enabled", False
+            ):
+                found = get_event_json_batch(
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
+                    missing_json_ids,
+                )
+                for eid, (_, j, _) in found.items():
+                    json_by_id[eid] = j
+
             # (event_id, parent_id, rel_type) for each relation
             relations_to_insert: list[tuple[str, str, str, str]] = []
             for event_id, event_json_raw in results:
+                if event_json_raw is None:
+                    event_json_raw = json_by_id.get(event_id)
+                if not event_json_raw:
+                    continue
                 try:
                     event_json = db_to_json(event_json_raw)
                 except Exception as e:
@@ -1859,6 +2083,21 @@ class EventsBackgroundUpdatesStore(
             )
 
         return batch_size
+
+    async def _background_migrate_event_edges_mtxdb(
+        self, progress: JsonDict, batch_size: int
+    ) -> int:
+        """Retire the legacy online edge migration.
+
+        FWD authority now requires a stopped-writer offline rebuild and exact
+        SQL verification. This handler remains registered solely to clear
+        update rows created by earlier schemas; completion never enables the
+        embedded read gate.
+        """
+        await self.db_pool.updates._end_background_update(
+            _BackgroundUpdates.EVENT_EDGES_MIGRATE_MTXDB
+        )
+        return 0
 
     async def _background_events_populate_state_key_rejections(
         self, progress: JsonDict, batch_size: int
@@ -3144,8 +3383,8 @@ class EventsBackgroundUpdatesStore(
                 # signature) JSON forever from the embedded engine.
                 if getattr(self, "_embedded_event_json_enabled", False):
                     put_event_json_batch(
-                        self._embedded_hamt_engine,
-                        self._embedded_hamt_namespace,
+                        self._embedded_db_engine,
+                        self._embedded_db_namespace,
                         [
                             (
                                 event_id,

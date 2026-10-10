@@ -1,0 +1,8 @@
+-- Retired generations remain queued until reader-epoch or grace-period GC
+-- proves that they are no longer reachable by an active reader.
+CREATE TABLE room_edge_retired_generations (
+    room_id TEXT NOT NULL,
+    generation BIGINT NOT NULL,
+    retired_at_ms BIGINT NOT NULL,
+    PRIMARY KEY (room_id, generation)
+);

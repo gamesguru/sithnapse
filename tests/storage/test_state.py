@@ -33,6 +33,7 @@ from synapse.api.constants import EventTypes, Membership
 from synapse.api.room_versions import RoomVersions
 from synapse.events import EventBase
 from synapse.events.snapshot import EventContext, UnpersistedEventContext
+from synapse.logging.context import LoggingContext
 from synapse.server import HomeServer
 from synapse.storage.database import LoggingTransaction
 from synapse.types import JsonDict, RoomID, StateMap, UserID, create_requester
@@ -41,7 +42,7 @@ from synapse.util.clock import Clock
 from synapse.util.stringutils import random_string
 
 from tests.unittest import HomeserverTestCase
-from tests.utils import EMBEDDED_HAMT_ENGINE
+from tests.utils import EMBEDDED_DB_ENGINE
 
 logger = logging.getLogger(__name__)
 
@@ -70,13 +71,13 @@ class StateStoreTestCase(HomeserverTestCase):
 
     def _force_sql_only_hamt(self) -> None:
         """Some tests assert pure-SQL HAMT behaviour specifically and must
-        stay deterministic regardless of SYNAPSE_TEST_EMBEDDED_HAMT_ENGINE
+        stay deterministic regardless of SYNAPSE_TEST_EMBEDDED_DB_ENGINE
         (the trial-mtxdb CI job runs the *whole* suite through the embedded
         engine by default -- see tests/utils.py's default_config -- so a
         test that specifically wants SQL must force it off locally rather
         than assume it's already off).
         """
-        self.state_datastore._embedded_hamt_engine = None
+        self.state_datastore._embedded_db_engine = None
 
     def inject_state_event(
         self, room: RoomID, sender: UserID, typ: str, state_key: str, content: JsonDict
@@ -161,9 +162,9 @@ class StateStoreTestCase(HomeserverTestCase):
             {(EventTypes.Create, ""): e1.event_id, (EventTypes.Name, ""): e2.event_id},
         )
 
-    @unittest.skipUnless(EMBEDDED_HAMT_ENGINE, "requires embedded HAMT engine")
+    @unittest.skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
     def test_state_group_reads_via_embedded_mtxdb_engine(self) -> None:
-        """With `embedded_hamt_engine` configured before these events are
+        """With `embedded_db_engine` configured before these events are
         persisted, `_store_state_hamt_nodes_txn` writes exclusively to mtxdb
         (not SQL -- see `_persist_state_hamt_txn`), and reads resolve
         entirely through `_materialize_state_hamts_from_embedded_txn` /
@@ -178,14 +179,20 @@ class StateStoreTestCase(HomeserverTestCase):
         tmpdir = tempfile.mkdtemp(prefix="test-embedded-mtxdb-")
         self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
         mtxdb_engine.open_client(tmpdir)
-        self.state_datastore._embedded_hamt_engine = "mtxdb"
-        self.state_datastore._embedded_hamt_path = tmpdir
-        # Note: __init__ already set self._embedded_hamt_namespace to a
-        # unique per-test value (see tests/utils.py's default_config), which
-        # keeps different tests' state_group ids from colliding on the same
-        # mtxdb keys. Don't override it here -- rewriting it to a shared
-        # value like server_name would make every test in this file collide
-        # on the same namespace against the same process-global mtxdb client.
+        self.state_datastore._embedded_db_engine = "mtxdb"
+        self.state_datastore._embedded_db_path = tmpdir
+        # `mtxdb_engine.open_client` is a no-op after the first call in
+        # this process (`DBS` is a process-global `OnceCell` -- see
+        # rust/src/database/mtxdb_syn.rs), so every `test_embedded_*` test
+        # in this file that opens its own "fresh" tmpdir is actually still
+        # sharing one mtxdb store for the whole trial worker process.
+        # `_embedded_db_namespace` defaults to `server_name`, which every
+        # test here shares too ("test"), so without overriding it, two
+        # tests using the same `self.room` and the same small state_group
+        # ids (both start counting from 1) collide on the same mtxdb keys.
+        # tmpdir is unique per test (tempfile.mkdtemp), so reuse it as the
+        # namespace to keep tests isolated despite the shared store.
+        self.state_datastore._embedded_db_namespace = tmpdir
 
         e1 = self.inject_state_event(self.room, self.u_alice, EventTypes.Create, "", {})
         e2 = self.inject_state_event(
@@ -213,7 +220,7 @@ class StateStoreTestCase(HomeserverTestCase):
         )
         self.assertEqual(
             mtxdb_engine.get_room_index(
-                self.state_datastore._embedded_hamt_namespace,
+                self.state_datastore._embedded_db_namespace,
                 [state_group],
             ),
             [expected_room_prefix],
@@ -246,9 +253,9 @@ class StateStoreTestCase(HomeserverTestCase):
             {(EventTypes.Name, ""): e2.event_id},
         )
 
-    @unittest.skipUnless(EMBEDDED_HAMT_ENGINE, "requires embedded HAMT engine")
+    @unittest.skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
     def test_embedded_engine_writes_are_exclusive_not_dual(self) -> None:
-        """Once `embedded_hamt_engine` is configured, new state groups are
+        """Once `embedded_db_engine` is configured, new state groups are
         written to mtxdb ONLY -- `state_hamt_roots`/`state_hamt_nodes` SQL
         rows are not also inserted (see `_persist_state_hamt_txn`).
         """
@@ -260,14 +267,20 @@ class StateStoreTestCase(HomeserverTestCase):
         tmpdir = tempfile.mkdtemp(prefix="test-exclusive-write-mtxdb-")
         self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
         mtxdb_engine.open_client(tmpdir)
-        self.state_datastore._embedded_hamt_engine = "mtxdb"
-        self.state_datastore._embedded_hamt_path = tmpdir
-        # Note: __init__ already set self._embedded_hamt_namespace to a
-        # unique per-test value (see tests/utils.py's default_config), which
-        # keeps different tests' state_group ids from colliding on the same
-        # mtxdb keys. Don't override it here -- rewriting it to a shared
-        # value like server_name would make every test in this file collide
-        # on the same namespace against the same process-global mtxdb client.
+        self.state_datastore._embedded_db_engine = "mtxdb"
+        self.state_datastore._embedded_db_path = tmpdir
+        # `mtxdb_engine.open_client` is a no-op after the first call in
+        # this process (`DBS` is a process-global `OnceCell` -- see
+        # rust/src/database/mtxdb_syn.rs), so every `test_embedded_*` test
+        # in this file that opens its own "fresh" tmpdir is actually still
+        # sharing one mtxdb store for the whole trial worker process.
+        # `_embedded_db_namespace` defaults to `server_name`, which every
+        # test here shares too ("test"), so without overriding it, two
+        # tests using the same `self.room` and the same small state_group
+        # ids (both start counting from 1) collide on the same mtxdb keys.
+        # tmpdir is unique per test (tempfile.mkdtemp), so reuse it as the
+        # namespace to keep tests isolated despite the shared store.
+        self.state_datastore._embedded_db_namespace = tmpdir
 
         event = self.inject_state_event(
             self.room, self.u_alice, EventTypes.Create, "", {}
@@ -303,9 +316,9 @@ class StateStoreTestCase(HomeserverTestCase):
             full_state[state_group], {(EventTypes.Create, ""): event.event_id}
         )
 
-    @unittest.skipUnless(EMBEDDED_HAMT_ENGINE, "requires embedded HAMT engine")
-    def test_embedded_hamt_migration_copies_existing_sql_data(self) -> None:
-        """A state group written before `embedded_hamt_engine` was turned on
+    @unittest.skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
+    def test_embedded_db_migration_copies_existing_sql_data(self) -> None:
+        """A state group written before `embedded_db_engine` was turned on
         stays SQL-only until `_background_migrate_state_hamt_to_embedded`
         runs; after it completes, the group is readable via mtxdb with SQL
         deleted out from under it -- proving the data actually moved, not
@@ -331,18 +344,18 @@ class StateStoreTestCase(HomeserverTestCase):
                 table="state_hamt_roots",
                 keyvalues={"state_group": state_group},
                 retcol="state_group",
-                desc="test_embedded_hamt_migration.check_sql_before",
+                desc="test_embedded_db_migration.check_sql_before",
             )
         )
         self.assertEqual(sql_root_before, state_group)
 
         # Now turn on the embedded engine and run the migration. In real
-        # deployments `embedded_hamt_engine` is set before the store is
+        # deployments `embedded_db_engine` is set before the store is
         # constructed, so __init__ registers the handler for
         # do_next_background_update to dispatch to; this test flips the
         # config after construction (same pattern the other embedded-engine
         # tests here use), so no handler was ever registered for this store
-        # instance. Exercise _enqueue_embedded_hamt_migration_if_needed
+        # instance. Exercise _enqueue_embedded_db_migration_if_needed
         # (real production code, still worth covering), but do not start its
         # poller: it would race this test's direct handler invocation and
         # repeatedly fail to dispatch the unregistered handler. Drive the
@@ -350,20 +363,26 @@ class StateStoreTestCase(HomeserverTestCase):
         tmpdir = tempfile.mkdtemp(prefix="test-hamt-migration-mtxdb-")
         self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
         mtxdb_engine.open_client(tmpdir)
-        self.state_datastore._embedded_hamt_engine = "mtxdb"
-        self.state_datastore._embedded_hamt_path = tmpdir
-        # Note: __init__ already set self._embedded_hamt_namespace to a
-        # unique per-test value (see tests/utils.py's default_config), which
-        # keeps different tests' state_group ids from colliding on the same
-        # mtxdb keys. Don't override it here -- rewriting it to a shared
-        # value like server_name would make every test in this file collide
-        # on the same namespace against the same process-global mtxdb client.
+        self.state_datastore._embedded_db_engine = "mtxdb"
+        self.state_datastore._embedded_db_path = tmpdir
+        # `mtxdb_engine.open_client` is a no-op after the first call in
+        # this process (`DBS` is a process-global `OnceCell` -- see
+        # rust/src/database/mtxdb_syn.rs), so every `test_embedded_*` test
+        # in this file that opens its own "fresh" tmpdir is actually still
+        # sharing one mtxdb store for the whole trial worker process.
+        # `_embedded_db_namespace` defaults to `server_name`, which every
+        # test here shares too ("test"), so without overriding it, two
+        # tests using the same `self.room` and the same small state_group
+        # ids (both start counting from 1) collide on the same mtxdb keys.
+        # tmpdir is unique per test (tempfile.mkdtemp), so reuse it as the
+        # namespace to keep tests isolated despite the shared store.
+        self.state_datastore._embedded_db_namespace = tmpdir
 
         with patch.object(
             self.store.db_pool.updates, "start_doing_background_updates"
         ) as start_background_updates:
             self.get_success(
-                self.state_datastore._enqueue_embedded_hamt_migration_if_needed()
+                self.state_datastore._enqueue_embedded_db_migration_if_needed()
             )
         start_background_updates.assert_called_once_with()
 
@@ -372,7 +391,7 @@ class StateStoreTestCase(HomeserverTestCase):
         # Model that selection explicitly rather than relying on a concurrently
         # running poller to set this private dispatcher state.
         self.store.db_pool.updates._current_background_update = (
-            self.state_datastore.EMBEDDED_HAMT_MIGRATION_UPDATE_NAME
+            self.state_datastore.EMBEDDED_DB_MIGRATION_UPDATE_NAME
         )
         progress: dict = {}
         while True:
@@ -392,7 +411,7 @@ class StateStoreTestCase(HomeserverTestCase):
             self.store.db_pool.simple_delete(
                 table="state_hamt_roots",
                 keyvalues={"state_group": state_group},
-                desc="test_embedded_hamt_migration.delete_sql_root",
+                desc="test_embedded_db_migration.delete_sql_root",
             )
         )
 
@@ -405,7 +424,7 @@ class StateStoreTestCase(HomeserverTestCase):
             full_state[state_group], {(EventTypes.Create, ""): event.event_id}
         )
 
-    @unittest.skipUnless(EMBEDDED_HAMT_ENGINE, "requires embedded HAMT engine")
+    @unittest.skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
     def test_embedded_engine_root_lookup_does_not_need_sql(self) -> None:
         """`_store_state_hamt_root_embedded_txn` mirrors the HAMT root
         record into the embedded engine itself (under the `hamt:root:...`
@@ -422,14 +441,20 @@ class StateStoreTestCase(HomeserverTestCase):
         tmpdir = tempfile.mkdtemp(prefix="test-embedded-root-mtxdb-")
         self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
         mtxdb_engine.open_client(tmpdir)
-        self.state_datastore._embedded_hamt_engine = "mtxdb"
-        self.state_datastore._embedded_hamt_path = tmpdir
-        # Note: __init__ already set self._embedded_hamt_namespace to a
-        # unique per-test value (see tests/utils.py's default_config), which
-        # keeps different tests' state_group ids from colliding on the same
-        # mtxdb keys. Don't override it here -- rewriting it to a shared
-        # value like server_name would make every test in this file collide
-        # on the same namespace against the same process-global mtxdb client.
+        self.state_datastore._embedded_db_engine = "mtxdb"
+        self.state_datastore._embedded_db_path = tmpdir
+        # `mtxdb_engine.open_client` is a no-op after the first call in
+        # this process (`DBS` is a process-global `OnceCell` -- see
+        # rust/src/database/mtxdb_syn.rs), so every `test_embedded_*` test
+        # in this file that opens its own "fresh" tmpdir is actually still
+        # sharing one mtxdb store for the whole trial worker process.
+        # `_embedded_db_namespace` defaults to `server_name`, which every
+        # test here shares too ("test"), so without overriding it, two
+        # tests using the same `self.room` and the same small state_group
+        # ids (both start counting from 1) collide on the same mtxdb keys.
+        # tmpdir is unique per test (tempfile.mkdtemp), so reuse it as the
+        # namespace to keep tests isolated despite the shared store.
+        self.state_datastore._embedded_db_namespace = tmpdir
 
         e1 = self.inject_state_event(self.room, self.u_alice, EventTypes.Create, "", {})
         e2 = self.inject_state_event(
@@ -709,8 +734,20 @@ class StateStoreTestCase(HomeserverTestCase):
         tmpdir = tempfile.mkdtemp(prefix=prefix)
         self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
         mtxdb_engine.open_client(tmpdir)
-        self.state_datastore._embedded_hamt_engine = "mtxdb"
-        self.state_datastore._embedded_hamt_path = tmpdir
+        self.state_datastore._embedded_db_engine = "mtxdb"
+        self.state_datastore._embedded_db_path = tmpdir
+        # `mtxdb_engine.open_client` is a no-op after the first call in this
+        # process (`DBS` is a process-global `OnceCell` -- see
+        # rust/src/database/mtxdb_syn.rs), so every test using this helper
+        # is actually still sharing one mtxdb store for the whole trial
+        # worker process. `_embedded_db_namespace` defaults to `server_name`
+        # ("test", shared by every test here), so without overriding it,
+        # two tests using the same `self.room` and the same small
+        # state_group ids (both start counting from 1) collide on the same
+        # mtxdb keys ("state_group alias collision detected"). tmpdir is
+        # unique per test (tempfile.mkdtemp), so reuse it as the namespace
+        # to keep tests isolated despite the shared store.
+        self.state_datastore._embedded_db_namespace = tmpdir
 
     def test_purge_unreferenced_state_groups_deletes_embedded_root(self) -> None:
         """Regression test: `purge_unreferenced_state_groups` used to call
@@ -742,7 +779,7 @@ class StateStoreTestCase(HomeserverTestCase):
 
         # Sanity check: the root really is there before purging.
         self.assertIsNotNone(
-            self.state_datastore._get_embedded_hamt_root(room_prefix, state_group)
+            self.state_datastore._get_embedded_db_root(room_prefix, state_group)
         )
 
         with patch.object(
@@ -758,7 +795,7 @@ class StateStoreTestCase(HomeserverTestCase):
         self.assertTrue(deleted)
 
         self.assertIsNone(
-            self.state_datastore._get_embedded_hamt_root(room_prefix, state_group)
+            self.state_datastore._get_embedded_db_root(room_prefix, state_group)
         )
         # e1's create-event state group must be untouched.
         prev_state_group = self.get_success(
@@ -766,7 +803,7 @@ class StateStoreTestCase(HomeserverTestCase):
         )
         assert prev_state_group is not None
         self.assertIsNotNone(
-            self.state_datastore._get_embedded_hamt_root(room_prefix, prev_state_group)
+            self.state_datastore._get_embedded_db_root(room_prefix, prev_state_group)
         )
 
     def test_drain_embedded_root_deletion_queue_deletes_and_empties_queue(
@@ -794,7 +831,7 @@ class StateStoreTestCase(HomeserverTestCase):
             self.room.to_string(), room_version.msc4291_room_ids_as_hashes
         )
         self.assertIsNotNone(
-            self.state_datastore._get_embedded_hamt_root(room_prefix, state_group)
+            self.state_datastore._get_embedded_db_root(room_prefix, state_group)
         )
 
         self.get_success(
@@ -810,7 +847,7 @@ class StateStoreTestCase(HomeserverTestCase):
         )
 
         self.assertIsNone(
-            self.state_datastore._get_embedded_hamt_root(room_prefix, state_group)
+            self.state_datastore._get_embedded_db_root(room_prefix, state_group)
         )
         remaining = self.get_success(
             self.store.db_pool.simple_select_list(
@@ -947,7 +984,7 @@ class StateStoreTestCase(HomeserverTestCase):
                 ],
             )
         )
-        stored_root = self.state_datastore._get_embedded_hamt_root(room_prefix, sg)
+        stored_root = self.state_datastore._get_embedded_db_root(room_prefix, sg)
         self.assertIsNotNone(stored_root)
         assert stored_root is not None
         self.assertEqual(stored_root[0], root_hash)
@@ -1004,10 +1041,10 @@ class StateStoreTestCase(HomeserverTestCase):
             )
         )
         self.assertIsNotNone(
-            self.state_datastore._get_embedded_hamt_root(room_prefix, sg1)
+            self.state_datastore._get_embedded_db_root(room_prefix, sg1)
         )
         self.assertIsNotNone(
-            self.state_datastore._get_embedded_hamt_root(room_prefix, sg2)
+            self.state_datastore._get_embedded_db_root(room_prefix, sg2)
         )
 
     def test_redo_mirror_write_batch_atomic_rollback_on_mismatch(self) -> None:
@@ -1056,12 +1093,8 @@ class StateStoreTestCase(HomeserverTestCase):
             RuntimeError,
         )
         # Neither group was published
-        self.assertIsNone(
-            self.state_datastore._get_embedded_hamt_root(room_prefix, sg1)
-        )
-        self.assertIsNone(
-            self.state_datastore._get_embedded_hamt_root(room_prefix, sg2)
-        )
+        self.assertIsNone(self.state_datastore._get_embedded_db_root(room_prefix, sg1))
+        self.assertIsNone(self.state_datastore._get_embedded_db_root(room_prefix, sg2))
 
     def test_redo_mirror_write_v0_missing_predecessor_fails_closed(self) -> None:
         """Version-0 replay without state map fails closed when predecessor is missing."""
@@ -1968,6 +2001,113 @@ class StateStoreTestCase(HomeserverTestCase):
                 sg3, sg3_children["state_group_edges"], "sg3 has unexpected edge"
             )
 
+    def test_get_partial_filtered_current_state_ids_concrete(self) -> None:
+        """A filter with no wildcards is served from the per-key cache, and the
+        absence of a key is cached too."""
+        room_id = self.room.to_string()
+
+        create = self.inject_state_event(
+            self.room, self.u_alice, EventTypes.Create, "", {}
+        )
+        name = self.inject_state_event(
+            self.room, self.u_alice, EventTypes.Name, "", {"name": "test room"}
+        )
+
+        state_filter = StateFilter.from_types(
+            [(EventTypes.Create, ""), (EventTypes.Name, ""), (EventTypes.Topic, "")]
+        )
+
+        state = self.get_success(
+            self.store.get_partial_filtered_current_state_ids(room_id, state_filter)
+        )
+
+        self.assertEqual(
+            dict(state),
+            {
+                (EventTypes.Create, ""): create.event_id,
+                (EventTypes.Name, ""): name.event_id,
+            },
+        )
+
+        # The room has no topic, and that fact is cached, so asking again does
+        # not go back to the database.
+        sentinel = object()
+        cache = self.store._get_current_state_event_id.cache
+        self.assertIsNone(
+            cache.get_immediate((room_id, (EventTypes.Topic, "")), sentinel)
+        )
+        self.assertEqual(
+            cache.get_immediate((room_id, (EventTypes.Name, "")), sentinel),
+            name.event_id,
+        )
+
+    def test_get_partial_filtered_current_state_ids_invalidation(self) -> None:
+        """Persisting a new state event invalidates the cached entries for the
+        room."""
+        room_id = self.room.to_string()
+
+        self.inject_state_event(self.room, self.u_alice, EventTypes.Create, "", {})
+
+        state_filter = StateFilter.from_types([(EventTypes.Name, "")])
+
+        state = self.get_success(
+            self.store.get_partial_filtered_current_state_ids(room_id, state_filter)
+        )
+        self.assertEqual(dict(state), {})
+
+        name = self.inject_state_event(
+            self.room, self.u_alice, EventTypes.Name, "", {"name": "test room"}
+        )
+
+        state = self.get_success(
+            self.store.get_partial_filtered_current_state_ids(room_id, state_filter)
+        )
+        self.assertEqual(dict(state), {(EventTypes.Name, ""): name.event_id})
+
+        name2 = self.inject_state_event(
+            self.room, self.u_alice, EventTypes.Name, "", {"name": "renamed"}
+        )
+
+        state = self.get_success(
+            self.store.get_partial_filtered_current_state_ids(room_id, state_filter)
+        )
+        self.assertEqual(dict(state), {(EventTypes.Name, ""): name2.event_id})
+
+    def test_get_partial_filtered_current_state_ids_uses_full_cache(self) -> None:
+        """Test that fetching a single state key from a room with a full cache
+        hits the full cache and does not go to the database."""
+
+        room_id = self.room.to_string()
+
+        create = self.inject_state_event(
+            self.room, self.u_alice, EventTypes.Create, "", {}
+        )
+        name = self.inject_state_event(
+            self.room, self.u_alice, EventTypes.Name, "", {"name": "test room"}
+        )
+
+        # prime the full cache
+        state_filter = StateFilter.all()
+        state = self.get_success(
+            self.store.get_partial_filtered_current_state_ids(room_id, state_filter)
+        )
+        self.assertEqual(
+            dict(state),
+            {
+                (EventTypes.Create, ""): create.event_id,
+                (EventTypes.Name, ""): name.event_id,
+            },
+        )
+
+        # now fetch a single key and check that it hits the full cache
+        with LoggingContext(name="test", server_name=self.hs.hostname) as ctx:
+            state_filter = StateFilter.from_types([(EventTypes.Name, "")])
+            state = self.get_success(
+                self.store.get_partial_filtered_current_state_ids(room_id, state_filter)
+            )
+            self.assertEqual(dict(state), {(EventTypes.Name, ""): name.event_id})
+            self.assertEqual(ctx.get_resource_usage().db_txn_count, 0)
+
 
 class CurrentStateDeltaStreamTestCase(HomeserverTestCase):
     def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
@@ -2313,22 +2453,20 @@ class HAMTStructuralKeyRegressionTest(HomeserverTestCase):
         # would pass regardless of what fed the hash, so pin the exact bytes.
         self.assertEqual(
             hash_a.hex(),
-            "fb95526dd1daa672eb9aeeae34b27de638a69a2ddc8ee5350eae79e944fcd56b",
+            "46a91b55f48cdb7e5e628395c65c3699a3af8bc81954886b59f972345fecc139",
         )
         self.assertEqual(
             sg_a.hex(),
-            "8b94bfad590b925e09f0a9b22ce4aadffd205d82948671760e0ad52ed129e332",
+            "5f97e29380759127f8cba9a59c7fd445882bd75e0e39a5688988a74d4aea2182",
         )
 
-    def test_room_structural_key_is_sha256_of_room_id(self) -> None:
-        import hashlib
-
+    def test_room_structural_key_is_room_id_bytes(self) -> None:
         from synapse.synapse_rust import state_hamt
 
         room_id = "!test:example.com"
         self.assertEqual(
             state_hamt.room_structural_key(room_id),
-            hashlib.sha256(room_id.encode()).digest(),
+            room_id.encode(),
         )
 
     def test_hamt_root_depends_on_room_id(self) -> None:
@@ -2427,14 +2565,19 @@ class RejectedEventStateGroupTestCase(HomeserverTestCase):
             self.store.db_pool.runInteraction("test_rejected_state_group", _persist_txn)
         )
 
-        state_group = self.get_success(
-            self.store.db_pool.simple_select_one_onecol(
-                table="event_to_state_groups",
-                keyvalues={"event_id": rejected.event_id},
-                retcol="state_group",
-                allow_none=True,
+        if getattr(self.store, "_embedded_event_json_enabled", False):
+            state_group = self.get_success(
+                self.store._get_state_group_for_event(rejected.event_id)
             )
-        )
+        else:
+            state_group = self.get_success(
+                self.store.db_pool.simple_select_one_onecol(
+                    table="event_to_state_groups",
+                    keyvalues={"event_id": rejected.event_id},
+                    retcol="state_group",
+                    allow_none=True,
+                )
+            )
         self.assertEqual(
             state_group,
             42,
@@ -2473,6 +2616,20 @@ class GetStateGroupForEventsCacheFallbackTestCase(HomeserverTestCase):
             99,
             "a mapping already in the scalar cache must be used instead of raising",
         )
+
+    def test_partial_batch_read_returns_only_mappings_with_state(self) -> None:
+        with patch.object(
+            self.store.db_pool,
+            "simple_select_many_batch",
+            return_value=[],
+        ):
+            result = self.get_success(
+                self.store._get_state_group_for_events(
+                    ["$stateless-outlier:test"], raise_on_missing=False
+                )
+            )
+
+        self.assertEqual(result, {})
 
     def test_missing_everywhere_still_raises(self) -> None:
         with patch.object(

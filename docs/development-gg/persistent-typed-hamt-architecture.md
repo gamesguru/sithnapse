@@ -228,10 +228,10 @@ ownership/repair semantics are specified.
 
 ## Storage Engine Selection & mtxdb Embedded Architecture
 
-`mtxdb` was selected as Synapse's embedded storage engine alongside
-PostgreSQL. `fjall` was evaluated first and dropped -- see `git log` for
-`ab59dd8ba6` ("storage(embedded): drop fjall, commit to mtxdb as the embedded
-engine") -- both on measured latency and architecturally: mtxdb supports native
+`mtxdb` was selected as Synapse's embedded storage engine alongside PostgreSQL.
+`fjall` was evaluated first and dropped -- see `git log` for `ab59dd8ba6`
+("storage(embedded): drop fjall, commit to mtxdb as the embedded engine") --
+both on measured latency and architecturally: mtxdb supports native
 multi-process `mmap` access on a shared filesystem, while fjall's LSM tree can
 only be opened by one OS process, which would require a separate RPC/socket
 bridge for every non-owning worker. **No such bridge was ever built or
@@ -271,9 +271,9 @@ bulk-load rows/s      n/a              192,129                 58,531       3.3x
 are reproducible:
 `eval "$(scripts-dev/start_test_postgres.sh)"; python3 scripts-dev/benchmark_hamt_mtxdb_vs_postgres.py`.
 Includes both fixes below: sorted `batch_put` and a single explicit transaction
-for the postgres bulk-load, so mtxdb and postgres each pay exactly one commit for
-the whole corpus -- the postgres bulk-load number barely moved from the earlier,
-per-page-autocommit measurement (58,202 -> 58,531 rows/s) because
+for the postgres bulk-load, so mtxdb and postgres each pay exactly one commit
+for the whole corpus -- the postgres bulk-load number barely moved from the
+earlier, per-page-autocommit measurement (58,202 -> 58,531 rows/s) because
 `start_test_postgres.sh` already disables fsync/synchronous_commit on this
 RAM-disk cluster, so per-page commit overhead was already near-zero here; the
 methodology bug was real, its effect on these particular numbers wasn't.)
@@ -362,7 +362,7 @@ A small, illustrative run on this development host's on-disk ext4 filesystem
 
 | Engine     | Corpus / value size |     p50 |     p95 |     p99 | Status                                                |
 | ---------- | ------------------- | ------: | ------: | ------: | ----------------------------------------------------- |
-| mtxdb       | 10,000 / 512 bytes  | 22.7 ms | 40.8 ms | 40.8 ms | Evicted-page sample; not a strict device-cold result. |
+| mtxdb      | 10,000 / 512 bytes  | 22.7 ms | 40.8 ms | 40.8 ms | Evicted-page sample; not a strict device-cold result. |
 | PostgreSQL | 10,000 / 512 bytes  | 14.1 ms | 61.1 ms | 61.1 ms | Dedicated disk cluster restarted between samples.     |
 
 This is an **evicted-page** result, not a perfectly device-cold guarantee:
@@ -419,11 +419,11 @@ python3 scripts-dev/benchmark_postgres_cold_reads.py \
      without memory allocations, deserialization wrappers, or IPC overhead.
 2. **Zero RPC Daemon / Zero Bridge Complexity**:
    - All Synapse worker processes (`sync`, `federation`, `state_res`, `api`)
-     open the mtxdb environment files directly via kernel `mmap`. This
-     avoids the operational overhead a single-process engine like fjall would
-     have required (a daemon or socket bridge for non-owning workers) -- but
-     note that overhead was never built, so it's an architectural argument, not
-     a measured one.
+     open the mtxdb environment files directly via kernel `mmap`. This avoids
+     the operational overhead a single-process engine like fjall would have
+     required (a daemon or socket bridge for non-owning workers) -- but note
+     that overhead was never built, so it's an architectural argument, not a
+     measured one.
 
 ### Dual-Store Crash-Consistency Protocol
 
@@ -453,8 +453,8 @@ python3 scripts-dev/benchmark_postgres_cold_reads.py \
    before committing the `state_groups` transaction in PostgreSQL.
 2. **PostgreSQL Commit is Truth**: A state group exists if and only if its row
    in PostgreSQL `state_groups` is committed. If a crash occurs after writing
-   mtxdb but before PostgreSQL commits, unreferenced HAMT nodes in mtxdb
-   are inert content-addressed blobs that harm nothing.
+   mtxdb but before PostgreSQL commits, unreferenced HAMT nodes in mtxdb are
+   inert content-addressed blobs that harm nothing.
 3. **Startup Self-Healing**: On startup, Synapse validates that the highest
    `state_group_id` in PostgreSQL has a matching HAMT root in mtxdb,
    automatically re-materializing missing roots if a crash occurred during

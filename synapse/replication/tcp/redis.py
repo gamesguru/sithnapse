@@ -21,7 +21,7 @@
 
 import logging
 from inspect import isawaitable
-from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Generic, Optional, TypeVar, cast
 
 import attr
 from txredisapi import (
@@ -307,6 +307,7 @@ class SynapseRedisFactory(RedisFactory):
         isLazy: bool = False,
         handler: type = ConnectionHandler,
         charset: str = "utf-8",
+        username: str | None = None,
         password: str | None = None,
         replyTimeout: int = 30,
         convertNumbers: int | None = True,
@@ -318,6 +319,7 @@ class SynapseRedisFactory(RedisFactory):
             isLazy=isLazy,
             handler=handler,
             charset=charset,
+            username=username,
             password=password,
             replyTimeout=replyTimeout,
             convertNumbers=convertNumbers,
@@ -398,6 +400,7 @@ class RedisDirectTcpReplicationClientFactory(SynapseRedisFactory):
             dbid=None,
             poolsize=1,
             replyTimeout=30,
+            username=hs.config.redis.redis_username,
             password=hs.config.redis.redis_password,
         )
 
@@ -409,7 +412,7 @@ class RedisDirectTcpReplicationClientFactory(SynapseRedisFactory):
 
         self.synapse_outbound_redis_connection = outbound_redis_connection
 
-    def buildProtocol(self, addr: IAddress) -> RedisSubscriber:
+    def buildProtocol(self, addr: Optional[IAddress]) -> RedisSubscriber:
         p = super().buildProtocol(addr)
         p = cast(RedisSubscriber, p)
 
@@ -433,6 +436,7 @@ def lazyConnection(
     port: int = 6379,
     dbid: int | None = None,
     reconnect: bool = True,
+    username: str | None = None,
     password: str | None = None,
     replyTimeout: int = 30,
 ) -> ConnectionHandler:
@@ -448,6 +452,7 @@ def lazyConnection(
         poolsize=1,
         isLazy=True,
         handler=ConnectionHandler,
+        username=username,
         password=password,
         replyTimeout=replyTimeout,
     )
@@ -482,6 +487,7 @@ def lazyUnixConnection(
     path: str = "/tmp/redis.sock",
     dbid: int | None = None,
     reconnect: bool = True,
+    username: str | None = None,
     password: str | None = None,
     replyTimeout: int = 30,
 ) -> ConnectionHandler:
@@ -501,6 +507,7 @@ def lazyUnixConnection(
         poolsize=1,
         isLazy=True,
         handler=UnixConnectionHandler,
+        username=username,
         password=password,
         replyTimeout=replyTimeout,
     )

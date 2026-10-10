@@ -493,7 +493,7 @@ class EventChainStoreTestCase(HomeserverTestCase):
         # `event_auth_chain_links` directly) so this test exercises whichever
         # backend -- SQL or the embedded mtxdb engine -- is actually
         # configured, instead of only ever checking the SQL table.
-        embedded_hamt_namespace = resolve_namespace(self.store)
+        embedded_db_namespace = resolve_namespace(self.store)
 
         def _fetch_links_txn(
             txn: LoggingTransaction,
@@ -502,8 +502,8 @@ class EventChainStoreTestCase(HomeserverTestCase):
             for links in self.store._get_chain_links(
                 txn,
                 {chain_id for chain_id, _ in chain_map.values()},
-                embedded_hamt_namespace,
-                getattr(self.store, "_embedded_hamt_engine", None),
+                embedded_db_namespace,
+                getattr(self.store, "_embedded_db_engine", None),
             ):
                 for origin_chain_id, values in links.items():
                     for (

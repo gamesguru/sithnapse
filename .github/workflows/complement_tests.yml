@@ -31,6 +31,13 @@ jobs:
       # homeserver, while its integrated database is still queryable.
       COMPLEMENT_POST_TEST_SCRIPT: ${{ startsWith(matrix.database, 'Postgres') && format('{0}/synapse/.ci/scripts/dump_complement_postgres_stats.sh', github.workspace) || '' }}
       COMPLEMENT_POSTGRES_STATS_DIR: /tmp/complement-postgres-stats
+      # Packages/tests run in parallel by `go test` (-p / -parallel). Keep this
+      # at complement.sh's default: a GitHub runner has 4 vCPUs and every test
+      # deploys two homeservers (each is postgres, redis, nginx and a dozen
+      # synapse processes in workers mode), so raising it starves homeserver
+      # startup and fails deployments with "timed out checking for homeserver
+      # to be up".
+      COMPLEMENT_PARALLEL: 2
 
     strategy:
       fail-fast: false
@@ -41,18 +48,24 @@ jobs:
 
           - arrangement: hybrid
             database: SQLite (hybrid, mtxdb)
+            # Complement containers are destroyed after every test, so the
+            # durable fsync path buys nothing here. Keep this lane consistent
+            # with the Postgres mtxdb lanes and run with sync off for speed.
+            mtxdb_sync_mode: "off"
 
           - arrangement: monolith
             database: Postgres
 
           - arrangement: hybrid
             database: Postgres (hybrid, mtxdb)
+            mtxdb_sync_mode: "off"
 
           - arrangement: workers
             database: Postgres
 
           - arrangement: workers
             database: Postgres (hybrid, mtxdb)
+            mtxdb_sync_mode: "off"
 
     steps:
       - name: Checkout synapse codebase
@@ -67,10 +80,10 @@ jobs:
         shell: bash
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # master
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: ${{ env.RUST_VERSION }}
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       # We use `uv` in `complement.sh`
       - name: Set up uv
@@ -100,16 +113,22 @@ jobs:
 
       - name: Run Complement Tests
         id: run_complement_tests
-        # -p=1: We're using `-p 1` to force the test packages to run serially as GHA boxes
-        #     are underpowered and don't like running tons of Synapse instances at once.
         run: |
-          COMPLEMENT_DIR=`pwd`/complement synapse/scripts-dev/complement.sh -p 1
+          COMPLEMENT_DIR=`pwd`/complement synapse/scripts-dev/complement.sh
         shell: bash
         env:
           POSTGRES: ${{ (startsWith(matrix.database, 'Postgres')) && 1 || '' }}
           WORKERS: ${{ (matrix.arrangement == 'workers') && 1 || '' }}
-          SYNAPSE_EMBEDDED_HAMT_ENGINE: ${{ (contains(matrix.database, 'mtxdb')) && 'mtxdb' || '' }}
-          SYNAPSE_EMBEDDED_HAMT_PATH: ${{ (contains(matrix.database, 'mtxdb')) && '/data/embedded_hamt' || '' }}
+          # complement.sh only honours the TEST_-scoped names (and blanks the
+          # bare ones to keep a developer's production env out of containers),
+          # so the engine/path MUST use the SYNAPSE_TEST_ prefix or the
+          # "hybrid, mtxdb" job silently boots plain SQLite.
+          SYNAPSE_TEST_EMBEDDED_DB_ENGINE: ${{ (contains(matrix.database, 'mtxdb')) && 'mtxdb' || '' }}
+          SYNAPSE_TEST_EMBEDDED_DB_PATH: ${{ (contains(matrix.database, 'mtxdb')) && '/data/embedded_db' || '' }}
+          # Complement mtxdb lanes disable fsync for speed; containers are
+          # destroyed after every test, so durability adds no value here.
+          SYNAPSE_TEST_MTXDB_SYNC_MODE: ${{ contains(matrix.database, 'mtxdb') && matrix.mtxdb_sync_mode || '' }}
+          SYNAPSE_TEST_MTXDB_STATS: ${{ (contains(matrix.database, 'mtxdb') && matrix.mtxdb_sync_mode != 'off') && '1' || '' }}
           TEST_ONLY_IGNORE_POETRY_LOCKFILE: ${{ inputs.use_latest_deps && 1 || '' }}
           TEST_ONLY_SKIP_DEP_HASH_VERIFICATION: ${{ inputs.use_twisted_trunk  && 1 || '' }}
           RESULTS_DIR: tests/complement/main
@@ -120,19 +139,29 @@ jobs:
         run: jq -Rrc 'fromjson? // empty' synapse/tests/complement/main/logs.jsonl | gotestfmt -hide "successful-downloads,successful-tests,empty-packages"
 
       - name: Run in-repo Complement Tests
+        # Always run as long as we attempted to run the original Complement tests.
+        # This lets us get a status report on the in-repo tests, even if the
+        # standard Complement test suite fails.
+        if: always() && steps.run_complement_tests.outcome != 'skipped'
         id: run_in_repo_complement_tests
-        # -p=1: We're using `-p 1` to force the test packages to run serially as GHA boxes
-        #     are underpowered and don't like running tons of Synapse instances at once.
         # -f: reuse the image built by the main run above (same checkout, same
         #     PASS_* env) instead of rebuilding 3 images a second time.
         run: |
-          COMPLEMENT_DIR=`pwd`/complement synapse/scripts-dev/complement.sh --in-repo -f -p 1
+          COMPLEMENT_DIR=`pwd`/complement synapse/scripts-dev/complement.sh --in-repo -f
         shell: bash
         env:
           POSTGRES: ${{ (startsWith(matrix.database, 'Postgres')) && 1 || '' }}
           WORKERS: ${{ (matrix.arrangement == 'workers') && 1 || '' }}
-          SYNAPSE_EMBEDDED_HAMT_ENGINE: ${{ (contains(matrix.database, 'mtxdb')) && 'mtxdb' || '' }}
-          SYNAPSE_EMBEDDED_HAMT_PATH: ${{ (contains(matrix.database, 'mtxdb')) && '/data/embedded_hamt' || '' }}
+          # complement.sh only honours the TEST_-scoped names (and blanks the
+          # bare ones to keep a developer's production env out of containers),
+          # so the engine/path MUST use the SYNAPSE_TEST_ prefix or the
+          # "hybrid, mtxdb" job silently boots plain SQLite.
+          SYNAPSE_TEST_EMBEDDED_DB_ENGINE: ${{ (contains(matrix.database, 'mtxdb')) && 'mtxdb' || '' }}
+          SYNAPSE_TEST_EMBEDDED_DB_PATH: ${{ (contains(matrix.database, 'mtxdb')) && '/data/embedded_db' || '' }}
+          # Complement mtxdb lanes disable fsync for speed; containers are
+          # destroyed after every test, so durability adds no value here.
+          SYNAPSE_TEST_MTXDB_SYNC_MODE: ${{ contains(matrix.database, 'mtxdb') && matrix.mtxdb_sync_mode || '' }}
+          SYNAPSE_TEST_MTXDB_STATS: ${{ (contains(matrix.database, 'mtxdb') && matrix.mtxdb_sync_mode != 'off') && '1' || '' }}
           TEST_ONLY_IGNORE_POETRY_LOCKFILE: ${{ inputs.use_latest_deps && 1 || '' }}
           TEST_ONLY_SKIP_DEP_HASH_VERIFICATION: ${{ inputs.use_twisted_trunk  && 1 || '' }}
           RESULTS_DIR: tests/complement/in-repo

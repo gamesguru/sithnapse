@@ -13,15 +13,19 @@ completed test, including its test ID, process ID, and elapsed milliseconds.
 
 import json
 import os
+import pathlib
 import re
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import IO, Any, Callable, Protocol, cast
+
+import run_header
 
 from twisted.python import usage
 from twisted.scripts.trial import Options, _getSuite, _initialDebugSetup, _makeRunner
@@ -165,6 +169,8 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
         return
 
     out(f"\n=== Diagnostics aggregated from {len(worker_pids)} process(es) ===")
+    for line in _run_identity():
+        out(line)
 
     # 1. Lifecycle timings
     lc_lifecycle_counters: dict[str, int] = defaultdict(int)
@@ -214,6 +220,22 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                     out(
                         f"    ├── {'db_recycle_reset':38s}  {rr_s * 1000:8.1f}ms  {rr_cnt:6d}  {(rr_s / rr_cnt) * 1000:10.3f}ms"
                     )
+                    for sub_tag in (
+                        "db_reset_connect",
+                        "db_reset_terminate_backends",
+                        "db_reset_catalog",
+                        "db_reset_dirty_scan",
+                        "db_reset_truncate",
+                        "db_reset_reseed",
+                        "db_reset_sequences",
+                        "db_reset_close",
+                    ):
+                        if sub_tag in lc_timings:
+                            sub_s = lc_timings[sub_tag]
+                            sub_cnt = lc_counts[sub_tag]
+                            out(
+                                f"    │     ├── {sub_tag:32s}  {sub_s * 1000:8.1f}ms  {sub_cnt:6d}  {(sub_s / sub_cnt) * 1000:10.3f}ms"
+                            )
                 if "hs_setup_total" in lc_timings:
                     st_s = lc_timings["hs_setup_total"]
                     st_cnt = lc_counts["hs_setup_total"]
@@ -258,6 +280,14 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                     "hs_setup_wall",
                     "create_database",
                     "db_recycle_reset",
+                    "db_reset_connect",
+                    "db_reset_terminate_backends",
+                    "db_reset_catalog",
+                    "db_reset_dirty_scan",
+                    "db_reset_truncate",
+                    "db_reset_reseed",
+                    "db_reset_sequences",
+                    "db_reset_close",
                     "hs_setup_total",
                     "make_conn",
                     "prepare_database",
@@ -306,6 +336,7 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
         sql_scheduling_total = 0.0
         sql_scheduling_count = 0
         sql_scheduling_samples: list[float] = []
+        sql_slow_statements: list[tuple[float, str, int, int]] = []
         for fname in sql_files:
             try:
                 with open(os.path.join(timings_dir, fname), encoding="utf-8") as sql_fh:
@@ -320,6 +351,8 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                 sql_scheduling_total += scheduling.get("total", 0.0)
                 sql_scheduling_count += scheduling.get("count", 0)
                 sql_scheduling_samples.extend(scheduling.get("latencies", []))
+                for elapsed, text, payload, rowcount in data.get("slow_statements", []):
+                    sql_slow_statements.append((elapsed, text, payload, rowcount))
             except Exception as e:
                 out(f"Warning: failed to read {fname}: {e}")
 
@@ -374,6 +407,16 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                 f"  {total_row[0]:{table_width}s}  {total_row[1]:>{total_width}s}  {total_row[2]:>{calls_width}s}  {total_row[3]:>{rows_width}s}  {total_row[4]:>{avg_width}s}"
             )
             out("=====================================")
+            out("")
+
+        if sql_slow_statements:
+            sql_slow_statements.sort(key=lambda entry: entry[0], reverse=True)
+            out("=== Slowest SQL statements (all processes) ===")
+            for elapsed, text, payload, rowcount in sql_slow_statements[:10]:
+                out(
+                    f"  {elapsed * 1000:9.1f}ms  sent={payload:>9,d}B  "
+                    f"rows={rowcount:>6,d}  {text}"
+                )
             out("")
 
         if sql_scheduling_count and sql_scheduling_samples:
@@ -586,7 +629,13 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
 
         if ffi_timings:
             out("\n=== FFI boundary timings ===")
-            has_hist = bool(ffi_latencies)
+            # Percentiles are meaningful alongside total/count only when all
+            # calls are represented in the bounded latency sample.
+            has_hist = any(
+                tag in ffi_latencies
+                and len(ffi_latencies[tag]) == ffi_counts.get(tag, 0)
+                for tag in ffi_timings
+            )
             if has_hist:
                 out(
                     f"  {'':50s}  {'total':>10s}  {'calls':>6s}  {'avg':>12s}  {'p50':>11s}  {'p95':>11s}  {'p99':>11s}"
@@ -605,13 +654,19 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                 count = ffi_counts[tag]
                 total_ms = total_s * 1000
                 avg_ms = (total_s / count) * 1000 if count else 0.0
-                if tag in ffi_latencies:
-                    s = sorted(ffi_latencies[tag])
-                    p50_ms = _pct(s, 0.50) * 1000
-                    p95_ms = _pct(s, 0.95) * 1000
-                    p99_ms = _pct(s, 0.99) * 1000
+                if has_hist:
+                    if tag in ffi_latencies and len(ffi_latencies[tag]) == count:
+                        s = sorted(ffi_latencies[tag])
+                        p50_ms = _pct(s, 0.50) * 1000
+                        p95_ms = _pct(s, 0.95) * 1000
+                        p99_ms = _pct(s, 0.99) * 1000
+                        percentiles = (
+                            f"{p50_ms:9.3f}ms  {p95_ms:9.3f}ms  {p99_ms:9.3f}ms"
+                        )
+                    else:
+                        percentiles = f"{'n/a':>9s}     {'n/a':>9s}     {'n/a':>9s}"
                     out(
-                        f"  {tag:50s}  {total_ms:8.1f}ms  {count:6d}  {avg_ms:10.3f}ms  {p50_ms:9.3f}ms  {p95_ms:9.3f}ms  {p99_ms:9.3f}ms"
+                        f"  {tag:50s}  {total_ms:8.1f}ms  {count:6d}  {avg_ms:10.3f}ms  {percentiles}"
                     )
                 else:
                     out(f"  {tag:50s}  {total_ms:8.1f}ms  {count:6d}  {avg_ms:10.3f}ms")
@@ -709,6 +764,338 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                     )
                 out("=======================")
                 out("")
+
+
+def _flatten_container_timings(root: str) -> str:
+    """Merge per-container timing directories into one flat directory.
+
+    Complement writes ``<root>/<container>/<kind>_<pid>.json``. Every container
+    has its own PID namespace, so PIDs repeat across containers; give each
+    container a distinct numeric prefix so ``_aggregate_and_print_timings`` (which
+    expects one flat directory keyed by PID) sees every process.
+    """
+    flat = tempfile.mkdtemp(prefix="synapse_timings_flat_")
+    containers = sorted(
+        d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))
+    )
+    for index, container in enumerate(containers):
+        cdir = os.path.join(root, container)
+        for fname in os.listdir(cdir):
+            m = re.fullmatch(r"(.+)_(\d+)\.json", fname)
+            if not m:
+                continue
+            kind, pid = m.group(1), int(m.group(2))
+            shutil.copyfile(
+                os.path.join(cdir, fname),
+                os.path.join(flat, f"{kind}_{index:05d}{pid:07d}.json"),
+            )
+    return flat
+
+
+# mtxdb's OperationLatency: fixed, non-cumulative buckets (upper bounds).
+_LATENCY_BUCKETS = ("<50us", "<100us", "<250us", "<1ms", "<10ms", ">=10ms")
+_LATENCY_OPS = ("get", "get_many", "get_many_with_refresh", "put", "put_many")
+
+
+def _latency_percentile(buckets: list[int], quantile: float) -> str:
+    """The upper bound of the bucket the given quantile falls in."""
+    total = sum(buckets)
+    if not total:
+        return "-"
+    seen = 0
+    for count, bound in zip(buckets, _LATENCY_BUCKETS):
+        seen += count
+        if seen >= total * quantile:
+            return bound
+    return _LATENCY_BUCKETS[-1]
+
+
+def _print_mtxdb_engine_stats(timings_dir: str) -> None:
+    """Sum the per-process mtxdb engine stats (``mtxdb_<pid>.json``)."""
+    totals: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    latencies: dict[str, dict[str, Any]] = defaultdict(
+        lambda: defaultdict(
+            lambda: {
+                "calls": 0,
+                "total_us": 0,
+                "max_us": 0,
+                "buckets": [0] * len(_LATENCY_BUCKETS),
+            }
+        )
+    )
+    durability: dict[str, Any] = {
+        "durable_requests": 0,
+        "durable_waits_already_durable": 0,
+        "durable_wait": {
+            "calls": 0,
+            "total_us": 0,
+            "max_us": 0,
+            "buckets": [],
+        },
+        "sync_requests": 0,
+        "sync_waiters": 0,
+        "sync_coalesced": 0,
+        "commits": 0,
+        "commit_records": 0,
+        "max_commit_records": 0,
+        "staged_publish_refused": 0,
+    }
+    processes = 0
+    for fname in sorted(os.listdir(timings_dir)):
+        if not (fname.startswith("mtxdb_") and fname.endswith(".json")):
+            continue
+        try:
+            with open(os.path.join(timings_dir, fname), encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception as e:
+            print(f"Warning: failed to read {fname}: {e}", file=sys.stderr)
+            continue
+        processes += 1
+        # RuntimeStats exposes the same JournalCoordinator through each pool
+        # when the pools share a WAL. Use one representative pool per process;
+        # summing all three would triple-count every journal-wide counter.
+        representative = data.get("event_dag") or data.get("state")
+        if isinstance(representative, dict):
+            src = representative.get("durability")
+            if isinstance(src, dict):
+                for key in (
+                    "durable_requests",
+                    "durable_waits_already_durable",
+                    "sync_requests",
+                    "sync_waiters",
+                    "sync_coalesced",
+                    "commits",
+                    "commit_records",
+                    "staged_publish_refused",
+                ):
+                    value = src.get(key, 0)
+                    if isinstance(value, (int, float)):
+                        durability[key] += value
+                durability["max_commit_records"] = max(
+                    durability["max_commit_records"],
+                    src.get("max_commit_records", 0) or 0,
+                )
+                wait = src.get("durable_wait")
+                if isinstance(wait, dict):
+                    into = durability["durable_wait"]
+                    into["calls"] += wait.get("calls", 0) or 0
+                    into["total_us"] += wait.get("total_us", 0) or 0
+                    into["max_us"] = max(into["max_us"], wait.get("max_us", 0) or 0)
+                    buckets = wait.get("buckets", [])
+                    if len(into["buckets"]) < len(buckets):
+                        into["buckets"].extend(
+                            [0] * (len(buckets) - len(into["buckets"]))
+                        )
+                    for i, count in enumerate(buckets):
+                        into["buckets"][i] += count
+        for pool, ps in data.items():
+            if not isinstance(ps, dict):
+                continue
+            for op in _LATENCY_OPS:
+                lat = ps.get(f"{op}_latency")
+                if isinstance(lat, dict) and lat.get("calls"):
+                    into = latencies[pool][op]
+                    into["calls"] += lat["calls"]
+                    into["total_us"] += lat.get("total_us", 0)
+                    into["max_us"] = max(into["max_us"], lat.get("max_us", 0))
+                    for i, count in enumerate(lat.get("buckets", [])):
+                        into["buckets"][i] += count
+            acc = totals[pool]
+            for key in ("get_calls", "get_misses", "cache_hits", "cache_misses"):
+                acc[key] += ps.get(key, 0) or 0
+            for key, value in (ps.get("sync_totals") or {}).items():
+                if isinstance(value, (int, float)):
+                    acc[f"sync_{key}"] += value
+    if not totals:
+        return
+
+    def fmt(us: float) -> str:
+        if us < 1000:
+            return f"{us:.0f}us"
+        if us < 1_000_000:
+            return f"{us / 1000:.1f}ms"
+        return f"{us / 1_000_000:.2f}s"
+
+    err = sys.stderr
+    print(
+        f"\n=== mtxdb runtime stats (summed over {processes} process(es)) ===", file=err
+    )
+    for pool in ("state", "event_dag", "auth_chain"):
+        pool_totals = totals.get(pool)
+        if not pool_totals:
+            continue
+        # The stats keys keep their older names; the report says `event`/`edges`.
+        label = {"event_dag": "event", "auth_chain": "edges"}.get(pool, pool)
+        print(f"\n  [{label}]", file=err)
+        print(
+            f"    get: {pool_totals['get_calls']:,.0f} calls, {pool_totals['get_misses']:,.0f} misses"
+            f" | cache: {pool_totals['cache_hits']:,.0f} hits, {pool_totals['cache_misses']:,.0f} misses",
+            file=err,
+        )
+        # The pools share one journal, so a physical commit is counted once, by
+        # whichever call performed it; the rest found their target already
+        # committed ("coalesced"). Real commits = calls that reached the journal
+        # minus the coalesced ones.
+        journal_calls = pool_totals.get("sync_journal_sync_calls", 0)
+        coalesced = pool_totals.get("sync_journal_coalesced", 0)
+        if journal_calls:
+            commits = max(journal_calls - coalesced, 0)
+            fsync_us = pool_totals.get("sync_journal_fsync_us", 0)
+            records = pool_totals.get("sync_journal_records", 0)
+            print(
+                f"    journal: {journal_calls:,.0f} sync calls -> {commits:,.0f} real commits,"
+                f" {coalesced:,.0f} coalesced"
+                f" | fsync total={fmt(fsync_us)}"
+                f" avg={fmt(fsync_us / commits) if commits else '-'}"
+                f" max={fmt(pool_totals.get('sync_max_journal_fsync_us', 0))}"
+                f" | records/commit={records / commits if commits else 0:,.1f}",
+                file=err,
+            )
+        pool_latencies = latencies.get(pool)
+        if pool_latencies:
+            print(
+                "    latency  (calls, avg, max | counts per "
+                + " ".join(_LATENCY_BUCKETS)
+                + " | p50/p95/p99 upper bound)",
+                file=err,
+            )
+            for op in _LATENCY_OPS:
+                lat = pool_latencies.get(op)
+                if not lat or not lat["calls"]:
+                    continue
+                print(
+                    f"      {op:<22s}{lat['calls']:>9,d} calls"
+                    f"  avg={fmt(lat['total_us'] / lat['calls'])}"
+                    f"  max={fmt(lat['max_us'])}"
+                    f" | {' '.join(f'{c:,d}' for c in lat['buckets'])}"
+                    f" | {'/'.join(_latency_percentile(lat['buckets'], q) for q in (0.5, 0.95, 0.99))}",
+                    file=err,
+                )
+        calls = pool_totals.get("sync_calls", 0)
+        if calls:
+            print(
+                f"    sync ({calls:,.0f} calls): total={fmt(pool_totals.get('sync_total_us', 0))}"
+                f" flush={fmt(pool_totals.get('sync_pack_flush_us', 0))}"
+                f" fsync={fmt(pool_totals.get('sync_pack_fsync_us', 0))}"
+                f" sidecar={fmt(pool_totals.get('sync_sidecar_us', 0))}"
+                f" delta={fmt(pool_totals.get('sync_delta_log_us', 0))}"
+                f" checkpoint={fmt(pool_totals.get('sync_checkpoint_us', 0))}",
+                file=err,
+            )
+    if (
+        any(durability[key] for key in durability if key != "durable_wait")
+        or durability["durable_wait"]["calls"]
+    ):
+        wait = durability["durable_wait"]
+        buckets = wait["buckets"]
+        wait_shape = " ".join(f"{count:,d}" for count in buckets) if buckets else "-"
+        commits = durability["commits"]
+        print("\n  [journal durability; one shared coordinator per process]", file=err)
+        print(
+            f"    durable: {durability['durable_requests']:,.0f} requests"
+            f" | waits blocked={wait['calls']:,.0f} already-durable={durability['durable_waits_already_durable']:,.0f}"
+            f" | wait total={fmt(wait['total_us'])} max={fmt(wait['max_us'])}",
+            file=err,
+        )
+        print(
+            f"    sync: requests={durability['sync_requests']:,.0f}"
+            f" waiters={durability['sync_waiters']:,.0f} coalesced={durability['sync_coalesced']:,.0f}"
+            f" | real commits={commits:,.0f}"
+            f" | records/commit={durability['commit_records'] / commits if commits else 0:,.1f}"
+            f" max records/commit={durability['max_commit_records']:,.0f}",
+            file=err,
+        )
+        print(
+            f"    durable-wait buckets: {wait_shape}"
+            f" | staged publish refused (legacy pending): {durability['staged_publish_refused']:,.0f}",
+            file=err,
+        )
+    print("===============================\n", file=err)
+
+
+# Complement starts the baseline before its run (complement.sh exports the path);
+# this process only aggregates afterwards, so a fresh one would show no load
+# change and no pressure. Trial has no such file and starts its own.
+_BASELINE = (
+    run_header.Baseline.load_from(os.environ["RUN_HEADER_STATE"])
+    if os.environ.get("RUN_HEADER_STATE")
+    else run_header.Baseline()
+)
+
+
+def _run_identity() -> list[str]:
+    """Lines naming the code, pin and settings a run was made with, so a log
+    can be attributed to a commit later instead of remembered."""
+    jobs = "-"
+    if os.environ.get("RUN_HEADER_WORKERS"):
+        jobs = f"-p{os.environ['RUN_HEADER_WORKERS']} (go test)"
+    for i, arg in enumerate(sys.argv):
+        if arg == "-j" and i + 1 < len(sys.argv):
+            jobs = f"-j{sys.argv[i + 1]}"
+        elif arg.startswith("-j") and arg[2:].isdigit():
+            jobs = arg
+    return [
+        *run_header.header_lines(
+            [
+                ("workers", jobs),
+                (
+                    "sync mode",
+                    os.environ.get("SYNAPSE_TEST_MTXDB_SYNC_MODE")
+                    or os.environ.get("PASS_SYNAPSE_MTXDB_SYNC", "(unset)"),
+                ),
+                (
+                    "persist txn",
+                    os.environ.get("SYNAPSE_MTXDB_PERSIST_TXN", "(unset, on)"),
+                ),
+            ]
+        ),
+        *run_header.load_lines(_BASELINE),
+    ]
+
+
+def aggregate_container_timings(root: str) -> None:
+    """Print the combined report for a Complement run's timing directory."""
+    flat = _flatten_container_timings(root)
+    try:
+        _aggregate_and_print_timings(flat)
+        _print_mtxdb_engine_stats(flat)
+    finally:
+        shutil.rmtree(flat, ignore_errors=True)
+
+
+def _preserve_failure_logs(working_dir: str) -> None:
+    """Copy each test.log under the trial working directory into a new
+    `res/logs/<date>-trial-failure-<rev>-<time>/` directory, with a manifest.
+
+    A failed test's server-side traceback lives only in these files, and the
+    next run reuses (and overwrites) the working directory. The destination is
+    unique per run, so later reruns never replace it. Nothing is committed.
+    """
+    logs = sorted(pathlib.Path(working_dir).rglob("test.log"))
+    if not logs:
+        return
+    repo = pathlib.Path(__file__).resolve().parent.parent
+    try:
+        rev = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        rev = "unknown"
+    stamp = time.strftime("%Y-%m-%d-%H%M%S")
+    dest = repo / "res" / "logs" / f"{stamp}-trial-failure-{rev}"
+    dest.mkdir(parents=True, exist_ok=True)
+    manifest = {}
+    for i, log in enumerate(logs):
+        rel = log.relative_to(working_dir)
+        name = f"{i:02d}-" + "_".join(rel.parts)
+        shutil.copy2(log, dest / name)
+        manifest[name] = str(log)
+    (dest / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    sys.stderr.write(f"Preserved {len(logs)} test.log file(s) in {dest}\n")
 
 
 def run() -> None:
@@ -901,8 +1288,21 @@ def run() -> None:
             finally:
                 shutil.rmtree(timings_dir, ignore_errors=True)
 
+    if not successful and not interrupted:
+        try:
+            _preserve_failure_logs(
+                cast(_DistributedRunner, trialRunner)._workingDirectory
+                if config["jobs"] is not None
+                else cast(TrialRunner, trialRunner).workingDirectory
+            )
+        except Exception as e:  # never mask the test result
+            sys.stderr.write(f"Could not preserve failure logs: {e}\n")
+
     sys.exit(130 if interrupted else int(not successful))
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--aggregate-timings":
+        aggregate_container_timings(sys.argv[2])
+        sys.exit(0)
     run()

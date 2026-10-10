@@ -20,6 +20,7 @@
 #
 
 import logging
+from collections import defaultdict
 from typing import TYPE_CHECKING, Any
 
 from twisted.web.server import Request
@@ -134,7 +135,12 @@ class ReplicationSendEventsRestServlet(ReplicationEndpoint):
         ):
             events_and_context = []
             events = payload["events"]
-            rooms = set()
+            rooms: set[str] = set()
+            # Collect and deduplicate pending HAMT mirror replays across the entire
+            # batch of events so they execute in a single database interaction per room.
+            replays_by_room: dict[tuple[str, Any], dict[int, dict[str, Any]]] = (
+                defaultdict(dict)
+            )
 
             for event_payload in events:
                 event_dict = event_payload["event"]
@@ -155,13 +161,14 @@ class ReplicationSendEventsRestServlet(ReplicationEndpoint):
                 if context.pending_embedded_hamt_mirror_roots is not None:
                     # The instance that created this event's state group (or its
                     # predecessors) opened mtxdb read-only and could not mirror-write
-                    # it -- redo those writes here, now that we're on the events
-                    # writer. Sort by state group so that the predecessor is always
-                    # mirror-written before the child group that depends on it.
-                    replays: list[dict[str, Any]] = []
-                    for sg, pending_payload in sorted(
-                        context.pending_embedded_hamt_mirror_roots.items()
-                    ):
+                    # it -- collect those writes here, to be redone on the events writer.
+                    for (
+                        sg,
+                        pending_payload,
+                    ) in context.pending_embedded_hamt_mirror_roots.items():
+                        if sg in replays_by_room[(event.room_id, event.room_version)]:
+                            continue
+
                         prev_sg = None
                         delta: StateMap[str] | None = None
 
@@ -288,32 +295,17 @@ class ReplicationSendEventsRestServlet(ReplicationEndpoint):
                             (event_type, state_key, ev_id)
                             for (event_type, state_key), ev_id in delta.items()
                         ]
-                        replays.append(
-                            {
-                                "state_group": sg,
-                                "prev_state_group": prev_sg,
-                                "updates": updates,
-                                "expected_root_hash": expected_root,
-                                "expected_lattice": expected_lattice,
-                                "expected_room_prefix": expected_prefix,
-                                "state_map": full_state_map,
-                                "state_count": state_count,
-                                "version": version,
-                            }
-                        )
-
-                    if replays:
-                        if len(replays) > 1 and any(
-                            replay["version"] == 0 for replay in replays
-                        ):
-                            raise RuntimeError(
-                                "Cannot replay multiple legacy HAMT payloads"
-                            )
-                        await self._state_store.redo_embedded_hamt_mirror_writes_batch(
-                            event.room_id,
-                            event.room_version,
-                            replays,
-                        )
+                        replays_by_room[(event.room_id, event.room_version)][sg] = {
+                            "state_group": sg,
+                            "prev_state_group": prev_sg,
+                            "updates": updates,
+                            "expected_root_hash": expected_root,
+                            "expected_lattice": expected_lattice,
+                            "expected_room_prefix": expected_prefix,
+                            "state_map": full_state_map,
+                            "state_count": state_count,
+                            "version": version,
+                        }
 
                 ratelimit = event_payload["ratelimit"]
                 events_and_context.append((event, context))
@@ -325,6 +317,23 @@ class ReplicationSendEventsRestServlet(ReplicationEndpoint):
                 # all the rooms *should* be the same, but we'll log separately to be
                 # sure.
                 rooms.add(event.room_id)
+
+            for (room_id, room_version), sg_replays in replays_by_room.items():
+                if sg_replays:
+                    # Sort by state group so that the predecessor is always
+                    # mirror-written before the child group that depends on it.
+                    replays = [sg_replays[sg] for sg in sorted(sg_replays.keys())]
+                    if len(replays) > 1 and any(
+                        replay["version"] == 0 for replay in replays
+                    ):
+                        raise RuntimeError(
+                            "Cannot replay multiple legacy HAMT payloads"
+                        )
+                    await self._state_store.redo_embedded_hamt_mirror_writes_batch(
+                        room_id,
+                        room_version,
+                        replays,
+                    )
 
             logger.info(
                 "Got batch of %i events to persist to rooms %s", len(events), rooms

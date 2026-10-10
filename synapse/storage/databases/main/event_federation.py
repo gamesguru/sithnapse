@@ -40,6 +40,7 @@ from synapse.api.constants import MAX_DEPTH
 from synapse.api.errors import StoreError
 from synapse.api.room_versions import EventFormatVersions, RoomVersion
 from synapse.events import EventBase, make_event_from_dict
+from synapse.events.py_protocol import MSC4242Event, supports_msc4242_state_dag
 from synapse.logging.opentracing import tag_args, trace
 from synapse.metrics import SERVER_NAME_LABEL
 from synapse.metrics.background_process_metrics import wrap_as_background_process
@@ -51,7 +52,7 @@ from synapse.storage.database import (
     LoggingTransaction,
 )
 from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
-from synapse.storage.databases.main.embedded_common import ffi_count
+from synapse.storage.databases.main.embedded_common import ffi_count, ffi_timing
 from synapse.storage.databases.main.events_worker import EventsWorkerStore
 from synapse.storage.databases.main.signatures import SignatureWorkerStore
 from synapse.storage.engines import PostgresEngine, Sqlite3Engine
@@ -302,14 +303,14 @@ class EventFederationWorkerStore(
                 resolve_namespace,
             )
 
-            embedded_hamt_namespace = resolve_namespace(self)
+            embedded_db_namespace = resolve_namespace(self)
             is_embedded_writer = (
-                embedded_hamt_namespace is not None
+                embedded_db_namespace is not None
                 and self.hs.get_instance_name() in self.hs.config.worker.writers.events
             )
             try:
                 if is_embedded_writer:
-                    assert embedded_hamt_namespace is not None
+                    assert embedded_db_namespace is not None
                     _auth_coverage(
                         "get_auth_chain_ids", "embedded_attempt", len(event_ids)
                     )
@@ -317,7 +318,7 @@ class EventFederationWorkerStore(
                         result = await self.db_pool.runInteraction(
                             "get_auth_chain_ids_embedded",
                             self._get_auth_chain_ids_using_embedded_closures_txn,
-                            embedded_hamt_namespace,
+                            embedded_db_namespace,
                             room_id,
                             event_ids,
                             include_given,
@@ -355,7 +356,7 @@ class EventFederationWorkerStore(
                         )
                         return result
 
-                # Non-writers (or instances without embedded HAMT): prefer the cover
+                # Non-writers (or instances without embedded DB): prefer the cover
                 # index when complete. Non-writers hold a read-only mtxdb handle and
                 # cannot safely repair missing links; if the cover index is incomplete or
                 # missing, fall back to the authoritative legacy SQL BFS walk.
@@ -410,7 +411,7 @@ class EventFederationWorkerStore(
     def _get_auth_chain_ids_using_embedded_closures_txn(
         self,
         txn: LoggingTransaction,
-        embedded_hamt_namespace: str,
+        embedded_db_namespace: str,
         room_id: str,
         event_ids: Collection[str],
         include_given: bool,
@@ -439,18 +440,18 @@ class EventFederationWorkerStore(
             "get_auth_chain_ids: using EMBEDDED CLOSURES path for room=%s "
             "namespace=%s initial_events=%s include_given=%s",
             room_id,
-            embedded_hamt_namespace,
+            embedded_db_namespace,
             initial_events,
             include_given,
         )
 
-        engine_name = self._embedded_hamt_engine
+        engine_name = self._embedded_db_engine
         short_ids = get_or_create_short_ids(
-            engine_name, embedded_hamt_namespace, room_id, initial_events
+            engine_name, embedded_db_namespace, room_id, initial_events
         )
 
         closures = self._auth_chain_closure_cache.get_closures_batch(
-            txn, engine_name, embedded_hamt_namespace, room_id, short_ids
+            txn, engine_name, embedded_db_namespace, room_id, short_ids
         )
 
         result_short_ids: set[int] = set()
@@ -465,7 +466,7 @@ class EventFederationWorkerStore(
 
         resolved = resolve_short_ids_to_event_ids(
             engine_name,
-            embedded_hamt_namespace,
+            embedded_db_namespace,
             room_id,
             list(result_short_ids),
         )
@@ -536,12 +537,12 @@ class EventFederationWorkerStore(
             resolve_namespace,
         )
 
-        embedded_hamt_namespace = resolve_namespace(self)
+        embedded_db_namespace = resolve_namespace(self)
         for links in self._get_chain_links(
             txn,
             set(event_chains.keys()),
-            embedded_hamt_namespace,
-            self._embedded_hamt_engine,
+            embedded_db_namespace,
+            self._embedded_db_engine,
         ):
             for chain_id in links:
                 if chain_id not in event_chains:
@@ -647,8 +648,8 @@ class EventFederationWorkerStore(
         cls,
         txn: LoggingTransaction,
         chains_to_fetch: set[int],
-        embedded_hamt_namespace: str | None,
-        embedded_hamt_engine: str | None,
+        embedded_db_namespace: str | None,
+        embedded_db_engine: str | None,
     ) -> Generator[dict[int, list[tuple[int, int, int]]], None, None]:
         """Fetch all auth chain links from the given set of chains, and all
         links from those chains, recursively.
@@ -659,15 +660,15 @@ class EventFederationWorkerStore(
         Returns a generator that produces dicts from origin chain ID to 3-tuple
         of origin sequence number, target chain ID and target sequence number.
 
-        `embedded_hamt_namespace`: the caller's resolved namespace when the
+        `embedded_db_namespace`: the caller's resolved namespace when the
         embedded engine is configured, `None` when it isn't -- a
         `@classmethod` has no `self` of its own, so this can't be
         recomputed here; see `embedded_event_auth_chain_links.py`.
 
-        `embedded_hamt_engine`: the engine name threaded alongside
-        `embedded_hamt_namespace` (same `@classmethod` constraint).
+        `embedded_db_engine`: the engine name threaded alongside
+        `embedded_db_namespace` (same `@classmethod` constraint).
         """
-        if embedded_hamt_namespace is not None:
+        if embedded_db_namespace is not None:
             # Exclusive by configured engine, not a dual-write. mtxdb has no
             # recursive-query primitive, so the walk is done here in Python
             # instead of SQL's `WITH RECURSIVE` below -- see
@@ -708,7 +709,7 @@ class EventFederationWorkerStore(
                     batch = set(itertools.islice(to_walk, 1000))
                     to_walk.difference_update(batch)
                     embedded_links = get_chain_links_batch(
-                        embedded_hamt_engine, embedded_hamt_namespace, batch
+                        embedded_db_engine, embedded_db_namespace, batch
                     )
                     for chain_id, edges in embedded_links.items():
                         accumulated.setdefault(chain_id, []).extend(edges)
@@ -885,14 +886,14 @@ class EventFederationWorkerStore(
             )
 
             try:
-                embedded_hamt_namespace = resolve_namespace(self)
+                embedded_db_namespace = resolve_namespace(self)
                 is_embedded_writer = (
-                    embedded_hamt_namespace is not None
+                    embedded_db_namespace is not None
                     and self.hs.get_instance_name()
                     in self.hs.config.worker.writers.events
                 )
                 if is_embedded_writer:
-                    assert embedded_hamt_namespace is not None
+                    assert embedded_db_namespace is not None
                     _auth_coverage(
                         "get_auth_chain_difference",
                         "embedded_attempt",
@@ -902,7 +903,7 @@ class EventFederationWorkerStore(
                         result = await self.db_pool.runInteraction(
                             "get_auth_chain_difference_embedded",
                             self._get_auth_chain_difference_using_embedded_closures_txn,
-                            embedded_hamt_namespace,
+                            embedded_db_namespace,
                             room_id,
                             state_sets,
                             conflicted_set,
@@ -999,7 +1000,7 @@ class EventFederationWorkerStore(
     def _get_auth_chain_difference_using_embedded_closures_txn(
         self,
         txn: LoggingTransaction,
-        embedded_hamt_namespace: str,
+        embedded_db_namespace: str,
         room_id: str,
         state_sets: list[set[str]],
         conflicted_set: set[str] | None = None,
@@ -1038,7 +1039,7 @@ class EventFederationWorkerStore(
             resolve_short_ids_to_event_ids,
         )
 
-        engine_name = self._embedded_hamt_engine
+        engine_name = self._embedded_db_engine
 
         is_state_res_v21 = conflicted_set is not None
         initial_events = set(state_sets[0]).union(*state_sets[1:])
@@ -1063,7 +1064,7 @@ class EventFederationWorkerStore(
 
         event_ids = list(initial_events)
         short_ids = get_or_create_short_ids(
-            engine_name, embedded_hamt_namespace, room_id, event_ids
+            engine_name, embedded_db_namespace, room_id, event_ids
         )
         short_id_of = dict(zip(event_ids, short_ids))
 
@@ -1080,7 +1081,7 @@ class EventFederationWorkerStore(
             closures = self._auth_chain_closure_cache.get_closures_batch(
                 txn,
                 engine_name,
-                embedded_hamt_namespace,
+                embedded_db_namespace,
                 room_id,
                 member_short_ids,
             )
@@ -1107,7 +1108,7 @@ class EventFederationWorkerStore(
             for closure in self._auth_chain_closure_cache.get_closures_batch(
                 txn,
                 engine_name,
-                embedded_hamt_namespace,
+                embedded_db_namespace,
                 room_id,
                 conflicted_short_ids,
             ).values():
@@ -1121,7 +1122,7 @@ class EventFederationWorkerStore(
                 for closure in self._auth_chain_closure_cache.get_closures_batch(
                     txn,
                     engine_name,
-                    embedded_hamt_namespace,
+                    embedded_db_namespace,
                     room_id,
                     additional_short_ids,
                 ).values():
@@ -1132,7 +1133,7 @@ class EventFederationWorkerStore(
             forwards_ids = get_forward_reachable_short_ids(
                 txn,
                 engine_name,
-                embedded_hamt_namespace,
+                embedded_db_namespace,
                 room_id,
                 conflicted_short_ids,
                 candidate_short_ids=backwards_ids,
@@ -1144,7 +1145,7 @@ class EventFederationWorkerStore(
                 return set()
             resolved = resolve_short_ids_to_event_ids(
                 engine_name,
-                embedded_hamt_namespace,
+                embedded_db_namespace,
                 room_id,
                 list(short_id_iter),
             )
@@ -1310,9 +1311,9 @@ class EventFederationWorkerStore(
             resolve_namespace,
         )
 
-        embedded_hamt_namespace = resolve_namespace(self)
+        embedded_db_namespace = resolve_namespace(self)
         for links in self._get_chain_links(
-            txn, set(seen_chains), embedded_hamt_namespace, self._embedded_hamt_engine
+            txn, set(seen_chains), embedded_db_namespace, self._embedded_db_engine
         ):
             # `links` encodes the backwards reachable events _from a single chain_ all the way to
             # the root of the graph.
@@ -1807,6 +1808,196 @@ class EventFederationWorkerStore(
 
         # Return all events where not all sets can reach them.
         return {eid for eid, n in event_to_missing_sets.items() if n}
+
+    async def get_state_dag(
+        self, room_id: str, forward_extrems: set[str]
+    ) -> dict[str, MSC4242Event]:
+        """Get the current state DAG for the given room.
+
+        This function is called when calculating a /send_join response.
+        This does not check that the room is an state DAG room, so check this
+        before calling this function!
+
+        This functions guarantees that the returned state DAG is connected.
+
+        Args:
+            room_id: The room to get the state dag for
+            forward_extrems: latest event IDs in the room. The state DAG is all events reachable from these events.
+        Returns:
+            A map of event_id => event
+        """
+
+        def _get_state_events_txn(txn: LoggingTransaction, room_id: str) -> list[str]:
+            sql = """
+                SELECT event_id FROM msc4242_state_dag_edges WHERE room_id = ?
+            """
+            txn.execute(sql, (room_id,))
+            event_ids = [ev_id for (ev_id,) in txn]
+            return event_ids
+
+        # Pull out all state events for this room using the events_by_room_and_type index.
+        event_ids = await self.db_pool.runInteraction(
+            "_get_state_events_txn",
+            _get_state_events_txn,
+            room_id,
+        )
+        event_map = await self.get_events(event_ids)
+        # Filter the returned state events to only include ones on the paths back from the forward
+        # extremities.
+        result: dict[str, MSC4242Event] = {}
+        next_ids = forward_extrems
+        seen: set[str] = set()
+        while len(next_ids) > 0:
+            # Pull the event and add the prev_state_events.
+            # We must have the event.
+            event_id = next_ids.pop()
+            if event_id in seen:
+                continue
+            seen.add(event_id)
+            ev = event_map[event_id]
+            # `prev_state_events` only exists on MSC4242 event formats, and this is only
+            # called for state DAG rooms.
+            assert supports_msc4242_state_dag(ev)
+            result[event_id] = ev
+            for prev_state_event_id in ev.prev_state_events:
+                next_ids.add(prev_state_event_id)
+
+        assert len(result) > 0  # we always return the forward extremities
+        # Assert that the create event was returned. Pick the first event (any will do) to verify
+        # that this room version supports room IDs as hashes.
+        first_event: MSC4242Event = next(iter(result.values()))
+        if first_event.room_version.msc4291_room_ids_as_hashes:
+            create_event_id = f"${room_id[1:]}"
+            assert create_event_id in result
+
+        return result
+
+    async def get_missing_events_state_dag(
+        self,
+        *,
+        room_id: str,
+        earliest_event_ids: list[str],
+        latest_event_ids: list[str],
+        limit: int,
+    ) -> list[EventBase]:
+        """Get parts of the state DAG in response to a /get_missing_events query.
+
+        Args:
+            room_id: The state DAG to look at
+            earliest_event_ids: Which events the caller has seen. These events will not be returned.
+            latest_event_ids: Which events to start walking back from via prev_state_events.
+            limit: The max number of events to return.
+        Returns:
+            A list of events, deterministically ordered according to MSC4242.
+        """
+        ids = await self.db_pool.runInteraction(
+            "get_missing_events_state_dag",
+            self._get_missing_events_state_dag_txn,
+            room_id,
+            earliest_event_ids,
+            latest_event_ids,
+            limit,
+        )
+        return await self.get_events_as_list(ids)
+
+    def _get_missing_events_state_dag_txn(
+        self,
+        txn: LoggingTransaction,
+        room_id: str,
+        earliest_event_ids: list[str],
+        latest_event_ids: list[str],
+        limit: int,
+    ) -> list[str]:
+        """Walk the state DAG backward from `latest_event_ids`, stopping at
+        `limit` results or the beginning of the DAG, whichever comes first.
+
+        Earliest events are treated as already-visited: they are not emitted,
+        and their predecessors are not traversed via them.
+
+        Results are deterministic and ordered by breadth-first search (BFS), with lexicographic
+        tie-breaking among siblings at the same hops away.
+
+        Executes as a single recursive CTE in both SQLite and Postgres.
+        """
+        earliest_set = set(earliest_event_ids)
+        # Sort the seeds lexicographically by event ID: seeds are all 0 hops away from
+        # themselves, so the event ID is the only tie-breaker available for them and we need
+        # the walk to start from a deterministic order.
+        # See https://github.com/matrix-org/matrix-spec-proposals/blob/kegan/placeholder-1/proposals/4242-state-dags.md#get_missing_events
+        seed_ids = sorted(set(latest_event_ids) - earliest_set)
+        if not seed_ids or limit <= 0:
+            return []
+
+        seed_clause, seed_args = make_in_list_sql_clause(
+            self.database_engine, "e.event_id", seed_ids
+        )
+
+        # With no earliest events this is a no-op clause that is TRUE for every row.
+        earliest_clause, earliest_args = make_in_list_sql_clause(
+            self.database_engine,
+            "e.prev_state_event_id",
+            earliest_event_ids,
+            negative=True,
+        )
+
+        query = f"""
+            WITH RECURSIVE walk(event_id, hops) AS (
+                SELECT
+                    e.prev_state_event_id,
+                    1
+                FROM msc4242_state_dag_edges e
+                WHERE e.room_id = ?
+                AND {seed_clause}
+                -- The create event has no edges, so it is stored as a single row with a NULL
+                -- `prev_state_event_id`. Skipping NULLs therefore only skips that sentinel
+                -- row: the create event is still returned by the walk, because it appears as
+                -- the `prev_state_event_id` of the events that reference it.
+                AND e.prev_state_event_id IS NOT NULL
+                AND {earliest_clause}
+
+                -- `UNION` rather than `UNION ALL`: the same (event_id, hops) pair can be
+                -- reached via multiple children, and de-duplicating here stops us expanding
+                -- the same row over and over.
+                UNION
+
+                SELECT
+                    e.prev_state_event_id,
+                    w.hops + 1
+                FROM walk w
+                JOIN msc4242_state_dag_edges e
+                ON e.room_id = ?
+                AND e.event_id = w.event_id
+                WHERE e.prev_state_event_id IS NOT NULL
+                AND {earliest_clause}
+                -- Bound the recursion by `limit`: every extra hop adds at least one event to
+                -- the result, so events more than `limit` hops away can never make it into a
+                -- `limit`-sized response. This is also what makes the query safe against a
+                -- cyclic edge set: a cycle cannot be created via the normal write path, but
+                -- if one did exist the walk would still stop after `limit` hops rather than
+                -- spinning forever.
+                AND w.hops < ?
+            )
+            -- An event can be reached by several paths with different hop counts. MSC4242
+            -- orders by distance from the seed events, which is the *shortest* such path, so
+            -- collapse each event to its minimum hop count before sorting. `hops` is only
+            -- selected because we need it as the primary sort key.
+            SELECT event_id, MIN(hops) AS hops
+            FROM walk
+            GROUP BY event_id
+            ORDER BY hops, event_id
+            LIMIT ?
+        """
+
+        params: list = [room_id]
+        params.extend(seed_args)
+        params.extend(earliest_args)
+        params.append(room_id)
+        params.extend(earliest_args)
+        params.append(limit)
+        params.append(limit)
+
+        txn.execute(query, params)
+        return [row[0] for row in txn]
 
     @trace
     @tag_args
@@ -2381,6 +2572,12 @@ class EventFederationWorkerStore(
         )
 
         event_id_results: set[str] = set()
+        queued_event_ids: set[str] = set()
+        # Outlier seeds are walked back from but never returned themselves: we
+        # don't have the state at an outlier, so can't check whether the
+        # requesting server may see it (`filter_events_for_server` assumes
+        # outliers are open). Their non-outlier predecessors can be checked.
+        outlier_seed_ids: set[str] = set()
 
         # In a PriorityQueue, the lowest valued entries are retrieved first.
         # We're using depth as the priority in the queue and tie-break based on
@@ -2399,12 +2596,13 @@ class EventFederationWorkerStore(
                     "type",
                     "depth",
                     "stream_ordering",
+                    "outlier",
                 ),
                 allow_none=True,
             )
 
             if event_lookup_result is not None:
-                event_type, depth, stream_ordering = event_lookup_result
+                event_type, depth, stream_ordering, outlier = event_lookup_result
                 logger.debug(
                     "_get_backfill_events(room_id=%s): seed_event_id=%s depth=%s stream_ordering=%s type=%s",
                     room_id,
@@ -2414,7 +2612,10 @@ class EventFederationWorkerStore(
                     event_type,
                 )
 
-                if depth:
+                if depth and seed_event_id not in queued_event_ids:
+                    queued_event_ids.add(seed_event_id)
+                    if outlier:
+                        outlier_seed_ids.add(seed_event_id)
                     queue.put((-depth, -stream_ordering, seed_event_id, event_type))
 
         while not queue.empty() and len(event_id_results) < limit:
@@ -2426,7 +2627,8 @@ class EventFederationWorkerStore(
             if event_id in event_id_results:
                 continue
 
-            event_id_results.add(event_id)
+            if event_id not in outlier_seed_ids:
+                event_id_results.add(event_id)
 
             # Now we just look up the DAG by prev_events as normal
             connected_prev_event_backfill_results = (
@@ -2442,7 +2644,12 @@ class EventFederationWorkerStore(
             for (
                 connected_prev_event_backfill_item
             ) in connected_prev_event_backfill_results:
-                if connected_prev_event_backfill_item.event_id not in event_id_results:
+                if (
+                    connected_prev_event_backfill_item.event_id not in event_id_results
+                    and connected_prev_event_backfill_item.event_id
+                    not in queued_event_ids
+                ):
+                    queued_event_ids.add(connected_prev_event_backfill_item.event_id)
                     queue.put(
                         (
                             -connected_prev_event_backfill_item.depth,
@@ -2686,62 +2893,142 @@ class EventFederationWorkerStore(
         Args:
             event_id: The event to search for as a prev_event.
         """
-        if getattr(self, "_embedded_event_edges_enabled", False):
+        started = time.monotonic()
+
+        # A warm FWD generation is not proof of completeness. Only the
+        # offline verifier may grant this authority marker; until then SQL is
+        # the source of truth and FWD remains a write-side projection.
+        from synapse.storage.databases.main.embedded_event_edges import (
+            event_edges_fwd_is_authoritative,
+        )
+
+        if await event_edges_fwd_is_authoritative(self):
             from synapse.storage.databases.main.embedded_event_edges import (
                 get_event_edges_forward_batch,
-                queue_edge_write,
+                repair_edge_index_from_sql,
             )
 
-            forward_map = get_event_edges_forward_batch(
-                self._embedded_hamt_namespace, [event_id]
+            sql_started = time.monotonic()
+            room_id = await self.db_pool.simple_select_one_onecol(
+                table="events",
+                keyvalues={"event_id": event_id},
+                retcol="room_id",
+                allow_none=True,
+                desc="get_successor_events_room_id",
             )
-            successors = forward_map.get(event_id)
-            if successors is not None:
-                ffi_count("event_edges_successor_hits", 1)
-                return successors
+            if room_id is None:
+                room_id = await self.db_pool.simple_select_one_onecol(
+                    table="event_backward_extremities",
+                    keyvalues={"event_id": event_id},
+                    retcol="room_id",
+                    allow_none=True,
+                    desc="get_successor_events_backward_extremity_room_id",
+                )
+            ffi_timing(
+                "event_edges_successor_room_lookup", time.monotonic() - sql_started
+            )
+            if room_id is not None:
+                sql_started = time.monotonic()
+                source_version = await self.db_pool.simple_select_one_onecol(
+                    table="room_edge_source_version",
+                    keyvalues={"room_id": room_id},
+                    retcol="source_version",
+                    allow_none=True,
+                    desc="get_successor_events_source_version",
+                )
+                ffi_timing(
+                    "event_edges_successor_source_version",
+                    time.monotonic() - sql_started,
+                )
+                embedded_started = time.monotonic()
+                forward_map = get_event_edges_forward_batch(
+                    self._embedded_db_namespace,
+                    room_id,
+                    int(source_version or 0),
+                    [event_id],
+                )
+                ffi_timing(
+                    "event_edges_successor_embedded_read",
+                    time.monotonic() - embedded_started,
+                )
+                successors = None if forward_map.stale else forward_map.get(event_id)
+                logger.debug(
+                    "get_successor_events: event_id=%s room_id=%s source_version=%s hit=%s",
+                    event_id,
+                    room_id,
+                    source_version,
+                    successors is not None,
+                )
+                if successors is not None:
+                    ffi_count("event_edges_successor_hits", 1)
+                    ffi_timing(
+                        "event_edges_successor_total", time.monotonic() - started
+                    )
+                    return successors
 
             ffi_count("event_edges_successor_fallbacks", 1)
+            sql_started = time.monotonic()
             sql_res = await self.db_pool.simple_select_onecol(
                 table="event_edges",
                 keyvalues={"prev_event_id": event_id},
                 retcol="event_id",
                 desc="get_successor_events",
             )
+            logger.debug(
+                "get_successor_events fallback: event_id=%s successor_count=%s",
+                event_id,
+                len(sql_res),
+            )
+            ffi_timing(
+                "event_edges_successor_sql_fallback", time.monotonic() - sql_started
+            )
             if sql_res and getattr(self, "_embedded_event_edges_writable", False):
-                try:
+                if room_id is None:
                     room_id = await self.db_pool.simple_select_one_onecol(
                         table="events",
-                        keyvalues={"event_id": event_id},
+                        keyvalues={"event_id": sql_res[0]},
                         retcol="room_id",
                         allow_none=True,
-                        desc="get_successor_events_room_id",
+                        desc="get_successor_events_repair_room_id",
                     )
-                    if room_id:
-                        queue_edge_write(
-                            self._embedded_hamt_namespace,
-                            [
-                                (room_id, succ_id, event_id, False)
-                                for succ_id in sql_res
-                            ],
+                if room_id is not None:
+                    try:
+                        repair_started = time.monotonic()
+                        # The gated path already resolved this event's immutable
+                        # room id before reading the source-version watermark.
+                        # Reusing it avoids a second SQL round trip on every
+                        # repair-triggering miss.
+                        await repair_edge_index_from_sql(
+                            self,
+                            self._embedded_db_namespace,
+                            room_id,
+                            event_id,
+                            sql_res,
                         )
-                        # The row joins the per-namespace coalescing queue; the
-                        # flush coalescer drains it within its debounce window.
-                        # Reads before then fall back to SQL, which already
-                        # covered this miss, so a following read of the same
-                        # event stays correct.
                         ffi_count("event_edges_successor_repairs", len(sql_res))
-                except Exception:
-                    logger.debug(
-                        "Failed to repair forward edge for %s", event_id, exc_info=True
-                    )
+                        ffi_timing(
+                            "event_edges_successor_repair",
+                            time.monotonic() - repair_started,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Failed to repair forward edge for %s",
+                            event_id,
+                            exc_info=True,
+                        )
+            ffi_timing("event_edges_successor_total", time.monotonic() - started)
             return sql_res
 
-        return await self.db_pool.simple_select_onecol(
+        sql_started = time.monotonic()
+        sql_res = await self.db_pool.simple_select_onecol(
             table="event_edges",
             keyvalues={"prev_event_id": event_id},
             retcol="event_id",
             desc="get_successor_events",
         )
+        ffi_timing("event_edges_successor_sql_only", time.monotonic() - sql_started)
+        ffi_timing("event_edges_successor_total", time.monotonic() - started)
+        return sql_res
 
     @wrap_as_background_process("delete_old_forward_extrem_cache")
     async def _delete_old_forward_extrem_cache(self) -> None:

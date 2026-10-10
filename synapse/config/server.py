@@ -35,7 +35,7 @@ from typing_extensions import TypeGuard
 
 from twisted.conch.ssh.keys import Key
 
-from synapse.api.room_versions import KNOWN_ROOM_VERSIONS
+from synapse.api.room_versions import KNOWN_ROOM_VERSIONS, RoomVersions
 from synapse.types import JsonDict, StrSequence
 from synapse.util.duration import Duration
 from synapse.util.module_loader import load_module
@@ -176,7 +176,7 @@ DEFAULT_IP_RANGE_BLOCKLIST = [
     "fec0::/10",
 ]
 
-DEFAULT_ROOM_VERSION = "11"
+DEFAULT_ROOM_VERSION = "12"
 
 # Defaults for the presence state machine timers, in milliseconds. Overridden
 # by the corresponding options in the `presence` config section.
@@ -569,6 +569,20 @@ class ServerConfig(Config):
             False,
         )
 
+        # The shared-room check needs to know who is asking, and profile requests
+        # are only authenticated when `require_auth_for_profile_requests` is set.
+        # Without it the limit would silently never apply, so refuse to start.
+        if (
+            self.limit_profile_requests_to_users_who_share_rooms
+            and not self.require_auth_for_profile_requests
+        ):
+            raise ConfigError(
+                "'limit_profile_requests_to_users_who_share_rooms' can only be"
+                " enforced on authenticated requests, so"
+                " 'require_auth_for_profile_requests' must also be enabled.",
+                ("limit_profile_requests_to_users_who_share_rooms",),
+            )
+
         # Whether to retrieve and display profile data for a user when they
         # are invited to a room
         self.include_profile_data_on_invite = config.get(
@@ -585,7 +599,7 @@ class ServerConfig(Config):
                 " 'allow_public_rooms_over_federation' is set."
             )
 
-        # Whether to support MSC4429 profile updates down legacy /sync
+        # Whether to support MSC4429 and MSC4262 Profile updates down sync
         self.include_profile_updates_in_sync = config.get(
             "include_profile_updates_in_sync",
             False,
@@ -610,6 +624,13 @@ class ServerConfig(Config):
             )
 
         default_room_version = config.get("default_room_version", DEFAULT_ROOM_VERSION)
+
+        # ExperimentalConfig is parsed after ServerConfig, but an experimental
+        # room version may still be selected as the default. Register MSC3389
+        # early enough for the validation below to see it.
+        experimental_features = config.get("experimental_features") or {}
+        if experimental_features.get("msc3389_enabled"):
+            KNOWN_ROOM_VERSIONS.add_room_version(RoomVersions.MSC3389v10)
 
         # Ensure room version is a str
         default_room_version = str(default_room_version)
@@ -658,6 +679,15 @@ class ServerConfig(Config):
             )
         else:
             self.redaction_retention_period = None
+
+        # How long to allow event redactions for on `m.room.message`
+        redaction_allowed_period = config.get("redaction_allowed_period", None)
+        if redaction_allowed_period is not None:
+            self.redaction_allowed_period: int | None = self.parse_duration(
+                redaction_allowed_period
+            )
+        else:
+            self.redaction_allowed_period = None
 
         # How long to keep locally forgotten rooms before purging them from the DB.
         forgotten_room_retention_period = config.get(

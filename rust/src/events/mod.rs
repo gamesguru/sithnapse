@@ -114,7 +114,9 @@ pub(crate) struct EventResolverData {
     /// field to trust explicitly, rather than guessing from which one happens
     /// to be non-empty.
     pub(crate) msc4242_state_dags: bool,
-    pub(crate) content: Value,
+    /// Cloning this Arc-backed object shares the content tree with the event;
+    /// state resolution does not serialize or rebuild JSON for typed events.
+    pub(crate) content: JsonObject,
     pub(crate) rejected: bool,
     pub(crate) soft_failed: bool,
 }
@@ -140,6 +142,7 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     child_module.add_function(wrap_pyfunction!(filter::event_visible_to_server_py, m)?)?;
     child_module.add_function(wrap_pyfunction!(redact_event_py, m)?)?;
     child_module.add_function(wrap_pyfunction!(redact_event_dict, m)?)?;
+    child_module.add_function(wrap_pyfunction!(sha256_canonical_json, m)?)?;
     child_module.add_function(wrap_pyfunction!(serialize::serialize_events, m)?)?;
     child_module.add_function(wrap_pyfunction!(serialize::format_event_raw, m)?)?;
     child_module.add_function(wrap_pyfunction!(serialize::format_event_for_client_v1, m)?)?;
@@ -158,6 +161,21 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
         .set_item("synapse.synapse_rust.events", child_module)?;
 
     Ok(())
+}
+
+/// Canonicalize a Python JSON-compatible value and return its SHA-256 digest.
+/// The conversion happens once in Rust; the canonical serializer streams
+/// directly into the hasher without creating an intermediate JSON string.
+#[pyfunction]
+#[pyo3(text_signature = "(value, /)")]
+fn sha256_canonical_json(value: Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+    let value: Value = depythonize(&value)?;
+    crate::canonical_json::sha256_canonical(
+        &value,
+        crate::canonical_json::CanonicalizationOptions::relaxed(),
+    )
+    .map(|digest| digest.to_vec())
+    .map_err(|err| PyValueError::new_err(err.to_string()))
 }
 
 /// The Rust-side representation of a Matrix event, exposed to Python.
@@ -655,6 +673,10 @@ impl Event {
 }
 
 impl Event {
+    /// Extract the fields needed by state resolution.
+    ///
+    /// `content` is shared through `JsonObject`'s `Arc`; the event metadata and
+    /// event-reference lists are converted to owned strings for `LeanEvent`.
     pub(crate) fn resolver_data(&self) -> PyResult<EventResolverData> {
         let origin_server_ts = u64::try_from(self.origin_server_ts()).map_err(|_| {
             PyValueError::new_err(format!(
@@ -665,10 +687,7 @@ impl Event {
         let depth = u64::try_from(self.depth()).map_err(|_| {
             PyValueError::new_err(format!("event {} has a negative depth", self.event_id))
         })?;
-        let content =
-            serde_json::to_value(&self.parsed_event.common_fields.content).map_err(|err| {
-                PyValueError::new_err(format!("Failed to serialize event content: {err}"))
-            })?;
+        let content = self.parsed_event.common_fields.content.clone();
 
         Ok(EventResolverData {
             event_id: self.event_id.to_string(),

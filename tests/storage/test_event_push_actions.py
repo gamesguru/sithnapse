@@ -20,13 +20,19 @@
 #
 
 
+from typing import Any, Callable
+from unittest.case import SkipTest
+from unittest.mock import patch
+
 from twisted.internet.testing import MemoryReactor
 
 from synapse.api.constants import MAIN_TIMELINE, RelationTypes
 from synapse.rest import admin
 from synapse.rest.client import login, room
 from synapse.server import HomeServer
+from synapse.storage.database import LoggingTransaction
 from synapse.storage.databases.main.event_push_actions import NotifCounts
+from synapse.storage.engines import PostgresEngine
 from synapse.types import JsonDict
 from synapse.util.clock import Clock
 
@@ -471,6 +477,361 @@ class EventPushActionsStoreTestCase(HomeserverTestCase):
         # Without the fix: badge = 2 (thread highlight re-counted). With: badge = 1.
         self.get_success(self.store._rotate_notifs())
         _assert_badge(1)
+
+    def test_count_aggregation_badge_recount_is_scoped_per_room(self) -> None:
+        """
+        Regression test: a room whose summary row is out of date must be recounted
+        from `event_push_actions`, even when another room has an up-to-date summary
+        for the same thread ID.
+
+        The set of threads a valid summary was found for used to be keyed on the
+        thread ID alone, so a single room with an up-to-date `main` summary excluded
+        `main` from the recount in *every* room, dropping those rooms' counts.
+        """
+        user_id, token, other_id, other_token, room_id = self._create_users_and_room()
+
+        stale_room_id = self.helper.create_room_as(user_id, tok=token)
+        self.helper.join(stale_room_id, other_id, tok=other_token)
+
+        def _send(room: str) -> str:
+            return self.helper.send_event(
+                room,
+                type="m.room.message",
+                content={"msgtype": "m.text", "body": "msg"},
+                tok=other_token,
+            )["event_id"]
+
+        def _read(room: str, event_id: str) -> None:
+            self.get_success(
+                self.store.insert_receipt(
+                    room,
+                    "m.read",
+                    user_id=user_id,
+                    event_ids=[event_id],
+                    thread_id=None,
+                    data={},
+                )
+            )
+
+        def _badge(room: str) -> int:
+            counts = self.get_success(
+                self.store.db_pool.runInteraction(
+                    "get-aggregate-unread-counts",
+                    self.store._get_unread_counts_by_room_for_user_txn,
+                    user_id,
+                )
+            )
+            return counts.get(room, 0)
+
+        # `room_id` keeps an up-to-date summary throughout, so its `main` thread is
+        # always one we found a valid summary for.
+        first = _send(room_id)
+        _send(room_id)
+
+        stale_first = _send(stale_room_id)
+        stale_second = _send(stale_room_id)
+        _send(stale_room_id)
+
+        # Read one event in each room and rotate, so that both summary rows record
+        # the receipt they were calculated against.
+        _read(room_id, first)
+        _read(stale_room_id, stale_first)
+        self.get_success(self.store._rotate_notifs())
+
+        self.assertEqual(_badge(room_id), 1)
+        self.assertEqual(_badge(stale_room_id), 2)
+
+        # A second receipt, which rotation has not processed yet: `stale_room_id`'s
+        # summary row no longer matches it, so its count has to be recovered from
+        # `event_push_actions`.
+        _read(stale_room_id, stale_second)
+
+        self.assertEqual(_badge(room_id), 1)
+        self.assertEqual(_badge(stale_room_id), 1)
+        # A new event, not yet rotated, while the summary row is still stale.
+        _send(stale_room_id)
+
+        self.assertEqual(_badge(room_id), 1)
+        self.assertEqual(_badge(stale_room_id), 2)
+
+    def test_count_aggregation_stale_summary_with_pending_receipt(self) -> None:
+        """
+        Regression test for the `TestThreadedReceipts` Complement failure.
+
+        Rotation writes `event_push_summary` rows with
+        `last_receipt_stream_ordering = NULL` (it never sees receipts), and
+        `_handle_new_receipts_for_notifs_txn` only runs as part of the 30s
+        rotation loop.  The summary freshness check used to accept such a row
+        whenever its `stream_ordering` was past the unthreaded receipt, but the
+        receipts CTE feeding that check filters
+        `event_stream_ordering > unthreaded_receipt`, so once an unthreaded
+        receipt lands every receipt (including itself) disappears from that CTE
+        and a stale row looks current: the counts stayed at 6 (3 main + 3
+        thread) instead of dropping to 2 (1 main + 1 thread).
+
+        A summary row is only trustworthy once
+        `event_push_summary_last_receipt_stream_id` has caught up with the
+        receipts which affect it.
+        """
+        user_id, token, _, other_token, room_id = self._create_users_and_room()
+
+        def _send(thread_root: str | None = None, highlight: bool = False) -> str:
+            content: JsonDict = {
+                "msgtype": "m.text",
+                "body": user_id if highlight else "msg",
+            }
+            if thread_root is not None:
+                content["m.relates_to"] = {
+                    "rel_type": RelationTypes.THREAD,
+                    "event_id": thread_root,
+                }
+            return self.helper.send_event(
+                room_id,
+                type="m.room.message",
+                content=content,
+                tok=other_token,
+            )["event_id"]
+
+        def _read(event_id: str, thread_id: str | None) -> None:
+            self.get_success(
+                self.store.insert_receipt(
+                    room_id,
+                    "m.read",
+                    user_id=user_id,
+                    event_ids=[event_id],
+                    thread_id=thread_id,
+                    data={},
+                )
+            )
+
+        def _assert_counts(
+            main_notif: int, thread_notif: int, thread_highlight: int
+        ) -> None:
+            counts = self.get_success(
+                self.store.db_pool.runInteraction(
+                    "get-unread-counts",
+                    self.store._get_unread_counts_by_receipt_txn,
+                    room_id,
+                    user_id,
+                )
+            )
+            self.assertEqual(
+                counts.main_timeline,
+                NotifCounts(notify_count=main_notif, unread_count=0, highlight_count=0),
+                f"main timeline was {counts.main_timeline}",
+            )
+            self.assertEqual(
+                counts.threads,
+                {
+                    thread_root: NotifCounts(
+                        notify_count=thread_notif,
+                        unread_count=0,
+                        highlight_count=thread_highlight,
+                    )
+                },
+                f"threads were {counts.threads}",
+            )
+
+            # The badge (push) query shares the same freshness logic.
+            badge = self.get_success(
+                self.store.db_pool.runInteraction(
+                    "get-aggregate-unread-counts",
+                    self.store._get_unread_counts_by_room_for_user_txn,
+                    user_id,
+                )
+            )
+            self.assertEqual(
+                badge.get(room_id, 0),
+                main_notif + thread_notif,
+                f"badge was {badge}",
+            )
+
+        thread_root = _send()  # main timeline
+        first_thread_event = _send(thread_root=thread_root)
+        _send(thread_root=thread_root, highlight=True)  # thread highlight
+        read_target = _send()  # main timeline, unthreaded receipt target
+        _send(thread_root=thread_root)
+        _send()  # main timeline
+
+        # 3 notifications on the main timeline, 3 in the thread (one highlight).
+        _assert_counts(3, 3, 1)
+
+        # Rotation summarises everything; it writes the summary rows with
+        # `last_receipt_stream_ordering = NULL`.
+        self.get_success(self.store._rotate_notifs())
+        _assert_counts(3, 3, 1)
+
+        # A threaded receipt on the thread root ...
+        _read(thread_root, MAIN_TIMELINE)
+        _assert_counts(2, 3, 1)
+        # ... and one on the first event of the thread.
+        _read(first_thread_event, thread_root)
+        _assert_counts(2, 2, 1)
+
+        # The unthreaded receipt covers both timelines (and the highlight).
+        # `_handle_new_receipts_for_notifs_txn` has not run yet, so the counts
+        # must come from `event_push_actions`, not the stale summary rows.
+        _read(read_target, None)
+        _assert_counts(1, 1, 0)
+
+        # Once rotation has processed the receipts the counts must not change.
+        self.get_success(self.store._rotate_notifs())
+        _assert_counts(1, 1, 0)
+
+    def test_old_push_actions_kept_for_pending_receipt(self) -> None:
+        """Old rotated push actions after a receipt that hasn't been processed
+        yet must survive deletion: until the receipt is folded into the summary
+        the counts come from `event_push_actions` alone, so deleting them would
+        undercount the badge."""
+        user_id, token, _, other_token, room_id = self._create_users_and_room()
+
+        event_ids = [
+            self.helper.send(room_id, body="msg", tok=other_token)["event_id"]
+            for _ in range(3)
+        ]
+
+        def _badge() -> int:
+            badge = self.get_success(
+                self.store.db_pool.runInteraction(
+                    "get-aggregate-unread-counts",
+                    self.store._get_unread_counts_by_room_for_user_txn,
+                    user_id,
+                )
+            )
+            return badge.get(room_id, 0)
+
+        self.assertEqual(_badge(), 3)
+        self.get_success(self.store._rotate_notifs())
+        self.assertEqual(_badge(), 3)
+
+        # A receipt lands, but rotation hasn't processed it yet.
+        self.get_success(
+            self.store.insert_receipt(
+                room_id,
+                "m.read",
+                user_id=user_id,
+                event_ids=[event_ids[0]],
+                thread_id=None,
+                data={},
+            )
+        )
+        self.assertEqual(_badge(), 2)
+
+        # Everything is now old enough to delete, but the pending receipt needs
+        # the rows after it.
+        # (Don't `pump`: that would also run the rotation loop and process the
+        # receipt.)
+        self.store.stream_ordering_day_ago = self.store.get_room_max_stream_ordering()
+        self.get_success(self.store._remove_old_push_actions_that_have_rotated())
+        remaining = self.get_success(
+            self.store.db_pool.simple_select_list(
+                table="event_push_actions",
+                keyvalues={"1": 1},
+                retcols=("event_id",),
+                desc="",
+            )
+        )
+        self.assertTrue(set(event_ids[1:]).issubset({row[0] for row in remaining}))
+        self.assertEqual(_badge(), 2)
+
+        # Once the receipt is processed the count is unchanged.
+        self.get_success(self.store._rotate_notifs())
+        self.assertEqual(_badge(), 2)
+
+    def _record_statements(self, run: Callable[[], Any]) -> list[str]:
+        """Run `run`, collecting every statement the store executes on the way."""
+        statements: list[str] = []
+        original_execute = LoggingTransaction.execute
+
+        def record_execute(
+            txn: LoggingTransaction, sql: str, *args: Any, **kwargs: Any
+        ) -> Any:
+            statements.append(sql)
+            return original_execute(txn, sql, *args, **kwargs)
+
+        with patch.object(LoggingTransaction, "execute", record_execute):
+            run()
+        return statements
+
+    def test_receipt_shares_watermark_lock(self) -> None:
+        """Receipt writes take the receipt watermark row `FOR SHARE`.
+
+        Cleanup takes it `FOR UPDATE`, which conflicts with `FOR SHARE` but not
+        with another `FOR SHARE`, so receipts are ordered against cleanup's
+        snapshot-and-delete without serializing against each other.
+        """
+        if not isinstance(self.store.database_engine, PostgresEngine):
+            raise SkipTest("row locks only apply to Postgres")
+
+        user_id, _, _, other_token, room_id = self._create_users_and_room()
+        event_id = self.helper.send(room_id, body="msg", tok=other_token)["event_id"]
+
+        statements = self._record_statements(
+            lambda: self.get_success(
+                self.store.insert_receipt(
+                    room_id,
+                    "m.read",
+                    user_id=user_id,
+                    event_ids=[event_id],
+                    thread_id=None,
+                    data={},
+                )
+            )
+        )
+
+        shared = [
+            sql
+            for sql in statements
+            if "event_push_summary_last_receipt_stream_id" in sql and "FOR SHARE" in sql
+        ]
+        self.assertEqual(len(shared), 1, statements)
+        # An exclusive lock here would make every receipt wait for every other.
+        exclusive = [
+            sql
+            for sql in statements
+            if "event_push_summary_last_receipt_stream_id" in sql
+            and "FOR UPDATE" in sql
+        ]
+        self.assertEqual(exclusive, [], statements)
+        # The lock is taken before the receipt row it protects is written.
+        self.assertLess(
+            statements.index(shared[0]),
+            next(
+                index
+                for index, sql in enumerate(statements)
+                if "receipts_linearized" in sql and "INSERT" in sql.upper()
+            ),
+            statements,
+        )
+
+    def test_cleanup_locks_watermark_before_bound_and_delete(self) -> None:
+        """Cleanup takes the watermark row `FOR UPDATE` before it reads the
+        bound it will delete to, and holds it through the delete, so no receipt
+        can commit in between the two."""
+        if not isinstance(self.store.database_engine, PostgresEngine):
+            raise SkipTest("row locks only apply to Postgres")
+
+        statements = self._record_statements(
+            lambda: self.get_success(
+                self.store._remove_old_push_actions_that_have_rotated()
+            )
+        )
+
+        def index_of(predicate: Callable[[str], bool]) -> int:
+            matches = [index for index, sql in enumerate(statements) if predicate(sql)]
+            self.assertEqual(len(matches), 1, statements)
+            return matches[0]
+
+        lock = index_of(
+            lambda sql: "event_push_summary_last_receipt_stream_id" in sql
+            and "FOR UPDATE" in sql
+        )
+        bound = index_of(lambda sql: "MIN(event_stream_ordering)" in sql)
+        delete = index_of(lambda sql: "DELETE FROM event_push_actions" in sql)
+        # The lock is taken before the watermark it guards is even read, and
+        # held across both the bound and the delete.
+        self.assertLess(lock, bound, statements)
+        self.assertLess(bound, delete, statements)
 
     def test_count_aggregation_threads(self) -> None:
         """

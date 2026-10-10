@@ -1,7 +1,17 @@
 from collections.abc import Iterable
+from typing import Any
+
+class StaleReadError(Exception):
+    """A collection changed between a versioned read and transaction commit.
+
+    ``args`` is ``(message, pool, collection_id, expected, actual)``.
+    """
 
 def open_client(path: str) -> None: ...
 def open_client_read_only(path: str) -> None: ...
+
+# Test-only diagnostic: repack every open pool; returns per-pool summaries.
+def repack() -> dict[str, dict[str, int]]: ...
 def put_state_hamt_nodes(
     namespace: str,
     room_prefix: bytes,
@@ -50,6 +60,7 @@ def event_edges_put(
     namespace: str,
     rows: Iterable[tuple[str, str, str, bool]],
 ) -> None: ...
+def event_edges_occ_conflicts() -> int: ...
 def event_edges_get_backward(
     namespace: str,
     event_ids: list[str],
@@ -58,10 +69,41 @@ def event_edges_get_forward(
     namespace: str,
     prev_event_ids: list[str],
 ) -> list[tuple[str, list[str] | None]]: ...
+def event_edges_get_forward_gated(
+    namespace: str,
+    room_id: str,
+    expected_source_version: int,
+    prev_event_ids: list[str],
+) -> tuple[str, list[tuple[str, list[str] | None]]] | tuple[str, int, int]: ...
+def event_edges_apply_forward_outbox(
+    namespace: str,
+    room_id: str,
+    generation: int,
+    published_source_version: int,
+    rows: Iterable[tuple[str, str, str]],
+) -> None: ...
+def event_edges_apply_forward_generation_delta(
+    namespace: str,
+    room_id: str,
+    generation: int,
+    rows: Iterable[tuple[str, str, str]],
+) -> None: ...
+def event_edges_build_generation_batch(
+    namespace: str,
+    room_id: str,
+    target_generation: int,
+    edges: Iterable[tuple[str, list[str]]],
+) -> None: ...
+def event_edges_reset_generation(room_id: str, target_generation: int) -> None: ...
+def room_forward_meta_swap(
+    room_id: str, target_generation: int, target_source_version: int
+) -> None: ...
+def event_edges_drop_generation(room_id: str, retired_generation: int) -> None: ...
+def room_forward_meta_get(room_id: str) -> tuple[int, int] | None: ...
 def event_edges_delete(
     namespace: str,
     event_ids: list[str],
-) -> None: ...
+) -> dict[str, float | int]: ...
 def materialize_state_hamt(
     namespace: str,
     room_prefix: bytes,
@@ -86,6 +128,11 @@ def get_state_hamt_roots_for_room(
     room_prefix: bytes,
     state_groups: list[int],
 ) -> list[bytes | None]: ...
+def get_state_hamt_roots_by_state_group_id(
+    namespace: str,
+    room_prefix: bytes,
+    state_group_ids: list[bytes],
+) -> list[bytes | None]: ...
 def get_state_hamt_roots_bulk(
     namespace: str,
     state_groups: list[int],
@@ -106,3 +153,50 @@ def sync() -> None: ...
 def sync_state() -> None: ...
 def sync_event_dag() -> None: ...
 def sync_auth_chain() -> None: ...
+
+class MtxdbTransaction:
+    """Writes staged here are invisible to every reader until `commit()`,
+    which publishes them as one journal group (all or nothing)."""
+
+    def event_json_put(
+        self, namespace: str, rows: list[tuple[str, str, bytes, bytes]]
+    ) -> None: ...
+    def get_with_collection_version(
+        self,
+        pool_tag: int,
+        collection_id: bytes,
+        node_ids: list[bytes],
+    ) -> tuple[list[bytes | None], int]: ...
+    def expect_collection_version(
+        self, pool_tag: int, collection_id: bytes, expected: int
+    ) -> None: ...
+    def get_with_record_versions(
+        self,
+        pool_tag: int,
+        collection_id: bytes,
+        node_ids: list[bytes],
+    ) -> tuple[list[bytes | None], list[int]]: ...
+    def expect_record_version(
+        self, pool_tag: int, collection_id: bytes, node_id: bytes, expected: int
+    ) -> None: ...
+    def put(
+        self,
+        pool_tag: int,
+        collection_id: bytes,
+        node_id: bytes,
+        payload: bytes,
+    ) -> None: ...
+    def commit(self) -> float: ...
+    def abort(self) -> None: ...
+
+def begin_transaction() -> MtxdbTransaction | None: ...
+def recheck_collection_version(
+    pool_tag: int, collection_id: bytes, expected: int
+) -> bool: ...
+def txn_commit_phases() -> list[tuple[str, float, int]] | None: ...
+def start_background_commit(interval_ms: int, max_pending: int) -> None: ...
+def stop_background_commit() -> None: ...
+def background_commit_error() -> str | None: ...
+def request_durable() -> list[int]: ...
+def wait_durable(targets: list[int]) -> None: ...
+def stats() -> dict[str, Any]: ...

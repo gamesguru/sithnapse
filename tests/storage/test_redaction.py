@@ -35,7 +35,7 @@ from synapse.util.clock import Clock
 
 from tests import unittest
 from tests.unittest import skip_unless
-from tests.utils import EMBEDDED_HAMT_ENGINE, create_room
+from tests.utils import EMBEDDED_DB_ENGINE, create_room
 
 
 class RedactionTestCase(unittest.HomeserverTestCase):
@@ -360,13 +360,25 @@ class RedactionTestCase(unittest.HomeserverTestCase):
             event,
         )
 
-        event_json = self.get_success(
-            self.store.db_pool.simple_select_one_onecol(
-                table="event_json",
-                keyvalues={"event_id": msg_event.event_id},
-                retcol="json",
+        if getattr(self.store, "_embedded_event_json_enabled", False):
+            from synapse.storage.databases.main.embedded_event_json import (
+                get_event_json_batch,
             )
-        )
+
+            found = get_event_json_batch(
+                self.store._embedded_db_engine,
+                self.store._embedded_db_namespace,
+                [msg_event.event_id],
+            )
+            event_json = found[msg_event.event_id][1]
+        else:
+            event_json = self.get_success(
+                self.store.db_pool.simple_select_one_onecol(
+                    table="event_json",
+                    keyvalues={"event_id": msg_event.event_id},
+                    retcol="json",
+                )
+            )
 
         self.assert_dict(
             {"content": {"body": "t", "msgtype": "message"}}, json.loads(event_json)
@@ -378,17 +390,29 @@ class RedactionTestCase(unittest.HomeserverTestCase):
         self.reactor.advance(60 * 60 * 24 * 31)
         self.reactor.advance(60 * 60 * 2)
 
-        event_json = self.get_success(
-            self.store.db_pool.simple_select_one_onecol(
-                table="event_json",
-                keyvalues={"event_id": msg_event.event_id},
-                retcol="json",
+        if getattr(self.store, "_embedded_event_json_enabled", False):
+            from synapse.storage.databases.main.embedded_event_json import (
+                get_event_json_batch,
             )
-        )
+
+            found = get_event_json_batch(
+                self.store._embedded_db_engine,
+                self.store._embedded_db_namespace,
+                [msg_event.event_id],
+            )
+            event_json = found[msg_event.event_id][1]
+        else:
+            event_json = self.get_success(
+                self.store.db_pool.simple_select_one_onecol(
+                    table="event_json",
+                    keyvalues={"event_id": msg_event.event_id},
+                    retcol="json",
+                )
+            )
 
         self.assert_dict({"content": {}}, json.loads(event_json))
 
-    @skip_unless(bool(EMBEDDED_HAMT_ENGINE), "requires embedded HAMT engine")
+    @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
     def test_expire_event_updates_embedded_mirror(self) -> None:
         """`_censor_event_txn` (shared by censoring and expiry) must update
         the embedded mtxdb mirror, not just SQL -- otherwise `get_event`
@@ -411,11 +435,11 @@ class RedactionTestCase(unittest.HomeserverTestCase):
         self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
         mtxdb_engine.open_client(tmpdir)
         self.store._embedded_event_json_enabled = True
-        self.store._embedded_hamt_engine = "mtxdb"
+        self.store._embedded_db_engine = "mtxdb"
         persist_store = self.hs.get_datastores().persist_events
         assert persist_store is not None
         persist_store._embedded_event_json_enabled = True
-        persist_store._embedded_hamt_engine = "mtxdb"
+        persist_store._embedded_db_engine = "mtxdb"
 
         self.inject_room_member(self.room1, self.u_alice, Membership.JOIN)
         msg_event = self.inject_message(self.room1, self.u_alice, "t")

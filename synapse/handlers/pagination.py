@@ -633,7 +633,17 @@ class PaginationHandler:
             missing_too_many_events = (
                 number_of_gaps > BACKFILL_BECAUSE_TOO_MANY_GAPS_THRESHOLD
             )
-            not_enough_events_to_fill_response = len(events) < pagin_config.limit
+            # A filtered page can legitimately contain fewer events than the
+            # requested limit. That alone does not show that history is
+            # missing, so do not synchronously federate in that case.
+            not_enough_events_to_fill_response = (
+                event_filter is None and len(events) < pagin_config.limit
+            )
+
+            # Keep the pagination cursor as the backfill point. Using the
+            # shallowest event in a sparse page can advance past a gap attached
+            # to a newer event in the same page.
+            backfill_depth = curr_topo
 
             if (
                 found_big_gap
@@ -643,8 +653,9 @@ class PaginationHandler:
             ):
                 did_backfill = await self.hs.get_federation_handler().maybe_backfill(
                     room_id,
-                    curr_topo,
+                    backfill_depth,
                     limit=pagin_config.limit,
+                    force=True,
                 )
 
                 # If we did backfill something, refetch the events from the database to
@@ -670,7 +681,7 @@ class PaginationHandler:
                     "maybe_backfill_in_the_background",
                     self.hs.get_federation_handler().maybe_backfill,
                     room_id,
-                    curr_topo,
+                    backfill_depth,
                     limit=pagin_config.limit,
                 )
 

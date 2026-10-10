@@ -32,6 +32,18 @@ from synapse.api.room_versions import (
 from synapse.events import EventBase
 from synapse.rest.client import room
 from synapse.server import HomeServer
+from synapse.storage.databases.main.embedded_common import (
+    enable_ffi_counting,
+    get_ffi_count,
+)
+from synapse.storage.databases.main.embedded_redactions import (
+    get_redactions_batch,
+    put_redaction_batch,
+)
+from synapse.storage.databases.main.embedded_rejections import (
+    get_rejections_batch,
+    put_rejection_batch,
+)
 from synapse.types.state import StateFilter
 from synapse.types.storage import _BackgroundUpdates
 from synapse.util.clock import Clock
@@ -45,8 +57,7 @@ class PurgeTests(HomeserverTestCase):
     servlets = [room.register_servlets]
 
     def make_homeserver(self, reactor: MemoryReactor, clock: Clock) -> HomeServer:
-        hs = self.setup_test_homeserver("server")
-        return hs
+        return self.setup_test_homeserver("server")
 
     def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
         self.room_id = self.helper.create_room_as(self.user_id)
@@ -55,6 +66,78 @@ class PurgeTests(HomeserverTestCase):
         self.state_store = hs.get_datastores().state
         self.state_deletion_store = hs.get_datastores().state_deletion
         self._storage_controllers = self.hs.get_storage_controllers()
+
+    def _enable_embedded_engine(self) -> tuple[str, str]:
+        """Force-enable the embedded mtxdb path for a single test.
+
+        Opens a per-test client and enables both the main and persister
+        stores *before* the room under test is created: the room's create
+        event must be persisted through the mirror, or events_worker.py's
+        unconditional `_embedded_event_json_enabled` read check
+        (events_worker.py:1666) routes its auth-chain lookup through a mirror
+        that never saw it, 403ing with "No create event in auth events".
+
+        Returns the configured (engine, namespace).
+        """
+        import shutil
+        import tempfile
+
+        from synapse.synapse_rust import mtxdb_engine
+
+        tmpdir = tempfile.mkdtemp(prefix="test-purge-embedded-")
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        mtxdb_engine.open_client(tmpdir)
+
+        persist_store = self.hs.get_datastores().persist_events
+        assert persist_store is not None
+        for store in (self.store, persist_store):
+            store._embedded_event_json_enabled = True
+            store._embedded_db_engine = "mtxdb"
+
+        engine = self.store._embedded_db_engine
+        assert engine is not None
+        return engine, self.store._embedded_db_namespace
+
+    def _seed_redaction_and_rejection_mirror(
+        self, engine: str, namespace: str, target_id: str, redaction_id: str
+    ) -> None:
+        """Seed the SQL rows and matching mirror entries for a redaction
+        (keyed by its target) and a rejection (keyed by the event id)."""
+        self.get_success(
+            self.store.db_pool.simple_insert(
+                table="redactions",
+                values={
+                    "event_id": redaction_id,
+                    "redacts": target_id,
+                    "received_ts": 1,
+                    "recheck": False,
+                },
+            )
+        )
+        self.get_success(
+            self.store.db_pool.simple_insert(
+                table="rejections",
+                values={
+                    "event_id": target_id,
+                    "reason": "test rejection",
+                    "last_check": "1",
+                },
+            )
+        )
+        put_redaction_batch(engine, namespace, [(target_id, redaction_id, True)])
+        put_rejection_batch(engine, namespace, [(target_id, "test rejection", "1")])
+
+    def _assert_mirrors(
+        self, engine: str, namespace: str, target_id: str, present: bool
+    ) -> None:
+        redactions = get_redactions_batch(engine, namespace, [target_id])
+        rejections = get_rejections_batch(engine, namespace, [target_id])
+        if present:
+            self.assertIn(target_id, redactions)
+            self.assertIn(target_id, rejections)
+        else:
+            self.assertNotIn(target_id, redactions)
+            self.assertNotIn(target_id, rejections)
 
     def test_purge_history(self) -> None:
         """
@@ -142,6 +225,152 @@ class PurgeTests(HomeserverTestCase):
         self.store._invalidate_local_get_event_cache(create_event.event_id)
         self.get_failure(self.store.get_event(create_event.event_id), NotFoundError)
         self.get_failure(self.store.get_event(first["event_id"]), NotFoundError)
+
+    def test_purge_room_clears_embedded_redaction_and_rejection_mirrors(self) -> None:
+        engine, namespace = self._enable_embedded_engine()
+
+        room_id = self.helper.create_room_as(self.user_id)
+        target = self.helper.send(room_id, body="target")
+        redaction = self.helper.send(room_id, body="redaction event")
+
+        self._seed_redaction_and_rejection_mirror(
+            engine, namespace, target["event_id"], redaction["event_id"]
+        )
+        self._assert_mirrors(engine, namespace, target["event_id"], present=True)
+
+        self.get_success(self._storage_controllers.purge_events.purge_room(room_id))
+
+        self._assert_mirrors(engine, namespace, target["event_id"], present=False)
+
+    def test_purge_history_clears_embedded_redaction_and_rejection_mirrors(
+        self,
+    ) -> None:
+        engine, namespace = self._enable_embedded_engine()
+
+        room_id = self.helper.create_room_as(self.user_id)
+        target = self.helper.send(room_id, body="target")
+        redaction = self.helper.send(room_id, body="redaction event")
+        last = self.helper.send(room_id, body="last")
+
+        self._seed_redaction_and_rejection_mirror(
+            engine, namespace, target["event_id"], redaction["event_id"]
+        )
+        self._assert_mirrors(engine, namespace, target["event_id"], present=True)
+
+        token = self.get_success(
+            self.store.get_topological_token_for_event(last["event_id"])
+        )
+        token_str = self.get_success(token.to_string(self.hs.get_datastores().main))
+        self.get_success(
+            self._storage_controllers.purge_events.purge_history(
+                room_id, token_str, True
+            )
+        )
+
+        self._assert_mirrors(engine, namespace, target["event_id"], present=False)
+
+    def test_purge_history_tombstones_never_migrated_edge(self) -> None:
+        """A purged event that was never mirrored into mtxdb (the shape a
+        pre-existing/legacy event_edges row has before
+        `event_edges_migrate_mtxdb` runs) still gets correctly tombstoned:
+        purge computes its purge set from SQL `events`, not from whether
+        mtxdb has already seen the row, so there is no gap here for
+        `res/docs/2026-09-20-events-table-deprecation-plan.md`'s "make purge
+        mtxdb-aware for legacy rows" item -- it already is.
+
+        `get_event_edges_backward_batch` returns `None` for both "no record"
+        and "tombstoned" (that collapse is the whole point of the lazy
+        design), so a before/after `None` read can't tell "purge tombstoned
+        it" apart from "purge did nothing." The `event_edges_deleted` FFI
+        counter is the only Python-visible signal that the Rust delete
+        actually ran for this id, so that's what this test checks.
+        """
+        engine, namespace = self._enable_embedded_engine()
+        # Edges mirror starts disabled: these events' edges only ever exist
+        # in SQL, exactly like a row written before the engine was enabled.
+        persist_store = self.hs.get_datastores().persist_events
+        assert persist_store is not None
+
+        room_id = self.helper.create_room_as(self.user_id)
+        first = self.helper.send(room_id, body="never-mirrored-first")
+        last = self.helper.send(room_id, body="last")
+
+        # Enable the edges mirror only now -- after the event was already
+        # persisted SQL-only -- then purge it, the same way a server would
+        # enable the engine and later purge history that predates that.
+        for store in (self.store, persist_store):
+            store._embedded_event_edges_enabled = True
+            store._embedded_event_edges_writable = True
+
+        token = self.get_success(
+            self.store.get_topological_token_for_event(last["event_id"])
+        )
+        token_str = self.get_success(token.to_string(self.hs.get_datastores().main))
+
+        with enable_ffi_counting():
+            self.get_success(
+                self._storage_controllers.purge_events.purge_history(
+                    room_id, token_str, True
+                )
+            )
+            self.assertGreaterEqual(
+                get_ffi_count("event_edges_deleted"),
+                1,
+                "purge must call the mtxdb edge delete for the purged event, "
+                "even though its edge was never mirrored there before",
+            )
+
+        self.store._invalidate_local_get_event_cache(first["event_id"])
+        self.get_failure(self.store.get_event(first["event_id"]), NotFoundError)
+
+    def test_purge_history_deletes_unmigrated_sql_state_group_rows(self) -> None:
+        """A purged event whose `event_to_state_groups` row is still SQL-only
+        (the SQL -> mtxdb migration retains SQL rows and may not have reached
+        it) must lose that row too, or the migration -- or turning the
+        embedded engine off -- would resurrect the purged event's mapping."""
+        from synapse.storage.databases.main.embedded_event_to_state_group import (
+            delete_event_to_state_group_batch,
+            get_state_group_for_events_batch,
+        )
+
+        engine, namespace = self._enable_embedded_engine()
+        room_id = self.helper.create_room_as(self.user_id)
+        first = self.helper.send(room_id, body="unmigrated")
+        last = self.helper.send(room_id, body="last")
+        first_id = first["event_id"]
+
+        # Turn `first`'s mapping back into the pre-migration shape: present in
+        # SQL only.
+        state_group = get_state_group_for_events_batch(engine, namespace, [first_id])[
+            first_id
+        ]
+        delete_event_to_state_group_batch(engine, namespace, [first_id])
+        self.get_success(
+            self.store.db_pool.simple_upsert(
+                table="event_to_state_groups",
+                keyvalues={"event_id": first_id},
+                values={"state_group": state_group},
+            )
+        )
+
+        token = self.get_success(
+            self.store.get_topological_token_for_event(last["event_id"])
+        )
+        token_str = self.get_success(token.to_string(self.hs.get_datastores().main))
+        self.get_success(
+            self._storage_controllers.purge_events.purge_history(
+                room_id, token_str, True
+            )
+        )
+
+        rows = self.get_success(
+            self.store.db_pool.simple_select_list(
+                table="event_to_state_groups",
+                keyvalues={"event_id": first_id},
+                retcols=("state_group",),
+            )
+        )
+        self.assertEqual(rows, [])
 
     def test_purge_history_deletes_state_groups(self) -> None:
         """Test that unreferenced state groups get cleaned up after purge"""
@@ -324,8 +553,13 @@ class PurgeTests(HomeserverTestCase):
             self.room_id, "org.matrix.test", body={"number": 2}
         )
         # Create enough state events to require multiple batches of
-        # mark_unreferenced_state_groups_for_deletion_bg_update to be run.
-        for i in range(200):
+        # mark_unreferenced_state_groups_for_deletion_bg_update to be run. Sending
+        # events is the slow part, so shrink the batch size rather than send
+        # hundreds of events.
+        updates = self.store.db_pool.updates
+        updates.default_background_batch_size = 5
+        updates.minimum_background_batch_size = 1
+        for i in range(20):
             self.helper.send_state(self.room_id, "org.matrix.test", body={"number": i})
         self.helper.send(self.room_id, body="test4")
         last = self.helper.send(self.room_id, body="test5")
@@ -411,20 +645,20 @@ class PurgeTests(HomeserverTestCase):
         # backend directly -- a raw SQL-only insert would silently stop
         # making this group look referenced the moment the embedded engine
         # is on, since real writes wouldn't touch SQL at all in that case.
-        if getattr(self.store, "_embedded_hamt_engine", None):
+        if getattr(self.store, "_embedded_db_engine", None):
             from synapse.storage.databases.main.embedded_event_to_state_group import (
                 increment_state_group_refcounts_batch,
                 put_event_to_state_group_batch,
             )
 
             put_event_to_state_group_batch(
-                self.store._embedded_hamt_engine,
-                self.store._embedded_hamt_namespace,
+                self.store._embedded_db_engine,
+                self.store._embedded_db_namespace,
                 [("$new_event", referenced_chain_state_group)],
             )
             increment_state_group_refcounts_batch(
-                self.store._embedded_hamt_engine,
-                self.store._embedded_hamt_namespace,
+                self.store._embedded_db_engine,
+                self.store._embedded_db_namespace,
                 [referenced_chain_state_group],
             )
         else:

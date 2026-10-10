@@ -23,7 +23,7 @@ import json
 import logging
 import time
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Generator
+from typing import TYPE_CHECKING, Any, Generator, Optional
 
 import attr
 from zope.interface import implementer
@@ -907,7 +907,7 @@ class SynapseSite(ProxySite):
         self.server_version_string = server_version_string.encode("ascii")
         self.connections: list[Protocol] = []
 
-    def buildProtocol(self, addr: IAddress) -> SynapseProtocol:
+    def buildProtocol(self, addr: Optional[IAddress]) -> SynapseProtocol:
         protocol = SynapseProtocol(
             self,
             self.server_name,
