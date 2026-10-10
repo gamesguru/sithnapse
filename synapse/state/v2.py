@@ -236,10 +236,11 @@ async def resolve_events_with_store(
 
     # Calculate the base state.
     #
-    # v2 uses the unconflicted state as the base state, but v2.1 uses the empty
-    # set.
+    # V2 uses the relevant unconflicted auth state as the base state. V2.1
+    # starts its resolved state empty, but Rezzy still needs the unconflicted
+    # create, join-rules, and power-level events to build its mainline.
     base_state: StateMap[str] = {}
-    if room_version.state_res != StateResolutionVersions.V2_1:
+    if room_version.state_res == StateResolutionVersions.V2:
         # Resolving conflicted sets requires the following types from the base
         # state:
         #   - the `auth_types_for_event(..)` of the conflicted events for
@@ -260,6 +261,16 @@ async def resolve_events_with_store(
             for key in base_state_keys
             if key in unconflicted_state
         }
+    elif room_version.state_res == StateResolutionVersions.V2_1:
+        base_state = {
+            key: unconflicted_state[key]
+            for key in (
+                (EventTypes.Create, ""),
+                (EventTypes.JoinRules, ""),
+                (EventTypes.PowerLevels, ""),
+            )
+            if key in unconflicted_state
+        }
 
     resolved_state: StateMap[str] | None = None
     cache_key: bytes | None = None
@@ -276,6 +287,7 @@ async def resolve_events_with_store(
             room_version,
             full_conflicted_set,
             base_state,
+            unconflicted_state,
             event_map,
             state_res_store,
         )
@@ -436,6 +448,7 @@ async def _resolve_conflicted_set_with_rust(
     room_version: RoomVersion,
     full_conflicted_set: set[str],
     base_state: StateMap[str],
+    unconflicted_state: StateMap[str],
     event_map: dict[str, EventBase],
     state_res_store: StateResolutionStore,
 ) -> StateMap[str]:
@@ -472,7 +485,11 @@ async def _resolve_conflicted_set_with_rust(
 
             _gg_rust_res_start = time.monotonic()
             resolved_state_rust: StateMap[str] = rust_res.resolve_v2_via_lattice_fold(
-                dict(base_state),
+                dict(
+                    unconflicted_state
+                    if room_version.state_res == StateResolutionVersions.V2_1
+                    else base_state
+                ),
                 list(full_conflicted_set),
                 event_map,
                 room_version.state_res,
@@ -484,6 +501,16 @@ async def _resolve_conflicted_set_with_rust(
                 len(event_map),
                 (time.monotonic() - _gg_rust_res_start) * 1000,
             )
+            if room_version.state_res == StateResolutionVersions.V2_1:
+                # Rezzy receives the full unconflicted state so it can build
+                # the V2.1 mainline, but the cache stores only the resolution
+                # of the conflicted subgraph. The caller layers the
+                # unconflicted state back on via ChainMap.
+                resolved_state_rust = {
+                    key: event_id
+                    for key, event_id in resolved_state_rust.items()
+                    if event_id in full_conflicted_set
+                }
             return resolved_state_rust
         except Exception as e:
             # `logger.exception` logs at ERROR: until the Rust/Python parity is

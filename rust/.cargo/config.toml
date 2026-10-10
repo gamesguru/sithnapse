@@ -1,0 +1,2 @@
+[patch."https://gitlab.com/gamesguru/rezzy.git"]
+rezzy = { path = "/run/media/shane/shane4tb-ent/repos/rezzy" }
