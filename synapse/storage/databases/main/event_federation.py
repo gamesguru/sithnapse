@@ -66,7 +66,6 @@ from synapse.util.json import json_encoder
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
-    from synapse.storage.databases.main.lock import Lock
 
 oldest_pdu_in_federation_staging = Gauge(
     "synapse_federation_server_oldest_inbound_pdu_in_staging",
@@ -3103,42 +3102,6 @@ class EventFederationWorkerStore(
             _remove_received_event_from_staging_txn,
             db_autocommit=True,
         )
-
-    async def release_inbound_pdu_lock_if_staging_empty(
-        self, room_id: str, lock: "Lock"
-    ) -> tuple[bool, bool]:
-        """Atomically release the inbound lock if the room queue is empty.
-
-        The emptiness check and lock release must be in the same transaction:
-        otherwise a producer can stage an event, observe the live lock, and
-        lose its only opportunity to start a drainer while this drainer is
-        checking the queue.
-        """
-
-        def _release_if_empty_txn(txn: LoggingTransaction) -> tuple[bool, bool]:
-            if not lock.is_still_valid_txn(txn):
-                return False, False
-
-            txn.execute(
-                """
-                    SELECT 1 FROM federation_inbound_events_staging
-                    WHERE room_id = ?
-                    LIMIT 1
-                """,
-                (room_id,),
-            )
-            if txn.fetchone() is not None:
-                return False, True
-
-            lock.release_txn(txn)
-            return True, True
-
-        queue_is_empty, lock_is_valid = await self.db_pool.runInteraction(
-            "release_inbound_pdu_lock_if_staging_empty", _release_if_empty_txn
-        )
-        if queue_is_empty:
-            lock.mark_released()
-        return queue_is_empty, lock_is_valid
 
     async def get_next_staged_event_id_for_room(
         self,
