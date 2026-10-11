@@ -539,31 +539,6 @@ class Lock:
             desc="drop_lock",
         )
 
-        self.mark_released()
-
-    def release_txn(self, txn: LoggingTransaction) -> None:
-        """Delete the lock row within an existing transaction.
-
-        The caller must call `mark_released` once the transaction has committed.
-        """
-        self._store.db_pool.simple_delete_txn(
-            txn,
-            table=self._table,
-            keyvalues={
-                "lock_name": self._lock_name,
-                "lock_key": self._lock_key,
-                "token": self._token,
-            },
-        )
-
-    def mark_released(self) -> None:
-        """Update in-memory state after the lock row has been deleted."""
-        if self._dropped:
-            return
-
-        if self._looping_call and self._looping_call.running:
-            self._looping_call.stop()
-
         if self._read_write:
             self._store._live_read_write_lock_tokens.pop(
                 (self._lock_name, self._lock_key, self._token), None

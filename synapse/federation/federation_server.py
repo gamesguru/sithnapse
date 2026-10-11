@@ -112,6 +112,12 @@ STAGED_EVENT_QUEUE_PRUNE_INTERVAL = 20
 # events. Keep this comfortably below the 200-event replication request limit.
 STAGED_EVENT_BATCH_SIZE = 20
 
+# How many times, and how far apart, a drainer retries taking the room lock
+# back after it finds more staged events (see
+# `_process_incoming_pdus_in_room_inner`).
+STAGED_EVENT_LOCK_REACQUIRE_ATTEMPTS = 5
+STAGED_EVENT_LOCK_REACQUIRE_DELAY = Duration(milliseconds=20)
+
 logger = logging.getLogger(__name__)
 
 received_pdus_counter = Counter(
@@ -1594,21 +1600,6 @@ class FederationServer(FederationBase):
 
                         events_since_prune_check += len(staged_events)
 
-                        (
-                            queue_is_empty,
-                            lock_is_valid,
-                        ) = await self.store.release_inbound_pdu_lock_if_staging_empty(
-                            room_id, lock
-                        )
-                        if not lock_is_valid:
-                            logger.info(
-                                "Lost inbound PDU processing lock for room %s while draining",
-                                room_id,
-                            )
-                            return
-                        if queue_is_empty:
-                            return
-
                     # A declined or failed batch must fall through to the
                     # conservative single-event path below. In particular, do
                     # not remove the later staged events: they may be outliers,
@@ -1657,21 +1648,6 @@ class FederationServer(FederationBase):
                         ).observe((self._clock.time_msec() - received_ts) / 1000)
                     events_since_prune_check += 1
 
-                    (
-                        queue_is_empty,
-                        lock_is_valid,
-                    ) = await self.store.release_inbound_pdu_lock_if_staging_empty(
-                        room_id, lock
-                    )
-                    if not lock_is_valid:
-                        logger.info(
-                            "Lost inbound PDU processing lock for room %s while draining",
-                            room_id,
-                        )
-                        return
-                    if queue_is_empty:
-                        return
-
             # The lock is deliberately released before this query. If a producer
             # staged an event before the release it will be found here; if it
             # stages one afterwards it can acquire the lock itself.
@@ -1685,9 +1661,23 @@ class FederationServer(FederationBase):
             if not next:
                 return
 
-            new_lock = await self.store.try_acquire_lock(
-                _INBOUND_EVENT_HANDLING_LOCK_NAME, room_id
-            )
+            # `try_acquire_lock` returns None both when someone else holds the
+            # lock and when a producer in this process is part-way through its
+            # own acquire attempt. In the latter case the producer, having seen
+            # our not-yet-released lock, is about to give up as well, so if we
+            # also give up the staged event is stranded until
+            # `_handle_old_staged_events`. Retry briefly: a real holder will
+            # drain the queue itself, and a producer's attempt resolves in a
+            # few milliseconds.
+            new_lock = None
+            for attempt in range(STAGED_EVENT_LOCK_REACQUIRE_ATTEMPTS):
+                if attempt:
+                    await self._clock.sleep(STAGED_EVENT_LOCK_REACQUIRE_DELAY)
+                new_lock = await self.store.try_acquire_lock(
+                    _INBOUND_EVENT_HANDLING_LOCK_NAME, room_id
+                )
+                if new_lock:
+                    break
             if not new_lock:
                 return
 
