@@ -2904,6 +2904,7 @@ class EventFederationWorkerStore(
 
         if await event_edges_fwd_is_authoritative(self):
             from synapse.storage.databases.main.embedded_event_edges import (
+                classify_event_edge_fallback,
                 get_event_edges_forward_batch,
                 record_event_edge_read,
                 record_event_edge_repair,
@@ -2974,13 +2975,7 @@ class EventFederationWorkerStore(
             record_event_edge_read(
                 self.server_name,
                 "successor",
-                (
-                    "stale"
-                    if forward_map is not None and forward_map.stale
-                    else "miss"
-                    if forward_map is not None
-                    else "unavailable"
-                ),
+                classify_event_edge_fallback(forward_map),
             )
             sql_started = time.monotonic()
             sql_res = await self.db_pool.simple_select_onecol(

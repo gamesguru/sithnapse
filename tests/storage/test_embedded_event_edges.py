@@ -45,6 +45,7 @@ from synapse.storage.databases.main.embedded_common import (
 from synapse.storage.databases.main.embedded_event_edges import (
     _retry_on_contention,
     check_event_edges_migration_complete,
+    classify_event_edge_fallback,
     delete_event_edges_batch,
     drain_edge_index_outbox,
     event_edge_publish_signal_gauge,
@@ -1151,6 +1152,11 @@ class EventEdgeReaderMetricsTestCase(TestCase):
         self.assertEqual(_reads(server, "gap", "stale"), 1)
         self.assertEqual(_reads(server, "gap", "miss"), 0)
 
+    def test_classify_event_edge_fallback(self) -> None:
+        self.assertEqual(classify_event_edge_fallback(None), "unavailable")
+        self.assertEqual(classify_event_edge_fallback(mock.Mock(stale=True)), "stale")
+        self.assertEqual(classify_event_edge_fallback(mock.Mock(stale=False)), "miss")
+
     def test_repair_counts_attempts_and_rows_separately(self) -> None:
         server = "repair-" + uuid4().hex
         record_event_edge_repair(server, "successor", True, 5)
@@ -1202,13 +1208,23 @@ class EventEdgeReaderMetricsTestCase(TestCase):
     def test_publish_signal_gauge_handles_older_extension(self) -> None:
         hs = mock.Mock()
         hs.hostname = "old-mtxdb-" + uuid4().hex
+        # The warning is once-per-process; re-arm it so test order can't matter.
+        with mock.patch.object(
+            embedded_event_edges_module, "_publish_signal_api_warning_logged", False
+        ):
+            self._check_older_extension(hs)
+
+    def _check_older_extension(self, hs: Any) -> None:
         hs.get_instance_id.return_value = uuid4().hex
-        with mock.patch(
-            "synapse.storage.databases.embedded_engine.get_embedded_engine",
-            return_value=object(),
-        ), mock.patch(
-            "synapse.storage.databases.main.embedded_event_edges._publish_signal_api_warning_logged",
-            False,
+        with (
+            mock.patch(
+                "synapse.storage.databases.embedded_engine.get_embedded_engine",
+                return_value=object(),
+            ),
+            mock.patch(
+                "synapse.storage.databases.main.embedded_event_edges._publish_signal_api_warning_logged",
+                False,
+            ),
         ):
             register_publish_signal_gauge(hs)
             try:
@@ -2144,9 +2160,9 @@ class EventEdgesSqlOnlyMetricTestCase(EventEdgesStorageIntegrationTestCase):
 
     @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
     def test_failed_successor_repair_counts_fallback_once(self) -> None:
-        parent_id = self.helper.send(self.room_id, "failed-repair-parent", tok=self.tok)[
-            "event_id"
-        ]
+        parent_id = self.helper.send(
+            self.room_id, "failed-repair-parent", tok=self.tok
+        )["event_id"]
         child_id = self.helper.send(self.room_id, "failed-repair-child", tok=self.tok)[
             "event_id"
         ]
@@ -2156,7 +2172,9 @@ class EventEdgesSqlOnlyMetricTestCase(EventEdgesStorageIntegrationTestCase):
 
         server = self.store.server_name
         outcomes = ("hit", "miss", "stale", "sql_only", "unavailable")
-        reads_before = {outcome: _reads(server, "successor", outcome) for outcome in outcomes}
+        reads_before = {
+            outcome: _reads(server, "successor", outcome) for outcome in outcomes
+        }
         failures_before = _sample(
             "synapse_event_edges_repairs_total",
             path="successor",

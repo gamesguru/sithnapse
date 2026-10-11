@@ -468,6 +468,17 @@ def _log_missing_publish_signal_api_once() -> None:
     )
 
 
+def classify_event_edge_fallback(forward_map: Any | None) -> str:
+    """Name why an embedded lookup did not produce a hit.
+
+    ``None`` means mtxdb was never queried (e.g. the room could not be
+    resolved), which must not be counted as a lookup that missed.
+    """
+    if forward_map is None:
+        return "unavailable"
+    return "stale" if forward_map.stale else "miss"
+
+
 def record_event_edge_read(server_name: str, path: str, outcome: str) -> None:
     """Count one event-edge lookup (see `event_edge_reads_counter`)."""
     event_edge_reads_counter.labels(

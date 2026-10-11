@@ -85,6 +85,7 @@ from synapse.storage.database import (
 )
 from synapse.storage.databases.main.embedded_common import ffi_count
 from synapse.storage.databases.main.embedded_event_edges import (
+    classify_event_edge_fallback,
     drain_edge_index_outbox,
     embedded_event_edges_is_writable,
     gc_retired_forward_generations,
@@ -2725,7 +2726,7 @@ class EventsWorkerStore(SQLBaseStore):
                     return True
                 ffi_count("event_edges_gap_fallbacks", 1)
                 record_event_edge_read(
-                    self.server_name, "gap", "stale" if forward_map.stale else "miss"
+                    self.server_name, "gap", classify_event_edge_fallback(forward_map)
                 )
 
             # Check to see whether the event in question is already referenced
