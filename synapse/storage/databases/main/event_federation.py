@@ -2895,9 +2895,10 @@ class EventFederationWorkerStore(
         """
         started = time.monotonic()
 
-        # A warm FWD generation is not proof of completeness. Only the
-        # offline verifier may grant this authority marker; until then SQL is
-        # the source of truth and FWD remains a write-side projection.
+        # Once the embedded backend is authoritative, the forward index is the
+        # source of truth. The startup migration gate guarantees that all
+        # pre-existing SQL edges have been imported before the SQL insert is
+        # removed.
         from synapse.storage.databases.main.embedded_event_edges import (
             event_edges_fwd_is_authoritative,
         )
@@ -2905,7 +2906,6 @@ class EventFederationWorkerStore(
         if await event_edges_fwd_is_authoritative(self):
             from synapse.storage.databases.main.embedded_event_edges import (
                 get_event_edges_forward_batch,
-                repair_edge_index_from_sql,
             )
 
             sql_started = time.monotonic()
@@ -2966,59 +2966,16 @@ class EventFederationWorkerStore(
                     )
                     return successors
 
-            ffi_count("event_edges_successor_fallbacks", 1)
-            sql_started = time.monotonic()
-            sql_res = await self.db_pool.simple_select_onecol(
-                table="event_edges",
-                keyvalues={"prev_event_id": event_id},
-                retcol="event_id",
-                desc="get_successor_events",
-            )
-            logger.debug(
-                "get_successor_events fallback: event_id=%s successor_count=%s",
-                event_id,
-                len(sql_res),
-            )
-            ffi_timing(
-                "event_edges_successor_sql_fallback", time.monotonic() - sql_started
-            )
-            if sql_res and getattr(self, "_embedded_event_edges_writable", False):
-                if room_id is None:
-                    room_id = await self.db_pool.simple_select_one_onecol(
-                        table="events",
-                        keyvalues={"event_id": sql_res[0]},
-                        retcol="room_id",
-                        allow_none=True,
-                        desc="get_successor_events_repair_room_id",
-                    )
-                if room_id is not None:
-                    try:
-                        repair_started = time.monotonic()
-                        # The gated path already resolved this event's immutable
-                        # room id before reading the source-version watermark.
-                        # Reusing it avoids a second SQL round trip on every
-                        # repair-triggering miss.
-                        await repair_edge_index_from_sql(
-                            self,
-                            self._embedded_db_namespace,
-                            room_id,
-                            event_id,
-                            sql_res,
-                        )
-                        ffi_count("event_edges_successor_repairs", len(sql_res))
-                        ffi_timing(
-                            "event_edges_successor_repair",
-                            time.monotonic() - repair_started,
-                        )
-                    except Exception:
-                        logger.debug(
-                            "Failed to repair forward edge for %s",
-                            event_id,
-                            exc_info=True,
-                        )
+            # A stale or missing embedded result is a broken MTXDB invariant
+            # after the migration gate has passed. Do not silently fall back
+            # to the SQL table: that would keep the removed hot path alive and
+            # could hide an incomplete edge publication.
+            if room_id is not None and forward_map.stale:
+                raise RuntimeError(f"stale MTXDB event-edge index for room {room_id}")
             ffi_timing("event_edges_successor_total", time.monotonic() - started)
-            return sql_res
+            return []
 
+        # Non-MTXDB deployments retain the legacy SQL implementation.
         sql_started = time.monotonic()
         sql_res = await self.db_pool.simple_select_onecol(
             table="event_edges",

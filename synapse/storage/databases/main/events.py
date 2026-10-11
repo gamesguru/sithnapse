@@ -4544,7 +4544,10 @@ class PersistEventsStore:
                 (ev.event_id, e_id) for ev in events for e_id in ev.prev_event_ids()
             )
         )
-        if edge_values:
+        # MTXDB is authoritative for event edges once enabled. Keep the SQL
+        # write only for deployments that have not enabled the embedded DAG;
+        # the SQL table remains present during the migration/rollback window.
+        if edge_values and not self._embedded_event_edges_writable:
             if isinstance(self.database_engine, PostgresEngine):
                 sql = (
                     "INSERT INTO event_edges (event_id, prev_event_id) "
@@ -4558,11 +4561,10 @@ class PersistEventsStore:
                 )
                 txn.executemany(sql, edge_values)
 
-        # Keep the authoritative SQL edge write, its per-room source version,
-        # and the embedded-index publication mutations in one transaction.
-        # The outbox is deliberately populated even when the embedded engine
-        # is disabled: it makes enabling the publisher later a resumable,
-        # database-backed operation rather than a best-effort mirror.
+        # Keep the per-room source version and embedded-index publication
+        # mutations in one transaction. The outbox remains durable during the
+        # migration/rollback window and is also the ordering source for the
+        # forward index.
         edges_by_room: dict[str, list[tuple[str, str]]] = collections.defaultdict(list)
         for event in events:
             edges_by_room[event.room_id].extend(

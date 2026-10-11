@@ -2712,7 +2712,18 @@ class EventsWorkerStore(SQLBaseStore):
                     if any(c not in rejected_children for c in children):
                         return False
                     return True
-                ffi_count("event_edges_gap_fallbacks", 1)
+
+                # MTXDB is authoritative after the migration gate. A stale
+                # result is an invariant violation, not a reason to query the
+                # retired SQL edge table.
+                if forward_map.stale:
+                    raise RuntimeError(
+                        f"stale MTXDB event-edge index for room {event.room_id}"
+                    )
+                # A complete index with no entry means this event has no
+                # known children, so it is next to a forward gap.
+                ffi_count("event_edges_gap_hits", 1)
+                return True
 
             # Check to see whether the event in question is already referenced
             # by another event. If we don't see any edges, we're next to a
