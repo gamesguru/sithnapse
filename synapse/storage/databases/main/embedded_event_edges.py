@@ -422,9 +422,10 @@ event_edge_reads_counter = Counter(
     "Lookups of event edges by caller (`path`) and outcome, one increment per "
     "lookup so the outcomes sum to the total lookup rate: `hit` (served from "
     "mtxdb), `miss` (no entry; SQL fallback), `stale` (source-version "
-    "mismatch; SQL fallback), `sql_only` (authority gate closed or engine "
-    "disabled, mtxdb not consulted). SQL-read removal needs `miss`, `stale` "
-    "and `sql_only` at ~0 on every process. Unlike the opt-in ffi counters "
+    "mismatch; SQL fallback), `unavailable` (room could not be resolved, so "
+    "mtxdb was not queried), and `sql_only` (authority gate closed or engine "
+    "disabled, mtxdb not consulted). SQL-read removal needs all fallback "
+    "outcomes at ~0 on every process. Unlike the opt-in ffi counters "
     "this is always on.",
     labelnames=["path", "outcome", SERVER_NAME_LABEL],
 )
@@ -450,6 +451,21 @@ event_edge_publish_signal_gauge = LaterGauge(
     "removed.",
     labelnames=["pool", SERVER_NAME_LABEL],
 )
+
+_publish_signal_api_warning_lock = threading.Lock()
+_publish_signal_api_warning_logged = False
+
+
+def _log_missing_publish_signal_api_once() -> None:
+    global _publish_signal_api_warning_logged
+    with _publish_signal_api_warning_lock:
+        if _publish_signal_api_warning_logged:
+            return
+        _publish_signal_api_warning_logged = True
+    logger.warning(
+        "The installed mtxdb extension does not expose publish_signal_active; "
+        "event-edge freshness capability cannot be reported"
+    )
 
 
 def record_event_edge_read(server_name: str, path: str, outcome: str) -> None:
@@ -484,7 +500,13 @@ def register_publish_signal_gauge(hs: HomeServer) -> None:
     def collect() -> dict[tuple[str, ...], int]:
         from synapse.storage.databases.embedded_engine import get_embedded_engine
 
-        active = get_embedded_engine("mtxdb").publish_signal_active()
+        engine = get_embedded_engine("mtxdb")
+        publish_signal_active = getattr(engine, "publish_signal_active", None)
+        if not callable(publish_signal_active):
+            _log_missing_publish_signal_api_once()
+            return {}
+
+        active = publish_signal_active()
         return {(pool, server_name): int(bool(v)) for pool, v in active.items()}
 
     event_edge_publish_signal_gauge.register_hook(

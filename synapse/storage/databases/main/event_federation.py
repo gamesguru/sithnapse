@@ -2974,7 +2974,13 @@ class EventFederationWorkerStore(
             record_event_edge_read(
                 self.server_name,
                 "successor",
-                "stale" if forward_map is not None and forward_map.stale else "miss",
+                (
+                    "stale"
+                    if forward_map is not None and forward_map.stale
+                    else "miss"
+                    if forward_map is not None
+                    else "unavailable"
+                ),
             )
             sql_started = time.monotonic()
             sql_res = await self.db_pool.simple_select_onecol(

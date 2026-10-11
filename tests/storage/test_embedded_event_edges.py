@@ -1199,6 +1199,36 @@ class EventEdgeReaderMetricsTestCase(TestCase):
                     hs.get_instance_id()
                 )
 
+    def test_publish_signal_gauge_handles_older_extension(self) -> None:
+        hs = mock.Mock()
+        hs.hostname = "old-mtxdb-" + uuid4().hex
+        hs.get_instance_id.return_value = uuid4().hex
+        with mock.patch(
+            "synapse.storage.databases.embedded_engine.get_embedded_engine",
+            return_value=object(),
+        ), mock.patch(
+            "synapse.storage.databases.main.embedded_event_edges._publish_signal_api_warning_logged",
+            False,
+        ):
+            register_publish_signal_gauge(hs)
+            try:
+                with self.assertLogs(
+                    "synapse.storage.databases.main.embedded_event_edges",
+                    level="WARNING",
+                ) as logs:
+                    metrics = list(event_edge_publish_signal_gauge.collect())
+                self.assertTrue(
+                    any(
+                        "does not expose publish_signal_active" in message
+                        for message in logs.output
+                    )
+                )
+                self.assertEqual(list(metrics[0].samples), [])
+            finally:
+                event_edge_publish_signal_gauge.unregister_hooks_for_homeserver_instance_id(
+                    hs.get_instance_id()
+                )
+
 
 class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
     servlets = [
@@ -2083,6 +2113,80 @@ class EventEdgesSqlOnlyMetricTestCase(EventEdgesStorageIntegrationTestCase):
         self.get_success(self.store.is_event_next_to_forward_gap(parent))
         self.assertEqual(_reads(sn, "successor", "sql_only") - succ0, 1)
         self.assertEqual(_reads(sn, "gap", "sql_only") - gap0, 1)
+
+    @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
+    def test_unresolvable_successor_lookup_counts_unavailable(self) -> None:
+        sn = self.store.server_name
+        unavailable0 = _reads(sn, "successor", "unavailable")
+        self.assertEqual(
+            self.get_success(
+                self.store.get_successor_events("$unknown-event:example.org")
+            ),
+            [],
+        )
+        self.assertEqual(_reads(sn, "successor", "unavailable") - unavailable0, 1)
+
+    @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
+    def test_successor_lookup_counts_a_clean_miss(self) -> None:
+        parent_id = self.helper.send(self.room_id, "miss-parent", tok=self.tok)[
+            "event_id"
+        ]
+        ns = self.store._embedded_db_namespace
+        flush_edge_writes(ns)
+        self.get_success(drain_edge_index_outbox(self.store, namespace=ns))
+
+        sn = self.store.server_name
+        miss0 = _reads(sn, "successor", "miss")
+        self.assertEqual(
+            self.get_success(self.store.get_successor_events(parent_id)), []
+        )
+        self.assertEqual(_reads(sn, "successor", "miss") - miss0, 1)
+
+    @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
+    def test_failed_successor_repair_counts_fallback_once(self) -> None:
+        parent_id = self.helper.send(self.room_id, "failed-repair-parent", tok=self.tok)[
+            "event_id"
+        ]
+        child_id = self.helper.send(self.room_id, "failed-repair-child", tok=self.tok)[
+            "event_id"
+        ]
+        ns = self.store._embedded_db_namespace
+        flush_edge_writes(ns)
+        mtxdb_engine.event_edges_delete(ns, [child_id])
+
+        server = self.store.server_name
+        outcomes = ("hit", "miss", "stale", "sql_only", "unavailable")
+        reads_before = {outcome: _reads(server, "successor", outcome) for outcome in outcomes}
+        failures_before = _sample(
+            "synapse_event_edges_repairs_total",
+            path="successor",
+            result="failed",
+            server_name=server,
+        )
+        with mock.patch(
+            "synapse.storage.databases.main.embedded_event_edges.repair_edge_index_from_sql",
+            side_effect=RuntimeError("simulated repair failure"),
+        ):
+            successors = self.get_success(self.store.get_successor_events(parent_id))
+
+        self.assertIn(child_id, successors)
+        self.assertEqual(
+            sum(
+                _reads(server, "successor", outcome) - before
+                for outcome, before in reads_before.items()
+            ),
+            1,
+        )
+        self.assertEqual(
+            _sample(
+                "synapse_event_edges_repairs_total",
+                path="successor",
+                result="failed",
+                server_name=server,
+            )
+            - failures_before,
+            1,
+        )
 
 
 class EventEdgesMigrationGateTestCase(EventEdgesStorageIntegrationTestCase):
