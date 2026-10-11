@@ -443,7 +443,7 @@ def embedded_event_edges_is_writable(hs: HomeServer) -> bool:
 # events-stream writer specifically rather than every worker, and checked
 # after the async datastore layer is up (`has_completed_background_update`
 # needs it) rather than during synchronous schema prep.
-EVENT_EDGES_SQL_INSERT_REMOVED = True
+EVENT_EDGES_SQL_INSERT_REMOVED = False
 
 
 async def event_edges_fwd_is_authoritative(store: Any) -> bool:
