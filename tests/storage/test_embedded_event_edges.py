@@ -55,6 +55,7 @@ from synapse.storage.databases.main.embedded_event_edges import (
     queue_edge_write,
     queued_edge_write_count,
     record_event_edge_read,
+    record_event_edge_repair,
     register_publish_signal_gauge,
 )
 from synapse.synapse_rust import mtxdb_engine
@@ -1124,31 +1125,46 @@ class ContentionRetryCounterTestCase(unittest.TestCase):
             self.assertEqual(get_ffi_count("event_edges_contention_exhausted"), 1)
 
 
+def _sample(name: str, **labels: str) -> float:
+    return REGISTRY.get_sample_value(name, labels) or 0.0
+
+
+def _reads(server: str, path: str, outcome: str) -> float:
+    return _sample(
+        "synapse_event_edges_reads_total",
+        path=path,
+        outcome=outcome,
+        server_name=server,
+    )
+
+
 class EventEdgeReaderMetricsTestCase(TestCase):
     """The always-on Prometheus metrics the SQL-read-removal gate depends on."""
-
-    def _reads(self, server: str, path: str, outcome: str) -> float:
-        return (
-            REGISTRY.get_sample_value(
-                "synapse_event_edges_reads_total",
-                {
-                    "path": path,
-                    "outcome": outcome,
-                    "server_name": server,
-                },
-            )
-            or 0.0
-        )
 
     def test_record_event_edge_read_counts_without_ffi_diagnostics(self) -> None:
         server = "metrics-" + uuid4().hex
         record_event_edge_read(server, "successor", "hit")
-        record_event_edge_read(server, "successor", "repair", 3)
+        record_event_edge_read(server, "successor", "sql_only")
         record_event_edge_read(server, "gap", "stale")
-        self.assertEqual(self._reads(server, "successor", "hit"), 1)
-        self.assertEqual(self._reads(server, "successor", "repair"), 3)
-        self.assertEqual(self._reads(server, "gap", "stale"), 1)
-        self.assertEqual(self._reads(server, "gap", "miss"), 0)
+        self.assertEqual(_reads(server, "successor", "hit"), 1)
+        self.assertEqual(_reads(server, "successor", "sql_only"), 1)
+        self.assertEqual(_reads(server, "gap", "stale"), 1)
+        self.assertEqual(_reads(server, "gap", "miss"), 0)
+
+    def test_repair_counts_attempts_and_rows_separately(self) -> None:
+        server = "repair-" + uuid4().hex
+        record_event_edge_repair(server, "successor", True, 5)
+        record_event_edge_repair(server, "successor", False)
+        kw = {"path": "successor", "server_name": server}
+        self.assertEqual(
+            _sample("synapse_event_edges_repairs_total", result="ok", **kw), 1
+        )
+        self.assertEqual(
+            _sample("synapse_event_edges_repairs_total", result="failed", **kw), 1
+        )
+        self.assertEqual(_sample("synapse_event_edges_repaired_rows_total", **kw), 5)
+        # Repairs must not leak into the lookup counter's units.
+        self.assertEqual(_reads(server, "successor", "hit"), 0)
 
     def test_publish_signal_gauge_reports_each_pool(self) -> None:
         hs = mock.Mock()
@@ -1517,8 +1533,39 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         # Querying successor events falls back to SQL, successfully finding c_id,
         # and queues a repair of the mtxdb forward edge.  The read is served
         # by SQL; the repair only lands in mtxdb on the next coalesced flush.
+        sn = self.store.server_name
+        stale0 = _reads(sn, "successor", "stale")
+        ok0 = _sample(
+            "synapse_event_edges_repairs_total",
+            path="successor",
+            result="ok",
+            server_name=sn,
+        )
+        rows0 = _sample(
+            "synapse_event_edges_repaired_rows_total", path="successor", server_name=sn
+        )
         successors = self.get_success(self.store.get_successor_events(p_id))
         self.assertIn(c_id, successors)
+        self.assertEqual(_reads(sn, "successor", "stale") - stale0, 1)
+        self.assertEqual(
+            _sample(
+                "synapse_event_edges_repairs_total",
+                path="successor",
+                result="ok",
+                server_name=sn,
+            )
+            - ok0,
+            1,
+        )
+        self.assertEqual(
+            _sample(
+                "synapse_event_edges_repaired_rows_total",
+                path="successor",
+                server_name=sn,
+            )
+            - rows0,
+            len(successors),
+        )
 
         # Advance the reactor past the flush window so the coalescer drains
         # the queued repair (and syncs EVENT_DAG).  Use FLUSH_DELAY_SECS plus
@@ -1877,7 +1924,10 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
 
         # Gate closed: must take the all-SQL path and return both children,
         # not the incomplete mtxdb list.
+        sn = self.store.server_name
+        stale0 = _reads(sn, "successor", "stale")
         successors = self.get_success(self.store.get_successor_events(parent_id))
+        self.assertEqual(_reads(sn, "successor", "stale") - stale0, 1)
         self.assertEqual(
             set(successors),
             {legacy_child, mirrored_child},
@@ -1888,7 +1938,9 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         # child too, so mtxdb's forward list becomes complete.
         self.wait_for_background_updates()
 
+        hit0 = _reads(sn, "successor", "hit")
         successors_after = self.get_success(self.store.get_successor_events(parent_id))
+        self.assertEqual(_reads(sn, "successor", "hit") - hit0, 1)
         self.assertEqual(
             set(successors_after),
             {legacy_child, mirrored_child},
@@ -1965,6 +2017,72 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
             self.get_success(self.store.is_event_next_to_forward_gap(parent_event)),
             "gate open: still a real child, still not a gap",
         )
+
+
+class EventEdgesSqlOnlyMetricTestCase(EventEdgesStorageIntegrationTestCase):
+    """With the embedded backend off for a store, lookups bypass mtxdb and must
+    still be counted, so `sql_only` gives a denominator for all lookups."""
+
+    @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
+    def test_gap_lookup_counts_hit_then_fallback(self) -> None:
+        """`is_event_next_to_forward_gap` records a hit from mtxdb, and a
+        `stale` once the SQL source version moves ahead."""
+        parent_id = self.helper.send(self.room_id, "gap-parent", tok=self.tok)[
+            "event_id"
+        ]
+        self.helper.send(self.room_id, "gap-child", tok=self.tok)
+        parent = self.get_success(self.store.get_event(parent_id))
+        ns = self.store._embedded_db_namespace
+        flush_edge_writes(ns)
+        self.get_success(drain_edge_index_outbox(self.store, namespace=ns))
+        sn = self.store.server_name
+
+        hit0 = _reads(sn, "gap", "hit")
+        self.assertFalse(
+            self.get_success(self.store.is_event_next_to_forward_gap(parent))
+        )
+        self.assertEqual(
+            _reads(sn, "gap", "hit") - hit0,
+            1,
+            [_reads(sn, "gap", o) for o in ("hit", "miss", "stale", "sql_only")],
+        )
+
+        # Advance the SQL source version past what mtxdb has published, so the
+        # embedded result is stale and the lookup must be counted as such.
+        self.get_success(
+            self.store.db_pool.runInteraction(
+                "bump_source_version",
+                lambda txn: txn.execute(
+                    "UPDATE room_edge_source_version SET source_version = "
+                    "source_version + 1 WHERE room_id = ?",
+                    (self.room_id,),
+                ),
+            )
+        )
+        hit1 = _reads(sn, "gap", "hit")
+        stale0 = _reads(sn, "gap", "stale")
+        self.assertFalse(
+            self.get_success(self.store.is_event_next_to_forward_gap(parent))
+        )
+        self.assertEqual(_reads(sn, "gap", "hit"), hit1)
+        self.assertEqual(_reads(sn, "gap", "stale") - stale0, 1)
+
+    @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
+    def test_disabled_embedded_edges_count_sql_only_on_both_callers(self) -> None:
+        parent_id = self.helper.send(self.room_id, "so-parent", tok=self.tok)[
+            "event_id"
+        ]
+        self.helper.send(self.room_id, "so-child", tok=self.tok)
+        parent = self.get_success(self.store.get_event(parent_id))
+        sn = self.store.server_name
+        self.store._embedded_event_edges_enabled = False
+
+        succ0 = _reads(sn, "successor", "sql_only")
+        gap0 = _reads(sn, "gap", "sql_only")
+        self.get_success(self.store.get_successor_events(parent_id))
+        self.get_success(self.store.is_event_next_to_forward_gap(parent))
+        self.assertEqual(_reads(sn, "successor", "sql_only") - succ0, 1)
+        self.assertEqual(_reads(sn, "gap", "sql_only") - gap0, 1)
 
 
 class EventEdgesMigrationGateTestCase(EventEdgesStorageIntegrationTestCase):

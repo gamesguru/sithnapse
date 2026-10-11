@@ -2906,6 +2906,7 @@ class EventFederationWorkerStore(
             from synapse.storage.databases.main.embedded_event_edges import (
                 get_event_edges_forward_batch,
                 record_event_edge_read,
+                record_event_edge_repair,
                 repair_edge_index_from_sql,
             )
 
@@ -3014,14 +3015,15 @@ class EventFederationWorkerStore(
                             sql_res,
                         )
                         ffi_count("event_edges_successor_repairs", len(sql_res))
-                        record_event_edge_read(
-                            self.server_name, "successor", "repair", len(sql_res)
+                        record_event_edge_repair(
+                            self.server_name, "successor", True, len(sql_res)
                         )
                         ffi_timing(
                             "event_edges_successor_repair",
                             time.monotonic() - repair_started,
                         )
                     except Exception:
+                        record_event_edge_repair(self.server_name, "successor", False)
                         logger.debug(
                             "Failed to repair forward edge for %s",
                             event_id,
@@ -3030,6 +3032,11 @@ class EventFederationWorkerStore(
             ffi_timing("event_edges_successor_total", time.monotonic() - started)
             return sql_res
 
+        from synapse.storage.databases.main.embedded_event_edges import (
+            record_event_edge_read,
+        )
+
+        record_event_edge_read(self.server_name, "successor", "sql_only")
         sql_started = time.monotonic()
         sql_res = await self.db_pool.simple_select_onecol(
             table="event_edges",

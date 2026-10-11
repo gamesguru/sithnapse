@@ -2688,6 +2688,8 @@ class EventsWorkerStore(SQLBaseStore):
             if txn.fetchone():
                 return False
 
+            if not embedded_edges_trustworthy:
+                record_event_edge_read(self.server_name, "gap", "sql_only")
             if embedded_edges_trustworthy:
                 from synapse.storage.databases.main.embedded_event_edges import (
                     get_event_edges_forward_batch,

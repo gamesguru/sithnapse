@@ -419,11 +419,27 @@ def open_embedded_event_edges_engine(hs: HomeServer) -> bool:
 
 event_edge_reads_counter = Counter(
     "synapse_event_edges_reads",
-    "Reads of the embedded event-edge index by caller (`path`) and result: "
-    "`hit` (served from mtxdb), `miss` (no entry; caller falls back), `stale` "
-    "(source-version mismatch; caller falls back), `repair` (rows copied from "
-    "SQL back into mtxdb). Unlike the opt-in ffi counters this is always on.",
+    "Lookups of event edges by caller (`path`) and outcome, one increment per "
+    "lookup so the outcomes sum to the total lookup rate: `hit` (served from "
+    "mtxdb), `miss` (no entry; SQL fallback), `stale` (source-version "
+    "mismatch; SQL fallback), `sql_only` (authority gate closed or engine "
+    "disabled, mtxdb not consulted). SQL-read removal needs `miss`, `stale` "
+    "and `sql_only` at ~0 on every process. Unlike the opt-in ffi counters "
+    "this is always on.",
     labelnames=["path", "outcome", SERVER_NAME_LABEL],
+)
+
+event_edge_repairs_counter = Counter(
+    "synapse_event_edges_repairs",
+    "Repairs of the mtxdb forward index from SQL after a fallback read, by "
+    "`path` and `result` (`ok`/`failed`), counted per repair attempt.",
+    labelnames=["path", "result", SERVER_NAME_LABEL],
+)
+
+event_edge_repaired_rows_counter = Counter(
+    "synapse_event_edges_repaired_rows",
+    "SQL edge rows copied into mtxdb by successful repairs.",
+    labelnames=["path", SERVER_NAME_LABEL],
 )
 
 event_edge_publish_signal_gauge = LaterGauge(
@@ -436,17 +452,33 @@ event_edge_publish_signal_gauge = LaterGauge(
 )
 
 
-def record_event_edge_read(
-    server_name: str, path: str, outcome: str, count: int = 1
-) -> None:
-    """Count an embedded event-edge read outcome (see `event_edge_reads_counter`)."""
+def record_event_edge_read(server_name: str, path: str, outcome: str) -> None:
+    """Count one event-edge lookup (see `event_edge_reads_counter`)."""
     event_edge_reads_counter.labels(
         path=path, outcome=outcome, **{SERVER_NAME_LABEL: server_name}
-    ).inc(count)
+    ).inc()
+
+
+def record_event_edge_repair(
+    server_name: str, path: str, ok: bool, rows: int = 0
+) -> None:
+    """Count one repair attempt and, if it succeeded, the rows it copied."""
+    labels = {SERVER_NAME_LABEL: server_name}
+    event_edge_repairs_counter.labels(
+        path=path, result="ok" if ok else "failed", **labels
+    ).inc()
+    if ok and rows:
+        event_edge_repaired_rows_counter.labels(path=path, **labels).inc(rows)
 
 
 def register_publish_signal_gauge(hs: HomeServer) -> None:
-    """Export per-pool publish-signal state for this process's mtxdb handle."""
+    """Export per-pool publish-signal state for this process's mtxdb handle.
+
+    This is a capability snapshot, not proof of freshness. A worker that is
+    not scraped has no sample at all, so rollout checks must require a sample
+    of 1 for the `event_dag` pool from every live read-only worker (absence
+    fails the check, same as 0).
+    """
     server_name = hs.hostname
 
     def collect() -> dict[tuple[str, ...], int]:
