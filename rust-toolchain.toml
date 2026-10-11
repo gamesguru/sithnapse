@@ -1,3 +1,8 @@
+# Local dev pin. CI's nightly jobs (cargo-bench, lint-clippy-nightly,
+# lint-rustfmt in tests.yml, plus fix_lint.yaml) must set RUSTUP_TOOLCHAIN to
+# get past this: rustup ranks a toolchain file above the `rustup default` that
+# dtolnay/rust-toolchain sets, so they would otherwise run on stable and the
+# `#![feature(test)]` benches would fail with E0554.
 [toolchain]
 channel = "1.87.0"
 components = ["clippy", "rustc", "rustfmt", "rust-src", "rust-analyzer"]

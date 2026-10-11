@@ -45,11 +45,19 @@ jobs:
         continue-on-error: true
         run: uv run ruff format --quiet .
 
+      # The `rustup default` set by the Install Rust step above isn't enough:
+      # the repo's `rust-toolchain.toml` is a toolchain file, which rustup
+      # ranks above the default, so these would otherwise silently run on
+      # stable. See the note in tests.yml's `cargo-bench` job.
       - run: cargo clippy --all-features --fix -- -D warnings
         continue-on-error: true
+        env:
+          RUSTUP_TOOLCHAIN: ${{ env.RUST_VERSION }}
 
       - run: cargo fmt
         continue-on-error: true
+        env:
+          RUSTUP_TOOLCHAIN: ${{ env.RUST_VERSION }}
 
       - uses: stefanzweifel/git-auto-commit-action@4a55954c782fc1ea30b9056cd3e7a2b40ca8887d # v7.2.0
         with:

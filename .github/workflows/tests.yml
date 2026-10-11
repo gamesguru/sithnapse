@@ -287,6 +287,11 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - run: cargo clippy --locked --all-features -- -D warnings
+        env:
+          # See the note on this in `cargo-bench` below: without this, the
+          # repo's `rust-toolchain.toml` (a toolchain file, which outranks
+          # `rustup default`) wins, and this job runs on stable.
+          RUSTUP_TOOLCHAIN: ${{ env.RUST_NIGHTLY_VERSION }}
 
   lint-rust:
     runs-on: ubuntu-latest
@@ -354,6 +359,11 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - run: cargo fmt --check
+        env:
+          # See the note on this in `cargo-bench` below: stable rustfmt only
+          # warns about the nightly-only options in `.rustfmt.toml`, so
+          # without this the job passes while linting nothing useful.
+          RUSTUP_TOOLCHAIN: ${{ env.RUST_NIGHTLY_VERSION }}
 
   lint-golangci:
     runs-on: ubuntu-latest
@@ -946,7 +956,14 @@ jobs:
           toolchain: ${{ env.RUST_NIGHTLY_VERSION }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
+      # `rust-toolchain.toml` at the repo root pins a toolchain, which rustup
+      # ranks above the `rustup default` the Install Rust step just set -- so
+      # without RUSTUP_TOOLCHAIN (ranked above both) this job compiles the
+      # `#![feature(test)]` benches on stable and dies with E0554. Set it on
+      # any step that must actually run on the nightly.
       - run: cargo bench --locked --no-run
+        env:
+          RUSTUP_TOOLCHAIN: ${{ env.RUST_NIGHTLY_VERSION }}
 
   # a job which marks all the other jobs as complete, thus allowing PRs to be merged.
   tests-done:
