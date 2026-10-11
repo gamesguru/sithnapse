@@ -19,8 +19,10 @@ import sqlite3
 import tempfile
 import threading
 from typing import Any
-from unittest import mock, skipUnless
+from unittest import TestCase, mock, skipUnless
 from uuid import uuid4
+
+from prometheus_client import REGISTRY
 
 from twisted.test.proto_helpers import MemoryReactor
 
@@ -45,12 +47,15 @@ from synapse.storage.databases.main.embedded_event_edges import (
     check_event_edges_migration_complete,
     delete_event_edges_batch,
     drain_edge_index_outbox,
+    event_edge_publish_signal_gauge,
     flush_edge_writes,
     get_event_edges_backward_batch,
     get_event_edges_forward_batch,
     put_event_edges_batch,
     queue_edge_write,
     queued_edge_write_count,
+    record_event_edge_read,
+    register_publish_signal_gauge,
 )
 from synapse.synapse_rust import mtxdb_engine
 from synapse.util.clock import Clock
@@ -1119,6 +1124,66 @@ class ContentionRetryCounterTestCase(unittest.TestCase):
             self.assertEqual(get_ffi_count("event_edges_contention_exhausted"), 1)
 
 
+class EventEdgeReaderMetricsTestCase(TestCase):
+    """The always-on Prometheus metrics the SQL-read-removal gate depends on."""
+
+    def _reads(self, server: str, path: str, outcome: str) -> float:
+        return (
+            REGISTRY.get_sample_value(
+                "synapse_event_edges_reads_total",
+                {
+                    "path": path,
+                    "outcome": outcome,
+                    "server_name": server,
+                },
+            )
+            or 0.0
+        )
+
+    def test_record_event_edge_read_counts_without_ffi_diagnostics(self) -> None:
+        server = "metrics-" + uuid4().hex
+        record_event_edge_read(server, "successor", "hit")
+        record_event_edge_read(server, "successor", "repair", 3)
+        record_event_edge_read(server, "gap", "stale")
+        self.assertEqual(self._reads(server, "successor", "hit"), 1)
+        self.assertEqual(self._reads(server, "successor", "repair"), 3)
+        self.assertEqual(self._reads(server, "gap", "stale"), 1)
+        self.assertEqual(self._reads(server, "gap", "miss"), 0)
+
+    def test_publish_signal_gauge_reports_each_pool(self) -> None:
+        hs = mock.Mock()
+        hs.hostname = "gauge-" + uuid4().hex
+        hs.get_instance_id.return_value = uuid4().hex
+        fake = mock.Mock()
+        fake.publish_signal_active.return_value = {
+            "state": True,
+            "event_dag": False,
+            "auth_chain": True,
+        }
+        with mock.patch(
+            "synapse.storage.databases.embedded_engine.get_embedded_engine",
+            return_value=fake,
+        ):
+            register_publish_signal_gauge(hs)
+            try:
+                for pool, expected in (
+                    ("state", 1.0),
+                    ("event_dag", 0.0),
+                    ("auth_chain", 1.0),
+                ):
+                    self.assertEqual(
+                        REGISTRY.get_sample_value(
+                            "synapse_event_edges_publish_signal_active",
+                            {"pool": pool, "server_name": hs.hostname},
+                        ),
+                        expected,
+                    )
+            finally:
+                event_edge_publish_signal_gauge.unregister_hooks_for_homeserver_instance_id(
+                    hs.get_instance_id()
+                )
+
+
 class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
     servlets = [
         admin.register_servlets,
@@ -1471,6 +1536,14 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         # assertion is isolated from any other test activity and does not add
         # overhead to production deployments where diagnostics are disabled.
         self.store._embedded_event_edges_writable = False
+        hits_before = REGISTRY.get_sample_value(
+            "synapse_event_edges_reads_total",
+            {
+                "path": "successor",
+                "outcome": "hit",
+                "server_name": self.store.server_name,
+            },
+        )
         with enable_ffi_counting():
             reader_successors = self.get_success(self.store.get_successor_events(p_id))
             self.assertIn(c_id, reader_successors)
@@ -1486,6 +1559,15 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
                 0,
                 "expected no SQL fallback for the read-only query after repair",
             )
+        hits_after = REGISTRY.get_sample_value(
+            "synapse_event_edges_reads_total",
+            {
+                "path": "successor",
+                "outcome": "hit",
+                "server_name": self.store.server_name,
+            },
+        )
+        self.assertEqual((hits_after or 0) - (hits_before or 0), 1)
 
     @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
     def test_sql_fallback_repairs_preserved_row2_edge_despite_purge(self) -> None:

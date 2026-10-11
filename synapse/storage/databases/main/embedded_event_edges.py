@@ -46,6 +46,9 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Any, Callable, Iterable, TypeVar, cast
 
+from prometheus_client import Counter
+
+from synapse.metrics import SERVER_NAME_LABEL, LaterGauge
 from synapse.storage.database import make_in_list_sql_clause
 from synapse.storage.databases.main.embedded_common import (
     Pool,
@@ -411,6 +414,49 @@ def open_embedded_event_edges_engine(hs: HomeServer) -> bool:
     return bool(
         hs.config.database.embedded_db_engine == "mtxdb"
         and hs.config.database.embedded_db_path
+    )
+
+
+event_edge_reads_counter = Counter(
+    "synapse_event_edges_reads",
+    "Reads of the embedded event-edge index by caller (`path`) and result: "
+    "`hit` (served from mtxdb), `miss` (no entry; caller falls back), `stale` "
+    "(source-version mismatch; caller falls back), `repair` (rows copied from "
+    "SQL back into mtxdb). Unlike the opt-in ffi counters this is always on.",
+    labelnames=["path", "outcome", SERVER_NAME_LABEL],
+)
+
+event_edge_publish_signal_gauge = LaterGauge(
+    name="synapse_event_edges_publish_signal_active",
+    desc="1 if the read-only mtxdb handle for this pool mapped the writer's "
+    "publish signal (strict cross-process freshness), 0 if it is on the "
+    "stat-based fallback. Every reader must report 1 before SQL reads are "
+    "removed.",
+    labelnames=["pool", SERVER_NAME_LABEL],
+)
+
+
+def record_event_edge_read(
+    server_name: str, path: str, outcome: str, count: int = 1
+) -> None:
+    """Count an embedded event-edge read outcome (see `event_edge_reads_counter`)."""
+    event_edge_reads_counter.labels(
+        path=path, outcome=outcome, **{SERVER_NAME_LABEL: server_name}
+    ).inc(count)
+
+
+def register_publish_signal_gauge(hs: HomeServer) -> None:
+    """Export per-pool publish-signal state for this process's mtxdb handle."""
+    server_name = hs.hostname
+
+    def collect() -> dict[tuple[str, ...], int]:
+        from synapse.storage.databases.embedded_engine import get_embedded_engine
+
+        active = get_embedded_engine("mtxdb").publish_signal_active()
+        return {(pool, server_name): int(bool(v)) for pool, v in active.items()}
+
+    event_edge_publish_signal_gauge.register_hook(
+        homeserver_instance_id=hs.get_instance_id(), hook=collect
     )
 
 

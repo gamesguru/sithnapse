@@ -2905,9 +2905,11 @@ class EventFederationWorkerStore(
         if await event_edges_fwd_is_authoritative(self):
             from synapse.storage.databases.main.embedded_event_edges import (
                 get_event_edges_forward_batch,
+                record_event_edge_read,
                 repair_edge_index_from_sql,
             )
 
+            forward_map = None
             sql_started = time.monotonic()
             room_id = await self.db_pool.simple_select_one_onecol(
                 table="events",
@@ -2961,12 +2963,18 @@ class EventFederationWorkerStore(
                 )
                 if successors is not None:
                     ffi_count("event_edges_successor_hits", 1)
+                    record_event_edge_read(self.server_name, "successor", "hit")
                     ffi_timing(
                         "event_edges_successor_total", time.monotonic() - started
                     )
                     return successors
 
             ffi_count("event_edges_successor_fallbacks", 1)
+            record_event_edge_read(
+                self.server_name,
+                "successor",
+                "stale" if forward_map is not None and forward_map.stale else "miss",
+            )
             sql_started = time.monotonic()
             sql_res = await self.db_pool.simple_select_onecol(
                 table="event_edges",
@@ -3006,6 +3014,9 @@ class EventFederationWorkerStore(
                             sql_res,
                         )
                         ffi_count("event_edges_successor_repairs", len(sql_res))
+                        record_event_edge_read(
+                            self.server_name, "successor", "repair", len(sql_res)
+                        )
                         ffi_timing(
                             "event_edges_successor_repair",
                             time.monotonic() - repair_started,

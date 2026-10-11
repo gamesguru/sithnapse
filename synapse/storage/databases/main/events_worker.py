@@ -89,6 +89,8 @@ from synapse.storage.databases.main.embedded_event_edges import (
     embedded_event_edges_is_writable,
     gc_retired_forward_generations,
     open_embedded_event_edges_engine,
+    record_event_edge_read,
+    register_publish_signal_gauge,
 )
 from synapse.storage.databases.main.embedded_event_json import (
     get_event_json_batch,
@@ -256,6 +258,12 @@ class EventsWorkerStore(SQLBaseStore):
         self._embedded_event_json_enabled = open_embedded_event_json_engine(hs)
         self._embedded_event_edges_enabled = open_embedded_event_edges_engine(hs)
         self._embedded_event_edges_writable = embedded_event_edges_is_writable(hs)
+        if (
+            self._embedded_event_edges_enabled
+            and not self._embedded_event_edges_writable
+        ):
+            # Only read-only handles map the writer's publish signal.
+            register_publish_signal_gauge(hs)
         self._embedded_db_engine = hs.config.database.embedded_db_engine
         # Namespaces event_to_state_group/refcount keys in the embedded
         # engine -- see embedded_event_to_state_group.py's module docstring.
@@ -2702,6 +2710,7 @@ class EventsWorkerStore(SQLBaseStore):
                 )
                 if children is not None:
                     ffi_count("event_edges_gap_hits", 1)
+                    record_event_edge_read(self.server_name, "gap", "hit")
                     if not children:
                         return True
                     clause, args = make_in_list_sql_clause(
@@ -2713,6 +2722,9 @@ class EventsWorkerStore(SQLBaseStore):
                         return False
                     return True
                 ffi_count("event_edges_gap_fallbacks", 1)
+                record_event_edge_read(
+                    self.server_name, "gap", "stale" if forward_map.stale else "miss"
+                )
 
             # Check to see whether the event in question is already referenced
             # by another event. If we don't see any edges, we're next to a
