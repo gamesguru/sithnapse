@@ -1000,7 +1000,7 @@ dependencies = [
 [[package]]
 name = "mtxdb"
 version = "0.1.0-beta.2"
-source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=refactor%2Fpack-id-store-layout#74f7f090262e3163c312bb0d1fece56f0a9a4137"
+source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=refactor%2Fpack-id-store-layout#815db1c170373de6ee8049af910bb2ef77a1711f"
 dependencies = [
  "arc-swap",
  "blake3",
@@ -1010,7 +1010,7 @@ dependencies = [
  "memchr",
  "memmap2",
  "parking_lot",
- "rezzy-recon",
+ "rezzy-recon 0.6.0-rc.1 (git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha)",
  "sha2",
  "zstd",
  "zstd-sys",
@@ -1362,22 +1362,28 @@ dependencies = [
 [[package]]
 name = "rezzy"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#1504cc760efeeb29c88e93662b754bec147dddf4"
 dependencies = [
  "base64 0.23.1",
  "blake3",
  "hashbrown 0.16.1",
  "rezzy-json",
- "rezzy-recon",
+ "rezzy-recon 0.6.0-rc.1",
  "sha2",
 ]
 
 [[package]]
 name = "rezzy-json"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#1504cc760efeeb29c88e93662b754bec147dddf4"
 dependencies = [
  "ryu",
+]
+
+[[package]]
+name = "rezzy-recon"
+version = "0.6.0-rc.1"
+dependencies = [
+ "base64 0.23.1",
+ "sha2",
 ]
 
 [[package]]
@@ -1602,9 +1608,9 @@ dependencies = [
 
 [[package]]
 name = "sha2"
-version = "0.11.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4"
+checksum = "47d7069beb7d6ac7b9acd1039986e73443f24234f41074da099d6f994ac9ad19"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.1",

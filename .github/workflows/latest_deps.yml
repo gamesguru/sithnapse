@@ -22,7 +22,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  RUST_VERSION: 1.87.0
+  RUST_VERSION: 1.88.0
   UV_HTTP_RETRIES: 5
 
 jobs:
