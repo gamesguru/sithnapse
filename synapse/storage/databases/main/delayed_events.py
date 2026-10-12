@@ -321,19 +321,16 @@ class DelayedEventsStore(SQLBaseStore):
             "restart_delayed_event", restart_delayed_event_txn
         )
 
-    async def get_count_of_delayed_events(self) -> int:
-        """Returns the number of pending delayed events in the DB."""
+    async def have_delayed_events(self) -> bool:
+        """Whether there are any delayed-event rows in the DB."""
 
-        def _get_count_of_delayed_events(txn: LoggingTransaction) -> int:
-            sql = "SELECT count(*) FROM delayed_events"
-
-            txn.execute(sql)
-            resp = txn.fetchone()
-            return resp[0] if resp is not None else 0
+        def _have_delayed_events(txn: LoggingTransaction) -> bool:
+            txn.execute("SELECT 1 FROM delayed_events LIMIT 1")
+            return txn.fetchone() is not None
 
         return await self.db_pool.runInteraction(
-            "get_count_of_delayed_events",
-            _get_count_of_delayed_events,
+            "have_delayed_events",
+            _have_delayed_events,
         )
 
     async def get_delayed_event_for_user(
