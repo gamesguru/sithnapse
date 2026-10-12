@@ -1669,10 +1669,14 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 # so a rolled-back transaction's id is never reissued, and
                 # nothing will ever look this state_group up again.
                 _et = time.monotonic()
-                engine.put_room_index(
+                inner_ns = engine.put_room_index(
                     self._embedded_db_namespace, [(state_group, room_prefix)]
                 )
                 ffi_timing("ffi_put_room_index", time.monotonic() - _et)
+                # Time inside the GIL-released write; the gap to the span
+                # above is argument conversion plus GIL re-acquisition.
+                if isinstance(inner_ns, int):
+                    ffi_timing("ffi_put_room_index_inner", inner_ns / 1e9)
                 if pending_room_roots is not None:
                     pending_room_roots.append((state_group, root_value))
                     return

@@ -1626,13 +1626,20 @@ pub fn put_room_index(
     py: Python<'_>,
     namespace: String,
     entries: Vec<(i64, Vec<u8>)>,
-) -> PyResult<()> {
+) -> PyResult<u64> {
     assert_writable()?;
     // `room_index::put` does blocking local I/O and takes its own handle
     // cache mutex. Release the GIL while it runs so concurrent Python threads
     // (including test-harness Postgres dispatchers) are not serialized behind
     // this write.
-    py.detach(|| room_index::put(&namespace, &entries))
+    //
+    // Returns the nanoseconds spent inside the detached closure, so a caller
+    // timing the whole call can separate the write from GIL re-acquisition.
+    py.detach(|| {
+        let started = std::time::Instant::now();
+        room_index::put(&namespace, &entries)?;
+        Ok(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX))
+    })
 }
 
 #[pyfunction]
