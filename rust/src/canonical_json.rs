@@ -683,8 +683,7 @@ where
             // only has one field and we've handled it in `serialize_field`.
             if !self.map.is_empty() {
                 return Err(Self::Error::custom(format!(
-                    "unexpected fields in `{}`",
-                    SERDE_JSON_NUMBER_TOKEN
+                    "unexpected fields in `{SERDE_JSON_NUMBER_TOKEN}`"
                 )));
             }
         }

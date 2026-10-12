@@ -181,7 +181,7 @@ where
                     if let Some(tx) = success_sender
                         .lock()
                         .map_err(|err| {
-                            anyhow::anyhow!("Failed to acquire lock on `success_sender`: {:#}", err)
+                            anyhow::anyhow!("Failed to acquire lock on `success_sender`: {err:#}")
                         })?
                         .take()
                     {
@@ -202,7 +202,7 @@ where
                     if let Some(tx) = error_sender
                         .lock()
                         .map_err(|err| {
-                            anyhow::anyhow!("Failed to acquire lock on `error_sender`: {:#}", err)
+                            anyhow::anyhow!("Failed to acquire lock on `error_sender`: {err:#}")
                         })?
                         .take()
                     {

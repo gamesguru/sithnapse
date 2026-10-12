@@ -404,8 +404,8 @@ fn root_record_parts(value: &[u8]) -> Result<(Vec<u8>, String, &[u8]), String> {
 fn state_group_id_from_root_value(value: &[u8]) -> Result<[u8; 32], String> {
     let (_, _, lattice_bytes) = root_record_parts(value)?;
     let mut lattice = [0u16; 1024];
-    for (index, chunk) in lattice_bytes.chunks_exact(2).enumerate() {
-        lattice[index] = u16::from_le_bytes([chunk[0], chunk[1]]);
+    for (index, chunk) in lattice_bytes.as_chunks::<2>().0.iter().enumerate() {
+        lattice[index] = u16::from_le_bytes(*chunk);
     }
     Ok(rezzy::hamt::state_group_id_from_lthash(
         &rezzy::incremental::LtHash::from_lanes(lattice),
@@ -700,7 +700,7 @@ pub fn put_state_hamt_roots(
             return Ok(());
         }
         let committed = engine.put_many(&room_id, &pairs).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {}", e))
+            pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {e}"))
         })?;
         if committed != pairs.len() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -855,7 +855,7 @@ pub fn delete_state_hamt_roots_for_room(
             }
         }
         let committed = engine.put_many(&room_id, &pairs).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb delete error: {}", e))
+            pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb delete error: {e}"))
         })?;
         if committed != pairs.len() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -1385,7 +1385,7 @@ mod room_index {
             {
                 break;
             }
-            for record in bytes.chunks_exact(RECORD_LEN).rev() {
+            for record in bytes.as_chunks::<RECORD_LEN>().0.iter().rev() {
                 if record[..INDEX_MAGIC.len()] != INDEX_MAGIC
                     || record[INDEX_MAGIC.len()..INDEX_MAGIC.len() + NAMESPACE_DIGEST_LEN]
                         != *namespace_digest
@@ -2186,8 +2186,7 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
         )
         .map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "failed to open shared mtxdb database: {}",
-                e
+                "failed to open shared mtxdb database: {e}"
             ))
         })?;
         let state = shared_database.pool(ShardType::State).clone();
@@ -2261,7 +2260,7 @@ pub fn open_client_read_only(py: Python<'_>, path: String) -> PyResult<()> {
             return Ok(());
         }
         let layout = DatabaseLayout::open(std::path::PathBuf::from(&path)).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("failed to open mtxdb layout: {}", e))
+            pyo3::exceptions::PyRuntimeError::new_err(format!("failed to open mtxdb layout: {e}"))
         })?;
         if !wal_enabled()
             && layout.shared_wal_path().is_file()
@@ -2332,17 +2331,11 @@ pub fn open_client_read_only(py: Python<'_>, path: String) -> PyResult<()> {
         let auth_chain_signal_active = auth_chain.read_journal_publish_signal_active();
         if wal_enabled() {
             log::info!(
-                "mtxdb read-only worker opened: publish_signal_active state={} event_dag={} edges={}",
-                state_signal_active,
-                event_dag_signal_active,
-                auth_chain_signal_active,
+                "mtxdb read-only worker opened: publish_signal_active state={state_signal_active} event_dag={event_dag_signal_active} edges={auth_chain_signal_active}",
             );
         } else {
             log::debug!(
-                "mtxdb read-only worker opened (snapshot, no publish signal): state={} event_dag={} edges={}",
-                state_signal_active,
-                event_dag_signal_active,
-                auth_chain_signal_active,
+                "mtxdb read-only worker opened (snapshot, no publish signal): state={state_signal_active} event_dag={event_dag_signal_active} edges={auth_chain_signal_active}",
             );
         }
         let _ = DBS.set(MtxdbPools {
@@ -2395,9 +2388,9 @@ pub fn put_state_hamt_nodes(
     let t1 = std::time::Instant::now();
     py.detach(|| {
         let engine = state_db()?;
-        engine.put_many(&room_id, &pairs).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {}", e))
-        })
+        engine
+            .put_many(&room_id, &pairs)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {e}")))
     })?;
     let put_many_us = t1.elapsed().as_micros();
 
@@ -2459,7 +2452,7 @@ pub fn put_auth_chain_links_batch(
             // the whole read-modify-write operation, but must not be captured by the
             // Ungil closure (MutexGuard is !Send).
             let _guard = RMW_LOCK.lock().map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {}", e))
+                pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}"))
             })?;
             let engine = auth_chain_db()?;
             let room_id = namespace_room_id(&namespace);
@@ -2481,8 +2474,7 @@ pub fn put_auth_chain_links_batch(
                     Ok(None) => Vec::new(),
                     Err(e) => {
                         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "mtxdb get error reading chain {}: {}",
-                            chain_id, e
+                            "mtxdb get error reading chain {chain_id}: {e}"
                         )))
                     }
                 };
@@ -2506,7 +2498,7 @@ pub fn put_auth_chain_links_batch(
             }
 
             engine.put_many(&room_id, &pairs_to_put).map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {}", e))
+                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {e}"))
             })?;
             Ok(())
         })
@@ -2519,7 +2511,7 @@ pub fn delete_auth_chain_links_batch(namespace: String, pairs: Vec<(i64, i64)>) 
     Python::attach(|py| {
         py.detach(|| {
             let _guard = RMW_LOCK.lock().map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {}", e))
+                pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}"))
             })?;
             let engine = auth_chain_db()?;
             let room_id = namespace_room_id(&namespace);
@@ -2534,7 +2526,7 @@ pub fn delete_auth_chain_links_batch(namespace: String, pairs: Vec<(i64, i64)>) 
             for (chain_id, seqs_to_delete) in grouped {
                 let node_id = chain_node_id(chain_id);
                 let data = engine.get(&room_id, &node_id).map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get error: {}", e))
+                    pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get error: {e}"))
                 })?;
                 if let Some(data) = data {
                     let edges = deserialize_manifest(&data.bytes);
@@ -2550,7 +2542,7 @@ pub fn delete_auth_chain_links_batch(namespace: String, pairs: Vec<(i64, i64)>) 
 
             if !pairs_to_put.is_empty() {
                 engine.put_many(&room_id, &pairs_to_put).map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {}", e))
+                    pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {e}"))
                 })?;
             }
             Ok(())
@@ -2583,7 +2575,7 @@ pub fn get_or_create_short_ids(
     Python::attach(|py| {
         py.detach(|| {
             let _guard = RMW_LOCK.lock().map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {}", e))
+                pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}"))
             })?;
             let engine = db_for_shard_type(ShardType::Edges)?;
             let collection = auth_chain_closure_room_id(&namespace, &room_id);
@@ -2594,7 +2586,7 @@ pub fn get_or_create_short_ids(
             for event_id in event_ids {
                 let fwd_id = short_id_forward_node_id(&event_id);
                 let existing = engine.get(&collection, &fwd_id).map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get error: {}", e))
+                    pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get error: {e}"))
                 })?;
 
                 if let Some(data) = existing {
@@ -2609,7 +2601,7 @@ pub fn get_or_create_short_ids(
                     // mapping already exists (see docstring above).
                     let rev_id = short_id_reverse_node_id(short_id);
                     let rev_present = engine.get(&collection, &rev_id).map_err(|e| {
-                        pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get error: {}", e))
+                        pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get error: {e}"))
                     })?;
                     if rev_present.is_none() {
                         engine
@@ -2620,8 +2612,7 @@ pub fn get_or_create_short_ids(
                             )
                             .map_err(|e| {
                                 pyo3::exceptions::PyRuntimeError::new_err(format!(
-                                    "mtxdb put error repairing reverse mapping: {}",
-                                    e
+                                    "mtxdb put error repairing reverse mapping: {e}"
                                 ))
                             })?;
                     }
@@ -2644,8 +2635,7 @@ pub fn get_or_create_short_ids(
                         }
                         Err(e) => {
                             return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                                "mtxdb get error reading counter: {}",
-                                e
+                                "mtxdb get error reading counter: {e}"
                             )))
                         }
                     },
@@ -2671,8 +2661,7 @@ pub fn get_or_create_short_ids(
                     )
                     .map_err(|e| {
                         pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "mtxdb put error updating counter: {}",
-                            e
+                            "mtxdb put error updating counter: {e}"
                         ))
                     })?;
 
@@ -2686,8 +2675,7 @@ pub fn get_or_create_short_ids(
                     )
                     .map_err(|e| {
                         pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "mtxdb put error writing forward mapping: {}",
-                            e
+                            "mtxdb put error writing forward mapping: {e}"
                         ))
                     })?;
 
@@ -2700,8 +2688,7 @@ pub fn get_or_create_short_ids(
                     )
                     .map_err(|e| {
                         pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "mtxdb put error writing reverse mapping: {}",
-                            e
+                            "mtxdb put error writing reverse mapping: {e}"
                         ))
                     })?;
 
@@ -2807,7 +2794,7 @@ pub fn auth_chain_edges_put(
             })
             .collect();
         let committed = engine.put_many(&collection, &pairs).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {}", e))
+            pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {e}"))
         })?;
         if committed != pairs.len() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -2874,7 +2861,7 @@ pub fn auth_chain_children_append(
     Python::attach(|py| {
         py.detach(|| {
             let _guard = RMW_LOCK.lock().map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {}", e))
+                pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}"))
             })?;
             let engine = db_for_shard_type(ShardType::Edges)?;
             let collection = auth_chain_closure_room_id(&namespace, &room_id);
@@ -2902,8 +2889,7 @@ pub fn auth_chain_children_append(
                     Ok(None) => Vec::new(),
                     Err(e) => {
                         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "mtxdb get error reading children of {}: {}",
-                            parent_short_id, e
+                            "mtxdb get error reading children of {parent_short_id}: {e}"
                         )))
                     }
                 };
@@ -2923,7 +2909,7 @@ pub fn auth_chain_children_append(
 
             if !pairs_to_put.is_empty() {
                 engine.put_many(&collection, &pairs_to_put).map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {}", e))
+                    pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {e}"))
                 })?;
             }
             Ok(())
@@ -2944,10 +2930,7 @@ pub fn auth_chain_purge_room(py: Python<'_>, namespace: String, room_id: String)
         let engine = db_for_shard_type(ShardType::Edges)?;
         let collection = auth_chain_closure_room_id(&namespace, &room_id);
         engine.delete_collection(&collection).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "mtxdb delete_collection error: {}",
-                e
-            ))
+            pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb delete_collection error: {e}"))
         })
     })
 }
@@ -3876,10 +3859,7 @@ pub fn event_json_purge_room(py: Python<'_>, namespace: String, room_id: String)
         let engine = event_dag_db()?;
         let collection = event_dag_room_id(&namespace, &room_id);
         engine.delete_collection(&collection).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "mtxdb delete_collection error: {}",
-                e
-            ))
+            pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb delete_collection error: {e}"))
         })
     })
 }
@@ -3909,8 +3889,7 @@ pub fn materialize_state_hamt(
 ) -> PyResult<Option<StateEntries>> {
     let room_prefix: [u8; ROOM_PREFIX_LEN] = room_prefix.try_into().map_err(|_| {
         pyo3::exceptions::PyValueError::new_err(format!(
-            "room_prefix must be {} bytes",
-            ROOM_PREFIX_LEN
+            "room_prefix must be {ROOM_PREFIX_LEN} bytes"
         ))
     })?;
     let root_structural_hash: StructuralHash = root_structural_hash.try_into().map_err(|_| {
@@ -3948,8 +3927,7 @@ pub fn materialize_state_hamts(
         .map(|(room_prefix, root_hash, room_id)| {
             let room_prefix: [u8; ROOM_PREFIX_LEN] = room_prefix.try_into().map_err(|_| {
                 pyo3::exceptions::PyValueError::new_err(format!(
-                    "room_prefix must be {} bytes",
-                    ROOM_PREFIX_LEN
+                    "room_prefix must be {ROOM_PREFIX_LEN} bytes"
                 ))
             })?;
             let root_hash: StructuralHash = root_hash.try_into().map_err(|_| {
@@ -3984,8 +3962,7 @@ pub fn lookup_state_hamts(
         .map(|(room_prefix, root_hash, structural_key, keys)| {
             let room_prefix: [u8; ROOM_PREFIX_LEN] = room_prefix.try_into().map_err(|_| {
                 pyo3::exceptions::PyValueError::new_err(format!(
-                    "room_prefix must be {} bytes",
-                    ROOM_PREFIX_LEN
+                    "room_prefix must be {ROOM_PREFIX_LEN} bytes"
                 ))
             })?;
             let root_hash: StructuralHash = root_hash.try_into().map_err(|_| {
@@ -4014,7 +3991,7 @@ pub fn increment_counters_batch(pairs: Vec<(Vec<u8>, i64)>) -> PyResult<Vec<i64>
     Python::attach(|py| {
         py.detach(|| {
             let _guard = RMW_LOCK.lock().map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {}", e))
+                pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}"))
             })?;
             let engine = state_db()?;
             let room_id = kv_room_id();
@@ -4042,8 +4019,7 @@ pub fn increment_counters_batch(pairs: Vec<(Vec<u8>, i64)>) -> PyResult<Vec<i64>
                     }
                     Err(e) => {
                         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "mtxdb get error reading counter: {}",
-                            e
+                            "mtxdb get error reading counter: {e}"
                         )))
                     }
                 };
@@ -4057,7 +4033,7 @@ pub fn increment_counters_batch(pairs: Vec<(Vec<u8>, i64)>) -> PyResult<Vec<i64>
 
             if !puts.is_empty() {
                 engine.put_many(&room_id, &puts).map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {}", e))
+                    pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {e}"))
                 })?;
             }
 

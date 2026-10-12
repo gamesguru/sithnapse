@@ -183,7 +183,7 @@ impl DatabasePool for PythonDatabasePoolWrapper {
                     match func(&mut txn).now_or_never() {
                         Some(Ok(value)) => {
                             let mut callback_slot = callback_slot.lock().map_err(|err| {
-                                anyhow::anyhow!("Failed to lock `callback_slot`: {:#}", err)
+                                anyhow::anyhow!("Failed to lock `callback_slot`: {err:#}")
                             })?;
                             *callback_slot = Some(Ok(value));
                             Ok(py.None())
@@ -194,7 +194,7 @@ impl DatabasePool for PythonDatabasePoolWrapper {
                             // serialization/deadlock errors).
                             let py_err = anyhow_to_pyerr(py, &err);
                             let mut callback_slot = callback_slot.lock().map_err(|err| {
-                                anyhow::anyhow!("Failed to lock `callback_slot`: {:#}", err)
+                                anyhow::anyhow!("Failed to lock `callback_slot`: {err:#}")
                             })?;
                             *callback_slot = Some(Err(err));
                             Err(py_err)
@@ -227,7 +227,7 @@ impl DatabasePool for PythonDatabasePoolWrapper {
         // Return the result we captured based on if `runInteraction` was successful
         let captured_result = result_slot
             .lock()
-            .map_err(|err| anyhow::anyhow!("Failed to acquire lock on `result_slot`: {:#}", err))?
+            .map_err(|err| anyhow::anyhow!("Failed to acquire lock on `result_slot`: {err:#}"))?
             .take();
         match run_interaction_outcome {
             // Only return the `captured_result` if `runInteraction` succeeded. We don't
@@ -244,7 +244,7 @@ impl DatabasePool for PythonDatabasePoolWrapper {
                 )),
             },
             Err(py_err) => Err(anyhow::Error::from(py_err))
-                .with_context(|| format!("run_interaction(name={}) failed", name)),
+                .with_context(|| format!("run_interaction(name={name}) failed")),
         }
     }
 }

@@ -235,7 +235,7 @@ impl Event {
             let room_version_str = r.extract::<&str>()?;
             room_version_str
                 .parse()
-                .map_err(|e| PyValueError::new_err(format!("Unsupported room version: {}", e)))?
+                .map_err(|e| PyValueError::new_err(format!("Unsupported room version: {e}")))?
         };
 
         let rejected_reason = rejected_reason.map(String::into_boxed_str);
@@ -244,8 +244,7 @@ impl Event {
         // a `ValueError`.
         let parsed_event = event_dict_from_json_str(room_version, event_json).map_err(|err| {
             let new_err = PyValueError::new_err(format!(
-                "Failed to parse event for room version {}: {}",
-                room_version, err
+                "Failed to parse event for room version {room_version}: {err}"
             ));
             new_err.set_cause(py, Some(PyValueError::new_err(err.to_string())));
             new_err
@@ -264,11 +263,11 @@ impl Event {
                 // having out-of-range integers), which we report as
                 // `ValueError` as it indicates the event is invalid.
                 let event_value = serde_json::to_value(&parsed_event).map_err(|err| {
-                    PyValueError::new_err(format!("Failed to serialize event: {}", err))
+                    PyValueError::new_err(format!("Failed to serialize event: {err}"))
                 })?;
                 calculate_event_id(&event_value, room_version)
                     .map_err(|err| {
-                        PyValueError::new_err(format!("Failed to calculate event_id: {}", err))
+                        PyValueError::new_err(format!("Failed to calculate event_id: {err}"))
                     })?
                     .into()
             }
@@ -281,16 +280,14 @@ impl Event {
                 .room_id(&event_id, &parsed_event.common_fields)
                 .map_err(|err| {
                 PyValueError::new_err(format!(
-                    "Failed to calculate room_id for event {}: {}",
-                    event_id, err
+                    "Failed to calculate room_id for event {event_id}: {err}"
                 ))
             })?,
             EventFormatEnum::VMSC4242(format) => format
                 .room_id(&event_id, &parsed_event.common_fields)
                 .map_err(|err| {
                     PyValueError::new_err(format!(
-                        "Failed to calculate room_id for event {}: {}",
-                        event_id, err
+                        "Failed to calculate room_id for event {event_id}: {err}"
                     ))
                 })?,
         };
@@ -505,11 +502,11 @@ impl Event {
 
         let fields_str = fields
             .into_iter()
-            .map(|(name, value)| format!("{}={}", name, value))
+            .map(|(name, value)| format!("{name}={value}"))
             .collect::<Vec<_>>()
             .join(", ");
 
-        Ok(format!("<Event {}>", fields_str))
+        Ok(format!("<Event {fields_str}>"))
     }
 
     // Below are the methods for interacting with the event as a mapping.
@@ -732,10 +729,7 @@ fn event_dict_from_json_str(
             event_format.into()
         }
         _ => {
-            return Err(anyhow::anyhow!(
-                "Unsupported room version: {}",
-                room_version
-            ));
+            return Err(anyhow::anyhow!("Unsupported room version: {room_version}"));
         }
     };
 
@@ -751,7 +745,7 @@ fn event_dict_from_json_str(
 #[pyfunction(name = "redact_event")]
 fn redact_event_py(event: &Event) -> PyResult<Event> {
     let event_value = serde_json::to_value(&event.parsed_event).map_err(|err| {
-        PyValueError::new_err(format!("Failed to serialize event for redaction: {}", err))
+        PyValueError::new_err(format!("Failed to serialize event for redaction: {err}"))
     })?;
 
     let redacted_value = redact(&event_value, event.room_version)?;
@@ -760,11 +754,11 @@ fn redact_event_py(event: &Event) -> PyResult<Event> {
     // through JSON. See [`FormattedEvent`] for details on why we can't go
     // directly through Python dicts.
     let redacted_event_json = serde_json::to_string(&redacted_value).map_err(|err| {
-        PyValueError::new_err(format!("Failed to serialize redacted event: {}", err))
+        PyValueError::new_err(format!("Failed to serialize redacted event: {err}"))
     })?;
     let redacted_formatted_event =
         event_dict_from_json_str(event.room_version, &redacted_event_json).map_err(|err| {
-            PyValueError::new_err(format!("Failed to deserialize redacted event: {}", err))
+            PyValueError::new_err(format!("Failed to deserialize redacted event: {err}"))
         })?;
 
     let redacted_event = Event {

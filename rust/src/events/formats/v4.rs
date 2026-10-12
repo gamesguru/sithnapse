@@ -119,8 +119,7 @@ pub fn validate_optional_room_id(
             // '!'.
             ensure!(
                 room_id.starts_with("!"),
-                "room_id must start with '!': {}",
-                room_id
+                "room_id must start with '!': {room_id}"
             );
 
             Ok(Some(Arc::clone(room_id)))
@@ -145,7 +144,7 @@ pub fn get_room_id_for_optional_room_id(
             // This is the create event, where the room ID is derived from the
             // event ID by replacing the leading '$' with '!'.
             if !event_id.starts_with('$') {
-                bail!("Create event ID does not start with '$': {}", event_id);
+                bail!("Create event ID does not start with '$': {event_id}");
             }
 
             let mut room_id = String::with_capacity(event_id.len());
