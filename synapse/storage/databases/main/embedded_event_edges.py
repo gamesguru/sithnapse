@@ -44,6 +44,7 @@ import logging
 import threading
 import time
 import uuid
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Callable, Iterable, TypeVar, cast
 
 from prometheus_client import Counter
@@ -453,6 +454,28 @@ event_edge_publish_signal_gauge = LaterGauge(
     labelnames=["pool", SERVER_NAME_LABEL],
 )
 
+
+@lru_cache(maxsize=32)
+def _event_edge_read_metric(path: str, outcome: str, server_name: str) -> Any:
+    return event_edge_reads_counter.labels(
+        path=path, outcome=outcome, **{SERVER_NAME_LABEL: server_name}
+    )
+
+
+@lru_cache(maxsize=16)
+def _event_edge_repair_metric(path: str, result: str, server_name: str) -> Any:
+    return event_edge_repairs_counter.labels(
+        path=path, result=result, **{SERVER_NAME_LABEL: server_name}
+    )
+
+
+@lru_cache(maxsize=8)
+def _event_edge_repaired_rows_metric(path: str, server_name: str) -> Any:
+    return event_edge_repaired_rows_counter.labels(
+        path=path, **{SERVER_NAME_LABEL: server_name}
+    )
+
+
 _publish_signal_api_warning_lock = threading.Lock()
 _publish_signal_api_warning_logged = False
 
@@ -482,21 +505,16 @@ def classify_event_edge_fallback(forward_map: Any | None) -> str:
 
 def record_event_edge_read(server_name: str, path: str, outcome: str) -> None:
     """Count one event-edge lookup (see `event_edge_reads_counter`)."""
-    event_edge_reads_counter.labels(
-        path=path, outcome=outcome, **{SERVER_NAME_LABEL: server_name}
-    ).inc()
+    _event_edge_read_metric(path, outcome, server_name).inc()
 
 
 def record_event_edge_repair(
     server_name: str, path: str, ok: bool, rows: int = 0
 ) -> None:
     """Count one repair attempt and, if it succeeded, the rows it copied."""
-    labels = {SERVER_NAME_LABEL: server_name}
-    event_edge_repairs_counter.labels(
-        path=path, result="ok" if ok else "failed", **labels
-    ).inc()
+    _event_edge_repair_metric(path, "ok" if ok else "failed", server_name).inc()
     if ok and rows:
-        event_edge_repaired_rows_counter.labels(path=path, **labels).inc(rows)
+        _event_edge_repaired_rows_metric(path, server_name).inc(rows)
 
 
 def register_publish_signal_gauge(hs: HomeServer) -> None:
