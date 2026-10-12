@@ -1370,7 +1370,10 @@ mod room_index {
         let Ok(mut records_left) = usize::try_from(length / RECORD_LEN as u64) else {
             return found;
         };
-        let mut buf = vec![0u8; SCAN_CHUNK_RECORDS * RECORD_LEN];
+        // Don't allocate a full chunk for the common small-shard case. The
+        // first chunk is the largest read; subsequent chunks are no larger.
+        let initial_chunk_records = records_left.min(SCAN_CHUNK_RECORDS);
+        let mut buf = vec![0u8; initial_chunk_records * RECORD_LEN];
         while records_left > 0 && found.len() < wanted.len() {
             let chunk_records = records_left.min(SCAN_CHUNK_RECORDS);
             let start = records_left - chunk_records;
