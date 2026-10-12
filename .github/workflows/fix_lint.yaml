@@ -45,10 +45,9 @@ jobs:
         continue-on-error: true
         run: uv run ruff format --quiet .
 
-      # The `rustup default` set by the Install Rust step above isn't enough:
-      # the repo's `rust-toolchain.toml` is a toolchain file, which rustup
-      # ranks above the default, so these would otherwise silently run on
-      # stable. See the note in tests.yml's `cargo-bench` job.
+      # Pin these steps to the nightly explicitly: RUSTUP_TOOLCHAIN outranks
+      # `rustup default`, so they can never silently run on stable. See the
+      # note in tests.yml's `cargo-bench` job.
       - run: cargo clippy --all-features --fix -- -D warnings
         continue-on-error: true
         env:
