@@ -1618,7 +1618,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         (bg_updates.py) -- which only ever has a bare `state_group` int, by
         design -- find the right room's collection to look in, without SQL
         or a second shared mtxdb collection. See `put_room_index`'s module
-        doc comment (`rust/src/database/mtxdb.rs`) for that index's
+        doc comment (`rust/src/database/mtxdb_syn.rs`) for that index's
         durability/concurrency invariants.
 
         Called synchronously in the persisting transaction: an embedded
@@ -1635,8 +1635,8 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         way `_store_state_hamt_nodes_txn`'s `put_many` already does for
         nodes, instead of paying that clone once per one-pair call. The
         room-index write is not deferred alongside it: it's a single
-        direct-offset syscall with no clone cost to amortize, so there's
-        nothing to gain by batching it, and eagerly writing it keeps
+        append to a shared shard file with no clone cost to amortize, so
+        there's nothing to gain by batching it, and eagerly writing it keeps
         `_fetch_hamt_roots_for_embedded_txn` able to resolve a state
         group's room immediately after this call returns rather than only
         after the batch's deferred root flush. The caller is responsible
