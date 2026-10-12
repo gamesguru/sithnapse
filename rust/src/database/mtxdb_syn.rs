@@ -1204,7 +1204,7 @@ mod room_index {
     // (`lookup_state_hamts` et al.) enforces the true 8-byte length, so a
     // padded value failed downstream with "room_prefix must be 8 bytes".
     // Keep recent mappings in-process after a successful write or read. This
-    // is an optimization only: the direct-offset file remains authoritative,
+    // is an optimization only: the append-only shard log remains authoritative,
     // so a worker that has not seen another worker's write simply falls back
     // to `pread`. Bounded retention keeps a long-running monolith from
     // turning the index into an unbounded second copy of all state groups.
