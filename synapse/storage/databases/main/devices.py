@@ -2410,6 +2410,50 @@ class DeviceWorkerStore(RoomMemberWorkerStore, EndToEndKeyWorkerStore):
                 stream_id,
             )
 
+    async def add_device_list_outbound_pokes_for_users(
+        self,
+        user_device_ids: Collection[tuple[str, str]],
+        hosts: Collection[str],
+        context: dict[str, str] | None,
+    ) -> None:
+        """Queue device updates for multiple (user_id, device_id) pairs to be
+        sent to the same set of hosts, in a single transaction.
+
+        Equivalent to calling `add_device_list_outbound_pokes` once per pair,
+        but avoids allocating a separate stream ID and opening a separate
+        transaction (its own connection-pool checkout, commit, etc.) for
+        each one -- e.g. after a partial-state room resync completes, this
+        can be called for every affected local user/device at once instead
+        of sequentially, one round trip per device.
+        """
+        # This generates new stream IDs and therefore must be called on a writer.
+        if not self._is_device_list_writer:
+            raise Exception("Can only be called on device list writers")
+
+        if not hosts or not user_device_ids:
+            return
+
+        def add_device_list_outbound_pokes_for_users_txn(
+            txn: LoggingTransaction,
+        ) -> None:
+            stream_ids = self._device_list_id_gen.get_next_mult_txn(
+                txn, len(user_device_ids)
+            )
+            for (user_id, device_id), stream_id in zip(user_device_ids, stream_ids):
+                self._add_device_outbound_poke_to_stream_txn(
+                    txn,
+                    user_id=user_id,
+                    device_id=device_id,
+                    hosts=hosts,
+                    stream_id=stream_id,
+                    context=context,
+                )
+
+        await self.db_pool.runInteraction(
+            "add_device_list_outbound_pokes_for_users",
+            add_device_list_outbound_pokes_for_users_txn,
+        )
+
     async def add_remote_device_list_to_pending(
         self, user_id: str, device_id: str
     ) -> None:

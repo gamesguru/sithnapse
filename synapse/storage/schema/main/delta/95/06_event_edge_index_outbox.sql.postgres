@@ -1,0 +1,18 @@
+-- Durable publication queue for the embedded forward-edge index.
+-- The edge row, room version, and outbox mutation are committed together.
+CREATE TABLE room_edge_source_version (
+    room_id TEXT NOT NULL PRIMARY KEY,
+    source_version BIGINT NOT NULL
+);
+
+CREATE TABLE edge_index_outbox (
+    room_id TEXT NOT NULL,
+    source_version BIGINT NOT NULL,
+    event_id TEXT NOT NULL,
+    prev_event_id TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    PRIMARY KEY (room_id, source_version, event_id, prev_event_id, operation)
+);
+
+CREATE INDEX edge_index_outbox_room_version
+    ON edge_index_outbox (room_id, source_version);

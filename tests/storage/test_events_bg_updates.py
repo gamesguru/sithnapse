@@ -14,7 +14,12 @@
 #
 
 
+import atexit
 import json
+import shutil
+import tempfile
+from typing import Any
+from unittest.mock import patch
 
 import signedjson.key
 from canonicaljson import encode_canonical_json
@@ -27,10 +32,17 @@ from synapse.rest import admin
 from synapse.rest.client import login, room
 from synapse.server import HomeServer
 from synapse.storage.background_updates import BackgroundUpdater
+from synapse.storage.database import LoggingTransaction
+from synapse.storage.databases.main import events_bg_updates
+from synapse.storage.databases.main.embedded_event_to_state_group import (
+    get_state_group_for_events_batch,
+)
 from synapse.types.storage import _BackgroundUpdates
 from synapse.util.clock import Clock
 
 from tests.unittest import HomeserverTestCase, override_config
+
+_MTXDB_DIR: str | None = None
 
 
 class TestFixupMaxDepthCapBgUpdate(HomeserverTestCase):
@@ -453,3 +465,117 @@ class TestResignEventsBgUpdate(HomeserverTestCase):
         self.assertIn(
             new_key_id, new_event.signatures[self.hs.config.server.server_name]
         )
+
+
+class TestEventToStateGroupMigrationLockOrder(HomeserverTestCase):
+    """The SQL -> mtxdb `event_to_state_groups` migration has to take the
+    per-event SQL lock before it probes mtxdb: the probe decides which rows get
+    written, so it (and the write after it) must not interleave with a
+    partial-state rewrite or a purge of the same row."""
+
+    def prepare(
+        self, reactor: MemoryReactor, clock: Clock, homeserver: HomeServer
+    ) -> None:
+        from synapse.synapse_rust import mtxdb_engine
+
+        self.store = self.hs.get_datastores().main
+
+        # The engine is process-global and `open_client` only honours the first
+        # path, so the directory must outlive every test in the process.
+        global _MTXDB_DIR
+        if _MTXDB_DIR is None:
+            _MTXDB_DIR = tempfile.mkdtemp(prefix="test-esg-migration-lock-")
+            atexit.register(shutil.rmtree, _MTXDB_DIR, ignore_errors=True)
+        mtxdb_engine.open_client(_MTXDB_DIR)
+        # Isolate each test with its own namespace within the shared store.
+        namespace = tempfile.mkdtemp(prefix="ns-", dir=_MTXDB_DIR)
+        self.engine = "mtxdb"
+        self.namespace = namespace
+        self.store._embedded_event_json_enabled = True
+        self.store._embedded_db_engine = self.engine
+        self.store._embedded_db_namespace = self.namespace
+
+    def _run_migration(self) -> None:
+        """Run the migration to completion through the real background updater
+        (the handler is only registered when the engine is configured, which
+        the test homeserver doesn't do)."""
+        updates = self.store.db_pool.updates
+        name = self.store.EMBEDDED_EVENT_TO_STATE_GROUP_MIGRATION_UPDATE_NAME
+        updates.register_background_update_handler(
+            name, self.store._background_migrate_event_to_state_groups_to_embedded
+        )
+        self.get_success(
+            self.store.db_pool.simple_upsert(
+                table="background_updates",
+                keyvalues={"update_name": name},
+                values={},
+                insertion_values={"progress_json": "{}"},
+            )
+        )
+        updates._all_done = False
+        while not self.get_success(updates.has_completed_background_update(name)):
+            self.get_success(updates.do_next_background_update(False))
+
+    def test_migration_drops_sql_rows_before_probing_mtxdb(self) -> None:
+        event_id = "$lockorder:example.com"
+        self.get_success(
+            self.store.db_pool.simple_upsert(
+                table="event_to_state_groups",
+                keyvalues={"event_id": event_id},
+                values={"state_group": 9601},
+            )
+        )
+
+        statements: list[str] = []
+        probe_statement_index: list[int] = []
+        original_execute = LoggingTransaction.execute
+        original_probe = events_bg_updates.get_state_group_for_events_batch
+
+        def record_execute(
+            txn: LoggingTransaction, sql: str, *args: Any, **kwargs: Any
+        ) -> Any:
+            statements.append(sql)
+            return original_execute(txn, sql, *args, **kwargs)
+
+        def record_probe(*args: Any, **kwargs: Any) -> Any:
+            if kwargs.get("purpose") == "migration_probe":
+                probe_statement_index.append(len(statements))
+            return original_probe(*args, **kwargs)
+
+        with (
+            patch.object(LoggingTransaction, "execute", record_execute),
+            patch.object(
+                events_bg_updates,
+                "get_state_group_for_events_batch",
+                record_probe,
+            ),
+        ):
+            self._run_migration()
+
+        # The migration probed exactly once...
+        self.assertEqual(len(probe_statement_index), 1, statements)
+        # ...and dropped the batch's SQL rows before it did, so the lock those
+        # deletes take is held across the probe and the mtxdb write that follow
+        # it. Without it a rewrite or purge of the same row could commit in
+        # between, and this batch would then put the group it read over the top.
+        drops = [
+            index
+            for index, sql in enumerate(statements)
+            if "DELETE FROM event_to_state_groups" in sql
+        ]
+        self.assertEqual(len(drops), 1, statements)
+        self.assertLess(drops[0], probe_statement_index[0])
+
+        # The batch still migrated normally: mtxdb is the only copy now.
+        self.assertEqual(
+            get_state_group_for_events_batch(self.engine, self.namespace, [event_id]),
+            {event_id: 9601},
+        )
+        rows = self.get_success(
+            self.store.db_pool.simple_select_list(
+                table="event_to_state_groups",
+                keyvalues={"event_id": event_id},
+                retcols=("state_group",),
+            )
+        )
+        self.assertEqual(rows, [])

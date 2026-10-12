@@ -96,6 +96,31 @@ pub mod utils;
 
 use json_object::JsonObject;
 
+#[derive(Clone)]
+pub(crate) struct EventResolverData {
+    pub(crate) event_id: String,
+    pub(crate) room_id: String,
+    pub(crate) event_type: String,
+    pub(crate) state_key: Option<String>,
+    pub(crate) sender: String,
+    pub(crate) origin_server_ts: u64,
+    pub(crate) depth: u64,
+    pub(crate) prev_events: Vec<String>,
+    pub(crate) auth_events: Vec<String>,
+    pub(crate) prev_state_events: Vec<String>,
+    /// Whether this event's room version is one where events carry
+    /// `prev_state_events` instead of `auth_events` (MSC4242 / room version
+    /// 2.2), i.e. `room_version.msc4242_state_dags`. Lets callers pick which
+    /// field to trust explicitly, rather than guessing from which one happens
+    /// to be non-empty.
+    pub(crate) msc4242_state_dags: bool,
+    /// Cloning this Arc-backed object shares the content tree with the event;
+    /// state resolution does not serialize or rebuild JSON for typed events.
+    pub(crate) content: JsonObject,
+    pub(crate) rejected: bool,
+    pub(crate) soft_failed: bool,
+}
+
 /// Called when registering modules with python.
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Register the `JsonObject` class as a `Mapping` so that `isinstance` works.
@@ -117,6 +142,7 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     child_module.add_function(wrap_pyfunction!(filter::event_visible_to_server_py, m)?)?;
     child_module.add_function(wrap_pyfunction!(redact_event_py, m)?)?;
     child_module.add_function(wrap_pyfunction!(redact_event_dict, m)?)?;
+    child_module.add_function(wrap_pyfunction!(sha256_canonical_json, m)?)?;
     child_module.add_function(wrap_pyfunction!(serialize::serialize_events, m)?)?;
     child_module.add_function(wrap_pyfunction!(serialize::format_event_raw, m)?)?;
     child_module.add_function(wrap_pyfunction!(serialize::format_event_for_client_v1, m)?)?;
@@ -135,6 +161,21 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
         .set_item("synapse.synapse_rust.events", child_module)?;
 
     Ok(())
+}
+
+/// Canonicalize a Python JSON-compatible value and return its SHA-256 digest.
+/// The conversion happens once in Rust; the canonical serializer streams
+/// directly into the hasher without creating an intermediate JSON string.
+#[pyfunction]
+#[pyo3(text_signature = "(value, /)")]
+fn sha256_canonical_json(value: Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+    let value: Value = depythonize(&value)?;
+    crate::canonical_json::sha256_canonical(
+        &value,
+        crate::canonical_json::CanonicalizationOptions::relaxed(),
+    )
+    .map(|digest| digest.to_vec())
+    .map_err(|err| PyValueError::new_err(err.to_string()))
 }
 
 /// The Rust-side representation of a Matrix event, exposed to Python.
@@ -344,7 +385,7 @@ impl Event {
 
     /// Returns the list of auth event IDs. The order matches the order
     /// specified in the event, though there is no meaning to it.
-    fn auth_event_ids(&self) -> PyResult<Vec<String>> {
+    pub(crate) fn auth_event_ids(&self) -> PyResult<Vec<String>> {
         match &*self.parsed_event.specific_fields {
             EventFormatEnum::V1(format) => Ok(format.auth_event_ids()),
             EventFormatEnum::V2V3(format) => Ok(format.auth_event_ids()),
@@ -628,6 +669,42 @@ impl Event {
             common.other_fields.get(REDACTS)
         };
         value
+    }
+}
+
+impl Event {
+    /// Extract the fields needed by state resolution.
+    ///
+    /// `content` is shared through `JsonObject`'s `Arc`; the event metadata and
+    /// event-reference lists are converted to owned strings for `LeanEvent`.
+    pub(crate) fn resolver_data(&self) -> PyResult<EventResolverData> {
+        let origin_server_ts = u64::try_from(self.origin_server_ts()).map_err(|_| {
+            PyValueError::new_err(format!(
+                "event {} has a negative origin_server_ts",
+                self.event_id
+            ))
+        })?;
+        let depth = u64::try_from(self.depth()).map_err(|_| {
+            PyValueError::new_err(format!("event {} has a negative depth", self.event_id))
+        })?;
+        let content = self.parsed_event.common_fields.content.clone();
+
+        Ok(EventResolverData {
+            event_id: self.event_id.to_string(),
+            room_id: self.room_id.to_string(),
+            event_type: self.r#type().to_string(),
+            state_key: self.get_state_key().map(str::to_owned),
+            sender: self.sender().to_string(),
+            origin_server_ts,
+            depth,
+            prev_events: self.prev_event_ids(),
+            auth_events: self.auth_event_ids()?,
+            prev_state_events: self.prev_state_events().unwrap_or_default(),
+            msc4242_state_dags: self.room_version.msc4242_state_dags,
+            content,
+            rejected: self.rejected_reason.is_some(),
+            soft_failed: self.internal_metadata.is_soft_failed()?,
+        })
     }
 }
 

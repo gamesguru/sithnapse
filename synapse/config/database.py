@@ -77,6 +77,35 @@ class DatabaseConnectionConfig:
         self.databases = data_stores
 
 
+def is_path_on_rotational_disk(path: str) -> bool | None:
+    """Return True if path is on a rotational drive (HDD), False if non-rotational (SSD/NVMe), or None if unknown."""
+    try:
+        p = path
+        while p and not os.path.exists(p):
+            parent = os.path.dirname(p)
+            if parent == p:
+                break
+            p = parent
+        if not os.path.exists(p):
+            return None
+        st = os.stat(p)
+        major, minor = os.major(st.st_dev), os.minor(st.st_dev)
+        for candidate in (
+            f"/sys/dev/block/{major}:{minor}/queue/rotational",
+            f"/sys/dev/block/{major}:{minor}/../queue/rotational",
+        ):
+            if os.path.exists(candidate):
+                with open(candidate) as f:
+                    val = f.read().strip()
+                    if val == "1":
+                        return True
+                    elif val == "0":
+                        return False
+    except Exception:
+        pass
+    return None
+
+
 class DatabaseConfig(Config):
     section = "database"
 
@@ -84,6 +113,55 @@ class DatabaseConfig(Config):
         super().__init__(*args)
 
         self.databases: list[DatabaseConnectionConfig] = []
+        self.embedded_db_engine: str | None = None
+        self.embedded_db_path: str | None = None
+        # Optional explicit namespace for HAMT keys in the embedded engine
+        # (see StateGroupDataStore.hamt_namespace) -- defaults to the server
+        # name when unset. Only useful for isolating multiple homeservers
+        # that share one embedded-engine file (e.g. many trial test
+        # processes reusing one mtxdb path), not a normal deployment concern.
+        self.embedded_db_namespace: str | None = None
+        # Diagnostic escape hatch: when True, all DURABLE-tier sync() calls
+        # are suppressed (maybe_sync returns immediately).  Reintroduces the
+        # silent-data-loss window that SyncTier.DURABLE exists to close --
+        # NOT for production use.  Set via embedded_db.no_sync or
+        # SYNAPSE_MTXDB_NO_SYNC env var.
+        self.embedded_db_no_sync: bool = False
+        # How persists make embedded writes visible and durable:
+        #   "interval" (the default): publish to other workers at the commit
+        #     boundary and let the flush coalescer group the fsyncs. A crash can
+        #     lose the writes of the last flush window (about 0.5s, 2s on a
+        #     rotational disk), and because the embedded event JSON and state
+        #     mappings have no SQL copy, a committed SQL row can then be left
+        #     without its mtxdb record. Needs the WAL; without it this behaves
+        #     as "always".
+        #   "always": fsync before a persist returns (one journal sync per
+        #     persisted event). Strict, and slow on a spinning disk.
+        #   "off": as interval but never fsync (tests and diagnostics only).
+        # Set via embedded_db.sync_mode or SYNAPSE_MTXDB_SYNC. `no_sync`
+        # above is the older spelling of "off".
+        self.embedded_db_sync_mode: str = "interval"
+        # Flush coalescer window for mtxdb in seconds.
+        # If unset (None), automatically tunes based on whether the database path
+        # resides on a rotational drive (HDD -> 2.0s) or non-rotational drive (SSD/NVMe -> 0.5s).
+        self.embedded_db_flush_delay_secs: float | None = None
+        # If set, Databases.__init__ timing data (tag → total seconds + call
+        # count) is written as JSON to this path after HomeServer.setup()
+        # completes.  Intended for profiling production startup (e.g.
+        # Complement runs) without the Trial test harness.  Set via
+        # database.setup_timings_path in config or SYNAPSE_DB_SETUP_TIMINGS_PATH
+        # env var.
+        self.setup_timings_path: str | None = None
+
+    @staticmethod
+    def _parse_sync_mode(value: object, name: str) -> str:
+        if not isinstance(value, str) or value.strip().lower() not in (
+            "always",
+            "interval",
+            "off",
+        ):
+            raise ConfigError(f"{name} must be one of: always, interval, off")
+        return value.strip().lower()
 
     def read_config(self, config: JsonDict, **kwargs: Any) -> None:
         # We *experimentally* support specifying multiple databases via the
@@ -104,6 +182,114 @@ class DatabaseConfig(Config):
         multi_database_config = config.get("databases")
         database_config = config.get("database")
         database_path = config.get("database_path")
+
+        embedded_config = config.get("embedded_db")
+        if embedded_config:
+            self.embedded_db_engine = embedded_config.get("engine")
+            self.embedded_db_path = embedded_config.get("path")
+            self.embedded_db_namespace = embedded_config.get("namespace")
+            no_sync = embedded_config.get("no_sync", False)
+            if not isinstance(no_sync, bool):
+                raise ConfigError("embedded_db.no_sync must be a boolean")
+            self.embedded_db_no_sync = no_sync
+            sync_mode = embedded_config.get("sync_mode")
+            if sync_mode is not None:
+                self.embedded_db_sync_mode = self._parse_sync_mode(
+                    sync_mode, "embedded_db.sync_mode"
+                )
+            flush_delay = embedded_config.get("flush_delay_secs")
+            if flush_delay is not None:
+                try:
+                    self.embedded_db_flush_delay_secs = float(flush_delay)
+                except (ValueError, TypeError):
+                    raise ConfigError("embedded_db.flush_delay_secs must be a number")
+
+        env_engine = os.environ.get("SYNAPSE_EMBEDDED_DB_ENGINE")
+        if env_engine:
+            self.embedded_db_engine = env_engine
+        env_path = os.environ.get("SYNAPSE_EMBEDDED_DB_PATH")
+        if env_path:
+            self.embedded_db_path = env_path
+        env_no_sync = os.environ.get("SYNAPSE_MTXDB_NO_SYNC")
+        if env_no_sync is not None and env_no_sync.strip().lower() not in (
+            "",
+            "0",
+            "false",
+            "no",
+            "off",
+        ):
+            self.embedded_db_no_sync = True
+
+        env_sync_mode = os.environ.get("SYNAPSE_MTXDB_SYNC")
+        if env_sync_mode is not None and env_sync_mode.strip():
+            self.embedded_db_sync_mode = self._parse_sync_mode(
+                env_sync_mode, "SYNAPSE_MTXDB_SYNC"
+            )
+
+        env_flush_delay = os.environ.get("SYNAPSE_MTXDB_FLUSH_DELAY_SECS")
+        if env_flush_delay:
+            try:
+                self.embedded_db_flush_delay_secs = float(env_flush_delay)
+            except (ValueError, TypeError):
+                raise ConfigError("SYNAPSE_MTXDB_FLUSH_DELAY_SECS must be a number")
+
+        # A concise production switch. The path is deliberately still
+        # required: unlike tests, a production server must never silently put
+        # persistent state into a temporary directory.
+        if os.environ.get("SYNAPSE_MTXDB"):
+            self.embedded_db_engine = "mtxdb"
+            self.embedded_db_path = os.environ.get(
+                "SYNAPSE_MTXDB_PATH", self.embedded_db_path
+            )
+            if not self.embedded_db_path:
+                raise ConfigError(
+                    "SYNAPSE_MTXDB requires SYNAPSE_MTXDB_PATH or embedded_db.path"
+                )
+
+        if self.embedded_db_flush_delay_secs is None and self.embedded_db_path:
+            is_rotational = is_path_on_rotational_disk(self.embedded_db_path)
+            if is_rotational is True:
+                self.embedded_db_flush_delay_secs = 2.0
+            else:
+                self.embedded_db_flush_delay_secs = 0.5
+
+        self.setup_timings_path = config.get("setup_timings_path") or os.environ.get(
+            "SYNAPSE_DB_SETUP_TIMINGS_PATH"
+        )
+
+        # Validate embedded_db engine/path consistency.
+        # A half-set config (engine without path) boots fine but crashes on
+        # first state write with "RuntimeError: mtxdb not opened".
+        if self.embedded_db_engine and not self.embedded_db_path:
+            raise ConfigError(
+                f"embedded_db.engine is set to {self.embedded_db_engine!r} "
+                "but embedded_db.path is not set. "
+                "Set embedded_db.path (or SYNAPSE_EMBEDDED_DB_PATH) to "
+                "a file path, or remove the engine setting."
+            )
+        if self.embedded_db_path and not self.embedded_db_engine:
+            raise ConfigError(
+                "embedded_db.path is set but embedded_db.engine is not. "
+                "Set embedded_db.engine (or SYNAPSE_EMBEDDED_DB_ENGINE) to "
+                "'mtxdb', or remove the path setting."
+            )
+        if self.embedded_db_engine and self.embedded_db_engine != "mtxdb":
+            raise ConfigError(
+                f"embedded_db.engine is {self.embedded_db_engine!r}, "
+                "but only 'mtxdb' is supported."
+            )
+
+        # Whether the embedded engine requires the write-ahead journal
+        # (SYNAPSE_MTXDB_WAL) is a *worker-deployment* question, not a
+        # database-section one: WAL only buys a read-only worker's
+        # get_many_with_refresh gate a visibility path (get_read_committed's
+        # overlay) that closes independently of a deferred checkpoint
+        # rewrite -- it is not a durability improvement (the coalescer's sync
+        # cadence is unchanged either way) and it does nothing for a single
+        # process, which never goes through that cross-process gate at all.
+        # So that check lives in synapse/config/workers.py, gated on the same
+        # "is this a multi-process deployment" predicate as the other
+        # embedded_db_engine worker guards there, not here.
 
         if multi_database_config and database_config:
             raise ConfigError("Can't specify both 'database' and 'databases' in config")

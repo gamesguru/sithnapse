@@ -70,3 +70,65 @@ class PartialStateStreamsTestCase(BaseMultiWorkerStreamTestCase):
         self.assertTrue(
             d.called, "get_current_hosts_in_room/await_full_state did not unblock"
         )
+
+    def test_un_partial_stated_event_cache_invalidation_over_replication(self) -> None:
+        """
+        Tests that when an event is un-partial-stated on the writer, the worker's
+        un-partial-stated cache gets invalidated over replication and re-queries SQL.
+        """
+        room_id = self.helper.create_room_as("@bob:test")
+        res = self.helper.send(room_id, "body", "@bob:test")
+        event_id = res["event_id"]
+        event = self.get_success(self.store.get_event(event_id))
+
+        worker = self.make_worker_hs("synapse.app.generic_worker")
+        worker_store = worker.get_datastores().main
+
+        # 1. Worker checks if event is un-partial-stated -> False, and caches it
+        is_un = self.get_success(worker_store.is_un_partial_stated_event(event_id))
+        self.assertFalse(is_un)
+        cached_val = worker_store.is_un_partial_stated_event.cache.get_immediate(
+            (event_id,), None
+        )
+        self.assertFalse(cached_val)
+
+        # 2. Mark event as partial state, then writer de-partial-states it
+        self.get_success(
+            self.store.store_partial_state_room(
+                room_id=room_id,
+                servers={"test"},
+                device_lists_stream_id=0,
+                joined_via="test",
+            )
+        )
+        self.get_success(
+            self.store.db_pool.simple_insert(
+                table="partial_state_events",
+                values={"room_id": room_id, "event_id": event_id},
+            )
+        )
+        context = self.get_success(
+            self.hs.get_state_handler().compute_event_context(event)
+        )
+        self.get_success(
+            self.store.update_state_for_partial_state_event(event, context)
+        )
+        self.hs.get_replication_notifier().notify_replication()
+
+        # 3. Advance reactor to deliver replication stream to worker
+        self.reactor.advance(0.1)
+
+        # 4. Worker cache should be invalidated and now return True
+        self.assertIsNone(
+            worker_store.is_un_partial_stated_event.cache.get_immediate(
+                (event_id,), None
+            )
+        )
+        is_un_now = self.get_success(worker_store.is_un_partial_stated_event(event_id))
+        self.assertTrue(is_un_now)
+
+        # 5. Batch cache lookup also works correctly
+        batch_map = self.get_success(
+            worker_store.get_un_partial_stated_events([event_id, "$nonexistent:test"])
+        )
+        self.assertEqual(batch_map, {event_id: True, "$nonexistent:test": False})

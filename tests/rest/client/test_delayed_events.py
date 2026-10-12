@@ -115,6 +115,9 @@ class DelayedEventsTestCase(HomeserverTestCase):
         self.reactor.advance(Duration(days=1).as_secs())
 
     def test_delayed_events_empty_on_startup(self) -> None:
+        self.assertFalse(
+            self.get_success(self.hs.get_datastores().main.have_delayed_events())
+        )
         self.assertListEqual([], self._get_delayed_events())
 
     def test_delayed_event_lookup(self) -> None:
@@ -130,6 +133,9 @@ class DelayedEventsTestCase(HomeserverTestCase):
         )
         self.assertEqual(channel.code, HTTPStatus.OK, channel.result)
         delay_id = channel.json_body["delay_id"]
+        self.assertTrue(
+            self.get_success(self.hs.get_datastores().main.have_delayed_events())
+        )
 
         # Test that the scheduled delayed event can be retrieved
         channel = self.make_request(

@@ -326,21 +326,21 @@ class MultiWriterIdGenerator(AbstractStreamIdGenerator):
             positive=positive,
         )
 
-        # We check that the table and sequence haven't diverged.
-        for table, _, id_column in tables:
-            self._sequence_gen.check_consistency(
-                db_conn,
-                table=table,
-                id_column=id_column,
-                stream_name=stream_name,
-                positive=positive,
-            )
+        if not db.is_fresh:
+            # We check that the table and sequence haven't diverged.
+            for table, _, id_column in tables:
+                self._sequence_gen.check_consistency(
+                    db_conn,
+                    table=table,
+                    id_column=id_column,
+                    stream_name=stream_name,
+                    positive=positive,
+                )
 
         # This goes and fills out the above state from the database.
-        # This may read on the PostgreSQL sequence, and
-        # SequenceGenerator.check_consistency might have fixed up the sequence, which
-        # means the SequenceGenerator needs to be setup before we read the value from
-        # the sequence.
+        # This reads on the PostgreSQL sequence (ensuring advanced sequences like
+        # thread_subscriptions_sequence are correctly initialized) and sets up
+        # _current_positions for all configured writers.
         self._load_current_ids(db_conn, tables, sequence_name)
 
         self._max_seen_allocated_stream_id = max(
@@ -616,6 +616,7 @@ class MultiWriterIdGenerator(AbstractStreamIdGenerator):
                 self._db.runInteraction,
                 "MultiWriterIdGenerator._update_table",
                 self._update_stream_positions_table_txn,
+                db_autocommit=True,
             )
 
         return self._return_factor * next_id
@@ -663,6 +664,7 @@ class MultiWriterIdGenerator(AbstractStreamIdGenerator):
                 self._db.runInteraction,
                 "MultiWriterIdGenerator._update_table",
                 self._update_stream_positions_table_txn,
+                db_autocommit=True,
             )
 
         return [self._return_factor * next_id for next_id in next_ids]
@@ -944,41 +946,27 @@ class _MultiWriterCtxManager:
     multiple_ids: int | None = None
     stream_ids: list[int] = attr.Factory(list)
 
-    async def __aenter__(self) -> int | list[int]:
-        def _load(txn: LoggingTransaction) -> list[int]:
-            ids = self.id_gen._load_next_mult_id_txn(txn, self.multiple_ids or 1)
-            # Record the allocated IDs on the context manager as a side effect
-            # (rather than only via the return value), so that if this coroutine
-            # is cancelled after the transaction has committed we still know
-            # which IDs to release below.
-            self.stream_ids = ids
-            return ids
+    def _load_next_ids_txn(
+        self, txn: LoggingTransaction, multiple_ids: int
+    ) -> list[int]:
+        ids = self.id_gen._load_next_mult_id_txn(txn, multiple_ids)
+        # Record the allocation while the database interaction is still running,
+        # so cancellation after commit can release IDs even if __aenter__ never
+        # returns and __aexit__ is therefore skipped.
+        self.stream_ids = ids
+        return ids
 
+    async def __aenter__(self) -> int | list[int]:
         # It's safe to run this in autocommit mode as fetching values from a
         # sequence ignores transaction semantics anyway.
         try:
             await self.id_gen._db.runInteraction(
                 "_load_next_mult_id",
-                _load,
+                self._load_next_ids_txn,
+                self.multiple_ids or 1,
                 db_autocommit=True,
             )
         except BaseException:
-            # We catch `BaseException` rather than `Exception`,
-            # because request cancellation surfaces here as exceptions that are
-            # not `Exception` subclasses: `asyncio.CancelledError`
-            # and `GeneratorExit` (raised when a paused coroutine is garbage
-            # collected).
-            #
-            # If we're interrupted (e.g. the enclosing request was cancelled)
-            # after the transaction allocated the IDs but before we returned,
-            # then `__aexit__` will never run, because Python only invokes it
-            # once `__aenter__` has returned. The allocated IDs would then be
-            # leaked into `_unfinished_ids` forever, permanently pinning the
-            # persisted stream position and, e.g., wedging presence.
-            #
-            # So mark them as finished here to unblock the position. This mirrors
-            # what `__aexit__` does on the failure path (marking the IDs finished
-            # and notifying replication, but not persisting a new position).
             if self.stream_ids:
                 self.id_gen._mark_ids_as_finished(self.stream_ids)
                 self.notifier.notify_replication()

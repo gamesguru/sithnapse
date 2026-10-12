@@ -10,12 +10,13 @@
 #
 # See the GNU Affero General Public License for more details:
 # <https://www.gnu.org/licenses/agpl-3.0.html>.
+import json
 import logging
 import random
 from collections.abc import Set
 from dataclasses import dataclass
 from itertools import chain
-from typing import TYPE_CHECKING, Collection, cast
+from typing import TYPE_CHECKING, Collection
 
 from twisted.internet.defer import Deferred
 
@@ -25,6 +26,7 @@ from synapse.api.errors import AuthError
 from synapse.events import EventBase
 from synapse.events.snapshot import EventPersistencePair
 from synapse.replication.tcp.streams._base import StickyEventsStream
+from synapse.storage._base import db_to_json
 from synapse.storage.database import (
     DatabasePool,
     LoggingDatabaseConnection,
@@ -32,6 +34,10 @@ from synapse.storage.database import (
     make_in_list_sql_clause,
 )
 from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
+from synapse.storage.databases.main.embedded_event_json import (
+    get_event_json_batch,
+    put_event_json_batch,
+)
 from synapse.storage.databases.main.events import DeltaState
 from synapse.storage.databases.main.state import StateGroupWorkerStore
 from synapse.storage.engines import PostgresEngine, Sqlite3Engine
@@ -223,9 +229,9 @@ class StickyEventsWorkerStore(StateGroupWorkerStore, CacheInvalidationWorkerStor
 
         txn.execute(
             f"""
-            SELECT se.stream_id, se.room_id, event_id
+            SELECT se.stream_id, se.room_id, se.event_id, {expr_soft_failed} AS "soft_failed"
             FROM sticky_events se
-            INNER JOIN event_json ej USING (event_id)
+            LEFT JOIN event_json ej USING (event_id)
             WHERE
                 NOT {expr_soft_failed}
                 AND ? < expires_at
@@ -237,7 +243,32 @@ class StickyEventsWorkerStore(StateGroupWorkerStore, CacheInvalidationWorkerStor
             """,
             (now, from_id, to_id, *room_id_in_list_values, *limit_params),
         )
-        return cast(list[tuple[int, str, str]], txn.fetchall())
+        rows = txn.fetchall()
+        if not rows:
+            return []
+
+        missing_meta_ids = [
+            event_id for _, _, event_id, soft_failed in rows if not soft_failed
+        ]
+        meta_by_id = {}
+        if missing_meta_ids and getattr(self, "_embedded_event_json_enabled", False):
+            found = get_event_json_batch(
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
+                missing_meta_ids,
+            )
+            for eid, (m, _, _) in found.items():
+                meta_by_id[eid] = (
+                    db_to_json(m).get("soft_failed", False) if m else False
+                )
+
+        result = []
+        for stream_id, room_id, event_id, soft_failed in rows:
+            if event_id in meta_by_id:
+                soft_failed = meta_by_id[event_id]
+            if not soft_failed:
+                result.append((stream_id, room_id, event_id))
+        return result
 
     async def get_updated_sticky_events(
         self, *, from_id: int, to_id: int, limit: int
@@ -284,21 +315,39 @@ class StickyEventsWorkerStore(StateGroupWorkerStore, CacheInvalidationWorkerStor
             SELECT se.stream_id, se.room_id, se.event_id,
             {expr_soft_failed} AS "soft_failed"
             FROM sticky_events se
-            INNER JOIN event_json ej USING (event_id)
+            LEFT JOIN event_json ej USING (event_id)
             WHERE ? < stream_id AND stream_id <= ?
             LIMIT ?
             """,
             (from_id, to_id, limit),
         )
+        rows = txn.fetchall()
+        if not rows:
+            return []
+
+        missing_ids = [
+            event_id for _, _, event_id, soft_failed in rows if not soft_failed
+        ]
+        meta_by_id = {}
+        if missing_ids and getattr(self, "_embedded_event_json_enabled", False):
+            found = get_event_json_batch(
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
+                missing_ids,
+            )
+            for eid, (m, _, _) in found.items():
+                meta_by_id[eid] = (
+                    db_to_json(m).get("soft_failed", False) if m else False
+                )
 
         return [
             StickyEventUpdate(
                 stream_id=stream_id,
                 room_id=room_id,
                 event_id=event_id,
-                soft_failed=bool(soft_failed),
+                soft_failed=meta_by_id.get(event_id, bool(soft_failed)),
             )
-            for stream_id, room_id, event_id, soft_failed in txn
+            for stream_id, room_id, event_id, soft_failed in rows
         ]
 
     def insert_sticky_events_txn(
@@ -654,18 +703,45 @@ class StickyEventsWorkerStore(StateGroupWorkerStore, CacheInvalidationWorkerStor
         # tractable, as we can't realistically apply any LIMIT here.
         txn.execute(
             f"""
-            SELECT se.event_id
+            SELECT se.event_id, {expr_soft_failed} AS "soft_failed"
             FROM sticky_events se
-            INNER JOIN event_json ej USING (event_id)
+            LEFT JOIN event_json ej USING (event_id)
             WHERE
                 se.room_id = ?
                 AND ? < se.expires_at
-                AND {expr_soft_failed}
                 {sender_clause}
             """,
             (room_id, self.clock.time_msec(), *sender_args),
         )
-        return [event_id for (event_id,) in txn]
+        rows = list(txn)
+
+        # With embedded event-JSON the SQL `event_json` mirror can lag or be
+        # absent altogether (rows live only in the embedded store), so a plain
+        # SQL filter on `soft_failed` would silently miss soft-failed sticky
+        # events. Consult the embedded store for rows whose SQL metadata is
+        # absent or says not-soft-failed, then filter in Python.
+        possibly_soft_failed_ids = [
+            event_id for event_id, soft_failed in rows if not soft_failed
+        ]
+        meta_by_id: dict[str, bool] = {}
+        if possibly_soft_failed_ids and getattr(
+            self, "_embedded_event_json_enabled", False
+        ):
+            found = get_event_json_batch(
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
+                possibly_soft_failed_ids,
+            )
+            for eid, (m, _, _) in found.items():
+                meta_by_id[eid] = (
+                    db_to_json(m).get("soft_failed", False) if m else False
+                )
+
+        return [
+            event_id
+            for event_id, soft_failed in rows
+            if meta_by_id.get(event_id, bool(soft_failed))
+        ]
 
     def un_soft_fail_sticky_events_txn(
         self, txn: LoggingTransaction, sticky_event_ids: Set[str]
@@ -707,6 +783,52 @@ class StickyEventsWorkerStore(StateGroupWorkerStore, CacheInvalidationWorkerStor
                 """,
                 event_id_in_list_args,
             )
+
+        # Under embedded event-JSON (embedded-exclusive mode) the SQL
+        # `event_json` row updated above may not exist, so also clear the
+        # soft-failed flag in the embedded mirror; otherwise reads that fall
+        # back to the embedded store still see the event as soft-failed.
+        if getattr(self, "_embedded_event_json_enabled", False):
+            found = get_event_json_batch(
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
+                list(sticky_event_ids),
+            )
+            mirror_rows: list[tuple[str, str, str, str, int | None]] = []
+            if found:
+                room_id_clause, room_id_args = make_in_list_sql_clause(
+                    txn.database_engine, "event_id", list(found)
+                )
+                txn.execute(
+                    f"SELECT event_id, room_id FROM events WHERE {room_id_clause}",
+                    room_id_args,
+                )
+                room_ids: dict[str, str] = dict(txn)
+                for event_id, (
+                    internal_metadata,
+                    json_str,
+                    format_version,
+                ) in found.items():
+                    room_id = room_ids.get(event_id)
+                    if room_id is None:
+                        continue
+                    metadata = db_to_json(internal_metadata)
+                    metadata["soft_failed"] = False
+                    mirror_rows.append(
+                        (
+                            event_id,
+                            room_id,
+                            json.dumps(metadata),
+                            json_str,
+                            format_version,
+                        )
+                    )
+            if mirror_rows:
+                put_event_json_batch(
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
+                    mirror_rows,
+                )
 
         # Invalidate caches as a result
         for event_id in sticky_event_ids:

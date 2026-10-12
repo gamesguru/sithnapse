@@ -206,6 +206,20 @@ class RoomMemberHandler(metaclass=abc.ABCMeta):
         self._push_writer = hs.config.worker.writers.push_rules[0]
         self._copy_push_client = ReplicationCopyPusherRestServlet.make_client(hs)
 
+    def _is_remote_invite_for_user(self, event: EventBase, target_user_id: str) -> bool:
+        """Whether ``event`` is the remote invite being acted on.
+
+        Remote OOB invites are stored as outliers and therefore have no state
+        group. The outlier flag is not sufficient here: an event loaded while
+        the invite is being de-outliered may not retain that metadata.
+        """
+        return (
+            event.type == EventTypes.Member
+            and event.state_key == target_user_id
+            and event.membership == Membership.INVITE
+            and not self.hs.is_mine_id(event.sender)
+        )
+
     def _on_user_joined_room(self, event_id: str, room_id: str) -> None:
         """Notify the rate limiter that a room join has occurred.
 

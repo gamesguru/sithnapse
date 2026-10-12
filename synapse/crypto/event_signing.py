@@ -35,7 +35,7 @@ from synapse.api.room_versions import RoomVersion
 from synapse.events import EventBase
 from synapse.events.utils import prune_event
 from synapse.logging.opentracing import trace
-from synapse.synapse_rust.events import redact_event_dict
+from synapse.synapse_rust.events import redact_event_dict, sha256_canonical_json
 from synapse.types import JsonDict, UserID
 
 logger = logging.getLogger(__name__)
@@ -105,8 +105,10 @@ def compute_content_hash(
     # N.B. no need to pop the room_id from create events in MSC4291 rooms
     # as they shouldn't have one.
 
-    event_json_bytes = encode_canonical_json(event_dict)
+    if hash_algorithm is hashlib.sha256:
+        return "sha256", sha256_canonical_json(event_dict)
 
+    event_json_bytes = encode_canonical_json(event_dict)
     hashed = hash_algorithm(event_json_bytes)
     return hashed.name, hashed.digest()
 
@@ -130,6 +132,9 @@ def compute_event_reference_hash(
     event_dict.pop("signatures", None)
     event_dict.pop("age_ts", None)
     event_dict.pop("unsigned", None)
+    if hash_algorithm is hashlib.sha256:
+        return "sha256", sha256_canonical_json(event_dict)
+
     event_json_bytes = encode_canonical_json(event_dict)
     hashed = hash_algorithm(event_json_bytes)
     return hashed.name, hashed.digest()

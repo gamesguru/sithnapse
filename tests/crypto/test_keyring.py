@@ -26,16 +26,21 @@ import attr
 import canonicaljson
 import signedjson.key
 import signedjson.sign
-from signedjson.key import encode_verify_key_base64, get_verify_key
+from signedjson.key import (
+    decode_verify_key_bytes,
+    encode_verify_key_base64,
+    get_verify_key,
+)
 from signedjson.types import SigningKey, VerifyKey
 
 from twisted.internet import defer
 from twisted.internet.defer import Deferred, ensureDeferred
 from twisted.internet.testing import MemoryReactor
 
-from synapse.api.errors import SynapseError
+from synapse.api.errors import HttpResponseException, SynapseError
 from synapse.crypto import keyring
 from synapse.crypto.keyring import (
+    KeyLookupError,
     PerspectivesKeyFetcher,
     ServerKeyFetcher,
     StoreKeyFetcher,
@@ -510,6 +515,220 @@ class ServerKeyFetcherTestCase(unittest.HomeserverTestCase):
 
         keys = self.get_success(fetcher.get_keys(SERVER_NAME, ["key1"], 0))
         self.assertEqual(keys, {})
+
+    def test_failed_fetch_backs_off_and_clears_on_success(self) -> None:
+        """MSC4499: a failed direct key fetch for a server MUST NOT trigger a
+        fresh outbound probe again until the backoff interval elapses, and a
+        subsequent successful fetch MUST clear that backoff state."""
+        self.reactor.advance(100)
+
+        SERVER_NAME = "server2"
+        fetcher = ServerKeyFetcher(self.hs)
+        testkey = signedjson.key.generate_signing_key("ver1")
+        testverifykey = signedjson.key.get_verify_key(testkey)
+        testverifykey_id = "ed25519:ver1"
+        VALID_UNTIL_TS = self.clock.time_msec() + 1000 * 1000
+
+        response = {
+            "server_name": SERVER_NAME,
+            "old_verify_keys": {},
+            "valid_until_ts": VALID_UNTIL_TS,
+            "verify_keys": {
+                testverifykey_id: {
+                    "key": signedjson.key.encode_verify_key_base64(testverifykey)
+                }
+            },
+        }
+        signedjson.sign.sign_json(response, SERVER_NAME, testkey)
+
+        call_count = 0
+
+        async def get_json(destination: str, path: str, **kwargs: Any) -> JsonDict:
+            nonlocal call_count
+            call_count += 1
+            raise HttpResponseException(502, "Failed to fetch", b"")
+
+        self.http_client.get_json.side_effect = get_json
+
+        # First attempt fails and should record a backoff.
+        self.get_failure(
+            fetcher.get_server_verify_keys_v2_direct(SERVER_NAME), KeyLookupError
+        )
+        self.assertEqual(call_count, 1)
+
+        # A second attempt immediately afterwards must fail fast against the
+        # negative cache rather than making another outbound request.
+        self.get_failure(
+            fetcher.get_server_verify_keys_v2_direct(SERVER_NAME), KeyLookupError
+        )
+        self.assertEqual(call_count, 1)
+
+        # Advance past the (default 1 minute) backoff floor: the next attempt
+        # should be allowed through again.
+        self.reactor.advance(61)
+
+        async def get_json_success(
+            destination: str, path: str, **kwargs: Any
+        ) -> JsonDict:
+            nonlocal call_count
+            call_count += 1
+            return response
+
+        self.http_client.get_json.side_effect = get_json_success
+
+        keys = self.get_success(fetcher.get_server_verify_keys_v2_direct(SERVER_NAME))
+        self.assertIn(testverifykey_id, keys)
+        self.assertEqual(call_count, 2)
+
+        # Backoff state should now be cleared: an immediate subsequent
+        # attempt is allowed through (not fast-failed) even though we're
+        # nowhere near a full interval since the successful fetch.
+        # The successful fetch must remove the server's backoff entry.
+        self.assertNotIn(SERVER_NAME, fetcher._backoff._backoff)
+
+    def test_first_seen_wins_rejects_colliding_key_body(self) -> None:
+        """MSC4499 First Seen Wins: a second, self-signed-valid response that
+        reuses an already-bound key ID with a *different* key body MUST be
+        rejected -- the original binding is retained, both in what's
+        returned to the caller and in what's persisted (so a later notary
+        query keeps serving the original, not the spurious one)."""
+        self.reactor.advance(100)
+
+        SERVER_NAME = "server2"
+        KEY_ID = "ed25519:ver1"
+        fetcher = ServerKeyFetcher(self.hs)
+
+        original_key = signedjson.key.generate_signing_key("ver1")
+        original_verify_key = signedjson.key.get_verify_key(original_key)
+        VALID_UNTIL_TS = self.clock.time_msec() + 1000 * 1000
+
+        original_response = {
+            "server_name": SERVER_NAME,
+            "old_verify_keys": {},
+            "valid_until_ts": VALID_UNTIL_TS,
+            "verify_keys": {
+                KEY_ID: {
+                    "key": signedjson.key.encode_verify_key_base64(original_verify_key)
+                }
+            },
+        }
+        signedjson.sign.sign_json(original_response, SERVER_NAME, original_key)
+
+        async def get_original(destination: str, path: str, **kwargs: Any) -> JsonDict:
+            return original_response
+
+        self.http_client.get_json.side_effect = get_original
+        keys = self.get_success(fetcher.get_keys(SERVER_NAME, [KEY_ID], 0))
+        self.assertEqual(keys[KEY_ID].verify_key.encode(), original_verify_key.encode())
+
+        # A second, differently-keyed but *validly self-signed* response
+        # claiming the same key ID -- the spurious collision.
+        spurious_key = signedjson.key.generate_signing_key("ver1")
+        spurious_verify_key = signedjson.key.get_verify_key(spurious_key)
+        self.assertNotEqual(original_verify_key.encode(), spurious_verify_key.encode())
+
+        spurious_response = {
+            "server_name": SERVER_NAME,
+            "old_verify_keys": {},
+            "valid_until_ts": VALID_UNTIL_TS,
+            "verify_keys": {
+                KEY_ID: {
+                    "key": signedjson.key.encode_verify_key_base64(spurious_verify_key)
+                }
+            },
+        }
+        signedjson.sign.sign_json(spurious_response, SERVER_NAME, spurious_key)
+
+        async def get_spurious(destination: str, path: str, **kwargs: Any) -> JsonDict:
+            return spurious_response
+
+        self.http_client.get_json.side_effect = get_spurious
+        # Clear the ServerKeyFetcher's queue/cache state by using a fresh
+        # fetcher instance -- avoids the negative-cache backoff (a separate
+        # concern) from short-circuiting this second, deliberately-forced
+        # fetch attempt.
+        fetcher2 = ServerKeyFetcher(self.hs)
+        keys2 = self.get_success(fetcher2.get_keys(SERVER_NAME, [KEY_ID], 0))
+
+        # The caller must still see the *original* key body -- not the
+        # spurious one -- for this key ID.
+        self.assertEqual(
+            keys2[KEY_ID].verify_key.encode(), original_verify_key.encode()
+        )
+
+        # And the persisted record must likewise still be the original.
+        store = self.hs.get_datastores().main
+        stored_row = self.get_success(
+            store.db_pool.simple_select_one(
+                table="server_signature_keys",
+                keyvalues={"server_name": SERVER_NAME, "key_id": KEY_ID},
+                retcols=("verify_key",),
+                desc="get_stored_verify_key",
+            )
+        )
+        assert stored_row is not None
+        stored_key = decode_verify_key_bytes(KEY_ID, bytes(stored_row[0]))
+        self.assertEqual(stored_key.encode(), original_verify_key.encode())
+
+    def test_old_verify_key_readable_from_db_cache(self) -> None:
+        """MSC4499 historical event verification: an expired key that is only
+        ever present in `old_verify_keys` of a fetched response must still be
+        readable back out via the DB-cache fast path (`StoreKeyFetcher` ->
+        `get_server_keys_json`), not just at the moment it was first parsed
+        by `process_v2_response`."""
+        self.reactor.advance(100)
+
+        SERVER_NAME = "server2"
+        OLD_KEY_ID = "ed25519:old"
+        old_key = signedjson.key.generate_signing_key("old")
+        old_verify_key = signedjson.key.get_verify_key(old_key)
+        EXPIRED_TS = self.clock.time_msec() - 1000 * 1000
+
+        current_key = signedjson.key.generate_signing_key("cur")
+        current_verify_key = signedjson.key.get_verify_key(current_key)
+        CURRENT_KEY_ID = "ed25519:cur"
+        VALID_UNTIL_TS = self.clock.time_msec() + 1000 * 1000
+
+        response = {
+            "server_name": SERVER_NAME,
+            "old_verify_keys": {
+                OLD_KEY_ID: {
+                    "key": signedjson.key.encode_verify_key_base64(old_verify_key),
+                    "expired_ts": EXPIRED_TS,
+                }
+            },
+            "valid_until_ts": VALID_UNTIL_TS,
+            "verify_keys": {
+                CURRENT_KEY_ID: {
+                    "key": signedjson.key.encode_verify_key_base64(current_verify_key)
+                }
+            },
+        }
+        signedjson.sign.sign_json(response, SERVER_NAME, current_key)
+
+        async def get_json(destination: str, path: str, **kwargs: Any) -> JsonDict:
+            return response
+
+        self.http_client.get_json.side_effect = get_json
+
+        fetcher = ServerKeyFetcher(self.hs)
+        keys = self.get_success(
+            fetcher.get_keys(SERVER_NAME, [CURRENT_KEY_ID, OLD_KEY_ID], 0)
+        )
+        self.assertIn(OLD_KEY_ID, keys)
+        self.assertEqual(keys[OLD_KEY_ID].valid_until_ts, EXPIRED_TS)
+
+        # Now fetch the same expired key purely through the DB-cache fast
+        # path, as a backdated-event verification would.
+        store_fetcher = StoreKeyFetcher(self.hs)
+        cached_keys = self.get_success(
+            store_fetcher.get_keys(SERVER_NAME, [OLD_KEY_ID], EXPIRED_TS)
+        )
+        self.assertIn(OLD_KEY_ID, cached_keys)
+        self.assertEqual(
+            cached_keys[OLD_KEY_ID].verify_key.encode(), old_verify_key.encode()
+        )
+        self.assertEqual(cached_keys[OLD_KEY_ID].valid_until_ts, EXPIRED_TS)
 
 
 class PerspectivesKeyFetcherTestCase(unittest.HomeserverTestCase):

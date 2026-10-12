@@ -46,6 +46,7 @@ from synapse.types import (
     MultiWriterStreamToken,
     SlidingSyncStreamToken,
     StrCollection,
+    StreamKeyType,
     StreamToken,
     ThreadSubscriptionsToken,
     UserID,
@@ -88,6 +89,7 @@ class SlidingSyncExtensionHandler:
         self.device_handler = hs.get_device_handler()
         self.push_rules_handler = hs.get_push_rules_handler()
         self.clock = hs.get_clock()
+        self._replication = hs.get_replication_data_handler()
         self._storage_controllers = hs.get_storage_controllers()
         self._enable_thread_subscriptions = hs.config.experimental.msc4306_enabled
         self._enable_sticky_events = hs.config.experimental.msc4354_enabled
@@ -351,6 +353,22 @@ class SlidingSyncExtensionHandler:
                 next_batch=f"{to_token.to_device_key}",
                 events=[],
             )
+
+        # The to-device stream is written by dedicated writers, so this process
+        # may not yet have replicated a message that was acknowledged to the
+        # sender. Wait until we've caught up with what each writer has persisted
+        # (a safe, gap-free bound), then use our own replicated position.
+        for (
+            instance_name,
+            position,
+        ) in await self.store.get_to_device_persisted_positions():
+            await self._replication.wait_for_stream_position(
+                instance_name, "to_device", position
+            )
+        to_token = to_token.copy_and_replace(
+            StreamKeyType.TO_DEVICE,
+            max(to_token.to_device_key, self.store.get_to_device_stream_token()),
+        )
 
         since_stream_id = 0
         if to_device_request.since is not None:

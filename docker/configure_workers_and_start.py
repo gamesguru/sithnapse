@@ -959,10 +959,16 @@ def generate_worker_files(
     else:
         healthcheck_urls = ["http://localhost:8080/health"]
 
+    # The URLs above hit each worker's `/health` directly, bypassing nginx, so
+    # they never prove nginx itself is up and routing correctly. Always add a
+    # federation version check through nginx: the main process serves it when
+    # no federation_reader worker is configured.
     # Get the set of all worker types that we have configured
     all_worker_types_in_use = set(
         chain(*[worker.worker_types for worker in requested_workers])
     )
+    if requested_workers:
+        healthcheck_urls.append("http://localhost:8008/_matrix/federation/v1/version")
     # Map locations to upstreams (corresponding to worker types) in Nginx
     # but only if we use the appropriate worker type
     for worker_type in all_worker_types_in_use:
@@ -1229,6 +1235,29 @@ def generate_worker_files(
                 "host": MAIN_PROCESS_LOCALHOST_ADDRESS,
                 "port": MAIN_PROCESS_REPLICATION_PORT,
             }
+
+    # Support for an embedded DB engine (mtxdb) in Complement integration
+    # tests doesn't need anything here -- SYNAPSE_EMBEDDED_DB_ENGINE/
+    # SYNAPSE_EMBEDDED_DB_PATH are read directly as environment variables
+    # in synapse/config/database.py, independent of this generated
+    # shared_config. Just set them on the container.
+    #
+    # TODO: this generator has no awareness of embedded_db/mtxdb at all --
+    # it will happily emit a topology with an event_persister worker (or
+    # several) alongside SYNAPSE_EMBEDDED_DB_ENGINE=mtxdb. That invalid
+    # combination is caught today, but only downstream, as a hard ConfigError
+    # at Synapse startup (see synapse/config/workers.py's
+    # embedded_db_engine validation, which requires the sole events writer
+    # to be the main process itself -- not merely a single persister worker
+    # -- plus run_background_tasks_on to be main, which rules out a
+    # background_worker too; and docker/complement/conf/
+    # start_for_complement.sh, which omits both from the Complement
+    # blueprint's defaults under mtxdb for exactly that reason). Consider
+    # having this generator drop event_persister/background_worker workers
+    # (or refuse to start) when embedded_db.engine/
+    # SYNAPSE_EMBEDDED_DB_ENGINE is set, so real deployments get a clear
+    # error from the generator up front instead of failing later at
+    # Synapse's own config-validation step.
 
     # Shared homeserver config
     convert(

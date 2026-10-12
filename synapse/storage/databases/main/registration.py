@@ -195,6 +195,7 @@ class RegistrationWorkerStore(StatsStore, CacheInvalidationWorkerStore):
             "user_id_seq",
             table=None,
             id_column=None,
+            db_is_fresh=database.is_fresh,
         )
 
         self._account_validity_enabled = (

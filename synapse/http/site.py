@@ -907,10 +907,7 @@ class SynapseSite(ProxySite):
         self.server_version_string = server_version_string.encode("ascii")
         self.connections: list[Protocol] = []
 
-    # Twisted 26.4.0 types HTTPFactory.buildProtocol as returning its concrete
-    # `_GenericHTTPChannelProtocol` wrapper. We intentionally return our own HTTPChannel
-    # subclass instead. Thus we add a type-ignore.
-    def buildProtocol(self, addr: Optional[IAddress]) -> SynapseProtocol:  # type: ignore[override]
+    def buildProtocol(self, addr: Optional[IAddress]) -> SynapseProtocol:
         protocol = SynapseProtocol(
             self,
             self.server_name,

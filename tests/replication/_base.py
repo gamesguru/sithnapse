@@ -19,7 +19,7 @@
 #
 import logging
 from collections import defaultdict
-from typing import Any
+from typing import Any, cast
 
 from twisted.internet.address import IPv4Address
 from twisted.internet.protocol import Protocol, connectionDone
@@ -27,6 +27,7 @@ from twisted.internet.testing import MemoryReactor
 from twisted.python.failure import Failure
 from twisted.web.resource import Resource
 
+from synapse.app._base import max_request_body_size
 from synapse.app.generic_worker import GenericWorkerServer
 from synapse.config.workers import InstanceTcpLocationConfig, InstanceUnixLocationConfig
 from synapse.http.site import SynapseRequest, SynapseSite
@@ -45,10 +46,13 @@ from tests import unittest
 from tests.server import FakeTransport
 from tests.utils import USE_POSTGRES_FOR_TESTS
 
+hiredis: Any = None
 try:
-    import hiredis
+    import hiredis as _hiredis
 except ImportError:
-    hiredis = None  # type: ignore
+    pass
+else:
+    hiredis = cast(Any, _hiredis)
 
 logger = logging.getLogger(__name__)
 
@@ -75,9 +79,10 @@ class BaseStreamTestCase(unittest.HomeserverTestCase):
 
         # Make a new HomeServer object for the worker
         self.reactor.lookups["testserv"] = "1.2.3.4"
+        worker_config = self._get_worker_hs_config()
         self.worker_hs = self.setup_test_homeserver(
             homeserver_to_use=GenericWorkerServer,
-            config=self._get_worker_hs_config(),
+            config=worker_config,
             reactor=self.reactor,
             federation_http_client=None,
         )
@@ -118,6 +123,16 @@ class BaseStreamTestCase(unittest.HomeserverTestCase):
         config = self.default_config()
         config["worker_app"] = "synapse.app.generic_worker"
         config["instance_map"] = {"main": {"host": "testserv", "port": 8765}}
+        if hasattr(self, "hs") and getattr(
+            self.hs.config.database, "embedded_db_engine", None
+        ):
+            config["embedded_db"] = {
+                "engine": self.hs.config.database.embedded_db_engine,
+                "path": self.hs.config.database.embedded_db_path,
+                "namespace": self.hs.config.database.embedded_db_namespace,
+                "no_sync": self.hs.config.database.embedded_db_no_sync,
+                "flush_delay_secs": self.hs.config.database.embedded_db_flush_delay_secs,
+            }
         return config
 
     def _build_replication_data_handler(self) -> "TestReplicationDataHandler":
@@ -267,6 +282,19 @@ class BaseMultiWorkerStreamTestCase(unittest.HomeserverTestCase):
     def setUp(self) -> None:
         super().setUp()
 
+        # Worker homeservers created via `make_worker_hs` are otherwise only
+        # ever referenced by whatever local variable the test body assigns
+        # them to. That local's frame is torn down the instant the test
+        # method returns -- before Trial invokes any `addCleanup` callback --
+        # so without an independent strong reference here, the worker's own
+        # shutdown cleanup can find it already garbage collected and skip
+        # calling `shutdown()` (leaking its DB connection pool). A plain
+        # instance attribute on `self` keeps it alive for exactly the test's
+        # duration without reintroducing that problem for the *primary* `hs`
+        # object -- see tests/app/test_homeserver_shutdown.py, which relies
+        # on nothing but a weakref keeping it alive past explicit shutdown.
+        self._worker_homeservers: list[HomeServer] = []
+
         # build a replication server
         self.streamer = self.hs.get_replication_streamer()
 
@@ -346,6 +374,9 @@ class BaseMultiWorkerStreamTestCase(unittest.HomeserverTestCase):
             reactor=self.reactor,
             **kwargs,
         )
+        # Keep this worker HS alive for the duration of the test -- see the
+        # comment on `self._worker_homeservers` in `setUp`.
+        self._worker_homeservers.append(worker_hs)
 
         # If the instance is in the `instance_map` config then workers may try
         # and send HTTP requests to it, so we register it with
@@ -395,7 +426,7 @@ class BaseMultiWorkerStreamTestCase(unittest.HomeserverTestCase):
             config=worker_hs.config.server.listeners[0],
             resource=resource,
             server_version_string="1",
-            max_request_body_size=8192,
+            max_request_body_size=max_request_body_size(worker_hs.config),
             reactor=self.reactor,
             hs=worker_hs,
         )
@@ -406,6 +437,16 @@ class BaseMultiWorkerStreamTestCase(unittest.HomeserverTestCase):
 
     def _get_worker_hs_config(self) -> dict:
         config = self.default_config()
+        if hasattr(self, "hs") and getattr(
+            self.hs.config.database, "embedded_db_engine", None
+        ):
+            config["embedded_db"] = {
+                "engine": self.hs.config.database.embedded_db_engine,
+                "path": self.hs.config.database.embedded_db_path,
+                "namespace": self.hs.config.database.embedded_db_namespace,
+                "no_sync": self.hs.config.database.embedded_db_no_sync,
+                "flush_delay_secs": self.hs.config.database.embedded_db_flush_delay_secs,
+            }
         return config
 
     def replicate(self) -> None:

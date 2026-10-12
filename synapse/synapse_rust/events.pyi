@@ -16,6 +16,8 @@ from synapse.synapse_rust.room_versions import RoomVersion
 from synapse.types import JsonDict, JsonMapping, Requester, StrSequence
 from synapse.util.duration import Duration
 
+def sha256_canonical_json(value: JsonMapping) -> bytes: ...
+
 class EventInternalMetadata:
     def __init__(self, internal_metadata_dict: JsonDict): ...
 

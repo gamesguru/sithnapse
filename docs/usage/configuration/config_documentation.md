@@ -3350,7 +3350,7 @@ use_appservice_legacy_authorization: true
 
 If none is specified, the `registration_shared_secret` is used, if one is given; otherwise, a secret key is derived from the signing key.
 
-> ⚠️ **Warning** – Replacing an existing `macaroon_secret_key` with a new one will lead to invalidation of access tokens for all guest users. It will also break unsubscribe links in emails sent before the change. An unlucky user might encounter a broken SSO login flow and would have to start again.
+> ⚠️ **Warning** – Replacing an existing `macaroon_secret_key` with a new one will lead to invalidation of access tokens for all guest users. It will also break unsubscribe links in emails sent before the change. An unlucky user might encounter a broken SSO login flow and would have to start again. When HAMT state storage is enabled, it also changes the structural key used to address persisted HAMT nodes. Existing HAMT state must be migrated or rebuilt before rotating this secret.
 
 Defaults to `null`.
 
@@ -4145,6 +4145,8 @@ user_consent:
 This setting has the following sub-options:
 
 * `enabled` (boolean): Set to false to disable room and user statistics. Note that doing so may cause certain features (such as the room directory) not to work correctly. Defaults to `true`.
+
+* `server_stats_endpoint_enabled` (boolean): Enable the authenticated `/_synapse/client/server_stats` endpoint. Requests require a server-admin access token. This is disabled by default. Defaults to `false`.
 
 Example configuration:
 ```yaml

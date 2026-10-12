@@ -174,17 +174,17 @@ recommend the use of `systemd` where available: for information on setting up
 [Systemd with Workers](systemd-with-workers/). To use `synctl`, see
 [Using synctl with Workers](synctl_workers.md).
 
-## Start Synapse with Poetry
+## Start Synapse with uv
 
-The following applies to Synapse installations that have been installed from source using `poetry`.
+The following applies to Synapse installations that have been installed from source using `uv`.
 
-You can start the main Synapse process with Poetry by running the following command:
+You can start the main Synapse process with `uv` by running the following command:
 ```console
-poetry run synapse_homeserver --config-path [your homeserver.yaml]
+uv run synapse_homeserver --config-path [your homeserver.yaml]
 ```
 For worker setups, you can run the following command
 ```console
-poetry run synapse_worker --config-path [your homeserver.yaml] --config-path [your worker.yaml]
+uv run synapse_worker --config-path [your homeserver.yaml] --config-path [your worker.yaml]
 ```
 ## Available worker applications
 

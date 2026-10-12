@@ -276,9 +276,17 @@ class RedisSubscriber(SubscriberProtocol):
 
         channel_name = cmd.redis_channel_name(self.synapse_stream_prefix)
 
-        await make_deferred_yieldable(
-            self.synapse_outbound_redis_connection.publish(channel_name, encoded_string)
-        )
+        # `txredisapi.publish` is an inlineCallbacks function. If the outbound
+        # connection is not ready yet, it starts running immediately and yields
+        # while acquiring one from its pool. Make that initial call from the
+        # sentinel context, rather than from this background process, so that
+        # txredisapi does not leak our logging context to the reactor.
+        with PreserveLoggingContext():
+            deferred = self.synapse_outbound_redis_connection.publish(
+                channel_name, encoded_string
+            )
+
+        await make_deferred_yieldable(deferred)
 
 
 class SynapseRedisFactory(RedisFactory):

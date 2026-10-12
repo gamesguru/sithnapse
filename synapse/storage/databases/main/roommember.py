@@ -46,6 +46,7 @@ from synapse.storage.database import (
     LoggingTransaction,
 )
 from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
+from synapse.storage.databases.main.embedded_event_json import get_event_json_batch
 from synapse.storage.databases.main.events_worker import EventsWorkerStore
 from synapse.storage.databases.main.stream import _filter_results_by_stream
 from synapse.storage.engines import Sqlite3Engine
@@ -468,6 +469,8 @@ class RoomMemberWorkerStore(EventsWorkerStore, CacheInvalidationWorkerStore):
         user_id: str,
         membership_list: Collection[str],
         excluded_rooms: StrCollection = (),
+        *,
+        require_fresh_forgotten_rooms: bool = False,
     ) -> list[RoomsForUser]:
         """Get all the rooms for this *local* user where the membership for this user
         matches one in the membership list.
@@ -479,6 +482,10 @@ class RoomMemberWorkerStore(EventsWorkerStore, CacheInvalidationWorkerStore):
             membership_list: A list of synapse.api.constants.Membership
                 values which the user must be in.
             excluded_rooms: A list of rooms to ignore.
+            require_fresh_forgotten_rooms: Whether to bypass the forgotten-room
+                cache. This is needed when responding to an initial sync, which
+                must observe a preceding `/forget` even if the cache invalidation
+                has not yet reached this worker.
 
         Returns:
             The RoomsForUser that the user matches the membership types.
@@ -500,7 +507,12 @@ class RoomMemberWorkerStore(EventsWorkerStore, CacheInvalidationWorkerStore):
 
         # Users can't forget joined/invited rooms, so we skip the check for such look ups.
         if any(m not in (Membership.JOIN, Membership.INVITE) for m in membership_list):
-            rooms_to_exclude = await self.get_forgotten_rooms_for_user(user_id)
+            if require_fresh_forgotten_rooms:
+                rooms_to_exclude = await self.get_forgotten_rooms_for_user_uncached(
+                    user_id
+                )
+            else:
+                rooms_to_exclude = await self.get_forgotten_rooms_for_user(user_id)
 
         if excluded_rooms is not None:
             # Take a copy to avoid mutating the in-cache set
@@ -1399,32 +1411,51 @@ class RoomMemberWorkerStore(EventsWorkerStore, CacheInvalidationWorkerStore):
             The forgotten rooms.
         """
 
-        def _get_forgotten_rooms_for_user_txn(txn: LoggingTransaction) -> set[str]:
-            # This is a slightly convoluted query that first looks up all rooms
-            # that the user has forgotten in the past, then rechecks that list
-            # to see if any have subsequently been updated. This is done so that
-            # we can use a partial index on `forgotten = 1` on the assumption
-            # that few users will actually forget many rooms.
-            #
-            # Note that a room is considered "forgotten" if *all* membership
-            # events for that user and room have the forgotten field set (as
-            # when a user forgets a room we update all rows for that user and
-            # room, not just the current one).
-            sql = """
-                SELECT room_id, (
-                    SELECT count(*) FROM room_memberships
-                    WHERE room_id = m.room_id AND user_id = m.user_id AND forgotten = 0
-                ) AS count
-                FROM room_memberships AS m
-                WHERE user_id = ? AND forgotten = 1
-                GROUP BY room_id, user_id;
-            """
-            txn.execute(sql, (user_id,))
-            return {row[0] for row in txn if row[1] == 0}
+        return await self.db_pool.runInteraction(
+            "get_forgotten_rooms_for_user",
+            self._get_forgotten_rooms_for_user_txn,
+            user_id,
+        )
+
+    async def get_forgotten_rooms_for_user_uncached(
+        self, user_id: str
+    ) -> AbstractSet[str]:
+        """Gets forgotten rooms directly from the database.
+
+        This is used for an initial sync immediately following `/forget`: the
+        cache invalidation is replicated asynchronously, so another worker's
+        cache can otherwise briefly return the old value.
+        """
 
         return await self.db_pool.runInteraction(
-            "get_forgotten_rooms_for_user", _get_forgotten_rooms_for_user_txn
+            "get_forgotten_rooms_for_user_uncached",
+            self._get_forgotten_rooms_for_user_txn,
+            user_id,
         )
+
+    def _get_forgotten_rooms_for_user_txn(
+        self, txn: LoggingTransaction, user_id: str
+    ) -> set[str]:
+        # This is a slightly convoluted query that first looks up all rooms
+        # that the user has forgotten in the past, then rechecks that list
+        # to see if any have subsequently been updated. This lets us use a
+        # partial index on `forgotten = 1`, on the assumption that few users
+        # forget many rooms.
+        #
+        # A room is considered forgotten if all membership events for that user
+        # and room have the forgotten field set: forgetting updates every row,
+        # not only the current membership.
+        sql = """
+            SELECT room_id, (
+                SELECT count(*) FROM room_memberships
+                WHERE room_id = m.room_id AND user_id = m.user_id AND forgotten = 0
+            ) AS count
+            FROM room_memberships AS m
+            WHERE user_id = ? AND forgotten = 1
+            GROUP BY room_id, user_id;
+        """
+        txn.execute(sql, (user_id,))
+        return {row[0] for row in txn if row[1] == 0}
 
     async def is_locally_forgotten_room(self, room_id: str) -> bool:
         """Returns whether all local users have forgotten this room_id.
@@ -2028,7 +2059,7 @@ class RoomMemberBackgroundUpdateStore(SQLBaseStore):
             sql = """
                 SELECT stream_ordering, event_id, events.room_id, event_json.json
                 FROM events
-                INNER JOIN event_json USING (event_id)
+                LEFT JOIN event_json USING (event_id)
                 WHERE ? <= stream_ordering AND stream_ordering < ?
                 AND type = 'm.room.member'
                 ORDER BY stream_ordering DESC
@@ -2043,9 +2074,28 @@ class RoomMemberBackgroundUpdateStore(SQLBaseStore):
 
             min_stream_id = rows[-1][0]
 
+            missing_json_ids = [
+                event_id for _, event_id, _, json in rows if json is None
+            ]
+            json_by_id = {}
+            if missing_json_ids and getattr(
+                self, "_embedded_event_json_enabled", False
+            ):
+                found = get_event_json_batch(
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
+                    missing_json_ids,
+                )
+                for eid, (_, j, _) in found.items():
+                    json_by_id[eid] = j
+
             to_update = []
             for _, event_id, room_id, json in rows:
                 try:
+                    if json is None:
+                        json = json_by_id.get(event_id)
+                    if not json:
+                        continue
                     event_json = db_to_json(json)
                     content = event_json["content"]
                 except Exception:

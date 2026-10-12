@@ -83,6 +83,21 @@ from synapse.storage.database import (
     LoggingTransaction,
     make_tuple_in_list_sql_clause,
 )
+from synapse.storage.databases.main.embedded_common import ffi_count
+from synapse.storage.databases.main.embedded_event_edges import (
+    classify_event_edge_fallback,
+    drain_edge_index_outbox,
+    embedded_event_edges_is_writable,
+    gc_retired_forward_generations,
+    open_embedded_event_edges_engine,
+    record_event_edge_read,
+    register_publish_signal_gauge,
+)
+from synapse.storage.databases.main.embedded_event_json import (
+    get_event_json_batch,
+    open_embedded_event_json_engine,
+)
+from synapse.storage.databases.main.embedded_redactions import get_redactions_batch
 from synapse.storage.types import Cursor
 from synapse.storage.util.id_generators import (
     AbstractStreamIdGenerator,
@@ -241,6 +256,31 @@ class EventsWorkerStore(SQLBaseStore):
     ):
         super().__init__(database, db_conn, hs)
 
+        self._embedded_event_json_enabled = open_embedded_event_json_engine(hs)
+        self._embedded_event_edges_enabled = open_embedded_event_edges_engine(hs)
+        self._embedded_event_edges_writable = embedded_event_edges_is_writable(hs)
+        if (
+            self._embedded_event_edges_enabled
+            and not self._embedded_event_edges_writable
+        ):
+            # Only read-only handles map the writer's publish signal.
+            register_publish_signal_gauge(hs)
+        self._embedded_db_engine = hs.config.database.embedded_db_engine
+        # Namespaces event_to_state_group/refcount keys in the embedded
+        # engine -- see embedded_event_to_state_group.py's module docstring.
+        # Independent from (but must agree with) the state datastore's own
+        # hamt_namespace property: both default to the server name unless
+        # embedded_db.namespace is set in config, so they naturally agree
+        # without needing to share an instance.
+        self._embedded_db_namespace = (
+            hs.config.database.embedded_db_namespace or hs.hostname
+        )
+
+        txn = db_conn.cursor()
+        txn.execute("SELECT event_id FROM un_partial_stated_event_stream")
+        self._un_partial_stated_event_ids: set[str] = {row[0] for row in txn.fetchall()}
+        txn.close()
+
         self._stream_id_gen: MultiWriterIdGenerator
         self._backfill_id_gen: MultiWriterIdGenerator
 
@@ -292,6 +332,17 @@ class EventsWorkerStore(SQLBaseStore):
         )
 
         if hs.config.worker.run_background_tasks:
+            if embedded_event_edges_is_writable(hs):
+                self.clock.looping_call(
+                    lambda: drain_edge_index_outbox(
+                        self, namespace=self._embedded_db_namespace
+                    ),
+                    Duration(seconds=1),
+                )
+                self.clock.looping_call(
+                    lambda: gc_retired_forward_generations(self),
+                    Duration(minutes=5),
+                )
             # We periodically clean out old transaction ID mappings
             self.clock.looping_call(
                 self._cleanup_old_transaction_ids,
@@ -344,6 +395,7 @@ class EventsWorkerStore(SQLBaseStore):
             "event_auth_chain_id",
             table="event_auth_chains",
             id_column="chain_id",
+            db_is_fresh=database.is_fresh,
         )
 
         self._un_partial_stated_events_stream_id_gen: AbstractStreamIdGenerator
@@ -470,7 +522,8 @@ class EventsWorkerStore(SQLBaseStore):
         if stream_name == UnPartialStatedEventStream.NAME:
             for row in rows:
                 assert isinstance(row, UnPartialStatedEventStreamRow)
-
+                self._un_partial_stated_event_ids.add(row.event_id)
+                self.is_un_partial_stated_event.invalidate((row.event_id,))
                 self.is_partial_state_event.invalidate((row.event_id,))
 
                 if row.rejection_status_changed:
@@ -510,6 +563,18 @@ class EventsWorkerStore(SQLBaseStore):
         Returns:
             True if the event has been censored, False otherwise.
         """
+        # Fast path: the embedded mirror, if configured, is a point lookup
+        # keyed by the redacted event id -- see embedded_redactions.py. A miss
+        # falls through to the authoritative SQL row below.
+        if getattr(self, "_embedded_event_json_enabled", False):
+            found = get_redactions_batch(
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
+                [event_id],
+            )
+            if event_id in found:
+                return found[event_id][1]
+
         censored_redactions_list = await self.db_pool.simple_select_onecol(
             table="redactions",
             keyvalues={"redacts": event_id},
@@ -1299,6 +1364,17 @@ class EventsWorkerStore(SQLBaseStore):
                     for _, deferred in event_fetches_to_fail:
                         deferred.errback(exc)
 
+    def _event_fetch_pool_is_small(self) -> bool:
+        """Whether the connection pool has no thread to spare for fetch threads.
+
+        An idle fetch thread waits `EVENT_QUEUE_ITERATIONS * EVENT_QUEUE_TIMEOUT_S`
+        (about 0.4 s) for more requests while holding a database thread. With
+        no more pool threads than fetch threads, every other query queues behind
+        those waits: Complement runs workers with `cp_max: 3`, and a join sat
+        behind idle fetch loops for 400 ms.
+        """
+        return bool(self.db_pool._db_pool.max <= EVENT_QUEUE_THREADS)
+
     def _fetch_loop(self, conn: LoggingDatabaseConnection) -> None:
         """Takes a database connection and waits for requests for events from
         the _event_fetch_list queue.
@@ -1317,6 +1393,7 @@ class EventsWorkerStore(SQLBaseStore):
                     if (
                         not self.USE_DEDICATED_DB_THREADS_FOR_EVENT_FETCHING
                         or single_threaded
+                        or self._event_fetch_pool_is_small()
                         or i > EVENT_QUEUE_ITERATIONS
                     ):
                         return
@@ -1634,6 +1711,63 @@ class EventsWorkerStore(SQLBaseStore):
 
         return row_map
 
+    def _fetch_event_json_for_ids_txn(
+        self, txn: LoggingTransaction, event_ids: list[str]
+    ) -> dict[str, tuple[str, str, int | None]]:
+        """Returns `event_id -> (internal_metadata, json, format_version)`
+        for `event_ids`, preferring the embedded engine (a local point
+        lookup, no SQL) and falling back to `event_json` in SQL for any id
+        it doesn't have. In embedded-exclusive mode the SQL `event_json`
+        table is never populated (see `_persist_events_txn`), so that
+        fallback finds nothing: a miss there means the id is absent from the
+        embedded engine, not that SQL will supply it.
+
+        Deliberately does NOT write the SQL-fallback result back into mtxdb:
+        `event_json` is mutable (censoring, expiry -- see
+        `_censor_event_txn`), and this read runs outside of and concurrently
+        with any writer's transaction. A reader that fetched a pre-censor
+        row here could still land its mtxdb write after a concurrent
+        censor/expiry has already updated mtxdb to the pruned value,
+        silently resurrecting content the writer just redacted -- there's
+        no version/CAS scheme to make a read-path write safe against that
+        race. Missing ids (e.g. from before the mirror existed) simply keep
+        falling back to SQL rather than self-healing; a real backfill needs
+        an explicit background job that can't race a live censor/expiry.
+        """
+        if not event_ids:
+            return {}
+
+        found: dict[str, tuple[str, str, int | None]] = {}
+        still_missing = event_ids
+        if self._embedded_event_json_enabled:
+            found = get_event_json_batch(
+                self._embedded_db_engine, self._embedded_db_namespace, event_ids
+            )
+            still_missing = [e for e in event_ids if e not in found]
+
+        if still_missing:
+            clause, args = make_in_list_sql_clause(
+                txn.database_engine, "event_id", still_missing
+            )
+            txn.execute(
+                "SELECT event_id, internal_metadata, json, format_version "
+                "FROM event_json WHERE " + clause,
+                args,
+            )
+            for event_id, internal_metadata, json_str, format_version in txn:
+                found[event_id] = (internal_metadata, json_str, format_version)
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[mtxdb-trace] event-json fetch requested=%d final=%d sql_fallback=%s missing=%s",
+                len(event_ids),
+                len(found),
+                still_missing,
+                [event_id for event_id in event_ids if event_id not in found],
+            )
+
+        return found
+
     def _fetch_event_rows(
         self, txn: LoggingTransaction, event_ids: Iterable[str]
     ) -> dict[str, _EventRow]:
@@ -1650,19 +1784,21 @@ class EventsWorkerStore(SQLBaseStore):
         """
         event_dict = {}
         for evs in batch_iter(event_ids, 200):
+            # event_json (internal_metadata, json, format_version) is
+            # fetched separately below -- from the embedded engine when
+            # configured, falling back to SQL per id it doesn't have --
+            # rather than joined into this query, so its (often several-KB)
+            # blob payload isn't pulled through this query's result set
+            # when the embedded engine already has it.
             sql = """\
                 SELECT
                   e.event_id,
                   e.stream_ordering,
                   e.instance_name,
-                  ej.internal_metadata,
-                  ej.json,
-                  ej.format_version,
                   r.room_version,
                   rej.reason,
                   e.outlier
                 FROM events AS e
-                  JOIN event_json AS ej USING (event_id)
                   LEFT JOIN rooms r ON r.room_id = e.room_id
                   LEFT JOIN rejections as rej USING (event_id)
                 WHERE """
@@ -1673,37 +1809,61 @@ class EventsWorkerStore(SQLBaseStore):
 
             txn.execute(sql + clause, args)
 
-            for row in txn:
+            metadata_rows = txn.fetchall()
+            event_json_by_id = self._fetch_event_json_for_ids_txn(
+                txn, [row[0] for row in metadata_rows]
+            )
+
+            for row in metadata_rows:
                 event_id = row[0]
+                # An event with no event_json row (in neither the embedded
+                # engine nor SQL) is omitted, matching the old query's
+                # INNER JOIN filtering semantics.
+                event_json_row = event_json_by_id.get(event_id)
+                if event_json_row is None:
+                    continue
+                internal_metadata, json_str, format_version = event_json_row
                 event_dict[event_id] = _EventRow(
                     event_id=event_id,
                     stream_ordering=row[1],
                     # If instance_name is null we default to "master"
                     instance_name=row[2] or "master",
-                    internal_metadata=row[3],
-                    json=row[4],
-                    format_version=row[5],
-                    room_version_id=row[6],
-                    rejected_reason=row[7],
+                    internal_metadata=internal_metadata,
+                    json=json_str,
+                    format_version=format_version,
+                    room_version_id=row[3],
+                    rejected_reason=row[4],
                     unconfirmed_redactions=[],
                     confirmed_redactions=[],
-                    outlier=bool(row[8]),  # This is an int in SQLite3
+                    outlier=bool(row[5]),  # This is an int in SQLite3
                 )
 
             # check for redactions
-            redactions_sql = "SELECT event_id, redacts, recheck FROM redactions WHERE "
+            #
+            # The `redactions` table is empty in the vast majority of rooms, so
+            # skip the query outright until something has actually been written
+            # to it (see `TableEmptyCache`).
+            redactions_empty = self.db_pool.table_empty_cache("redactions")
+            if redactions_empty is None or redactions_empty.should_query(
+                txn, "redactions"
+            ):
+                redactions_sql = (
+                    "SELECT event_id, redacts, recheck FROM redactions WHERE "
+                )
 
-            clause, args = make_in_list_sql_clause(txn.database_engine, "redacts", evs)
+                clause, args = make_in_list_sql_clause(
+                    txn.database_engine, "redacts", evs
+                )
 
-            txn.execute(redactions_sql + clause, args)
+                txn.execute(redactions_sql + clause, args)
 
-            for redacter, redacted, recheck in txn:
-                d = event_dict.get(redacted)
-                if d:
-                    if recheck:
-                        d.unconfirmed_redactions.append(redacter)
-                    else:
-                        d.confirmed_redactions.append(redacter)
+                for redacter, redacted, recheck in txn:
+                    d = event_dict.get(redacted)
+                    if d:
+                        if recheck:
+                            d.unconfirmed_redactions.append(redacter)
+                        else:
+                            d.confirmed_redactions.append(redacter)
 
             # check for MSC4293 redactions
             to_check = []
@@ -1724,35 +1884,45 @@ class EventsWorkerStore(SQLBaseStore):
             # likely that some of these events may be for the same room/user combo, in
             # which case we don't need to do redundant queries
             to_check_set = set(to_check)
-            room_redaction_sql = "SELECT room_id, user_id, redacting_event_id, redact_end_ordering FROM room_ban_redactions WHERE "
-            (
-                in_list_clause,
-                room_redaction_args,
-            ) = make_tuple_in_list_sql_clause(
-                self.database_engine, ("room_id", "user_id"), to_check_set
+            # As with `redactions` above, `room_ban_redactions` is almost always
+            # empty; skip the query until a membership event actually writes to
+            # it (see `TableEmptyCache`).
+            room_ban_redactions_empty = self.db_pool.table_empty_cache(
+                "room_ban_redactions"
             )
-            txn.execute(room_redaction_sql + in_list_clause, room_redaction_args)
-            for (
-                returned_room_id,
-                returned_user_id,
-                redacting_event_id,
-                redact_end_ordering,
-            ) in txn:
-                for e_row in events:
-                    e_json = json.loads(e_row.json)
-                    room_id = e_json.get("room_id")
-                    user_id = e_json.get("sender")
-                    room_and_user = (returned_room_id, returned_user_id)
-                    # check if we have a redaction match for this room, user combination
-                    if room_and_user != (room_id, user_id):
-                        continue
-                    if redact_end_ordering:
-                        # Avoid redacting any events arriving *after* the membership event which
-                        # ends an active redaction - note that this will always redact
-                        # backfilled events, as they have a negative stream ordering
-                        if e_row.stream_ordering >= redact_end_ordering:
+            if (
+                room_ban_redactions_empty is None
+                or room_ban_redactions_empty.should_query(txn, "room_ban_redactions")
+            ):
+                room_redaction_sql = "SELECT room_id, user_id, redacting_event_id, redact_end_ordering FROM room_ban_redactions WHERE "
+                (
+                    in_list_clause,
+                    room_redaction_args,
+                ) = make_tuple_in_list_sql_clause(
+                    self.database_engine, ("room_id", "user_id"), to_check_set
+                )
+                txn.execute(room_redaction_sql + in_list_clause, room_redaction_args)
+                for (
+                    returned_room_id,
+                    returned_user_id,
+                    redacting_event_id,
+                    redact_end_ordering,
+                ) in txn:
+                    for e_row in events:
+                        e_json = json.loads(e_row.json)
+                        room_id = e_json.get("room_id")
+                        user_id = e_json.get("sender")
+                        room_and_user = (returned_room_id, returned_user_id)
+                        # check if we have a redaction match for this room, user combination
+                        if room_and_user != (room_id, user_id):
                             continue
-                    e_row.unconfirmed_redactions.append(redacting_event_id)
+                        if redact_end_ordering:
+                            # Avoid redacting any events arriving *after* the membership event which
+                            # ends an active redaction - note that this will always redact
+                            # backfilled events, as they have a negative stream ordering
+                            if e_row.stream_ordering >= redact_end_ordering:
+                                continue
+                        e_row.unconfirmed_redactions.append(redacting_event_id)
         return event_dict
 
     def _maybe_redact_event_row(
@@ -2476,6 +2646,15 @@ class EventsWorkerStore(SQLBaseStore):
             "This function relies on `event_edges` and `event_forward_extremities` which won't be filled in for `outliers`."
         )
 
+        # Resolved before runInteraction: the txn closure below is sync. A
+        # completed legacy background update does not prove FWD completeness;
+        # only the offline verifier's marker can authorize this read path.
+        from synapse.storage.databases.main.embedded_event_edges import (
+            event_edges_fwd_is_authoritative,
+        )
+
+        embedded_edges_trustworthy = await event_edges_fwd_is_authoritative(self)
+
         def is_event_next_to_gap_txn(txn: LoggingTransaction) -> bool:
             # If the event in question is a forward extremity, we will just
             # consider any potential forward gap as not a gap since it's one of
@@ -2509,6 +2688,46 @@ class EventsWorkerStore(SQLBaseStore):
             txn.execute(forward_extremity_query, (event.room_id, event.event_id))
             if txn.fetchone():
                 return False
+
+            if not embedded_edges_trustworthy:
+                record_event_edge_read(self.server_name, "gap", "sql_only")
+            if embedded_edges_trustworthy:
+                from synapse.storage.databases.main.embedded_event_edges import (
+                    get_event_edges_forward_batch,
+                )
+
+                txn.execute(
+                    "SELECT source_version FROM room_edge_source_version WHERE room_id = ?",
+                    (event.room_id,),
+                )
+                source_version_row = txn.fetchone()
+                source_version = int(source_version_row[0]) if source_version_row else 0
+                forward_map = get_event_edges_forward_batch(
+                    self._embedded_db_namespace,
+                    event.room_id,
+                    source_version,
+                    [event.event_id],
+                )
+                children = (
+                    None if forward_map.stale else forward_map.get(event.event_id)
+                )
+                if children is not None:
+                    ffi_count("event_edges_gap_hits", 1)
+                    record_event_edge_read(self.server_name, "gap", "hit")
+                    if not children:
+                        return True
+                    clause, args = make_in_list_sql_clause(
+                        self.database_engine, "event_id", children
+                    )
+                    txn.execute(f"SELECT event_id FROM rejections WHERE {clause}", args)
+                    rejected_children = {r[0] for r in txn}
+                    if any(c not in rejected_children for c in children):
+                        return False
+                    return True
+                ffi_count("event_edges_gap_fallbacks", 1)
+                record_event_edge_read(
+                    self.server_name, "gap", classify_event_edge_fallback(forward_map)
+                )
 
             # Check to see whether the event in question is already referenced
             # by another event. If we don't see any edges, we're next to a
@@ -2651,6 +2870,18 @@ class EventsWorkerStore(SQLBaseStore):
             desc="is_partial_state_event",
         )
         return result is not None
+
+    @cachedList(cached_method_name="is_un_partial_stated_event", list_name="event_ids")
+    async def get_un_partial_stated_events(
+        self, event_ids: Collection[str]
+    ) -> Mapping[str, bool]:
+        """Checks which of the given events have been un-partial-stated."""
+        return {e_id: e_id in self._un_partial_stated_event_ids for e_id in event_ids}
+
+    @cached()
+    async def is_un_partial_stated_event(self, event_id: str) -> bool:
+        """Checks if the given event has been un-partial-stated."""
+        return event_id in self._un_partial_stated_event_ids
 
     async def get_partial_state_events_batch(self, room_id: str) -> list[str]:
         """

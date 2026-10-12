@@ -15,11 +15,13 @@ mkdir -p complement
 # 2. Attempt to use the base branch, e.g. when merging into release-vX.Y
 #    (GITHUB_BASE_REF for pull requests).
 # 3. Use the default complement branch ("HEAD").
+COMPLEMENT_REPO="${COMPLEMENT_REPO:-matrix-org/complement}"
+
 for BRANCH_NAME in "$GITHUB_HEAD_REF" "$GITHUB_BASE_REF" "${GITHUB_REF#refs/heads/}" "HEAD"; do
   # Skip empty branch names and merge commits.
   if [[ -z "$BRANCH_NAME" || $BRANCH_NAME =~ ^refs/pull/.* ]]; then
     continue
   fi
 
-  (wget -O - "https://github.com/matrix-org/complement/archive/$BRANCH_NAME.tar.gz" | tar -xz --strip-components=1 -C complement) && break
+  (wget -O - "https://github.com/${COMPLEMENT_REPO}/archive/$BRANCH_NAME.tar.gz" | tar -xz --strip-components=1 -C complement) && break
 done

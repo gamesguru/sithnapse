@@ -19,8 +19,17 @@
 #
 #
 
+import atexit
+import json
 import logging
+import os
+import struct
+import sys
+import threading
+import time
+from collections import defaultdict
 from typing import (
+    IO,
     TYPE_CHECKING,
     Mapping,
 )
@@ -32,10 +41,14 @@ from synapse.storage.database import (
     LoggingDatabaseConnection,
     LoggingTransaction,
 )
+from synapse.storage.databases.embedded_engine import get_embedded_engine
+from synapse.storage.databases.main.embedded_common import ffi_timing, namespace_hash
 from synapse.storage.engines import PostgresEngine
 from synapse.types import MutableStateMap, StateMap
 from synapse.types.state import StateFilter
 from synapse.util.caches import intern_string
+from synapse.util.iterutils import batch_iter
+from synapse.util.timings_flush import register_periodic_flush
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
@@ -43,13 +56,560 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _decode_packed_state_entries(packed: bytes) -> list[tuple[str, str, str]]:
+    """Decode the versioned Rust HAMT entry buffer."""
+    if not packed or packed[0] != 1:
+        raise RuntimeError("unsupported packed state HAMT format")
+    offset = 1
+    if len(packed) < offset + 4:
+        raise RuntimeError("truncated packed state HAMT header")
+    (count,) = struct.unpack_from("<I", packed, offset)
+    offset += 4
+    entries: list[tuple[str, str, str]] = []
+    for _ in range(count):
+        fields: list[str] = []
+        for _ in range(3):
+            if len(packed) < offset + 4:
+                raise RuntimeError("truncated packed state HAMT field length")
+            (length,) = struct.unpack_from("<I", packed, offset)
+            offset += 4
+            end = offset + length
+            if end > len(packed):
+                raise RuntimeError("truncated packed state HAMT field")
+            fields.append(packed[offset:end].decode("utf-8"))
+            offset = end
+        entries.append((fields[0], fields[1], fields[2]))
+    if offset != len(packed):
+        raise RuntimeError("trailing bytes in packed state HAMT response")
+    return entries
+
+
+# ── mtxdb-vs-SQL timing (opt-in via SYNAPSE_PG_TIMINGS=1) ───────────────
+# Read once at import time. `_state_timing`/`_state_counter` are called from
+# every state-group read/write -- including the plain-SQL fallback branches,
+# which run regardless of whether an embedded engine is configured -- so
+# re-running `os.environ.get(...)` inside them on every call is a real,
+# measurable per-event cost across a whole test suite or busy homeserver,
+# even though the call itself no-ops when timings are disabled.
+_PG_TIMINGS_ENABLED = bool(os.environ.get("SYNAPSE_PG_TIMINGS"))
+
+_STATE_TIMINGS: dict[str, float] = defaultdict(float)
+_STATE_TIMING_COUNTS: dict[str, int] = defaultdict(int)
+_STATE_COUNTERS: dict[str, int] = defaultdict(int)
+_STATE_TIMING_LOCK: "threading.Lock | None" = (
+    threading.Lock() if _PG_TIMINGS_ENABLED else None
+)
+
+# ── Node-write bucketed stats (opt-in via SYNAPSE_PG_TIMINGS=1) ────────
+# Tracks batch size, total bytes, and per-call latency for put_state_hamt_nodes
+# to diagnose the 0.27ms/call fixed-cost amplification.
+_NODE_WRITE_CALLS = 0
+_NODE_WRITE_TOTAL_NODES = 0
+_NODE_WRITE_TOTAL_BYTES = 0
+_NODE_WRITE_TOTAL_TIME = 0.0
+_NODE_WRITE_LATENCY_BUCKETS: dict[str, int] = defaultdict(
+    int
+)  # latency bucket -> count
+_NODE_WRITE_SIZE_BUCKETS: dict[str, int] = defaultdict(
+    int
+)  # batch-size bucket -> count
+_ROOT_WRITE_CALLS = 0
+_ROOT_WRITE_TOTAL_ROOTS = 0
+_ROOT_WRITE_TOTAL_BYTES = 0
+_ROOT_WRITE_TOTAL_TIME = 0.0
+_ROOT_WRITE_LATENCY_BUCKETS: dict[str, int] = defaultdict(int)
+_ROOT_WRITE_SIZE_BUCKETS: dict[str, int] = defaultdict(int)
+
+_timings_file: IO[str] | None = None
+if _PG_TIMINGS_ENABLED:
+    _timings_path = os.environ.get("SYNAPSE_PG_TIMINGS_FILE")
+    if _timings_path:
+        try:
+            _timings_file = open(_timings_path, "a")
+        except OSError:
+            pass
+
+
+def _timings_print(*args: object) -> None:
+    print(*args, file=sys.stderr)
+    if _timings_file is not None:
+        print(*args, file=_timings_file)
+
+
+def _state_timing(tag: str, elapsed: float) -> None:
+    if not _PG_TIMINGS_ENABLED:
+        return
+    lock = _STATE_TIMING_LOCK
+    if lock is not None:
+        with lock:
+            _STATE_TIMINGS[tag] += elapsed
+            _STATE_TIMING_COUNTS[tag] += 1
+    else:
+        _STATE_TIMINGS[tag] += elapsed
+        _STATE_TIMING_COUNTS[tag] += 1
+
+
+def _state_counter(tag: str, value: int = 1) -> None:
+    """Record diagnostic state-mirror counts when PostgreSQL timings are enabled."""
+    if not _PG_TIMINGS_ENABLED:
+        return
+    lock = _STATE_TIMING_LOCK
+    if lock is not None:
+        with lock:
+            _STATE_COUNTERS[tag] += value
+    else:
+        _STATE_COUNTERS[tag] += value
+
+
+def _record_node_write_stats(nodes: list[tuple[bytes, bytes]], elapsed: float) -> None:
+    """Record batch-size/byte-count stats for put_state_hamt_nodes diagnostics."""
+    if not _PG_TIMINGS_ENABLED:
+        return
+    global \
+        _NODE_WRITE_CALLS, \
+        _NODE_WRITE_TOTAL_NODES, \
+        _NODE_WRITE_TOTAL_BYTES, \
+        _NODE_WRITE_TOTAL_TIME
+    batch_size = len(nodes)
+    total_bytes = sum(len(h) + len(b) for h, b in nodes)
+    # Latency buckets: <0.1ms, <0.25ms, <0.5ms, <1ms, >=1ms
+    if elapsed < 0.0001:
+        lat_bucket = "<0.1ms"
+    elif elapsed < 0.00025:
+        lat_bucket = "<0.25ms"
+    elif elapsed < 0.0005:
+        lat_bucket = "<0.5ms"
+    elif elapsed < 0.001:
+        lat_bucket = "<1ms"
+    else:
+        lat_bucket = ">=1ms"
+    # Size buckets: 1, 2-5, 6-20, 21-100, >100
+    if batch_size == 1:
+        size_bucket = "1"
+    elif batch_size <= 5:
+        size_bucket = "2-5"
+    elif batch_size <= 20:
+        size_bucket = "6-20"
+    elif batch_size <= 100:
+        size_bucket = "21-100"
+    else:
+        size_bucket = ">100"
+    lock = _STATE_TIMING_LOCK
+    if lock is not None:
+        with lock:
+            _NODE_WRITE_CALLS += 1
+            _NODE_WRITE_TOTAL_NODES += batch_size
+            _NODE_WRITE_TOTAL_BYTES += total_bytes
+            _NODE_WRITE_TOTAL_TIME += elapsed
+            _NODE_WRITE_LATENCY_BUCKETS[lat_bucket] += 1
+            _NODE_WRITE_SIZE_BUCKETS[size_bucket] += 1
+    else:
+        _NODE_WRITE_CALLS += 1
+        _NODE_WRITE_TOTAL_NODES += batch_size
+        _NODE_WRITE_TOTAL_BYTES += total_bytes
+        _NODE_WRITE_TOTAL_TIME += elapsed
+        _NODE_WRITE_LATENCY_BUCKETS[lat_bucket] += 1
+        _NODE_WRITE_SIZE_BUCKETS[size_bucket] += 1
+
+
+def _record_root_write_stats(roots: list[tuple[int, bytes]], elapsed: float) -> None:
+    """Record batch-size/byte-count stats for put_state_hamt_roots."""
+    if not _PG_TIMINGS_ENABLED:
+        return
+    global _ROOT_WRITE_CALLS, _ROOT_WRITE_TOTAL_ROOTS, _ROOT_WRITE_TOTAL_BYTES
+    global _ROOT_WRITE_TOTAL_TIME
+    batch_size = len(roots)
+    total_bytes = sum(8 + len(value) for _state_group, value in roots)
+    if elapsed < 0.0001:
+        lat_bucket = "<0.1ms"
+    elif elapsed < 0.00025:
+        lat_bucket = "<0.25ms"
+    elif elapsed < 0.0005:
+        lat_bucket = "<0.5ms"
+    elif elapsed < 0.001:
+        lat_bucket = "<1ms"
+    else:
+        lat_bucket = ">=1ms"
+    if batch_size == 1:
+        size_bucket = "1"
+    elif batch_size <= 5:
+        size_bucket = "2-5"
+    elif batch_size <= 20:
+        size_bucket = "6-20"
+    elif batch_size <= 100:
+        size_bucket = "21-100"
+    else:
+        size_bucket = ">100"
+    lock = _STATE_TIMING_LOCK
+    assert lock is not None
+    with lock:
+        _ROOT_WRITE_CALLS += 1
+        _ROOT_WRITE_TOTAL_ROOTS += batch_size
+        _ROOT_WRITE_TOTAL_BYTES += total_bytes
+        _ROOT_WRITE_TOTAL_TIME += elapsed
+        _ROOT_WRITE_LATENCY_BUCKETS[lat_bucket] += 1
+        _ROOT_WRITE_SIZE_BUCKETS[size_bucket] += 1
+
+
+def _print_state_timings() -> None:
+    if not _PG_TIMINGS_ENABLED:
+        return
+    lock = _STATE_TIMING_LOCK
+    assert lock is not None
+    with lock:
+        if not _STATE_TIMINGS:
+            return
+        # Snapshot under the lock so the SIGTERM/atexit flusher never races a
+        # concurrent `_state_timing` on these dicts.
+        timings = dict(_STATE_TIMINGS)
+        counts = dict(_STATE_TIMING_COUNTS)
+        counters = dict(_STATE_COUNTERS)
+
+    run_dir = os.environ.get("SYNAPSE_TIMINGS_RUN_DIR")
+    if run_dir:
+        tmp_path = os.path.join(
+            run_dir, f"state_{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        final_path = os.path.join(run_dir, f"state_{os.getpid()}.json")
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"timings": timings, "counts": counts, "counters": counters}, f
+                )
+            os.replace(tmp_path, final_path)
+        except OSError:
+            pass
+        return
+
+    _timings_print("\n=== State store mtxdb-vs-SQL timings ===")
+    _timings_print(
+        f"  {'':40s}  {'total':>10s}  {'calls':>6s}  {'avg':>13s}",
+    )
+
+    embedded_tags = sorted(t for t in timings if t.endswith("_embedded"))
+    sql_tags = sorted(t for t in timings if t.endswith("_sql"))
+    other_tags = sorted(t for t in timings if not t.endswith(("_embedded", "_sql")))
+
+    def _print_tag_group(label: str, tags: list[str]) -> None:
+        if not tags:
+            return
+        _timings_print(f"  -- {label} --")
+        for tag in tags:
+            total_s = timings[tag]
+            count = counts[tag]
+            total_ms = total_s * 1000
+            avg_ms = (total_s / count) * 1000 if count else 0.0
+            _timings_print(
+                f"  {tag:40s}  {total_ms:8.1f}ms  {count:6d}  {avg_ms:10.3f}ms",
+            )
+
+    def _print_subtotal(label: str, tags: list[str]) -> None:
+        total_s = sum(timings[tag] for tag in tags)
+        count = sum(counts[tag] for tag in tags)
+        total_ms = total_s * 1000
+        avg_ms = (total_s / count) * 1000 if count else 0.0
+        _timings_print(
+            f"  {label:40s}  {total_ms:8.1f}ms  {count:6d}  {avg_ms:10.3f}ms",
+        )
+
+    _print_tag_group("hits (embedded)", embedded_tags)
+    _timings_print("")
+    _print_subtotal("SUB-TOTAL (hits embedded)", embedded_tags)
+    _timings_print("")
+    _print_tag_group("misses (sql)", sql_tags)
+    _timings_print("")
+    _print_tag_group("other", other_tags)
+
+    total_time_s = sum(timings.values())
+    total_count = sum(counts.values())
+    total_ms = total_time_s * 1000
+    avg_ms = (total_time_s / total_count) * 1000 if total_count else 0.0
+    _timings_print("")
+    _timings_print(
+        f"  {'TOTAL':40s}  {total_ms:8.1f}ms  {total_count:6d}  {avg_ms:10.3f}ms",
+    )
+    _timings_print("=========================================")
+    _timings_print("")
+    if counters:
+        _timings_print("=== State mirror diagnostics ===")
+        for tag in sorted(counters):
+            _timings_print(f"  {tag:50s}  {counters[tag]:>12,d}")
+        _timings_print("================================")
+        _timings_print("")
+
+
+def _print_node_write_stats() -> None:
+    """Print node-write bucketed stats for put_state_hamt_nodes diagnostics."""
+    if not _PG_TIMINGS_ENABLED:
+        return
+    lock = _STATE_TIMING_LOCK
+    assert lock is not None
+    with lock:
+        calls = _NODE_WRITE_CALLS
+        total_nodes = _NODE_WRITE_TOTAL_NODES
+        total_bytes = _NODE_WRITE_TOTAL_BYTES
+        total_time = _NODE_WRITE_TOTAL_TIME
+        lat_buckets = dict(_NODE_WRITE_LATENCY_BUCKETS)
+        size_buckets = dict(_NODE_WRITE_SIZE_BUCKETS)
+    if calls == 0:
+        return
+
+    run_dir = os.environ.get("SYNAPSE_TIMINGS_RUN_DIR")
+    if run_dir:
+        tmp_path = os.path.join(
+            run_dir, f"node_writes_{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        final_path = os.path.join(run_dir, f"node_writes_{os.getpid()}.json")
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "calls": calls,
+                        "total_nodes": total_nodes,
+                        "total_bytes": total_bytes,
+                        "total_time": total_time,
+                        "lat_buckets": lat_buckets,
+                        "size_buckets": size_buckets,
+                    },
+                    f,
+                )
+            os.replace(tmp_path, final_path)
+        except OSError:
+            pass
+        return
+
+    _timings_print("\n=== put_state_hamt_nodes batch diagnostics ===")
+    _timings_print(f"  calls:                    {calls}")
+    _timings_print(f"  total nodes:              {total_nodes}")
+    _timings_print(f"  total bytes:              {total_bytes:,}")
+    _timings_print(f"  total time:               {total_time * 1000:.1f}ms")
+    _timings_print(f"  avg nodes/call:           {total_nodes / calls:.1f}")
+    _timings_print(f"  avg bytes/call:           {total_bytes / calls:.0f}")
+    _timings_print(f"  avg time/call:            {(total_time / calls) * 1000:.3f}ms")
+    _timings_print(
+        f"  avg bytes/node:           {total_bytes / total_nodes:.0f}"
+        if total_nodes
+        else ""
+    )
+    _timings_print("")
+    _timings_print("  Latency distribution:")
+    for bucket in ("<0.1ms", "<0.25ms", "<0.5ms", "<1ms", ">=1ms"):
+        count = lat_buckets.get(bucket, 0)
+        pct = (count / calls) * 100 if calls else 0
+        _timings_print(f"    {bucket:12s}  {count:6d}  ({pct:5.1f}%)")
+    _timings_print("")
+    _timings_print("  Batch-size distribution:")
+    for bucket in ("1", "2-5", "6-20", "21-100", ">100"):
+        count = size_buckets.get(bucket, 0)
+        pct = (count / calls) * 100 if calls else 0
+        _timings_print(f"    {bucket:12s}  {count:6d}  ({pct:5.1f}%)")
+    _timings_print("=============================================")
+    _timings_print("")
+
+
+def _print_root_write_stats() -> None:
+    """Write process-local root batch diagnostics for the trial aggregator."""
+    if not _PG_TIMINGS_ENABLED:
+        return
+    lock = _STATE_TIMING_LOCK
+    assert lock is not None
+    with lock:
+        calls = _ROOT_WRITE_CALLS
+        roots = _ROOT_WRITE_TOTAL_ROOTS
+        total_bytes = _ROOT_WRITE_TOTAL_BYTES
+        total_time = _ROOT_WRITE_TOTAL_TIME
+        lat_buckets = dict(_ROOT_WRITE_LATENCY_BUCKETS)
+        size_buckets = dict(_ROOT_WRITE_SIZE_BUCKETS)
+    if not calls:
+        return
+    run_dir = os.environ.get("SYNAPSE_TIMINGS_RUN_DIR")
+    if run_dir:
+        tmp_path = os.path.join(
+            run_dir, f"root_writes_{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        final_path = os.path.join(run_dir, f"root_writes_{os.getpid()}.json")
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "calls": calls,
+                        "total_roots": roots,
+                        "total_bytes": total_bytes,
+                        "total_time": total_time,
+                        "lat_buckets": lat_buckets,
+                        "size_buckets": size_buckets,
+                    },
+                    f,
+                )
+            os.replace(tmp_path, final_path)
+        except OSError:
+            pass
+        return
+    _timings_print("\n=== put_state_hamt_roots batch diagnostics ===")
+    _timings_print(f"  calls:                    {calls}")
+    _timings_print(f"  total roots:              {roots}")
+    _timings_print(f"  total bytes:              {total_bytes:,}")
+    _timings_print(f"  total time:               {total_time * 1000:.1f}ms")
+    _timings_print(f"  avg roots/call:           {roots / calls:.1f}")
+    _timings_print(f"  avg bytes/call:           {total_bytes / calls:.0f}")
+    _timings_print(f"  avg time/call:            {total_time / calls * 1000:.3f}ms")
+    _timings_print("==============================================")
+    _timings_print("")
+    _timings_print("  Latency distribution:")
+    for bucket in ("<0.1ms", "<0.25ms", "<0.5ms", "<1ms", ">=1ms"):
+        count = lat_buckets.get(bucket, 0)
+        pct = (count / calls) * 100 if calls else 0
+        _timings_print(f"    {bucket:12s}  {count:6d}  ({pct:5.1f}%)")
+    _timings_print("")
+    _timings_print("  Batch-size distribution:")
+    for bucket in ("1", "2-5", "6-20", "21-100", ">100"):
+        count = size_buckets.get(bucket, 0)
+        pct = (count / calls) * 100 if calls else 0
+        _timings_print(f"    {bucket:12s}  {count:6d}  ({pct:5.1f}%)")
+    _timings_print("=============================================")
+    _timings_print("")
+
+
+if _PG_TIMINGS_ENABLED:
+
+    def flush_state_timings() -> None:
+        _print_state_timings()
+
+    def flush_node_write_stats() -> None:
+        _print_node_write_stats()
+
+    def flush_root_write_stats() -> None:
+        _print_root_write_stats()
+
+    atexit.register(flush_state_timings)
+    atexit.register(flush_node_write_stats)
+    atexit.register(flush_root_write_stats)
+    register_periodic_flush(flush_state_timings)
+    register_periodic_flush(flush_node_write_stats)
+    register_periodic_flush(flush_root_write_stats)
+
+    import signal as _signal
+    from types import FrameType as _FrameType
+
+    _original_sigterm_state_timings = _signal.getsignal(_signal.SIGTERM)
+
+    def _flush_state_timings_on_sigterm(signum: int, frame: _FrameType | None) -> None:
+        _print_state_timings()
+        if callable(_original_sigterm_state_timings):
+            _original_sigterm_state_timings(signum, frame)
+        elif _original_sigterm_state_timings == _signal.SIG_DFL:
+            _signal.signal(_signal.SIGTERM, _signal.SIG_DFL)
+            _signal.raise_signal(_signal.SIGTERM)
+
+    _signal.signal(_signal.SIGTERM, _flush_state_timings_on_sigterm)
+
+
 MAX_STATE_DELTA_HOPS = 100
+
+
+def _state_hamt_node_key(
+    namespace: str, room_prefix: bytes, structural_hash: bytes
+) -> bytes:
+    # Must match `node_key` in `rust/src/database/core.rs`.
+    ns_hash = namespace_hash(namespace)
+    return (
+        b"hamt:node:"
+        + ns_hash.hex().encode("ascii")
+        + b":"
+        + room_prefix.hex().encode("ascii")
+        + b":"
+        + structural_hash.hex().encode("ascii")
+    )
+
+
+def _state_hamt_root_key(namespace: str, state_group: int) -> bytes:
+    """Return the per-namespace HAMT root key.
+
+    State-group ids are only unique inside one Synapse database, so the
+    namespace is part of the key. The room prefix is stored in the
+    value, allowing readers to locate a root from only its state-group id.
+    """
+    ns_hash = namespace_hash(namespace)
+    return (
+        b"hamt:root:" + ns_hash.hex().encode("ascii") + str(state_group).encode("ascii")
+    )
+
+
+def _encode_state_hamt_root(
+    room_prefix: bytes,
+    root_hash: bytes,
+    lattice: bytes,
+    room_id: str,
+) -> bytes:
+    room_id_bytes = room_id.encode("utf-8")
+    return (
+        b"MTHR\x01"
+        + struct.pack(">H", len(room_prefix))
+        + room_prefix
+        + struct.pack(">H", len(room_id_bytes))
+        + room_id_bytes
+        + root_hash
+        + lattice
+    )
+
+
+def _decode_state_hamt_root(
+    value: bytes,
+) -> tuple[bytes, bytes, bytes, str]:
+    if len(value) < 9 or value[:4] != b"MTHR" or value[4] != 1:
+        raise RuntimeError("invalid or unsupported HAMT root record version")
+    prefix_len = struct.unpack(">H", value[5:7])[0]
+    room_id_len_offset = 7 + prefix_len
+    if len(value) < room_id_len_offset + 2:
+        raise RuntimeError("truncated HAMT root record")
+    room_id_len = struct.unpack(
+        ">H", value[room_id_len_offset : room_id_len_offset + 2]
+    )[0]
+    room_id_start = room_id_len_offset + 2
+    root_start = room_id_start + room_id_len
+    if len(value) < root_start + 32:
+        raise RuntimeError("truncated HAMT root record")
+    room_prefix = value[7:room_id_len_offset]
+    room_id = value[room_id_start:root_start].decode("utf-8")
+    root_hash = value[root_start : root_start + 32]
+    lattice = value[root_start + 32 :]
+    return room_prefix, root_hash, lattice, room_id
 
 
 class StateGroupBackgroundUpdateStore(SQLBaseStore):
     """Defines functions related to state groups needed to run the state background
     updates.
     """
+
+    def __init__(
+        self,
+        database: DatabasePool,
+        db_conn: LoggingDatabaseConnection,
+        hs: "HomeServer",
+    ):
+        super().__init__(database, db_conn, hs)
+        self._hamt_namespace_override: str | None = None
+
+    @property
+    def hamt_namespace(self) -> str:
+        """Namespaces HAMT root/node keys in the embedded engine so that
+        independent deployments sharing a filesystem (e.g. multiple trial
+        workers in the same test run) can't overwrite each other's state.
+        Defaults to the server name; tests override it to a fresh value per
+        run (see `tests/utils.py`).
+        """
+        if self._hamt_namespace_override is not None:
+            return self._hamt_namespace_override
+        db_pool_ns = getattr(self.db_pool, "_hamt_namespace", None)
+        if db_pool_ns:
+            return str(db_pool_ns)
+        return self.hs.hostname
+
+    @hamt_namespace.setter
+    def hamt_namespace(self, value: str) -> None:
+        self._hamt_namespace_override = value
+        if hasattr(self, "db_pool") and self.db_pool is not None:
+            self.db_pool._hamt_namespace = value
 
     @trace
     @tag_args
@@ -118,6 +678,105 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
         if state_filter is None:
             state_filter = StateFilter.all()
 
+        groups = list(groups)
+        results: dict[int, MutableStateMap[str]] = {group: {} for group in groups}
+
+        hamt_results, missing_groups = self._get_state_groups_from_hamt_txn(
+            txn, groups, state_filter
+        )
+        results.update(hamt_results)
+
+        if not missing_groups:
+            return results
+
+        # Existing groups without a root are expected only while the v95
+        # backfill is pending. Once it has completed, a missing root is data
+        # corruption.
+        txn.execute(
+            "SELECT 1 FROM background_updates WHERE update_name = ?",
+            ("state_hamt_backfill_roots",),
+        )
+        backfill_pending = txn.fetchone() is not None
+        if not backfill_pending:
+            existing_rows = self.db_pool.simple_select_many_txn(
+                txn,
+                table="state_groups",
+                column="id",
+                iterable=missing_groups,
+                keyvalues={},
+                retcols=("id",),
+            )
+            existing_in_sql = {group for (group,) in existing_rows}
+            if (
+                existing_in_sql
+                and getattr(self, "_embedded_db_engine", None) == "mtxdb"
+            ):
+                # In a multi-worker deployment, this worker's in-process
+                # mtxdb index may simply be stale rather than the group
+                # being genuinely corrupt: another worker can have written
+                # the root/nodes after this worker last loaded (or never
+                # loaded) that room's collection, and nothing invalidates
+                # this worker's copy automatically -- see
+                # `StorageEngine::refresh_collection`'s doc comment.
+                # `room_index` itself needs no such retry (it's always
+                # current -- a plain `pread`), so this resolves the
+                # affected groups to their rooms via that index and forces
+                # a one-time re-scan of each room's collection before
+                # concluding the data is actually missing.
+                from synapse.synapse_rust.mtxdb_engine import (
+                    refresh_state_hamt_collections_for_groups,
+                )
+
+                namespace = getattr(self, "_embedded_db_namespace", None)
+                # __init__ always sets this alongside `_embedded_db_engine`
+                # in the same branch (see store.py) -- reaching here with
+                # the engine set but not the namespace would be an init bug,
+                # not a normal runtime state.
+                assert namespace is not None
+                refresh_state_hamt_collections_for_groups(
+                    namespace, list(existing_in_sql)
+                )
+                retry_results, _ = self._get_state_groups_from_hamt_txn(
+                    txn, list(existing_in_sql), state_filter
+                )
+                results.update(retry_results)
+                existing_in_sql -= set(retry_results)
+                # Recovered groups must not also go through the legacy
+                # fallback below -- it would overwrite the correct,
+                # just-refreshed state with an empty/wrong reconstruction.
+                missing_groups = [g for g in missing_groups if g not in retry_results]
+
+            if existing_in_sql:
+                raise RuntimeError(
+                    f"State group(s) exist in SQL but have no HAMT root: {existing_in_sql}"
+                )
+
+        logger.debug(
+            "Falling back to legacy state-group reads for %s (state_groups_state is "
+            "not populated on this branch; expect empty results)",
+            missing_groups,
+        )
+        results.update(
+            self._get_legacy_state_for_groups_txn(txn, missing_groups, state_filter)
+        )
+        return results
+
+    def _get_legacy_state_for_groups_txn(
+        self,
+        txn: LoggingTransaction,
+        groups: list[int],
+        state_filter: StateFilter,
+    ) -> dict[int, MutableStateMap[str]]:
+        """Walk `state_group_edges`/`state_groups_state` directly to
+        reconstruct the state for `groups`, bypassing the HAMT entirely.
+
+        This is the fallback used when a group has no HAMT root (either
+        because it's genuinely missing, in which case this correctly
+        resolves to `{}`, or -- see `_get_state_groups_from_groups_txn` --
+        because it predates the HAMT schema and hasn't been backfilled yet
+        by `_background_backfill_state_hamt_roots`, which calls this
+        directly to get the state to build a root from).
+        """
         results: dict[int, MutableStateMap[str]] = {group: {} for group in groups}
 
         if isinstance(self.database_engine, PostgresEngine):
@@ -276,7 +935,571 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
                     )
 
         # The results shouldn't be considered mutable.
+        logger.debug(
+            "Legacy fallback for %s returned %s state entries "
+            "(state_groups_state is empty on this branch)",
+            groups,
+            {group: len(results[group]) for group in groups},
+        )
         return results
+
+    def _get_state_groups_from_hamt_txn(
+        self,
+        txn: LoggingTransaction,
+        groups: list[int],
+        state_filter: StateFilter,
+    ) -> tuple[dict[int, MutableStateMap[str]], list[int]]:
+        _gg_hamt_txn_start = time.monotonic()
+        results: dict[int, MutableStateMap[str]] = {}
+        missing_groups: list[int] = []
+        exact_keys = (
+            state_filter.concrete_types() if not state_filter.has_wildcards() else None
+        )
+
+        # The embedded engine (mtxdb) mirrors both nodes and root records
+        # (`_store_state_hamt_root_embedded_txn`/`batch_get_state_hamt_roots`),
+        # falling back to `state_hamt_roots`/`state_groups` SQL only for a
+        # group it doesn't have. Always use the bulk path (it degrades to a
+        # single-root fetch fine for len(groups) == 1).
+        use_embedded = bool(getattr(self, "_embedded_db_engine", None))
+
+        bulk_results: dict[int, list[tuple[str, str, str]] | None] | None = None
+        bulk_selective_results: dict[int, list[tuple[str, str, str]] | None] | None = (
+            None
+        )
+        if use_embedded:
+            _et = time.monotonic()
+            if exact_keys is None:
+                bulk_results = self._materialize_state_hamts_from_embedded_txn(
+                    txn, groups
+                )
+            else:
+                bulk_selective_results = self._lookup_state_hamts_from_embedded_txn(
+                    txn, groups, exact_keys
+                )
+            _state_timing("state_read_embedded", time.monotonic() - _et)
+        elif len(groups) > 1:
+            _st = time.monotonic()
+            if exact_keys is None:
+                bulk_results = self._materialize_state_hamt_from_postgres_many_txn(
+                    txn, groups
+                )
+            else:
+                bulk_selective_results = self._lookup_state_hamt_from_postgres_many_txn(
+                    txn, groups, exact_keys
+                )
+            _state_timing("state_read_sql", time.monotonic() - _st)
+
+        for group in groups:
+            if exact_keys is not None:
+                entries = (
+                    bulk_selective_results[group]
+                    if bulk_selective_results is not None
+                    else self._lookup_state_hamt_from_postgres_txn(
+                        txn, group, exact_keys
+                    )
+                )
+            else:
+                entries = (
+                    bulk_results[group]
+                    if bulk_results is not None
+                    else self._materialize_state_hamt_from_postgres_txn(txn, group)
+                )
+            if entries is None:
+                missing_groups.append(group)
+                continue
+
+            state_map: MutableStateMap[str] = {}
+            for typ, state_key, event_id in entries:
+                key = (intern_string(typ), intern_string(state_key))
+                state_map[key] = event_id
+
+            results[group] = dict(state_filter.filter_state(state_map))
+
+        logger.debug(
+            "[gg-state-timing] _get_state_groups_from_hamt_txn groups=%d "
+            "elapsed_ms=%.1f missing=%d",
+            len(groups),
+            (time.monotonic() - _gg_hamt_txn_start) * 1000,
+            len(missing_groups),
+        )
+        return results, missing_groups
+
+    def _materialize_state_hamt_from_postgres_txn(
+        self, txn: LoggingTransaction, state_group: int
+    ) -> list[tuple[str, str, str]] | None:
+        _gg_mat_start = time.monotonic()
+        from synapse.synapse_rust import state_hamt
+
+        root = self.db_pool.simple_select_one_onecol_txn(
+            txn,
+            table="state_hamt_roots",
+            keyvalues={"state_group": state_group},
+            retcol="root_structural_hash",
+            allow_none=True,
+        )
+        if root is None:
+            logger.debug(
+                "SQL HAMT materialization: no state_hamt_roots row for "
+                "state_group %s -> falls through to empty legacy fallback",
+                state_group,
+            )
+            return None
+        root_structural_hash = bytes(root)
+
+        root_node = self.db_pool.simple_select_one_onecol_txn(
+            txn,
+            table="state_hamt_nodes",
+            keyvalues={"structural_hash": bytearray(root_structural_hash)},
+            retcol="node_bytes",
+            allow_none=True,
+        )
+        if root_node is None:
+            logger.warning(
+                "SQL HAMT materialization: state_hamt_roots row exists for "
+                "state_group %s but root node %s is missing from state_hamt_nodes",
+                state_group,
+                root_structural_hash.hex(),
+            )
+            raise RuntimeError(
+                "Missing HAMT root node for state group "
+                f"{state_group}: {root_structural_hash.hex()}"
+            )
+        root_node_bytes = bytes(root_node)
+
+        node_bytes_by_hash: dict[bytes, bytes] = {root_structural_hash: root_node_bytes}
+        seen_hashes = {root_structural_hash}
+        to_fetch = {
+            bytes(child_hash)
+            for child_hash in state_hamt.node_child_hashes(root_node_bytes)
+        }
+
+        while to_fetch:
+            current_batch = list(to_fetch)
+            to_fetch = set()
+
+            for chunk in batch_iter(current_batch, 100):
+                rows = [
+                    (bytes(structural_hash), bytes(node_bytes))
+                    for structural_hash, node_bytes in self.db_pool.simple_select_many_txn(
+                        txn,
+                        table="state_hamt_nodes",
+                        column="structural_hash",
+                        iterable=[
+                            bytearray(structural_hash) for structural_hash in chunk
+                        ],
+                        keyvalues={},
+                        retcols=("structural_hash", "node_bytes"),
+                    )
+                ]
+                found_hashes = {node_hash for node_hash, _ in rows}
+                missing_hashes = set(chunk) - found_hashes
+                if missing_hashes:
+                    raise RuntimeError(
+                        "Missing HAMT child nodes for state group "
+                        f"{state_group}: {[hash.hex() for hash in missing_hashes]}"
+                    )
+
+                for structural_hash, node_bytes in rows:
+                    node_bytes_by_hash[structural_hash] = node_bytes
+
+                    for child_hash in state_hamt.node_child_hashes(node_bytes):
+                        if child_hash not in seen_hashes:
+                            seen_hashes.add(child_hash)
+                            to_fetch.add(child_hash)
+
+        entries = _decode_packed_state_entries(
+            state_hamt.materialize_state_entries_packed(
+                node_bytes_by_hash[root_structural_hash],
+                list(node_bytes_by_hash.items()),
+            )
+        )
+        logger.debug(
+            "[gg-state-timing] _materialize_state_hamt_from_postgres_txn "
+            "group=%d elapsed_ms=%.1f entries=%d",
+            state_group,
+            (time.monotonic() - _gg_mat_start) * 1000,
+            len(entries),
+        )
+        return entries
+
+    def _materialize_state_hamt_from_postgres_many_txn(
+        self, txn: LoggingTransaction, groups: list[int]
+    ) -> dict[int, list[tuple[str, str, str]] | None]:
+        """Materialize multiple SQL HAMT roots while sharing node fetches."""
+        from synapse.synapse_rust import state_hamt
+
+        root_rows = self.db_pool.simple_select_many_txn(
+            txn,
+            table="state_hamt_roots",
+            column="state_group",
+            iterable=groups,
+            keyvalues={},
+            retcols=("state_group", "root_structural_hash"),
+        )
+        roots = {int(group): bytes(root_hash) for group, root_hash in root_rows}
+        results: dict[int, list[tuple[str, str, str]] | None] = dict.fromkeys(
+            groups, None
+        )
+        if not roots:
+            return results
+
+        to_fetch = set(roots.values())
+        node_bytes_by_hash: dict[bytes, bytes] = {}
+        while to_fetch:
+            current_batch = list(to_fetch)
+            to_fetch = set()
+            for chunk in batch_iter(current_batch, 100):
+                rows = [
+                    (bytes(node_hash), bytes(node_bytes))
+                    for node_hash, node_bytes in self.db_pool.simple_select_many_txn(
+                        txn,
+                        table="state_hamt_nodes",
+                        column="structural_hash",
+                        iterable=[bytearray(node_hash) for node_hash in chunk],
+                        keyvalues={},
+                        retcols=("structural_hash", "node_bytes"),
+                    )
+                ]
+                missing = set(chunk) - {node_hash for node_hash, _ in rows}
+                if missing:
+                    raise RuntimeError(
+                        "Missing HAMT nodes for state groups "
+                        f"{groups}: {[node_hash.hex() for node_hash in missing]}"
+                    )
+                for node_hash, node_bytes in rows:
+                    if node_hash in node_bytes_by_hash:
+                        continue
+                    node_bytes_by_hash[node_hash] = node_bytes
+                    for child_hash in state_hamt.node_child_hashes(node_bytes):
+                        if child_hash not in node_bytes_by_hash:
+                            to_fetch.add(child_hash)
+
+        for group, root_hash in roots.items():
+            root_bytes = node_bytes_by_hash[root_hash]
+            results[group] = _decode_packed_state_entries(
+                state_hamt.materialize_state_entries_packed(
+                    root_bytes,
+                    list(node_bytes_by_hash.items()),
+                )
+            )
+        return results
+
+    def _lookup_state_hamt_from_postgres_txn(
+        self,
+        txn: LoggingTransaction,
+        state_group: int,
+        keys: list[tuple[str, str]],
+    ) -> list[tuple[str, str, str]] | None:
+        from synapse.synapse_rust import state_hamt
+
+        _gg_single_start = time.monotonic()
+        root = self.db_pool.simple_select_one_onecol_txn(
+            txn,
+            table="state_hamt_roots",
+            keyvalues={"state_group": state_group},
+            retcol="root_structural_hash",
+            allow_none=True,
+        )
+        if root is None:
+            return None
+        root_hash = bytes(root)
+        room_id = self.db_pool.simple_select_one_onecol_txn(
+            txn,
+            table="state_groups",
+            keyvalues={"id": state_group},
+            retcol="room_id",
+            allow_none=False,
+        )
+        root_node = self.db_pool.simple_select_one_onecol_txn(
+            txn,
+            table="state_hamt_nodes",
+            keyvalues={"structural_hash": bytearray(root_hash)},
+            retcol="node_bytes",
+            allow_none=True,
+        )
+        if root_node is None:
+            raise RuntimeError(
+                f"Missing HAMT root node for state group {state_group}: {root_hash.hex()}"
+            )
+        root_bytes = bytes(root_node)
+        nodes: dict[bytes, bytes] = {root_hash: root_bytes}
+        while True:
+            packed_entries, missing = state_hamt.lookup_state_entries_packed(
+                room_id,
+                root_bytes,
+                list(nodes.items()),
+                keys,
+            )
+            entries = _decode_packed_state_entries(packed_entries)
+            missing = [
+                bytes(node_hash) for node_hash in missing if node_hash not in nodes
+            ]
+            if not missing:
+                logger.debug(
+                    "[gg-state-timing] _lookup_state_hamt_from_postgres_txn "
+                    "group=%d keys=%d elapsed_ms=%.1f",
+                    state_group,
+                    len(keys),
+                    (time.monotonic() - _gg_single_start) * 1000,
+                )
+                return entries
+            rows = self.db_pool.simple_select_many_txn(
+                txn,
+                table="state_hamt_nodes",
+                column="structural_hash",
+                iterable=[bytearray(node_hash) for node_hash in missing],
+                keyvalues={},
+                retcols=("structural_hash", "node_bytes"),
+            )
+            nodes.update(
+                (bytes(node_hash), bytes(node_bytes)) for node_hash, node_bytes in rows
+            )
+            unresolved = set(missing) - nodes.keys()
+            if unresolved:
+                raise RuntimeError(
+                    "Missing HAMT child nodes for state group "
+                    f"{state_group}: {[node_hash.hex() for node_hash in unresolved]}"
+                )
+
+    def _lookup_state_hamt_from_postgres_many_txn(
+        self,
+        txn: LoggingTransaction,
+        groups: list[int],
+        keys: list[tuple[str, str]],
+    ) -> dict[int, list[tuple[str, str, str]] | None]:
+        """Selective HAMT key lookup across several state groups, sharing node
+        fetches -- the SQL-mode mirror of the embedded engine's batched
+        selective lookup (`lookup_state_hamts` in `rust/src/database/`).
+
+        Each round, every group attempts to resolve `keys` against whatever
+        nodes have been fetched so far; any node hashes still missing across
+        *all* groups are merged into one shared batch fetch for the next
+        round, so groups needing a node in common only ever fetch it once.
+        """
+        _gg_many_start = time.monotonic()
+        from synapse.synapse_rust import state_hamt
+
+        root_rows = self.db_pool.simple_select_many_txn(
+            txn,
+            table="state_hamt_roots",
+            column="state_group",
+            iterable=groups,
+            keyvalues={},
+            retcols=("state_group", "root_structural_hash"),
+        )
+        roots = {int(group): bytes(root_hash) for group, root_hash in root_rows}
+        results: dict[int, list[tuple[str, str, str]] | None] = dict.fromkeys(
+            groups, None
+        )
+        if not roots:
+            return results
+
+        room_id_rows = self.db_pool.simple_select_many_txn(
+            txn,
+            table="state_groups",
+            column="id",
+            iterable=list(roots.keys()),
+            keyvalues={},
+            retcols=("id", "room_id"),
+        )
+        room_ids = {int(group): room_id for group, room_id in room_id_rows}
+
+        def try_resolve_all() -> set[bytes]:
+            """Attempt selective resolution for every group against the
+            nodes fetched so far. Returns the union of node hashes still
+            missing across all groups (deduped, and excluding anything
+            already fetched -- defensive, mirrors the single-group loop)."""
+            still_missing: set[bytes] = set()
+            for group, root_hash in roots.items():
+                packed_entries, missing = state_hamt.lookup_state_entries_packed(
+                    room_ids[group],
+                    node_bytes_by_hash[root_hash],
+                    list(node_bytes_by_hash.items()),
+                    keys,
+                )
+                entries = _decode_packed_state_entries(packed_entries)
+                results[group] = entries
+                still_missing.update(
+                    bytes(node_hash)
+                    for node_hash in missing
+                    if bytes(node_hash) not in node_bytes_by_hash
+                )
+            return still_missing
+
+        node_bytes_by_hash: dict[bytes, bytes] = {}
+        to_fetch = set(roots.values())
+        rounds = 0
+        while to_fetch:
+            rounds += 1
+            current_batch = list(to_fetch)
+            for chunk in batch_iter(current_batch, 100):
+                rows = [
+                    (bytes(node_hash), bytes(node_bytes))
+                    for node_hash, node_bytes in self.db_pool.simple_select_many_txn(
+                        txn,
+                        table="state_hamt_nodes",
+                        column="structural_hash",
+                        iterable=[bytearray(node_hash) for node_hash in chunk],
+                        keyvalues={},
+                        retcols=("structural_hash", "node_bytes"),
+                    )
+                ]
+                missing_from_db = set(chunk) - {node_hash for node_hash, _ in rows}
+                if missing_from_db:
+                    raise RuntimeError(
+                        "Missing HAMT nodes for state groups "
+                        f"{groups}: {[node_hash.hex() for node_hash in missing_from_db]}"
+                    )
+                node_bytes_by_hash.update(rows)
+
+            to_fetch = try_resolve_all()
+
+        logger.debug(
+            "[gg-state-timing] _lookup_state_hamt_from_postgres_many_txn "
+            "groups=%d keys=%d elapsed_ms=%.1f rounds=%d",
+            len(groups),
+            len(keys),
+            (time.monotonic() - _gg_many_start) * 1000,
+            rounds,
+        )
+        return results
+
+    def _fetch_hamt_roots_for_embedded_txn(
+        self, txn: LoggingTransaction, groups: list[int]
+    ) -> dict[int, tuple[bytes, bytes, str]]:
+        """Fetch `(room_prefix, root_structural_hash, room_id)` for each of
+        `groups` that has a published HAMT root, from the embedded engine --
+        the configured store, used exclusively. A group still missing after
+        that is NOT silently re-fetched from SQL: once the embedded engine
+        is configured it's the source of truth for new data, so a real miss
+        means either genuine corruption or (the one legitimate exception)
+        that `EMBEDDED_DB_MIGRATION_UPDATE_NAME` hasn't finished copying
+        this group's pre-existing SQL row over yet -- see
+        `_background_migrate_state_hamt_to_embedded`. Only in that bounded,
+        explicit window does this fall back to SQL.
+
+        `groups` is a bare list of `state_group` ints spanning arbitrary,
+        unknown rooms by design (this is the generic materialize/lookup-by
+        -groups path). Roots live in per-room mtxdb collections, so the Rust
+        bulk API resolves each group's room via the flat-file room index,
+        groups the reads by room, and decodes their records before returning
+        to Python. This keeps the whole operation to one FFI crossing.
+        """
+        engine = get_embedded_engine(getattr(self, "_embedded_db_engine", None))
+        namespace = getattr(self, "_embedded_db_namespace", None)
+        found: dict[int, tuple[bytes, bytes, str]] = {}
+        still_missing: list[int] = []
+
+        roots = engine.get_state_hamt_roots_bulk(namespace, groups)
+        for group, root in zip(groups, roots):
+            if root is None:
+                still_missing.append(group)
+                continue
+            room_prefix, root_hash, room_id = root
+            found[group] = (bytes(room_prefix), bytes(root_hash), room_id)
+        if not still_missing:
+            return found
+
+        migration_name = getattr(
+            self, "EMBEDDED_DB_MIGRATION_UPDATE_NAME", "state_hamt_embedded_migration"
+        )
+        txn.execute(
+            "SELECT 1 FROM background_updates WHERE update_name = ?",
+            (migration_name,),
+        )
+        migration_pending = txn.fetchone() is not None
+        if not migration_pending:
+            # Not a migration window -- these groups are genuinely missing
+            # from the configured store. Let the caller's normal
+            # missing-group handling (raise-unless-legacy-pre-v95) decide,
+            # rather than masking it with a legacy-SQL read here.
+            return found
+
+        root_rows = self.db_pool.simple_select_many_txn(
+            txn,
+            table="state_hamt_roots",
+            column="state_group",
+            iterable=still_missing,
+            keyvalues={},
+            retcols=("state_group", "room_prefix", "root_structural_hash"),
+        )
+        if not root_rows:
+            return found
+        roots = {
+            int(group): (bytes(room_prefix), bytes(root_hash))
+            for group, room_prefix, root_hash in root_rows
+        }
+        room_id_rows = self.db_pool.simple_select_many_txn(
+            txn,
+            table="state_groups",
+            column="id",
+            iterable=list(roots.keys()),
+            keyvalues={},
+            retcols=("id", "room_id"),
+        )
+        room_ids = {int(group): room_id for group, room_id in room_id_rows}
+        found.update(
+            {
+                group: (room_prefix, root_hash, room_ids[group])
+                for group, (room_prefix, root_hash) in roots.items()
+                if group in room_ids
+            }
+        )
+        return found
+
+    def _materialize_state_hamts_from_embedded_txn(
+        self, txn: LoggingTransaction, groups: list[int]
+    ) -> dict[int, list[tuple[str, str, str]] | None]:
+        results: dict[int, list[tuple[str, str, str]] | None] = dict.fromkeys(
+            groups, None
+        )
+        roots = self._fetch_hamt_roots_for_embedded_txn(txn, groups)
+        if not roots:
+            return results
+        engine = get_embedded_engine(getattr(self, "_embedded_db_engine", None))
+        ordered_groups = list(roots.keys())
+        _et = time.monotonic()
+        materialized = engine.materialize_state_hamts(
+            getattr(self, "_embedded_db_namespace", None),
+            [roots[group] for group in ordered_groups],
+        )
+        ffi_timing("ffi_materialize_hamts", time.monotonic() - _et)
+        for group, entries in zip(ordered_groups, materialized):
+            results[group] = entries
+        return results
+
+    def _lookup_state_hamts_from_embedded_txn(
+        self,
+        txn: LoggingTransaction,
+        groups: list[int],
+        keys: list[tuple[str, str]],
+    ) -> dict[int, list[tuple[str, str, str]] | None]:
+        results: dict[int, list[tuple[str, str, str]] | None] = dict.fromkeys(
+            groups, None
+        )
+        roots = self._fetch_hamt_roots_for_embedded_txn(txn, groups)
+        if not roots:
+            return results
+        engine = get_embedded_engine(getattr(self, "_embedded_db_engine", None))
+        ordered_groups = list(roots.keys())
+        queries = [
+            (room_prefix, root_hash, self._room_structural_key(room_id), keys)
+            for room_prefix, root_hash, room_id in (roots[g] for g in ordered_groups)
+        ]
+        _et = time.monotonic()
+        looked_up = engine.lookup_state_hamts(
+            getattr(self, "_embedded_db_namespace", None), queries
+        )
+        ffi_timing("ffi_lookup_hamts", time.monotonic() - _et)
+        for group, entries in zip(ordered_groups, looked_up):
+            results[group] = entries
+        return results
+
+    def _room_structural_key(self, room_id: str) -> bytes:
+        from synapse.synapse_rust import state_hamt
+
+        return bytes(state_hamt.room_structural_key(room_id))
 
 
 class StateBackgroundUpdateStore(StateGroupBackgroundUpdateStore):
@@ -284,6 +1507,7 @@ class StateBackgroundUpdateStore(StateGroupBackgroundUpdateStore):
     STATE_GROUP_INDEX_UPDATE_NAME = "state_group_state_type_index"
     STATE_GROUPS_ROOM_INDEX_UPDATE_NAME = "state_groups_room_id_idx"
     STATE_GROUP_EDGES_UNIQUE_INDEX_UPDATE_NAME = "state_group_edges_unique_idx"
+    STATE_HAMT_BACKFILL_ROOTS_UPDATE_NAME = "state_hamt_backfill_roots"
 
     def __init__(
         self,
@@ -320,6 +1544,34 @@ class StateBackgroundUpdateStore(StateGroupBackgroundUpdateStore):
             # The old index was on (state_group) and was not unique.
             replaces_index="state_group_edges_idx",
         )
+
+        # State groups created before schema v95 (the HAMT tables) have no
+        # `state_hamt_roots` row. `_get_state_groups_from_groups_txn` treats
+        # that as corruption, so any pre-existing database needs every
+        # legacy group's root built once. The handler
+        # lives on `StateGroupDataStore` (store.py), which is where
+        # `_persist_state_hamt_txn` -- the same root-building logic used for
+        # newly-created groups -- is defined.
+        #
+        # `StateBackgroundUpdateStore` is also mixed directly into
+        # `synapse_port_db`'s composed `Store` class, which does *not*
+        # inherit `StateGroupDataStore` and so has no
+        # `_background_backfill_state_hamt_roots` (or `_persist_state_hamt_txn`)
+        # to call. `update_synapse_database` has already fully migrated the
+        # source database, including this backfill, before `synapse_port_db`
+        # runs, so the port script cannot execute it directly -- it instead
+        # re-inserts a pending entry into PostgreSQL's `background_updates`
+        # (see `_maybe_requeue_state_hamt_backfill`) when the source
+        # database is missing roots for some rooms (e.g. an interrupted
+        # source-side backfill, or -- historically -- a source that was
+        # TiKV-backed, back when that was a supported embedded engine). Guard
+        # the registration so constructing that composed `Store` doesn't
+        # crash on the missing attribute.
+        if hasattr(self, "_background_backfill_state_hamt_roots"):
+            self.db_pool.updates.register_background_update_handler(
+                self.STATE_HAMT_BACKFILL_ROOTS_UPDATE_NAME,
+                self._background_backfill_state_hamt_roots,
+            )
 
     async def _background_deduplicate_state(
         self, progress: dict, batch_size: int

@@ -20,16 +20,22 @@
 #
 
 import logging
-from typing import TYPE_CHECKING
+from collections import defaultdict
+from typing import TYPE_CHECKING, Any
 
 from twisted.web.server import Request
 
 from synapse.api.room_versions import KNOWN_ROOM_VERSIONS
 from synapse.events import make_event_from_dict
-from synapse.events.snapshot import EventContext, EventPersistencePair
+from synapse.events.snapshot import (
+    EventContext,
+    EventPersistencePair,
+    _decode_state_dict,
+)
 from synapse.http.server import HttpServer
 from synapse.replication.http._base import ReplicationEndpoint
-from synapse.types import JsonDict, Requester, UserID
+from synapse.storage.databases.state.store import MAX_MIRROR_STATE_ENTRIES
+from synapse.types import JsonDict, Requester, StateMap, UserID
 from synapse.util.metrics import Measure
 
 if TYPE_CHECKING:
@@ -80,6 +86,7 @@ class ReplicationSendEventsRestServlet(ReplicationEndpoint):
         self.server_name = hs.hostname
         self.event_creation_handler = hs.get_event_creation_handler()
         self.store = hs.get_datastores().main
+        self._state_store = hs.get_datastores().state
         self._storage_controllers = hs.get_storage_controllers()
         self.clock = hs.get_clock()
 
@@ -128,7 +135,12 @@ class ReplicationSendEventsRestServlet(ReplicationEndpoint):
         ):
             events_and_context = []
             events = payload["events"]
-            rooms = set()
+            rooms: set[str] = set()
+            # Collect and deduplicate pending HAMT mirror replays across the entire
+            # batch of events so they execute in a single database interaction per room.
+            replays_by_room: dict[tuple[str, Any], dict[int, dict[str, Any]]] = (
+                defaultdict(dict)
+            )
 
             for event_payload in events:
                 event_dict = event_payload["event"]
@@ -146,6 +158,155 @@ class ReplicationSendEventsRestServlet(ReplicationEndpoint):
                     self._storage_controllers, event_payload["context"]
                 )
 
+                if context.pending_embedded_hamt_mirror_roots is not None:
+                    # The instance that created this event's state group (or its
+                    # predecessors) opened mtxdb read-only and could not mirror-write
+                    # it -- collect those writes here, to be redone on the events writer.
+                    for (
+                        sg,
+                        pending_payload,
+                    ) in context.pending_embedded_hamt_mirror_roots.items():
+                        if sg in replays_by_room[(event.room_id, event.room_version)]:
+                            continue
+
+                        prev_sg = None
+                        delta: StateMap[str] | None = None
+
+                        if isinstance(pending_payload, bytes):
+                            if len(pending_payload) != 32:
+                                raise RuntimeError(
+                                    f"Invalid legacy root length {len(pending_payload)} for state group {sg}"
+                                )
+                            expected_root = pending_payload
+                            full_state_map = None
+                            expected_lattice = None
+                            expected_prefix = None
+                            version = 0
+                            state_count = None
+                        else:
+                            payload = pending_payload
+                            version = payload.get("version", 0)
+                            if version not in (0, 1):
+                                raise RuntimeError(
+                                    f"Unsupported pending HAMT payload version {version}"
+                                )
+                            if version == 0:
+                                if "expected_root" not in payload:
+                                    raise RuntimeError(
+                                        f"Missing expected_root in mirror payload for state group {sg}"
+                                    )
+                                expected_root = bytes.fromhex(payload["expected_root"])
+                                if len(expected_root) != 32:
+                                    raise RuntimeError(
+                                        f"Invalid expected_root length {len(expected_root)} for state group {sg}"
+                                    )
+                                full_state_map = None
+                                expected_lattice = None
+                                expected_prefix = None
+                                state_count = None
+                            else:
+                                if payload.get("state_group") != sg:
+                                    raise RuntimeError(
+                                        "Pending HAMT payload state-group mismatch"
+                                    )
+                                if (
+                                    "state" not in payload
+                                    or "state_count" not in payload
+                                    or "expected_root" not in payload
+                                    or "lattice" not in payload
+                                    or "room_prefix" not in payload
+                                ):
+                                    raise RuntimeError(
+                                        "Incomplete version-1 pending HAMT payload"
+                                    )
+                                state_count = payload["state_count"]
+                                if (
+                                    not isinstance(state_count, int)
+                                    or state_count < 0
+                                    or state_count > MAX_MIRROR_STATE_ENTRIES
+                                ):
+                                    raise RuntimeError(
+                                        "Pending HAMT payload exceeds state limit"
+                                    )
+                                expected_root = bytes.fromhex(payload["expected_root"])
+                                if len(expected_root) != 32:
+                                    raise RuntimeError(
+                                        f"Invalid expected_root length {len(expected_root)} for state group {sg}"
+                                    )
+                                expected_lattice = bytes.fromhex(payload["lattice"])
+                                if len(expected_lattice) != 2048:
+                                    raise RuntimeError(
+                                        f"Invalid expected_lattice length {len(expected_lattice)} for state group {sg}"
+                                    )
+                                expected_prefix = bytes.fromhex(payload["room_prefix"])
+                                if len(expected_prefix) != 8:
+                                    raise RuntimeError(
+                                        f"Invalid room_prefix length {len(expected_prefix)} for state group {sg}; expected 8"
+                                    )
+
+                                from synapse.synapse_rust import state_hamt
+
+                                event_room_prefix = state_hamt.room_hamt_prefix(
+                                    event.room_id,
+                                    event.room_version.msc4291_room_ids_as_hashes,
+                                )
+                                if expected_prefix != event_room_prefix:
+                                    raise RuntimeError(
+                                        f"Room prefix mismatch in mirror payload for state group {sg}: "
+                                        f"expected {expected_prefix.hex()} but room computed {event_room_prefix.hex()}"
+                                    )
+
+                                full_state_map = _decode_state_dict(payload["state"])
+                                if full_state_map is None:
+                                    raise RuntimeError(
+                                        "Version-1 pending HAMT payload has no state"
+                                    )
+                                if len(full_state_map) != state_count:
+                                    raise RuntimeError(
+                                        f"State count mismatch in mirror payload for state group {sg}: "
+                                        f"payload specified {state_count} entries, found {len(full_state_map)}"
+                                    )
+
+                        if version == 1:
+                            # v1 carries the complete state map, so the
+                            # predecessor is metadata and is not needed for
+                            # reconstruction. Batched contexts do not always
+                            # carry every pending group's delta.
+                            assert isinstance(payload, dict)
+                            prev_sg = payload["predecessor_state_group"]
+                            delta = {}
+                        elif sg == context._state_group:
+                            prev_sg = context.state_group_before_event
+                            delta = context._state_delta_due_to_event or {}
+                        else:
+                            for (
+                                p_sg,
+                                c_sg,
+                            ), d_map in context.state_group_deltas.items():
+                                if c_sg == sg:
+                                    prev_sg = p_sg
+                                    delta = d_map
+                                    break
+                            if delta is None:
+                                raise RuntimeError(
+                                    f"Could not find predecessor for state group {sg} in deltas"
+                                )
+                        updates = [
+                            (event_type, state_key, ev_id)
+                            for (event_type, state_key), ev_id in delta.items()
+                        ]
+                        replays_by_room[(event.room_id, event.room_version)][sg] = {
+                            "state_group": sg,
+                            "prev_state_group": prev_sg,
+                            "updates": updates,
+                            "expected_root_hash": expected_root,
+                            "expected_lattice": expected_lattice,
+                            "expected_room_prefix": expected_prefix,
+                            "state_map": full_state_map,
+                            "state_count": state_count,
+                            "version": version,
+                        }
+
                 ratelimit = event_payload["ratelimit"]
                 events_and_context.append((event, context))
 
@@ -156,6 +317,23 @@ class ReplicationSendEventsRestServlet(ReplicationEndpoint):
                 # all the rooms *should* be the same, but we'll log separately to be
                 # sure.
                 rooms.add(event.room_id)
+
+            for (room_id, room_version), sg_replays in replays_by_room.items():
+                if sg_replays:
+                    # Sort by state group so that the predecessor is always
+                    # mirror-written before the child group that depends on it.
+                    replays = [sg_replays[sg] for sg in sorted(sg_replays.keys())]
+                    if len(replays) > 1 and any(
+                        replay["version"] == 0 for replay in replays
+                    ):
+                        raise RuntimeError(
+                            "Cannot replay multiple legacy HAMT payloads"
+                        )
+                    await self._state_store.redo_embedded_hamt_mirror_writes_batch(
+                        room_id,
+                        room_version,
+                        replays,
+                    )
 
             logger.info(
                 "Got batch of %i events to persist to rooms %s", len(events), rooms

@@ -7,7 +7,6 @@ use std::collections::BTreeSet;
 use anyhow::Context as _;
 use base64::Engine as _;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 use super::constants::{
     aliases_field, create_field,
@@ -78,13 +77,11 @@ pub fn compute_event_reference_hash(
     // We use `CanonicalizationOptions::relaxed()` as we have some events that
     // have already been accepted with int fields outside the valid range. We
     // still want to be able to load them and calculate their event ID.
-    let json = crate::canonical_json::to_string_canonical(
+    let hash = crate::canonical_json::sha256_canonical(
         &redacted_value_mut,
         CanonicalizationOptions::relaxed(),
     )
     .map_err(|err| anyhow::anyhow!(err))?;
-
-    let hash = Sha256::digest(json.as_bytes());
 
     let base64_alphabet = if room_version.event_format == EventFormatVersions::ROOM_V3 {
         base64::alphabet::STANDARD

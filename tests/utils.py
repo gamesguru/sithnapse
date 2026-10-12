@@ -20,8 +20,13 @@
 #
 
 import atexit
+import logging
 import os
 import signal
+import sys
+import tempfile
+import time
+import uuid
 from types import FrameType, TracebackType
 from typing import (
     Literal,
@@ -35,6 +40,7 @@ from synapse.config.homeserver import HomeServerConfig
 from synapse.config.server import DEFAULT_ROOM_VERSION
 from synapse.server import HomeServer
 from synapse.storage.database import LoggingDatabaseConnection
+from synapse.storage.databases.main import embedded_common
 from synapse.storage.engines import create_engine
 from synapse.storage.prepare_database import prepare_database
 
@@ -45,6 +51,8 @@ try:
 except ImportError:
     HAS_AUTHLIB = False
 
+logger = logging.getLogger(__name__)
+
 # set this to True to run the tests against postgres instead of sqlite.
 #
 # When running under postgres, we first create a base database with the name
@@ -52,22 +60,269 @@ except ImportError:
 # create another unique database, using the base database as a template.
 USE_POSTGRES_FOR_TESTS = os.environ.get("SYNAPSE_POSTGRES", False)
 LEAVE_DB = os.environ.get("SYNAPSE_LEAVE_DB", False)
-POSTGRES_USER = os.environ.get("SYNAPSE_POSTGRES_USER", None)
-POSTGRES_HOST = os.environ.get("SYNAPSE_POSTGRES_HOST", None)
+
+# If scripts-dev/start_test_postgres.sh's RAM-disk cluster is up, connect to
+# that instead of requiring `eval "$(scripts-dev/start_test_postgres.sh)"`
+# every time -- but only as a fallback: any of SYNAPSE_POSTGRES_HOST/_USER/
+# _PORT set explicitly always wins over this, same as every other var here.
+# Announced below (not silent) specifically because a test run silently
+# talking to a different Postgres than the one you think you configured is
+# exactly the kind of thing that's maddening to debug.
+FAST_PG_SOCKET_DIR = "/tmp/synapse-pgtest"
+FAST_PG_PORT = 5433
+HAS_FAST_PG = os.path.exists(f"{FAST_PG_SOCKET_DIR}/.s.PGSQL.{FAST_PG_PORT}")
+USE_FAST_PG = HAS_FAST_PG and "SYNAPSE_POSTGRES_HOST" not in os.environ
+
+POSTGRES_USER = os.environ.get(
+    "SYNAPSE_POSTGRES_USER", "postgres" if USE_FAST_PG else None
+)
+POSTGRES_HOST = os.environ.get(
+    "SYNAPSE_POSTGRES_HOST", FAST_PG_SOCKET_DIR if USE_FAST_PG else None
+)
 POSTGRES_PASSWORD = os.environ.get("SYNAPSE_POSTGRES_PASSWORD", None)
 POSTGRES_PORT = (
     int(os.environ["SYNAPSE_POSTGRES_PORT"])
     if "SYNAPSE_POSTGRES_PORT" in os.environ
-    else None
+    else (FAST_PG_PORT if USE_FAST_PG else None)
 )
+
+if USE_POSTGRES_FOR_TESTS and USE_FAST_PG:
+    print(
+        f"tests/utils.py: using the RAM-disk test Postgres at "
+        f"{FAST_PG_SOCKET_DIR} (found its socket) -- set SYNAPSE_POSTGRES_HOST "
+        f"explicitly to use a different one.",
+        file=sys.stderr,
+    )
 POSTGRES_BASE_DB = "_synapse_unit_tests_base_%s" % (os.getpid(),)
+POSTGRES_CREATE_DB_STRATEGY = ""
+POSTGRES_CLONE_STRATEGY_NAME = "DEFAULT"
+
+
+def get_postgres_clone_strategy() -> tuple[str, str]:
+    """Return (create_db_clause, strategy_name), e.g. (' STRATEGY = FILE_COPY', 'FILE_COPY')."""
+    return POSTGRES_CREATE_DB_STRATEGY, POSTGRES_CLONE_STRATEGY_NAME
+
 
 # When debugging a specific test, it's occasionally useful to write the
 # DB to disk and query it with the sqlite CLI.
 SQLITE_PERSIST_DB = os.environ.get("SYNAPSE_TEST_PERSIST_SQLITE_DB") is not None
 
+# When set, every test homeserver runs its HAMT state store through the
+# embedded engine (mtxdb) instead of plain SQL -- the trial-embedded
+# CI job's whole purpose. The embedded engine is just a local file, so no
+# "is a server reachable" check is needed here -- config/database.py opens
+# it directly.
+#
+# Deliberately *not* falling back to the bare deployment switches
+# (SYNAPSE_EMBEDDED_DB_ENGINE / SYNAPSE_EMBEDDED_DB_PATH / SYNAPSE_MTXDB):
+# unit tests inherit the process environment, and a shell configured for
+# running a real homeserver (e.g. SYNAPSE_EMBEDDED_DB_PATH pointing at a
+# production store) must not have `trial` silently open and mutate that
+# store. Only the SYNAPSE_TEST_-prefixed, test-only variables are honoured
+# here. SYNAPSE_TEST_MTXDB is a shorthand alias for
+# the common case of just wanting the mtxdb engine, without spelling out the name.
+EMBEDDED_DB_ENGINE = os.environ.get("SYNAPSE_TEST_EMBEDDED_DB_ENGINE")
+if EMBEDDED_DB_ENGINE is None and os.environ.get("SYNAPSE_TEST_MTXDB"):
+    EMBEDDED_DB_ENGINE = "mtxdb"
+
+EMBEDDED_DB_PATH = os.environ.get("SYNAPSE_TEST_EMBEDDED_DB_PATH")
+_embedded_db_path_is_tmp = EMBEDDED_DB_PATH is None and EMBEDDED_DB_ENGINE
+if _embedded_db_path_is_tmp:
+    EMBEDDED_DB_PATH = tempfile.mkdtemp()
+elif EMBEDDED_DB_PATH is not None:
+    # `trial --jobs=N` (see .github/workflows/tests.yml's trial-mtxdb job)
+    # forks N worker *processes* that all inherit the same
+    # SYNAPSE_TEST_EMBEDDED_DB_PATH env var. mtxdb takes an exclusive
+    # lock on its storage directory, so N workers all opening the literal
+    # configured path meant only the first ever succeeded -- every other
+    # worker's very first homeserver setup failed with "Failed to open
+    # embedded mtxdb engine" and every test in it errored. Namespace the
+    # configured path by pid so each worker process gets its own
+    # subdirectory instead of racing for the same one; a single-process
+    # run (no --jobs) just gets a `pid-<n>` subdir of the configured path,
+    # which is harmless.
+    EMBEDDED_DB_PATH = os.path.join(EMBEDDED_DB_PATH, f"pid-{os.getpid()}")
+    os.makedirs(EMBEDDED_DB_PATH, exist_ok=True)
+
+    # Reap stale pid-* subdirs left behind by dead trial workers (crashed
+    # or SIGKILL'd before their own cleanup could run).  Only touches
+    # dirs whose PID is no longer alive; never touches our own dir or
+    # non-pid-* entries.
+    import shutil
+
+    _parent_dir = os.path.dirname(EMBEDDED_DB_PATH)
+    _reaped = 0
+    if os.path.isdir(_parent_dir):
+        for _entry in os.listdir(_parent_dir):
+            if _entry.startswith("pid-") and _entry != f"pid-{os.getpid()}":
+                try:
+                    _pid = int(_entry[4:])
+                except ValueError:
+                    continue
+                try:
+                    os.kill(_pid, 0)
+                except ProcessLookupError:
+                    shutil.rmtree(os.path.join(_parent_dir, _entry), ignore_errors=True)
+                    _reaped += 1
+                except PermissionError:
+                    pass  # alive but not ours
+    if _reaped:
+        print(f"Reaped {_reaped} stale pid-* dirs from {_parent_dir}", file=sys.stderr)
+
+# Durability (fsync) is pointless for the throwaway store trial gives each
+# test homeserver: it is created fresh and torn down on exit, so there is no
+# crash to recover from. Default `no_sync` on so tests don't pay thousands of
+# synchronous fsyncs. A truthy SYNAPSE_TEST_MTXDB_NO_SYNC keeps that on; a
+# falsey value (0/false/no/off/empty) turns it off when specifically exercising
+# the durable path (or writing a crash-recovery test). This is the same
+# variable and value semantics scripts-dev/complement.sh forwards into
+# Complement containers, so one rule covers both harnesses -- only the *unset*
+# default differs: trial defaults no_sync on (stores are torn down instantly),
+# Complement/production defaults sync on (it approximates a real deployment).
+_no_sync_env = os.environ.get("SYNAPSE_TEST_MTXDB_NO_SYNC")
+_no_sync_off = _no_sync_env is not None and _no_sync_env.strip().lower() in (
+    "",
+    "0",
+    "false",
+    "no",
+    "off",
+)
+EMBEDDED_DB_NO_SYNC = not _no_sync_off
+if EMBEDDED_DB_NO_SYNC:
+    # The test harness turns durability off on purpose (see above), which
+    # WorkerConfig otherwise rejects for a worker deployment because a crash
+    # could lose data that another worker already read. Trial's stores are
+    # thrown away, so opt in explicitly, exactly as a test-only run must.
+    os.environ.setdefault("SYNAPSE_TEST_MTXDB_ALLOW_UNSAFE_OFF", "1")
+
+# synapse/config/workers.py requires the write-ahead journal
+# (SYNAPSE_MTXDB_WAL) whenever the embedded engine is on *and* the
+# deployment is multi-process (worker_app set or a non-empty instance_map --
+# see WorkerConfig.read_config's embedded_db_engine guards): with no SQL
+# fallback for the data it owns, a committed write can be reported absent by
+# a read-only worker until a checkpoint rewrite refreshes its index (and
+# that rewrite can be deferred), and the WAL's get_read_committed overlay is
+# the only read path that closes that window independently of the
+# checkpoint rewrite. This is a visibility requirement, not a durability
+# one -- a single process never goes through that cross-process gate at
+# all, so the check is worker-conditional, not blanket.
+#
+# Trial's test homeservers are single-process, so that check never actually
+# requires this. Default WAL on anyway, the same rule
+# scripts-dev/complement.sh applies to containers, purely so every
+# embedded-engine trial run exercises the WAL path Complement and
+# production both use by default, not because leaving it off would fail
+# validation here. Only the TEST_-scoped variable is honoured; an explicit
+# falsey override clears any SYNAPSE_MTXDB_WAL this process inherited
+# (rather than merely skipping the on-default), so it's still possible to
+# exercise the single-process WAL-off path deterministically regardless of
+# the shell's own environment.
+_wal_env = os.environ.get("SYNAPSE_TEST_MTXDB_WAL")
+_wal_off = _wal_env is not None and _wal_env.strip().lower() in (
+    "",
+    "0",
+    "false",
+    "no",
+    "off",
+)
+if _wal_off:
+    os.environ.pop("SYNAPSE_MTXDB_WAL", None)
+elif EMBEDDED_DB_ENGINE:
+    os.environ["SYNAPSE_MTXDB_WAL"] = "1"
+
+if EMBEDDED_DB_ENGINE:
+    print(
+        f"Embedded DB engine: {EMBEDDED_DB_ENGINE} at {EMBEDDED_DB_PATH}"
+        f"{' (no_sync)' if EMBEDDED_DB_NO_SYNC else ''}",
+        file=sys.stderr,
+    )
+
+if _embedded_db_path_is_tmp and not os.environ.get(
+    "SYNAPSE_TEST_KEEP_EMBEDDED_DB_PATH"
+):
+    # Clean up an auto-created store (set e.g. when debugging a failure and
+    # you want to inspect the store afterwards). An explicitly-configured
+    # `SYNAPSE_TEST_EMBEDDED_DB_PATH` is never touched.
+    import shutil
+
+    def _cleanup_embedded_db(path: str) -> None:
+        shutil.rmtree(path, ignore_errors=True)
+
+    assert EMBEDDED_DB_PATH is not None
+    atexit.register(_cleanup_embedded_db, EMBEDDED_DB_PATH)
+
 # the dbname we will connect to in order to create the base database.
 POSTGRES_DBNAME_FOR_INITIAL_CREATE = "postgres"
+
+
+def _drain_template_background_updates_postgres() -> None:
+    """Pre-drain all background schema updates on POSTGRES_BASE_DB.
+
+    This runs all pending index creations and data updates once on the empty
+    template database, then cleanly shuts down so all sessions on POSTGRES_BASE_DB
+    are closed. Every clone created from POSTGRES_BASE_DB will inherit an empty
+    background_updates table and pre-created indexes.
+    """
+    from unittest.mock import Mock, patch
+
+    from twisted.internet.defer import ensureDeferred
+    from twisted.trial.unittest import SynchronousTestCase
+
+    from synapse.config.homeserver import HomeServerConfig
+    from synapse.storage.controllers.purge_events import PurgeEventsStorageController
+
+    from tests.server import (
+        TestHomeServer,
+        ThreadedMemoryReactorClock,
+        make_fake_db_pool,
+    )
+
+    reactor = ThreadedMemoryReactorClock()
+    raw_config = default_config(server_name="test-template-draining", parse=False)
+    raw_config["database"] = {
+        "name": "psycopg2",
+        "args": {
+            "database": POSTGRES_BASE_DB,
+            "user": POSTGRES_USER,
+            "host": POSTGRES_HOST,
+            "port": POSTGRES_PORT,
+            "password": POSTGRES_PASSWORD,
+            "cp_min": 1,
+            "cp_max": 1,
+        },
+    }
+    config = HomeServerConfig()
+    config.parse_config_dict(raw_config, "", "")
+
+    hs = TestHomeServer("test-template-draining", config=config, reactor=reactor)
+    hs.tls_server_context_factory = Mock()
+
+    with patch("synapse.storage.database.make_pool", side_effect=make_fake_db_pool):
+        hs.setup()
+
+    # Register controller background updates (e.g. state group deletion)
+    PurgeEventsStorageController(hs, hs.get_datastores())
+
+    from synapse.logging.context import LoggingContext
+
+    stor = hs.get_datastores().main
+    with LoggingContext(
+        name="drain_template_bg_updates", server_name="test-template-draining"
+    ):
+        d = ensureDeferred(stor.db_pool.updates.run_background_updates(False))
+
+        while not d.called or d.paused:
+            time.sleep(0.001)
+            reactor.advance(0.01)
+
+        stc = SynchronousTestCase()
+        stc.successResultOf(d)
+
+    d_sd = ensureDeferred(hs.shutdown())
+    while not d_sd.called or d_sd.paused:
+        time.sleep(0.001)
+        reactor.advance(0.01)
+    stc.successResultOf(d_sd)
 
 
 def setupdb() -> None:
@@ -90,6 +345,65 @@ def setupdb() -> None:
             "CREATE DATABASE %s ENCODING 'UTF8' LC_COLLATE='C' LC_CTYPE='C' "
             "template=template0;" % (POSTGRES_BASE_DB,)
         )
+
+        global POSTGRES_CREATE_DB_STRATEGY, POSTGRES_CLONE_STRATEGY_NAME
+        raw_strategy = os.environ.get("SYNAPSE_POSTGRES_CLONE_STRATEGY", "auto").strip()
+        override = raw_strategy.upper()
+        if override in ("FILE_COPY", "WAL_LOG"):
+            POSTGRES_CREATE_DB_STRATEGY = f" STRATEGY = {override}"
+            POSTGRES_CLONE_STRATEGY_NAME = override
+        elif override in ("DEFAULT", "NONE", "OFF"):
+            POSTGRES_CREATE_DB_STRATEGY = ""
+            POSTGRES_CLONE_STRATEGY_NAME = "DEFAULT"
+        elif override in ("AUTO", ""):
+            # Auto-detect: PostgreSQL 15+ introduces STRATEGY = FILE_COPY
+            cur.execute("SHOW server_version_num;")
+            row = cur.fetchone()
+            server_version = int(row[0]) if row else 0
+            if server_version >= 150000:
+                import psycopg2
+
+                probe_db = f"_synapse_probe_strat_{os.getpid()}"
+                probe_created = False
+                try:
+                    cur.execute(
+                        f"CREATE DATABASE {probe_db} WITH TEMPLATE template0 STRATEGY = FILE_COPY;"
+                    )
+                    probe_created = True
+                    POSTGRES_CREATE_DB_STRATEGY = " STRATEGY = FILE_COPY"
+                    POSTGRES_CLONE_STRATEGY_NAME = "FILE_COPY"
+                except psycopg2.Error as e:
+                    try:
+                        db_conn.rollback()
+                    except psycopg2.Error:
+                        pass
+                    # Only treat syntax errors as capability fallback (PostgreSQL < 15 syntax);
+                    # propagate any operational failures (permissions, disk space, catalog errors).
+                    if e.pgcode == "42601":  # syntax_error
+                        POSTGRES_CREATE_DB_STRATEGY = ""
+                        POSTGRES_CLONE_STRATEGY_NAME = "DEFAULT"
+                    else:
+                        raise
+                finally:
+                    if probe_created:
+                        try:
+                            cur.execute(f"DROP DATABASE IF EXISTS {probe_db};")
+                        except psycopg2.Error as cleanup_err:
+                            logger.warning(
+                                "Failed to drop probe database %s: %s",
+                                probe_db,
+                                cleanup_err,
+                            )
+                            raise
+            else:
+                POSTGRES_CREATE_DB_STRATEGY = ""
+                POSTGRES_CLONE_STRATEGY_NAME = "DEFAULT"
+        else:
+            raise ValueError(
+                f"Invalid SYNAPSE_POSTGRES_CLONE_STRATEGY={raw_strategy!r}. "
+                "Expected one of: AUTO, FILE_COPY, WAL_LOG, DEFAULT."
+            )
+
         cur.close()
         db_conn.close()
 
@@ -110,6 +424,13 @@ def setupdb() -> None:
         prepare_database(logging_conn, db_engine, None)
         logging_conn.close()
 
+        # Pre-drain all 50+ background schema updates (index creations, data
+        # migrations over empty tables) once on the template database. Every
+        # test clone will then inherit a database where all indexes already
+        # exist and background_updates is already empty, avoiding running 50+
+        # updates in every single test (~750k queries across the full suite).
+        _drain_template_background_updates_postgres()
+
         def _cleanup() -> None:
             db_conn = db_engine.module.connect(
                 user=POSTGRES_USER,
@@ -129,16 +450,24 @@ def setupdb() -> None:
 
 @overload
 def default_config(
-    *, server_name: str, parse: Literal[False] = ...
+    *,
+    server_name: str,
+    parse: Literal[False] = ...,
 ) -> dict[str, object]: ...
 
 
 @overload
-def default_config(*, server_name: str, parse: Literal[True]) -> HomeServerConfig: ...
+def default_config(
+    *,
+    server_name: str,
+    parse: Literal[True],
+) -> HomeServerConfig: ...
 
 
 def default_config(
-    *, server_name: str, parse: bool = False
+    *,
+    server_name: str,
+    parse: bool = False,
 ) -> dict[str, object] | HomeServerConfig:
     """
     Create a reasonable test config.
@@ -220,6 +549,27 @@ def default_config(
         "caches": {"global_factor": 1, "sync_response_cache_duration": 0},
         "listeners": [{"port": 0, "type": "http"}],
     }
+
+    if EMBEDDED_DB_ENGINE and EMBEDDED_DB_PATH:
+        # Many test homeservers (each with their own fresh SQL database, so
+        # each restarting its state_group id sequence at 1) can share this
+        # one mtxdb file across a whole trial worker process. Without a
+        # unique namespace per homeserver, two different tests' state_group
+        # 1 would collide on the same mtxdb keys and silently read each
+        # other's data.
+        config_dict["embedded_db"] = {
+            "engine": EMBEDDED_DB_ENGINE,
+            "path": EMBEDDED_DB_PATH,
+            "namespace": f"trial-{os.getpid()}-{uuid.uuid4().hex}",
+            "no_sync": EMBEDDED_DB_NO_SYNC,
+            # Tests rely on FLUSH_DELAY_SECS to know exactly how far to
+            # advance the reactor to drain the coalescer. Pin the runtime
+            # value to match it explicitly rather than letting production's
+            # rotational-disk auto-tuning (synapse.config.database) pick a
+            # different delay when SYNAPSE_TEST_EMBEDDED_DB_PATH happens to
+            # sit on a physical HDD.
+            "flush_delay_secs": embedded_common.FLUSH_DELAY_SECS,
+        }
 
     if parse:
         config = HomeServerConfig()

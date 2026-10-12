@@ -1,0 +1,5 @@
+-- HAMT roots and nodes are authoritative in the embedded engine. Remove the
+-- temporary SQL publication bridge introduced by 02_state_hamt_publication.
+DROP TABLE IF EXISTS state_hamt_pending_nodes;
+-- SQLite cannot drop a column on older supported versions; the unused column
+-- is harmless and is intentionally left in place.

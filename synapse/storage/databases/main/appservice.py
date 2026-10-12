@@ -102,6 +102,7 @@ class ApplicationServiceWorkerStore(RoomMemberWorkerStore):
             "application_services_txn_id_seq",
             table="application_services_txns",
             id_column="txn_id",
+            db_is_fresh=database.is_fresh,
         )
 
         super().__init__(database, db_conn, hs)

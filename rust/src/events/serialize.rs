@@ -32,9 +32,9 @@ use std::collections::HashMap;
 
 use pyo3::{
     exceptions::{PyTypeError, PyValueError},
-    pyclass, pyfunction, pymethods,
-    types::{PyAnyMethods, PyDict, PyDictMethods},
-    Bound, PyAny, PyResult, Python,
+    prelude::*,
+    types::{PyDict, PyDictMethods},
+    Borrowed,
 };
 use pythonize::pythonize;
 use serde_json::{Map, Number, Value};
@@ -80,7 +80,7 @@ const V1_COPY_KEYS: [&str; 6] = [
 
 /// The format used to convert an event from its federation shape to the shape
 /// sent to clients.
-#[pyclass(eq, eq_int, frozen, from_py_object)]
+#[pyclass(eq, eq_int, frozen, skip_from_py_object)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EventFormat {
     /// Return the event dict unchanged (federation format).
@@ -91,6 +91,15 @@ pub enum EventFormat {
     ClientV2,
     /// Like `ClientV2`, but also strips `room_id`.
     ClientV2WithoutRoomId,
+}
+
+impl<'a, 'py> FromPyObject<'a, 'py> for EventFormat {
+    type Error = PyErr;
+
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        let cell: PyRef<'py, Self> = ob.extract()?;
+        Ok(*cell)
+    }
 }
 
 /// Configuration for serializing an event for clients.

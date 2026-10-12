@@ -345,6 +345,8 @@ class PreserveLoggingContext:
         context = set_current_context(self._old_context)
 
         if context != self._new_context:
+            if type is GeneratorExit:
+                return
             if not context:
                 logcontext_error(
                     "Expected logging context %s was lost" % (self._new_context,)

@@ -1,0 +1,12 @@
+[package]
+name = "sith-cli-prototype"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Keep this speculative crate independent of the parent Synapse workspace.
+[workspace]
+
+[[bin]]
+name = "sith"
+path = "src/main.rs"

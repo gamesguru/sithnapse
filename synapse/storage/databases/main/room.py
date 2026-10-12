@@ -58,6 +58,7 @@ from synapse.storage.database import (
     make_tuple_in_list_sql_clause,
 )
 from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
+from synapse.storage.databases.main.embedded_event_json import get_event_json_batch
 from synapse.storage.types import Cursor
 from synapse.storage.util.id_generators import IdGenerator, MultiWriterIdGenerator
 from synapse.types import (
@@ -1204,8 +1205,8 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
             the hostname and the value is the media ID.
         """
         sql = """
-            SELECT stream_ordering, json FROM events
-            JOIN event_json USING (room_id, event_id)
+            SELECT stream_ordering, events.event_id, event_json.json FROM events
+            LEFT JOIN event_json USING (room_id, event_id)
             WHERE room_id = ?
                 %(where_clause)s
                 AND contains_url = TRUE AND outlier = FALSE
@@ -1219,8 +1220,31 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
 
         while True:
             next_token = None
-            for stream_ordering, content_json in txn:
+            rows = txn.fetchall()
+            if not rows:
+                break
+
+            missing_json_ids = [
+                event_id for _, event_id, content_json in rows if content_json is None
+            ]
+            json_by_id = {}
+            if missing_json_ids and getattr(
+                self, "_embedded_event_json_enabled", False
+            ):
+                found = get_event_json_batch(
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
+                    missing_json_ids,
+                )
+                for eid, (_, j, _) in found.items():
+                    json_by_id[eid] = j
+
+            for stream_ordering, event_id, content_json in rows:
                 next_token = stream_ordering
+                if content_json is None:
+                    content_json = json_by_id.get(event_id)
+                if not content_json:
+                    continue
                 event_json = db_to_json(content_json)
                 content = event_json["content"]
                 content_url = content.get("url")
@@ -1866,15 +1890,11 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
         complete.
         """
 
-        entry = await self.db_pool.simple_select_one_onecol(
-            table="partial_state_rooms",
-            keyvalues={"room_id": room_id},
-            retcol="room_id",
-            allow_none=True,
-            desc="is_partial_state_room",
-        )
-
-        return entry is not None
+        # Partial-state rooms are rare compared to the number of room checks.
+        # Reuse the cached set instead of issuing one SQL lookup per distinct
+        # room. The set cache is invalidated and replicated whenever a room is
+        # added to or removed from partial_state_rooms.
+        return room_id in await self.get_partial_rooms()
 
     @cachedList(cached_method_name="is_partial_state_room", list_name="room_ids")
     async def is_partial_state_room_batched(
@@ -1887,18 +1907,20 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
         complete.
         """
 
-        rows = cast(
-            list[tuple[str]],
-            await self.db_pool.simple_select_many_batch(
-                table="partial_state_rooms",
-                column="room_id",
-                iterable=room_ids,
-                retcols=("room_id",),
-                desc="is_partial_state_room_batched",
-            ),
-        )
-        partial_state_rooms = {row[0] for row in rows}
+        partial_state_rooms = await self.get_partial_rooms()
         return {room_id: room_id in partial_state_rooms for room_id in room_ids}
+
+    @cached(num_args=0)
+    async def has_partial_state_rooms(self) -> bool:
+        """Check whether any rooms are currently in partial state."""
+
+        def _has_partial_state_rooms_txn(txn: LoggingTransaction) -> bool:
+            txn.execute("SELECT 1 FROM partial_state_rooms LIMIT 1")
+            return txn.fetchone() is not None
+
+        return await self.db_pool.runInteraction(
+            "has_partial_state_rooms", _has_partial_state_rooms_txn
+        )
 
     @cached(max_entries=10000, iterable=True)
     async def get_partial_rooms(self) -> AbstractSet[str]:
@@ -2069,7 +2091,7 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
                 FROM event_reports AS er
                 LEFT JOIN events
                     ON events.event_id = er.event_id
-                JOIN event_json
+                LEFT JOIN event_json
                     ON event_json.event_id = er.event_id
                 JOIN room_stats_state
                     ON room_stats_state.room_id = er.room_id
@@ -2082,6 +2104,19 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
             if not row:
                 return None
 
+            event_id = row[3]
+            raw_event_json = row[9]
+            if raw_event_json is None and getattr(
+                self, "_embedded_event_json_enabled", False
+            ):
+                found = get_event_json_batch(
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
+                    [event_id],
+                )
+                if event_id in found:
+                    raw_event_json = found[event_id][1]
+
             event_report = {
                 "id": row[0],
                 "received_ts": row[1],
@@ -2093,7 +2128,7 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
                 "sender": row[6],
                 "canonical_alias": row[7],
                 "name": row[8],
-                "event_json": db_to_json(row[9]),
+                "event_json": db_to_json(raw_event_json) if raw_event_json else None,
             }
 
             return event_report
@@ -2627,17 +2662,35 @@ class RoomBackgroundUpdateStore(RoomWorkerStore):
             txn: LoggingTransaction,
         ) -> bool:
             sql = """
-                SELECT room_id, json FROM current_state_events
-                INNER JOIN event_json USING (room_id, event_id)
+                SELECT room_id, event_id, json FROM current_state_events
+                LEFT JOIN event_json USING (room_id, event_id)
                 WHERE room_id > ? AND type = 'm.room.create' AND state_key = ''
                 ORDER BY room_id
                 LIMIT ?
             """
 
             txn.execute(sql, (last_room_id, batch_size))
+            rows = txn.fetchall()
+            if not rows:
+                return True
+
+            missing_ids = [event_id for _, event_id, json in rows if json is None]
+            json_by_id = {}
+            if missing_ids and getattr(self, "_embedded_event_json_enabled", False):
+                found = get_event_json_batch(
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
+                    missing_ids,
+                )
+                for eid, (_, j, _) in found.items():
+                    json_by_id[eid] = j
 
             updates = []
-            for room_id, event_json in txn:
+            for room_id, event_id, event_json in rows:
+                if event_json is None:
+                    event_json = json_by_id.get(event_id)
+                if not event_json:
+                    continue
                 event_dict = db_to_json(event_json)
                 room_version_id = event_dict.get("content", {}).get(
                     "room_version", RoomVersions.V1.identifier
@@ -2811,9 +2864,9 @@ class RoomBackgroundUpdateStore(RoomWorkerStore):
             txn: LoggingTransaction,
         ) -> bool:
             sql = """
-                SELECT room_id, json FROM event_json
-                INNER JOIN rooms AS room USING (room_id)
-                INNER JOIN current_state_events AS state_event USING (room_id, event_id)
+                SELECT room_id, event_id, event_json.json FROM rooms AS room
+                INNER JOIN current_state_events AS state_event USING (room_id)
+                LEFT JOIN event_json USING (room_id, event_id)
                 WHERE room_id > ? AND (room.creator IS NULL OR room.creator = '') AND state_event.type = 'm.room.create' AND state_event.state_key = ''
                 ORDER BY room_id
                 LIMIT ?
@@ -2821,9 +2874,31 @@ class RoomBackgroundUpdateStore(RoomWorkerStore):
 
             txn.execute(sql, (last_room_id, batch_size))
             room_id_to_create_event_results = txn.fetchall()
+            if not room_id_to_create_event_results:
+                return True
+
+            missing_ids = [
+                event_id
+                for _, event_id, json in room_id_to_create_event_results
+                if json is None
+            ]
+            json_by_id = {}
+            if missing_ids and getattr(self, "_embedded_event_json_enabled", False):
+                found = get_event_json_batch(
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
+                    missing_ids,
+                )
+                for eid, (_, j, _) in found.items():
+                    json_by_id[eid] = j
 
             new_last_room_id = ""
-            for room_id, event_json in room_id_to_create_event_results:
+            for room_id, event_id, event_json in room_id_to_create_event_results:
+                if event_json is None:
+                    event_json = json_by_id.get(event_id)
+                if not event_json:
+                    new_last_room_id = room_id
+                    continue
                 event_dict = db_to_json(event_json)
 
                 # The creator property might not exist in newer room versions, but
@@ -2875,8 +2950,8 @@ class RoomBackgroundUpdateStore(RoomWorkerStore):
             txn: LoggingTransaction,
         ) -> bool:
             sql = """
-                SELECT state.room_id, json FROM event_json
-                INNER JOIN current_state_events AS state USING (event_id)
+                SELECT state.room_id, state.event_id, event_json.json FROM current_state_events AS state
+                LEFT JOIN event_json USING (event_id)
                 WHERE state.room_id > ? AND type = 'm.room.create'
                 ORDER BY state.room_id
                 LIMIT ?
@@ -2884,9 +2959,31 @@ class RoomBackgroundUpdateStore(RoomWorkerStore):
 
             txn.execute(sql, (last_room_id, batch_size))
             room_id_to_create_event_results = txn.fetchall()
+            if not room_id_to_create_event_results:
+                return True
+
+            missing_ids = [
+                event_id
+                for _, event_id, json in room_id_to_create_event_results
+                if json is None
+            ]
+            json_by_id = {}
+            if missing_ids and getattr(self, "_embedded_event_json_enabled", False):
+                found = get_event_json_batch(
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
+                    missing_ids,
+                )
+                for eid, (_, j, _) in found.items():
+                    json_by_id[eid] = j
 
             new_last_room_id = None
-            for room_id, event_json in room_id_to_create_event_results:
+            for room_id, event_id, event_json in room_id_to_create_event_results:
+                if event_json is None:
+                    event_json = json_by_id.get(event_id)
+                if not event_json:
+                    new_last_room_id = room_id
+                    continue
                 event_dict = db_to_json(event_json)
 
                 room_type = event_dict.get("content", {}).get(
@@ -3052,6 +3149,7 @@ class RoomStore(RoomBackgroundUpdateStore, RoomWorkerStore):
             txn, self._get_partial_state_servers_at_join, (room_id,)
         )
         self._invalidate_all_cache_and_stream(txn, self.get_partial_rooms)
+        self._invalidate_all_cache_and_stream(txn, self.has_partial_state_rooms)
 
     async def write_partial_state_rooms_join_event_id(
         self,
@@ -3235,6 +3333,7 @@ class RoomStore(RoomBackgroundUpdateStore, RoomWorkerStore):
             txn, self._get_partial_state_servers_at_join, (room_id,)
         )
         self._invalidate_all_cache_and_stream(txn, self.get_partial_rooms)
+        self._invalidate_all_cache_and_stream(txn, self.has_partial_state_rooms)
 
         DatabasePool.simple_insert_txn(
             txn,

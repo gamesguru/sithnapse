@@ -79,6 +79,42 @@ class RoomMemberStoreTestCase(unittest.HomeserverTestCase):
 
         self.assertEqual([self.room], [m.room_id for m in rooms_for_user])
 
+    def test_get_forgotten_rooms_for_user_uncached(self) -> None:
+        """The uncached lookup observes a forget not yet invalidated locally.
+
+        This models a sync worker receiving `/sync` before the master process's
+        cache-invalidation stream has reached it.
+        """
+        room_id = self.helper.create_room_as(self.u_alice, tok=self.t_alice)
+        self.helper.leave(room_id, self.u_alice, tok=self.t_alice)
+
+        self.assertEqual(
+            self.get_success(self.store.get_forgotten_rooms_for_user(self.u_alice)),
+            set(),
+        )
+
+        # Update the database without invalidating the warmed cache, as happens
+        # on a different worker before it consumes the cache stream.
+        self.get_success(
+            self.store.db_pool.simple_update(
+                table="room_memberships",
+                keyvalues={"user_id": self.u_alice, "room_id": room_id},
+                updatevalues={"forgotten": 1},
+                desc="test_get_forgotten_rooms_for_user_uncached",
+            )
+        )
+
+        self.assertEqual(
+            self.get_success(self.store.get_forgotten_rooms_for_user(self.u_alice)),
+            set(),
+        )
+        self.assertEqual(
+            self.get_success(
+                self.store.get_forgotten_rooms_for_user_uncached(self.u_alice)
+            ),
+            {room_id},
+        )
+
     def test_count_known_servers(self) -> None:
         """
         _count_known_servers will calculate how many servers are in a room.

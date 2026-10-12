@@ -66,6 +66,7 @@ from twisted.web.server import Request
 from synapse import events
 from synapse.api.constants import EventTypes
 from synapse.api.room_versions import KNOWN_ROOM_VERSIONS, RoomVersion
+from synapse.app._base import max_request_body_size
 from synapse.config._base import Config, RootConfig
 from synapse.config.homeserver import HomeServerConfig
 from synapse.config.server import DEFAULT_ROOM_VERSION
@@ -205,6 +206,26 @@ def make_homeserver_config_obj(config: dict[str, Any]) -> HomeServerConfig:
     but it keeps a cache of `HomeServerConfig` instances and deepcopies them as needed,
     to avoid validating the whole configuration every time.
     """
+    # embedded_db (mtxdb) supports a single writer process. Strip it when
+    # the config declares a non-main background tasks worker or non-main event writers
+    # to avoid the guard in WorkerConfig.read_config.
+    config = dict(config)
+    stream_writers = config.get("stream_writers") or {}
+    event_writers = (
+        stream_writers.get("events") if isinstance(stream_writers, dict) else []
+    )
+    background_tasks_instance = config.get("run_background_tasks_on") or "master"
+    if isinstance(event_writers, str):
+        event_writers = [event_writers]
+    if background_tasks_instance not in ("main", "master") or (
+        event_writers
+        and set(event_writers)
+        not in (
+            {"main"},
+            {"master"},
+        )
+    ):
+        config.pop("embedded_db", None)
     config_obj = _parse_config_dict(json.dumps(config, sort_keys=True))
     return deepcopy_config(config_obj)
 
@@ -586,7 +607,7 @@ class HomeserverTestCase(TestCase):
             config=self.hs.config.server.listeners[0],
             resource=self.resource,
             server_version_string="1",
-            max_request_body_size=4096,
+            max_request_body_size=max_request_body_size(self.hs.config),
             reactor=self.reactor,
             hs=self.hs,
         )
@@ -642,6 +663,20 @@ class HomeserverTestCase(TestCase):
     def tearDown(self) -> None:
         # Reset to not use frozen dicts.
         events.USE_FROZEN_DICTS = False
+
+        if os.environ.get("SYNAPSE_TEST_MTXDB_REPACK_BETWEEN_TESTS") not in (
+            "1",
+            "true",
+            "True",
+            "yes",
+            "on",
+            "On",
+        ):
+            return
+
+        from synapse.synapse_rust import mtxdb_engine
+
+        mtxdb_engine.repack()
 
     def wait_for_background_updates(self) -> None:
         """Block until all background database updates have completed."""
@@ -832,7 +867,31 @@ class HomeserverTestCase(TestCase):
 
         async def run_bg_updates() -> None:
             with LoggingContext(name="run_bg_updates", server_name=server_name):
+                profile_background_updates = (
+                    os.environ.get("SYNAPSE_TEST_PROFILE_BACKGROUND_UPDATES") == "1"
+                )
+                pending_updates: list[str] = []
+                if profile_background_updates:
+                    pending_updates = await stor.db_pool.simple_select_onecol(
+                        "background_updates",
+                        keyvalues=None,
+                        retcol="update_name",
+                        desc="test_profile_pending_background_updates",
+                    )
+                    start = time.perf_counter()
+
                 self.get_success(stor.db_pool.updates.run_background_updates(False))
+
+                if profile_background_updates:
+                    elapsed_ms = (time.perf_counter() - start) * 1000
+                    logger.warning(
+                        "SYNAPSE_TEST_PROFILE_BACKGROUND_UPDATES "
+                        "test=%s database=%s pending=%d elapsed_ms=%.1f",
+                        self.id(),
+                        stor.db_pool.name(),
+                        len(pending_updates),
+                        elapsed_ms,
+                    )
 
         hs = setup_test_homeserver(
             cleanup_func=self.addCleanup,
@@ -840,6 +899,7 @@ class HomeserverTestCase(TestCase):
             config=config_obj,
             reactor=reactor,
             clock=clock,
+            test_name=self.id() if hasattr(self, "id") else None,
             **extra_homeserver_attributes,
         )
         stor = hs.get_datastores().main

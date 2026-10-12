@@ -20,6 +20,7 @@
 
 import datetime
 import random
+import unittest
 from typing import (
     Collection,
     Iterable,
@@ -48,6 +49,10 @@ from synapse.rest import admin
 from synapse.rest.client import login, room
 from synapse.server import HomeServer
 from synapse.storage.database import LoggingTransaction
+from synapse.storage.databases.main.embedded_event_auth_chain_links import (
+    put_chain_links_batch,
+    resolve_namespace,
+)
 from synapse.storage.types import Cursor
 from synapse.synapse_rust.events import EventInternalMetadata
 from synapse.synapse_rust.room_versions import RoomVersions
@@ -58,6 +63,7 @@ from synapse.util.json import json_encoder
 import tests.unittest
 import tests.utils
 from tests.test_utils.event_builders import make_test_event
+from tests.utils import EMBEDDED_DB_ENGINE
 
 # The silly auth graph we use to test the auth difference algorithm,
 # where the top are the most recent events.
@@ -801,19 +807,41 @@ class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
                     desc="insert",
                 )
             )
-        for link in links:
-            self.get_success(
-                self.store.db_pool.simple_insert(
-                    "event_auth_chain_links",
-                    {
-                        "origin_chain_id": link.origin_chain_and_seq[0],
-                        "origin_sequence_number": link.origin_chain_and_seq[1],
-                        "target_chain_id": link.target_chain_and_seq[0],
-                        "target_sequence_number": link.target_chain_and_seq[1],
-                    },
-                    desc="insert",
-                )
+        # Links are exclusive to whichever engine is configured (SQL or the
+        # embedded mtxdb engine -- see `_persist_chain_cover_index`), so
+        # insert the fixture the same way the production write path does
+        # rather than always writing straight to the SQL table, otherwise
+        # this test would only ever check the SQL backend under the
+        # trial-mtxdb CI job's `embedded_db_engine` config.
+        embedded_db_namespace = resolve_namespace(self.store)
+        if embedded_db_namespace is not None:
+            put_chain_links_batch(
+                getattr(self.store, "_embedded_db_engine", None),
+                embedded_db_namespace,
+                [
+                    (
+                        link.origin_chain_and_seq[0],
+                        link.origin_chain_and_seq[1],
+                        link.target_chain_and_seq[0],
+                        link.target_chain_and_seq[1],
+                    )
+                    for link in links
+                ],
             )
+        else:
+            for link in links:
+                self.get_success(
+                    self.store.db_pool.simple_insert(
+                        "event_auth_chain_links",
+                        {
+                            "origin_chain_id": link.origin_chain_and_seq[0],
+                            "origin_sequence_number": link.origin_chain_and_seq[1],
+                            "target_chain_id": link.target_chain_and_seq[0],
+                            "target_sequence_number": link.target_chain_and_seq[1],
+                        },
+                        desc="insert",
+                    )
+                )
 
         # Define the test cases
         class TestCase(NamedTuple):
@@ -925,6 +953,168 @@ class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
             self.get_success(
                 self.store.db_pool.runInteraction(
                     f"test_case_{test_case.name}", run_test, test_case
+                )
+            )
+
+    @unittest.skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
+    def test_conflicted_subgraph_embedded_closures(self) -> None:
+        """Embedded-closures counterpart to `test_conflicted_subgraph`.
+
+        The fixture above is a chain-cover **(chain id, seq num, link)**
+        description; the embedded closures path instead navigates a plain
+        auth DAG (short ids + direct auth edges), so this test expresses the
+        same ancestry as *direct edges* and asserts
+        `_get_auth_chain_difference_using_embedded_closures_txn` returns the
+        very same `want_conflicted_subgraph` sets the chain-cover code is held
+        to. Both implementations must agree; if one drifts, this is the guard.
+
+        The edge set is derived from the links: an event that "links into" a
+        chain at position `n` auths every position `<= n` of that chain, plus
+        its own chain's predecessors -- the chain-cover semantics that the
+        want sets above were computed under.
+        """
+        from synapse.storage.databases.main.embedded_event_auth_chains import (
+            embed_auth_edges_batch,
+            get_or_create_short_ids,
+        )
+
+        embedded_db_namespace = resolve_namespace(self.store)
+        if embedded_db_namespace is None:
+            self.skipTest("embedded closures namespace not configured")
+
+        engine_name = getattr(self.store, "_embedded_db_engine", None)
+        room_id = "!conflicted_subgraph_embedded_closures"
+
+        # Direct auth edges reproducing the same ancestry as the chain
+        # fixture (see the ASCII diagram in `test_conflicted_subgraph`).
+        auth_edges = {
+            "A1": [],
+            "A2": ["A1"],
+            "A3": ["A2"],
+            "B1": ["A1", "A2"],
+            "B2": ["B1"],
+            "B3": ["B2"],
+            "C1": ["B1", "B2"],
+            "C2": ["C1"],
+            "C3": ["C2"],
+            "D1": ["C1"],
+            "D2": ["D1"],
+            "D3": ["D2"],
+            "E1": ["D1", "D2"],
+            "F1": ["E1"],
+            "F2": ["F1"],
+            "G1": ["D1", "D2", "D3"],
+            "G2": ["G1"],
+        }
+        event_ids = list(auth_edges)
+        short_ids = get_or_create_short_ids(
+            engine_name, embedded_db_namespace, room_id, event_ids
+        )
+        short_id_of = dict(zip(event_ids, short_ids))
+        embed_auth_edges_batch(
+            engine_name,
+            embedded_db_namespace,
+            room_id,
+            [
+                (short_id_of[event_id], [short_id_of[auth_id] for auth_id in auths])
+                for event_id, auths in auth_edges.items()
+            ],
+        )
+
+        class TestCase(NamedTuple):
+            name: str
+            conflicted: set[str]
+            additional_backwards_reachable: set[str]
+            want_conflicted_subgraph: set[str]
+
+        test_cases = [
+            TestCase(
+                name="basic_single_chain",
+                conflicted={"B1", "B3"},
+                additional_backwards_reachable=set(),
+                want_conflicted_subgraph={"B1", "B2", "B3"},
+            ),
+            TestCase(
+                name="basic_single_link",
+                conflicted={"A1", "B2"},
+                additional_backwards_reachable=set(),
+                want_conflicted_subgraph={"A1", "A2", "B1", "B2"},
+            ),
+            TestCase(
+                name="basic_multi_link",
+                conflicted={"B1", "F1"},
+                additional_backwards_reachable=set(),
+                want_conflicted_subgraph={"B1", "B2", "C1", "D1", "D2", "E1", "F1"},
+            ),
+            TestCase(
+                name="basic_single_chain_as_additional",
+                conflicted={"B1"},
+                additional_backwards_reachable={"B3"},
+                want_conflicted_subgraph={"B1", "B2", "B3"},
+            ),
+            TestCase(
+                name="basic_single_link_as_additional",
+                conflicted={"A1"},
+                additional_backwards_reachable={"B2"},
+                want_conflicted_subgraph={"A1", "A2", "B1", "B2"},
+            ),
+            TestCase(
+                name="basic_multi_link_as_additional",
+                conflicted={"B1"},
+                additional_backwards_reachable={"F1"},
+                want_conflicted_subgraph={"B1", "B2", "C1", "D1", "D2", "E1", "F1"},
+            ),
+            TestCase(
+                name="mixed_multi_link",
+                conflicted={"D1", "F1"},
+                additional_backwards_reachable={"G1"},
+                want_conflicted_subgraph={"D1", "D2", "D3", "E1", "F1", "G1"},
+            ),
+            TestCase(
+                name="additional_backwards_doesnt_add_forwards_info",
+                conflicted={"C1", "C3"},
+                additional_backwards_reachable={"B1"},
+                want_conflicted_subgraph={"C1", "C2", "C3"},
+            ),
+            TestCase(
+                name="empty_subgraph",
+                conflicted={"B3", "C3"},
+                additional_backwards_reachable=set(),
+                want_conflicted_subgraph={"B3", "C3"},
+            ),
+            TestCase(
+                name="empty_subgraph_with_additional",
+                conflicted={"C1"},
+                additional_backwards_reachable={"B1"},
+                want_conflicted_subgraph={"C1"},
+            ),
+            TestCase(
+                name="empty_subgraph_single_conflict",
+                conflicted={"C1"},
+                additional_backwards_reachable=set(),
+                want_conflicted_subgraph={"C1"},
+            ),
+        ]
+
+        def run_test(txn: LoggingTransaction, test_case: TestCase) -> None:
+            result = self.store._get_auth_chain_difference_using_embedded_closures_txn(
+                txn,
+                embedded_db_namespace,
+                room_id,
+                [test_case.conflicted.union(test_case.additional_backwards_reachable)],
+                test_case.conflicted,
+                test_case.additional_backwards_reachable,
+            )
+            self.assertEqual(
+                result.conflicted_subgraph,
+                test_case.want_conflicted_subgraph,
+                f"{test_case.name} : conflicted subgraph mismatch",
+            )
+
+        for test_case in test_cases:
+            self.get_success(
+                self.store.db_pool.runInteraction(
+                    f"embedded_test_case_{test_case.name}", run_test, test_case
                 )
             )
 
@@ -1163,6 +1353,73 @@ class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
         )
 
         return _BackfillSetupInfo(room_id=room_id, depth_map=depth_map)
+
+    def test_get_backfill_events_withholds_outlier_seed(self) -> None:
+        """An outlier seed has no state, so we can't check the requester may see
+        it: it's walked back from but not returned, while its (non-outlier)
+        predecessors are."""
+        room_id = "!backfill-outlier:test"
+
+        def populate_db(txn: LoggingTransaction) -> None:
+            self.store.db_pool.simple_insert_txn(
+                txn,
+                "rooms",
+                {
+                    "room_id": room_id,
+                    "creator": "room_creator_user_id",
+                    "is_public": True,
+                    "room_version": "6",
+                },
+            )
+            for depth, event_id, outlier in [
+                (1, "$e1", False),
+                (2, "$e2", False),
+                (3, "$e3", True),
+            ]:
+                self.store.db_pool.simple_insert_txn(
+                    txn,
+                    table="events",
+                    values={
+                        "event_id": event_id,
+                        "type": "m.room.message",
+                        "room_id": room_id,
+                        "depth": depth,
+                        "topological_ordering": depth,
+                        "stream_ordering": depth,
+                        "processed": True,
+                        "outlier": outlier,
+                    },
+                )
+            for event_id, prev_event_id in [("$e2", "$e1"), ("$e3", "$e2")]:
+                self.store.db_pool.simple_insert_txn(
+                    txn,
+                    table="event_edges",
+                    values={
+                        "event_id": event_id,
+                        "prev_event_id": prev_event_id,
+                        "room_id": room_id,
+                    },
+                )
+
+        self.get_success(
+            self.store.db_pool.runInteraction("populate_backfill_outlier", populate_db)
+        )
+
+        def backfill(seed: str) -> set[str]:
+            return self.get_success(
+                self.store.db_pool.runInteraction(
+                    "get_backfill_events",
+                    self.store._get_backfill_events,
+                    room_id,
+                    [seed],
+                    100,
+                )
+            )
+
+        # The outlier seed itself is withheld, but backfill still walks back.
+        self.assertEqual(backfill("$e3"), {"$e2", "$e1"})
+        # A non-outlier seed is returned as before.
+        self.assertEqual(backfill("$e2"), {"$e2", "$e1"})
 
     def test_get_backfill_points_in_room(self) -> None:
         """
@@ -1789,6 +2046,144 @@ class FakeEvent:
 
     def is_state(self) -> bool:
         return True
+
+
+class WarnedIncompleteAuthGraphCacheTestCase(unittest.TestCase):
+    def test_dedup_and_ttl_and_eviction(self) -> None:
+        from synapse.storage.databases.main.event_federation import (
+            _WarnedIncompleteAuthGraphCache,
+        )
+
+        cache = _WarnedIncompleteAuthGraphCache(max_size=2, ttl_seconds=10.0)
+        self.assertTrue(cache.should_warn("!r1:test"))
+        self.assertFalse(cache.should_warn("!r1:test"))
+        self.assertIn("!r1:test", cache)
+
+        self.assertTrue(cache.should_warn("!r2:test"))
+        self.assertTrue(
+            cache.should_warn("!r3:test")
+        )  # evicts !r1:test due to max_size=2
+
+        self.assertNotIn("!r1:test", cache)
+        self.assertTrue(cache.should_warn("!r1:test"))
+
+
+class AuthChainReaderWorkerTestCase(tests.unittest.HomeserverTestCase):
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
+        self.store = hs.get_datastores().main
+
+    def test_non_writer_v21_fails_loud(self) -> None:
+        """Non-writer instances must deliberately fail loud with _NoChainCoverIndex
+        on state res v2.1 requests (conflicted_set is not None), since non-writers
+        cannot safely mutate/repair short IDs or embedded closures and legacy BFS
+        cannot compute the conflicted subgraph."""
+        from synapse.storage.databases.main.event_federation import _NoChainCoverIndex
+
+        room_id = "!v21_fail_loud:test"
+
+        def setup_room(txn: LoggingTransaction) -> None:
+            self.store.db_pool.simple_insert_txn(
+                txn,
+                "rooms",
+                {
+                    "room_id": room_id,
+                    "creator": "@user:test",
+                    "is_public": True,
+                    "room_version": "org.matrix.msc4297",
+                    "has_auth_chain_index": True,
+                },
+            )
+
+        self.get_success(self.store.db_pool.runInteraction("setup_room", setup_room))
+
+        # Simulate running on a reader worker (not in writers.events)
+        self.hs.get_instance_name = lambda: "federation_reader1"  # type: ignore[method-assign]
+
+        self.get_failure(
+            self.store.get_auth_chain_difference_extended(
+                room_id,
+                state_sets=[{"$e1"}, {"$e2"}],
+                conflicted_set={"$e1", "$e2"},
+                additional_backwards_reachable_conflicted_events=set(),
+            ),
+            _NoChainCoverIndex,
+        )
+
+    def test_non_writer_auth_chain_fallback_on_incomplete_cover(self) -> None:
+        """When the cover index is incomplete (e.g. missing direct auth events
+        or create event in cover index), a non-writer reader worker must detect
+        the gap and fall back to the authoritative SQL event_auth traversal."""
+        self.store.tests_allow_no_chain_cover_index = True
+        room_id = "!incomplete_cover:test"
+
+        def insert_test_events(txn: LoggingTransaction) -> None:
+            self.store.db_pool.simple_insert_txn(
+                txn,
+                "rooms",
+                {
+                    "room_id": room_id,
+                    "creator": "@user:test",
+                    "is_public": True,
+                    "room_version": "6",
+                    "has_auth_chain_index": True,
+                },
+            )
+            # Insert create event ($create), power levels ($pl), and message/state ($s1)
+            for eid, etype, depth in [
+                ("$create", "m.room.create", 1),
+                ("$pl", "m.room.power_levels", 2),
+                ("$s1", "m.room.member", 3),
+            ]:
+                self.store.db_pool.simple_insert_txn(
+                    txn,
+                    "events",
+                    {
+                        "event_id": eid,
+                        "room_id": room_id,
+                        "depth": depth,
+                        "topological_ordering": depth,
+                        "type": etype,
+                        "processed": True,
+                        "outlier": False,
+                        "stream_ordering": depth,
+                    },
+                )
+            # Direct event_auth edges
+            self.store.db_pool.simple_insert_txn(
+                txn,
+                "event_auth",
+                {"event_id": "$pl", "room_id": room_id, "auth_id": "$create"},
+            )
+            self.store.db_pool.simple_insert_txn(
+                txn,
+                "event_auth",
+                {"event_id": "$s1", "room_id": room_id, "auth_id": "$pl"},
+            )
+            self.store.db_pool.simple_insert_txn(
+                txn,
+                "event_auth",
+                {"event_id": "$s1", "room_id": room_id, "auth_id": "$create"},
+            )
+            # Intentionally insert an event_auth_chains row for $s1 with a fictitious chain
+            # that has NO links in mtxdb/SQL, so cover index alone would return only {$s1}.
+            self.store.db_pool.simple_insert_txn(
+                txn,
+                "event_auth_chains",
+                {"event_id": "$s1", "chain_id": 99999, "sequence_number": 1},
+            )
+
+        self.get_success(
+            self.store.db_pool.runInteraction("insert_test_events", insert_test_events)
+        )
+
+        # Simulate reader worker
+        self.hs.get_instance_name = lambda: "federation_reader1"  # type: ignore[method-assign]
+
+        # Calling get_auth_chain_ids for $s1 must fall back to SQL and return the full auth chain
+        chain = self.get_success(
+            self.store.get_auth_chain_ids(room_id, ["$s1"], include_given=True)
+        )
+        self.assertEqual(chain, {"$s1", "$pl", "$create"})
 
 
 def walk_state_dag(

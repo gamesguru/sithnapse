@@ -1,0 +1,13 @@
+-- Durable consumers of the edge-index outbox. Rows must be retained until
+-- every live rebuild has replayed past them.
+CREATE TABLE room_edge_rebuild_checkpoints (
+    room_id TEXT NOT NULL,
+    rebuild_id TEXT NOT NULL,
+    start_source_version BIGINT NOT NULL,
+    last_replayed_source_version BIGINT NOT NULL,
+    lease_expires_at_ms BIGINT NOT NULL,
+    PRIMARY KEY (room_id, rebuild_id)
+);
+
+CREATE INDEX room_edge_rebuild_checkpoints_room
+    ON room_edge_rebuild_checkpoints (room_id, lease_expires_at_ms);

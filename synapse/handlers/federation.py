@@ -88,7 +88,10 @@ from synapse.storage.databases.main.events_worker import EventRedactBehaviour
 from synapse.storage.invite_rule import InviteRule
 from synapse.types import JsonDict, StrCollection, get_domain_from_id
 from synapse.types.state import StateFilter
-from synapse.util.async_helpers import Linearizer, concurrently_execute
+from synapse.util.async_helpers import (
+    Linearizer,
+    concurrently_execute,
+)
 from synapse.util.duration import Duration
 from synapse.util.retryutils import NotRetryingDestination
 from synapse.visibility import filter_events_for_server
@@ -97,6 +100,21 @@ if TYPE_CHECKING:
     from synapse.server import HomeServer
 
 logger = logging.getLogger(__name__)
+
+# A partial-state room must eventually be resynchronised. In particular, a
+# transient database error late in the resync must not leave the room partial
+# forever, since several client endpoints wait for that flag to clear.
+#
+# Retry scheduling uses exponential backoff: the delay doubles after each
+# consecutive failure, starting at _PARTIAL_STATE_SYNC_INITIAL_BACKOFF and
+# capped at _PARTIAL_STATE_SYNC_MAX_BACKOFF. After
+# _PARTIAL_STATE_SYNC_MAX_CONSECUTIVE_FAILURES consecutive failures we stop
+# retrying entirely, logging a warning and leaving the room partial until a
+# restart or a new join triggers another sync attempt.
+_PARTIAL_STATE_SYNC_INITIAL_BACKOFF = Duration(seconds=1)
+_PARTIAL_STATE_SYNC_MAX_BACKOFF = Duration(hours=1)
+_PARTIAL_STATE_SYNC_MAX_CONSECUTIVE_FAILURES = 10
+
 
 # Added to debug performance and track progress on optimizations
 backfill_processing_before_timer = Histogram(
@@ -217,6 +235,9 @@ class FederationHandler:
         self._partial_state_syncs_maybe_needing_restart: dict[
             str, tuple[str | None, AbstractSet[str]]
         ] = {}
+        # Tracks consecutive failure counts per room for exponential backoff on
+        # partial state sync retries. Reset to 0 on success.
+        self._partial_state_sync_failure_counts: dict[str, int] = {}
         # A lock guarding the partial state flag for rooms.
         # When the lock is held for a given room, no other concurrent code may
         # partial state or un-partial state the room.
@@ -237,7 +258,12 @@ class FederationHandler:
     @trace
     @tag_args
     async def maybe_backfill(
-        self, room_id: str, current_depth: int, limit: int, record_time: bool = True
+        self,
+        room_id: str,
+        current_depth: int,
+        limit: int,
+        record_time: bool = True,
+        force: bool = False,
     ) -> bool:
         """Checks the database to see if we should backfill before paginating,
         and if so do.
@@ -251,6 +277,8 @@ class FederationHandler:
                 return. This is used as part of the heuristic to decide if we
                 should back paginate.
             record_time: Whether to record the time it takes to backfill.
+            force: Whether to force backfilling even if the depth heuristic would
+                otherwise skip it (e.g. when there are not enough local events).
 
         Returns:
             True if we actually tried to backfill something, otherwise False.
@@ -258,6 +286,20 @@ class FederationHandler:
         # Starting the processing time here so we can include the room backfill
         # linearizer lock queue in the timing
         processing_start_time = self.clock.time_msec() if record_time else 0
+
+        # If a partial state resync is currently active for this room, wait for it
+        # to complete so the backward extremities from the join event are persisted.
+        await self._storage_controllers.state._partial_state_room_tracker.await_full_state(
+            room_id, return_if_abandoned=True
+        )
+        if await self.store.is_partial_state_room(room_id):
+            # The resync was abandoned (or has not finished), so the backward
+            # extremities from the join event may not be persisted yet.
+            logger.warning(
+                "Room %s is still partial-state; skipping backfill",
+                room_id,
+            )
+            return False
 
         async with self._room_backfill.queue(room_id):
             async with self._worker_locks.acquire_read_write_lock(
@@ -268,6 +310,7 @@ class FederationHandler:
                     current_depth,
                     limit,
                     processing_start_time=processing_start_time,
+                    force=force,
                 )
 
     @trace
@@ -279,6 +322,7 @@ class FederationHandler:
         limit: int,
         *,
         processing_start_time: int | None,
+        force: bool = False,
     ) -> bool:
         """
         Checks whether the `current_depth` is at or approaching any backfill
@@ -372,24 +416,19 @@ class FederationHandler:
                 return False
 
             logger.debug(
-                "_maybe_backfill_inner: all backfill points are *after* current depth. Trying again with later backfill points."
+                "_maybe_backfill_inner: all backfill points are *after* current depth. Retrying synchronously with later backfill points."
             )
-            self.hs.run_as_background_process(
-                "_maybe_backfill_inner_anyway_with_max_depth",
-                self.maybe_backfill,
-                room_id=room_id,
-                # We use `MAX_DEPTH` so that we find all backfill points next
-                # time (all events are below the `MAX_DEPTH`)
-                current_depth=MAX_DEPTH,
-                limit=limit,
-                # We don't want to start another timing observation from this
-                # nested recursive call. The top-most call can record the time
-                # overall otherwise the smaller one will throw off the results.
-                record_time=False,
+            return await self._maybe_backfill_inner(
+                room_id,
+                MAX_DEPTH,
+                limit,
+                processing_start_time=processing_start_time,
+                # This is a fallback probe for extremities newer than the
+                # pagination cursor. Do not carry foreground pagination's
+                # force flag into it, or an unrelated newer extremity can
+                # make the request block on federation.
+                force=False,
             )
-            # We return `False` because we're backfilling in the background and there is
-            # no new events immediately for the caller to know about yet.
-            return False
 
         # Even after recursing with `MAX_DEPTH`, we didn't find any
         # backward extremities to backfill from.
@@ -409,7 +448,11 @@ class FederationHandler:
         # much larger factor will result in triggering a backfill request much
         # earlier than necessary.
         max_depth_of_backfill_points = sorted_backfill_points[0].depth
-        if current_depth - 2 * limit > max_depth_of_backfill_points:
+        if (
+            current_depth != MAX_DEPTH
+            and not force
+            and current_depth - 2 * limit > max_depth_of_backfill_points
+        ):
             logger.debug(
                 "Not backfilling as we don't need to. %d < %d - 2 * %d",
                 max_depth_of_backfill_points,
@@ -627,10 +670,21 @@ class FederationHandler:
 
     async def on_event_auth(self, event_id: str, room_id: str) -> list[EventBase]:
         event = await self.store.get_event(event_id, check_room_id=room_id)
+        requested_auth_event_ids = set(event.auth_event_ids())
         auth = await self.store.get_auth_chain(
-            event.room_id, list(event.auth_event_ids()), include_given=True
+            event.room_id, list(requested_auth_event_ids), include_given=True
         )
-        return list(auth)
+        auth_events = list(auth)
+        returned_event_ids = {auth_event.event_id for auth_event in auth_events}
+        logger.info(
+            "Serving /event_auth for %s: requested_auth_event_ids=%s "
+            "returned_event_ids=%s missing_requested_event_ids=%s",
+            event_id,
+            sorted(requested_auth_event_ids),
+            sorted(returned_event_ids),
+            sorted(requested_auth_event_ids - returned_event_ids),
+        )
+        return auth_events
 
     async def do_invite_join(
         self, target_hosts: Iterable[str], room_id: str, joinee: str, content: JsonDict
@@ -1146,6 +1200,9 @@ class FederationHandler:
             if await self._event_auth_handler.has_restricted_join_rules(
                 state_ids, room_version
             ):
+                allowed_rooms = (
+                    await self._event_auth_handler.get_rooms_that_allow_join(state_ids)
+                )
                 prev_member_event_id = state_ids.get((EventTypes.Member, user_id), None)
                 # If the user is invited or joined to the room already, then
                 # no additional info is needed.
@@ -1157,7 +1214,7 @@ class FederationHandler:
                         Membership.INVITE,
                     )
 
-                if include_auth_user_id:
+                if include_auth_user_id and allowed_rooms:
                     event_content[
                         EventContentFields.AUTHORISING_USER
                     ] = await self._event_auth_handler.get_user_which_could_invite(
@@ -2419,11 +2476,21 @@ class FederationHandler:
 
             self._active_partial_state_syncs.add(room_id)
 
+            sync_failed = False
             try:
                 await self._sync_partial_state_room(
                     initial_destination=initial_destination,
                     other_destinations=other_destinations,
                     room_id=room_id,
+                )
+            except Exception:
+                # A failure here can happen after we have fetched and applied all
+                # state but before clearing the partial-state flag (for example,
+                # while updating device lists). Retrying is required to avoid
+                # leaving the room permanently partial.
+                sync_failed = True
+                logger.exception(
+                    "Failed to resynchronise partial-state room %s", room_id
                 )
             finally:
                 # Read the room's partial state flag while we still hold the claim to
@@ -2432,17 +2499,91 @@ class FederationHandler:
                 # Normally, the partial state flag will be gone. If it isn't, then we
                 # may find ourselves in scenario 2a or 2b as described in the comment
                 # above, where we want to restart the partial state sync.
-                is_still_partial_state_room = await self.store.is_partial_state_room(
-                    room_id
-                )
-                self._active_partial_state_syncs.remove(room_id)
+                try:
+                    is_still_partial_state_room = (
+                        await self.store.is_partial_state_room(room_id)
+                    )
+                except Exception:
+                    # Cleanup below must still run if this diagnostic read
+                    # fails. Treat the room as still partial so that the
+                    # normal retry handling remains conservative.
+                    is_still_partial_state_room = True
+                    logger.exception(
+                        "Failed to check partial-state flag for room %s", room_id
+                    )
+                finally:
+                    self._active_partial_state_syncs.remove(room_id)
 
-                if room_id in self._partial_state_syncs_maybe_needing_restart:
+                    restart_params = (
+                        self._partial_state_syncs_maybe_needing_restart.pop(
+                            room_id, None
+                        )
+                    )
+
+                # Determine whether to schedule a retry and with what delay.
+                # On success, reset the failure counter. On failure, compute an
+                # exponential backoff delay and cap retries at
+                # _PARTIAL_STATE_SYNC_MAX_CONSECUTIVE_FAILURES.
+                retry_delay: Duration | None = None
+                if sync_failed and is_still_partial_state_room:
+                    failure_count = (
+                        self._partial_state_sync_failure_counts.get(room_id, 0) + 1
+                    )
+                    self._partial_state_sync_failure_counts[room_id] = failure_count
+                    if failure_count >= _PARTIAL_STATE_SYNC_MAX_CONSECUTIVE_FAILURES:
+                        logger.warning(
+                            "Giving up on resynchronising partial-state room %s "
+                            "after %d consecutive failures",
+                            room_id,
+                            failure_count,
+                        )
+                        # A later join may give us usable remote destinations again.
+                        # Give that fresh attempt a full retry budget.
+                        self._partial_state_sync_failure_counts.pop(room_id, None)
+                        if restart_params is not None:
+                            retry_delay = _PARTIAL_STATE_SYNC_INITIAL_BACKOFF
+                    else:
+                        retry_delay = min(
+                            _PARTIAL_STATE_SYNC_INITIAL_BACKOFF
+                            * (2 ** (failure_count - 1)),
+                            _PARTIAL_STATE_SYNC_MAX_BACKOFF,
+                        )
+                else:
+                    self._partial_state_sync_failure_counts.pop(room_id, None)
+
+                if sync_failed and retry_delay is None and is_still_partial_state_room:
+                    # We're not going to retry, so don't leave anything (such as
+                    # backfill) waiting for the room to become full-state.
+                    self._storage_controllers.state._partial_state_room_tracker.notify_resync_abandoned(
+                        room_id
+                    )
+
+                if retry_delay is not None:
+                    if restart_params is not None:
+                        (
+                            restart_initial_destination,
+                            restart_other_destinations,
+                        ) = restart_params
+                        self.clock.call_later(
+                            retry_delay,
+                            self._start_partial_state_room_sync,
+                            restart_initial_destination,
+                            restart_other_destinations,
+                            room_id,
+                        )
+                    else:
+                        self.clock.call_later(
+                            retry_delay,
+                            self._start_partial_state_room_sync,
+                            initial_destination,
+                            other_destinations,
+                            room_id,
+                        )
+                elif restart_params is not None and not sync_failed:
                     (
                         restart_initial_destination,
                         restart_other_destinations,
-                    ) = self._partial_state_syncs_maybe_needing_restart.pop(room_id)
-
+                    ) = restart_params
                     if is_still_partial_state_room:
                         self._start_partial_state_room_sync(
                             initial_destination=restart_initial_destination,
@@ -2543,7 +2684,6 @@ class FederationHandler:
             )
             for event in events:
                 for attempt in itertools.count():
-                    # We try a new destination on every iteration.
                     try:
                         while True:
                             try:
@@ -2552,14 +2692,15 @@ class FederationHandler:
                                 )
                                 break
                             except FederationPullAttemptBackoffError as e:
-                                # We are in the backoff period for one of the event's
-                                # prev_events. Wait it out and try again after.
-                                logger.warning(
-                                    "%s; waiting for %d ms...", e, e.retry_after_ms
-                                )
-                                await self.clock.sleep(
-                                    Duration(milliseconds=e.retry_after_ms)
-                                )
+                                # The backoff is keyed on (room_id, event_id), not on
+                                # destination -- switching destinations doesn't get us
+                                # out of it, and would otherwise put us in a hot loop
+                                # re-hitting the backoff every batch pass with no sleep.
+                                # Wait out the backoff (capped to a reasonable polling
+                                # interval) against the same destination and retry.
+                                sleep_ms = min(e.retry_after_ms, 5000)
+                                logger.warning("%s; waiting for %d ms...", e, sleep_ms)
+                                await self.clock.sleep(Duration(milliseconds=sleep_ms))
 
                         # Success, no need to try the rest of the destinations.
                         break

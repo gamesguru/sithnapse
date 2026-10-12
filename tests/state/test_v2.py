@@ -19,13 +19,16 @@
 #
 
 import itertools
+from collections import UserDict
 from typing import (
+    Any,
     Collection,
     Iterable,
     Mapping,
     Sequence,
     TypeVar,
 )
+from unittest import mock
 
 import attr
 from parameterized import parameterized
@@ -63,6 +66,14 @@ MEMBERSHIP_CONTENT_BAN = {"membership": Membership.BAN}
 
 
 ORIGIN_SERVER_TS = 0
+
+
+try:
+    import synapse.synapse_rust.state_res as _rust_state_res  # noqa: F401
+
+    HAVE_RUST_STATE_RES = True
+except Exception:
+    HAVE_RUST_STATE_RES = False
 
 
 class FakeClock:
@@ -626,6 +637,78 @@ class StateTestCase(unittest.TestCase):
         self.assertNotEqual(warm[ZARA_KEY], agreed_result[ZARA_KEY])
         self.assertEqual(warm, cold)
 
+    @unittest.skip_unless(HAVE_RUST_STATE_RES, "synapse_rust.state_res unavailable")
+    def test_rust_used_on_miss_skipped_on_hit(self) -> None:
+        """A v2 conflict-cache miss invokes the Rust lattice fold; subsequent
+        hits (including when only unrelated unconflicted state differs) do not,
+        while a different base state does."""
+        import synapse.synapse_rust.state_res as rust_res
+
+        self._build_cache_scenario()
+        conflict_cache: dict[bytes, StateMap[str]] = {}
+
+        with_zara = [self._state("PA", "T1"), self._state("PA", "T2")]
+        without_zara = [
+            {key: value for key, value in state.items() if key != ZARA_KEY}
+            for state in with_zara
+        ]
+        # Same conflicted set, but the power levels (part of the base state)
+        # differ.
+        under_ipower = [self._state("T1"), self._state("T2")]
+
+        real = rust_res.resolve_v2_via_lattice_fold
+        calls: list[Any] = []
+
+        def spy(*args: Any, **kwargs: Any) -> Any:
+            calls.append(args)
+            return real(*args, **kwargs)
+
+        with mock.patch.object(rust_res, "resolve_v2_via_lattice_fold", spy):
+            self._resolve_with_cache(V2_ROOM, with_zara, conflict_cache)
+            self.assertEqual(len(calls), 1, "cache miss should invoke Rust")
+
+            self._resolve_with_cache(V2_ROOM, without_zara, conflict_cache)
+            self.assertEqual(
+                len(calls),
+                1,
+                "cache hit with unrelated unconflicted state must not invoke Rust",
+            )
+
+            self._resolve_with_cache(V2_ROOM, under_ipower, conflict_cache)
+            self.assertEqual(
+                len(calls), 2, "a different base state must be a cache miss"
+            )
+
+        self.assertEqual(len(conflict_cache), 2)
+
+    @unittest.skip_unless(HAVE_RUST_STATE_RES, "synapse_rust.state_res unavailable")
+    def test_rust_result_matches_python(self) -> None:
+        """With the Rust entry point forced to raise, the Python fallback must
+        produce the same resolved state as the Rust path."""
+        import synapse.synapse_rust.state_res as rust_res
+
+        self._build_cache_scenario()
+        state_sets = [self._state("PA", "T1"), self._state("PA", "T2")]
+
+        # Separate caches so both calls are cache misses and actually run their
+        # respective implementations (a shared cache would make the second call
+        # a hit and skip the Python path entirely).
+        rust_cache: dict[bytes, StateMap[str]] = {}
+        rust_result = self._resolve_with_cache(V2_ROOM, state_sets, rust_cache)
+
+        def explode(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("forced fallback for the Rust/Python parity test")
+
+        python_cache: dict[bytes, StateMap[str]] = {}
+        with mock.patch.object(rust_res, "resolve_v2_via_lattice_fold", explode):
+            python_result = self._resolve_with_cache(V2_ROOM, state_sets, python_cache)
+
+        # The fallback deliberately raises, so trial must not treat the
+        # resulting error log as an unflushed failure.
+        self.flushLoggedErrors(RuntimeError)
+
+        self.assertEqual(dict(rust_result), dict(python_result))
+
     def build_event_graph(
         self,
         events: list[FakeEvent],
@@ -871,6 +954,58 @@ class SimpleParamStateTestCase(unittest.TestCase):
         state = self.successResultOf(defer.ensureDeferred(state_d))
 
         self.assert_dict(self.expected_combined_state, state)
+
+    def test_unconflicted_events_are_prefetched_for_auth_context(self) -> None:
+        """Keep unconflicted events available to state resolution as auth context."""
+        topic_event = FakeEvent(
+            id="TOPIC",
+            sender=ALICE,
+            type=EventTypes.Topic,
+            state_key="",
+            content={"topic": "unconflicted"},
+        ).to_event(
+            [
+                self.create_event.event_id,
+                self.alice_member.event_id,
+                self.join_rules.event_id,
+            ],
+            [],
+        )
+        event_map = {**self.event_map, topic_event.event_id: topic_event}
+        state_at_bob = {
+            **self.state_at_bob,
+            (topic_event.type, topic_event.state_key): topic_event.event_id,
+        }
+        state_at_charlie = {
+            **self.state_at_charlie,
+            (topic_event.type, topic_event.state_key): topic_event.event_id,
+        }
+        store = TestStateResolutionStore(event_map)
+
+        state = self.successResultOf(
+            defer.ensureDeferred(
+                resolve_events_with_store(
+                    FakeClock(),
+                    ROOM_ID,
+                    RoomVersions.V2,
+                    [state_at_bob, state_at_charlie],
+                    event_map=None,
+                    state_res_store=store,
+                )
+            )
+        )
+
+        self.assert_dict(
+            {
+                **self.expected_combined_state,
+                (topic_event.type, topic_event.state_key): topic_event.event_id,
+            },
+            state,
+        )
+        self.assertIn(
+            topic_event.event_id,
+            {event_id for call in store.get_events_calls for event_id in call},
+        )
 
 
 class AuthChainDifferenceTestCase(unittest.TestCase):
@@ -1203,6 +1338,153 @@ class AuthChainDifferenceTestCase(unittest.TestCase):
                 )
 
 
+@unittest.skip_unless(HAVE_RUST_STATE_RES, "synapse_rust.state_res unavailable")
+class RustAuthChainDifferenceInputTestCase(unittest.TestCase):
+    """Input-shape coverage for the Rust auth-difference fast path.
+
+    The Rust entry point has to copy every Python object it needs *before* it
+    releases the GIL, so `state_sets` is only ever inspected during that copy
+    and then never touched again. These cases feed one logical graph through
+    several container shapes and assert the answer never changes, which keeps
+    both the exact-`dict` fast path and the `values()` fallback honest.
+    """
+
+    def setUp(self) -> None:
+        # A -> B -> C, all present in the event map. The production caller only
+        # takes this path when every state-set ID *and its whole auth chain* is
+        # in `event_map` (see the `complete_event_graph` check), so the graph
+        # handed to Rust here is closed by construction.
+        self.a = FakeEvent(
+            id="A",
+            sender=ALICE,
+            type=EventTypes.Member,
+            state_key="",
+            content={},
+        ).to_event([], [])
+        self.b = FakeEvent(
+            id="B",
+            sender=ALICE,
+            type=EventTypes.Member,
+            state_key="",
+            content={},
+        ).to_event([self.a.event_id], [])
+        self.c = FakeEvent(
+            id="C",
+            sender=ALICE,
+            type=EventTypes.Member,
+            state_key="",
+            content={},
+        ).to_event([self.b.event_id], [])
+        self.event_map = {event.event_id: event for event in (self.a, self.b, self.c)}
+        self.state_sets = [
+            {("a", ""): self.a.event_id},
+            {("b", ""): self.b.event_id},
+            {("c", ""): self.c.event_id},
+        ]
+        # Each state set's auth chain includes itself, so the three chains are
+        # {A}, {A, B} and {A, B, C}: union - intersection is {B, C}.
+        self.expected = {self.b.event_id, self.c.event_id}
+
+    def rust_difference(self, state_sets: Any) -> set[str]:
+        import synapse.synapse_rust.state_res as rust_res
+
+        return rust_res.get_auth_chain_difference_from_event_graph(
+            state_sets, self.event_map
+        )
+
+    def python_difference(self, state_sets: Sequence[StateMap[str]]) -> set[str]:
+        """Run the pure-Python/store path on the identical inputs."""
+        difference = _get_auth_chain_difference(
+            ROOM_ID,
+            state_sets,
+            self.event_map,
+            TestStateResolutionStore({}),
+            None,
+            complete_event_graph=False,
+        )
+        return self.successResultOf(defer.ensureDeferred(difference))
+
+    def test_plain_dicts(self) -> None:
+        self.assertEqual(self.rust_difference(self.state_sets), self.expected)
+
+    def test_matches_python_path(self) -> None:
+        """The Rust fast path must agree with the path it replaced."""
+        self.assertEqual(
+            self.rust_difference(self.state_sets),
+            self.python_difference(self.state_sets),
+        )
+
+    def test_generator(self) -> None:
+        """`state_sets` is consumed with `try_iter`, so a generator works."""
+        self.assertEqual(
+            self.rust_difference(s for s in self.state_sets), self.expected
+        )
+
+    def test_state_sets_without_len(self) -> None:
+        """The container must never be asked for `len()`.
+
+        `len()` on an arbitrary iterable runs Python code whose exceptions are
+        only ever used for a capacity hint, so measuring the input is a
+        regression even if the answer comes out the same.
+        """
+
+        class IterableOnly:
+            def __init__(self, items: Sequence[StateMap[str]]) -> None:
+                self._items = items
+
+            def __iter__(self) -> Any:
+                return iter(self._items)
+
+            def __len__(self) -> int:
+                raise AssertionError("state_sets must not be measured with len()")
+
+        self.assertEqual(
+            self.rust_difference(IterableOnly(self.state_sets)), self.expected
+        )
+
+    def test_non_dict_mapping(self) -> None:
+        """A mapping that is not a `dict` still goes through `values()`."""
+        state_sets = [UserDict(s) for s in self.state_sets]
+        self.assertEqual(self.rust_difference(state_sets), self.expected)
+
+    def test_lengthless_values_iterable(self) -> None:
+        """The values fallback accepts an iterable without `__len__`."""
+
+        class LengthlessMapping(UserDict):
+            def values(self) -> Any:
+                return iter(super().values())
+
+        state_sets = [LengthlessMapping(s) for s in self.state_sets]
+        self.assertEqual(self.rust_difference(state_sets), self.expected)
+
+    def test_dict_subclass_honours_values(self) -> None:
+        """A `dict` subclass must reach its overridden `values()`.
+
+        The exact-`dict` fast path deliberately stops at plain dictionaries so
+        that an overridden `values()` is not silently bypassed; this is the
+        test that keeps that restriction in place.
+        """
+        values_calls: list[str] = []
+
+        class RecordingDict(dict):
+            def values(self) -> Any:
+                values_calls.append("called")
+                return super().values()
+
+        state_sets = [RecordingDict(s) for s in self.state_sets]
+        self.assertEqual(self.rust_difference(state_sets), self.expected)
+        self.assertEqual(len(values_calls), len(self.state_sets))
+
+    def test_empty(self) -> None:
+        """No state sets means no difference, not an error."""
+        self.assertEqual(self.rust_difference([]), set())
+        self.assertEqual(self.rust_difference(iter(())), set())
+
+    def test_single_state_set(self) -> None:
+        """With one set the intersection equals the union, so nothing differs."""
+        self.assertEqual(self.rust_difference(self.state_sets[:1]), set())
+
+
 T = TypeVar("T")
 
 
@@ -1216,6 +1498,7 @@ def pairwise(iterable: Iterable[T]) -> Iterable[tuple[T, T]]:
 @attr.s
 class TestStateResolutionStore:
     event_map: dict[str, EventBase] = attr.ib()
+    get_events_calls: list[Collection[str]] = attr.ib(factory=list)
 
     def get_events(
         self, event_ids: Collection[str], allow_rejected: bool = False
@@ -1230,6 +1513,7 @@ class TestStateResolutionStore:
             Dict from event_id to event.
         """
 
+        self.get_events_calls.append(event_ids)
         return defer.succeed(
             {eid: self.event_map[eid] for eid in event_ids if eid in self.event_map}
         )

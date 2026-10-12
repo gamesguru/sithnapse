@@ -47,7 +47,7 @@ trial_sqlite_tests = [
         "extras": "all",
     },
     {
-        "python-version": "3.14",
+        "python-version": "3.13",
         "database": "sqlite",
         "extras": "all",
     },
@@ -76,7 +76,7 @@ trial_postgres_tests = [
         "extras": "all",
     },
     {
-        "python-version": "3.14",
+        "python-version": "3.13",
         "database": "postgres",
         "postgres-version": "17",
         "extras": "all",
@@ -92,16 +92,48 @@ trial_no_extra_tests = [
     }
 ]
 
+# trial_mtxdb_tests: test mtxdb on oldest and newest Python versions
+# in PRs, and all versions on non-PR runs. The dedicated trial-mtxdb job
+# in tests.yml runs on Python 3.12; this matrix ensures coverage on the
+# oldest (3.10) and newest (3.13) supported versions too.
+trial_mtxdb_tests = [
+    {
+        "python-version": "3.10",
+        "database": "mtxdb",
+        "extras": "all",
+    },
+    {
+        "python-version": "3.13",
+        "database": "mtxdb",
+        "extras": "all",
+    },
+]
+
+if not IS_PR:
+    # Check all supported Python versions.
+    trial_mtxdb_tests.extend(
+        {
+            "python-version": version,
+            "database": "mtxdb",
+            "extras": "all",
+        }
+        for version in ("3.11", "3.12", "3.13")
+    )
+
 print("::group::Calculated trial jobs")
 print(
     json.dumps(
-        trial_sqlite_tests + trial_postgres_tests + trial_no_extra_tests, indent=4
+        trial_sqlite_tests
+        + trial_postgres_tests
+        + trial_no_extra_tests
+        + trial_mtxdb_tests,
+        indent=4,
     )
 )
 print("::endgroup::")
 
 test_matrix = json.dumps(
-    trial_sqlite_tests + trial_postgres_tests + trial_no_extra_tests
+    trial_sqlite_tests + trial_postgres_tests + trial_no_extra_tests + trial_mtxdb_tests
 )
 set_output("trial_test_matrix", test_matrix)
 
@@ -118,6 +150,11 @@ sytest_tests = [
     {
         "sytest-tag": "bookworm",
         "postgres": "postgres",
+    },
+    {
+        "sytest-tag": "bookworm",
+        "postgres": "postgres",
+        "embedded_db": "mtxdb",
     },
     {
         "sytest-tag": "bookworm",

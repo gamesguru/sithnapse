@@ -1,26 +1,25 @@
-# Managing dependencies with Poetry
+# Managing dependencies with uv
 
-This is a quick cheat sheet for developers on how to use [`poetry`](https://python-poetry.org/).
+This is a quick cheat sheet for developers on how to use [`uv`](https://github.com/astral-sh/uv).
 
 # Installing
 
 See the [contributing guide](contributing_guide.md#4-install-the-dependencies).
 
-Developers should use Poetry 2.2.0 or higher. If you encounter problems related
-to poetry, please [double-check your poetry version](#check-the-version-of-poetry-with-poetry---version).
+Developers should use `uv` 0.5.0 or higher. If you encounter problems, please [double-check your uv version](#check-the-version-of-uv-with-uv---version).
 
 # Background
 
 Synapse uses a variety of third-party Python packages to function as a homeserver.
 Some of these are direct dependencies, listed in `pyproject.toml` under the
-`[tool.poetry.dependencies]` section. The rest are transitive dependencies (the
+`dependencies` section. The rest are transitive dependencies (the
 things that our direct dependencies themselves depend on, and so on recursively.)
 
 We maintain a locked list of all our dependencies (transitive included) so that
 we can track exactly which version of each dependency appears in a given release.
 See [here](https://github.com/matrix-org/synapse/issues/11537#issue-1074469665)
 for discussion of why we wanted this for Synapse. We chose to use
-[`poetry`](https://python-poetry.org/) to manage this locked list; see
+[`uv`](https://github.com/astral-sh/uv) to manage this locked list; see
 [this comment](https://github.com/matrix-org/synapse/issues/11537#issuecomment-1015975819)
 for the reasoning.
 
@@ -38,43 +37,18 @@ they'll pull in the latest version of each package available at install time.
 
 An example may help. We have a broad dependency on
 [`phonenumbers`](https://pypi.org/project/phonenumbers/), as declared in
-this snippet from pyproject.toml [as of Synapse 1.57](
-https://github.com/matrix-org/synapse/blob/release-v1.57/pyproject.toml#L133
-):
+this snippet from pyproject.toml [as of Synapse 1.156]:
 
 ```toml
-[tool.poetry.dependencies]
-# ...
-phonenumbers = ">=8.2.0"
-```
-
-In our lockfile this is
-[pinned]( https://github.com/matrix-org/synapse/blob/dfc7646504cef3e4ff396c36089e1c6f1b1634de/poetry.lock#L679-L685)
-to version 8.12.44, even though
-[newer versions are available](https://pypi.org/project/phonenumbers/#history).
-
-```toml
-[[package]]
-name = "phonenumbers"
-version = "8.12.44"
-description = "Python version of Google's common library for parsing, formatting, storing and validating international phone numbers."
-category = "main"
-optional = false
-python-versions = "*"
-```
-
-The lockfile also includes a
-[cryptographic checksum](https://github.com/matrix-org/synapse/blob/release-v1.57/poetry.lock#L2178-L2181)
-of the sdists and wheels provided for this version of `phonenumbers`.
-
-```toml
-[metadata.files]
-# ...
-phonenumbers = [
-    {file = "phonenumbers-8.12.44-py2.py3-none-any.whl", hash = "sha256:cc1299cf37b309ecab6214297663ab86cb3d64ae37fd5b88e904fe7983a874a6"},
-    {file = "phonenumbers-8.12.44.tar.gz", hash = "sha256:26cfd0257d1704fe2f88caff2caabb70d16a877b1e65b6aae51f9fbbe10aa8ce"},
+dependencies = [
+    # ...
+    "phonenumbers>=8.2.0",
 ]
 ```
+
+In our lockfile `uv.lock` this is pinned to a specific version.
+
+The lockfile also includes cryptographic checksums of the sdists and wheels provided for this version.
 
 We can see this pinned version inside the docker image for that release:
 
@@ -83,46 +57,23 @@ $ docker pull matrixdotorg/synapse:latest
 ...
 $ docker run --entrypoint pip matrixdotorg/synapse:latest show phonenumbers
 Name: phonenumbers
-Version: 9.0.15
-Summary: Python version of Google's common library for parsing, formatting, storing and validating international phone numbers.
-Home-page: https://github.com/daviddrysdale/python-phonenumbers
-Author: David Drysdale
-Author-email: dmd@lurklurk.org
-License: Apache License 2.0
-Location: /usr/local/lib/python3.12/site-packages
-Requires:
-Required-by: matrix-synapse
-```
-
-Whereas the wheel metadata just contains the broad dependencies:
-
-```
-$ cd /tmp
-$ wget https://files.pythonhosted.org/packages/ca/5e/d722d572cc5b3092402b783d6b7185901b444427633bd8a6b00ea0dd41b7/matrix_synapse-1.57.0rc1-py3-none-any.whl
+Version: 9.0.33
 ...
-$ unzip -c matrix_synapse-1.57.0rc1-py3-none-any.whl matrix_synapse-1.57.0rc1.dist-info/METADATA | grep phonenumbers
-Requires-Dist: phonenumbers (>=8.2.0)
 ```
 
 # Tooling recommendation: direnv
 
 [`direnv`](https://direnv.net/) is a tool for activating environments in your
-shell inside a given directory. Its support for poetry is unofficial (a
-community wiki recipe only), but works solidly in our experience. We thoroughly
-recommend it for daily use. To use it:
+shell inside a given directory. We thoroughly recommend it for daily use. To use it:
 
 1. [Install `direnv`](https://direnv.net/docs/installation.html) - it's likely
    packaged for your system already.
-2. Teach direnv about poetry. The [shell config here](https://github.com/direnv/direnv/wiki/Python#poetry)
-   needs to be added to `~/.config/direnv/direnvrc` (or more generally `$XDG_CONFIG_HOME/direnv/direnvrc`).
-3. Mark the synapse checkout as a poetry project: `echo layout poetry > .envrc`.
-4. Convince yourself that you trust this `.envrc` configuration and project.
+2. Mark the synapse checkout as a uv project by specifying the virtualenv location: `echo "layout virtualenv .venv" > .envrc`.
+3. Convince yourself that you trust this `.envrc` configuration and project.
    Then formally confirm this to `direnv` by running `direnv allow`.
 
-Then whenever you navigate to the synapse checkout, you should be able to run
-e.g. `mypy` instead of `poetry run mypy`; `python` instead of
-`poetry run python`; and your shell commands will automatically run in the
-context of poetry's venv, without having to run `poetry shell` beforehand.
+Then whenever you navigate to the synapse checkout, your shell commands will automatically run in the
+context of the virtual environment, without having to run `source .venv/bin/activate` beforehand.
 
 
 # How do I...
@@ -130,156 +81,134 @@ context of poetry's venv, without having to run `poetry shell` beforehand.
 ## ...reset my venv to the locked environment?
 
 ```shell
-poetry install --all-extras --sync
+uv sync --all-extras --sync
 ```
 
 ## ...delete everything and start over from scratch?
 
 ```shell
 # Stop the current virtualenv if active
-$ deactivate
+# deactivate
 
 # Remove all of the files from the current environment.
-# Don't worry, even though it says "all", this will only
-# remove the Poetry virtualenvs for the current project.
-$ poetry env remove --all
+$ rm -rf .venv
 
-# Reactivate Poetry shell to create the virtualenv again
-$ poetry shell
+# Reactivate your shell to create the virtualenv again
+$ source .venv/bin/activate
 # Install everything again
-$ poetry install --extras all
+$ uv sync --all-extras
 ```
 
-If you want to go even further and remove the Poetry caches:
-
-```shell
-# Find your Poetry cache directory
-# Docs: https://github.com/python-poetry/poetry/blob/main/docs/configuration.md#cache-directory
-$ poetry config cache-dir
-
-# Remove packages from all cached repositories
-$ poetry cache clear --all .
-
-# Go completely nuclear and clear out everything Poetry cache related
-# including the wheel artifacts which is not covered by the above command
-# (see https://github.com/python-poetry/poetry/issues/10304)
-#
-# This is necessary in order to rebuild or fetch new wheels.
-$ rm -rf $(poetry config cache-dir)
-```
+If you want to go even further and remove the uv caches, see [Clear caches](#clear-caches-uv-cache-clean).
 
 
-## ...run a command in the `poetry` virtualenv?
+## ...run a command in the `uv` virtualenv?
 
-Use `poetry run cmd args` when you need the python virtualenv context.
-To avoid typing `poetry run` all the time, you can run  `poetry shell`
-to start a new shell in the poetry virtualenv context. Within `poetry shell`,
+Use `uv run cmd args` when you need the python virtualenv context.
+To avoid typing `uv run` all the time, you can run `source .venv/bin/activate`
+to start a new shell in the uv virtualenv context. Within `source .venv/bin/activate`,
 `python`, `pip`, `mypy`, `trial`, etc. are all run inside the project virtualenv
-and isolated from the rest o the system.
+and isolated from the rest of the system.
 
 Roughly speaking, the translation from a traditional virtualenv is:
-- `env/bin/activate` -> `poetry shell`, and
+- `env/bin/activate` -> `source .venv/bin/activate`, and
 - `deactivate` -> close the terminal (Ctrl-D, `exit`, etc.)
 
-See also the direnv recommendation above, which makes `poetry run` and
-`poetry shell` unnecessary.
+See also the direnv recommendation above, which makes `uv run` and
+`source .venv/bin/activate` unnecessary.
 
 
-## ...inspect the `poetry` virtualenv?
+## ...inspect the `uv` virtualenv?
 
 Some suggestions:
 
 ```shell
-# Current env only
-poetry env info
-# All envs: this allows you to have e.g. a poetry managed venv for Python 3.7,
-# and another for Python 3.10.
-poetry env list --full-path
-poetry run pip list
+uv run pip list
 ```
-
-Note that `poetry show` describes the abstract *lock file* rather than your
-on-disk environment. With that said, `poetry show --tree` can sometimes be
-useful.
 
 
 ## ...add a new dependency?
 
-Either:
-- manually update `pyproject.toml`; then `poetry lock`; or else
-- `poetry add packagename`. See `poetry add --help`; note the `--dev`,
-  `--extras` and `--optional` flags in particular.
+Either manually edit `pyproject.toml` or use the CLI commands.
 
-Include the updated `pyproject.toml` and `poetry.lock` files in your commit.
+**Using uv:**
+```shell
+uv add packagename
+```
+
+Include the updated `pyproject.toml` and `uv.lock` files in your commit.
 
 ## ...remove a dependency?
 
-This is not done often and is untested, but
+This is not done often and is untested, but:
 
+**Using uv:**
 ```shell
-poetry remove packagename
+uv remove packagename
 ```
 
-ought to do the trick. Alternatively, manually update `pyproject.toml` and
-`poetry lock`. Include the updated `pyproject.toml` and `poetry.lock`
-files in your commit.
+Include the updated `pyproject.toml` and `uv.lock` files in your commit.
 
 ## ...update the version range for an existing dependency?
 
-Best done by manually editing `pyproject.toml`, then `poetry lock`.
-Include the updated `pyproject.toml` and `poetry.lock` in your commit.
+Best done by manually editing `pyproject.toml`, and then locking:
+
+**Using uv:**
+```shell
+uv lock
+```
+
+Include the updated `pyproject.toml` and `uv.lock` in your commit.
 
 ## ...update a dependency in the locked environment?
 
-Use
+To use the latest version of `packagename` in the locked environment, without affecting the broad dependencies listed in the wheel:
 
+**Using uv:**
 ```shell
-poetry update packagename
+uv lock --upgrade-package packagename
 ```
-
-to use the latest version of `packagename` in the locked environment, without
-affecting the broad dependencies listed in the wheel.
 
 There doesn't seem to be a way to do this whilst locking a _specific_ version of
 `packagename`. We can workaround this (crudely) as follows:
 
 ```shell
-poetry add packagename==1.2.3
-# This should update pyproject.lock.
+uv add packagename==1.2.3
+# This should update uv.lock.
 
 # Now undo the changes to pyproject.toml. For example
 # git restore pyproject.toml
 
-# Get poetry to recompute the content-hash of pyproject.toml without changing
+# Get uv to recompute the content-hash of pyproject.toml without changing
 # the locked package versions.
-poetry lock
+uv lock
 ```
 
-Either way, include the updated `poetry.lock` file in your commit.
+Either way, include the updated `uv.lock` file in your commit.
 
 ## ...export a `requirements.txt` file?
 
 ```shell
-poetry export --extras all
+uv export --all-extras --output-file requirements.txt
 ```
 
-Be wary of bugs in `poetry export` and `pip install -r requirements.txt`.
+Be wary of bugs in `pip install -r requirements.txt`.
 
 ## ...build a test wheel?
 
 I usually use
 
 ```shell
-poetry run pip install build && poetry run python -m build
+uv pip install build && uv run python -m build
 ```
 
 because [`build`](https://github.com/pypa/build) is a standardish tool which
-doesn't require poetry. (It's what we use in CI too). However, you could try
-`poetry build` too.
+doesn't require our package manager. (It's what we use in CI too). However, you could try
+`uv build` too.
 
 ## ...handle a Dependabot pull request?
 
-Synapse uses Dependabot to keep the `poetry.lock` and `Cargo.lock` file 
+Synapse uses Dependabot to keep the `uv.lock` and `Cargo.lock` files
 up-to-date with the latest releases of our dependencies. The changelog check is
 omitted for Dependabot PRs; the release script will include them in the 
 changelog.
@@ -296,20 +225,14 @@ should be safe to merge if linting passes.
 
 # Troubleshooting
 
-## Check the version of poetry with `poetry --version`.
+## Check the version of uv with `uv --version`.
 
-The minimum version of poetry supported by Synapse is 1.3.2.
+The minimum version of uv supported by Synapse is 0.5.x.
 
-It can also be useful to check the version of `poetry-core` in use. If you've
-installed `poetry` with `pipx`, try `pipx runpip poetry list | grep
-poetry-core`.
+## Clear caches: `uv cache clean`.
 
-## Clear caches: `poetry cache clear --all pypi`.
-
-Poetry caches a bunch of information about packages that isn't readily available
-from PyPI. (This is what makes poetry seem slow when doing the first
-`poetry install`.) Try `poetry cache list` and `poetry cache clear --all
-<name of cache>` to see if that fixes things.
+uv caches a bunch of information about packages that isn't readily available
+from PyPI. Try `uv cache clean` to see if that fixes things.
 
 ## Remove outdated egg-info
 
@@ -317,10 +240,10 @@ Delete the `matrix_synapse.egg-info/` directory from the root of your Synapse
 install.
 
 This stores some cached information about dependencies and often conflicts with
-letting Poetry do the right thing.
+letting uv do the right thing.
 
 
 
 ## Try `--verbose` or `--dry-run` arguments.
 
-Sometimes useful to see what poetry's internal logic is.
+Sometimes useful to see what uv's internal logic is.

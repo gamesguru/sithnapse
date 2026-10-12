@@ -348,6 +348,15 @@ class CacheInvalidationWorkerStore(SQLBaseStore):
 
         data = row.data
 
+        logger.info(
+            "[replication-trace] worker=%s events-cache mutation token=%s row_type=%s room_id=%s event_id=%s",
+            self._instance_name,
+            token,
+            row.type,
+            getattr(data, "room_id", None),
+            getattr(data, "event_id", None),
+        )
+
         if row.type == EventsStreamEventRow.TypeId:
             assert isinstance(data, EventsStreamEventRow)
             self._invalidate_caches_for_event(
@@ -554,7 +563,7 @@ class CacheInvalidationWorkerStore(SQLBaseStore):
         self._attempt_to_invalidate_cache("get_room_type", (room_id,))
         self._attempt_to_invalidate_cache("get_room_encryption", (room_id,))
 
-        self._attempt_to_invalidate_cache("_get_state_group_for_event", None)
+        self._attempt_to_invalidate_cache("_get_state_group_for_event_sql", None)
 
         self._attempt_to_invalidate_cache("get_event_ordering", None)
         self._attempt_to_invalidate_cache("get_metadata_for_event", (room_id,))

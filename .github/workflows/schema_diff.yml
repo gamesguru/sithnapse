@@ -63,11 +63,15 @@ jobs:
       - name: Install PostgreSQL client and faketime
         run: sudo apt-get -qq install postgresql-client faketime
 
-      - uses: matrix-org/setup-python-poetry@5bbf6603c5c930615ec8a29f1b5d7d258d905aa4 # v2.0.0
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v7.0.0
         with:
-          poetry-version: "2.4.1"
-          extras: "postgres"
           python-version: "3.x"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+
+      - name: Install dependencies
+        run: uv sync --extra postgres --locked
 
       - name: Wait for Postgres to be up
         run: |
@@ -80,7 +84,7 @@ jobs:
           PGUSER: postgres
           PGPASSWORD: postgres
         run: |
-          poetry run python .ci/scripts/schema_diff.py \
+          uv run python .ci/scripts/schema_diff.py \
             --base origin/develop \
             > "${{ runner.temp }}/schema_diff.md"
 

@@ -53,7 +53,7 @@ use std::{cell::RefCell, future::Future};
 
 use log::{debug, error, log_enabled, Level};
 use pyo3::call::PyCallArgs;
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyGeneratorExit, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyString, PyTuple};
 use pyo3::{intern, PyTraverseError, PyVisit};
@@ -519,7 +519,7 @@ impl LoggingContext {
     /// exceptions).
     fn __exit__(
         slf: Bound<'_, Self>,
-        _exc_type: Bound<'_, PyAny>,
+        exc_type: Bound<'_, PyAny>,
         _exc_value: Bound<'_, PyAny>,
         _traceback: Bound<'_, PyAny>,
     ) -> PyResult<()> {
@@ -550,6 +550,15 @@ impl LoggingContext {
 
         let restored_self = current.as_ref().is_some_and(|c| c.bind(py).is(&slf));
         if !restored_self {
+            // The generator is being unwound (GeneratorExit); the context is
+            // not recoverable, but the caller is done with it either way -- mark
+            // it finished instead of leaving it permanently active.
+            if !exc_type.is_none()
+                && std::ptr::eq(exc_type.as_ptr(), py.get_type::<PyGeneratorExit>().as_ptr())
+            {
+                slf.borrow_mut().finished = true;
+                return Ok(());
+            }
             // Error path: the name string is only built for the message.
             let name = slf.borrow().name_string(py);
             match &current {

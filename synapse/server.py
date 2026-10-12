@@ -438,8 +438,6 @@ class HomeServer(metaclass=abc.ABCMeta):
         object in the garbage collector.
         """
 
-        self._is_shutdown = True
-
         logger.info(
             "Received shutdown request for %s (%s).",
             self.hostname,
@@ -511,21 +509,50 @@ class HomeServer(metaclass=abc.ABCMeta):
             except Exception:
                 pass
 
+        shutdown_handler_deferreds: list[defer.Deferred[Any | None]] = []
+
         for shutdown_handler in self._async_shutdown_handlers:
             try:
                 self.get_reactor().removeSystemEventTrigger(shutdown_handler.trigger_id)
-                defer.ensureDeferred(shutdown_handler.func(**shutdown_handler.kwargs))
-            except Exception as e:
-                logger.error("Error calling shutdown async handler: %s", e)
+            except NotImplementedError:
+                # The in-memory reactor used by unit tests does not implement
+                # trigger removal. The test cleanup clears its trigger list.
+                pass
+            except Exception:
+                logger.exception("Error removing shutdown async handler")
+
+            try:
+                d = defer.ensureDeferred(
+                    shutdown_handler.func(**shutdown_handler.kwargs)
+                )
+                shutdown_handler_deferreds.append(d)
+            except Exception:
+                logger.exception("Error starting shutdown async handler")
         self._async_shutdown_handlers.clear()
 
         for shutdown_handler in self._sync_shutdown_handlers:
             try:
                 self.get_reactor().removeSystemEventTrigger(shutdown_handler.trigger_id)
+            except NotImplementedError:
+                # See the corresponding async-handler case above.
+                pass
+            except Exception:
+                logger.exception("Error removing shutdown sync handler")
+
+            try:
                 shutdown_handler.func(**shutdown_handler.kwargs)
-            except Exception as e:
-                logger.error("Error calling shutdown sync handler: %s", e)
+            except Exception:
+                logger.exception("Error calling shutdown sync handler")
         self._sync_shutdown_handlers.clear()
+
+        # Registered shutdown handlers commonly use @wrap_as_background_process,
+        # which adds their Deferreds to _background_processes. Exclude those
+        # shutdown-handler Deferreds from the normal cancellation loop so their
+        # teardown work can complete, then prevent any new normal background work.
+        for d in shutdown_handler_deferreds:
+            self._background_processes.discard(d)
+
+        self._is_shutdown = True
 
         self.get_clock().shutdown()
 
@@ -636,7 +663,103 @@ class HomeServer(metaclass=abc.ABCMeta):
     def setup(self) -> None:
         logger.info("Setting up.")
         self.start_time = int(self.get_clock().time())
+
+        timings_path = self.config.database.setup_timings_path
+        if timings_path:
+            import json
+            import os
+            import sys
+            import threading
+            import time
+            from collections import defaultdict
+
+            from synapse.storage.databases import set_pg_timing_callback
+
+            _timings: dict[str, float] = defaultdict(float)
+            _counts: dict[str, int] = defaultdict(int)
+            _lock = threading.Lock()
+
+            def _record(tag: str, elapsed: float) -> None:
+                with _lock:
+                    _timings[tag] += elapsed
+                    _counts[tag] += 1
+
+            set_pg_timing_callback(_record)
+            _t0 = time.monotonic()
+
         self.datastores = Databases(self.DATASTORE_CLASS, self)
+
+        if timings_path:
+            set_pg_timing_callback(None)
+            _elapsed = time.monotonic() - _t0
+            _record("databases_init_total", _elapsed)
+
+            # Print a human-readable report to stderr using the same header
+            # that complement.sh's awk log-watcher already scans for.  This
+            # is the only output that survives in Complement: the container is
+            # destroyed before any file written inside it can be retrieved.
+            # The JSON path below is a bonus for non-Complement scripted use.
+            _tags_ordered = (
+                "create_engine",
+                "make_conn",
+                "check_database",
+                "prepare_database",
+                "database_pool_init",
+                "main_store_init",
+                "persist_events_store_init",
+                "state_deletion_store_init",
+                "state_store_init",
+                "databases_init_commit",
+                "databases_init_total",
+            )
+            _w = sys.stderr.write
+            _w(
+                "\n=== Postgres test-DB lifecycle timings (strategy: production) ===\n\n"
+            )
+            _w(f"  {'server_name':44s}  {self.hostname}\n")
+            _w("\n")
+            _w(f"  {'tag':44s}  {'total':>10s}  {'calls':>6s}  {'avg':>12s}\n")
+            _sub = 0.0
+            for _tag in _tags_ordered:
+                if _tag not in _timings:
+                    continue
+                _ts = _timings[_tag]
+                _tc = _counts[_tag]
+                _sub += _ts if _tag != "databases_init_total" else 0.0
+                _w(
+                    f"  {_tag:44s}  {_ts * 1000:8.1f}ms  {_tc:6d}"
+                    f"  {(_ts / _tc) * 1000:10.3f}ms\n"
+                )
+            # Any tags not in the ordered list (future additions)
+            for _tag in sorted(_timings):
+                if _tag not in _tags_ordered:
+                    _ts = _timings[_tag]
+                    _tc = _counts[_tag]
+                    _w(
+                        f"  {_tag:44s}  {_ts * 1000:8.1f}ms  {_tc:6d}"
+                        f"  {(_ts / _tc) * 1000:10.3f}ms\n"
+                    )
+            _w("==========================================\n\n")
+            sys.stderr.flush()
+
+            # Optionally also write JSON for scripted / non-Complement use.
+            if timings_path != "-":
+                payload = {
+                    "timings": dict(_timings),
+                    "counts": dict(_counts),
+                    "server_name": self.hostname,
+                }
+                _tmp = timings_path + ".tmp"
+                try:
+                    with open(_tmp, "w", encoding="utf-8") as _f:
+                        json.dump(payload, _f)
+                    os.replace(_tmp, timings_path)
+                    logger.info("Database setup timings written to %s", timings_path)
+                except OSError:
+                    logger.warning(
+                        "Failed to write database setup timings to %s", timings_path
+                    )
+
         logger.info("Finished setting up.")
 
     # def __del__(self) -> None:

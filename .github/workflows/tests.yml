@@ -13,6 +13,7 @@ concurrency:
 
 env:
   RUST_VERSION: 1.87.0
+  UV_HTTP_RETRIES: 5
   # This nightly is roughly the last to be branded 1.87.0.
   #
   # We know this, as 1.87.0 was branched from master on 2025-03-28. Shortly
@@ -58,7 +59,7 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'pyproject.toml'
-              - 'poetry.lock'
+              - 'uv.lock'
               - '.github/workflows/tests.yml'
 
             integration:
@@ -68,7 +69,7 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'pyproject.toml'
-              - 'poetry.lock'
+              - 'uv.lock'
               - 'docker/**'
               - '.ci/**'
               - '.github/workflows/tests.yml'
@@ -87,7 +88,7 @@ jobs:
               - '.ci/**'
               - 'mypy.ini'
               - 'pyproject.toml'
-              - 'poetry.lock'
+              - 'uv.lock'
               - '.github/workflows/tests.yml'
 
             golangci:
@@ -112,13 +113,25 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - uses: matrix-org/setup-python-poetry@5bbf6603c5c930615ec8a29f1b5d7d258d905aa4 # v2.0.0
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
-          python-version: "3.x"
-          poetry-version: "2.4.1"
-          extras: "all"
-      - run: poetry run scripts-dev/generate_sample_config.sh --check
-      - run: poetry run scripts-dev/config-lint.sh
+          python-version: "3.12"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          version: "0.5.31"
+          enable-cache: true
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          for i in 1 2 3 4 5; do
+            uv sync --all-extras --locked && break
+            echo "uv sync failed. Retrying ($i/5)..."
+            sleep 2
+            if [ $i -eq 5 ]; then exit 1; fi
+          done
+      - run: uv run scripts-dev/generate_sample_config.sh --check
+      - run: uv run scripts-dev/config-lint.sh
 
   check-schema-delta:
     runs-on: ubuntu-latest
@@ -151,17 +164,21 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Setup Poetry
-        uses: matrix-org/setup-python-poetry@5bbf6603c5c930615ec8a29f1b5d7d258d905aa4 # v2.0.0
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
-          poetry-version: "2.4.1"
-          install-project: "false"
+          python-version: "3.12"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          version: "0.5.31"
+          enable-cache: true
+          python-version: "3.12"
 
       - name: Run ruff check
-        run: poetry run ruff check --output-format=github .
+        run: uv run ruff check --output-format=github .
 
       - name: Run ruff format
-        run: poetry run ruff format --check .
+        run: uv run ruff format --check .
 
   lint-mypy:
     runs-on: ubuntu-latest
@@ -179,17 +196,24 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      - name: Setup Poetry
-        uses: matrix-org/setup-python-poetry@5bbf6603c5c930615ec8a29f1b5d7d258d905aa4 # v2.0.0
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
-          # We want to make use of type hints in optional dependencies too.
-          extras: all
-          # We have seen odd mypy failures that were resolved when we started
-          # installing the project again:
-          # https://github.com/matrix-org/synapse/pull/15376#issuecomment-1498983775
-          # To make CI green, err towards caution and install the project.
-          install-project: "true"
-          poetry-version: "2.4.1"
+          python-version: "3.12"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          version: "0.5.31"
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          for i in 1 2 3 4 5; do
+            uv sync --all-extras --locked && break
+            echo "uv sync failed. Retrying ($i/5)..."
+            sleep 2
+            if [ $i -eq 5 ]; then exit 1; fi
+          done
 
       # Cribbed from
       # https://github.com/AustinScola/mypy-cache-github-action/blob/85ea4f2972abed39b33bd02c36e341b28ca59213/src/restore.ts#L10-L17
@@ -202,7 +226,7 @@ jobs:
           restore-keys: mypy-cache-
 
       - name: Run mypy
-        run: poetry run mypy
+        run: uv run mypy
 
   lint-crlf:
     runs-on: ubuntu-latest
@@ -243,7 +267,7 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      - run: cargo clippy -- -D warnings
+      - run: cargo clippy --locked -- -D warnings
 
   # We also lint against a nightly rustc so that we can lint the benchmark
   # suite, which requires a nightly compiler.
@@ -262,7 +286,11 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      - run: cargo clippy --all-features -- -D warnings
+      - run: cargo clippy --locked --all-features -- -D warnings
+        env:
+          # See the note on this in `cargo-bench` below: explicitly pin this
+          # step so it can never silently run on stable.
+          RUSTUP_TOOLCHAIN: ${{ env.RUST_NIGHTLY_VERSION }}
 
   lint-rust:
     runs-on: ubuntu-latest
@@ -279,13 +307,24 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      - name: Setup Poetry
-        uses: matrix-org/setup-python-poetry@5bbf6603c5c930615ec8a29f1b5d7d258d905aa4 # v2.0.0
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
-          # Install like a normal project from source with all optional dependencies
-          extras: all
-          install-project: "true"
-          poetry-version: "2.4.1"
+          python-version: "3.12"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          version: "0.5.31"
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          for i in 1 2 3 4 5; do
+            uv sync --all-extras --locked && break
+            echo "uv sync failed. Retrying ($i/5)..."
+            sleep 2
+            if [ $i -eq 5 ]; then exit 1; fi
+          done
 
       - name: Ensure `Cargo.lock` is up to date (no stray changes after install)
         # The `::error::` syntax is using GitHub Actions' error annotations, see
@@ -294,7 +333,7 @@ jobs:
           if git diff --quiet Cargo.lock; then
             echo "Cargo.lock is up to date"
           else
-            echo "::error::Cargo.lock has uncommitted changes after install. Please run 'poetry install --extras all' and commit the Cargo.lock changes."
+            echo "::error::Cargo.lock has uncommitted changes after install. Please run 'uv sync --all-extras' and commit the Cargo.lock changes."
             git diff --exit-code Cargo.lock
             exit 1
           fi
@@ -319,6 +358,11 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - run: cargo fmt --check
+        env:
+          # See the note on this in `cargo-bench` below: stable rustfmt only
+          # warns about the nightly-only options in `.rustfmt.toml`, so
+          # without this the job passes while linting nothing useful.
+          RUSTUP_TOOLCHAIN: ${{ env.RUST_NIGHTLY_VERSION }}
 
   lint-golangci:
     runs-on: ubuntu-latest
@@ -361,7 +405,6 @@ jobs:
       - lint-newsfile
       - check-sampleconfig
       - check-schema-delta
-      - check-lockfile
       - lint-clippy
       - lint-clippy-nightly
       - lint-rust
@@ -434,21 +477,112 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      - uses: matrix-org/setup-python-poetry@5bbf6603c5c930615ec8a29f1b5d7d258d905aa4 # v2.0.0
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
+          python-version: ${{ matrix.job.python-version || '3.12' }}
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          version: "0.5.31"
+          enable-cache: true
           python-version: ${{ matrix.job.python-version }}
-          poetry-version: "2.4.1"
-          extras: ${{ matrix.job.extras }}
+      - name: Install dependencies
+        run: |
+          for i in 1 2 3 4 5; do
+            if [ "${{ matrix.job.extras }}" = "postgres" ]; then
+              uv sync --extra postgres --locked && break
+            elif [ "${{ matrix.job.extras }}" = "" ]; then
+              uv sync --locked && break
+            else
+              uv sync --all-extras --locked && break
+            fi
+            echo "uv sync failed. Retrying ($i/5)..."
+            sleep 2
+            if [ $i -eq 5 ]; then exit 1; fi
+          done
       - name: Await PostgreSQL
         if: ${{ matrix.job.postgres-version }}
         timeout-minutes: 2
         run: until pg_isready -h localhost; do sleep 1; done
-      - run: poetry run trial --jobs=6 tests
+      - run: uv run trial --jobs="$(nproc)" tests
         env:
           SYNAPSE_POSTGRES: ${{ matrix.job.database == 'postgres' || '' }}
           SYNAPSE_POSTGRES_HOST: /var/run/postgresql
           SYNAPSE_POSTGRES_USER: postgres
           SYNAPSE_POSTGRES_PASSWORD: postgres
+          SYNAPSE_TEST_EMBEDDED_DB_ENGINE: ${{ matrix.job.database == 'mtxdb' && 'mtxdb' || '' }}
+          SYNAPSE_TEST_EMBEDDED_DB_PATH: ${{ matrix.job.database == 'mtxdb' && '/tmp/synapse-embedded-db' || '' }}
+      - name: Dump PostgreSQL statistics
+        if: ${{ always() && matrix.job.database == 'postgres' }}
+        run: .ci/scripts/dump_postgres_stats.sh /tmp/postgres-stats.txt || true
+        env:
+          SYNAPSE_POSTGRES_HOST: /var/run/postgresql
+          SYNAPSE_POSTGRES_USER: postgres
+          SYNAPSE_POSTGRES_PASSWORD: postgres
+      - name: Upload PostgreSQL statistics
+        if: ${{ always() && matrix.job.database == 'postgres' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Trial PostgreSQL stats - (${{ join(matrix.job.*, ', ') }})
+          path: /tmp/postgres-stats.txt
+          if-no-files-found: warn
+      - name: Dump logs
+        # Logs are most useful when the command fails, always include them.
+        if: ${{ always() }}
+        # Note: Dumps to workflow logs instead of using actions/upload-artifact
+        #       This keeps logs colocated with failing jobs
+        #       It also ignores find's exit code; this is a best effort affair
+        run: >-
+          find _trial_temp -name '*.log'
+          -exec echo "::group::{}" \;
+          -exec cat {} \;
+          -exec echo "::endgroup::" \;
+          || true
+
+  trial-mtxdb:
+    # Runs the trial suite with the embedded mtxdb engine for HAMT state
+    # storage (see embedded_db_engine in synapse/config/database.py), so
+    # tests that exercise it -- e.g.
+    # test_state_group_hamt_corruption_does_not_fallback_to_sql in
+    # tests/storage/test_state.py -- actually run against mtxdb rather than
+    # the SQL fallback. Sqlite only; mtxdb is the variable under test here,
+    # not the SQL backend. Replaces the old trial-tikv job now that TiKV has
+    # been removed.
+    if: ${{ !cancelled() && !failure() && needs.changes.outputs.trial == 'true' }} # Allow previous steps to be skipped, but not fail
+    needs:
+      - linting-done
+      - changes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.12"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          version: "0.5.31"
+          enable-cache: true
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          for i in 1 2 3 4 5; do
+            uv sync --all-extras --locked && break
+            echo "uv sync failed. Retrying ($i/5)..."
+            sleep 2
+            if [ $i -eq 5 ]; then exit 1; fi
+          done
+      - run: uv run trial --jobs="$(nproc)" tests
+        env:
+          SYNAPSE_TEST_EMBEDDED_DB_ENGINE: mtxdb
+          SYNAPSE_TEST_EMBEDDED_DB_PATH: /tmp/synapse-embedded-db
       - name: Dump logs
         # Logs are most useful when the command fails, always include them.
         if: ${{ always() }}
@@ -505,7 +639,7 @@ jobs:
       # Sanity check we can import/run Synapse
       - run: python -m synapse.app.homeserver --help
 
-      - run: python -m twisted.trial -j6 tests
+      - run: python -m twisted.trial -j"$(nproc)" tests
       - name: Dump logs
         # Logs are most useful when the command fails, always include them.
         if: ${{ always() }}
@@ -536,12 +670,24 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Install libs necessary for PyPy to build binary wheels for dependencies
       - run: sudo apt-get -qq install xmlsec1 libxml2-dev libxslt-dev
-      - uses: matrix-org/setup-python-poetry@5bbf6603c5c930615ec8a29f1b5d7d258d905aa4 # v2.0.0
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
           python-version: ${{ matrix.python-version }}
-          poetry-version: "2.4.1"
-          extras: ${{ matrix.extras }}
-      - run: poetry run trial --jobs=2 tests
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          version: "0.5.31"
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: |
+          for i in 1 2 3 4 5; do
+            uv sync --all-extras --locked && break
+            echo "uv sync failed. Retrying ($i/5)..."
+            sleep 2
+            if [ $i -eq 5 ]; then exit 1; fi
+          done
+      - run: uv run trial --jobs="$(nproc)" tests
       - name: Dump logs
         # Logs are most useful when the command fails, always include them.
         if: ${{ always() }}
@@ -569,12 +715,15 @@ jobs:
         # If this is a pull request to a release branch, use that branch as default branch for sytest, else use develop
         # This works because the release script always create a branch on the sytest repo with the same name as the release branch
         SYTEST_DEFAULT_BRANCH: ${{ startsWith(github.base_ref, 'release-') && github.base_ref || 'develop' }}
-        SYTEST_BRANCH: ${{ github.head_ref }}
+        # Use the pinned SyTest revision from sytest-wrapper.sh. A branch-specific
+        # SyTest checkout can contain fixtures which lag the room versions
+        # supported by this Synapse checkout.
         POSTGRES: ${{ matrix.job.postgres && 1}}
         MULTI_POSTGRES: ${{ (matrix.job.postgres == 'multi-postgres') || '' }}
         ASYNCIO_REACTOR: ${{ (matrix.job.reactor == 'asyncio') || '' }}
         WORKERS: ${{ matrix.job.workers && 1 }}
         BLACKLIST: ${{ matrix.job.workers && 'synapse-blacklist-with-workers' }}
+        SYNAPSE_EMBEDDED_DB_ENGINE: ${{ matrix.job.embedded_db && 'mtxdb' }}
         TOP: ${{ github.workspace }}
 
     strategy:
@@ -593,9 +742,35 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      - name: Run SyTest
-        run: /bootstrap.sh synapse
+      - name: Install clang (for mtxdb-sys bindgen)
+        run: |
+          apt-get update
+          apt-get install -y clang libclang-dev pkg-config libzstd-dev
+
+      - name: Install dependencies using uv
+        run: |
+          /venv/bin/pip install uv
+          ln -s -T /venv /src/.venv
+          /venv/bin/uv sync --all-extras --locked
         working-directory: /src
+
+      - name: Run SyTest
+        run: .github/workflows/sytest-wrapper.sh frozen
+        working-directory: /src
+      - name: Dump PostgreSQL statistics
+        if: ${{ always() && matrix.job.postgres }}
+        run: .ci/scripts/dump_postgres_stats.sh /tmp/postgres-stats.txt
+        working-directory: /src
+        env:
+          SYNAPSE_POSTGRES_HOST: /var/run/postgresql
+          SYNAPSE_POSTGRES_USER: postgres
+      - name: Upload PostgreSQL statistics
+        if: ${{ always() && matrix.job.postgres }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Sytest PostgreSQL stats - (${{ join(matrix.job.*, ', ') }})
+          path: /tmp/postgres-stats.txt
+          if-no-files-found: warn
       - name: Summarise results.tap
         if: ${{ always() }}
         run: /sytest/scripts/tap_to_gha.pl /logs/results.tap
@@ -632,10 +807,23 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: sudo apt-get -qq install xmlsec1 postgresql-client
-      - uses: matrix-org/setup-python-poetry@5bbf6603c5c930615ec8a29f1b5d7d258d905aa4 # v2.0.0
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
-          poetry-version: "2.4.1"
-          extras: "postgres"
+          python-version: ${{ matrix.job.python-version || '3.12' }}
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          version: "0.5.31"
+          enable-cache: true
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          for i in 1 2 3 4 5; do
+            uv sync --extra postgres --locked && break
+            echo "uv sync failed. Retrying ($i/5)..."
+            sleep 2
+            if [ $i -eq 5 ]; then exit 1; fi
+          done
       - run: .ci/scripts/test_export_data_command.sh
         env:
           PGHOST: localhost
@@ -655,7 +843,7 @@ jobs:
           - python-version: "3.10"
             postgres-version: "14"
 
-          - python-version: "3.14"
+          - python-version: "3.13"
             postgres-version: "17"
 
     services:
@@ -684,11 +872,23 @@ jobs:
           wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
           sudo apt-get update
       - run: sudo apt-get -qq install xmlsec1 postgresql-client
-      - uses: matrix-org/setup-python-poetry@5bbf6603c5c930615ec8a29f1b5d7d258d905aa4 # v2.0.0
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
           python-version: ${{ matrix.python-version }}
-          poetry-version: "2.4.1"
-          extras: "postgres"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          version: "0.5.31"
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: |
+          for i in 1 2 3 4 5; do
+            uv sync --extra postgres --locked && break
+            echo "uv sync failed. Retrying ($i/5)..."
+            sleep 2
+            if [ $i -eq 5 ]; then exit 1; fi
+          done
       - run: .ci/scripts/test_synapse_port_db.sh
         id: run_tester_script
         env:
@@ -734,7 +934,7 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      - run: cargo test
+      - run: cargo test --locked
 
   # We want to ensure that the cargo benchmarks still compile, which requires a
   # nightly compiler.
@@ -755,13 +955,21 @@ jobs:
           toolchain: ${{ env.RUST_NIGHTLY_VERSION }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      - run: cargo bench --no-run
+      # RUSTUP_TOOLCHAIN outranks both `rustup default` and any toolchain
+      # file, so pinning it here guarantees this step compiles the
+      # `#![feature(test)]` benches on the nightly (running them on stable
+      # dies with E0554). Set it on any step that must actually run on the
+      # nightly.
+      - run: cargo bench --locked --no-run
+        env:
+          RUSTUP_TOOLCHAIN: ${{ env.RUST_NIGHTLY_VERSION }}
 
   # a job which marks all the other jobs as complete, thus allowing PRs to be merged.
   tests-done:
     if: ${{ always() }}
     needs:
       - trial
+      - trial-mtxdb
       - trial-olddeps
       - sytest
       - export-data
@@ -780,6 +988,7 @@ jobs:
           # The newsfile lint may be skipped on non PR builds.
           skippable: |
             trial
+            trial-mtxdb
             trial-olddeps
             sytest
             portdb

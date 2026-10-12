@@ -14,6 +14,7 @@ package synapse_tests
 
 import (
 	"net/http"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -42,17 +43,28 @@ func TestSynapseVersion(t *testing.T) {
 	// loudly and point out what's wrong instead of silently letting your PRs pass
 	// without actually being tested.
 	t.Run("Synapse version matches current git checkout", func(t *testing.T) {
-		// Get the Synapse version details of the current git checkout
-		checkoutSynapseVersion := runCommand(
-			t,
-			[]string{
-				"poetry",
-				"run",
-				"python",
-				"-c",
-				"from synapse.util import SYNAPSE_VERSION; print(SYNAPSE_VERSION)",
-			},
-		)
+		// Get the Synapse version details of the current git checkout.
+		//
+		// `complement.sh` already computes this (to pass as a Docker build arg) and
+		// exports it as `SYNAPSE_VERSION_STRING`, so prefer that here -- it avoids
+		// shelling out to `uv run python -c '...'`, which (absent a prior `uv sync`)
+		// would trigger an expensive from-scratch venv build (compiling the Rust
+		// extension, installing ~109 packages) purely to import `synapse.util` and
+		// print a version string. Fall back to the `uv run` invocation for anyone
+		// running this test directly, outside of `complement.sh`.
+		checkoutSynapseVersion := os.Getenv("SYNAPSE_VERSION_STRING")
+		if checkoutSynapseVersion == "" {
+			checkoutSynapseVersion = runCommand(
+				t,
+				[]string{
+					"uv",
+					"run",
+					"python",
+					"-c",
+					"from synapse.util import SYNAPSE_VERSION; print(SYNAPSE_VERSION)",
+				},
+			)
+		}
 
 		// Find the version details of the Synapse instance deployed from the Docker image
 		res := unauthedClient.MustDo(t, "GET", []string{"_matrix", "federation", "v1", "version"})

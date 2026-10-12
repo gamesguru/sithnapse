@@ -12,6 +12,10 @@
 #
 # See the GNU Affero General Public License for more details:
 # <https://www.gnu.org/licenses/agpl-3.0.html>.
+
+# joserfc exposes this registry through a private module which is not present
+# in every type-checking environment.
+# mypy: disable-error-code=import-not-found
 #
 # Originally licensed under the Apache License, Version 2.0:
 # <http://www.apache.org/licenses/LICENSE-2.0>.
@@ -42,6 +46,25 @@ from authlib.oauth2.rfc6749.parameters import prepare_grant_uri
 from authlib.oauth2.rfc7636.challenge import create_s256_code_challenge
 from authlib.oidc.core import CodeIDToken, UserInfo
 from authlib.oidc.discovery import OpenIDProviderMetadata, get_well_known_url
+
+try:
+    from joserfc._rfc7519.claims import (
+        InvalidClaimError,
+        JWTClaimsRegistry,
+    )
+
+    class _SynapseJWTClaimsRegistry(JWTClaimsRegistry):  # type: ignore[misc, unused-ignore]
+        def validate_sub(self, value: Any) -> None:
+            if isinstance(value, bool) or not isinstance(value, (str, int)):
+                raise InvalidClaimError(
+                    "sub", "Claim 'sub' must be a StringOrURI value"
+                )
+            self.check_value("sub", str(value) if isinstance(value, int) else value)
+
+    class _SynapseCodeIDToken(CodeIDToken):  # type: ignore[misc]
+        registry_cls = _SynapseJWTClaimsRegistry
+except ImportError:
+    _SynapseCodeIDToken = CodeIDToken  # type: ignore[misc]
 from jinja2 import Environment, Template
 from pymacaroons.exceptions import (
     MacaroonDeserializationException,
@@ -1051,7 +1074,7 @@ class OidcProvider:
         claims = await self._verify_jwt(
             alg_values=alg_values,
             token=id_token,
-            claims_cls=CodeIDToken,
+            claims_cls=_SynapseCodeIDToken,
             claims_options=claims_options,
             claims_params=claims_params,
         )

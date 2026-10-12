@@ -342,6 +342,24 @@ class GetEventsTestCase(unittest.HomeserverTestCase):
         self.assertIncludes(fetched_event_map.keys(), event_ids, exact=True)
 
 
+class EventFetchPoolSizeTestCase(unittest.HomeserverTestCase):
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
+        self.store = hs.get_datastores().main
+
+    def _with_pool_max(self, max_threads: int) -> bool:
+        with mock.patch.object(self.store.db_pool._db_pool, "max", max_threads):
+            return self.store._event_fetch_pool_is_small()
+
+    def test_pool_no_larger_than_fetch_threads_is_small(self) -> None:
+        """Idle fetch loops must give up their DB thread when the pool has none
+        to spare (Complement workers use `cp_max: 3`)."""
+        self.assertTrue(self._with_pool_max(EVENT_QUEUE_THREADS))
+        self.assertTrue(self._with_pool_max(1))
+
+    def test_larger_pool_is_not_small(self) -> None:
+        self.assertFalse(self._with_pool_max(EVENT_QUEUE_THREADS + 1))
+
+
 class DatabaseOutageTestCase(unittest.HomeserverTestCase):
     """Test event fetching during a database outage."""
 

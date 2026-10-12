@@ -21,6 +21,8 @@
 import datetime
 import itertools
 import logging
+import time
+from collections import OrderedDict
 from queue import Empty, PriorityQueue
 from typing import (
     TYPE_CHECKING,
@@ -50,6 +52,7 @@ from synapse.storage.database import (
     LoggingTransaction,
 )
 from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
+from synapse.storage.databases.main.embedded_common import ffi_count, ffi_timing
 from synapse.storage.databases.main.events_worker import EventsWorkerStore
 from synapse.storage.databases.main.signatures import SignatureWorkerStore
 from synapse.storage.engines import PostgresEngine, Sqlite3Engine
@@ -138,6 +141,55 @@ class _NoChainCoverIndex(Exception):
         super().__init__("Unexpectedly no chain cover for events in %s" % (room_id,))
 
 
+# Rooms for which the embedded auth-graph incomplete warning has already been
+# logged.  Populated lazily; lives at module level so every store instance
+# shares the dedup cache for the process lifetime.  Prevents unbounded memory
+# growth while rate-limiting repeated warnings for the same room (10m TTL, max 10k rooms).
+class _WarnedIncompleteAuthGraphCache:
+    def __init__(self, max_size: int = 10_000, ttl_seconds: float = 600.0) -> None:
+        self._max_size = max_size
+        self._ttl_seconds = ttl_seconds
+        self._entries: OrderedDict[str, float] = OrderedDict()
+
+    def should_warn(self, room_id: str) -> bool:
+        now = time.monotonic()
+        last_warned = self._entries.get(room_id)
+        if last_warned is not None and (now - last_warned) < self._ttl_seconds:
+            return False
+        self._entries[room_id] = now
+        self._entries.move_to_end(room_id)
+        while len(self._entries) > self._max_size:
+            self._entries.popitem(last=False)
+        return True
+
+    def __contains__(self, room_id: object) -> bool:
+        if not isinstance(room_id, str):
+            return False
+        last_warned = self._entries.get(room_id)
+        if last_warned is None:
+            return False
+        return (time.monotonic() - last_warned) < self._ttl_seconds
+
+    def add(self, room_id: str) -> None:
+        self._entries[room_id] = time.monotonic()
+        self._entries.move_to_end(room_id)
+        while len(self._entries) > self._max_size:
+            self._entries.popitem(last=False)
+
+
+_warned_incomplete_auth_graph = _WarnedIncompleteAuthGraphCache()
+
+
+def _auth_coverage(
+    operation: str, outcome: str, seeds: int, auth_events: int | None = None
+) -> None:
+    """Record opt-in auth-chain path coverage for the diagnostics report."""
+    ffi_count(f"auth_chain_{operation}_{outcome}_calls", 1)
+    ffi_count(f"auth_chain_{operation}_{outcome}_seeds", seeds)
+    if auth_events is not None:
+        ffi_count(f"auth_chain_{operation}_{outcome}_auth_events", auth_events)
+
+
 class EventFederationWorkerStore(
     SignatureWorkerStore, EventsWorkerStore, CacheInvalidationWorkerStore
 ):
@@ -172,6 +224,15 @@ class EventFederationWorkerStore(
         # Flag used by unit tests to disable fallback when there is no chain cover
         # index.
         self.tests_allow_no_chain_cover_index = True
+
+        # RAM-only ancestor-closure cache for the embedded (mtxdb) auth-chain
+        # path -- see embedded_event_auth_chains.py. Lives here (not module
+        # level) so each store/worker gets its own bounded LRU.
+        from synapse.storage.databases.main.embedded_event_auth_chains import (
+            ClosureCache,
+        )
+
+        self._auth_chain_closure_cache = ClosureCache()
 
         self.clock.looping_call(
             self._get_stats_for_federation_staging, Duration(seconds=30)
@@ -237,27 +298,179 @@ class EventFederationWorkerStore(
         room = await self.get_room(room_id)  # type: ignore[attr-defined]
         # If the room has an auth chain index.
         if room[1]:
+            from synapse.storage.databases.main.embedded_event_auth_chains import (
+                IncompleteAuthGraph,
+                resolve_namespace,
+            )
+
+            embedded_db_namespace = resolve_namespace(self)
+            is_embedded_writer = (
+                embedded_db_namespace is not None
+                and self.hs.get_instance_name() in self.hs.config.worker.writers.events
+            )
             try:
-                return await self.db_pool.runInteraction(
+                if is_embedded_writer:
+                    assert embedded_db_namespace is not None
+                    _auth_coverage(
+                        "get_auth_chain_ids", "embedded_attempt", len(event_ids)
+                    )
+                    try:
+                        result = await self.db_pool.runInteraction(
+                            "get_auth_chain_ids_embedded",
+                            self._get_auth_chain_ids_using_embedded_closures_txn,
+                            embedded_db_namespace,
+                            room_id,
+                            event_ids,
+                            include_given,
+                        )
+                        _auth_coverage(
+                            "get_auth_chain_ids",
+                            "embedded_complete",
+                            len(event_ids),
+                            len(result),
+                        )
+                        return result
+                    except IncompleteAuthGraph:
+                        # The embedded ramp is missing genuine data (e.g.
+                        # cold-import hasn't caught up yet).  Bypass the
+                        # chain-cover path entirely and fall through to the
+                        # legacy recursive BFS walk, which is authoritative
+                        # against raw event_auth rows.
+                        if _warned_incomplete_auth_graph.should_warn(room_id):
+                            logger.warning(
+                                "Embedded auth graph incomplete for room %s; "
+                                "falling back to legacy SQL auth-chain traversal",
+                                room_id,
+                            )
+                        result = await self.db_pool.runInteraction(
+                            "get_auth_chain_ids_legacy_fallback",
+                            self._get_auth_chain_ids_txn,
+                            event_ids,
+                            include_given,
+                        )
+                        _auth_coverage(
+                            "get_auth_chain_ids",
+                            "embedded_incomplete_sql_fallback",
+                            len(event_ids),
+                            len(result),
+                        )
+                        return result
+
+                # Non-writers (or instances without embedded DB): prefer the cover
+                # index when complete. Non-writers hold a read-only mtxdb handle and
+                # cannot safely repair missing links; if the cover index is incomplete or
+                # missing, fall back to the authoritative legacy SQL BFS walk.
+                result = await self.db_pool.runInteraction(
                     "get_auth_chain_ids_chains",
                     self._get_auth_chain_ids_using_cover_index_txn,
                     room_id,
                     event_ids,
                     include_given,
                 )
-            except _NoChainCoverIndex:
-                # For whatever reason we don't actually have a chain cover index
+                _auth_coverage(
+                    "get_auth_chain_ids",
+                    "sql_chain_cover_complete",
+                    len(event_ids),
+                    len(result),
+                )
+                return result
+            except (IncompleteAuthGraph, _NoChainCoverIndex):
+                # For whatever reason we don't actually have a complete chain cover index
                 # for the events in question, so we fall back to the old method
                 # (except in tests)
                 if not self.tests_allow_no_chain_cover_index:
                     raise
+                if _warned_incomplete_auth_graph.should_warn(room_id):
+                    logger.warning(
+                        "Cover index incomplete for room %s; "
+                        "falling back to legacy SQL auth-chain traversal",
+                        room_id,
+                    )
+                result = await self.db_pool.runInteraction(
+                    "get_auth_chain_ids_legacy_fallback",
+                    self._get_auth_chain_ids_txn,
+                    event_ids,
+                    include_given,
+                )
+                _auth_coverage(
+                    "get_auth_chain_ids",
+                    "embedded_incomplete_sql_fallback",
+                    len(event_ids),
+                    len(result),
+                )
+                return result
 
+        _auth_coverage("get_auth_chain_ids", "sql_only", len(event_ids))
         return await self.db_pool.runInteraction(
             "get_auth_chain_ids",
             self._get_auth_chain_ids_txn,
             event_ids,
             include_given,
         )
+
+    def _get_auth_chain_ids_using_embedded_closures_txn(
+        self,
+        txn: LoggingTransaction,
+        embedded_db_namespace: str,
+        room_id: str,
+        event_ids: Collection[str],
+        include_given: bool,
+    ) -> set[str]:
+        """Embedded-store equivalent of
+        `_get_auth_chain_ids_using_cover_index_txn`: union the requested
+        events' ancestor closures (short-id bitmaps), resolve back to event
+        ids, and apply `include_given` the same way the legacy method does
+        (its `chains[chain_id] = max(seq_no - 1, ...)` excludes each given
+        event's own chain position, then unions `initial_events` back in
+        only when `include_given` -- i.e. the closure is ancestors-only, and
+        `include_given` alone controls whether the starting set is added
+        back). Raises `IncompleteAuthGraph` on a genuine data gap; the
+        caller translates that to `_NoChainCoverIndex`.
+        """
+        from synapse.storage.databases.main.embedded_event_auth_chains import (
+            get_or_create_short_ids,
+            resolve_short_ids_to_event_ids,
+        )
+
+        initial_events = list(dict.fromkeys(event_ids))
+        if not initial_events:
+            return set()
+
+        logger.debug(
+            "get_auth_chain_ids: using EMBEDDED CLOSURES path for room=%s "
+            "namespace=%s initial_events=%s include_given=%s",
+            room_id,
+            embedded_db_namespace,
+            initial_events,
+            include_given,
+        )
+
+        engine_name = self._embedded_db_engine
+        short_ids = get_or_create_short_ids(
+            engine_name, embedded_db_namespace, room_id, initial_events
+        )
+
+        closures = self._auth_chain_closure_cache.get_closures_batch(
+            txn, engine_name, embedded_db_namespace, room_id, short_ids
+        )
+
+        result_short_ids: set[int] = set()
+        for short_id in short_ids:
+            result_short_ids.update(closures[short_id])
+
+        if include_given:
+            result_short_ids.update(short_ids)
+
+        if not result_short_ids:
+            return set()
+
+        resolved = resolve_short_ids_to_event_ids(
+            engine_name,
+            embedded_db_namespace,
+            room_id,
+            list(result_short_ids),
+        )
+        return {event_id for event_id in resolved if event_id is not None}
 
     def _get_auth_chain_ids_using_cover_index_txn(
         self,
@@ -267,6 +480,14 @@ class EventFederationWorkerStore(
         include_given: bool,
     ) -> set[str]:
         """Calculates the auth chain IDs using the chain index."""
+
+        logger.debug(
+            "get_auth_chain_ids: using LEGACY COVER-INDEX (chain_id/SQL) path "
+            "for room=%s event_ids=%s include_given=%s",
+            room_id,
+            list(event_ids),
+            include_given,
+        )
 
         # First we look up the chain ID/sequence numbers for the given events.
 
@@ -312,7 +533,17 @@ class EventFederationWorkerStore(
 
         # A map from chain ID to max sequence number *reachable* from any event ID.
         chains: dict[int, int] = {}
-        for links in self._get_chain_links(txn, set(event_chains.keys())):
+        from synapse.storage.databases.main.embedded_event_auth_chain_links import (
+            resolve_namespace,
+        )
+
+        embedded_db_namespace = resolve_namespace(self)
+        for links in self._get_chain_links(
+            txn,
+            set(event_chains.keys()),
+            embedded_db_namespace,
+            self._embedded_db_engine,
+        ):
             for chain_id in links:
                 if chain_id not in event_chains:
                     continue
@@ -360,11 +591,65 @@ class EventFederationWorkerStore(
                 txn.execute(sql, (chain_id, max_no))
                 results.update(r for (r,) in txn)
 
+        # Check that all direct auth events for the initial events are present in the
+        # computed auth chain. If any direct auth event is missing from the cover index,
+        # the chain cover is incomplete and we must fall back to legacy traversal.
+        # Note: when include_given is False, results does not contain initial_events,
+        # so direct auth events (and the room create event) that are already in
+        # initial_events must be accounted for via all_covered = results | initial_events.
+        clause, args = make_in_list_sql_clause(
+            txn.database_engine, "event_id", initial_events
+        )
+        txn.execute(
+            f"SELECT DISTINCT auth_id FROM event_auth WHERE {clause}",
+            args,
+        )
+        direct_auth_ids = {auth_id for (auth_id,) in txn}
+        all_covered = results | initial_events
+        missing_direct_auth = direct_auth_ids.difference(all_covered)
+        if missing_direct_auth:
+            from synapse.storage.databases.main.embedded_event_auth_chains import (
+                IncompleteAuthGraph,
+            )
+
+            logger.warning(
+                "Cover index auth chain incomplete for room %s: missing direct auth events %s",
+                room_id,
+                missing_direct_auth,
+            )
+            raise IncompleteAuthGraph(
+                f"Missing direct auth events in cover index: {missing_direct_auth}"
+            )
+
+        if direct_auth_ids:
+            txn.execute(
+                "SELECT event_id FROM events WHERE room_id = ? AND type = 'm.room.create' LIMIT 1",
+                (room_id,),
+            )
+            create_row = txn.fetchone()
+            if create_row and create_row[0] not in all_covered:
+                from synapse.storage.databases.main.embedded_event_auth_chains import (
+                    IncompleteAuthGraph,
+                )
+
+                logger.warning(
+                    "Cover index auth chain incomplete for room %s: room create event %s missing",
+                    room_id,
+                    create_row[0],
+                )
+                raise IncompleteAuthGraph(
+                    f"Room create event {create_row[0]} missing from cover index results"
+                )
+
         return results
 
     @classmethod
     def _get_chain_links(
-        cls, txn: LoggingTransaction, chains_to_fetch: set[int]
+        cls,
+        txn: LoggingTransaction,
+        chains_to_fetch: set[int],
+        embedded_db_namespace: str | None,
+        embedded_db_engine: str | None,
     ) -> Generator[dict[int, list[tuple[int, int, int]]], None, None]:
         """Fetch all auth chain links from the given set of chains, and all
         links from those chains, recursively.
@@ -374,7 +659,70 @@ class EventFederationWorkerStore(
 
         Returns a generator that produces dicts from origin chain ID to 3-tuple
         of origin sequence number, target chain ID and target sequence number.
+
+        `embedded_db_namespace`: the caller's resolved namespace when the
+        embedded engine is configured, `None` when it isn't -- a
+        `@classmethod` has no `self` of its own, so this can't be
+        recomputed here; see `embedded_event_auth_chain_links.py`.
+
+        `embedded_db_engine`: the engine name threaded alongside
+        `embedded_db_namespace` (same `@classmethod` constraint).
         """
+        if embedded_db_namespace is not None:
+            # Exclusive by configured engine, not a dual-write. mtxdb has no
+            # recursive-query primitive, so the walk is done here in Python
+            # instead of SQL's `WITH RECURSIVE` below -- see
+            # embedded_event_auth_chain_links.py's module docstring.
+            from synapse.storage.databases.main.embedded_event_auth_chain_links import (
+                get_chain_links_batch,
+            )
+
+            # `get_chain_links_batch` is a flat batch-get, not a BFS -- it
+            # only returns edges *out of* the chain IDs it's given, not the
+            # transitive closure. So unlike the SQL `WITH RECURSIVE` below,
+            # the walk has to happen here: every `target_chain_id` we
+            # discover is a new chain that might have further edges out of
+            # it, so it goes back into the fetch set (unless already seen).
+            #
+            # Every caller of this generator relies on each yielded `links`
+            # dict being *self-contained*: `_materialize` does its own
+            # internal stack-based walk over a single `links` dict starting
+            # from one origin chain, so if the edges for a chain two hops
+            # away land in a *different* yielded dict than the edges for the
+            # chain one hop away, `_materialize` dead-ends after one hop and
+            # silently drops everything beyond it (this used to happen here
+            # and kept happening: each BFS layer was fetched separately, and
+            # the `yield` stayed inside the BFS loop, so the closure was
+            # still split). So the whole transitive closure for each outer
+            # (<=1000-chain) seed batch is accumulated below and yielded
+            # once, matching what the SQL recursive query below returns in a
+            # single row set per outer batch.
+            chains_to_fetch = set(chains_to_fetch)
+            while chains_to_fetch:
+                seeds = set(itertools.islice(chains_to_fetch, 1000))
+                chains_to_fetch.difference_update(seeds)
+
+                seen_chains = set(seeds)
+                to_walk = set(seeds)
+                accumulated: dict[int, list[tuple[int, int, int]]] = {}
+                while to_walk:
+                    batch = set(itertools.islice(to_walk, 1000))
+                    to_walk.difference_update(batch)
+                    embedded_links = get_chain_links_batch(
+                        embedded_db_engine, embedded_db_namespace, batch
+                    )
+                    for chain_id, edges in embedded_links.items():
+                        accumulated.setdefault(chain_id, []).extend(edges)
+                        for _origin_seq, target_chain_id, _target_seq in edges:
+                            if target_chain_id not in seen_chains:
+                                seen_chains.add(target_chain_id)
+                                to_walk.add(target_chain_id)
+                # Chains that turned out to have links were consumed by this
+                # batch's closure (the SQL path removes them from
+                # `chains_to_fetch` the same way), so skip them as seeds.
+                chains_to_fetch.difference_update(accumulated)
+                yield accumulated
+            return
 
         # This query is structured to first get all chain IDs reachable, and
         # then pull out all links from those chains. This does pull out more
@@ -431,6 +779,12 @@ class EventFederationWorkerStore(
 
         This is used when we don't have a cover index for the room.
         """
+        logger.debug(
+            "get_auth_chain_ids: using OLDEST no-cover-index SQL fallback "
+            "for event_ids=%s include_given=%s",
+            list(event_ids),
+            include_given,
+        )
         if include_given:
             results = set(event_ids)
         else:
@@ -526,8 +880,75 @@ class EventFederationWorkerStore(
         room = await self.get_room(room_id)  # type: ignore[attr-defined]
         # If the room has an auth chain index.
         if room[1]:
+            from synapse.storage.databases.main.embedded_event_auth_chains import (
+                IncompleteAuthGraph,
+                resolve_namespace,
+            )
+
             try:
-                return await self.db_pool.runInteraction(
+                embedded_db_namespace = resolve_namespace(self)
+                is_embedded_writer = (
+                    embedded_db_namespace is not None
+                    and self.hs.get_instance_name()
+                    in self.hs.config.worker.writers.events
+                )
+                if is_embedded_writer:
+                    assert embedded_db_namespace is not None
+                    _auth_coverage(
+                        "get_auth_chain_difference",
+                        "embedded_attempt",
+                        sum(len(state_set) for state_set in state_sets),
+                    )
+                    try:
+                        result = await self.db_pool.runInteraction(
+                            "get_auth_chain_difference_embedded",
+                            self._get_auth_chain_difference_using_embedded_closures_txn,
+                            embedded_db_namespace,
+                            room_id,
+                            state_sets,
+                            conflicted_set,
+                            additional_backwards_reachable_conflicted_events,
+                        )
+                        _auth_coverage(
+                            "get_auth_chain_difference",
+                            "embedded_complete",
+                            sum(len(state_set) for state_set in state_sets),
+                            len(result.auth_difference),
+                        )
+                        return result
+                    except IncompleteAuthGraph:
+                        # The embedded ramp is missing genuine data (e.g.
+                        # cold-import hasn't caught up yet).  The SQL
+                        # cover-index may have the same gap for imported
+                        # outliers, so go directly to the authoritative
+                        # legacy BFS walk against raw event_auth rows.
+                        if _warned_incomplete_auth_graph.should_warn(room_id):
+                            logger.warning(
+                                "Embedded auth graph incomplete for room %s; "
+                                "falling back to legacy SQL auth-chain traversal",
+                                room_id,
+                            )
+                        if conflicted_set is not None:
+                            # The legacy BFS cannot compute the v2.1
+                            # conflicted subgraph; surface the error.
+                            raise _NoChainCoverIndex(room_id)
+                        auth_diff = await self.db_pool.runInteraction(
+                            "get_auth_chain_difference_legacy_fallback",
+                            self._get_auth_chain_difference_txn,
+                            state_sets,
+                        )
+                        _auth_coverage(
+                            "get_auth_chain_difference",
+                            "embedded_incomplete_sql_fallback",
+                            sum(len(state_set) for state_set in state_sets),
+                            len(auth_diff),
+                        )
+                        return StateDifference(
+                            auth_difference=auth_diff, conflicted_subgraph=None
+                        )
+                # Non-writers cannot repair the embedded graph. If the embedded lookup is
+                # incomplete, fall back to the SQL chain-cover implementation.
+                result = await self.db_pool.runInteraction(
                     "get_auth_chain_difference_chains",
                     self._get_auth_chain_difference_using_cover_index_txn,
                     room_id,
@@ -535,24 +956,210 @@ class EventFederationWorkerStore(
                     conflicted_set,
                     additional_backwards_reachable_conflicted_events,
                 )
-            except _NoChainCoverIndex:
+                _auth_coverage(
+                    "get_auth_chain_difference",
+                    "sql_chain_cover_complete",
+                    sum(len(state_set) for state_set in state_sets),
+                    len(result.auth_difference),
+                )
+                return result
+            except (IncompleteAuthGraph, _NoChainCoverIndex):
                 # For whatever reason we don't actually have a chain cover index
                 # for the events in question, so we fall back to the old method
                 # (except in tests)
                 if not self.tests_allow_no_chain_cover_index:
                     raise
+                if conflicted_set is not None:
+                    raise _NoChainCoverIndex(room_id)
+                auth_diff = await self.db_pool.runInteraction(
+                    "get_auth_chain_difference_legacy_fallback",
+                    self._get_auth_chain_difference_txn,
+                    state_sets,
+                )
+                return StateDifference(
+                    auth_difference=auth_diff, conflicted_subgraph=None
+                )
 
         # It's been 4 years since we added chain cover, so we expect all rooms to have it.
         # If they don't, we will error out when trying to do state res v2.1
         if conflicted_set is not None:
             raise _NoChainCoverIndex(room_id)
 
+        _auth_coverage(
+            "get_auth_chain_difference",
+            "sql_only",
+            sum(len(state_set) for state_set in state_sets),
+        )
         auth_diff = await self.db_pool.runInteraction(
             "get_auth_chain_difference",
             self._get_auth_chain_difference_txn,
             state_sets,
         )
         return StateDifference(auth_difference=auth_diff, conflicted_subgraph=None)
+
+    def _get_auth_chain_difference_using_embedded_closures_txn(
+        self,
+        txn: LoggingTransaction,
+        embedded_db_namespace: str,
+        room_id: str,
+        state_sets: list[set[str]],
+        conflicted_set: set[str] | None = None,
+        additional_backwards_reachable_conflicted_events: set[str] | None = None,
+    ) -> StateDifference:
+        """Embedded-store equivalent of
+        `_get_auth_chain_difference_using_cover_index_txn`: same `StateDifference`
+        result, computed from the ramp ancestor-closure bitmaps in
+        `embedded_event_auth_chains.py` instead of the chain-id/sequence-number
+        cover-index reduction.
+
+        `auth_difference` follows the spec definition directly -- the union of
+        each state set's combined auth chain, minus the events common to all of
+        them, where a combined auth chain is *inclusive* of the set's own
+        members (matching the cover-index path and the legacy BFS, both of
+        which seed the given events into the result when their ownership
+        differs across sets). Each state set's combined closure is the union of
+        its members' ancestor closures plus the members themselves.
+
+        `conflicted_subgraph` (v2.1 only) is `backwards ∩ forwards`, with both
+        sides *inclusive* of the conflicted events -- the exact contract the
+        chain-cover path's per-chain seq ranges encode (`forwards_seq_num ..
+        backwards_seq_num` inclusive of both, so each conflicted event's own
+        position ends up in the subgraph). Backwards is the union of the
+        conflicted and additional events' inclusive ancestor closures; forwards
+        is the seed-inclusive forward BFS (`get_forward_reachable_short_ids`)
+        *pruned to the backwards set* -- a descendant outside the backwards
+        universe provably can't be in the intersection, which is what bounds
+        the walk (it may not touch data the conflicted-set computation doesn't
+        need). Raises `IncompleteAuthGraph` on a genuine data gap; the caller
+        translates that to `_NoChainCoverIndex`.
+        """
+        from synapse.storage.databases.main.embedded_event_auth_chains import (
+            get_forward_reachable_short_ids,
+            get_or_create_short_ids,
+            resolve_short_ids_to_event_ids,
+        )
+
+        engine_name = self._embedded_db_engine
+
+        is_state_res_v21 = conflicted_set is not None
+        initial_events = set(state_sets[0]).union(*state_sets[1:])
+
+        if is_state_res_v21:
+            # Sanity check v2.1 fields -- mirroring the cover-index method.
+            assert conflicted_set is not None
+            assert conflicted_set.issubset(initial_events)
+            if additional_backwards_reachable_conflicted_events:
+                assert additional_backwards_reachable_conflicted_events.issubset(
+                    initial_events
+                )
+
+        if not initial_events:
+            conflicted_subgraph: set[str] = set()
+            if is_state_res_v21:
+                assert conflicted_set is not None
+                conflicted_subgraph = conflicted_set
+            return StateDifference(
+                auth_difference=set(), conflicted_subgraph=conflicted_subgraph
+            )
+
+        event_ids = list(initial_events)
+        short_ids = get_or_create_short_ids(
+            engine_name, embedded_db_namespace, room_id, event_ids
+        )
+        short_id_of = dict(zip(event_ids, short_ids))
+
+        # State-set closures: union of each set's members' ancestor closures,
+        # *plus the members themselves* -- auth-chain-difference semantics are
+        # inclusive on the given events, exactly like the cover-index path
+        # (a chain reachable at seq n by one set but un-reachable from another
+        # defaults that set's max to 0, so the gap spans `(0, n]` and pulls the
+        # member's own position into the result) and the legacy BFS (initial
+        # events are seeded into `event_to_missing_sets`).
+        set_closures: list[set[int]] = []
+        for state_set in state_sets:
+            member_short_ids = [short_id_of[event_id] for event_id in state_set]
+            closures = self._auth_chain_closure_cache.get_closures_batch(
+                txn,
+                engine_name,
+                embedded_db_namespace,
+                room_id,
+                member_short_ids,
+            )
+            union: set[int] = set(member_short_ids)
+            for closure in closures.values():
+                union.update(closure)
+            set_closures.append(union)
+
+        all_closures = set().union(*set_closures) if set_closures else set()
+        common_closures = set.intersection(*set_closures) if set_closures else set()
+        auth_difference_ids = all_closures - common_closures
+
+        conflicted_subgraph_ids: set[int] = set()
+        if is_state_res_v21:
+            assert conflicted_set is not None
+            conflicted_short_ids = [
+                short_id_of[event_id] for event_id in conflicted_set
+            ]
+
+            # Inclusive backwards-reachable universe: the conflicted events
+            # themselves, their ancestor closures, plus the additional
+            # backwards-reachable events and theirs.
+            backwards_ids: set[int] = set(conflicted_short_ids)
+            for closure in self._auth_chain_closure_cache.get_closures_batch(
+                txn,
+                engine_name,
+                embedded_db_namespace,
+                room_id,
+                conflicted_short_ids,
+            ).values():
+                backwards_ids.update(closure)
+            if additional_backwards_reachable_conflicted_events:
+                additional_short_ids = [
+                    short_id_of[event_id]
+                    for event_id in additional_backwards_reachable_conflicted_events
+                ]
+                backwards_ids.update(additional_short_ids)
+                for closure in self._auth_chain_closure_cache.get_closures_batch(
+                    txn,
+                    engine_name,
+                    embedded_db_namespace,
+                    room_id,
+                    additional_short_ids,
+                ).values():
+                    backwards_ids.update(closure)
+
+            # Inclusive forwards (seed-inclusive BFS), pruned to the backwards
+            # universe so the walk cost is bounded by |backwards|, not |room|.
+            forwards_ids = get_forward_reachable_short_ids(
+                txn,
+                engine_name,
+                embedded_db_namespace,
+                room_id,
+                conflicted_short_ids,
+                candidate_short_ids=backwards_ids,
+            )
+            conflicted_subgraph_ids = backwards_ids & forwards_ids
+
+        def resolve(short_id_iter: "Collection[int]") -> set[str]:
+            if not short_id_iter:
+                return set()
+            resolved = resolve_short_ids_to_event_ids(
+                engine_name,
+                embedded_db_namespace,
+                room_id,
+                list(short_id_iter),
+            )
+            return {event_id for event_id in resolved if event_id is not None}
+
+        if is_state_res_v21:
+            return StateDifference(
+                auth_difference=resolve(auth_difference_ids),
+                conflicted_subgraph=resolve(conflicted_subgraph_ids),
+            )
+        return StateDifference(
+            auth_difference=resolve(auth_difference_ids),
+            conflicted_subgraph=None,
+        )
 
     def _get_auth_chain_difference_using_cover_index_txn(
         self,
@@ -700,7 +1307,14 @@ class EventFederationWorkerStore(
         # are reachable from any event.
 
         # (We need to take a copy of `seen_chains` as the function mutates it)
-        for links in self._get_chain_links(txn, set(seen_chains)):
+        from synapse.storage.databases.main.embedded_event_auth_chain_links import (
+            resolve_namespace,
+        )
+
+        embedded_db_namespace = resolve_namespace(self)
+        for links in self._get_chain_links(
+            txn, set(seen_chains), embedded_db_namespace, self._embedded_db_engine
+        ):
             # `links` encodes the backwards reachable events _from a single chain_ all the way to
             # the root of the graph.
             for chains in set_to_chain:
@@ -1958,6 +2572,12 @@ class EventFederationWorkerStore(
         )
 
         event_id_results: set[str] = set()
+        queued_event_ids: set[str] = set()
+        # Outlier seeds are walked back from but never returned themselves: we
+        # don't have the state at an outlier, so can't check whether the
+        # requesting server may see it (`filter_events_for_server` assumes
+        # outliers are open). Their non-outlier predecessors can be checked.
+        outlier_seed_ids: set[str] = set()
 
         # In a PriorityQueue, the lowest valued entries are retrieved first.
         # We're using depth as the priority in the queue and tie-break based on
@@ -1976,12 +2596,13 @@ class EventFederationWorkerStore(
                     "type",
                     "depth",
                     "stream_ordering",
+                    "outlier",
                 ),
                 allow_none=True,
             )
 
             if event_lookup_result is not None:
-                event_type, depth, stream_ordering = event_lookup_result
+                event_type, depth, stream_ordering, outlier = event_lookup_result
                 logger.debug(
                     "_get_backfill_events(room_id=%s): seed_event_id=%s depth=%s stream_ordering=%s type=%s",
                     room_id,
@@ -1991,7 +2612,10 @@ class EventFederationWorkerStore(
                     event_type,
                 )
 
-                if depth:
+                if depth and seed_event_id not in queued_event_ids:
+                    queued_event_ids.add(seed_event_id)
+                    if outlier:
+                        outlier_seed_ids.add(seed_event_id)
                     queue.put((-depth, -stream_ordering, seed_event_id, event_type))
 
         while not queue.empty() and len(event_id_results) < limit:
@@ -2003,7 +2627,8 @@ class EventFederationWorkerStore(
             if event_id in event_id_results:
                 continue
 
-            event_id_results.add(event_id)
+            if event_id not in outlier_seed_ids:
+                event_id_results.add(event_id)
 
             # Now we just look up the DAG by prev_events as normal
             connected_prev_event_backfill_results = (
@@ -2019,7 +2644,12 @@ class EventFederationWorkerStore(
             for (
                 connected_prev_event_backfill_item
             ) in connected_prev_event_backfill_results:
-                if connected_prev_event_backfill_item.event_id not in event_id_results:
+                if (
+                    connected_prev_event_backfill_item.event_id not in event_id_results
+                    and connected_prev_event_backfill_item.event_id
+                    not in queued_event_ids
+                ):
+                    queued_event_ids.add(connected_prev_event_backfill_item.event_id)
                     queue.put(
                         (
                             -connected_prev_event_backfill_item.depth,
@@ -2263,12 +2893,161 @@ class EventFederationWorkerStore(
         Args:
             event_id: The event to search for as a prev_event.
         """
-        return await self.db_pool.simple_select_onecol(
+        started = time.monotonic()
+
+        # A warm FWD generation is not proof of completeness. Only the
+        # offline verifier may grant this authority marker; until then SQL is
+        # the source of truth and FWD remains a write-side projection.
+        from synapse.storage.databases.main.embedded_event_edges import (
+            event_edges_fwd_is_authoritative,
+        )
+
+        if await event_edges_fwd_is_authoritative(self):
+            from synapse.storage.databases.main.embedded_event_edges import (
+                classify_event_edge_fallback,
+                get_event_edges_forward_batch,
+                record_event_edge_read,
+                record_event_edge_repair,
+                repair_edge_index_from_sql,
+            )
+
+            forward_map = None
+            sql_started = time.monotonic()
+            room_id = await self.db_pool.simple_select_one_onecol(
+                table="events",
+                keyvalues={"event_id": event_id},
+                retcol="room_id",
+                allow_none=True,
+                desc="get_successor_events_room_id",
+            )
+            if room_id is None:
+                room_id = await self.db_pool.simple_select_one_onecol(
+                    table="event_backward_extremities",
+                    keyvalues={"event_id": event_id},
+                    retcol="room_id",
+                    allow_none=True,
+                    desc="get_successor_events_backward_extremity_room_id",
+                )
+            ffi_timing(
+                "event_edges_successor_room_lookup", time.monotonic() - sql_started
+            )
+            if room_id is not None:
+                sql_started = time.monotonic()
+                source_version = await self.db_pool.simple_select_one_onecol(
+                    table="room_edge_source_version",
+                    keyvalues={"room_id": room_id},
+                    retcol="source_version",
+                    allow_none=True,
+                    desc="get_successor_events_source_version",
+                )
+                ffi_timing(
+                    "event_edges_successor_source_version",
+                    time.monotonic() - sql_started,
+                )
+                embedded_started = time.monotonic()
+                forward_map = get_event_edges_forward_batch(
+                    self._embedded_db_namespace,
+                    room_id,
+                    int(source_version or 0),
+                    [event_id],
+                )
+                ffi_timing(
+                    "event_edges_successor_embedded_read",
+                    time.monotonic() - embedded_started,
+                )
+                successors = None if forward_map.stale else forward_map.get(event_id)
+                logger.debug(
+                    "get_successor_events: event_id=%s room_id=%s source_version=%s hit=%s",
+                    event_id,
+                    room_id,
+                    source_version,
+                    successors is not None,
+                )
+                if successors is not None:
+                    ffi_count("event_edges_successor_hits", 1)
+                    record_event_edge_read(self.server_name, "successor", "hit")
+                    ffi_timing(
+                        "event_edges_successor_total", time.monotonic() - started
+                    )
+                    return successors
+
+            ffi_count("event_edges_successor_fallbacks", 1)
+            record_event_edge_read(
+                self.server_name,
+                "successor",
+                classify_event_edge_fallback(forward_map),
+            )
+            sql_started = time.monotonic()
+            sql_res = await self.db_pool.simple_select_onecol(
+                table="event_edges",
+                keyvalues={"prev_event_id": event_id},
+                retcol="event_id",
+                desc="get_successor_events",
+            )
+            logger.debug(
+                "get_successor_events fallback: event_id=%s successor_count=%s",
+                event_id,
+                len(sql_res),
+            )
+            ffi_timing(
+                "event_edges_successor_sql_fallback", time.monotonic() - sql_started
+            )
+            if sql_res and getattr(self, "_embedded_event_edges_writable", False):
+                if room_id is None:
+                    room_id = await self.db_pool.simple_select_one_onecol(
+                        table="events",
+                        keyvalues={"event_id": sql_res[0]},
+                        retcol="room_id",
+                        allow_none=True,
+                        desc="get_successor_events_repair_room_id",
+                    )
+                if room_id is not None:
+                    try:
+                        repair_started = time.monotonic()
+                        # The gated path already resolved this event's immutable
+                        # room id before reading the source-version watermark.
+                        # Reusing it avoids a second SQL round trip on every
+                        # repair-triggering miss.
+                        await repair_edge_index_from_sql(
+                            self,
+                            self._embedded_db_namespace,
+                            room_id,
+                            event_id,
+                            sql_res,
+                        )
+                        ffi_count("event_edges_successor_repairs", len(sql_res))
+                        record_event_edge_repair(
+                            self.server_name, "successor", True, len(sql_res)
+                        )
+                        ffi_timing(
+                            "event_edges_successor_repair",
+                            time.monotonic() - repair_started,
+                        )
+                    except Exception:
+                        record_event_edge_repair(self.server_name, "successor", False)
+                        logger.debug(
+                            "Failed to repair forward edge for %s",
+                            event_id,
+                            exc_info=True,
+                        )
+            ffi_timing("event_edges_successor_total", time.monotonic() - started)
+            return sql_res
+
+        from synapse.storage.databases.main.embedded_event_edges import (
+            record_event_edge_read,
+        )
+
+        record_event_edge_read(self.server_name, "successor", "sql_only")
+        sql_started = time.monotonic()
+        sql_res = await self.db_pool.simple_select_onecol(
             table="event_edges",
             keyvalues={"prev_event_id": event_id},
             retcol="event_id",
             desc="get_successor_events",
         )
+        ffi_timing("event_edges_successor_sql_only", time.monotonic() - sql_started)
+        ffi_timing("event_edges_successor_total", time.monotonic() - started)
+        return sql_res
 
     @wrap_as_background_process("delete_old_forward_extrem_cache")
     async def _delete_old_forward_extrem_cache(self) -> None:
@@ -2412,6 +3191,50 @@ class EventFederationWorkerStore(
         )
 
         return origin, event
+
+    async def get_staged_events_for_room(
+        self,
+        room_id: str,
+        room_version: RoomVersion,
+        limit: int,
+    ) -> list[tuple[str, EventBase]]:
+        """Get the oldest staged events for a room.
+
+        The caller holds the per-room inbound-PDU lock, so the rows remain owned by
+        it until they are removed from staging. This is deliberately a read rather
+        than a claim: an event must stay staged until it has been persisted.
+        """
+
+        def _get_staged_events_for_room_txn(
+            txn: LoggingTransaction,
+        ) -> list[tuple[str, str, str]]:
+            txn.execute(
+                """
+                SELECT event_json, internal_metadata, origin
+                FROM federation_inbound_events_staging
+                WHERE room_id = ?
+                ORDER BY received_ts ASC
+                LIMIT ?
+                """,
+                (room_id, limit),
+            )
+            return cast(list[tuple[str, str, str]], txn.fetchall())
+
+        rows = await self.db_pool.runInteraction(
+            "get_staged_events_for_room", _get_staged_events_for_room_txn
+        )
+
+        return [
+            (
+                row[2],
+                make_event_from_dict(
+                    event_dict=db_to_json(row[0]),
+                    room_version=room_version,
+                    internal_metadata_dict=db_to_json(row[1]),
+                ),
+            )
+            for row in rows
+        ]
 
     async def prune_staged_events_in_room(
         self,

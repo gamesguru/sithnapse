@@ -58,6 +58,32 @@ class BackgroundUpdateTestCase(unittest.HomeserverTestCase):
         )
         self.store = self.hs.get_datastores().main
 
+    def test_have_completed_background_updates(self) -> None:
+        self.get_success(
+            self.store.db_pool.simple_insert(
+                "background_updates",
+                values={"update_name": "test_update", "progress_json": "{}"},
+            )
+        )
+        # Simulate a worker which has not yet observed the newly queued update.
+        self.updates._all_done = False
+
+        self.assertFalse(
+            self.get_success(
+                self.updates.have_completed_background_updates(("test_update",))
+            )
+        )
+        # An unrelated pending update does not block a feature gated on a
+        # different update; an empty requested set is likewise complete.
+        self.assertTrue(
+            self.get_success(
+                self.updates.have_completed_background_updates(("other_update",))
+            )
+        )
+        self.assertTrue(
+            self.get_success(self.updates.have_completed_background_updates(()))
+        )
+
     async def update(self, progress: JsonDict, count: int) -> int:
         fake_work_duration = Duration(seconds=1)
         await self.clock.sleep(fake_work_duration)
@@ -125,6 +151,47 @@ class BackgroundUpdateTestCase(unittest.HomeserverTestCase):
         result = self.get_success(self.updates.do_next_background_update(False))
         self.assertTrue(result)
         self.assertFalse(self.update_handler.called)
+
+    def test_dependent_update_waits_for_its_prerequisite(self) -> None:
+        """Select a runnable update even when it sorts after a blocked update."""
+
+        async def complete(update_name: str, progress: JsonDict, count: int) -> int:
+            await self.updates._end_background_update(update_name)
+            return count
+
+        first_handler = Mock(
+            side_effect=lambda progress, count: complete("first", progress, count)
+        )
+        dependent_handler = Mock(
+            side_effect=lambda progress, count: complete("dependent", progress, count)
+        )
+        self.updates.register_background_update_handler("first", first_handler)
+        self.updates.register_background_update_handler("dependent", dependent_handler)
+
+        # Put the dependent update first in sort order. The query must skip it
+        # until "first" has been removed from the queue.
+        self.get_success(
+            self.store.db_pool.simple_insert_many(
+                table="background_updates",
+                keys=("ordering", "update_name", "progress_json", "depends_on"),
+                values=[
+                    (1, "dependent", "{}", "first"),
+                    (2, "first", "{}", None),
+                ],
+                desc="insert_dependent_background_updates",
+            )
+        )
+
+        self.assertFalse(
+            self.get_success(self.updates.do_next_background_update(False))
+        )
+        first_handler.assert_called_once()
+        dependent_handler.assert_not_called()
+
+        self.assertFalse(
+            self.get_success(self.updates.do_next_background_update(False))
+        )
+        dependent_handler.assert_called_once()
 
     @override_config(
         yaml.safe_load(

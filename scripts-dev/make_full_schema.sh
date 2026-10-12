@@ -14,7 +14,7 @@ REQUIRED_DEPS=("synapse" "sqlite3" "psycopg2")
 usage() {
   echo
   echo "Usage: $0 -p <postgres_username> -o <path> [-c] [-n <schema number>] [-h]"
-  echo "It is the caller's responsibility to be in the correct Python environment (e.g. using \`poetry run scripts-dev/make_full_schema.sh\`)."
+  echo "It is the caller's responsibility to be in the correct Python environment (e.g. using \`uv run scripts-dev/make_full_schema.sh\`)."
   echo
   echo "-p <postgres_username>"
   echo "  Username to connect to local postgres instance. The password will be requested"
@@ -39,7 +39,7 @@ usage() {
   echo ""
   echo "You probably want to invoke this with something like"
   echo "  docker run --rm -e POSTGRES_PASSWORD=postgres -e POSTGRES_USER=postgres -e POSTGRES_DB=synapse -p 5432:5432 postgres:14-alpine"
-  echo "  echo postgres | poetry run scripts-dev/make_full_schema.sh -p postgres -n MY_SCHEMA_NUMBER -o synapse/storage/schema"
+  echo "  echo postgres | uv run scripts-dev/make_full_schema.sh -p postgres -n MY_SCHEMA_NUMBER -o synapse/storage/schema"
   echo ""
   echo "  NB: make sure to run this against the *oldest* supported version of postgres,"
   echo "  or else pg_dump might output non-backwards-compatible syntax."
@@ -80,7 +80,7 @@ for dep in "${REQUIRED_DEPS[@]}"; do
   python -c "import $dep" &> /dev/null || unsatisfied_requirements+=("$dep")
 done
 if [ ${#unsatisfied_requirements} -ne 0 ]; then
-  echo 'Please `poetry install --extras postgres` first as the following Python modules are not importable: '"${unsatisfied_requirements[*]}"
+  echo 'Please `uv sync --extra postgres` first as the following Python modules are not importable: '"${unsatisfied_requirements[*]}"
   exit 1
 fi
 
@@ -106,8 +106,9 @@ export PGPASSWORD
 # Exit immediately if a command fails
 set -e
 
-# cd to root of the synapse directory
-cd "$(dirname "$0")/.."
+# cd to root of the synapse directory. Callers running a saved copy of this
+# script can explicitly point it at the checkout being inspected.
+cd "${SYNAPSE_SOURCE_DIR:-$(dirname "$0")/..}"
 
 # Create temporary SQLite and Postgres homeserver db configs and key file
 TMPDIR=$(mktemp -d)
@@ -203,7 +204,7 @@ python -m synapse.app.homeserver --generate-keys -c "$SQLITE_CONFIG"
 
 # Make sure the SQLite3 database is using the latest schema and has no pending background update.
 echo "Running db background jobs..."
-poetry run python synapse/_scripts/update_synapse_database.py --database-config "$SQLITE_CONFIG" --run-background-updates
+python synapse/_scripts/update_synapse_database.py --database-config "$SQLITE_CONFIG" --run-background-updates
 
 # Create the PostgreSQL database.
 echo "Creating postgres databases..."
@@ -212,7 +213,7 @@ createdb --lc-collate=C --lc-ctype=C --template=template0 "$POSTGRES_MAIN_DB_NAM
 createdb --lc-collate=C --lc-ctype=C --template=template0 "$POSTGRES_STATE_DB_NAME"
 
 echo "Running db background jobs..."
-poetry run python synapse/_scripts/update_synapse_database.py --database-config "$POSTGRES_CONFIG" --run-background-updates
+python synapse/_scripts/update_synapse_database.py --database-config "$POSTGRES_CONFIG" --run-background-updates
 
 
 echo "Dropping unwanted db tables..."

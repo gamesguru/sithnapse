@@ -36,6 +36,7 @@ __pycache__/
 /uploads
 /homeserver-config-overrides.d
 tmp/
+.tmp/
 
 # For direnv users
 /.envrc
@@ -68,16 +69,38 @@ tmp/
 # docs
 book/
 
+# test stuff
+/media
+*.crt
+*.csr
+*.cnf
+*.srl
+.sytest/
+*.tar
+*.tar.*
+
 # complement
 /complement-*
 /main.tar.gz
+tests/complement/*
+.cold-pg-bench/
+*.jsonl
 
 # rust
-/target/
+target/
 /synapse/*.so
+*.bin
+*.pack
+*.idx
 
 # Poetry will create a setup.py, which we don't want to include.
 /setup.py
 
 # Don't include users' poetry configs
 /poetry.toml
+
+# env files
+.env
+
+# Local-only dependency path overrides (absolute paths; never commit)
+rust/.cargo/config.toml

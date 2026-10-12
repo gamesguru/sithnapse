@@ -1,0 +1,16 @@
+More Rust optimization priorities
+=================================
+
+The measured profile shows that the Rust bridge is no longer the dominant
+cost. Remaining hotspots are Python graph walking, repeated event-map
+conversion, `_seperate`, and string-keyed dictionary lookups in the lattice
+fold.
+
+Planned work:
+
+1. Accept normalized Rust event graphs to reduce Python-side graph walking.
+2. Cache parsed Rust event-graph data across resolutions in a merge batch.
+3. Move `_seperate` into Rust.
+4. Evaluate dense IDs or adjacency lists for lattice-fold lookups.
+5. Reduce Python orchestration around `resolve_events_with_store` with a
+   consolidated Rust entry point.

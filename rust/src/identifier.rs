@@ -16,6 +16,7 @@
 //!
 //! This module contains definitions and utilities for working with matrix identifiers.
 
+use std::str::FromStr;
 use std::{fmt, ops::Deref};
 
 /// Errors that can occur when parsing a matrix identifier.
@@ -53,12 +54,12 @@ impl UserID {
     }
 }
 
-impl TryFrom<&str> for UserID {
-    type Error = IdentifierError;
+impl FromStr for UserID {
+    type Err = IdentifierError;
 
     /// Will try creating a `UserID` from the provided `&str`.
     /// Can fail if the user_id is incorrectly formatted.
-    fn try_from(s: &str) -> Result<Self, Self::Error> {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         if !s.starts_with('@') {
             return Err(IdentifierError::IncorrectSigil);
         }
@@ -68,6 +69,14 @@ impl TryFrom<&str> for UserID {
         }
 
         Ok(UserID(s.to_string()))
+    }
+}
+
+impl TryFrom<&str> for UserID {
+    type Error = IdentifierError;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        s.parse()
     }
 }
 
@@ -135,12 +144,12 @@ impl RoomID {
     }
 }
 
-impl TryFrom<&str> for RoomID {
-    type Error = IdentifierError;
+impl FromStr for RoomID {
+    type Err = IdentifierError;
 
     /// Will try creating a `RoomID` from the provided `&str`.
     /// Can fail if the room_id is incorrectly formatted.
-    fn try_from(s: &str) -> Result<Self, Self::Error> {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         if !s.starts_with('!') {
             return Err(IdentifierError::IncorrectSigil);
         }
@@ -150,6 +159,14 @@ impl TryFrom<&str> for RoomID {
         }
 
         Ok(RoomID(s.to_string()))
+    }
+}
+
+impl TryFrom<&str> for RoomID {
+    type Error = IdentifierError;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        s.parse()
     }
 }
 
@@ -199,17 +216,25 @@ impl fmt::Display for RoomID {
 #[derive(Clone, Debug, PartialEq)]
 pub struct EventID(String);
 
-impl TryFrom<&str> for EventID {
-    type Error = IdentifierError;
+impl FromStr for EventID {
+    type Err = IdentifierError;
 
     /// Will try creating a `EventID` from the provided `&str`.
     /// Can fail if the event_id is incorrectly formatted.
-    fn try_from(s: &str) -> Result<Self, Self::Error> {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         if !s.starts_with('$') {
             return Err(IdentifierError::IncorrectSigil);
         }
 
         Ok(EventID(s.to_string()))
+    }
+}
+
+impl TryFrom<&str> for EventID {
+    type Error = IdentifierError;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        s.parse()
     }
 }
 

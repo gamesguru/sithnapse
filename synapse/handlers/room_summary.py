@@ -833,6 +833,21 @@ class RoomSummaryHandler:
             if isinstance(join_rule_content, str):
                 entry["join_rule"] = join_rule_content
 
+        # If the background statistics processor is lagging behind room creation,
+        # stats.join_rules may be None. Fall back to fetching the join rule directly
+        # from the room's current state to ensure we always return it.
+        # Note: We specifically only fall back for the `join_rule` because it is
+        # critical for access control and visibility logic. Other metadata fields
+        # like `name` or `topic` are allowed to lag behind without security implications.
+        if entry["join_rule"] is None:
+            join_rules_event_id = join_rules_state_ids.get((EventTypes.JoinRules, ""))
+            if join_rules_event_id:
+                join_rules_event = await self._store.get_event(
+                    join_rules_event_id, allow_none=True
+                )
+                if join_rules_event:
+                    entry["join_rule"] = join_rules_event.content.get("join_rule")
+
         try:
             room_version = await self._store.get_room_version(room_id)
         except UnsupportedRoomVersionError:

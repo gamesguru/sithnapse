@@ -114,26 +114,144 @@ Don't forget to [back up](./usage/administration/backups.md#database) your datab
 
 ## Tuning Postgres
 
-The default settings should be fine for most deployments. For larger
-scale deployments tuning some of the settings is recommended, details of
-which can be found at
-<https://wiki.postgresql.org/wiki/Tuning_Your_PostgreSQL_Server>.
+The default PostgreSQL settings are conservative and designed to work
+safely on a wide range of hardware. Tuning these settings for your
+specific hardware and workload can significantly improve performance.
 
-In particular, we've found tuning the following values helpful for
-performance:
+All settings below are configured in `postgresql.conf` (or via
+`ALTER SYSTEM SET`) on the database server, not in Synapse's config.
 
--   `shared_buffers`
--   `effective_cache_size`
--   `work_mem`
--   `maintenance_work_mem`
--   `autovacuum_work_mem`
+### Quick Reference
 
-Note that the appropriate values for those fields depend on the amount
-of free memory the database host has available.
+Use this table as a starting point based on your database server's
+total RAM. These values assume SSD storage and a typical Synapse
+workload (many tables, write-heavy).
 
-Additionally, admins of large deployments might want to consider using huge pages
-to help manage memory, especially when using large values of `shared_buffers`. You
-can read more about that [here](https://www.postgresql.org/docs/10/kernel-resources.html#LINUX-HUGE-PAGES).
+| Parameter                    | 8GB RAM   | 16GB RAM  | 32GB RAM  | 64GB RAM  |
+|------------------------------|-----------|-----------|-----------|-----------|
+| shared_buffers               | 2GB       | 4GB       | 8GB       | 16GB      |
+| effective_cache_size         | 6GB       | 12GB      | 24GB      | 48GB      |
+| work_mem                     | 16MB      | 32MB      | 64MB      | 128MB     |
+| maintenance_work_mem         | 512MB     | 1GB       | 2GB       | 4GB       |
+| autovacuum_work_mem          | 256MB     | 512MB     | 1GB       | 1GB       |
+| max_wal_size                 | 2GB       | 4GB       | 5GB       | 10GB      |
+| wal_buffers                  | 16MB      | 32MB      | 64MB      | 64MB      |
+
+!!! note
+    `max_connections` should be sized to accommodate the sum of all Synapse
+    process `cp_max` pool limits plus headroom for administrative and
+    unexpected connections. Do not rely on fixed RAM-based values.
+
+### Memory Settings
+
+-   `shared_buffers`: The amount of memory dedicated to caching data
+    pages. Start at approximately 25% of system RAM. Values above 8GB can
+    still be appropriate for large, dedicated database servers, though
+    diminishing returns often apply above that point.
+
+-   `effective_cache_size`: An estimate of the total memory available
+    for disk caching by the OS and PostgreSQL. Set to about 75% of system
+    RAM. This does not allocate memory — it tells the query planner how
+    much memory is likely available for caching.
+
+-   `work_mem`: Memory used for hash tables, sorts, and other query
+    operations. Increase if you see lots of temporary disk files or slow
+    complex queries. Be careful: this is per-sort-operation, so a single
+    query can use multiple times this amount. Start with 16MB–32MB for
+    small to moderate deployments, increasing it for larger systems when
+    measurements show that it helps.
+
+-   `maintenance_work_mem`: Memory for maintenance operations like
+    `VACUUM`, `CREATE INDEX`, and `ALTER TABLE`. Higher values speed up
+    these operations. Set to 512MB–4GB depending on available RAM.
+
+-   `autovacuum_work_mem`: Memory allocated to each autovacuum worker
+    process. Defaults to `maintenance_work_mem` if not set explicitly.
+    Setting it separately lets you keep vacuum memory bounded while
+    allowing larger maintenance memory for manual operations.
+
+### WAL and Checkpoint Settings
+
+Synapse performs many small writes (events, state changes, membership
+updates). Tuning WAL settings helps balance write throughput with
+checkpoint performance.
+
+-   `max_wal_size`: A soft target for how much WAL can be generated between
+    checkpoints. Increasing this (e.g., to 2–10GB) allows checkpoints to
+    be spread out more, reducing I/O spikes. Set this higher if you see
+    frequent checkpoints or WAL-related I/O bottlenecks. Note that WAL
+    may exceed this size under heavy write load, failed WAL archiving,
+    or retention settings, so leave sufficient disk headroom.
+
+-   `wal_buffers`: Memory for WAL data before it is flushed to disk.
+    Defaults to approximately `shared_buffers / 32`, bounded below by 64kB
+    and above by one WAL segment. Set to at least 64MB for large
+    deployments.
+
+-   `checkpoint_completion_target`: Fraction of the checkpoint interval
+    over which the checkpoint is spread. Set to `0.9` to spread I/O more
+    evenly and avoid write spikes.
+
+-   `checkpoint_timeout`: Maximum time between automatic checkpoints.
+    Set to `10min` or `15min` for write-heavy workloads. Longer intervals
+    trade off slightly more WAL storage for less frequent checkpoint I/O,
+    but may lengthen crash recovery because PostgreSQL needs to replay more
+    WAL.
+
+### Autovacuum Settings
+
+Synapse creates many tables (event tables per room, state groups, etc.).
+Autovacuum performance is critical to prevent table bloat and maintain
+query performance.
+
+-   `autovacuum_max_workers`: Number of concurrent autovacuum
+    processes. The default (3) may be insufficient for Synapse with many
+    rooms. Set to 5–8 for busy servers to ensure all tables get vacuumed
+    in a timely manner.
+
+-   `autovacuum_vacuum_cost_limit`: How much work an autovacuum worker
+    can do before pausing. The default (200) is very conservative. Increase
+    to 1000–3000 to allow vacuum to keep up with write-heavy workloads.
+    This is one of the most impactful tuning changes for busy Synapse
+    servers.
+
+### Query Planner Settings
+
+-   `random_page_cost`: Estimated cost of a random disk page access.
+    Defaults to 4.0 (designed for spinning disks). For SSDs, set to
+    `1.1`–`1.5` to encourage the planner to use index scans, which is
+    much faster on flash storage.
+
+-   `effective_io_concurrency`: Number of concurrent disk I/O
+    operations the system can handle. Set to `200` for SSDs, `2` for
+    traditional disks. This helps PostgreSQL prefetch pages for bitmap
+    heap scans on supported versions.
+
+### Statistics and Monitoring
+
+-   `shared_preload_libraries`: Set to `'pg_stat_statements'` to
+    enable the `pg_stat_statements` extension. This tracks execution
+    statistics for all SQL queries and is invaluable for identifying slow
+    queries. The `pg_stat_statements` extension may require installing the
+    `postgresql-contrib` (or equivalent) package. After enabling and
+    restarting the PostgreSQL server, run
+    `CREATE EXTENSION pg_stat_statements;` in the Synapse database.
+
+-   `log_min_duration_statement`: Log queries taking longer than this
+    many milliseconds. Set to `1000` (1 second) to identify slow queries
+    without excessive logging. Useful for finding missing indexes or
+    query plan issues.
+
+### Further Reading
+
+-   [Tuning Your PostgreSQL Server](https://wiki.postgresql.org/wiki/Tuning_Your_PostgreSQL_Server)
+-   [PostgreSQL Memory](https://www.postgresql.org/docs/current/runtime-config-resource.html)
+-   [Autovacuum Tuning](https://www.postgresql.org/docs/current/routine-vacuuming.html#autovacuum)
+
+Additionally, admins of large deployments might want to consider using
+huge pages to help manage memory, especially when using large values of
+`shared_buffers`. You can read more about that in the
+[PostgreSQL huge pages documentation](https://www.postgresql.org/docs/current/kernel-resources.html#LINUX-HUGE-PAGES).
 
 ## Porting from SQLite
 

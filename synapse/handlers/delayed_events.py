@@ -165,8 +165,7 @@ class DelayedEventsHandler:
         room_max_stream_ordering = self._store.get_room_max_stream_ordering()
 
         # Check that there are actually any delayed events to process. If not, bail early.
-        delayed_events_count = await self._store.get_count_of_delayed_events()
-        if delayed_events_count == 0:
+        if not await self._store.have_delayed_events():
             # There are no delayed events to process. Update the
             # `delayed_events_stream_pos` to the latest `events` stream pos and
             # exit early.

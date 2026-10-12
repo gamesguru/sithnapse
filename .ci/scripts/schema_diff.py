@@ -11,6 +11,7 @@
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -21,7 +22,38 @@ SCHEMA_DIR = "synapse/storage/schema"
 MAKE_FULL_SCHEMA_SCRIPT = REPO_ROOT / "scripts-dev" / "make_full_schema.sh"
 
 
-def run_make_full_schema(output_dir: Path) -> None:
+def python_env_runner() -> list[str]:
+    """Return an uv runner without resolving a lockless tree twice."""
+
+    if (REPO_ROOT / "uv.lock").exists():
+        return ["uv", "run"]
+
+    return ["uv", "run", "--no-sync"]
+
+
+def install_dependencies() -> None:
+    """Install dependencies for the currently checked-out tree."""
+
+    lockfile = REPO_ROOT / "uv.lock"
+    had_lockfile = lockfile.exists()
+    cmd = ["uv", "sync", "--extra", "postgres"]
+    if had_lockfile:
+        cmd.append("--locked")
+
+    print(f"Running: {' '.join(cmd)}", file=sys.stderr)
+    try:
+        subprocess.run(
+            cmd,
+            cwd=REPO_ROOT,
+            check=True,
+            stdout=sys.stderr,
+        )
+    finally:
+        if not had_lockfile:
+            lockfile.unlink(missing_ok=True)
+
+
+def run_make_full_schema(output_dir: Path, script: Path) -> None:
     """Run make_full_schema.sh, piping the password via stdin."""
     pg_user = os.environ.get("PGUSER", "")
     pg_password = os.environ.get("PGPASSWORD", "")
@@ -34,14 +66,11 @@ def run_make_full_schema(output_dir: Path) -> None:
 
     cmd: list[str] = [
         # Use faketime here for schema deltas that are wall-clock sensitive under SQLite
-        # We must only use faketime at this level because freezing the clock
-        # seems to cause `poetry install` to hang when recompiling our Rust module
         "faketime",
         "-f",
         "2001-05-25 12:42:42",
-        "poetry",
-        "run",
-        str(MAKE_FULL_SCHEMA_SCRIPT),
+        *python_env_runner(),
+        str(script),
         "-p",
         pg_user,
         "-o",
@@ -59,6 +88,7 @@ def run_make_full_schema(output_dir: Path) -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         cwd=REPO_ROOT,
+        env={**os.environ, "SYNAPSE_SOURCE_DIR": str(REPO_ROOT)},
         text=True,
     )
     stdout, _ = proc.communicate(input=pg_password + "\n")
@@ -126,9 +156,11 @@ def main() -> None:
         before_dir = Path(tmpdir) / "before"
         after_dir.mkdir()
         before_dir.mkdir()
+        schema_script = Path(tmpdir) / "make_full_schema.sh"
+        shutil.copy2(MAKE_FULL_SCHEMA_SCRIPT, schema_script)
 
         print("\n--- Running make_full_schema.sh (after) ---", file=sys.stderr)
-        run_make_full_schema(after_dir)
+        run_make_full_schema(after_dir, schema_script)
 
         # Checkout base and run make_full_schema.sh
         print(
@@ -198,15 +230,9 @@ def main() -> None:
 
             # Refresh dependencies
             print("Installing dependencies for base commit...", file=sys.stderr)
-            subprocess.run(
-                ["poetry", "install", "--extras", "postgres"],
-                cwd=REPO_ROOT,
-                check=True,
-                # Poetry install is noisy, so pipe its stdout to stderr
-                stdout=sys.stderr,
-            )
+            install_dependencies()
 
-            run_make_full_schema(before_dir)
+            run_make_full_schema(before_dir, schema_script)
         finally:
             print("Returning to HEAD...", file=sys.stderr)
             subprocess.run(

@@ -106,6 +106,9 @@ class PostgresSequenceGenerator(SequenceGenerator):
         return fetch_res[0]
 
     def get_next_mult_txn(self, txn: Cursor, n: int) -> list[int]:
+        if n == 1:
+            return [self.get_next_id_txn(txn)]
+
         txn.execute(
             "SELECT nextval(?) FROM generate_series(1, ?)", (self._sequence_name, n)
         )
@@ -282,6 +285,7 @@ def build_sequence_generator(
     id_column: str | None,
     stream_name: str | None = None,
     positive: bool = True,
+    db_is_fresh: bool = False,
 ) -> SequenceGenerator:
     """Get the best impl of SequenceGenerator available
 
@@ -296,13 +300,16 @@ def build_sequence_generator(
         table, id_column, stream_name, positive: If set then `check_consistency`
             is called on the created sequence. See docstring for
             `check_consistency` details.
+        db_is_fresh: If True, skip `check_consistency`. The caller guarantees
+            the database is a freshly-created empty clone where all tables are
+            empty and all sequences are at their initial values.
     """
     if isinstance(database_engine, PostgresEngine):
         seq: SequenceGenerator = PostgresSequenceGenerator(sequence_name)
     else:
         seq = LocalSequenceGenerator(get_first_callback)
 
-    if table:
+    if table and not db_is_fresh:
         assert id_column
         seq.check_consistency(
             db_conn=db_conn,

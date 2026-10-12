@@ -32,7 +32,7 @@ from twisted.internet import defer
 
 from synapse.api.auth.internal import InternalAuth
 from synapse.api.constants import EventTypes, Membership
-from synapse.api.room_versions import RoomVersions
+from synapse.api.room_versions import RoomVersion, RoomVersions
 from synapse.events import EventBase
 from synapse.events.snapshot import EventContext
 from synapse.state import (
@@ -122,6 +122,7 @@ class _DummyStore:
         self,
         event_id: str,
         room_id: str,
+        room_version: RoomVersion,
         prev_group: int | None,
         delta_ids: StateMap[str] | None,
         current_state_ids: StateMap[str] | None,
@@ -179,6 +180,9 @@ class _DummyStore:
         for event in event_ids:
             res[event] = self._event_to_state_group[event]
         return res
+
+    async def _get_state_group_for_event(self, event_id: str) -> int | None:
+        return self._event_to_state_group.get(event_id)
 
     async def get_state_for_groups(
         self, groups: Collection[int]
@@ -606,6 +610,7 @@ class StateTestCase(unittest.TestCase):
             self.dummy_store.store_state_group(
                 prev_event_id,
                 event.room_id,
+                RoomVersions.V1,
                 None,
                 None,
                 {(e.type, e.state_key): e.event_id for e in old_state},
@@ -644,6 +649,7 @@ class StateTestCase(unittest.TestCase):
             self.dummy_store.store_state_group(
                 prev_event_id,
                 event.room_id,
+                RoomVersions.V1,
                 None,
                 None,
                 {(e.type, e.state_key): e.event_id for e in old_state},
@@ -849,6 +855,7 @@ class StateTestCase(unittest.TestCase):
             self.dummy_store.store_state_group(
                 prev_event_id_1,
                 event.room_id,
+                RoomVersions.V1,
                 None,
                 None,
                 {(e.type, e.state_key): e.event_id for e in old_state_1},
@@ -861,6 +868,7 @@ class StateTestCase(unittest.TestCase):
             self.dummy_store.store_state_group(
                 prev_event_id_2,
                 event.room_id,
+                RoomVersions.V1,
                 None,
                 None,
                 {(e.type, e.state_key): e.event_id for e in old_state_2},

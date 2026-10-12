@@ -1,0 +1,33 @@
+--
+-- This file is licensed under the Affero General Public License (AGPL) version 3.
+--
+-- Copyright (C) 2026 Element Creations Ltd
+--
+-- This program is free software: you can redistribute it and/or modify
+-- it under the terms of the GNU Affero General Public License as published by
+-- the Free Software Foundation, either version 3 of the License, or (at your
+-- option) any later version.
+--
+-- See the GNU Affero General Public License for more details:
+-- <https://www.gnu.org/licenses/agpl-3.0.html>.
+
+CREATE TABLE IF NOT EXISTS state_hamt_nodes (
+    structural_hash BLOB PRIMARY KEY,
+    node_bytes BLOB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS state_hamt_roots (
+    state_group BIGINT PRIMARY KEY,
+    room_prefix BLOB NOT NULL,
+    root_structural_hash BLOB NOT NULL,
+    -- See the .postgres delta for the rationale: the retained LtHash
+    -- lattice, distinct from the collapsed state_group_id digest, needed
+    -- to apply a later incremental update against this root.
+    root_lattice BLOB,
+    published BOOLEAN NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS state_hamt_pending_nodes (
+    structural_hash BLOB PRIMARY KEY,
+    node_bytes BLOB NOT NULL
+);

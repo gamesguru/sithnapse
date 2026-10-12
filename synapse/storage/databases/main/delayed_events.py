@@ -112,6 +112,25 @@ class DelayedEventsStore(SQLBaseStore):
             columns=("delay_id",),
             unique=True,
         )
+        self.db_pool.updates.register_background_index_update(
+            update_name="delayed_events_send_ts_idx",
+            index_name="delayed_events_send_ts",
+            table="delayed_events",
+            columns=("send_ts",),
+        )
+        self.db_pool.updates.register_background_index_update(
+            update_name="delayed_events_is_processed_idx",
+            index_name="delayed_events_is_processed",
+            table="delayed_events",
+            columns=("is_processed",),
+        )
+        self.db_pool.updates.register_background_index_update(
+            update_name="delayed_events_room_state_event_idx",
+            index_name="delayed_events_room_state_event_idx",
+            table="delayed_events",
+            columns=("room_id", "event_type", "state_key"),
+            where_clause="state_key IS NOT NULL",
+        )
 
     async def get_delayed_events_stream_pos(self) -> int:
         """
@@ -302,19 +321,16 @@ class DelayedEventsStore(SQLBaseStore):
             "restart_delayed_event", restart_delayed_event_txn
         )
 
-    async def get_count_of_delayed_events(self) -> int:
-        """Returns the number of pending delayed events in the DB."""
+    async def have_delayed_events(self) -> bool:
+        """Whether there are any delayed-event rows in the DB."""
 
-        def _get_count_of_delayed_events(txn: LoggingTransaction) -> int:
-            sql = "SELECT count(*) FROM delayed_events"
-
-            txn.execute(sql)
-            resp = txn.fetchone()
-            return resp[0] if resp is not None else 0
+        def _have_delayed_events(txn: LoggingTransaction) -> bool:
+            txn.execute("SELECT 1 FROM delayed_events LIMIT 1")
+            return txn.fetchone() is not None
 
         return await self.db_pool.runInteraction(
-            "get_count_of_delayed_events",
-            _get_count_of_delayed_events,
+            "have_delayed_events",
+            _have_delayed_events,
         )
 
     async def get_delayed_event_for_user(

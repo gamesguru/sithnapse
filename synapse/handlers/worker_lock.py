@@ -305,6 +305,11 @@ class WaitingLock:
     ) -> bool | None:
         assert self._inner_lock
 
+        # Notify waiters before releasing the database row. Notifying only
+        # after `__aexit__` returns ties waiter wakeup latency to the full
+        # release path (which is slow and contended under mtxdb); waiters then
+        # cross their retry budget and fail in lockstep. Waking early lets the
+        # acquisition attempt overlap the release instead.
         self.handler.notify_lock_released(self.lock_name, self.lock_key)
 
         try:
@@ -415,6 +420,8 @@ class WaitingMultiLock:
     ) -> bool | None:
         assert self._inner_lock_cm
 
+        # Notify waiters before releasing the database rows, so their wakeup
+        # latency does not depend on the full release path (see WaitingLock).
         for lock_name, lock_key in self.lock_names:
             self.handler.notify_lock_released(lock_name, lock_key)
 

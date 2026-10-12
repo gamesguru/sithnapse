@@ -1,6 +1,6 @@
-from unittest import TestCase as StdlibTestCase
-
 import yaml
+
+from twisted.trial import unittest
 
 from synapse.config import ConfigError
 from synapse.config._base import RootConfig
@@ -17,7 +17,7 @@ DEFAULT_PREJOIN_STATE_PAIRS = {
 }
 
 
-class TestRoomPrejoinState(StdlibTestCase):
+class TestRoomPrejoinState(unittest.TestCase):
     def read_config(self, source: str) -> ApiConfig:
         config = ApiConfig(RootConfig())
         config.read_config(yaml.safe_load(source))

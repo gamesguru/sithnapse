@@ -143,6 +143,21 @@ class KeyConfig(Config):
             config.get("key_refresh_interval", "1d")
         )
 
+        # MSC4499: negative caching / exponential backoff for failed remote
+        # signing-key fetches. Defaults match the MSC's suggested floor/cap
+        # (1 minute .. 1 hour); overridable so conformance tests don't have to
+        # sleep for a real minute to observe backoff being applied and cleared.
+        self.key_fetch_backoff_floor_ms = self.parse_duration(
+            config.get("key_fetch_backoff_floor", "1m")
+        )
+        self.key_fetch_backoff_ceiling_ms = self.parse_duration(
+            config.get("key_fetch_backoff_ceiling", "1h")
+        )
+        if self.key_fetch_backoff_floor_ms > self.key_fetch_backoff_ceiling_ms:
+            raise ConfigError(
+                "key_fetch_backoff_floor must be <= key_fetch_backoff_ceiling"
+            )
+
         suppress_key_server_warning = config.get("suppress_key_server_warning", False)
         key_server_signing_keys_path = config.get("key_server_signing_keys_path")
         if key_server_signing_keys_path:

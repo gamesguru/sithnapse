@@ -1,5 +1,10 @@
 use std::convert::Infallible;
 
+// Kept as a direct dependency only to pin its version for our MSRV floor (see
+// the note in `rust/Cargo.toml`), so it is never referenced from the source.
+// The `as _` import keeps only the version pin while satisfying Cargo's
+// unused-dependency lint.
+use getrandom as _;
 use lazy_static::lazy_static;
 use pyo3::prelude::*;
 use pyo3_log::ResetHandle;
@@ -7,6 +12,7 @@ use pyo3_log::ResetHandle;
 pub mod acl;
 pub mod canonical_json;
 pub mod config;
+pub mod database;
 pub mod deferred;
 pub mod duration;
 pub mod errors;
@@ -26,6 +32,8 @@ pub mod rendezvous;
 pub mod room_versions;
 pub mod runtime;
 pub mod segmenter;
+pub mod state_hamt;
+pub mod state_res;
 pub mod storage;
 pub mod twisted_dispatch;
 pub mod types;
@@ -85,7 +93,10 @@ fn synapse_rust(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     msc4388_rendezvous::register_module(py, m)?;
     segmenter::register_module(py, m)?;
     room_versions::register_module(py, m)?;
+    state_hamt::register_module(py, m)?;
+    state_res::register_module(py, m)?;
     types::register_module(py, m)?;
+    database::register_module(py, m)?;
 
     Ok(())
 }
