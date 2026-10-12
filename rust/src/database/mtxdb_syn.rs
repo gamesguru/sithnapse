@@ -1255,12 +1255,13 @@ mod room_index {
         Ok(dir.join(format!("index-{shard:02x}.bin")))
     }
 
-    fn legacy_index_path(namespace: &str) -> PyResult<std::path::PathBuf> {
+    fn legacy_index_path(
+        namespace_digest: &[u8; NAMESPACE_DIGEST_LEN],
+    ) -> PyResult<std::path::PathBuf> {
         let dir = ROOM_INDEX_DIR
             .get()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("mtxdb not opened"))?;
-        let namespace_hash = Sha256::digest(namespace.as_bytes());
-        Ok(dir.join(format!("{}.bin", hex::encode(&namespace_hash[..16]))))
+        Ok(dir.join(format!("{}.bin", hex::encode(namespace_digest))))
     }
 
     fn namespace_digest(namespace: &str) -> [u8; NAMESPACE_DIGEST_LEN] {
@@ -1443,19 +1444,24 @@ mod room_index {
         }
         // Read compatibility for databases written before the shared file
         // format. New writes never create another per-namespace file.
-        let legacy = legacy_index_path(namespace)
-            .ok()
-            .and_then(|path| File::open(path).ok());
-        if let Some(file) = legacy {
-            for (index, state_group) in state_groups.iter().enumerate() {
-                if out[index].is_some() {
-                    continue;
-                }
-                let mut record = [0u8; ROOM_PREFIX_LEN];
-                let offset = (*state_group as u64).saturating_mul(ROOM_PREFIX_LEN as u64);
-                if file.read_exact_at(&mut record, offset).is_ok() && record.iter().any(|&b| b != 0)
-                {
-                    out[index] = Some(record.to_vec());
+        // Skipped entirely when the shared-file scan above resolved
+        // everything: the legacy open would only return NotFound.
+        if out.iter().any(Option::is_none) {
+            let legacy = legacy_index_path(&namespace_digest)
+                .ok()
+                .and_then(|path| File::open(path).ok());
+            if let Some(file) = legacy {
+                for (index, state_group) in state_groups.iter().enumerate() {
+                    if out[index].is_some() {
+                        continue;
+                    }
+                    let mut record = [0u8; ROOM_PREFIX_LEN];
+                    let offset = (*state_group as u64).saturating_mul(ROOM_PREFIX_LEN as u64);
+                    if file.read_exact_at(&mut record, offset).is_ok()
+                        && record.iter().any(|&b| b != 0)
+                    {
+                        out[index] = Some(record.to_vec());
+                    }
                 }
             }
         }
@@ -1616,6 +1622,54 @@ mod room_index {
                 get_many(other, &[0]).expect("get other"),
                 vec![Some(b"OTHERPFX".to_vec())]
             );
+        }
+
+        #[test]
+        fn legacy_per_namespace_file_is_still_readable() {
+            use std::io::Write as _;
+
+            super::super::auth_chain_closure_tests::ensure_open();
+            let ns = "ns-legacy-compat";
+            let dir = ROOM_INDEX_DIR.get().expect("room_index dir");
+            std::fs::create_dir_all(dir).expect("room_index dir");
+
+            // Build the pre-shared-format filename the way the old writer
+            // did -- hex(sha256(namespace)[..16]) + ".bin" -- independently
+            // of legacy_index_path, so this pins byte-compatibility with
+            // files written before the shared shard existed.
+            let legacy_name = format!("{}.bin", hex::encode(&Sha256::digest(ns.as_bytes())[..16]));
+            let legacy_path = dir.join(&legacy_name);
+            let record = *b"LEGACY01";
+            let mut contents = vec![0u8; ROOM_PREFIX_LEN * 43];
+            contents[ROOM_PREFIX_LEN * 42..ROOM_PREFIX_LEN * 43].copy_from_slice(&record);
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&legacy_path)
+                .and_then(|mut f| f.write_all(&contents))
+                .expect("write legacy file");
+
+            *PREFIX_CACHE.lock().expect("no poison") = None;
+
+            // A group only the legacy file has still reads back...
+            assert_eq!(
+                get_many(ns, &[42]).expect("read legacy"),
+                vec![Some(record.to_vec())]
+            );
+            // ...but a group neither store has stays a miss.
+            assert_eq!(get_many(ns, &[43]).expect("miss"), vec![None]);
+
+            // A shared-shard write wins over the stale legacy record, and
+            // put() never rewrites the per-namespace file.
+            put(ns, &[(42, b"SHARED02".to_vec())]).expect("put");
+            *PREFIX_CACHE.lock().expect("no poison") = None;
+            assert_eq!(
+                get_many(ns, &[42]).expect("read shared"),
+                vec![Some(b"SHARED02".to_vec())]
+            );
+
+            std::fs::remove_file(&legacy_path).expect("remove legacy file");
         }
 
         #[test]
