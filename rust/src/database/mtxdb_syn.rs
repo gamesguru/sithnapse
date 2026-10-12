@@ -1284,8 +1284,10 @@ mod room_index {
     /// three pools proper.
     static DIRTY: Mutex<Option<HashSet<u8>>> = Mutex::new(None);
 
-    fn shard_for(namespace: &str) -> u8 {
-        namespace_digest(namespace)[0] % SHARD_COUNT
+    /// Shard for a namespace, from its already-computed digest. Callers hash
+    /// the namespace once and pass the digest down rather than re-hashing it.
+    fn shard_for(digest: &[u8; NAMESPACE_DIGEST_LEN]) -> u8 {
+        digest[0] % SHARD_COUNT
     }
 
     fn index_path(shard: u8, create: bool) -> PyResult<std::path::PathBuf> {
@@ -1317,8 +1319,7 @@ mod room_index {
         out
     }
 
-    fn cached_handle(namespace: &str, create: bool) -> PyResult<Option<std::sync::Arc<File>>> {
-        let shard = shard_for(namespace);
+    fn cached_handle(shard: u8, create: bool) -> PyResult<Option<std::sync::Arc<File>>> {
         let key = (shard, create);
         let mut guard = HANDLES
             .lock()
@@ -1354,8 +1355,9 @@ mod room_index {
         if entries.is_empty() {
             return Ok(());
         }
-        let mut file = cached_handle(namespace, true)?.expect("create=true never returns None");
         let namespace_digest = namespace_digest(namespace);
+        let shard = shard_for(&namespace_digest);
+        let mut file = cached_handle(shard, true)?.expect("create=true never returns None");
         for (state_group, room_prefix) in entries {
             let mut record = [0u8; RECORD_LEN];
             record[..INDEX_MAGIC.len()].copy_from_slice(&INDEX_MAGIC);
@@ -1374,7 +1376,7 @@ mod room_index {
             .lock()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}")))?
             .get_or_insert_with(HashSet::new)
-            .insert(shard_for(namespace));
+            .insert(shard);
         let mut cache = PREFIX_CACHE
             .lock()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}")))?;
@@ -1417,7 +1419,8 @@ mod room_index {
             return Ok(out);
         }
         let wanted: HashSet<i64> = missing.iter().map(|&(_, group)| group).collect();
-        let shared_records = cached_handle(namespace, false)?.and_then(|file| {
+        let namespace_digest = namespace_digest(namespace);
+        let shared_records = cached_handle(shard_for(&namespace_digest), false)?.and_then(|file| {
             let length = file.metadata().ok()?.len();
             let length = usize::try_from(length).ok()?;
             let mut bytes = vec![0u8; length];
@@ -1432,7 +1435,6 @@ mod room_index {
             }
             Some(bytes)
         });
-        let namespace_digest = namespace_digest(namespace);
         let mut found = HashMap::new();
         if let Some(bytes) = shared_records {
             for record in bytes.chunks_exact(RECORD_LEN) {
