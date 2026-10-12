@@ -47,12 +47,17 @@ _FFI_LATENCIES: dict[str, deque[float]] = defaultdict(
     lambda: deque(maxlen=_FFI_LATENCY_LIMIT)
 )
 _DIAGNOSTIC_TIMINGS_SUPPRESSED = 0
+# Read once at import time (the pattern state/bg_updates.py and
+# database.py already use): re-running os.environ.get() on every
+# diagnostic call is a measurable per-event cost. Set the variable before
+# the process starts; tests toggle counting via enable_ffi_counting().
+_PG_TIMINGS_ENABLED: bool = bool(os.environ.get("SYNAPSE_PG_TIMINGS"))
 _FFI_TIMING_LOCK: "threading.Lock | None" = (
-    threading.Lock() if os.environ.get("SYNAPSE_PG_TIMINGS") else None
+    threading.Lock() if _PG_TIMINGS_ENABLED else None
 )
 
 _ffi_timings_file: IO[str] | None = None
-if os.environ.get("SYNAPSE_PG_TIMINGS"):
+if _PG_TIMINGS_ENABLED:
     _ffi_timings_path = os.environ.get("SYNAPSE_PG_TIMINGS_FILE")
     if _ffi_timings_path:
         try:
@@ -70,7 +75,7 @@ def _ffi_timings_print(*args: object) -> None:
 
 
 def ffi_timing(tag: str, elapsed: float) -> None:
-    if not os.environ.get("SYNAPSE_PG_TIMINGS") or _DIAGNOSTIC_TIMINGS_SUPPRESSED:
+    if not _PG_TIMINGS_ENABLED or _DIAGNOSTIC_TIMINGS_SUPPRESSED:
         return
     lock = _FFI_TIMING_LOCK
     if lock is not None:
@@ -113,7 +118,7 @@ def ffi_count(tag: str, count: int) -> None:
     Tests may activate counting via the enable_ffi_counting() context manager.
     """
     if _DIAGNOSTIC_TIMINGS_SUPPRESSED or (
-        not _ffi_counting_enabled and not os.environ.get("SYNAPSE_PG_TIMINGS")
+        not _ffi_counting_enabled and not _PG_TIMINGS_ENABLED
     ):
         return
     lock = _FFI_TIMING_LOCK
@@ -132,7 +137,7 @@ def _count_sync_origin(kind: str, pools: Iterable[Pool] | None = None) -> None:
     site issues the barriers (coalescer flush vs an explicit ``sync_now`` vs a
     direct ``maybe_sync``) and for which pools.
     """
-    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+    if not _PG_TIMINGS_ENABLED:
         return
     frame = sys._getframe(2)
     this_file = __file__
@@ -188,7 +193,7 @@ def enable_ffi_counting() -> Iterator[None]:
 
 def ffi_batch_size(tag: str, size: int) -> None:
     """Record an opt-in batch-size sample for FFI diagnostics."""
-    if not os.environ.get("SYNAPSE_PG_TIMINGS") or _DIAGNOSTIC_TIMINGS_SUPPRESSED:
+    if not _PG_TIMINGS_ENABLED or _DIAGNOSTIC_TIMINGS_SUPPRESSED:
         return
     lock = _FFI_TIMING_LOCK
     if lock is not None:
@@ -231,7 +236,7 @@ def start_reactor_lag_probe(
     in Trial's reactor (which its per-test leak check would correctly reject).
     """
     global _reactor_lag_probe_started
-    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+    if not _PG_TIMINGS_ENABLED:
         return None
     if _reactor_lag_probe_started:
         return None
@@ -323,7 +328,7 @@ def lock_wait_timing(lock: threading.Lock, tag: str) -> Iterator[None]:
     Recorded as `lock_wait_<tag>` and `lock_hold_<tag>` in the FFI timing
     report. No timing calls are made unless SYNAPSE_PG_TIMINGS is enabled.
     """
-    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+    if not _PG_TIMINGS_ENABLED:
         with lock:
             yield
         return
@@ -340,7 +345,7 @@ def lock_wait_timing(lock: threading.Lock, tag: str) -> Iterator[None]:
 
 
 def _print_ffi_timings() -> None:
-    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+    if not _PG_TIMINGS_ENABLED:
         return
     lock = _FFI_TIMING_LOCK
     if lock is None:
@@ -543,7 +548,7 @@ def _print_ffi_timings() -> None:
         _ffi_timings_print("")
 
 
-if os.environ.get("SYNAPSE_PG_TIMINGS"):
+if _PG_TIMINGS_ENABLED:
 
     def flush_ffi_timings() -> None:
         _print_ffi_timings()
@@ -991,7 +996,7 @@ def mirror_timing(tag: str) -> Iterator[None]:
     No-op (near-zero overhead: one dict lookup, no timer read) when
     `SYNAPSE_PG_TIMINGS` isn't set, same as `ffi_timing`.
     """
-    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+    if not _PG_TIMINGS_ENABLED:
         yield
         return
     start = time.monotonic()
@@ -1185,7 +1190,7 @@ def record_commit_phases() -> None:
     zero; a total that went backwards is taken as a fresh start. Diagnostics
     only: a no-op unless `SYNAPSE_PG_TIMINGS` is set.
     """
-    if not os.environ.get("SYNAPSE_PG_TIMINGS"):
+    if not _PG_TIMINGS_ENABLED:
         return
     from synapse.synapse_rust.mtxdb_engine import txn_commit_phases
 
