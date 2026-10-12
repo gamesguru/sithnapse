@@ -523,22 +523,58 @@ class BackgroundUpdater:
         if self._all_done:
             return True
 
-        # We now check if we have completed all pending background updates. We
-        # do this as once this returns True then it will set `self._all_done`
-        # and we can skip checking the database in future.
-        if await self.has_completed_background_updates():
-            return True
+        # Check both whether the queue is empty and whether any of the requested
+        # updates remain in one round trip. This is called from request paths
+        # which gate features on a small set of updates; doing a global pending
+        # check followed by a second query for those names doubles the SQL
+        # round trips while updates are pending.
+        update_names = tuple(update_names)
+        if len(update_names) > 900:
+            # Keep using the batching helper for unusually large collections,
+            # to stay below SQLite's bound-parameter limit.
+            if await self.has_completed_background_updates():
+                return True
+            rows = await self.db_pool.simple_select_many_batch(
+                table="background_updates",
+                column="update_name",
+                iterable=update_names,
+                retcols=("update_name",),
+                desc="get_uncompleted_background_updates",
+            )
+            return not bool(rows)
 
-        rows = await self.db_pool.simple_select_many_batch(
-            table="background_updates",
-            column="update_name",
-            iterable=update_names,
-            retcols=("update_name",),
-            desc="get_uncompleted_background_updates",
+        requested_update_clause = (
+            "update_name IN (" + ", ".join("?" for _ in update_names) + ")"
+            if update_names
+            else "FALSE"
         )
 
-        # If we find any rows then we've not completed the update.
-        return not bool(rows)
+        def check_updates_txn(txn: Cursor) -> tuple[bool, bool]:
+            txn.execute(
+                "SELECT EXISTS(SELECT 1 FROM background_updates), "
+                f"EXISTS(SELECT 1 FROM background_updates WHERE {requested_update_clause})",
+                update_names,
+            )
+            row = txn.fetchone()
+            assert row is not None
+            return bool(row[0]), bool(row[1])
+
+        has_any_updates, has_requested_updates = await self.db_pool.runInteraction(
+            "have_completed_background_updates",
+            check_updates_txn,
+            db_autocommit=True,
+        )
+
+        if not has_any_updates:
+            # Preserve the distinction between an empty queue and a currently
+            # running update whose row has just been deleted but whose handler
+            # has not yet cleared `_current_background_update`.
+            if self._current_background_update:
+                return not has_requested_updates
+            self._all_done = True
+            return True
+
+        return not has_requested_updates
 
     async def do_next_background_update(self, sleep: bool = True) -> bool:
         """Does some amount of work on the next queued background update

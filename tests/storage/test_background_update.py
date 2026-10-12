@@ -58,6 +58,32 @@ class BackgroundUpdateTestCase(unittest.HomeserverTestCase):
         )
         self.store = self.hs.get_datastores().main
 
+    def test_have_completed_background_updates(self) -> None:
+        self.get_success(
+            self.store.db_pool.simple_insert(
+                "background_updates",
+                values={"update_name": "test_update", "progress_json": "{}"},
+            )
+        )
+        # Simulate a worker which has not yet observed the newly queued update.
+        self.updates._all_done = False
+
+        self.assertFalse(
+            self.get_success(
+                self.updates.have_completed_background_updates(("test_update",))
+            )
+        )
+        # An unrelated pending update does not block a feature gated on a
+        # different update; an empty requested set is likewise complete.
+        self.assertTrue(
+            self.get_success(
+                self.updates.have_completed_background_updates(("other_update",))
+            )
+        )
+        self.assertTrue(
+            self.get_success(self.updates.have_completed_background_updates(()))
+        )
+
     async def update(self, progress: JsonDict, count: int) -> int:
         fake_work_duration = Duration(seconds=1)
         await self.clock.sleep(fake_work_duration)
