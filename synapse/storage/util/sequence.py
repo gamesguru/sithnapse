@@ -106,6 +106,9 @@ class PostgresSequenceGenerator(SequenceGenerator):
         return fetch_res[0]
 
     def get_next_mult_txn(self, txn: Cursor, n: int) -> list[int]:
+        if n == 1:
+            return [self.get_next_id_txn(txn)]
+
         txn.execute(
             "SELECT nextval(?) FROM generate_series(1, ?)", (self._sequence_name, n)
         )

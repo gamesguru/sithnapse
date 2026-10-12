@@ -54,6 +54,16 @@ from tests.unittest import HomeserverTestCase, TestCase
 from tests.utils import USE_POSTGRES_FOR_TESTS
 
 
+class PostgresSequenceGeneratorTestCase(TestCase):
+    def test_get_next_mult_txn_uses_scalar_query_for_one_id(self) -> None:
+        txn = mock.Mock()
+        txn.fetchone.return_value = (42,)
+        generator = PostgresSequenceGenerator("test_sequence")
+
+        self.assertEqual(generator.get_next_mult_txn(txn, 1), [42])
+        txn.execute.assert_called_once_with("SELECT nextval(?)", ("test_sequence",))
+
+
 class MultiWriterIdGeneratorBase(HomeserverTestCase):
     positive: bool = True
     tables: list[str] = ["foobar"]
