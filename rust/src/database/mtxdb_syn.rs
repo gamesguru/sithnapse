@@ -1162,70 +1162,20 @@ pub fn refresh_state_hamt_collections_for_groups(
     })
 }
 
-/// A flat, direct-offset `state_group -> room_prefix` index: entry N lives
-/// at byte offset `N * ROOM_PREFIX_LEN` in a per-namespace file under
-/// `<embedded_hamt_path>/room_index/<namespace_hash>.bin`. Exists so
-/// `_fetch_hamt_roots_for_embedded_txn` (bg_updates.py) -- which only ever
-/// has a bare `state_group` int, by design, and needs to resolve which
-/// room's mtxdb collection to look a root up in -- doesn't have to touch
-/// SQL or a shared PackfileStorage collection (whose per-write clone cost
-/// scales with the server's *total* state-group count, the exact problem
-/// this index exists to avoid). `state_group` is a small, dense, sequential
-/// integer (not a content hash), so direct offset addressing needs no hash
-/// table, no clone, and no rebuild -- write and read are both a single
-/// syscall at a computed offset.
+/// A room-index file is an append-only log shared by namespaces assigned to
+/// the same shard. Each record stores a namespace digest, state-group id,
+/// and room prefix. `get_many` scans backward in chunks so the newest record
+/// wins and recent lookups can stop once all requested groups are found; an
+/// in-process bounded LRU avoids repeat scans for recently seen mappings.
+/// Legacy per-namespace files remain read-compatible. Writes mark their
+/// shard dirty so `sync()` only syncs shards that received records.
 ///
-/// Three invariants this design depends on, stated explicitly:
-///
-/// 1. **Concurrent multi-worker writes need no locking.** Different
-///    workers write disjoint `state_group` ids (ids are allocated once,
-///    server-wide, by `_state_group_seq_gen`, never reused), so their
-///    `pwrite`s land at disjoint, non-overlapping byte ranges. POSIX
-///    requires no coordination between writers of non-overlapping regions
-///    of the same regular file. Unlike `ShardPool`, this file needs no
-///    `WriterLock`: two writers can never target the same offset.
-/// 2. **All-zero is a valid "not (yet) written" sentinel, not ambiguous
-///    with a real value.** A real `room_prefix` is derived from a hashed
-///    `room_id` (`state_hamt.room_hamt_prefix`), so the chance of a
-///    genuine value being `ROOM_PREFIX_LEN` zero bytes is negligible
-///    (~2^-64) -- a smaller but still negligible margin than the 2^-128
-///    this file relies on elsewhere (`kv_node_id`, `chain_node_id`, both
-///    full 16-byte hashes) for the same kind of hash-derived id. A reader
-///    that sees all-zero (sparse-file default, or a `pwrite` mid-flight and
-///    not yet reflected) treats it as a miss. `pwrite`/`pread` of one
-///    `ROOM_PREFIX_LEN`-byte value, well within a single page, is applied
-///    atomically at the page-cache level on Linux -- a concurrent reader
-///    observes either the complete old or complete new value, never a torn
-///    mix.
-/// 3. **This index has the same bounded durability window as the rest of
-///    the embedded engine, not a weaker one.** There is no per-write
-///    fsync here (matching the engine-wide move away from per-write
-///    fsyncs -- see `_periodic_embedded_sync`): a crash can lose a very
-///    recent mapping along with the root record it points to, since both
-///    are written in the same uncommitted window. That's consistent, not
-///    a new gap -- the root itself has no stronger guarantee in that same
-///    window. A resulting miss for a group still inside the
-///    `EMBEDDED_HAMT_MIGRATION_UPDATE_NAME` window falls through to
-///    `_fetch_hamt_roots_for_embedded_txn`'s SQL fallback, same as a
-///    genuine migration-window miss.
-///
-/// **Outside that window, a miss does not degrade gracefully.** A
-/// missing or stale entry for an already-migrated, already-backfilled
-/// `state_group` is not a slower read and does not self-heal on the next
-/// read -- `_fetch_hamt_roots_for_embedded_txn` returns it as missing,
-/// and `_get_state_groups_from_groups_txn` (store.py) then raises
-/// `RuntimeError("State group(s) exist in SQL but have no HAMT root:
-/// ...")`, since a group with a SQL `state_groups` row and no HAMT root
-/// is treated as data corruption once both background updates have
-/// finished. This fails loud, not silently, but it is a hard failure,
-/// not a fallback. The only way an entry gets (re)written is a write
-/// through `put_room_index` (called from
-/// `_store_state_hamt_root_embedded_txn`) or a fresh run of the
-/// `state_hamt_backfill_roots` background update -- never a plain read.
-/// Anything that deletes or reinterprets this directory's files (e.g. a
-/// change to `RECORD_LEN`/the on-disk record layout, applied in place
-/// against files written under the old layout) hits this same failure
-/// mode for every group it doesn't happen to already cover.
+/// This index lets `_fetch_hamt_roots_for_embedded_txn` resolve a bare
+/// `state_group` id to its room's mtxdb collection without querying SQL or
+/// cloning a shared PackfileStorage collection. A missing mapping during
+/// migration can use the caller's SQL fallback. After migration, a missing
+/// mapping is treated as data corruption by the caller, so the index format
+/// and its backfill/update paths must remain consistent.
 mod room_index {
     use std::collections::{HashMap, HashSet};
     use std::fs::{File, OpenOptions};
@@ -1261,8 +1211,9 @@ mod room_index {
     const PREFIX_CACHE_CAPACITY: usize = 100_000;
 
     #[allow(clippy::type_complexity)]
-    static PREFIX_CACHE: Mutex<Option<LruCache<(String, i64), [u8; ROOM_PREFIX_LEN]>>> =
-        Mutex::new(None);
+    static PREFIX_CACHE: Mutex<
+        Option<LruCache<([u8; NAMESPACE_DIGEST_LEN], i64), [u8; ROOM_PREFIX_LEN]>>,
+    > = Mutex::new(None);
 
     /// Handles are cached by fixed shard and access mode, never by namespace.
     /// A read-only lookup must never poison the writable handle used by `put`.
@@ -1390,22 +1341,82 @@ mod room_index {
             // Preserve the on-disk all-zero sentinel's miss semantics even
             // for a malformed caller-provided empty prefix.
             if record.iter().any(|&b| b != 0) {
-                cache.put((namespace.to_owned(), *state_group), record);
+                cache.put((namespace_digest, *state_group), record);
             }
         }
         Ok(())
     }
 
+    /// Records read per chunk when scanning a shard backwards.
+    const SCAN_CHUNK_RECORDS: usize = 2048;
+
+    /// Latest non-empty prefix for each wanted state group in this namespace.
+    ///
+    /// The shard is an append-only log shared by many namespaces, so the
+    /// newest record for a group wins. Scanning from the tail therefore lets a
+    /// lookup of recently written groups stop as soon as every wanted group is
+    /// found, instead of reading the whole file. A group that was never
+    /// written still costs a full scan, as before. A torn trailing partial
+    /// record is ignored, matching a forward `chunks_exact` scan.
+    fn scan_latest_prefixes(
+        file: &File,
+        namespace_digest: &[u8; NAMESPACE_DIGEST_LEN],
+        wanted: &HashSet<i64>,
+    ) -> HashMap<i64, [u8; ROOM_PREFIX_LEN]> {
+        let mut found = HashMap::new();
+        let Ok(length) = file.metadata().map(|m| m.len()) else {
+            return found;
+        };
+        let Ok(mut records_left) = usize::try_from(length / RECORD_LEN as u64) else {
+            return found;
+        };
+        let mut buf = vec![0u8; SCAN_CHUNK_RECORDS * RECORD_LEN];
+        while records_left > 0 && found.len() < wanted.len() {
+            let chunk_records = records_left.min(SCAN_CHUNK_RECORDS);
+            let start = records_left - chunk_records;
+            let bytes = &mut buf[..chunk_records * RECORD_LEN];
+            if file
+                .read_exact_at(bytes, (start * RECORD_LEN) as u64)
+                .is_err()
+            {
+                break;
+            }
+            for record in bytes.chunks_exact(RECORD_LEN).rev() {
+                if record[..INDEX_MAGIC.len()] != INDEX_MAGIC
+                    || record[INDEX_MAGIC.len()..INDEX_MAGIC.len() + NAMESPACE_DIGEST_LEN]
+                        != *namespace_digest
+                {
+                    continue;
+                }
+                let group_start = INDEX_MAGIC.len() + NAMESPACE_DIGEST_LEN;
+                let group =
+                    i64::from_be_bytes(record[group_start..group_start + 8].try_into().unwrap());
+                if !wanted.contains(&group) || found.contains_key(&group) {
+                    continue;
+                }
+                let prefix_start = group_start + 8;
+                let mut prefix = [0u8; ROOM_PREFIX_LEN];
+                prefix.copy_from_slice(&record[prefix_start..prefix_start + ROOM_PREFIX_LEN]);
+                if prefix.iter().any(|&b| b != 0) {
+                    found.insert(group, prefix);
+                }
+            }
+            records_left = start;
+        }
+        found
+    }
+
     pub fn get_many(namespace: &str, state_groups: &[i64]) -> PyResult<Vec<Option<Vec<u8>>>> {
         let mut out: Vec<Option<Vec<u8>>> = vec![None; state_groups.len()];
         let mut missing = Vec::new();
+        let namespace_digest = namespace_digest(namespace);
         {
             let mut cache = PREFIX_CACHE.lock().map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}"))
             })?;
             if let Some(cache) = cache.as_mut() {
                 for (index, &state_group) in state_groups.iter().enumerate() {
-                    if let Some(room_prefix) = cache.get(&(namespace.to_owned(), state_group)) {
+                    if let Some(room_prefix) = cache.get(&(namespace_digest, state_group)) {
                         out[index] = Some(room_prefix.to_vec());
                     } else {
                         missing.push((index, state_group));
@@ -1419,44 +1430,9 @@ mod room_index {
             return Ok(out);
         }
         let wanted: HashSet<i64> = missing.iter().map(|&(_, group)| group).collect();
-        let namespace_digest = namespace_digest(namespace);
-        let shared_records = cached_handle(shard_for(&namespace_digest), false)?.and_then(|file| {
-            let length = file.metadata().ok()?.len();
-            let length = usize::try_from(length).ok()?;
-            let mut bytes = vec![0u8; length];
-            let mut offset = 0usize;
-            while offset < bytes.len() {
-                let count = file.read_at(&mut bytes[offset..], offset as u64).ok()?;
-                if count == 0 {
-                    bytes.truncate(offset);
-                    break;
-                }
-                offset += count;
-            }
-            Some(bytes)
-        });
-        let mut found = HashMap::new();
-        if let Some(bytes) = shared_records {
-            for record in bytes.chunks_exact(RECORD_LEN) {
-                if record[..INDEX_MAGIC.len()] != INDEX_MAGIC
-                    || record[INDEX_MAGIC.len()..INDEX_MAGIC.len() + NAMESPACE_DIGEST_LEN]
-                        != namespace_digest
-                {
-                    continue;
-                }
-                let group_start = INDEX_MAGIC.len() + NAMESPACE_DIGEST_LEN;
-                let group =
-                    i64::from_be_bytes(record[group_start..group_start + 8].try_into().unwrap());
-                if wanted.contains(&group) {
-                    let prefix_start = group_start + 8;
-                    let mut prefix = [0u8; ROOM_PREFIX_LEN];
-                    prefix.copy_from_slice(&record[prefix_start..prefix_start + ROOM_PREFIX_LEN]);
-                    if prefix.iter().any(|&b| b != 0) {
-                        found.insert(group, prefix);
-                    }
-                }
-            }
-        }
+        let found = cached_handle(shard_for(&namespace_digest), false)?
+            .map(|file| scan_latest_prefixes(&file, &namespace_digest, &wanted))
+            .unwrap_or_default();
         for (index, state_group) in missing {
             if let Some(prefix) = found.get(&state_group) {
                 out[index] = Some(prefix.to_vec());
@@ -1491,7 +1467,7 @@ mod room_index {
                 if let Some(value) = value {
                     let mut record = [0u8; ROOM_PREFIX_LEN];
                     record.copy_from_slice(value);
-                    cache.put((namespace.to_owned(), *state_group), record);
+                    cache.put((namespace_digest, *state_group), record);
                 }
             }
         }
@@ -1593,6 +1569,50 @@ mod room_index {
             // A later write must open a separate writable handle, rather than
             // reusing the read-only handle cached above.
             put(namespace, &[(10_002, b"ROOM5JKL".to_vec())]).expect("write after read");
+        }
+
+        #[test]
+        fn backward_scan_returns_newest_nonzero_prefix_across_chunks() {
+            use std::io::Write as _;
+
+            super::super::auth_chain_closure_tests::ensure_open();
+            let ns = "ns-backward-scan";
+            let other = "ns-backward-scan-other";
+
+            // More records than one scan chunk, interleaved with another
+            // namespace that may share the shard.
+            let total = (SCAN_CHUNK_RECORDS as i64) * 2 + 37;
+            for group in 0..total {
+                put(ns, &[(group, b"OLDPREFX".to_vec())]).expect("put");
+                put(other, &[(group, b"OTHERPFX".to_vec())]).expect("put other");
+            }
+            // Newest write wins; a later all-zero record must not erase it.
+            put(ns, &[(7, b"NEWPREFX".to_vec())]).expect("overwrite");
+            put(ns, &[(8, b"KEEPPFX1".to_vec())]).expect("put");
+            put(ns, &[(8, Vec::new())]).expect("zero record");
+            // A torn trailing partial record is ignored.
+            let digest = namespace_digest(ns);
+            let path = index_path(shard_for(&digest), false).expect("path");
+            OpenOptions::new()
+                .append(true)
+                .open(path)
+                .and_then(|mut f| f.write_all(b"torn"))
+                .expect("append torn tail");
+
+            *PREFIX_CACHE.lock().expect("no poison") = None;
+            let got = get_many(ns, &[0, 7, 8, total - 1, total + 5]).expect("get");
+            assert_eq!(got[0], Some(b"OLDPREFX".to_vec()));
+            assert_eq!(got[1], Some(b"NEWPREFX".to_vec()));
+            assert_eq!(got[2], Some(b"KEEPPFX1".to_vec()));
+            assert_eq!(got[3], Some(b"OLDPREFX".to_vec()));
+            assert_eq!(got[4], None, "never-written group is a miss");
+
+            // The other namespace's records are not returned for this one.
+            *PREFIX_CACHE.lock().expect("no poison") = None;
+            assert_eq!(
+                get_many(other, &[0]).expect("get other"),
+                vec![Some(b"OTHERPFX".to_vec())]
+            );
         }
 
         #[test]
