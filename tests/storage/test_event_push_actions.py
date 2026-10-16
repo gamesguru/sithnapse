@@ -26,7 +26,7 @@ from unittest.mock import patch
 
 from twisted.internet.testing import MemoryReactor
 
-from synapse.api.constants import MAIN_TIMELINE, RelationTypes
+from synapse.api.constants import MAIN_TIMELINE, EventContentFields, RelationTypes
 from synapse.rest import admin
 from synapse.rest.client import login, room
 from synapse.server import HomeServer
@@ -90,6 +90,7 @@ class EventPushActionsStoreTestCase(HomeserverTestCase):
             content={
                 "msgtype": "m.text",
                 "body": user_id,
+                EventContentFields.MENTIONS: {"user_ids": [user_id]},
                 "m.relates_to": {
                     "rel_type": RelationTypes.THREAD,
                     "event_id": first_event_id,
@@ -200,7 +201,13 @@ class EventPushActionsStoreTestCase(HomeserverTestCase):
             result = self.helper.send_event(
                 room_id,
                 type="m.room.message",
-                content={"msgtype": "m.text", "body": user_id if highlight else "msg"},
+                content={
+                    "msgtype": "m.text",
+                    "body": "msg",
+                    EventContentFields.MENTIONS: {"user_ids": [user_id]}
+                    if highlight
+                    else {},
+                },
                 tok=other_token,
             )
             nonlocal last_event_id
@@ -394,7 +401,13 @@ class EventPushActionsStoreTestCase(HomeserverTestCase):
             return self.helper.send_event(
                 room_id,
                 type="m.room.message",
-                content={"msgtype": "m.text", "body": user_id if highlight else "msg"},
+                content={
+                    "msgtype": "m.text",
+                    "body": "msg",
+                    EventContentFields.MENTIONS: {"user_ids": [user_id]}
+                    if highlight
+                    else {},
+                },
                 tok=other_token,
             )["event_id"]
 
@@ -441,7 +454,10 @@ class EventPushActionsStoreTestCase(HomeserverTestCase):
         def _send(thread_root: str | None = None, highlight: bool = False) -> str:
             content: JsonDict = {
                 "msgtype": "m.text",
-                "body": user_id if highlight else "msg",
+                "body": "msg",
+                EventContentFields.MENTIONS: {"user_ids": [user_id]}
+                if highlight
+                else {},
             }
             if thread_root is not None:
                 content["m.relates_to"] = {
@@ -894,7 +910,10 @@ class EventPushActionsStoreTestCase(HomeserverTestCase):
         def _create_event(highlight: bool = False, thread_id: str | None = None) -> str:
             content: JsonDict = {
                 "msgtype": "m.text",
-                "body": user_id if highlight else "msg",
+                "body": "msg",
+                EventContentFields.MENTIONS: {"user_ids": [user_id]}
+                if highlight
+                else {},
             }
             if thread_id:
                 content["m.relates_to"] = {
@@ -1074,7 +1093,10 @@ class EventPushActionsStoreTestCase(HomeserverTestCase):
         def _create_event(highlight: bool = False, thread_id: str | None = None) -> str:
             content: JsonDict = {
                 "msgtype": "m.text",
-                "body": user_id if highlight else "msg",
+                "body": "msg",
+                EventContentFields.MENTIONS: {"user_ids": [user_id]}
+                if highlight
+                else {},
             }
             if thread_id:
                 content["m.relates_to"] = {

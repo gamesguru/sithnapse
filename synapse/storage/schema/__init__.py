@@ -19,7 +19,7 @@
 #
 #
 
-SCHEMA_VERSION = 95  # remember to update the list below when updating
+SCHEMA_VERSION = 96  # remember to update the list below when updating
 """Represents the expectations made by the codebase about the database schema
 
 This should be incremented whenever the codebase changes its requirements on the
@@ -179,6 +179,12 @@ Changes in SCHEMA_VERSION = 94
     - Add an `inserted_ts` column to the `state_groups_persisting` table.
 
 Changes in SCHEMA_VERSION = 95
+    - MSC4140: Stop using the `delayed_events_stream_pos` table, now that
+      delayed state events are no longer canceled by more recent state events
+      sent from a different user.
+    - `event_edges.is_state` is no longer read from (it has not been written to since SCHEMA_VERSION 72).
+
+Changes in SCHEMA_VERSION = 96
     - Add tables to store HAMT roots and shared nodes for state groups.
     - Add `published` column and `state_hamt_pending_nodes` table for the
       publication bridge (removed once HAMT roots/nodes became
@@ -189,7 +195,6 @@ Changes in SCHEMA_VERSION = 95
       scoped to a user localpart (MSC4140).
     - Add the durable publication and rebuild-checkpoint tables for the
       embedded forward-edge index.
-
 """
 
 
@@ -198,7 +203,7 @@ SCHEMA_COMPAT_VERSION = (
     # configured, delayed-event IDs are globally unique rather than scoped to
     # a user localpart, and the embedded forward-edge publication bridge is
     # present.
-    95
+    96
 )
 """Limit on how far the synapse codebase can be rolled back without breaking db compat
 
