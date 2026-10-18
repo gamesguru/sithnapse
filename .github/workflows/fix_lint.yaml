@@ -11,7 +11,7 @@ env:
   # clippy correctly fixes up the benchmarks.
   #
   # Note: This should match the nightly rust version in `tests.yml`.
-  RUST_VERSION: nightly-2025-03-27
+  RUST_VERSION: nightly-2025-05-08
 
 jobs:
   fixup:

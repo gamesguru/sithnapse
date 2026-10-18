@@ -531,18 +531,12 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
-version = "0.16.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
-dependencies = [
- "foldhash 0.2.0",
-]
-
-[[package]]
-name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "foldhash 0.2.0",
+]
 
 [[package]]
 name = "headers"
@@ -1000,7 +994,7 @@ dependencies = [
 [[package]]
 name = "mtxdb"
 version = "0.1.0-beta.2"
-source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=refactor%2Fpack-id-store-layout#aa7e1979a552315e3144544124a8611eb9c1991a"
+source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=refactor%2Fpack-id-store-layout#e6ca95098e917a805dcd18f754100fdc131b5d76"
 dependencies = [
  "arc-swap",
  "blake3",
@@ -1362,11 +1356,11 @@ dependencies = [
 [[package]]
 name = "rezzy"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#1504cc760efeeb29c88e93662b754bec147dddf4"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#99ec54b687118705e4f0e41cfd2cd5b90b0365a0"
 dependencies = [
  "base64 0.23.1",
  "blake3",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
  "rezzy-json",
  "rezzy-recon",
  "sha2",
@@ -1375,7 +1369,7 @@ dependencies = [
 [[package]]
 name = "rezzy-json"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#1504cc760efeeb29c88e93662b754bec147dddf4"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#99ec54b687118705e4f0e41cfd2cd5b90b0365a0"
 dependencies = [
  "ryu",
 ]
@@ -1383,7 +1377,7 @@ dependencies = [
 [[package]]
 name = "rezzy-recon"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#1504cc760efeeb29c88e93662b754bec147dddf4"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#99ec54b687118705e4f0e41cfd2cd5b90b0365a0"
 dependencies = [
  "base64 0.23.1",
  "sha2",
@@ -1602,9 +1596,9 @@ dependencies = [
 
 [[package]]
 name = "sha2"
-version = "0.11.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4"
+checksum = "47d7069beb7d6ac7b9acd1039986e73443f24234f41074da099d6f994ac9ad19"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.1",

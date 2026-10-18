@@ -52,7 +52,7 @@ fn main() -> Result<(), std::io::Error> {
     let rustc_version = version_meta()
         .map(|v| v.short_version_string)
         .unwrap_or_else(|_| "unknown".to_string());
-    println!("cargo:rustc-env=SYNAPSE_RUSTC_VERSION={}", rustc_version,);
+    println!("cargo:rustc-env=SYNAPSE_RUSTC_VERSION={rustc_version}",);
 
     // The default rules don't pick up trivial changes to the workspace config
     // files, but we need to rebuild if those change to pick up the changed

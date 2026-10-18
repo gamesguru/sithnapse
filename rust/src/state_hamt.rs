@@ -886,14 +886,14 @@ pub(crate) fn materialize_from_node_map(
     let root_node = node_map
         .get(root_hash)
         .cloned()
-        .ok_or_else(|| format!("Missing persisted HAMT root node: {:02x?}", root_hash))?;
+        .ok_or_else(|| format!("Missing persisted HAMT root node: {root_hash:02x?}"))?;
 
     let mut entries = Vec::new();
     let mut resolver = |hash: &StructuralHash| -> Result<Arc<HamtNode<String, String>>, String> {
         node_map
             .get(hash)
             .cloned()
-            .ok_or_else(|| format!("Missing persisted HAMT node: {:02x?}", hash))
+            .ok_or_else(|| format!("Missing persisted HAMT node: {hash:02x?}"))
     };
 
     root_node.visit_entries(&mut resolver, &mut |key, value| {
@@ -915,14 +915,14 @@ fn pack_materialized_from_node_map(
     let root_node = node_map
         .get(root_hash)
         .cloned()
-        .ok_or_else(|| format!("Missing persisted HAMT root node: {:02x?}", root_hash))?;
+        .ok_or_else(|| format!("Missing persisted HAMT root node: {root_hash:02x?}"))?;
     let mut output = vec![PACKED_ENTRIES_FORMAT, 0, 0, 0, 0];
     let mut count = 0u32;
     let mut resolver = |hash: &StructuralHash| {
         node_map
             .get(hash)
             .cloned()
-            .ok_or_else(|| format!("Missing persisted HAMT node: {:02x?}", hash))
+            .ok_or_else(|| format!("Missing persisted HAMT node: {hash:02x?}"))
     };
     root_node.visit_entries(&mut resolver, &mut |key, value| {
         let (event_type, state_key): (String, String) = serde_json::from_str(key)
@@ -1015,7 +1015,7 @@ fn lookup_from_node_map_preencoded_into<S: StateEntrySink>(
     let root_node = node_map
         .get(root_hash)
         .cloned()
-        .ok_or_else(|| format!("Missing persisted HAMT root node: {:02x?}", root_hash))?;
+        .ok_or_else(|| format!("Missing persisted HAMT root node: {root_hash:02x?}"))?;
     let mut missing = HashSet::new();
 
     for ((event_type, state_key), key) in keys.iter().zip(encoded_keys) {
@@ -1499,8 +1499,7 @@ pub fn reachability_audit(
             hash.and_then(|hash| {
                 node_map.get(&hash).cloned().ok_or_else(|| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "Missing HAMT root node: {:02x?}",
-                        hash
+                        "Missing HAMT root node: {hash:02x?}"
                     ))
                 })
             })
@@ -1515,7 +1514,7 @@ pub fn reachability_audit(
         node_map
             .get(hash)
             .cloned()
-            .ok_or_else(|| format!("Missing persisted HAMT node: {:02x?}", hash))
+            .ok_or_else(|| format!("Missing persisted HAMT node: {hash:02x?}"))
     };
 
     let audit = rezzy::hamt::bitmap_node_reachability_audit(roots, universe, &mut resolver)

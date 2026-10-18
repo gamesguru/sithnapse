@@ -37,8 +37,7 @@ impl std::fmt::Display for PerUserExperimentalFeature {
             // Serialize so we can use the serde name of the variant as the source of truth
             serde_json::to_string(self)
                 .unwrap_or_else(|err| format!(
-                    "<unable to serialize PerUserExperimentalFeature::{:?} to get display value: {}>",
-                    self, err
+                    "<unable to serialize PerUserExperimentalFeature::{self:?} to get display value: {err}>"
                 ))
                 // Remove the surrounding quotes from JSON serialization
                 .trim_matches('"')

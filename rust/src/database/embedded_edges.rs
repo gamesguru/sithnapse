@@ -851,8 +851,7 @@ fn write_edges(
             .ok_or_else(|| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
                     "forward-edge node id collision while batching parent reads \
-                         (collection {:02x?}, node {:02x?})",
-                    room_collection, forward_node
+                         (collection {room_collection:02x?}, node {forward_node:02x?})"
                 ))
             })?;
 

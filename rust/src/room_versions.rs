@@ -367,7 +367,7 @@ impl FromStr for &'static RoomVersion {
             "org.matrix.msc3757.11" => Ok(&RoomVersion::MSC3757V11),
             "org.matrix.hydra.11" => Ok(&RoomVersion::HYDRA_V11),
             "org.matrix.msc4242.12" => Ok(&RoomVersion::MSC4242V12),
-            _ => Err(anyhow::anyhow!("Unknown room version: {}", s)),
+            _ => Err(anyhow::anyhow!("Unknown room version: {s}")),
         }
     }
 }

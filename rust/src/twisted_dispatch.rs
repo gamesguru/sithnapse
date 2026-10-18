@@ -159,7 +159,7 @@ impl TwistedDispatchReader {
                     //
                     // We can't do much here except log the error and break out
                     // of the loop.
-                    error!("Error reading from wakeup socket: {:?}", err);
+                    error!("Error reading from wakeup socket: {err:?}");
                     break;
                 }
             }
@@ -234,10 +234,7 @@ impl TwistedDispatchReader {
                 Ok(Err(err)) => {
                     // Log an error if setting the logcontexts in the dispatched
                     // Rust completion fails.
-                    log::error!(
-                        "error setting logcontexts in dispatched Rust completion: {}",
-                        err
-                    );
+                    log::error!("error setting logcontexts in dispatched Rust completion: {err}");
                 }
                 Err(err) => {
                     // Log an error if the dispatched Rust completion panicked.

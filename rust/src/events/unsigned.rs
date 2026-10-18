@@ -121,7 +121,7 @@ impl Unsigned {
     #[new]
     fn py_new(unsigned_json: &str) -> PyResult<Self> {
         let inner = serde_json::from_str(unsigned_json)
-            .map_err(|err| PyValueError::new_err(format!("Failed to parse unsigned: {}", err)))?;
+            .map_err(|err| PyValueError::new_err(format!("Failed to parse unsigned: {err}")))?;
 
         Ok(Self {
             inner: Arc::new(RwLock::new(inner)),
