@@ -1229,6 +1229,13 @@ run_one_pattern() {
 
 main "$@"
 
+# `--build-only` returns from main after building the images. The test runner
+# and its result handling live below main, so stop here instead of falling
+# through into them with no test results to report.
+if [ -n "$skip_complement_run" ]; then
+  exit 0
+fi
+
 test_start_seconds=$SECONDS
 TEST_EXIT_CODE=0
 _active_producer=""
