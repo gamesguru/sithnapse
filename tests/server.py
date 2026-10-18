@@ -1608,6 +1608,10 @@ class ThreadedMemoryReactorClock(MemoryReactorClock):
             # main thread.
             super().advance(0)
 
+        # Don't keep the last thread callback (and everything its closure
+        # references) alive via this frame, in case a retained child frame pins it.
+        callback = None  # type: ignore[assignment]
+
         # Now poll anything registered with `addReader`. A real reactor does
         # this in its poll loop, but `MemoryReactor` only stores the readers, so
         # results from Rust futures (see `TwistedDispatch`) would never reach

@@ -594,7 +594,10 @@ class EventPushActionsStoreTestCase(HomeserverTestCase):
         def _send(thread_root: str | None = None, highlight: bool = False) -> str:
             content: JsonDict = {
                 "msgtype": "m.text",
-                "body": user_id if highlight else "msg",
+                "body": "msg",
+                EventContentFields.MENTIONS: {"user_ids": [user_id]}
+                if highlight
+                else {},
             }
             if thread_root is not None:
                 content["m.relates_to"] = {
