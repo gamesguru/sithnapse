@@ -1541,7 +1541,7 @@ mod room_index {
 
             // Many namespaces share the same physical index file and handle.
             for i in 0..256 {
-                put(&format!("ns-lru-rot-{}", i), &[(1, b"ROOM2XYZ".to_vec())]).expect("put rot");
+                put(&format!("ns-lru-rot-{i}"), &[(1, b"ROOM2XYZ".to_vec())]).expect("put rot");
             }
 
             {

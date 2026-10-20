@@ -469,7 +469,14 @@ async def _resolve_conflicted_set_with_rust(
     unavailable or raises. The fallback is logged at error level so a genuine
     Rust/Python divergence is not silently masked.
     """
-    if room_version.state_res in (
+    # MSC4242 state DAG rooms use the Python resolver for now. They declare
+    # state resolution v2.1, but rezzy's v2.1 auth checks do not model the state
+    # DAG (it has a separate V2_2 mode that this binding does not select), so
+    # the Rust path wrongly rejects a state event whose `prev_state_events`
+    # chain runs through an event superseded within the conflicted set, e.g. one
+    # learned through backfill. See
+    # `BackfilledStateDagEventTests.test_backfilled_state_events_update_current_state`.
+    if not room_version.msc4242_state_dags and room_version.state_res in (
         StateResolutionVersions.V2,
         StateResolutionVersions.V2_1,
     ):

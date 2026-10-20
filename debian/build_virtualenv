@@ -64,7 +64,6 @@ RUSTC_BOOTSTRAP=1 dh_virtualenv \
     --builtin-venv \
     --python "$SNAKE" \
     --upgrade-pip \
-    --preinstall="lxml" \
     --preinstall="mock" \
     --preinstall="wheel" \
     --extra-pip-arg="--no-deps" \

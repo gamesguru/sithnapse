@@ -96,6 +96,7 @@ fn synapse_rust(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     acl::register_module(py, m)?;
     logging::context::register_module(py, m)?;
     deferred::register_module(py, m)?;
+    database::register_module(py, m)?;
     push::register_module(py, m)?;
     events::register_module(py, m)?;
     handlers::register_module(py, m)?;
@@ -108,7 +109,6 @@ fn synapse_rust(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     state_hamt::register_module(py, m)?;
     state_res::register_module(py, m)?;
     types::register_module(py, m)?;
-    database::register_module(py, m)?;
 
     Ok(())
 }
