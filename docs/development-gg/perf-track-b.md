@@ -66,3 +66,29 @@ Unverified. Candidates: the 4-worker tokio runtime started lazily per homeserver
 `taskset` for Postgres. First check whether tests start the runtime at all;
 pinning can starve Synapse or Postgres if cores are split badly. Measure with
 alternating A/B runs and `compare_trial_logs.py`.
+
+## Multiple event writers and the mtxdb owner (design constraints for B2 and B4)
+
+Today `synapse/storage/databases/state/store.py:193` opens mtxdb writable on
+every instance in `writers.events`. mtxdb's writable open takes an exclusive
+lock, so a second events writer cannot open it. Supporting several SQL event
+writers needs a separate mtxdb owner setting in worker configuration and
+routing of every mtxdb mutation to it over acknowledged replication.
+
+- Routing does not make mtxdb writes faster: it adds an RPC hop and queues all
+  mtxdb writes at one owner. Its only benefit is letting several event writers do
+  SQL work in parallel, and nothing measured shows the single events writer is
+  saturated. Treat it as a scaling option.
+- Keep one shared mtxdb database with one writing process; each process reads
+  through its read-only handle and the shared journal refresh. A database per
+  event writer would need fan-out and merge reads, so it is rejected.
+- Read-after-write: a process must not acknowledge a write and then serve a
+  stale local read. Define a visibility barrier (the acknowledgement carries a
+  position the reader waits for) before implementing.
+- Crash gap: the SQL commit and the owner's mtxdb write cannot commit
+  atomically. Needs a durable retry or reconciliation path (the B2 outbox) or a
+  stated fallback to SQL.
+- Verify: owner restart, duplicate requests, updates from different event
+  writers, reader visibility.
+- The alternative, multi-process writes inside mtxdb (coordinated WAL appends,
+  commits and publication), is a much larger mtxdb project.
