@@ -940,6 +940,12 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
+      # `cargo test` builds without pyo3's `extension-module` feature, so it
+      # links the test binaries against libpython. The runner's system Python
+      # ships without its development library ("cannot find -lpython3.12").
+      - name: Install libpython development files
+        run: sudo apt-get install -y --no-install-recommends python3-dev
+
       - run: cargo test --locked
 
   # We want to ensure that the cargo benchmarks still compile, which requires a
@@ -960,6 +966,10 @@ jobs:
         with:
           toolchain: ${{ env.RUST_NIGHTLY_VERSION }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # Linking the bench binaries needs libpython; see `cargo-test` above.
+      - name: Install libpython development files
+        run: sudo apt-get install -y --no-install-recommends python3-dev
 
       # RUSTUP_TOOLCHAIN outranks both `rustup default` and any toolchain
       # file, so pinning it here guarantees this step compiles the
