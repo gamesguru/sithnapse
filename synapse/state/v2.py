@@ -503,8 +503,10 @@ async def _resolve_conflicted_set_with_rust(
                 list(full_conflicted_set),
                 event_map,
                 # Pass the actual room version so rezzy can select V2.2 for
-                # MSC4242 state-DAG rooms.
-                room_version.identifier,
+                # MSC4242 state-DAG rooms. `state_res_version` is the fallback
+                # for room versions rezzy does not recognise.
+                room_version=room_version.identifier,
+                state_res_version=room_version.state_res,
             )
             logger.debug(
                 "[gg-state-timing] state_v2_rust_resolve "

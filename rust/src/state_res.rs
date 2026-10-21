@@ -558,7 +558,8 @@ fn py_to_lean_event(py_ev: &Bound<'_, PyAny>) -> PyResult<LeanEvent<String, Reso
         base_state,
         conflicted_event_ids,
         event_map,
-        room_version = "10",
+        room_version = None,
+        state_res_version = 2,
     )
 )]
 pub fn resolve_v2_via_lattice_fold<'py>(
@@ -566,7 +567,8 @@ pub fn resolve_v2_via_lattice_fold<'py>(
     base_state: Bound<'py, PyDict>,
     conflicted_event_ids: Bound<'py, PyAny>,
     event_map: Bound<'py, PyDict>,
-    room_version: &str,
+    room_version: Option<&str>,
+    state_res_version: i32,
 ) -> PyResult<Bound<'py, PyDict>> {
     let parsed_events = parse_event_map(event_map)?;
     resolve_v2_from_parsed_events(
@@ -575,6 +577,7 @@ pub fn resolve_v2_via_lattice_fold<'py>(
         conflicted_event_ids,
         &parsed_events,
         room_version,
+        state_res_version,
     )
 }
 
@@ -594,12 +597,33 @@ fn parse_event_map(
     Ok(parsed_events)
 }
 
+/// Pick the rezzy algorithm: rezzy's own mapping from the room version when it
+/// recognises it (this is how MSC4242 gets V2.2, which Synapse calls v2.1), and
+/// otherwise Synapse's `StateResolutionVersions` value, so room versions rezzy
+/// has never heard of (e.g. `org.matrix.msc3757.10`) resolve as before.
+fn rezzy_state_res_version(
+    room_version: Option<&str>,
+    state_res_version: i32,
+) -> PyResult<StateResVersion> {
+    if let Some(version) = room_version.and_then(StateResVersion::from_room_version) {
+        return Ok(version);
+    }
+    match state_res_version {
+        2 => Ok(StateResVersion::V2),
+        3 => Ok(StateResVersion::V2_1),
+        _ => Err(pyo3::exceptions::PyValueError::new_err(
+            "unsupported state resolution version",
+        )),
+    }
+}
+
 fn resolve_v2_from_parsed_events<'py>(
     py: Python<'py>,
     base_state: Bound<'py, PyDict>,
     conflicted_event_ids: Bound<'py, PyAny>,
     parsed_events: &HashMap<String, LeanEvent<String, ResolverContent>>,
-    room_version: &str,
+    room_version: Option<&str>,
+    state_res_version: i32,
 ) -> PyResult<Bound<'py, PyDict>> {
     let mut base_state_map = SharedState::new();
     for (k, v) in base_state.iter() {
@@ -618,11 +642,9 @@ fn resolve_v2_from_parsed_events<'py>(
 
     // Auth checking over the conflicted subgraph is pure Rust on owned data;
     // release the GIL so other Python workers keep running while it resolves.
-    // Let rezzy map the actual room version to its algorithm. This matters for
-    // MSC4242: Synapse represents it as V2.1, while rezzy maps its identifier
-    // to the V2.2 state-DAG algorithm.
-    let rezzy_version = StateResVersion::from_room_version(room_version)
-        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("unsupported room version"))?;
+    // This matters for MSC4242: Synapse represents it as V2.1, while rezzy maps
+    // its identifier to the V2.2 state-DAG algorithm.
+    let rezzy_version = rezzy_state_res_version(room_version, state_res_version)?;
     let resolved = py.detach(|| {
         resolve_semilattice_fold(
             &base_state_map,

@@ -36,7 +36,12 @@ from parameterized import parameterized
 from twisted.internet import defer
 
 from synapse.api.constants import EventTypes, JoinRules, Membership
-from synapse.api.room_versions import RoomVersion, RoomVersions
+from synapse.api.room_versions import (
+    KNOWN_ROOM_VERSIONS,
+    RoomVersion,
+    RoomVersions,
+    StateResolutionVersions,
+)
 from synapse.event_auth import auth_types_for_event
 from synapse.events import EventBase
 from synapse.state.v2 import (
@@ -708,6 +713,73 @@ class StateTestCase(unittest.TestCase):
         self.flushLoggedErrors(RuntimeError)
 
         self.assertEqual(dict(rust_result), dict(python_result))
+
+    @parameterized.expand(
+        [
+            (room_version.identifier,)
+            for room_version in (
+                *KNOWN_ROOM_VERSIONS.values(),
+                RoomVersions.MSC4242v12,
+            )
+            if room_version.state_res
+            in (StateResolutionVersions.V2, StateResolutionVersions.V2_1)
+        ]
+    )
+    @unittest.skip_unless(HAVE_RUST_STATE_RES, "synapse_rust.state_res unavailable")
+    def test_rust_accepts_every_room_version(self, room_version_id: str) -> None:
+        """The Rust resolver must accept every room version that Synapse routes to
+        it, including ones rezzy has never heard of (it falls back to the
+        `state_res_version` number for those). Otherwise every resolution in such
+        a room logs an error and silently drops to the slow Python path."""
+        import synapse.synapse_rust.state_res as rust_res
+
+        room_version = KNOWN_ROOM_VERSIONS.get(room_version_id, RoomVersions.MSC4242v12)
+
+        self.assertEqual(
+            rust_res.resolve_v2_via_lattice_fold(
+                {},
+                [],
+                {},
+                room_version=room_version_id,
+                state_res_version=room_version.state_res,
+            ),
+            {},
+        )
+
+    @unittest.skip_unless(HAVE_RUST_STATE_RES, "synapse_rust.state_res unavailable")
+    def test_rust_rejects_unknown_room_version_and_state_res(self) -> None:
+        """With a room version rezzy does not know and no usable fallback number,
+        the Rust resolver refuses rather than guessing an algorithm."""
+        import synapse.synapse_rust.state_res as rust_res
+
+        with self.assertRaises(ValueError):
+            rust_res.resolve_v2_via_lattice_fold(
+                {}, [], {}, room_version="not.a.room.version", state_res_version=99
+            )
+
+    @unittest.skip_unless(HAVE_RUST_STATE_RES, "synapse_rust.state_res unavailable")
+    def test_rust_used_for_room_version_unknown_to_rezzy(self) -> None:
+        """`HydraV11` is not a room version rezzy recognises. It must still be
+        resolved by Rust (via the `state_res_version` fallback), not by the
+        Python fallback."""
+        import synapse.synapse_rust.state_res as rust_res
+
+        self._build_cache_scenario()
+        state_sets = [self._state("PA", "T1"), self._state("PA", "T2")]
+
+        real = rust_res.resolve_v2_via_lattice_fold
+        results: list[Any] = []
+
+        def spy(*args: Any, **kwargs: Any) -> Any:
+            # An exception here would be caught and logged by the caller, which
+            # trial reports as a failure, but record the outcome explicitly too.
+            results.append(real(*args, **kwargs))
+            return results[-1]
+
+        with mock.patch.object(rust_res, "resolve_v2_via_lattice_fold", spy):
+            self._resolve_with_cache(V21_ROOM, state_sets, {})
+
+        self.assertEqual(len(results), 1, "expected exactly one Rust resolution")
 
     def build_event_graph(
         self,

@@ -21,5 +21,6 @@ def resolve_v2_via_lattice_fold(
     base_state: dict[tuple[str, str], str],
     conflicted_event_ids: Iterable[str],
     event_map: dict[str, Any],
-    room_version: str = "10",
+    room_version: str | None = None,
+    state_res_version: int = 2,
 ) -> dict[tuple[str, str], str]: ...
