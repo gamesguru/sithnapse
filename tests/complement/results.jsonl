@@ -696,9 +696,9 @@
 {"Action":"pass","Test":"TestPartialStateJoin/joined_members_blocks_during_partial_state_join"}
 {"Action":"pass","Test":"TestPollsLocalPushRules"}
 {"Action":"pass","Test":"TestPollsLocalPushRules/Polls_push_rules_are_correctly_presented_to_the_client"}
-{"Action":"fail","Test":"TestPollsPushGatewayNotifications"}
-{"Action":"skip","Test":"TestPollsPushGatewayNotifications/Poll_response_does_not_trigger_a_push_gateway_notification"}
-{"Action":"fail","Test":"TestPollsPushGatewayNotifications/Poll_start_triggers_a_push_gateway_notification"}
+{"Action":"pass","Test":"TestPollsPushGatewayNotifications"}
+{"Action":"pass","Test":"TestPollsPushGatewayNotifications/Poll_response_does_not_trigger_a_push_gateway_notification"}
+{"Action":"pass","Test":"TestPollsPushGatewayNotifications/Poll_start_triggers_a_push_gateway_notification"}
 {"Action":"pass","Test":"TestPowerLevels"}
 {"Action":"pass","Test":"TestPowerLevels/GET_/rooms/:room_id/state/m.room.power_levels_can_fetch_levels"}
 {"Action":"pass","Test":"TestPowerLevels/PUT_/rooms/:room_id/state/m.room.power_levels_can_set_levels"}
