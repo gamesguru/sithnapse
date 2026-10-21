@@ -424,10 +424,10 @@ def _print_table_ops() -> None:
             f"p99={percentile(0.99) * 1000:.3f}ms  "
             f"max={samples[-1] * 1000:.3f}ms"
         )
-        _timings_print("  top transactions by scheduling delay:")
+        _timings_print("  transactions by scheduling delay (all labels):")
         for label, (label_total, label_calls) in sorted(
             scheduling_by_label.items(), key=lambda kv: kv[1][0], reverse=True
-        )[:15]:
+        ):
             _timings_print(
                 f"  {label_total * 1000:10.1f}ms  calls={int(label_calls):>8,d}  "
                 f"avg={label_total * 1000 / label_calls:7.3f}ms  {label}"

@@ -479,12 +479,12 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                 f"max={sql_scheduling_samples[-1] * 1000:.3f}ms  "
                 f"samples={len(sql_scheduling_samples):,} (capped per process)"
             )
-            out("  top transactions by scheduling delay:")
+            out("  transactions by scheduling delay (all labels):")
             for label, (label_total, label_calls) in sorted(
                 sql_scheduling_by_label.items(),
                 key=lambda kv: kv[1][0],
                 reverse=True,
-            )[:15]:
+            ):
                 out(
                     f"  {label_total * 1000:10.1f}ms  calls={int(label_calls):>8,d}  "
                     f"avg={label_total * 1000 / label_calls:7.3f}ms  {label}"
