@@ -1079,8 +1079,11 @@ class PersistEventsStore:
                 self.database_engine, "prev_event_id", batch
             )
 
+            _t = time.monotonic()
             txn.execute(sql + clause, args)
             rows = txn.fetchall()
+            ffi_timing("persist_prevs_sql_exec", time.monotonic() - _t)
+            ffi_count("persist_prevs_sql_rows", len(rows))
             if not rows:
                 return
 
@@ -1104,9 +1107,12 @@ class PersistEventsStore:
                     results.append(prev_event_id)
 
         for chunk in batch_iter(event_ids, 100):
+            _t = time.monotonic()
             await self.db_pool.runInteraction(
                 "_get_events_which_are_prevs", _get_events_which_are_prevs_txn, chunk
             )
+            ffi_timing("persist_prevs_total", time.monotonic() - _t)
+            ffi_count("persist_prevs_candidates", len(chunk))
 
         return results
 
@@ -1159,8 +1165,11 @@ class PersistEventsStore:
                     self.database_engine, "event_id", to_recursively_check
                 )
 
+                _t = time.monotonic()
                 txn.execute(sql + clause, args)
                 rows = txn.fetchall()
+                ffi_timing("persist_rejected_sql_exec", time.monotonic() - _t)
+                ffi_count("persist_rejected_sql_rows", len(rows))
                 to_recursively_check = []
 
                 missing_meta_ids = [
@@ -1192,9 +1201,12 @@ class PersistEventsStore:
                         existing_prevs.add(prev_event_id)
 
         for chunk in batch_iter(event_ids, 100):
+            _t = time.monotonic()
             await self.db_pool.runInteraction(
                 "_get_prevs_before_rejected", _get_prevs_before_rejected_txn, chunk
             )
+            ffi_timing("persist_rejected_total", time.monotonic() - _t)
+            ffi_count("persist_rejected_candidates", len(chunk))
 
         return existing_prevs
 
