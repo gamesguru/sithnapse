@@ -1,7 +1,15 @@
 # Family 4 map: `event_edges`, `edge_index_outbox`, `room_edge_source_version`
 
-Read-only dependency map for B2 family 4 (see `perf-track-b.md`). Nothing here
-is implemented. Line numbers are from the tree at the time of writing.
+Dependency map for B2 family 4 (see `perf-track-b.md`). Only the measurement
+labels are implemented (`a912896dd7`). Line numbers are from the tree at the
+time of writing.
+
+**Model.** Edges are derived from each event's immutable `prev_events`. The
+snapshot, version gate and outbox exist only because SQL is the authority and
+mtxdb a mirror. With mtxdb authoritative, an event's body and edges commit in
+one mtxdb transaction; there is no snapshot, version gate or outbox, and no
+automatic recovery scan. The accepted crash trade is a manual repair tool that
+re-derives edges from event bodies.
 
 This family already has a detailed plan:
 `res/docs/2026-09-28-event-edges-sql-removal-plan.md` (cutover gates, strict
@@ -81,82 +89,85 @@ Hot path means it runs per persisted event or per request in a normal workload.
 `events.py:1480` also carries a comment about edges not being written to SQL or
 the embedded engine in one case; check it when the insert is removed.
 
+## Measured: the persist-path reads dominate
+
+Run: `tests.storage` only (787 tests, `-j4`, sync off, pin `f41d02a`; 25
+processes, summed SQL 57.2 s). Not a full-suite or federation workload, and
+storage tests are persist-heavy, so do not scale it up.
+
+| Label              | Calls | SQL exec | Total await | Candidates | Rows  |
+| ------------------ | ----- | -------- | ----------- | ---------- | ----- |
+| `persist_prevs`    | 2,371 | 1.33 s   | 1.99 s      | 5,102      | 8     |
+| `persist_rejected` | 2,029 | 0.97 s   | 1.62 s      | 2,808      | 1,927 |
+| combined           | 4,400 | 2.30 s   | 3.61 s      |            |       |
+
+- `event_edges` had 6,590 SQL calls (2.48 s); the INSERT ran 2,082 times. These
+  two queries are about two thirds of the calls, so reads dominate and removing
+  the duplicate write alone saves little. Table attribution is approximate.
+- About 1.3 s (36%) of the 3.6 s is outside statement execution (pool and
+  overhead); an FFI call avoids that part.
+- Pool scheduling delay per query is not known: both fall below the 15-entry
+  "top scheduling delay" cutoff.
+- About 1.4% of wall time here (3.6 s over 4 jobs in 66.6 s).
+- `persist_prevs` returned 8 rows for 5,102 candidates: nearly every call finds
+  nothing. A forward-children lookup (`ffi_event_edges_get_forward`, about 0.04
+  ms) would answer almost all of them. Hypothesis, not measured on the
+  replacement.
+
+## Replacement plan
+
+1. **`_get_events_which_are_prevs`.** One batched call in the Synapse Rust
+   binding over mtxdb: candidate ids in, forward children out; read
+   `internal_metadata` and rejections only for candidates that have children.
+   Keep the SQL path as fallback until measured.
+2. **`_get_prevs_before_rejected`.** After the above, once the filter inputs are
+   verified (below). Returns many rows, so it needs the full filter.
+3. Add an mtxdb API only if the binding cannot batch these reads efficiently.
+
+Unverified inputs: whether `internal_metadata` in mtxdb is always current with
+`events.outlier` (de-outlier path, `events.py` ~1435-1497) and populated for old
+events; whether the rejection mirror is complete (`mirror_get_rejections` ran
+only 9 times, so it is barely exercised).
+
 ## What this means for cutover
 
-1. **The persist-path reads are the real blocker.**
-   `_get_events_which_are_prevs` and `_get_prevs_before_rejected` run on every
-   persist, join four tables, and have no mtxdb path. Removing the SQL INSERT
-   without replacing them leaves them reading an empty table. They also join
+1. **The persist-path reads are the blocker.** Removing the SQL INSERT without
+   replacing them leaves them reading an empty table. They also join
    `event_json` (family 3), so families 3 and 4 are coupled here.
-2. **Replacing them is the expensive part.** They need the event's outlier flag,
-   internal metadata and rejection status. Options: (a) keep `event_edges` in
-   SQL for these queries (then nothing is removed), (b) have mtxdb return prevs
-   and do the filter against the already-loaded event cache in Python, (c) add
-   an mtxdb range call. None is designed or measured.
-3. **Backfill, purge and partial-state readers are rare**, but they use SQL
-   joins with `events` and `event_backward_extremities`. They also need a Python
-   or mtxdb path, or a defined "unsupported in embedded mode" answer.
-4. **Duplicate-write saving is real but small.** Only the write share of the
-   18.3 s table time and the outbox 4.5 s go away at cutover, and the reads
-   remain until item 1 is solved.
-
-## Rebuild, purge, restart, read-only workers
-
-- **Rebuild.** `rebuild_room_forward_index` takes a snapshot from SQL
-  `event_edges` JOIN `events` at `room_edge_source_version` V, builds a new
-  forward-index generation, then replays outbox rows after V. At cutover there
-  is no SQL snapshot, so rebuild must read canonical prev_events from event JSON
-  (the backward-edge record or the event body in mtxdb) and has no V or outbox
-  to catch up against. A rebuild that races live writes then needs a different
-  consistency rule (for example the single writer pausing edge writes for the
-  room, or rebuilding from a log position). That rule is not designed.
-- **Purge.** `delete_event_edges_batch` already deletes mtxdb edges for purged
-  events. Today the SQL purge writes a delete outbox row first
-  (`record_edge_index_deletes_txn`). At cutover it needs only the mtxdb delete,
-  and the plan notes purge was found to be already correct. Prune the
-  `event_edges` entry from the purge table loop. `remove_many` (B3) is a
-  separate decision.
-- **Restart and crash gap.** Today the outbox covers a crash between the SQL
-  commit and the post-commit mtxdb write
-  (`txn.call_after(put_event_edges_batch, ...)`). Without it, an event can be
-  committed to SQL (`events`) with no edges. This is the shared "failure gap"
-  constraint in `perf-track-b.md`. The mtxdb-authoritative answer must be that
-  edges are derivable from the event body: on writer startup, find events newer
-  than the last durable edge position and re-derive them. That recovery scan
-  does not exist.
-- **Read-only workers.** Already covered by the freshness plan: strict publish
-  signal (`mtxdb@af82b409`), `synapse_event_edges_publish_signal_active` and
-  `synapse_event_edges_reads_total`. Open items there: append-to-existing-parent
-  partial-hit test, backward-edge liveness, production callers through Python,
-  and the migration-completion authority gate (not enforced by
-  `event_edges_fwd_is_authoritative`).
-- **Write routing.** `_handle_mult_prev_events` writes mtxdb only when
-  `_embedded_event_edges_writable` (events writer). That matches the single
-  writer today. The shared multi-writer constraint in `perf-track-b.md` applies
-  only if more than one SQL event writer is configured.
+2. **Backfill, purge and partial-state readers are rare** but use SQL joins with
+   `events` and `event_backward_extremities`. They need a Python or mtxdb path,
+   or a defined "unsupported in embedded mode" answer.
+3. **Rebuild** becomes a manual repair tool that re-derives edges from event
+   bodies. There is no snapshot, version or outbox to catch up against.
+4. **Purge.** `delete_event_edges_batch` already deletes mtxdb edges; drop the
+   `record_edge_index_deletes_txn` outbox/version writes and the `event_edges`
+   entry from the purge table loop.
+5. **Restart / crash gap.** An event can be committed to SQL `events` with no
+   edges if the process dies before the mtxdb commit. Accepted; the repair tool
+   covers it. No startup scan.
+6. **Read-only workers** are covered by the freshness plan (publish signal
+   `mtxdb@af82b409`, `synapse_event_edges_*` metrics); its migration-completion
+   gate is not enforced by `event_edges_fwd_is_authoritative`.
+7. **Write routing.** mtxdb is written only when
+   `_embedded_event_edges_writable` (the events writer); see the shared
+   single-writer constraint in `perf-track-b.md`.
 
 ## What disappears, by stage
 
-1. SQL fallback reads in `get_successor_events` and
-   `is_event_next_to_forward_gap`, plus `repair_edge_index_from_sql` and the
-   `room_edge_source_version` read on every gated hit (per the target-clock
-   note). Requires the freshness gates in the removal plan.
+1. The `persist_prevs` and `persist_rejected` SQL joins (via the FFI lookup),
+   the SQL fallback in `get_successor_events` and
+   `is_event_next_to_forward_gap`, and `repair_edge_index_from_sql`.
 2. SQL INSERT into `event_edges`, `bump_room_edge_source_version`, the outbox
    INSERT, `record_edge_index_*` in purge, `drain_edge_index_outbox`, and the
-   rebuild's SQL snapshot and replay. Requires items 1 and 2 of "What this means
-   for cutover" to be solved, the startup check
+   snapshot/replay rebuild. Needs stage 1, the startup check
    (`EVENT_EDGES_SQL_INSERT_REMOVED = True`) and a rollback window.
-3. Table, tables `edge_index_outbox` and `room_edge_source_version`, schema
-   delta, background updates (`EVENT_EDGES_DROP_INVALID_ROWS`,
-   `EVENT_EDGES_REPLACE_INDEX`), stats and port-db entries.
+3. Tables `event_edges`, `edge_index_outbox`, `room_edge_source_version`, schema
+   delta, background updates, stats and port-db entries.
 
 ## Open questions
 
-- Are `_get_events_which_are_prevs` / `_get_prevs_before_rejected` inputs small
-  enough that a Python filter over mtxdb prevs beats the SQL join? Needs a
-  per-statement timing, not a guess.
-- How often do get_successor_events, backfill and get_missing_events run in the
-  Complement workload? The table time may sit mostly in the persist-path joins.
-- What is the recovery scan's position marker once the outbox is gone?
-- Does removing the table break any third-party module or admin API reading it?
-  Not checked.
+- Is the outlier flag in mtxdb always in step with `events.outlier`?
+- Full-suite cost of the two queries, and their pool scheduling delay.
+- How often do `get_successor_events`, backfill and `get_missing_events` run in
+  a federation workload?
+- Does removing the table break any third-party module or admin API?
