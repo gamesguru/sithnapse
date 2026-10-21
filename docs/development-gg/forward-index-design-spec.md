@@ -1,5 +1,11 @@
 # Design Specification: Forward-Index Engine (`embedded_edges.rs`)
 
+> **Superseded direction (pending revision).** This spec keeps SQL `event_edges`
+> authoritative and drains `edge_index_outbox` into mtxdb. The agreed direction
+> (`perf-track-b.md` B2) is mtxdb-authoritative edges rebuilt from canonical
+> event JSON, with the SQL edge write, outbox and version gate removed. Revise
+> this spec before implementing anything from it.
+
 ---
 
 ## 1. Overview & System Architecture

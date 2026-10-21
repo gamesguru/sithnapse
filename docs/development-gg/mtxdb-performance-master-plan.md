@@ -80,8 +80,12 @@ it is not required for the initial design.
 
 ## Design principles
 
-1. SQL remains the source of truth for data whose ordering and transactional
-   semantics have not been reproduced in mtxdb.
+1. Legacy baseline, not the agreed direction: SQL remains the source of truth
+   for data whose ordering and transactional semantics have not been reproduced
+   in mtxdb. For data migrated to mtxdb, mtxdb is the authority and duplicate
+   SQL writes are removed (see `perf-track-b.md` B2). Data that deliberately
+   stays SQL-authoritative keeps this rule, and only that data may use an SQL
+   outbox.
 2. mtxdb records must be refreshable by read-only workers without reopening the
    process or rebuilding the entire store.
 3. Every offload must have an explicit fallback and rebuild path.

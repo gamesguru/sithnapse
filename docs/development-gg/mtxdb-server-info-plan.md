@@ -60,24 +60,24 @@ schema (the first version of this document) is dropped.
 
 ## Mapping SQL semantics to the kinds (to confirm)
 
-| SQL today | mtxdb kind |
-|---|---|
-| `server_signature_keys` rows bound via a notary (`from_server != server_name`) | Provisional |
-| rows bound by a direct fetch (`from_server == server_name`) | Corroborated |
-| first-seen-wins reference of all keys ever bound | Historical |
-| `server_keys_json` (signed response, served by the notary endpoint) | Notary |
+| SQL today                                                                      | mtxdb kind   |
+| ------------------------------------------------------------------------------ | ------------ |
+| `server_signature_keys` rows bound via a notary (`from_server != server_name`) | Provisional  |
+| rows bound by a direct fetch (`from_server == server_name`)                    | Corroborated |
+| first-seen-wins reference of all keys ever bound                               | Historical   |
+| `server_keys_json` (signed response, served by the notary endpoint)            | Notary       |
 
 Open questions, to settle by reading the mtxdb payload contract and tests:
 
 - What is inside each payload (JSON? per-key-id map with `valid_until_ts`?).
   Per-origin records mean a read-modify-write of the whole origin record on
   every key refresh, inside one `DatabaseTransaction`.
-- `server_keys_json` is keyed `(server, key_id, from_server)` and holds one
-  row per fetch source. Notary is one record per origin. Check whether
+- `server_keys_json` is keyed `(server, key_id, from_server)` and holds one row
+  per fetch source. Notary is one record per origin. Check whether
   `get_all_server_keys_json_for_remote` and `remote_key_resource.py` need the
   per-`from_server` rows. If they do, Notary alone does not replace the table.
-- Does the first-seen-wins + provisional->corroborated transition (MSC4499
-  steps 1-4 above) fit as one transaction over those records?
+- Does the first-seen-wins + provisional->corroborated transition (MSC4499 steps
+  1-4 above) fit as one transaction over those records?
 
 ## Writer access (settled)
 
@@ -89,21 +89,22 @@ Open questions, to settle by reading the mtxdb payload contract and tests:
   (federation readers, the notary endpoint, the main process), not only on the
   events writer. So a direct mtxdb write is not possible from those processes.
 - Consequence for the design: key writes need a route to the single writer, or
-  key authority needs its own writer lock/role separate from the events
-  writer. Options to evaluate: (a) a replication command or HTTP replication
-  endpoint that forwards `store_server_keys_response` to the writer; (b) a
-  distinct `ServerInfo` writer process lock (the pool is separate from state);
-  (c) keep SQL as the write path for non-writer processes during migration.
-  This choice comes before any Rust API work.
+  key authority needs its own writer lock/role separate from the events writer.
+  Options to evaluate: (a) a replication command or HTTP replication endpoint
+  that forwards `store_server_keys_response` to the writer; (b) a distinct
+  `ServerInfo` writer process lock (the pool is separate from state); (c) keep
+  SQL as the write path for non-writer processes during migration. This choice
+  comes before any Rust API work.
 
 ## Repo and pin
 
-- Synapse pins mtxdb `dev@f41d02a91bb58f1aa91abeadde8ed549297b3e05` (Cargo.lock).
-- That commit is not in the local `../mtxdb` clone (it is on
-  `laptop/lru-cache`, unrelated). Before any mtxdb change: fetch, confirm the
-  key model is present at the pin, and cut a dedicated branch from exactly that
-  commit. Keep Synapse's pin aligned with that branch's commit. If the pin
-  predates `6a489d5`, decide explicitly whether to include it.
+- Synapse pins mtxdb `dev@f41d02a91bb58f1aa91abeadde8ed549297b3e05`
+  (Cargo.lock).
+- That commit is not in the local `../mtxdb` clone (it is on `laptop/lru-cache`,
+  unrelated). Before any mtxdb change: fetch, confirm the key model is present
+  at the pin, and cut a dedicated branch from exactly that commit. Keep
+  Synapse's pin aligned with that branch's commit. If the pin predates
+  `6a489d5`, decide explicitly whether to include it.
 
 ## Steps
 
