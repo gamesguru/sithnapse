@@ -1634,12 +1634,10 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         mtxdb's per-call `LossyIndex` clone across the whole batch the same
         way `_store_state_hamt_nodes_txn`'s `put_many` already does for
         nodes, instead of paying that clone once per one-pair call. The
-        room-index write is not deferred alongside it: it's a single
-        append to a shared shard file with no clone cost to amortize, so
-        there's nothing to gain by batching it, and eagerly writing it keeps
-        `_fetch_hamt_roots_for_embedded_txn` able to resolve a state
-        group's room immediately after this call returns rather than only
-        after the batch's deferred root flush. The caller is responsible
+        room-index write is deferred and batched with it: a per-group append
+        to the shared shard files contended with their fsyncs (~0.5 ms each),
+        so the flush writes one `put_room_index` call, ahead of the roots.
+        The caller is responsible
         for the deferred root write and for keeping `local_roots` (already
         used for mid-transaction visibility -- see
         `_persist_state_hamt_txn`'s docstring) in sync in the meantime.
@@ -1660,14 +1658,16 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             if self._embedded_db_engine == "mtxdb":
                 self._assert_embedded_db_writer()
                 engine = get_embedded_engine(self._embedded_db_engine)
-                # Written eagerly, ahead of root_value itself when
-                # pending_room_roots defers the latter: if the enclosing SQL
-                # transaction then rolls back before the deferred root flush
-                # runs, this index entry outlives a root that was never
-                # written. Harmless -- state_group ids come from a
-                # non-transactional sequence generator (_state_group_seq_gen),
-                # so a rolled-back transaction's id is never reissued, and
-                # nothing will ever look this state_group up again.
+                if pending_room_roots is not None:
+                    # The batch flush writes the index entries for every
+                    # pending root in one call, ahead of the roots
+                    # themselves (see `insert_deltas_group_txn`). One append
+                    # per state group contended with fsyncs of the shared
+                    # shard files. A rolled-back transaction's ids are never
+                    # reissued (_state_group_seq_gen is non-transactional),
+                    # so an entry for a root that never lands is harmless.
+                    pending_room_roots.append((state_group, root_value))
+                    return
                 _et = time.monotonic()
                 inner_ns = engine.put_room_index(
                     self._embedded_db_namespace, [(state_group, room_prefix)]
@@ -1677,9 +1677,6 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 # above is argument conversion plus GIL re-acquisition.
                 if isinstance(inner_ns, int):
                     ffi_timing("ffi_put_room_index_inner", inner_ns / 1e9)
-                if pending_room_roots is not None:
-                    pending_room_roots.append((state_group, root_value))
-                    return
                 _et = time.monotonic()
                 engine.put_state_hamt_roots(
                     self._embedded_db_namespace,
@@ -2085,6 +2082,16 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             if pending_room_roots and self._embedded_db_engine == "mtxdb":
                 _et = time.monotonic()
                 engine = get_embedded_engine(self._embedded_db_engine)
+                # Index first, so a group's room is resolvable as soon as its
+                # root is.
+                inner_ns = engine.put_room_index(
+                    self._embedded_db_namespace,
+                    [(sg, room_prefix) for sg, _ in pending_room_roots],
+                )
+                ffi_timing("ffi_put_room_index", time.monotonic() - _et)
+                if isinstance(inner_ns, int):
+                    ffi_timing("ffi_put_room_index_inner", inner_ns / 1e9)
+                _et = time.monotonic()
                 engine.put_state_hamt_roots(
                     self._embedded_db_namespace, room_prefix, pending_room_roots
                 )
