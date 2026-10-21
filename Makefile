@@ -11,6 +11,7 @@ STYLE_RESET := $(shell tput sgr0 2>/dev/null || echo -e "\033[0m")
 
 .PHONY: format
 format: ##H Format with ruff
+	prettier --prose-wrap always --print-width 80 --write docs/development-gg/
 	uv run --no-sync ruff format .
 	uv run --no-sync ruff check --fix .
 	cargo +nightly fmt
