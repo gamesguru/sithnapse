@@ -391,27 +391,34 @@ class MultiWriterIdGenerator(AbstractStreamIdGenerator):
             # important if we add back a writer after a long time; we want to
             # consider that a "new" writer, rather than using the old stale
             # entry here.
-            clause, args = make_in_list_sql_clause(
-                self._db.engine, "instance_name", self._writers, negative=True
-            )
-
-            sql = f"""
-                DELETE FROM stream_positions
-                WHERE
-                    stream_name = ?
-                    AND {clause}
-            """
-            cur.execute(sql, [self._stream_name] + args)
-
+            #
+            # We read the rows first and only issue the DELETE if one of them
+            # is stale. That is the same result as deleting first, minus a
+            # round trip per stream on the usual startup where nothing is
+            # stale.
             sql = """
                 SELECT instance_name, stream_id FROM stream_positions
                 WHERE stream_name = ?
             """
             cur.execute(sql, (self._stream_name,))
+            position_rows = cur.fetchall()
+
+            if any(instance not in self._writers for instance, _ in position_rows):
+                clause, args = make_in_list_sql_clause(
+                    self._db.engine, "instance_name", self._writers, negative=True
+                )
+
+                sql = f"""
+                    DELETE FROM stream_positions
+                    WHERE
+                        stream_name = ?
+                        AND {clause}
+                """
+                cur.execute(sql, [self._stream_name] + args)
 
             self._current_positions = {
                 instance: stream_id * self._return_factor
-                for instance, stream_id in cur
+                for instance, stream_id in position_rows
                 if instance in self._writers
             }
 
