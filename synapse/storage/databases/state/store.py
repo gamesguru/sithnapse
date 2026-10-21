@@ -1449,8 +1449,10 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             self._assert_embedded_db_writer()
             engine = get_embedded_engine(self._embedded_db_engine)
             _et = time.monotonic()
+            _ct = time.thread_time()
             engine.put_state_hamt_nodes(self._embedded_db_namespace, room_prefix, nodes)
             ffi_timing("ffi_put_hamt_nodes", time.monotonic() - _et)
+            ffi_timing("ffi_put_hamt_nodes:cpu", time.thread_time() - _ct)
             _state_timing("state_write_nodes_embedded", time.monotonic() - _et)
             _state_counter("state_write_nodes_embedded_batches")
             _state_counter("state_write_nodes_embedded_records", len(nodes))
@@ -1669,15 +1671,18 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                     pending_room_roots.append((state_group, root_value))
                     return
                 _et = time.monotonic()
+                _ct = time.thread_time()
                 inner_ns = engine.put_room_index(
                     self._embedded_db_namespace, [(state_group, room_prefix)]
                 )
                 ffi_timing("ffi_put_room_index", time.monotonic() - _et)
+                ffi_timing("ffi_put_room_index:cpu", time.thread_time() - _ct)
                 # Time inside the GIL-released write; the gap to the span
                 # above is argument conversion plus GIL re-acquisition.
                 if isinstance(inner_ns, int):
                     ffi_timing("ffi_put_room_index_inner", inner_ns / 1e9)
                 _et = time.monotonic()
+                _ct = time.thread_time()
                 engine.put_state_hamt_roots(
                     self._embedded_db_namespace,
                     room_prefix,
@@ -1685,6 +1690,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 )
                 elapsed = time.monotonic() - _et
                 ffi_timing("ffi_put_state_hamt_roots", elapsed)
+                ffi_timing("ffi_put_state_hamt_roots:cpu", time.thread_time() - _ct)
                 _state_counter("state_write_roots_embedded")
                 from synapse.storage.databases.state.bg_updates import (
                     _record_root_write_stats,
@@ -2081,6 +2087,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
 
             if pending_room_roots and self._embedded_db_engine == "mtxdb":
                 _et = time.monotonic()
+                _ct = time.thread_time()
                 engine = get_embedded_engine(self._embedded_db_engine)
                 # Index first, so a group's room is resolvable as soon as its
                 # root is.
@@ -2089,6 +2096,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                     [(sg, room_prefix) for sg, _ in pending_room_roots],
                 )
                 ffi_timing("ffi_put_room_index", time.monotonic() - _et)
+                ffi_timing("ffi_put_room_index:cpu", time.thread_time() - _ct)
                 if isinstance(inner_ns, int):
                     ffi_timing("ffi_put_room_index_inner", inner_ns / 1e9)
                 _et = time.monotonic()

@@ -426,8 +426,18 @@ def _print_ffi_timings() -> None:
         ("TOTAL (all measured spans)", None),
         ("TOTAL (excluding engine open)", "embedded_engine_open"),
     ):
-        total_s = sum(elapsed for tag, elapsed in timings.items() if tag != excluded)
-        total_count = sum(count for tag, count in counts.items() if tag != excluded)
+        # `<tag>:cpu` rows are the thread cpu time of a span already counted
+        # under `<tag>`; leave them out of the totals.
+        total_s = sum(
+            elapsed
+            for tag, elapsed in timings.items()
+            if tag != excluded and not tag.endswith(":cpu")
+        )
+        total_count = sum(
+            count
+            for tag, count in counts.items()
+            if tag != excluded and not tag.endswith(":cpu")
+        )
         total_ms = total_s * 1000
         total_avg_ms = (total_s / total_count) * 1000 if total_count else 0.0
         _ffi_timings_print(

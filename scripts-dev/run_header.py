@@ -103,6 +103,15 @@ class Baseline:
         except (OSError, ValueError, KeyError):
             return cls()
 
+    def cpu_stall_percent(self) -> Optional[float]:
+        """Share of the run the machine had runnable work waiting for a cpu
+        (PSI), or None when pressure data is unavailable."""
+        end = pressure_snapshot()
+        wall = time.time() - self.wall
+        if wall <= 0 or "cpu" not in end or "cpu" not in self.pressure:
+            return None
+        return 100 * (end["cpu"] - self.pressure["cpu"]) / wall
+
     def pressure_summary(self) -> str:
         """Share of the run stalled on cpu/io/memory (PSI) and in iowait, which
         load average cannot separate."""
@@ -144,12 +153,26 @@ def header_lines(
     return [f"  {label + ':':<14}{value}" for label, value in rows]
 
 
+# A review flag, not a verdict: per-call timings from a run with this much cpu
+# stall inflate (see res/logs), so check the stall before comparing two runs.
+# The threshold has not been validated against enough runs to be a hard cutoff.
+STALL_REVIEW_PERCENT = 25.0
+
+
 def load_lines(baseline: Baseline) -> list[str]:
-    return [
+    lines = [
         f"  {'load avg:':<14}{baseline.load} at start, {load_average()} at end "
         "(1/5/15 min)",
         f"  {'pressure:':<14}{baseline.pressure_summary()} (over the run)",
     ]
+    stall = baseline.cpu_stall_percent()
+    if stall is not None and stall > STALL_REVIEW_PERCENT:
+        lines.append(
+            f"  {'review:':<14}cpu stall {stall:.1f}% is over "
+            f"{STALL_REVIEW_PERCENT:.0f}%; per-call timings may be inflated "
+            "when compared with a lower-stall run"
+        )
+    return lines
 
 
 def main() -> None:

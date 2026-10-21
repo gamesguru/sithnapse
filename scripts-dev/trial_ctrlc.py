@@ -172,6 +172,38 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
     for line in _run_identity():
         out(line)
 
+    proc_files = [f for f in files if f.startswith("proc_") and f.endswith(".json")]
+    if proc_files:
+        proc_samples: list[tuple[float, float, str]] = []
+        for fname in proc_files:
+            try:
+                with open(os.path.join(timings_dir, fname), encoding="utf-8") as pf:
+                    proc_data = json.load(pf)
+                proc_samples.append(
+                    (
+                        float(proc_data["cpu_s"]),
+                        float(proc_data["wall_s"]),
+                        fname[len("proc_") : -len(".json")],
+                    )
+                )
+            except (OSError, ValueError, KeyError):
+                continue
+        proc_samples = [p for p in proc_samples if p[1] > 0]
+        if proc_samples:
+            total_cpu = sum(p[0] for p in proc_samples)
+            total_wall = sum(p[1] for p in proc_samples)
+            out(
+                f"  {'process cpu:':<14}{total_cpu:,.0f}s cpu over "
+                f"{total_wall:,.0f}s wall in {len(proc_samples)} process(es) "
+                f"(cpu/wall {total_cpu / total_wall:.2f}; off-cpu time is "
+                "descheduling, I/O, lock waits or idle)"
+            )
+            lowest = sorted(proc_samples, key=lambda p: p[0] / p[1])[:3]
+            out(
+                f"  {'cpu/wall low:':<14}"
+                + ", ".join(f"pid {p[2]} {p[0] / p[1]:.2f}" for p in lowest)
+            )
+
     # 1. Lifecycle timings
     lc_lifecycle_counters: dict[str, int] = defaultdict(int)
     if lifecycle_files:
@@ -693,11 +725,17 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                 ("TOTAL (all measured spans)", None),
                 ("TOTAL (excluding engine open)", "embedded_engine_open"),
             ):
+                # `<tag>:cpu` rows are the thread cpu time of a span already
+                # counted under `<tag>`; leave them out of the totals.
                 total_s = sum(
-                    elapsed for tag, elapsed in ffi_timings.items() if tag != excluded
+                    elapsed
+                    for tag, elapsed in ffi_timings.items()
+                    if tag != excluded and not tag.endswith(":cpu")
                 )
                 total_count = sum(
-                    count for tag, count in ffi_counts.items() if tag != excluded
+                    count
+                    for tag, count in ffi_counts.items()
+                    if tag != excluded and not tag.endswith(":cpu")
                 )
                 total_ms = total_s * 1000
                 total_avg_ms = (total_s / total_count) * 1000 if total_count else 0.0
