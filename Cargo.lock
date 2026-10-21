@@ -998,9 +998,9 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "memmap2"
-version = "0.9.11"
+version = "0.9.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
+checksum = "6b0ca1155a9ecc25aa12e8313a119f32edf0255fea2f44839c4ac0a12b2ac157"
 dependencies = [
  "libc",
 ]
@@ -1025,7 +1025,7 @@ dependencies = [
 [[package]]
 name = "mtxdb"
 version = "0.1.0-beta.2"
-source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=dev#0efca0a825b330f8a7c2e2ce144afdd957c82461"
+source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=dev#f41d02a91bb58f1aa91abeadde8ed549297b3e05"
 dependencies = [
  "arc-swap",
  "blake3",
@@ -1453,7 +1453,7 @@ dependencies = [
 [[package]]
 name = "rezzy"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#0fe9ec99fda1acdb273471581c4bd2b897fbe199"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#87996819b463f94784069a96e4d35bddef5ada54"
 dependencies = [
  "base64 0.23.1",
  "blake3",
@@ -1466,7 +1466,7 @@ dependencies = [
 [[package]]
 name = "rezzy-json"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#0fe9ec99fda1acdb273471581c4bd2b897fbe199"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#87996819b463f94784069a96e4d35bddef5ada54"
 dependencies = [
  "ryu",
 ]
@@ -1474,7 +1474,7 @@ dependencies = [
 [[package]]
 name = "rezzy-recon"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#0fe9ec99fda1acdb273471581c4bd2b897fbe199"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#87996819b463f94784069a96e4d35bddef5ada54"
 dependencies = [
  "base64 0.23.1",
  "sha2",
