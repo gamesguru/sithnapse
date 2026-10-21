@@ -348,19 +348,6 @@ main() {
       echo "Skipping unsupported Complement test package: $test_package" >&2
       continue
     fi
-    # A directory whose Go files only live in subpackages (e.g. msc4521's
-    # integration/ and library/) is not itself a package, and `go test` fails
-    # it with "no Go files" -- which fails the whole run. Run its test
-    # subpackages instead.
-    if ! compgen -G "$COMPLEMENT_DIR/tests/${test_package##*/}/*.go" > /dev/null; then
-      while IFS= read -r sub_package; do
-        default_complement_test_packages+=("$sub_package")
-      done < <(
-        find "$COMPLEMENT_DIR/tests/${test_package##*/}" -name '*_test.go' \
-          -printf '%h\n' | sort -u | sed "s|^$COMPLEMENT_DIR/|./|"
-      )
-      continue
-    fi
     default_complement_test_packages+=("$test_package")
   done < <(
     find "$COMPLEMENT_DIR/tests" -mindepth 1 -maxdepth 1 -type d -name 'msc*' \
