@@ -1,243 +1,178 @@
-# Event status in mtxdb frame metadata
+# Event status for mtxdb edge reads
 
-Status: design note, nothing implemented. Covers the state needed before the
-family-4 persist queries can read from mtxdb without SQL. See
+Status: design note; nothing implemented. This describes the mutable event state
+needed before the family-4 persist queries can read from mtxdb without SQL. See
 `perf-track-b-family4-edges-map.md` and
 `res/docs/2026-09-28-event-edges-sql-removal-plan.md`.
 
-## Problem
+## Goal
 
-The persist-path queries filter persisted children by mutable event state:
+Replace the persist-path SQL joins with Rust reads over mtxdb's forward edges
+and the status of their child events. The required status is small:
 
-- `_get_events_which_are_prevs` needs `NOT events.outlier` and no rejection,
-  plus `soft_failed` for the metadata filter.
-- `_get_prevs_before_rejected` needs the same rejection/soft-fail state.
+- `outlier` from `events.outlier`;
+- whether a rejection row exists;
+- `soft_failed` from event internal metadata.
 
-Two of those inputs are not in mtxdb today:
+The first two are mutable SQL state and are not yet completely represented in
+mtxdb. The rejection mirror is also not authoritative today.
 
-- **Outlier** is excluded from the stored `internal_metadata` JSON by design.
-  `rust/src/events/internal_metadata.rs:24` documents that `outlier`,
-  `received_ts` and `stream_ordering` have their own SQL columns.
-  `rust/src/events/internal_metadata.rs:604` repeats it for serialization.
-  mtxdb's `event_json_put` stores that JSON verbatim, so mtxdb has no outlier
-  bit at all. SQL `events.outlier` is the authority.
-- **Rejections** are mirrored only on some paths. `events.py:4575` mirrors new
-  rows, and `purge_events.py:430` / `:733` mirror deletes, but the accept/reject
-  recheck path at `events_worker.py:2969-2991` deletes or upserts the SQL row
-  with no mirror call. `get_rejections_batch` has no production caller.
+## Pool placement and consistency
 
-`soft_failed` is in the metadata JSON, but reading it means reading and parsing
-that record. Fine for the handful of children a persist actually finds; not a
-reason to keep the SQL join.
+Edges are read from the Edges pool (`auth_chain_db()` in the Synapse binding).
+Event JSON and its `event_meta_node_id` record are in the separate EventDag pool
+(`event_dag_db()`). A `PackfileStorage::read_snapshot()` pins one pool; it
+cannot give a consistent read across those two engines.
 
-## Decision
+Put the new compact status record in the **Edges pool**, in its own stable
+room-scoped collection (for example `STAT`, derived from the room's group
+digest), keyed by event ID. Keep it out of the generation-scoped `FWD`
+collection and out of `PREV`: a forward-generation rebuild or reset must not
+delete or rewrite status. Do not copy mutable status into parent forward lists:
+de-outliering or a rejection change would otherwise require rewriting every
+parent that references the event.
 
-Put a compact, versioned status field in mtxdb **frame metadata** on the event's
-already-separate metadata record (`event_meta_node_id`, see
-`rust/src/database/mtxdb_syn.rs:3113`).
+Then a single Edges-pool snapshot can read the forward lists and the status
+records from one boundary. The Rust binding should:
 
-Do not put it in `internal_metadata` JSON. That blob is Synapse's event-body
-compatibility format, it already excludes outlier, and reading it requires
-locating and decoding the record. Frame metadata is stored outside the
-compressed payload and is the right place for a few typed bits.
+1. Capture one read snapshot.
+2. Batch-read candidate forward lists in the room collection.
+3. If children exist, batch-read their status records in the same snapshot.
+4. Return qualifying parent IDs and diagnostic counts.
 
-## What the frame format gives us
+A snapshot's overlay covers committed journal groups only. A status record
+staged in another, uncommitted transaction is deliberately invisible; a record
+staged in the reader's own transaction is visible to that transaction. The read
+path must not depend on seeing another writer's uncommitted status.
 
-From the pinned mtxdb checkout (`mtxdb/src/engine/packfile/mod.rs`):
+For `_get_prevs_before_rejected`, traverse levels in Rust with a visited set;
+read each frontier and its statuses on the same snapshot. Do not call Python
+once per recursion level. If publication advances or a writer restarts and a
+snapshot returns `WouldBlock`, retry a bounded number of times inside Rust.
+After bounded retries, fail closed to the existing SQL path during migration; do
+not interpret an incomplete snapshot as “no edges”.
 
-- One flag byte per frame. Known bits: `0x01` compressed, `0x02` CRC disabled,
-  `0x04` metadata present, `0x08` removed (`:308-362`). An unknown flag bit is
-  fatal, so **do not add a new flag bit** for this.
-- `FLAG_METADATA` introduces `[version][length][TLV...]` outside the compressed
-  node bytes (`:315-330`). Existing tags: logical id, content digest, role,
-  digest algorithm, last-write LSN (`:334-354`).
-- Unknown **TLV tags are preserved**, not rejected (`FrameMetadata.unknown`,
-  `:576-578`; decoder arm `:706`). So a new tag is forward-compatible: older
-  readers round-trip it and newer readers interpret it. This is the opposite of
-  the flag-byte rule.
-- Reads do not expose frame metadata today. `NodeData` is only
-  `{ bytes, children }` (`mtxdb/src/engine/storage.rs:181-207`), and the
-  `get`/`get_many`/`get_many_bytes` surface returns no `FrameMetadata`. This is
-  the main API cost.
+The first query's saved workload had only 12 SQL result rows for 20,579
+candidates, so most calls should stop after the forward lookup. That makes a
+separate status record reasonable: it is fetched only for actual children. The
+rejected-predecessor traversal can have more children, so measure its status
+batch separately.
 
-## Recommended change in mtxdb
+## Atomic writes: what mtxdb already supports
 
-Yes, make the change in mtxdb, but make it **generic**: mtxdb should round-trip
-opaque per-record metadata and should not know what an event, outlier or
-rejection is. Synapse owns the tag number and the payload definition.
+The required body-plus-edges write does **not** require moving edge data into
+EventDag or adding a cross-pool transaction feature. The mtxdb `Database`
+documents atomic cross-pool transactions; `DatabaseTransaction::put` accepts a
+`ShardType`, and Synapse's transaction stages writes into a shared journal
+group. The existing event JSON staging targets EventDag, while edge staging
+targets Edges. Use one mtxdb transaction to commit the body and edges together.
 
-The current surface is payload-only at every layer, not just at the getter:
+This guarantee is within mtxdb. SQL and mtxdb still cannot commit atomically
+with each other. During migration, SQL remains authoritative and both stores are
+updated. The cutover needs an explicit recovery/reconciliation policy for the
+crash window between the mtxdb commit and SQL commit; it must not claim that
+cross-pool atomicity closes that cross-database gap.
 
-| Layer   | Today                                                                                            | Change                                                                                                  |
-| ------- | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------- |
-| Write   | `StorageEngine::put` / `put_many` take `NodeData`                                                | add `put_many_with_metadata` (and the transaction equivalent) taking `Option<FrameMetadata>` per record |
-| Journal | `Mutation::Put { collection_id, node_id, payload }` (`mtxdb/src/engine/journal.rs:106-115`)      | add `metadata: Option<FrameMetadata>`                                                                   |
-| Overlay | `ReadJournal::apply_mutation` stores `(bytes, lsn)` (`packfile/storage/read_journal.rs:364-380`) | store the metadata alongside, so a read after a write sees the same status as a committed read          |
-| Read    | `NodeData { bytes, children }`                                                                   | return a record with its `FrameMetadata`, or add `get_many_with_metadata`                               |
-| Binding | `event_json_put` / `event_json_get` pass bytes only                                              | pass and return the status TLV                                                                          |
+## Status record format and authority
 
-`PackfileStorage` already has internal
-`append_put_many_entry(..., metadata, ...)` and
-`put_many_internal(..., metadatas, ...)` paths, so the packfile can store it.
-What is missing is the public surface, the journal mutation, and the overlay.
-That makes this a contained upstream change, not a format redesign.
+Use a versioned, fixed-size Synapse-owned payload, written through the existing
+Rust binding layer rather than a new mtxdb frame TLV. A minimal first version
+needs bits for `outlier`, `rejected`, and `soft_failed`; omit unset/normal
+records after the backfill completion gate. Absence means normal only after that
+gate has completed.
 
-Constraints for the mtxdb change:
-
-- Do **not** add a frame flag bit. Unknown flags are fatal (`KNOWN_FLAGS`,
-  `packfile/mod.rs:325-327`).
-- Keep metadata optional: a record with none stays byte-identical.
-- Preserve unknown TLV tags on decode and re-encode. Verified at the pinned
-  `f41d02a`: `FrameMetadata.unknown` exists and is re-emitted
-  (`packfile/mod.rs:576-578`, `:620`). Older read-only readers therefore ignore
-  the status tag safely. Any older writer that rewrites the metadata record must
-  be on a revision that preserves unknown tags, or it will drop them.
-- A plain `put` replaces the frame. "Preserve on rewrite" must be explicit at
-  every write site, not assumed from the codec.
-
-Cost versus a sibling status record:
-
-- A sibling `event_status_node_id` record needs **no mtxdb change** and can be
-  written in the same collection and transaction. It costs one extra small
-  record per event and one extra point read per child in the persist filter.
-- The frame TLV costs roughly the TLV bytes (about 10-16) in an existing frame
-  and one read that already happens for `soft_failed`; it avoids a second record
-  and keeps status tied to the record version (a rewrite cannot leave a stale
-  sibling behind).
-- Recommendation: take the frame TLV if the generic mtxdb change lands in one
-  revision. If it slips, ship the sibling record behind the same
-  `event_status_get` API; do not block the rejection-mirror fix or the persist
-  read cutover on it.
-
-## Proposed tag
-
-Allocate one new TLV tag from mtxdb upstream, e.g. `META_TAG_EVENT_STATUS`
-(proposed `0x10`; tags `0x01-0x05` are taken). Payload:
+Keep the API layout-agnostic:
 
 ```text
-version u8        = 1
-flags   u8        bit 0 outlier
-                  bit 1 rejected
-                  bit 2 soft_failed (compat mirror, see below)
-                  bit 3 out_of_band_membership (optional)
-code    u8        rejection category, 0 = none/unknown
-reserved u8       = 0
+event_status_get_batch(room_id, event_ids) -> event_id -> status or missing
+event_status_put_batch(room_id, rows, transaction=...) -> ()
+event_status_delete_batch(room_id, event_ids, transaction=...) -> ()
 ```
 
-Rules:
+The API should permit staging in the same cross-pool mtxdb transaction as body,
+edge, or rejection-reason writes. Rust owns the encoding and the Edge-pool
+collection/key mapping. Python callers should not know the record layout.
 
-- Keep the payload fixed-size and versioned. Unknown versions are treated as
-  "status unavailable", so callers fall back to SQL during the transition.
-- The header carries a rejection **bit and optional category**, not the reason
-  text. `rejections.reason` is free text and the reason set is not provably
-  closed. Keep the full reason in an authoritative record (the existing
-  rejection record body is fine) and only put a stable category in the header if
-  callers need to filter without reading it.
-- `soft_failed` is already in `internal_metadata` and is rewritten on
-  soft-fail/un-soft-fail. Do not make the JSON cleanup a prerequisite. Either
-  (a) carry `soft_failed` in the header as a compatibility mirror maintained by
-  the same paths, with a documented rule that JSON remains the writer until a
-  later cleanup, or (b) leave it out of the header initially and parse the small
-  metadata record only for children that have edges. Option (b) is smaller and
-  still removes SQL; prefer it for the first cut.
+The status record carries a rejection bit, not the rejection reason. The current
+reason is free text, and this read path only needs to know whether the event is
+rejected. Keep full-reason reads and writes on their current SQL path until they
+receive a separate migration plan. A category code is unnecessary for these
+filters.
 
-## Write paths
+## Required mutation paths
 
-The status field must be written or updated everywhere `outlier` or rejection
-state changes, and must commit with the event body in the same mtxdb
-transaction.
+Keep SQL authoritative and dual-write until backfill and verification finish.
+Every status transition must update the Edge-pool record:
 
-| Path                                            | What changes                          | Requirement                                                         |
-| ----------------------------------------------- | ------------------------------------- | ------------------------------------------------------------------- |
-| `event_json_put` / `_persist_events_txn_body`   | new event status                      | stage with `mtxdb_txn`; one transaction with body and edges         |
-| `_update_outliers_txn` (`events.py` ~1435-1497) | de-outlier                            | rewrite the small metadata record; do not touch the JSON body       |
-| `purge_events.py` outlier flips                 | retained event becomes outlier        | same rewrite                                                        |
-| `_store_rejections_txn` (`events.py:4555`)      | rejection insert                      | set `rejected`; write the authoritative rejection record            |
-| `events_worker.py:2969-2991`                    | accept (delete) / re-reject (upsert)  | clear/set `rejected`; **currently unmirrored**                      |
-| purge `delete_rejections_batch`                 | rejection delete                      | clear `rejected`                                                    |
-| soft-fail / un-soft-fail paths                  | metadata JSON update                  | header mirror only if option (a) is chosen                          |
-| censoring / expiry / re-signing                 | body rewrite through `event_json_put` | preserve the status field; a body rewrite must not silently drop it |
+| Path                                     | Status change                                                           |
+| ---------------------------------------- | ----------------------------------------------------------------------- |
+| Event persistence                        | Initial outlier/rejected/soft-failed state                              |
+| `_update_outliers_txn` in `events.py`    | Clear outlier on de-outlier                                             |
+| Purge's retained-event outlier update    | Set outlier                                                             |
+| Event purge (`event_edges_delete`)       | Delete the status record; purge only tombstones the backward edge today |
+| `_store_rejections_txn` in `events.py`   | Set rejected                                                            |
+| `events_worker.py` accept/reject recheck | Clear or set rejected; currently not mirrored                           |
+| Both rejection purge paths               | Clear or delete rejected status                                         |
+| Soft-fail state writes                   | Set/clear soft-failed; audit exact mutation paths before implementation |
 
-Two properties matter:
+The existing rejection mirror does not satisfy this contract: its writes are
+documented as cache-tier, `get_rejections_batch` has no production caller, and
+`events_worker.py` has direct SQL upsert/delete paths that do not mirror. The
+status record must be updated on those paths too. This does not make the
+existing full rejection-reason record authoritative.
 
-1. **Atomicity with the body.** A newly persisted event's status is part of the
-   same record set as its body and edges. An update to outlier/rejection is a
-   separate small rewrite; that is unavoidable because those are post-persist
-   state changes.
-2. **Failure behavior during transition.** SQL remains authoritative until the
-   verifier passes. A failed mtxdb status write must not corrupt SQL; it should
-   surface as a retry or a reconciliation miss, not a silent divergence.
+`event_edges_delete` currently writes an empty backward record and deliberately
+does not touch parents' forward lists or delete collections, so it will not
+remove a `STAT` record implicitly. Add the status delete to that path (or
+tombstone it in the same batch). A stale status record is not read for a
+tombstoned child, because the forward read filters the child first, but it
+violates the absence contract and must not survive indefinitely.
 
-## Read API
+The body and edges should be staged in one mtxdb transaction. Status writes that
+accompany initial persistence should join that transaction. Later
+outlier/rejection transitions can be small status-only transactions. All updates
+still need the SQL↔mtxdb failure/reconciliation policy described above.
 
-Add one batched call, roughly:
+## Migration and cutover
 
-```text
-event_status_get(namespace, event_ids) ->
-    [(event_id, status_flags, rejection_code, present)]
-```
+1. Add the Edge-pool status record and dual-write every mutation path above;
+   keep reads on SQL.
+2. Backfill abnormal events from SQL (`outlier`, rejected rows, and
+   `soft_failed`). Make the background update resumable. Do not treat a missing
+   record as normal until the update is complete.
+3. Verify status against SQL for sampled records and specifically exercise
+   persist, de-outlier, purge's outlier flip, reject, re-reject, accept, and
+   purge deletion. Check transaction overlays and a read-only worker's published
+   view.
+4. After the verification gate, switch the two persist queries to the Rust
+   snapshot API. Keep the current SQL/version fallback until the edge cutover
+   makes a forward miss authoritative.
+5. Stage body and edges in one cross-pool mtxdb transaction. Then remove the
+   persist SQL joins and, only after all other edge readers are migrated, retire
+   the SQL edge mirror, outbox, and version gate.
 
-- Implement it in the Rust binding by reading the `event_meta_node_id` records
-  with a metadata-capable read.
-- It must use the same overlay/refresh path as `event_json_get`, so a read
-  immediately after a write (including a read-only worker after publication)
-  sees the same status. The pending-write overlay has to carry the metadata too.
-- A missing record or an unknown status version returns `present = false`; the
-  caller falls back to SQL until migration is complete.
-- `_get_events_which_are_prevs` then becomes: one forward-edge batch read plus
-  one status batch read for the children that exist, with no `runInteraction`.
-  `_get_prevs_before_rejected` uses the same status batch inside its Rust
-  recursion.
+The SQL and mtxdb commits remain separate systems throughout. Before declaring
+mtxdb authoritative, define how a crash between those commits is detected and
+repaired; a manual reconciliation tool may be sufficient, but the failure mode
+must be explicit.
 
-## Migration and verification
+## Why not a frame TLV now?
 
-Backfill is a background update over SQL, batched and resumable:
+A TLV on `event_meta_node_id` would avoid one small sibling record, but that
+record is in EventDag, while the edge snapshot is in Edges. It would therefore
+reintroduce the cross-pool read-consistency problem. A Synapse-owned status
+record in Edges gives the needed same-snapshot read without changing mtxdb's
+frame format or exposing frame metadata through its storage API.
 
-1. `events.outlier` per event id.
-2. `rejections` rows: `rejected` bit plus reason record.
-3. Optionally `event_json.internal_metadata` for `soft_failed` if option (a).
+Revisit a generic mtxdb frame-metadata API only if another consumer needs typed
+per-record metadata or measurements show the extra status records are material.
+The current read design gets no snapshot advantage from a TLV on the EventDag
+metadata record.
 
-Then a verifier compares mtxdb status against SQL for a deterministic sample and
-for every event touched by an update path. It must cover:
+## Measurements
 
-- persisted non-outlier, persisted outlier, and de-outliered events;
-- rejected, re-accepted (row deleted), and re-rejected events;
-- purged rooms and purged rejections;
-- censored/rewritten bodies (status preserved).
-
-Cut over reads only after the verifier is clean and the mirror write paths have
-run through a deployment window.
-
-## Sequencing
-
-1. Fix the unmirrored accept/reject path and add a `rejected` bit to the
-   existing rejection mirror. This is an independent bug fix; SQL stays
-   authoritative.
-2. Add the status field to the mtxdb record (new tag or, if the upstream write
-   API cannot take per-record metadata yet, a typed status record under a
-   sibling node id in the same collection and transaction).
-3. Backfill and verify.
-4. Switch `_get_events_which_are_prevs` and `_get_prevs_before_rejected` to the
-   mtxdb status + edge reads.
-5. Proceed with the family-4 single-transaction cutover (body + edges), then
-   remove the SQL join fallbacks, outbox and version gate.
-
-Steps 1 and 2 are useful even if the edge cutover slips: they remove a real
-mirror bug and give the persist path a SQL-free filter input.
-
-## Open questions
-
-- Allocate the TLV tag upstream and confirm the pinned mtxdb revision accepts
-  per-record metadata on the transactional `put` path. Today `NodeData` has no
-  metadata slot, and `DatabaseTransaction::put` takes a `NodeData`.
-- Confirm the pending-write overlay and read-committed refresh preserve unknown
-  TLV tags and expose them through the new read API.
-- Confirm a metadata-only read does not decompress or checksum the node payload.
-  `get_many_bytes` avoids the `NodeData` wrapper but still returns bytes only.
-- Is the rejection reason set closed enough for a category enum? Until it is,
-  keep the reason text in the authoritative record.
-- Does any censoring/expiry rewrite construct a fresh `FrameMetadata` and drop
-  unknown tags? The codec preserves them, but the writer template must too.
-- Does the fallback typed-status record change the answer? If the frame API is
-  too invasive, a sibling record costs one extra small read and no mtxdb change;
-  measure both before committing to the tag.
+Instrument the Rust call with duration, candidate count, forward hits, status
+records read, recursion levels, and `WouldBlock` retries. Compare these with
+`persist_prevs_total` and `persist_rejected_total`; the desired result is no SQL
+execution or `runInteraction` on the successful post-cutover path. Keep the SQL
+fallback visible during migration and count its use explicitly.
