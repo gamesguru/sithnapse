@@ -143,6 +143,8 @@ _SQL_SCHEDULING_LOCK = threading.Lock()
 _SQL_SCHEDULING_TOTAL: float = 0.0
 _SQL_SCHEDULING_COUNT: int = 0
 _SQL_SCHEDULING_LATENCIES: deque[float] = deque(maxlen=4096)
+# transaction description -> [total delay, calls], for the opt-in report.
+_SQL_SCHEDULING_BY_LABEL: dict[str, list[float]] = {}
 
 _TABLE_RE = re.compile(
     r"(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM|FROM|JOIN)\s+(\w+)",
@@ -282,13 +284,16 @@ def _track_slow_statement(
             del _SLOW_STATEMENTS[_SLOW_STATEMENTS_KEPT:]
 
 
-def _track_sql_scheduling(elapsed: float) -> None:
+def _track_sql_scheduling(elapsed: float, label: str | None = None) -> None:
     """Record pool checkout/thread scheduling delay for the opt-in report."""
     global _SQL_SCHEDULING_TOTAL, _SQL_SCHEDULING_COUNT
     with _SQL_SCHEDULING_LOCK:
         _SQL_SCHEDULING_TOTAL += elapsed
         _SQL_SCHEDULING_COUNT += 1
         _SQL_SCHEDULING_LATENCIES.append(elapsed)
+        entry = _SQL_SCHEDULING_BY_LABEL.setdefault(label or "(unlabelled)", [0.0, 0])
+        entry[0] += elapsed
+        entry[1] += 1
 
 
 def _print_table_ops() -> None:
@@ -308,6 +313,7 @@ def _print_table_ops() -> None:
         scheduling_total = _SQL_SCHEDULING_TOTAL
         scheduling_count = _SQL_SCHEDULING_COUNT
         scheduling_samples = sorted(_SQL_SCHEDULING_LATENCIES)
+        scheduling_by_label = {k: list(v) for k, v in _SQL_SCHEDULING_BY_LABEL.items()}
 
     if not table_ops and not scheduling_count:
         return
@@ -316,6 +322,7 @@ def _print_table_ops() -> None:
         "total": scheduling_total,
         "count": scheduling_count,
         "latencies": scheduling_samples,
+        "by_label": scheduling_by_label,
     }
 
     run_dir = os.environ.get("SYNAPSE_TIMINGS_RUN_DIR")
@@ -417,6 +424,14 @@ def _print_table_ops() -> None:
             f"p99={percentile(0.99) * 1000:.3f}ms  "
             f"max={samples[-1] * 1000:.3f}ms"
         )
+        _timings_print("  top transactions by scheduling delay:")
+        for label, (label_total, label_calls) in sorted(
+            scheduling_by_label.items(), key=lambda kv: kv[1][0], reverse=True
+        )[:15]:
+            _timings_print(
+                f"  {label_total * 1000:10.1f}ms  calls={int(label_calls):>8,d}  "
+                f"avg={label_total * 1000 / label_calls:7.3f}ms  {label}"
+            )
         _timings_print("======================================================")
         _timings_print("")
 
@@ -1458,6 +1473,7 @@ class DatabasePool:
                         *args,
                         db_autocommit=db_autocommit,
                         isolation_level=isolation_level,
+                        sched_label=desc,
                         **kwargs,
                     )
 
@@ -1489,6 +1505,7 @@ class DatabasePool:
         *args: Any,
         db_autocommit: bool = False,
         isolation_level: int | None = None,
+        sched_label: str | None = None,
         **kwargs: Any,
     ) -> R:
         """Wraps the .runWithConnection() method on the underlying db_pool.
@@ -1502,11 +1519,14 @@ class DatabasePool:
                 i.e. outside of a transaction. This is useful for transaction
                 that are only a single query. Currently only affects postgres.
             isolation_level: Set the server isolation level for this transaction.
+            sched_label: label under which the pool scheduling delay is
+                reported in the opt-in timings (defaults to `func.__name__`)
             kwargs: named args to pass to `func`
 
         Returns:
             The result of func
         """
+        sched_label = sched_label or getattr(func, "__name__", None)
         curr_context = current_context()
         if not curr_context:
             logger.warning(
@@ -1540,7 +1560,7 @@ class DatabasePool:
                         **{SERVER_NAME_LABEL: self.server_name}
                     ).observe(sched_duration_sec)
                     if _PG_TIMINGS_ENABLED:
-                        _track_sql_scheduling(sched_duration_sec)
+                        _track_sql_scheduling(sched_duration_sec, sched_label)
                     context.add_database_scheduled(sched_duration_sec)
 
                     if self._txn_limit > 0:

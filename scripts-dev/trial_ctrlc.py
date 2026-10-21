@@ -336,6 +336,7 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
         sql_scheduling_total = 0.0
         sql_scheduling_count = 0
         sql_scheduling_samples: list[float] = []
+        sql_scheduling_by_label: dict[str, list[float]] = {}
         sql_slow_statements: list[tuple[float, str, int, int]] = []
         for fname in sql_files:
             try:
@@ -351,6 +352,12 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                 sql_scheduling_total += scheduling.get("total", 0.0)
                 sql_scheduling_count += scheduling.get("count", 0)
                 sql_scheduling_samples.extend(scheduling.get("latencies", []))
+                for label, (label_total, label_calls) in scheduling.get(
+                    "by_label", {}
+                ).items():
+                    acc = sql_scheduling_by_label.setdefault(label, [0.0, 0])
+                    acc[0] += label_total
+                    acc[1] += label_calls
                 for elapsed, text, payload, rowcount in data.get("slow_statements", []):
                     sql_slow_statements.append((elapsed, text, payload, rowcount))
             except Exception as e:
@@ -440,6 +447,16 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                 f"max={sql_scheduling_samples[-1] * 1000:.3f}ms  "
                 f"samples={len(sql_scheduling_samples):,} (capped per process)"
             )
+            out("  top transactions by scheduling delay:")
+            for label, (label_total, label_calls) in sorted(
+                sql_scheduling_by_label.items(),
+                key=lambda kv: kv[1][0],
+                reverse=True,
+            )[:15]:
+                out(
+                    f"  {label_total * 1000:10.1f}ms  calls={int(label_calls):>8,d}  "
+                    f"avg={label_total * 1000 / label_calls:7.3f}ms  {label}"
+                )
             out("======================================================")
             out("")
 
