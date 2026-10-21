@@ -4573,6 +4573,7 @@ fn stats_impl(py: Python<'_>, take_diagnostics: bool) -> PyResult<Py<PyDict>> {
             let state_stats = pools.state.stats();
             let event_dag_stats = pools.event_dag.stats();
             let auth_chain_stats = pools.auth_chain.stats();
+            let server_info_stats = pools.server_info.stats();
             Ok(vec![
                 (
                     "state",
@@ -4603,6 +4604,16 @@ fn stats_impl(py: Python<'_>, take_diagnostics: bool) -> PyResult<Py<PyDict>> {
                         auth_chain_stats.sync_diagnostics.clone()
                     },
                     pools.auth_chain.read_journal_publish_signal_active(),
+                ),
+                (
+                    "server_info",
+                    server_info_stats.clone(),
+                    if take_diagnostics {
+                        pools.server_info.take_sync_diagnostics()
+                    } else {
+                        server_info_stats.sync_diagnostics.clone()
+                    },
+                    pools.server_info.read_journal_publish_signal_active(),
                 ),
             ])
         },

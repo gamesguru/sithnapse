@@ -563,7 +563,11 @@ if _PG_TIMINGS_ENABLED:
 # Display names for the stats keys. The keys keep their older names
 # (`event_dag`, `auth_chain`); the report says `event` (event JSON) and `edges`
 # (previous-event and auth-chain edges, mtxdb's `ShardType::Edges`).
-_POOL_LABELS: dict[str, str] = {"event_dag": "event", "auth_chain": "edges"}
+_POOL_LABELS: dict[str, str] = {
+    "event_dag": "event",
+    "auth_chain": "edges",
+    "server_info": "server-info",
+}
 
 
 def _print_mtxdb_stats() -> None:
@@ -604,7 +608,7 @@ def _print_mtxdb_stats() -> None:
         return f"{us / 1_000_000:.2f}s"
 
     print("\n=== mtxdb runtime stats ===", file=out)
-    for pool_name in ("state", "event_dag", "auth_chain"):
+    for pool_name in ("state", "event_dag", "auth_chain", "server_info"):
         ps = s.get(pool_name, {})
         if not ps:
             continue
@@ -910,7 +914,7 @@ def _mtxdb_snapshot_once() -> None:
         return 0.0 if last is None else value - last
 
     segments: list[str] = []
-    for pool in ("state", "event_dag", "auth_chain"):
+    for pool in ("state", "event_dag", "auth_chain", "server_info"):
         ps = s.get(pool, {})
         if not ps:
             continue
