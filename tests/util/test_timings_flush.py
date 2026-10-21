@@ -5,6 +5,7 @@
 # <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -37,40 +38,46 @@ class TimingsFlushForkTestCase(unittest.TestCase):
         restart the flusher thread itself, or it silently stops producing
         snapshots.
         """
-        with tempfile.TemporaryDirectory() as run_dir:
+        # Not a `with TemporaryDirectory()`: the parent's own flusher thread is
+        # still registered (and writing markers) until the test's cleanups run,
+        # so removing the directory before that races it and fails with
+        # "Directory not empty". Cleanups run last-in first-out, so this one,
+        # registered first, runs after the flusher is unregistered.
+        run_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, run_dir, ignore_errors=True)
 
-            def flusher() -> None:
-                # Marker named after the *calling* process, so the parent's own
-                # flusher can't satisfy the child's check.
-                open(os.path.join(run_dir, f"flushed_{os.getpid()}"), "w").close()
+        def flusher() -> None:
+            # Marker named after the *calling* process, so the parent's own
+            # flusher can't satisfy the child's check.
+            open(os.path.join(run_dir, f"flushed_{os.getpid()}"), "w").close()
 
-            with patch.dict(os.environ, {"SYNAPSE_TIMINGS_RUN_DIR": run_dir}):
-                self.addCleanup(timings_flush._flushers.remove, flusher)
-                self.addCleanup(setattr, timings_flush, "_INTERVAL_SECONDS", 2.0)
-                timings_flush._INTERVAL_SECONDS = 0.02
-                timings_flush.register_periodic_flush(flusher)
+        with patch.dict(os.environ, {"SYNAPSE_TIMINGS_RUN_DIR": run_dir}):
+            self.addCleanup(timings_flush.unregister_periodic_flush, flusher)
+            self.addCleanup(setattr, timings_flush, "_INTERVAL_SECONDS", 2.0)
+            timings_flush._INTERVAL_SECONDS = 0.02
+            timings_flush.register_periodic_flush(flusher)
 
-                pid = os.fork()
-                if pid == 0:
-                    # Child: only exit paths below; never return into the test runner.
-                    code = 1
-                    try:
-                        marker = os.path.join(run_dir, f"flushed_{os.getpid()}")
-                        deadline = time.monotonic() + 5
-                        while time.monotonic() < deadline:
-                            if os.path.exists(marker):
-                                code = 0
-                                break
-                            time.sleep(0.01)
-                    finally:
-                        os._exit(code)
+            pid = os.fork()
+            if pid == 0:
+                # Child: only exit paths below; never return into the test runner.
+                code = 1
+                try:
+                    marker = os.path.join(run_dir, f"flushed_{os.getpid()}")
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        if os.path.exists(marker):
+                            code = 0
+                            break
+                        time.sleep(0.01)
+                finally:
+                    os._exit(code)
 
-                _, status = os.waitpid(pid, 0)
-                self.assertEqual(
-                    os.waitstatus_to_exitcode(status),
-                    0,
-                    "forked child never invoked the registered flusher",
-                )
+            _, status = os.waitpid(pid, 0)
+            self.assertEqual(
+                os.waitstatus_to_exitcode(status),
+                0,
+                "forked child never invoked the registered flusher",
+            )
 
     def test_fork_during_flush_does_not_inherit_held_lock(self) -> None:
         """Forking while a flusher holds a diagnostics lock must not wedge the child.

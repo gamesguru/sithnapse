@@ -28,9 +28,11 @@ _thread: threading.Thread | None = None
 def _loop() -> None:
     stop = threading.Event()
     while not stop.wait(_INTERVAL_SECONDS):
-        with _lock:
-            flushers = list(_flushers)
         with _flush_gate:
+            # Snapshot under the gate so unregistering a flusher also waits
+            # out any in-flight cycle and cannot leave a stale callback.
+            with _lock:
+                flushers = list(_flushers)
             for flusher in flushers:
                 try:
                     flusher()
@@ -85,3 +87,11 @@ def register_periodic_flush(flusher: Callable[[], None]) -> None:
     with _lock:
         _flushers.append(flusher)
         _start_thread_locked()
+
+
+def unregister_periodic_flush(flusher: Callable[[], None]) -> None:
+    """Remove a flusher and wait for any in-progress flush cycle to finish."""
+    with _flush_gate:
+        with _lock:
+            if flusher in _flushers:
+                _flushers.remove(flusher)
