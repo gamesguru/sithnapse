@@ -383,6 +383,10 @@
 {"Action":"skip","Test":"TestMSC4186SlidingSync/SetPresence"}
 {"Action":"pass","Test":"TestMSC4186SlidingSync/Subscriptions"}
 {"Action":"skip","Test":"TestMSC4186SlidingSync/UnknownPos"}
+{"Action":"pass","Test":"TestMSC4242JoinLeaveRejoinPublicRoom"}
+{"Action":"pass","Test":"TestMSC4242JoinPublicRoomWithRejectedStateDAGEvents"}
+{"Action":"pass","Test":"TestMSC4242RejectionCascadesOnRejoin"}
+{"Action":"pass","Test":"TestMSC4242RejoinMergesOldAndNewStateDAGBranches"}
 {"Action":"pass","Test":"TestMSC4289PrivilegedRoomCreators"}
 {"Action":"pass","Test":"TestMSC4289PrivilegedRoomCreators/PL_event_is_missing_creator_in_users_map"}
 {"Action":"pass","Test":"TestMSC4289PrivilegedRoomCreators/admin_with_>PL100_cannot_kick_creator"}

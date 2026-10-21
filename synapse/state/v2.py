@@ -45,6 +45,7 @@ from synapse.api.constants import CREATOR_POWER_LEVEL, EventTypes
 from synapse.api.errors import AuthError
 from synapse.api.room_versions import RoomVersion, StateResolutionVersions
 from synapse.events import EventBase, is_creator
+from synapse.events.py_protocol import supports_msc4242_state_dag
 from synapse.storage.databases.main.event_federation import StateDifference
 from synapse.types import MutableStateMap, StateKey, StateMap, StrCollection
 from synapse.util import MutableOverlayMapping
@@ -201,7 +202,16 @@ async def resolve_events_with_store(
         for eid in to_fetch:
             ev = event_map.get(eid)
             if ev:
-                for aid in ev.auth_event_ids():
+                # MSC4242 events have no `auth_events`; rezzy's state DAG mode
+                # walks `prev_state_events` as the auth chain, so prefetch the
+                # same edges. Otherwise a state event superseded within the
+                # conflicted set (and so in no state group) is never loaded.
+                auth_ids = (
+                    ev.prev_state_events
+                    if supports_msc4242_state_dag(ev)
+                    else ev.auth_event_ids()
+                )
+                for aid in auth_ids:
                     if aid not in event_map:
                         new_to_fetch.add(aid)
         to_fetch = new_to_fetch
@@ -469,14 +479,7 @@ async def _resolve_conflicted_set_with_rust(
     unavailable or raises. The fallback is logged at error level so a genuine
     Rust/Python divergence is not silently masked.
     """
-    # MSC4242 state DAG rooms use the Python resolver for now. They declare
-    # state resolution v2.1, but rezzy's v2.1 auth checks do not model the state
-    # DAG (it has a separate V2_2 mode that this binding does not select), so
-    # the Rust path wrongly rejects a state event whose `prev_state_events`
-    # chain runs through an event superseded within the conflicted set, e.g. one
-    # learned through backfill. See
-    # `BackfilledStateDagEventTests.test_backfilled_state_events_update_current_state`.
-    if not room_version.msc4242_state_dags and room_version.state_res in (
+    if room_version.state_res in (
         StateResolutionVersions.V2,
         StateResolutionVersions.V2_1,
     ):
@@ -499,7 +502,9 @@ async def _resolve_conflicted_set_with_rust(
                 ),
                 list(full_conflicted_set),
                 event_map,
-                room_version.state_res,
+                # Pass the actual room version so rezzy can select V2.2 for
+                # MSC4242 state-DAG rooms.
+                room_version.identifier,
             )
             logger.debug(
                 "[gg-state-timing] state_v2_rust_resolve "

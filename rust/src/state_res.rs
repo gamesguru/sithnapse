@@ -558,7 +558,7 @@ fn py_to_lean_event(py_ev: &Bound<'_, PyAny>) -> PyResult<LeanEvent<String, Reso
         base_state,
         conflicted_event_ids,
         event_map,
-        state_res_version = 2,
+        room_version = "10",
     )
 )]
 pub fn resolve_v2_via_lattice_fold<'py>(
@@ -566,7 +566,7 @@ pub fn resolve_v2_via_lattice_fold<'py>(
     base_state: Bound<'py, PyDict>,
     conflicted_event_ids: Bound<'py, PyAny>,
     event_map: Bound<'py, PyDict>,
-    state_res_version: i32,
+    room_version: &str,
 ) -> PyResult<Bound<'py, PyDict>> {
     let parsed_events = parse_event_map(event_map)?;
     resolve_v2_from_parsed_events(
@@ -574,7 +574,7 @@ pub fn resolve_v2_via_lattice_fold<'py>(
         base_state,
         conflicted_event_ids,
         &parsed_events,
-        state_res_version,
+        room_version,
     )
 }
 
@@ -594,22 +594,12 @@ fn parse_event_map(
     Ok(parsed_events)
 }
 
-fn rezzy_state_res_version(version: i32) -> PyResult<StateResVersion> {
-    match version {
-        2 => Ok(StateResVersion::V2),
-        3 => Ok(StateResVersion::V2_1),
-        _ => Err(pyo3::exceptions::PyValueError::new_err(
-            "unsupported state resolution version",
-        )),
-    }
-}
-
 fn resolve_v2_from_parsed_events<'py>(
     py: Python<'py>,
     base_state: Bound<'py, PyDict>,
     conflicted_event_ids: Bound<'py, PyAny>,
     parsed_events: &HashMap<String, LeanEvent<String, ResolverContent>>,
-    state_res_version: i32,
+    room_version: &str,
 ) -> PyResult<Bound<'py, PyDict>> {
     let mut base_state_map = SharedState::new();
     for (k, v) in base_state.iter() {
@@ -628,7 +618,11 @@ fn resolve_v2_from_parsed_events<'py>(
 
     // Auth checking over the conflicted subgraph is pure Rust on owned data;
     // release the GIL so other Python workers keep running while it resolves.
-    let rezzy_version = rezzy_state_res_version(state_res_version)?;
+    // Let rezzy map the actual room version to its algorithm. This matters for
+    // MSC4242: Synapse represents it as V2.1, while rezzy maps its identifier
+    // to the V2.2 state-DAG algorithm.
+    let rezzy_version = StateResVersion::from_room_version(room_version)
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("unsupported room version"))?;
     let resolved = py.detach(|| {
         resolve_semilattice_fold(
             &base_state_map,
