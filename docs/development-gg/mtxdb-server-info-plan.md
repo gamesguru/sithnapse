@@ -38,61 +38,89 @@ sithnapse:
   `server_signature_keys` (MSC4499 first-seen-wins) and `server_keys_json`
   through SQL.
 
-## Data model
+## Existing mtxdb key model (reuse, do not replace)
 
-Two collections in the `ServerInfo` pool, keyed per server:
+mtxdb already defines the signing-key layout in `src/matrix/interop.rs`
+(introduced in `6a489d5`, "shared interop layouts"):
 
-- `SIGN`: `(server_name, key_id)` ->
-  `{verify_key bytes, ts_valid_until_ms, ts_added_ms, from_server}`. This
-  replaces `server_signature_keys`. The authoritative binding for MSC4499.
-- `KEYS`: `(server_name, key_id, from_server)` ->
-  `{ts_added_ms, ts_valid_until_ms, key_json}`. This replaces
-  `server_keys_json`. The signed response is stored once per fetch, not
-  duplicated per key id where avoidable (see Open questions).
+- One collection, `server_keys_collection_id()`, in the `ServerInfo` pool.
+- One record per `(KeyRecordKind, origin)`, id from `server_key_record_id`.
+  Kinds: **Historical** (cumulative `verify_keys` and `old_verify_keys` ever
+  seen), **Provisional** (key ids bound only through a notary so far),
+  **Corroborated** (key ids observed as currently active by a direct fetch),
+  **Notary** (last verbatim self-signed payload, re-served by the notary).
+- Value = version byte, length-prefixed origin, opaque payload
+  (`encode_server_key` / `decode_server_key`). The payload bytes are not
+  interpreted by mtxdb.
+- `export_schema.rs` has `server_keys` records (origin, kind, base64 payload),
+  and the pool also holds the import marker.
 
-## MSC4499 semantics to preserve
+This plan builds on that model. A parallel per-`(server_name, key_id)` SIGN/KEYS
+schema (the first version of this document) is dropped.
 
-Taken from `store_server_keys_response` in `keys.py`:
+## Mapping SQL semantics to the kinds (to confirm)
 
-1. Insert if absent; first committer wins.
-2. Same key body (refresh): keep the original `from_server`; extend
-   `ts_valid_until_ms` and set `ts_added_ms` only if the new validity is later.
-3. Different body, stored `from_server != server_name`, candidate
-   `from_server == server_name`: direct origin fetch replaces the provisional
-   notary binding (log a warning with both sha256 values).
-4. Otherwise: first seen wins; return the stored key body and do not persist the
-   candidate `KEYS` record for that key id.
+| SQL today | mtxdb kind |
+|---|---|
+| `server_signature_keys` rows bound via a notary (`from_server != server_name`) | Provisional |
+| rows bound by a direct fetch (`from_server == server_name`) | Corroborated |
+| first-seen-wins reference of all keys ever bound | Historical |
+| `server_keys_json` (signed response, served by the notary endpoint) | Notary |
 
-The compare-and-set must be atomic across `SIGN` and `KEYS` inside one mtxdb
-`DatabaseTransaction`, so a reader never sees a `KEYS` record without its `SIGN`
-binding.
+Open questions, to settle by reading the mtxdb payload contract and tests:
+
+- What is inside each payload (JSON? per-key-id map with `valid_until_ts`?).
+  Per-origin records mean a read-modify-write of the whole origin record on
+  every key refresh, inside one `DatabaseTransaction`.
+- `server_keys_json` is keyed `(server, key_id, from_server)` and holds one
+  row per fetch source. Notary is one record per origin. Check whether
+  `get_all_server_keys_json_for_remote` and `remote_key_resource.py` need the
+  per-`from_server` rows. If they do, Notary alone does not replace the table.
+- Does the first-seen-wins + provisional->corroborated transition (MSC4499
+  steps 1-4 above) fit as one transaction over those records?
+
+## Writer access (settled)
+
+- mtxdb's writable open takes an exclusive lock, so only one process writes.
+  `state/store.py:193` picks it: the instance is the writer iff
+  `hs.get_instance_name() in hs.config.worker.writers.events`. Every other
+  process calls `open_client_read_only`.
+- `store_server_keys_response` can run on any process that fetches keys
+  (federation readers, the notary endpoint, the main process), not only on the
+  events writer. So a direct mtxdb write is not possible from those processes.
+- Consequence for the design: key writes need a route to the single writer, or
+  key authority needs its own writer lock/role separate from the events
+  writer. Options to evaluate: (a) a replication command or HTTP replication
+  endpoint that forwards `store_server_keys_response` to the writer; (b) a
+  distinct `ServerInfo` writer process lock (the pool is separate from state);
+  (c) keep SQL as the write path for non-writer processes during migration.
+  This choice comes before any Rust API work.
+
+## Repo and pin
+
+- Synapse pins mtxdb `dev@f41d02a91bb58f1aa91abeadde8ed549297b3e05` (Cargo.lock).
+- That commit is not in the local `../mtxdb` clone (it is on
+  `laptop/lru-cache`, unrelated). Before any mtxdb change: fetch, confirm the
+  key model is present at the pin, and cut a dedicated branch from exactly that
+  commit. Keep Synapse's pin aligned with that branch's commit. If the pin
+  predates `6a489d5`, decide explicitly whether to include it.
 
 ## Steps
 
-0. Document the plan (this file).
-1. Counters: server-info reads, misses, refreshes and bytes, exposed through the
-   existing stats path (`reset_stats` / `set_stats_enabled` already cover the
-   pool). Record a baseline from a run before any behavior change.
-2. mtxdb: KEYS/SIGN collection API on `ShardType::ServerInfo`, with the atomic
-   SIGN compare-and-set in `DatabaseTransaction`. Unit tests in the mtxdb repo
-   for first-seen-wins, notary override, refresh, and concurrent writers.
-3. `mtxdb_syn.rs`: PyO3 functions for get / get-many / apply-key-response. Wire
-   read-only workers to read through the active overlay (replace the snapshot
-   open at the `has no read path` comment), so workers see committed records
-   without restart.
-4. `keys.py`: write path calls the mtxdb compare-and-set instead of the SQL
-   insert/select/update sequence when the embedded engine is on. No steady-state
-   SQL dual writes. Keep the `_get_server_keys_json` cache and replication
-   invalidation as they are.
-5. Reads: mtxdb first, SQL fallback for pre-migration rows only.
-6. Backfill existing `server_keys_json` and `server_signature_keys` rows into
-   mtxdb (background update or one-shot, idempotent, safe to rerun).
-7. Verification: crash/recovery (restart during a pending write), concurrent
-   MSC4499 writers, read-only worker visibility, backfill and fallback tests,
-   `TestMSC4499Key` in Complement.
-8. After validation: remove the SQL fallback reads and stop writing the two
-   tables. Only in a later change, and only with a rebuild path from SQL dumps
-   or a remote re-fetch (keys can be re-fetched, so loss is recoverable).
+0. Document the plan (done).
+1. Server-info counters in the stats report (done, `e819cc7042`).
+2. Verify the key model at the pin; create the mtxdb branch from it.
+3. Settle the writer route (above).
+4. Define the payload contract per kind; add the atomic first-seen-wins /
+   provisional->corroborated update over these records, with tests in mtxdb.
+5. `mtxdb_syn.rs` PyO3 get / apply functions; wire read-only workers to read
+   through the overlay (replace the snapshot open at the "has no read path"
+   comment).
+6. `keys.py`: mtxdb-first reads and the write route; no steady-state SQL dual
+   writes; keep the existing caches and replication invalidation.
+7. Backfill from `server_keys_json` and `server_signature_keys` (idempotent).
+8. Verification: crash/recovery, concurrent writers, read-only visibility,
+   `TestMSC4499Key`. Then remove SQL fallbacks.
 
 ## Measurement
 
