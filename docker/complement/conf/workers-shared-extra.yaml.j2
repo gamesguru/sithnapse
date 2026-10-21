@@ -33,6 +33,9 @@ federation_custom_ca_list:
 # unblacklist RFC1918 addresses
 federation_ip_range_blacklist: []
 
+# Complement's push gateway runs on the host, reached via a private address.
+ip_range_blacklist: []
+
 # Disable server rate-limiting
 rc_federation:
   window_size: 1000
