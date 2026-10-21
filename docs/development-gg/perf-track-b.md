@@ -122,6 +122,21 @@ lookups, not range scans or joins, so dropping it would mean building those
 indexes and query paths in Python/Rust. Revisit only after mapping its query
 patterns to mtxdb indexes and measuring the replacement cost.
 
+SQL cost per family (`res/logs/2026-10-21-trial-tests-530s.log`, 5,767 tests,
+`-j4`, sync off, pin `0efca0a`; summed over 25 processes, total 494.9 s). This
+is a unit-test run, not a federation workload, and the log does not split reads
+from writes:
+
+- Family 4: `event_edges` 18.3 s (43,754 calls, 31,282 rows) plus
+  `edge_index_outbox` 4.5 s = 22.7 s (4.6%).
+- Family 5: `state_groups` 12.8 s, `state_groups_persisting` 8.7 s,
+  `state_groups_pending_deletion` 7.4 s (42,728 calls, 206 rows) = 28.9 s
+  (5.8%). `state_group_edges` is under the top-30 cutoff (4.2 s).
+
+Spread over four parallel jobs each is about 1% of wall time, so 4 and 5 are
+structural simplifications, not large speedups. Order 4 before 5 by risk, not by
+SQL time.
+
 Items 2 and 3 retire legacy paths, 4 removes an active duplicate write, 5 is a
 redesign. The claims in this list (for example that new writes already go only
 to mtxdb) are unverified until each family's dependency map is done.
