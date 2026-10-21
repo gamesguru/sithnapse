@@ -81,7 +81,6 @@ from synapse.storage.databases.main.embedded_common import (
 from synapse.storage.databases.main.embedded_event_edges import (
     bump_room_edge_source_version,
     embedded_event_edges_is_writable,
-    get_event_edges_forward_batch,
     open_embedded_event_edges_engine,
     put_event_edges_batch,
 )
@@ -1049,9 +1048,7 @@ class PersistEventsStore:
             self._embedded_db_engine,
         )
 
-    async def _get_events_which_are_prevs(
-        self, event_ids: Iterable[str], room_id: str | None = None
-    ) -> list[str]:
+    async def _get_events_which_are_prevs(self, event_ids: Iterable[str]) -> list[str]:
         """Filter the supplied list of event_ids to get those which are prev_events of
         existing (non-outlier/rejected) events.
 
@@ -1066,52 +1063,6 @@ class PersistEventsStore:
         def _get_events_which_are_prevs_txn(
             txn: LoggingTransaction, batch: Collection[str]
         ) -> None:
-            query_batch = batch
-            if self._embedded_event_edges_enabled and room_id is not None:
-                # A raw miss cannot distinguish an empty edge list from an
-                # edge that has not reached mtxdb. Only trust a miss when the
-                # room's published source version proves the index is current.
-                # Read the version and perform the gated FFI lookup in this
-                # transaction, falling back to SQL on stale generations.
-                version_started = time.monotonic()
-                txn.execute(
-                    "SELECT source_version FROM room_edge_source_version "
-                    "WHERE room_id = ?",
-                    (room_id,),
-                )
-                version_row = txn.fetchone()
-                ffi_timing(
-                    "persist_prevs_source_version_sql",
-                    time.monotonic() - version_started,
-                )
-                source_version = int(version_row[0]) if version_row else 0
-                ffi_started = time.monotonic()
-                forward = get_event_edges_forward_batch(
-                    self._embedded_db_namespace,
-                    room_id,
-                    source_version,
-                    list(batch),
-                )
-                ffi_timing(
-                    "persist_prevs_mtxdb_forward", time.monotonic() - ffi_started
-                )
-                ffi_count("persist_prevs_mtxdb_candidates", len(batch))
-                if not forward.stale:
-                    query_batch = [
-                        event_id for event_id in batch if forward.get(event_id)
-                    ]
-                    ffi_count(
-                        "persist_prevs_mtxdb_candidates_with_children",
-                        len(query_batch),
-                    )
-                    if not query_batch:
-                        ffi_count("persist_prevs_sql_skipped_no_children", len(batch))
-
-            if not query_batch:
-                return
-
-            ffi_count("persist_prevs_sql_candidates", len(query_batch))
-
             sql = """
             SELECT prev_event_id, internal_metadata, event_id
             FROM event_edges
@@ -1125,7 +1076,7 @@ class PersistEventsStore:
             """
 
             clause, args = make_in_list_sql_clause(
-                self.database_engine, "prev_event_id", query_batch
+                self.database_engine, "prev_event_id", batch
             )
 
             _t = time.monotonic()
@@ -1155,8 +1106,7 @@ class PersistEventsStore:
                 if not meta or not db_to_json(meta).get("soft_failed"):
                     results.append(prev_event_id)
 
-        candidates = list(event_ids)
-        for chunk in batch_iter(candidates, 100):
+        for chunk in batch_iter(event_ids, 100):
             _t = time.monotonic()
             await self.db_pool.runInteraction(
                 "_get_events_which_are_prevs", _get_events_which_are_prevs_txn, chunk
