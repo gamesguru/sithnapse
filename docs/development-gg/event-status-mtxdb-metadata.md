@@ -1,4 +1,4 @@
-# Event status for mtxdb edge reads
+# Event status in the backward-edge record
 
 Status: design note; nothing implemented. This describes the mutable event state
 needed before the family-4 persist queries can read from mtxdb without SQL. See
@@ -7,172 +7,213 @@ needed before the family-4 persist queries can read from mtxdb without SQL. See
 
 ## Goal
 
-Replace the persist-path SQL joins with Rust reads over mtxdb's forward edges
-and the status of their child events. The required status is small:
+Replace the persist-path SQL joins with Rust reads over mtxdb. The filter needs
+three bits of per-event state:
 
 - `outlier` from `events.outlier`;
 - whether a rejection row exists;
 - `soft_failed` from event internal metadata.
 
-The first two are mutable SQL state and are not yet completely represented in
-mtxdb. The rejection mirror is also not authoritative today.
+The first two are mutable SQL state and are not represented in mtxdb. The
+rejection mirror is not authoritative today.
 
-## Pool placement and consistency
+## Decision: a status byte in the backward-edge payload
 
-Edges are read from the Edges pool (`auth_chain_db()` in the Synapse binding).
-Event JSON and its `event_meta_node_id` record are in the separate EventDag pool
-(`event_dag_db()`). A `PackfileStorage::read_snapshot()` pins one pool; it
-cannot give a consistent read across those two engines.
+Store the status as one optional trailing byte in each event's **backward-edge
+record** (`encode_backward_edges`, `rust/src/database/embedded_edges.rs`). No
+mtxdb change, no frame TLV, no sibling record.
 
-Put the new compact status record in the **Edges pool**, in its own stable
-room-scoped collection (for example `STAT`, derived from the room's group
-digest), keyed by event ID. Keep it out of the generation-scoped `FWD`
-collection and out of `PREV`: a forward-generation rebuild or reset must not
-delete or rewrite status. Do not copy mutable status into parent forward lists:
-de-outliering or a rejection change would otherwise require rewriting every
-parent that references the event.
+Why this record:
 
-Then a single Edges-pool snapshot can read the forward lists and the status
-records from one boundary. The Rust binding should:
+- It is already in the Edges pool, so one `PackfileStorage::read_snapshot()` on
+  that pool covers the forward lists and the status. Snapshots are per pool; the
+  EventDag metadata record cannot share one with the edges.
+- Both persist queries already need it. `_get_prevs_before_rejected` walks
+  backwards: each level needs the current event's prev list and its own status,
+  which is one backward record. `_get_events_which_are_prevs` reads forward
+  children and must read each child's backward record to drop tombstoned
+  children, so the status arrives in a record that read pays for.
+- A purge tombstone (`event_edges_delete` writes an empty backward record)
+  clears the status by construction. There is no separate delete.
+- It is Synapse-owned structured data, not `internal_metadata` JSON.
+
+Caveat on the second point: the ungated `event_edges_get_forward` does the child
+backward read (`embedded_edges.rs` ~1068-1115). The gated getter that production
+uses (`event_edges_get_forward_gated`) reads only the generation-scoped forward
+list. The new Rust persist read must do the child backward batch itself, in the
+same snapshot. It is one batched read per room collection, not free.
+
+### Format
+
+Today: `[version=2][self identity][u16 count]{[is_state u8][prev identity]}*`.
+The decoder reads exactly `count` edges and never checks that the payload is
+fully consumed, so an old reader ignores a trailing byte.
+
+Keep version 2 and append an optional status byte:
+
+- no trailing byte: legacy record, status unknown (see migration);
+- one trailing byte: bit 0 `outlier`, bit 1 `rejected`, bit 2 `soft_failed`,
+  remaining bits reserved and must be zero.
+
+New readers accept both. Do not bump to version 3: that would hard-fail old
+readers during a rolling deploy for no benefit. Centralise encode and decode so
+the three backward-record writers (`write_edges`, `event_edges_delete`, the new
+status update) cannot diverge.
+
+The status carries a rejection bit, not the reason. The reason is free text and
+this read path only needs to know whether the event is rejected. Full-reason
+reads and writes stay on their current SQL path until they have their own
+migration.
+
+### Absence is not "normal" yet
+
+A version-2 record written before this change has no status byte. It cannot mean
+"normal": an abnormal legacy event would be read as normal. Treat a missing byte
+as unknown and fall back to SQL until the backfill completion gate passes. After
+the gate, missing means normal and backfill only needs to rewrite legacy
+abnormal events, not every record.
+
+Events with no prev events (room creators) have no backward record. If one is
+ever abnormal, the status writer creates a zero-edge backward record to carry
+the byte. Normal creators need nothing.
+
+## Read path
+
+The Rust binding does one call per persist batch on one Edges snapshot:
 
 1. Capture one read snapshot.
-2. Batch-read candidate forward lists in the room collection.
-3. If children exist, batch-read their status records in the same snapshot.
-4. Return qualifying parent IDs and diagnostic counts.
+2. `_get_events_which_are_prevs`: batch-read candidate forward lists in the room
+   collection; for any children, batch-read their backward records and filter on
+   status. Return qualifying parent IDs and diagnostic counts. Most candidates
+   have no forward record (12 SQL rows for 20,579 candidates in the saved run),
+   so most calls stop after the forward read.
+3. `_get_prevs_before_rejected`: walk backwards in Rust with a visited set. Read
+   each frontier's backward records once, use the prev list and status together.
+   Do not call Python once per level.
+4. On `WouldBlock` (publication advanced or the writer restarted), retry a
+   bounded number of times inside Rust. After the bound, fail closed to the
+   existing SQL path during migration. Never read an incomplete snapshot as "no
+   edges".
 
-A snapshot's overlay covers committed journal groups only. A status record
-staged in another, uncommitted transaction is deliberately invisible; a record
-staged in the reader's own transaction is visible to that transaction. The read
-path must not depend on seeing another writer's uncommitted status.
+A snapshot covers committed journal groups only. A record staged in another,
+uncommitted transaction is invisible by design; one staged in the reader's own
+transaction is visible to it. The read must not depend on another writer's
+uncommitted status.
 
-For `_get_prevs_before_rejected`, traverse levels in Rust with a visited set;
-read each frontier and its statuses on the same snapshot. Do not call Python
-once per recursion level. If publication advances or a writer restarts and a
-snapshot returns `WouldBlock`, retry a bounded number of times inside Rust.
-After bounded retries, fail closed to the existing SQL path during migration; do
-not interpret an incomplete snapshot as “no edges”.
+A forward-list miss is authoritative only after the edge cutover (body and edges
+committed together). Until then the version gate stays; see "Migration".
 
-The first query's saved workload had only 12 SQL result rows for 20,579
-candidates, so most calls should stop after the forward lookup. That makes a
-separate status record reasonable: it is fetched only for actual children. The
-rejected-predecessor traversal can have more children, so measure its status
-batch separately.
+## Writes
 
-## Atomic writes: what mtxdb already supports
+Initial persistence passes the known state into `event_edges_put` as an optional
+status byte per event, in the same put as the backward record.
 
-The required body-plus-edges write does **not** require moving edge data into
-EventDag or adding a cross-pool transaction feature. The mtxdb `Database`
-documents atomic cross-pool transactions; `DatabaseTransaction::put` accepts a
-`ShardType`, and Synapse's transaction stages writes into a shared journal
-group. The existing event JSON staging targets EventDag, while edge staging
-targets Edges. Use one mtxdb transaction to commit the body and edges together.
+Later changes (de-outlier, reject, accept, soft-fail) go through
+`event_status_put_batch`, a version-bound read-modify-write of the backward
+record: read, replace the trailing byte, re-encode the same prev list, write
+with `expect_record_version`. The prev list is immutable, so this is safe, and
+the transitions are rare. Updates must serialise with edge writes and with purge
+so a status write cannot overwrite a newer edge write or resurrect a purged
+record. A version conflict retries.
 
-This guarantee is within mtxdb. SQL and mtxdb still cannot commit atomically
-with each other. During migration, SQL remains authoritative and both stores are
-updated. The cutover needs an explicit recovery/reconciliation policy for the
-crash window between the mtxdb commit and SQL commit; it must not claim that
-cross-pool atomicity closes that cross-database gap.
-
-## Status record format and authority
-
-Use a versioned, fixed-size Synapse-owned payload, written through the existing
-Rust binding layer rather than a new mtxdb frame TLV. A minimal first version
-needs bits for `outlier`, `rejected`, and `soft_failed`; omit unset/normal
-records after the backfill completion gate. Absence means normal only after that
-gate has completed.
-
-Keep the API layout-agnostic:
+Keep the API layout-agnostic so Python never knows the record layout:
 
 ```text
-event_status_get_batch(room_id, event_ids) -> event_id -> status or missing
+event_status_get_batch(room_id, event_ids) -> event_id -> status or unknown
 event_status_put_batch(room_id, rows, transaction=...) -> ()
-event_status_delete_batch(room_id, event_ids, transaction=...) -> ()
 ```
 
-The API should permit staging in the same cross-pool mtxdb transaction as body,
-edge, or rejection-reason writes. Rust owns the encoding and the Edge-pool
-collection/key mapping. Python callers should not know the record layout.
+Body and edges are written in one mtxdb transaction. mtxdb's `Database` provides
+atomic cross-pool transactions (`engine/database.rs`), and Synapse's transaction
+already stages event JSON into EventDag and edges into Edges. Moving body writes
+and edge writes into one transaction is a call-site change, not a pool change.
+This is atomic within mtxdb only; SQL and mtxdb still cannot commit together.
+The cutover needs an explicit policy for the window between the two commits (a
+manual reconciliation tool may suffice), and must not claim cross-pool atomicity
+closes it.
 
-The status record carries a rejection bit, not the rejection reason. The current
-reason is free text, and this read path only needs to know whether the event is
-rejected. Keep full-reason reads and writes on their current SQL path until they
-receive a separate migration plan. A category code is unnecessary for these
-filters.
+## Mutation paths
 
-## Required mutation paths
+SQL stays authoritative and every path dual-writes until the verification gate.
 
-Keep SQL authoritative and dual-write until backfill and verification finish.
-Every status transition must update the Edge-pool record:
-
-| Path                                     | Status change                                                           |
-| ---------------------------------------- | ----------------------------------------------------------------------- |
-| Event persistence                        | Initial outlier/rejected/soft-failed state                              |
-| `_update_outliers_txn` in `events.py`    | Clear outlier on de-outlier                                             |
-| Purge's retained-event outlier update    | Set outlier                                                             |
-| Event purge (`event_edges_delete`)       | Delete the status record; purge only tombstones the backward edge today |
-| `_store_rejections_txn` in `events.py`   | Set rejected                                                            |
-| `events_worker.py` accept/reject recheck | Clear or set rejected; currently not mirrored                           |
-| Both rejection purge paths               | Clear or delete rejected status                                         |
-| Soft-fail state writes                   | Set/clear soft-failed; audit exact mutation paths before implementation |
+| Path                                     | Status change                                               |
+| ---------------------------------------- | ----------------------------------------------------------- |
+| Event persistence                        | Initial outlier/rejected/soft-failed state, in the edge put |
+| `_update_outliers_txn` in `events.py`    | Clear outlier on de-outlier                                 |
+| Purge's retained-event outlier update    | Set outlier                                                 |
+| Event purge (`event_edges_delete`)       | Tombstone clears the byte; nothing extra                    |
+| `_store_rejections_txn` in `events.py`   | Set rejected                                                |
+| `events_worker.py` accept/reject recheck | Clear or set rejected; currently not mirrored at all        |
+| Both rejection purge paths               | Clear rejected                                              |
+| Soft-fail state writes                   | Set/clear soft-failed; audit exact mutation paths first     |
+| Repair and backfill of legacy records    | Pass the SQL-derived status when rewriting a legacy record  |
 
 The existing rejection mirror does not satisfy this contract: its writes are
 documented as cache-tier, `get_rejections_batch` has no production caller, and
-`events_worker.py` has direct SQL upsert/delete paths that do not mirror. The
-status record must be updated on those paths too. This does not make the
-existing full rejection-reason record authoritative.
+`events_worker.py` upserts and deletes SQL rows without mirroring. The
+unmirrored accept/reject path is an existing bug to fix first, independent of
+this work.
 
-`event_edges_delete` currently writes an empty backward record and deliberately
-does not touch parents' forward lists or delete collections, so it will not
-remove a `STAT` record implicitly. Add the status delete to that path (or
-tombstone it in the same batch). A stale status record is not read for a
-tombstoned child, because the forward read filters the child first, but it
-violates the absence contract and must not survive indefinitely.
-
-The body and edges should be staged in one mtxdb transaction. Status writes that
-accompany initial persistence should join that transaction. Later
-outlier/rejection transitions can be small status-only transactions. All updates
-still need the SQL↔mtxdb failure/reconciliation policy described above.
+The risk is a backward-record writer that forgets the byte, silently clearing
+status. The surface is small (`write_edges`, `event_edges_delete`, the status
+update); audit all three and test each.
 
 ## Migration and cutover
 
-1. Add the Edge-pool status record and dual-write every mutation path above;
-   keep reads on SQL.
-2. Backfill abnormal events from SQL (`outlier`, rejected rows, and
-   `soft_failed`). Make the background update resumable. Do not treat a missing
-   record as normal until the update is complete.
-3. Verify status against SQL for sampled records and specifically exercise
-   persist, de-outlier, purge's outlier flip, reject, re-reject, accept, and
-   purge deletion. Check transaction overlays and a read-only worker's published
-   view.
-4. After the verification gate, switch the two persist queries to the Rust
-   snapshot API. Keep the current SQL/version fallback until the edge cutover
-   makes a forward miss authoritative.
-5. Stage body and edges in one cross-pool mtxdb transaction. Then remove the
-   persist SQL joins and, only after all other edge readers are migrated, retire
-   the SQL edge mirror, outbox, and version gate.
+1. Fix the unmirrored accept/reject path. SQL stays authoritative.
+2. Add the status byte to the backward record and dual-write every path above.
+   Reads stay on SQL.
+3. Backfill abnormal legacy events from SQL (`outlier`, rejected rows,
+   `soft_failed`) with a resumable background update. A missing byte means
+   unknown until the update completes.
+4. Verify status against SQL for sampled records and for each transition:
+   persist, de-outlier, purge's outlier flip, reject, re-reject, accept, purge
+   deletion. Check transaction overlays and a read-only worker's published view.
+5. Switch the two persist queries to the Rust snapshot read. Keep the SQL and
+   version fallback until step 6 makes a forward miss authoritative.
+6. Stage body and edges in one mtxdb transaction. Then remove the persist SQL
+   joins and, only after the other edge readers are migrated, the SQL edge
+   mirror, outbox and version gate.
 
-The SQL and mtxdb commits remain separate systems throughout. Before declaring
-mtxdb authoritative, define how a crash between those commits is detected and
-repaired; a manual reconciliation tool may be sufficient, but the failure mode
-must be explicit.
+Rollback: old writers omit the byte, so a record rewritten by an old writer
+loses it. SQL remains authoritative during migration and backfill can repair it.
+After cutover, require the new writer.
 
-## Why not a frame TLV now?
+## Alternatives considered
 
-A TLV on `event_meta_node_id` would avoid one small sibling record, but that
-record is in EventDag, while the edge snapshot is in Edges. It would therefore
-reintroduce the cross-pool read-consistency problem. A Synapse-owned status
-record in Edges gives the needed same-snapshot read without changing mtxdb's
-frame format or exposing frame metadata through its storage API.
-
-Revisit a generic mtxdb frame-metadata API only if another consumer needs typed
-per-record metadata or measurements show the extra status records are material.
-The current read design gets no snapshot advantage from a TLV on the EventDag
-metadata record.
+- **Sibling STAT record in the Edges pool.** Same snapshot, but it adds a read
+  to both queries (the backward record is already read), a collection to keep
+  out of generation rebuilds, and an explicit delete on purge. Rejected because
+  the payload byte gets the same consistency with no extra read.
+- **Frame TLV on `event_meta_node_id`.** That record is in EventDag, so it
+  cannot share an Edges snapshot. It would need the cross-pool snapshot
+  capability, which mtxdb does not have (snapshots are scoped to one
+  `PackfileStorage`).
+- **Frame TLV on the backward-edge frame.** Shares the pool, but needs mtxdb
+  changes (metadata on put, metadata on read, overlay, repack preservation) and
+  does not remove a read, because the prev list must be decoded anyway. The
+  payload byte is equivalent for these queries. Revisit only if a second
+  consumer needs generic typed per-record metadata.
+- **Copying status into parent forward lists.** De-outlier or rejection would
+  rewrite every parent. Rejected.
 
 ## Measurements
 
-Instrument the Rust call with duration, candidate count, forward hits, status
-records read, recursion levels, and `WouldBlock` retries. Compare these with
-`persist_prevs_total` and `persist_rejected_total`; the desired result is no SQL
-execution or `runInteraction` on the successful post-cutover path. Keep the SQL
-fallback visible during migration and count its use explicitly.
+This is a layout choice, not a measured speedup. Instrument the Rust call with
+duration, candidate count, forward hits, backward records read, recursion levels
+and `WouldBlock` retries. Compare with `persist_prevs_total` and
+`persist_rejected_total` from the 470 s run (18.8 s and 11.9 s summed). The goal
+on the post-cutover path is no SQL execution and no `runInteraction`. Count SQL
+fallback use explicitly during migration.
+
+## Open questions
+
+- Every site that writes `soft_failed` into internal metadata.
+- Which writer serialises status updates against edge writes and purge (the
+  record-version CAS should be enough; confirm under concurrent persist).
+- The crash window between the mtxdb and SQL commits: detection and repair.
+- Whether any other reader decodes backward records and would choke on, or
+  mishandle, the trailing byte.
+- Which mtxdb revision Synapse is pinned to for this work. Cargo.lock is at
+  `ce55563`, not `f41d02a`, and `dev` HEAD carries unfinished server-key
+  commits.

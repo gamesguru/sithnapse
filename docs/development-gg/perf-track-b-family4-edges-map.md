@@ -117,17 +117,18 @@ storage tests are persist-heavy, so do not scale it up.
 ## Replacement plan
 
 1. **`_get_events_which_are_prevs`.** One batched call in the Synapse Rust
-   binding over mtxdb: candidate ids in, forward children out; read
-   `internal_metadata` and rejections only for candidates that have children.
-   Keep the SQL path as fallback until measured.
+   binding over mtxdb: candidate ids in, forward children out; read the
+   Edge-pool status record for children only. See
+   `event-status-mtxdb-metadata.md`. Keep the SQL path as fallback until
+   measured.
 2. **`_get_prevs_before_rejected`.** After the above, once the filter inputs are
    verified (below). Returns many rows, so it needs the full filter.
 3. Add an mtxdb API only if the binding cannot batch these reads efficiently.
 
-Unverified inputs: whether `internal_metadata` in mtxdb is always current with
-`events.outlier` (de-outlier path, `events.py` ~1435-1497) and populated for old
-events; whether the rejection mirror is complete (`mirror_get_rejections` ran
-only 9 times, so it is barely exercised).
+The persist path no longer reads `internal_metadata` or the rejection mirror; it
+reads the new Edge-pool status record (outlier, rejected, soft-failed). The
+rejection mirror's completeness still matters for the rejected bit and its own
+migration; see the note's mutation-path table.
 
 ## What this means for cutover
 
