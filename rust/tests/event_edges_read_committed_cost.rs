@@ -84,13 +84,13 @@ fn event_dag_refresh_counters(py: Python<'_>) -> (u64, u64) {
 fn populate(py: Python<'_>) -> (Vec<String>, Vec<String>) {
     let mut parents = Vec::with_capacity(N_PARENTS);
     let mut leaf_children = Vec::with_capacity(N_PARENTS);
-    let rows: Vec<(String, String, String, bool)> = (0..N_PARENTS)
+    let rows: Vec<(String, String, String, bool, u8)> = (0..N_PARENTS)
         .map(|i| {
             let parent = format!("$cost-parent-{i}");
             let child = format!("$cost-child-{i}");
             parents.push(parent.clone());
             leaf_children.push(child.clone());
-            (ROOM.to_owned(), child, parent, false)
+            (ROOM.to_owned(), child, parent, false, 0)
         })
         .collect();
     event_edges_put(py, NAMESPACE.to_owned(), rows).expect("populate");

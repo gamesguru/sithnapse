@@ -484,6 +484,12 @@ const EDGE_STATUS_REJECTED: u8 = 0x02;
 const EDGE_STATUS_SOFT_FAILED: u8 = 0x04;
 const EDGE_STATUS_KNOWN: u8 = EDGE_STATUS_OUTLIER | EDGE_STATUS_REJECTED | EDGE_STATUS_SOFT_FAILED;
 
+type BackwardEdges = Vec<(String, bool)>;
+type BackwardRecord = (String, BackwardEdges, u8);
+type BackwardBatchMap = HashMap<(String, String), (BackwardEdges, u8)>;
+type StatusChange = (u8, u8);
+type StatusCollectionMap = HashMap<[u8; 16], Vec<(NodeId, String, Vec<StatusChange>)>>;
+
 fn encode_backward_edges(self_identity: &str, edges: &[(String, bool)], status: u8) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.push(BACKWARD_EDGES_FORMAT_VERSION);
@@ -501,7 +507,7 @@ fn encode_backward_edges(self_identity: &str, edges: &[(String, bool)], status: 
 /// silently) on anything short of a well-formed record: an unrecognized
 /// format version, an unknown identity tag, a missing status byte, or a length
 /// that runs past the record's end.
-fn decode_backward_edges(bytes: &[u8]) -> PyResult<(String, Vec<(String, bool)>, u8)> {
+fn decode_backward_edges(bytes: &[u8]) -> PyResult<BackwardRecord> {
     let version = *bytes.first().ok_or_else(|| {
         pyo3::exceptions::PyValueError::new_err("truncated event-edge record (empty)")
     })?;
@@ -789,7 +795,7 @@ fn write_edges(
 
     // Every row for one event carries the same status. A caller that disagrees
     // with itself is a bug, so fail rather than silently picking one.
-    let mut backward_map: HashMap<(String, String), (Vec<(String, bool)>, u8)> = HashMap::new();
+    let mut backward_map: BackwardBatchMap = HashMap::new();
     let mut forward_map: HashMap<(String, String), Vec<String>> = HashMap::new();
 
     for (room_id, event_id, prev_event_id, is_state, status) in rows {
@@ -951,7 +957,7 @@ fn apply_status_updates(
             .push((*set_bits, *clear_bits));
     }
 
-    let mut by_collection: HashMap<[u8; 16], Vec<(NodeId, String, Vec<(u8, u8)>)>> = HashMap::new();
+    let mut by_collection: StatusCollectionMap = HashMap::new();
     for ((room_id, event_id), changes) in grouped {
         let collection = prev_edges_room_id(namespace, &room_id);
         let node = event_edges_backward_node_id(namespace, &event_id);
@@ -1993,10 +1999,12 @@ mod tests {
             (v4_event_id(), false),
             (v1_event_id(), true),
         ];
-        let encoded = encode_backward_edges(&self_id, &edges);
-        let (decoded_self, decoded_edges) = decode_backward_edges(&encoded).unwrap();
+        let encoded = encode_backward_edges(&self_id, &edges, 0x05);
+        let (decoded_self, decoded_edges, decoded_status) =
+            decode_backward_edges(&encoded).unwrap();
         assert_eq!(decoded_self, self_id);
         assert_eq!(decoded_edges, edges);
+        assert_eq!(decoded_status, 0x05);
     }
 
     #[test]
@@ -2029,12 +2037,14 @@ mod tests {
                         "$child".to_string(),
                         "$p1".to_string(),
                         true,
+                        0,
                     ),
                     (
                         room.to_string(),
                         "$child".to_string(),
                         "$p2".to_string(),
                         false,
+                        0,
                     ),
                 ],
             )
@@ -2086,6 +2096,7 @@ mod tests {
                     "$child2".to_string(),
                     "$p1".to_string(),
                     false,
+                    0,
                 )],
             )
             .expect("put second child");
@@ -2160,9 +2171,17 @@ mod tests {
 
         pyo3::Python::attach(|py| {
             let children: Vec<String> = (0..child_count).map(|i| format!("$sc{i}")).collect();
-            let rows: Vec<(String, String, String, bool)> = children
+            let rows: Vec<(String, String, String, bool, u8)> = children
                 .iter()
-                .map(|child| (room.to_string(), child.clone(), parent.to_string(), false))
+                .map(|child| {
+                    (
+                        room.to_string(),
+                        child.clone(),
+                        parent.to_string(),
+                        false,
+                        0,
+                    )
+                })
                 .collect();
             event_edges_put(py, ns.to_string(), rows).expect("put children");
 
@@ -2251,7 +2270,7 @@ mod tests {
                         event_edges_put(
                             py,
                             ns.to_string(),
-                            vec![(room.to_string(), child, parent.to_string(), false)],
+                            vec![(room.to_string(), child, parent.to_string(), false, 0)],
                         )
                         .expect("put from concurrent thread")
                     });
@@ -2307,6 +2326,7 @@ mod tests {
                         "$independent-child".to_string(),
                         "$independent-parent".to_string(),
                         false,
+                        0,
                     )],
                 )
                 .expect("put to independent room");

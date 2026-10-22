@@ -99,7 +99,13 @@ fn writer_phase(py: Python<'_>, dir: &str) {
     event_edges_put(
         py,
         NAMESPACE.to_owned(),
-        vec![(ROOM.to_owned(), CHILD.to_owned(), PARENT.to_owned(), false)],
+        vec![(
+            ROOM.to_owned(),
+            CHILD.to_owned(),
+            PARENT.to_owned(),
+            false,
+            0,
+        )],
     )
     .expect("writer put");
     sync_auth_chain(py).expect("sync edges pool");
@@ -195,6 +201,7 @@ fn repeated_writer_phase(py: Python<'_>, dir: &str) {
             REPEATED_CHILD_1.to_owned(),
             REPEATED_PARENT.to_owned(),
             false,
+            0,
         )],
     )
     .expect("writer put 1");
@@ -215,6 +222,7 @@ fn repeated_writer_phase(py: Python<'_>, dir: &str) {
             REPEATED_CHILD_2.to_owned(),
             REPEATED_PARENT.to_owned(),
             false,
+            0,
         )],
     )
     .expect("writer put 2");
