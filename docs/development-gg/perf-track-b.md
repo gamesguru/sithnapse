@@ -36,6 +36,28 @@ largest identified components.
   generators further without evidence that the extra few milliseconds justify
   its maintenance cost.
 
+- Startup migration enqueues (`422ea06275`). Three hooks re-queued a migration
+  by an idempotent upsert into `background_updates` on every homeserver start,
+  then called `start_doing_background_updates()`, which restarts the updater's
+  poll loop. They are dual-mode scaffolding for databases that predate the
+  embedded engine, not state-family work.
+
+  | Hook                                                | Checks                                      | Fresh test DB                |
+  | --------------------------------------------------- | ------------------------------------------- | ---------------------------- |
+  | `enqueue_event_to_state_group_embedded_migration`   | legacy `event_to_state_groups` rows to copy | no-op: migrate step ~0.08 ms |
+  | `enqueue_event_auth_chain_links_embedded_migration` | legacy auth chain link rows                 | no-op: select step ~0.08 ms  |
+  | `enqueue_state_hamt_embedded_migration`             | legacy `state_hamt_*` SQL rows              | no-op: select step ~0.08 ms  |
+
+  In the 984 s slice each ran 2,323 times, with 20-22 ms of thread-pool
+  scheduling delay per call (148.5 s summed, about 30% of all scheduling delay)
+  against about 0.6 ms of SQL. That is accumulated queue time that overlaps with
+  other work, not a wall-time saving. A one-time completion marker would have
+  replaced the per-start check, but with no deployments the migrations are not
+  needed at all, so the hooks were removed and old databases are rebuilt. The
+  handlers, enqueue functions and tests remain until the A/B (homeserver setup,
+  `main_store_init`, total scheduling delay) is run; the Rust module must be
+  rebuilt first.
+
 The two B1 changes are measured setup improvements, not production request-path
 improvements. No full suite was run for these changes.
 
@@ -111,7 +133,9 @@ locks, device-list coordination, push queues, delayed events):
    once recovery is proven. `forward-index-design-spec.md` must be revised
    first.
 5. `state_groups`, `state_group_edges`, `state_group_id_seq`
-   (`state-groups-out-of-sql.md`): broadest change, last.
+   ([family-5 state map](perf-track-b-family5-state-map.md),
+   [state-groups-out-of-sql.md](state-groups-out-of-sql.md)): broadest change,
+   last.
 
 The SQL `events` table is not a candidate yet. Event bodies are already in mtxdb
 for new events; `events` is the relational index (event/room IDs, stream and
