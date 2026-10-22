@@ -86,8 +86,17 @@ Hot path means it runs per persisted event or per request in a normal workload.
 | `controllers/stats.py:108`                                                      | table size estimate                                             | admin                                                        | n/a                               | remove the name                                           |
 | `synapse_port_db.py:118, 160`                                                   | port tables list                                                | one-off tool                                                 | n/a                               | remove the name after the table is dropped                |
 
-`events.py:1480` also carries a comment about edges not being written to SQL or
-the embedded engine in one case; check it when the insert is removed.
+`events.py` writes normal-event edges in `_update_metadata_tables_txn`, after
+`_store_rejected_events_txn` has filtered out persist-time rejected events.
+Those rejected events therefore have no `event_edges` row. They cannot be
+selected as the current event or have their prev list traversed by
+`_get_prevs_before_rejected`; they may still be returned as candidate prev IDs
+by `_get_events_which_are_prevs`, whose status filter is on the referencing
+child. De-outliered events are the exception to the normal call order:
+`_persist_events_and_batches_txn` explicitly invokes `_handle_mult_prev_events`
+for them because they were removed before `_store_event_txn`. Their adjacency is
+written. This was checked at the relevant call sites in `events.py`, not audited
+across every possible writer.
 
 ## Measured: the persist-path reads dominate
 
@@ -117,18 +126,23 @@ storage tests are persist-heavy, so do not scale it up.
 ## Replacement plan
 
 1. **`_get_events_which_are_prevs`.** One batched call in the Synapse Rust
-   binding over mtxdb: candidate ids in, forward children out; read the
-   Edge-pool status record for children only. See
-   `event-status-mtxdb-metadata.md`. Keep the SQL path as fallback until
-   measured.
-2. **`_get_prevs_before_rejected`.** After the above, once the filter inputs are
-   verified (below). Returns many rows, so it needs the full filter.
+   binding over mtxdb: candidate IDs in, forward children out; read backward
+   records for tombstone/existence filtering and per-event status records for
+   the surviving children. See `event-status-mtxdb-metadata.md`. Keep the SQL
+   path until the rebuild and cutover gates are satisfied.
+2. **`_get_prevs_before_rejected`.** Batch-read backward adjacency and separate
+   per-event status records for each traversal frontier. Match SQL's starting
+   set: only events with `event_edges` rows participate. Persist-time rejected
+   events have status records but no adjacency, so they stop the traversal;
+   later-rejected events and de-outliered events can have both.
 3. Add an mtxdb API only if the binding cannot batch these reads efficiently.
 
-The persist path no longer reads `internal_metadata` or the rejection mirror; it
-reads the new Edge-pool status record (outlier, rejected, soft-failed). The
-rejection mirror's completeness still matters for the rejected bit and its own
-migration; see the note's mutation-path table.
+The persist path reads a separate Edge-pool status record (outlier,
+rejected/reason, soft-failed), not status embedded in adjacency. During
+migration SQL remains authoritative: status is derived from `events.outlier`,
+`rejections`, and event internal metadata. Persist-time rejected events must
+still receive status records even though they have no edge rows. See the status
+note's mutation and rebuild requirements.
 
 ## What this means for cutover
 
