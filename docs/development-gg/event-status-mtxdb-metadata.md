@@ -25,13 +25,16 @@ event's own ID. Its format is:
 
 ```text
 [format_version: u8][self_identity][edge_count: u16]
-{[is_state: u8][parent_identity]}*
+{[is_state: u8][parent_identity]}*[status: u8]
 ```
 
-Append an optional status byte after the edge list. Keep the format version
-at 2. The existing decoder stops after `edge_count` edges and does not require
-that it consumed the whole payload, so an older reader ignores a trailing byte.
-That gives forward compatibility without a hard version failure.
+Reset the backward and forward edge payload formats to version 1. The backward
+record's status byte is mandatory. There are no releases, so there is no
+compatibility contract to preserve; v2 records are unsupported rather than
+decoded as “status unknown”.
+
+Existing local mtxdb edge data is rebuilt, not migrated in place: the v1 decoder
+rejects v2, and the read path falls back to SQL while the rebuild gate is open.
 
 Status bits:
 
@@ -61,21 +64,19 @@ header/TLV: it requires a new mtxdb write, overlay and header-read surface, and
 it does not remove a read because the payload is already decompressed for the
 prev list.
 
-## Absence semantics and compatibility
+## Version and rebuild
 
-New writers always append the status byte, including `0` for normal. Legacy
-format-2 records have no byte.
+New writers always write format 1, including a `0` status byte for normal. There
+is no compatibility path for v2: the decoder rejects it.
 
-A missing byte means **unknown**, not normal, until the backfill completion gate
-has passed. During that window a read that needs the status of a record without
-a byte must fall back to SQL rather than assume the event is normal. After the
-gate, a missing byte means normal, because the backfill has added the byte to
-every abnormal legacy record. The gate is what makes that inference valid; do
-not rely on per-event guessing.
+During the rebuild, a v2 record, a missing status byte, or any version/decode
+error means fall back to SQL. Do not interpret it as normal or as unknown. The
+rebuild rewrites every forward and backward edge record from SQL (or from event
+bodies if the SQL mirror is gone); after the gate every edge record is v1 and v2
+is unreachable.
 
-Old writers omit the byte. During a rollback, an abnormal record rewritten by
-old code loses it; SQL is still authoritative during migration, and the backfill
-can repair it. After cutover, require the new writer.
+An old writer would emit v2, which the new decoder rejects. After cutover,
+require the new writer.
 
 ## Read path
 
@@ -136,10 +137,9 @@ Serialization:
   read it with its write version, replace the trailing status byte, re-encode
   the same prev list, stage `expect_record_version`, and write in one
   transaction. Retry on `StaleRead`.
-- `event_edges_put` writes status with the initial backward put. A repair or
-  backfill rewrite of an existing backward record must carry the SQL-derived
-  status (or preserve the existing byte) and bind to the record version, so it
-  cannot erase a newer status.
+- `event_edges_put` writes status with the initial backward put. A rebuild or
+  repair rewrite of an existing backward record must carry the derived status
+  and bind to the record version, so it cannot erase a newer status.
 - Purge wins over a racing status update. If the record is empty (tombstoned), a
   status update must no-op rather than append a byte to the tombstone.
 - An event with no prevs has no backward record. If such an event is abnormal,
@@ -168,10 +168,11 @@ does not close that cross-database gap.
 
 1. Add the status byte and dual-write every mutation path above; keep reads on
    SQL.
-2. Backfill abnormal legacy events from SQL (`outlier`, rejected rows, and
-   `soft_failed`) by rewriting their backward records with the status byte. Make
-   the background update resumable. Mark completion; until then a missing byte
-   means unknown and reads fall back to SQL.
+2. Rebuild all forward and backward edge records from SQL (`event_edges`, or
+   `prev_events` from event bodies if the SQL mirror is already gone), writing
+   v1 records with the derived status. Make the rebuild resumable and mark
+   completion. Until the gate closes, a v2 record or decode error means fall
+   back to SQL.
 3. Verify against SQL for sampled records and exercise persist, de-outlier,
    purge's outlier flip, reject, re-reject, accept, soft-fail/un-soft-fail, and
    purge deletion. Check transaction overlays, the read-only worker's published
@@ -195,11 +196,15 @@ must be explicit.
 - Audit every status mutation call site, especially soft-fail/un-soft-fail and
   the accept/reject recheck.
 - Confirm no consumer outside `embedded_edges.rs` parses the backward payload
-  strictly. The current decoder accepts trailing bytes; verify the same for any
-  dump/import tooling.
+  strictly; the decoder accepts only v1, and v2 triggers the SQL fallback during
+  the rebuild.
 - Confirm the body-plus-edges call path can share one `MtxdbTransaction`; the
   current edge write is post-SQL-commit.
 - Confirm the tombstone/status race resolves to purge-wins.
+- Define the rebuild source and gate: SQL `event_edges` while it is
+  authoritative, else `prev_events` from event bodies. The rebuild must be
+  resumable, rewrite both forward and backward records as v1, and close the gate
+  only after a full pass.
 
 ## Measurements
 
