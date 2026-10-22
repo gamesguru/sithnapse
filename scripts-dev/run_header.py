@@ -10,6 +10,8 @@ Importable too: `Baseline()` snapshots the machine, `header_lines()` and
 `load_lines()` format it.
 """
 
+import datetime
+import glob
 import json
 import os
 import re
@@ -131,6 +133,27 @@ class Baseline:
         return ", ".join(parts)
 
 
+# A debug maturin build of the extension is about ten times the size of a
+# release build (172 MB against 17 MB here). The size is a heuristic, not a
+# build flag, but it is enough to stop a debug build being compared with a
+# release one unnoticed.
+_DEBUG_EXTENSION_BYTES = 60 * 1024 * 1024
+
+
+def rust_extension() -> str:
+    """Size, build time and a debug/release guess for the installed extension."""
+    try:
+        paths = glob.glob(os.path.join(_REPO, "synapse", "synapse_rust*.so"))
+        stat = os.stat(paths[0])
+    except (IndexError, OSError):
+        return "?"
+    built = datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
+    profile = "debug" if stat.st_size > _DEBUG_EXTENSION_BYTES else "release"
+    return (
+        f"{profile} (size heuristic), {stat.st_size / 1_048_576:.0f} MB, built {built}"
+    )
+
+
 def header_lines(
     extra: list[tuple[str, str]], baseline: Optional[Baseline] = None
 ) -> list[str]:
@@ -145,6 +168,7 @@ def header_lines(
         ),
         ("branch", git("rev-parse", "--abbrev-ref", "HEAD")),
         ("mtxdb pin", mtxdb_pin()),
+        ("rust ext", rust_extension()),
         ("cpus", str(os.cpu_count())),
         *extra,
     ]
