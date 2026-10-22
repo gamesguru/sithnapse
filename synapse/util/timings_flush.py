@@ -28,6 +28,7 @@ _thread: threading.Thread | None = None
 # When this process (or, after a fork, this worker) started, for the
 # cpu-versus-wall snapshot below.
 _process_start = time.monotonic()
+_process_cpu_start = time.process_time()
 
 
 def _loop() -> None:
@@ -61,12 +62,13 @@ def _restart_in_forked_child() -> None:
     """
     global _lock, _flush_gate, _thread
     # The parent's locks may have been held by its (now absent) flusher thread.
-    global _process_start
+    global _process_start, _process_cpu_start
     _lock = threading.Lock()
     _flush_gate = threading.Lock()
     _thread = None
     # The child's cpu clock starts at the fork, so its wall clock must too.
     _process_start = time.monotonic()
+    _process_cpu_start = time.process_time()
     if _flushers:
         with _lock:
             _start_thread_locked()
@@ -105,7 +107,7 @@ def _write_process_cpu() -> None:
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(
                 {
-                    "cpu_s": time.process_time(),
+                    "cpu_s": time.process_time() - _process_cpu_start,
                     "wall_s": time.monotonic() - _process_start,
                 },
                 f,

@@ -1073,9 +1073,11 @@ run_one_pattern() {
     _batch_names=("${BASH_REMATCH[1]}")
   fi
 
-  if [ "${#_batch_names[@]}" -gt 0 ]; then
+  # The in-repo package list intentionally uses the Go wildcard ./tests/...
+  # rather than concrete package paths, so exact package narrowing only
+  # applies to the external Complement checkout.
+  if [ "${#_batch_names[@]}" -gt 0 ] && [ -z "$use_in_repo_tests" ]; then
     local _base_dir="$COMPLEMENT_DIR"
-    if [ -n "$use_in_repo_tests" ]; then _base_dir="${repo_root}/complement"; fi
     if command -v rg &>/dev/null; then
       local -a matched_pkgs=()
       mapfile -t matched_pkgs < <(

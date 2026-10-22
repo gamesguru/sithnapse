@@ -365,7 +365,7 @@ def _print_table_ops() -> None:
         table_ops = dict(_TABLE_OPS)
         table_counts = dict(_TABLE_OPS_COUNTS)
         table_rows = dict(_TABLE_OPS_ROWS)
-        fingerprints = dict(_SQL_FINGERPRINTS)
+        fingerprints = {key: list(value) for key, value in _SQL_FINGERPRINTS.items()}
         slow_statements = sorted(_SLOW_STATEMENTS, key=lambda e: e[0], reverse=True)[
             :_SLOW_STATEMENTS_KEPT
         ]
@@ -1560,7 +1560,7 @@ class DatabasePool:
                         *args,
                         db_autocommit=db_autocommit,
                         isolation_level=isolation_level,
-                        sched_label=desc,
+                        scheduling_label=desc,
                         **kwargs,
                     )
 
@@ -1592,7 +1592,7 @@ class DatabasePool:
         *args: Any,
         db_autocommit: bool = False,
         isolation_level: int | None = None,
-        sched_label: str | None = None,
+        scheduling_label: str | None = None,
         **kwargs: Any,
     ) -> R:
         """Wraps the .runWithConnection() method on the underlying db_pool.
@@ -1606,14 +1606,14 @@ class DatabasePool:
                 i.e. outside of a transaction. This is useful for transaction
                 that are only a single query. Currently only affects postgres.
             isolation_level: Set the server isolation level for this transaction.
-            sched_label: label under which the pool scheduling delay is
+            scheduling_label: label under which the pool scheduling delay is
                 reported in the opt-in timings (defaults to `func.__name__`)
             kwargs: named args to pass to `func`
 
         Returns:
             The result of func
         """
-        sched_label = sched_label or getattr(func, "__name__", None)
+        scheduling_label = scheduling_label or getattr(func, "__name__", None)
         curr_context = current_context()
         if not curr_context:
             logger.warning(
@@ -1647,7 +1647,7 @@ class DatabasePool:
                         **{SERVER_NAME_LABEL: self.server_name}
                     ).observe(sched_duration_sec)
                     if _PG_TIMINGS_ENABLED:
-                        _track_sql_scheduling(sched_duration_sec, sched_label)
+                        _track_sql_scheduling(sched_duration_sec, scheduling_label)
                     context.add_database_scheduled(sched_duration_sec)
 
                     if self._txn_limit > 0:
