@@ -48,20 +48,8 @@ fn write_phase(py: Python<'_>, dir: &str) {
         py,
         NAMESPACE.to_owned(),
         vec![
-            (
-                ROOM.to_owned(),
-                LIVE.to_owned(),
-                PARENT.to_owned(),
-                false,
-                0,
-            ),
-            (
-                ROOM.to_owned(),
-                DEAD.to_owned(),
-                PARENT.to_owned(),
-                false,
-                0,
-            ),
+            (ROOM.to_owned(), LIVE.to_owned(), PARENT.to_owned(), false),
+            (ROOM.to_owned(), DEAD.to_owned(), PARENT.to_owned(), false),
         ],
     )
     .expect("write edges");

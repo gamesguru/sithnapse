@@ -48,14 +48,12 @@ fn staged_put_merges_forward_lists_and_publishes_backward_edges() {
                     "$staged-child-1".to_string(),
                     parent.clone(),
                     false,
-                    0,
                 ),
                 (
                     ROOM.to_string(),
                     "$staged-child-2".to_string(),
                     parent.clone(),
                     false,
-                    0,
                 ),
             ],
         )
@@ -74,14 +72,12 @@ fn staged_put_merges_forward_lists_and_publishes_backward_edges() {
                     "$staged-child-1".to_string(),
                     parent.clone(),
                     false,
-                    0,
                 ),
                 (
                     ROOM.to_string(),
                     "$staged-child-3".to_string(),
                     parent.clone(),
                     false,
-                    0,
                 ),
             ],
         )
