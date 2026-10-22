@@ -23,7 +23,7 @@ import tempfile
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import IO, Any, Callable, Protocol, cast
+from typing import IO, Any, Callable, NamedTuple, Protocol, cast
 
 import run_header
 
@@ -47,6 +47,13 @@ class _TestResult(Protocol):
     def startTest(self, test: object) -> None: ...
 
     def stopTest(self, test: object) -> None: ...
+
+
+class _SqlFingerprint(NamedTuple):
+    calls: int
+    total_s: float
+    max_s: float
+    rows: int
 
 
 def _install_test_timing_logging(
@@ -370,6 +377,10 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
         sql_scheduling_samples: list[float] = []
         sql_scheduling_by_label: dict[str, list[float]] = {}
         sql_slow_statements: list[tuple[float, str, int, int]] = []
+        sql_fingerprints: dict[tuple[str, str, str], _SqlFingerprint] = {}
+        # Older runs may still emit the per-transaction `desc-hex` name; strip
+        # it here so aggregation groups by the logical description.
+        txn_suffix_re = re.compile(r"-[0-9a-f]+$")
         for fname in sql_files:
             try:
                 with open(os.path.join(timings_dir, fname), encoding="utf-8") as sql_fh:
@@ -390,6 +401,19 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                     acc = sql_scheduling_by_label.setdefault(label, [0.0, 0])
                     acc[0] += label_total
                     acc[1] += label_calls
+                for fingerprint in data.get("fingerprints", []):
+                    key = (
+                        str(fingerprint.get("table", "")),
+                        txn_suffix_re.sub("", str(fingerprint.get("txn", "(unnamed)"))),
+                        str(fingerprint.get("sql", "")),
+                    )
+                    prev = sql_fingerprints.get(key, _SqlFingerprint(0, 0.0, 0.0, 0))
+                    sql_fingerprints[key] = _SqlFingerprint(
+                        prev.calls + int(fingerprint.get("calls", 0)),
+                        prev.total_s + float(fingerprint.get("total_s", 0.0)),
+                        max(prev.max_s, float(fingerprint.get("max_s", 0.0))),
+                        prev.rows + int(fingerprint.get("rows", 0)),
+                    )
                 for elapsed, text, payload, rowcount in data.get("slow_statements", []):
                     sql_slow_statements.append((elapsed, text, payload, rowcount))
             except Exception as e:
@@ -447,6 +471,33 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
             )
             out("=====================================")
             out("")
+
+        if sql_fingerprints:
+            ranked_fingerprints = sorted(
+                sql_fingerprints.items(), key=lambda item: item[1].total_s, reverse=True
+            )
+            out("=== SQL statement fingerprints (top 20 by total across workers) ===")
+            for (table, txn, sql), fp in ranked_fingerprints[:20]:
+                avg_ms = fp.total_s * 1000 / fp.calls if fp.calls else 0.0
+                out(
+                    f"  {fp.total_s * 1000:9.1f}ms  calls={fp.calls:>8,d}  "
+                    f"avg={avg_ms:7.3f}ms  max={fp.max_s * 1000:8.1f}ms  "
+                    f"rows={fp.rows:>9,d}  [{table}] {txn}: {sql[:240]}"
+                )
+            out("")
+            event_fingerprints = [
+                item for item in ranked_fingerprints if item[0][0] == "events"
+            ]
+            if event_fingerprints:
+                out("=== events SQL fingerprints (top 15 by total across workers) ===")
+                for (_table, txn, sql), fp in event_fingerprints[:15]:
+                    avg_ms = fp.total_s * 1000 / fp.calls if fp.calls else 0.0
+                    out(
+                        f"  {fp.total_s * 1000:9.1f}ms  calls={fp.calls:>8,d}  "
+                        f"avg={avg_ms:7.3f}ms  max={fp.max_s * 1000:8.1f}ms  "
+                        f"rows={fp.rows:>9,d}  {txn}: {sql[:240]}"
+                    )
+                out("")
 
         if sql_slow_statements:
             sql_slow_statements.sort(key=lambda entry: entry[0], reverse=True)

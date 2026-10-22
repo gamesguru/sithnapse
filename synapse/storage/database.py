@@ -152,6 +152,54 @@ _TABLE_RE = re.compile(
 )
 
 _SQL_COMMENT_RE = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
+_TXN_SUFFIX_RE = re.compile(r"-[0-9a-f]+$")
+
+# Per-statement SQL fingerprints, opt-in with the rest of `SYNAPSE_PG_TIMINGS`.
+# A per-table total says which table is expensive but not which shape of query
+# is responsible: 170k calls costing 0.3ms each and a handful of slow scans
+# look identical in that table. Keying by `(table, transaction name, normalized
+# SQL)` separates them, and keeping `rows` distinguishes an INSERT from a
+# 0-row miss and a 1-row point lookup from a batched IN (?) query.
+# Protected by `_TABLE_OPS_LOCK`.
+_SQL_FINGERPRINTS: dict[tuple[str, str, str], list] = {}
+
+# Placeholder forms seen after `convert_param_style` (`%s`) and before it (`?`).
+_SQL_PLACEHOLDER_RE = r"(?:\?|%s)"
+_SQL_IN_LIST_RE = re.compile(
+    rf"\bIN\s*\(\s*{_SQL_PLACEHOLDER_RE}"
+    rf"(?:\s*,\s*{_SQL_PLACEHOLDER_RE})+\s*\)",
+    re.IGNORECASE,
+)
+_SQL_VALUES_LIST_RE = re.compile(
+    rf"\bVALUES\s*\(\s*{_SQL_PLACEHOLDER_RE}"
+    rf"(?:\s*,\s*{_SQL_PLACEHOLDER_RE})*\s*\)"
+    rf"(?:\s*,\s*\(\s*{_SQL_PLACEHOLDER_RE}"
+    rf"(?:\s*,\s*{_SQL_PLACEHOLDER_RE})*\s*\))+",
+    re.IGNORECASE,
+)
+_SQL_DOLLAR_LITERAL_RE = re.compile(
+    r"\$(?:[A-Za-z_]\w*)?\$.*?\$(?:[A-Za-z_]\w*)?\$", re.DOTALL
+)
+# Bare numeric literals (including `$1`-style placeholders). Word boundaries
+# keep digits inside identifiers (`events_2`) intact.
+_SQL_NUMBER_RE = re.compile(r"(?<![\w.])\d+(?:\.\d+)?(?![\w.])")
+
+
+def _sql_fingerprint(sql: str) -> str:
+    """Normalize a statement into a stable shape for per-shape accounting."""
+    if "--" in sql or "/*" in sql:
+        sql = _SQL_COMMENT_RE.sub(" ", sql)
+    # Dollar-quoted bodies can contain quotes, so mask them before the
+    # single-quote pass; then mask the remaining string and numeric literals.
+    sql = _SQL_DOLLAR_LITERAL_RE.sub("?", sql)
+    sql = _SQL_STRING_LITERAL_RE.sub("?", sql)
+    sql = _SQL_NUMBER_RE.sub("?", sql)
+    # Canonicalize the driver's placeholder style before collapsing batches.
+    sql = sql.replace("%s", "?")
+    # Variable-size batches must not split into one key per arity.
+    sql = _SQL_IN_LIST_RE.sub("IN (?)", sql)
+    sql = _SQL_VALUES_LIST_RE.sub("VALUES (?+)", sql)
+    return " ".join(sql.split())
 
 
 def _timings_print(*args: object) -> None:
@@ -218,13 +266,18 @@ def pop_dirty_tables() -> tuple[set[str], bool, list[str]]:
         return dirty, had_ddl, triggers
 
 
-def _track_table_op(sql: str, elapsed: float, rowcount: int = 0) -> None:
+def _track_table_op(
+    sql: str, elapsed: float, rowcount: int = 0, txn_name: str | None = None
+) -> None:
     if "--" in sql or "/*" in sql:
         sql = _SQL_COMMENT_RE.sub(" ", sql)
     m = _TABLE_RE.search(sql)
     if not m:
         return
     table = m.group(1).lower()
+    fingerprint = _sql_fingerprint(sql)
+    txn = _TXN_SUFFIX_RE.sub("", txn_name) if txn_name else "(unnamed)"
+    rows = max(rowcount, 0) if isinstance(rowcount, int) else 0
     with _TABLE_OPS_LOCK:
         _TABLE_OPS[table] += elapsed
         _TABLE_OPS_COUNTS[table] += 1
@@ -235,6 +288,13 @@ def _track_table_op(sql: str, elapsed: float, rowcount: int = 0) -> None:
         # instrumentation into a hard crash of the actual query it's timing.
         if isinstance(rowcount, int):
             _TABLE_OPS_ROWS[table] += max(rowcount, 0)
+        entry = _SQL_FINGERPRINTS.setdefault(
+            (table, txn, fingerprint), [0, 0.0, 0.0, 0]
+        )
+        entry[0] += 1
+        entry[1] += elapsed
+        entry[2] = max(entry[2], elapsed)
+        entry[3] += rows
 
 
 # Quoted string literals, including doubled quotes inside them. Masked in the
@@ -305,6 +365,7 @@ def _print_table_ops() -> None:
         table_ops = dict(_TABLE_OPS)
         table_counts = dict(_TABLE_OPS_COUNTS)
         table_rows = dict(_TABLE_OPS_ROWS)
+        fingerprints = dict(_SQL_FINGERPRINTS)
         slow_statements = sorted(_SLOW_STATEMENTS, key=lambda e: e[0], reverse=True)[
             :_SLOW_STATEMENTS_KEPT
         ]
@@ -340,6 +401,18 @@ def _print_table_ops() -> None:
                         "rows": table_rows,
                         "scheduling": scheduling,
                         "slow_statements": slow_statements,
+                        "fingerprints": [
+                            {
+                                "table": table,
+                                "txn": txn,
+                                "sql": fp,
+                                "calls": entry[0],
+                                "total_s": entry[1],
+                                "max_s": entry[2],
+                                "rows": entry[3],
+                            }
+                            for (table, txn, fp), entry in fingerprints.items()
+                        ],
                     },
                     f,
                 )
@@ -397,6 +470,20 @@ def _print_table_ops() -> None:
     )
     _timings_print("=====================================")
     _timings_print("")
+
+    if fingerprints:
+        ranked_fingerprints = sorted(
+            fingerprints.items(), key=lambda kv: kv[1][1], reverse=True
+        )[:30]
+        _timings_print("=== Per-statement SQL fingerprints (top 30 by total) ===")
+        for (table, txn, fp), (calls, total_s, max_s, rows) in ranked_fingerprints:
+            avg_ms = (total_s / calls) * 1000 if calls else 0.0
+            _timings_print(
+                f"  {total_s * 1000:9.1f}ms  calls={calls:>7,d}  "
+                f"avg={avg_ms:7.3f}ms  max={max_s * 1000:8.1f}ms  "
+                f"rows={rows:>8,d}  [{table}] {txn}: {fp[:180]}"
+            )
+        _timings_print("")
 
     if slow_statements:
         _timings_print(
@@ -904,7 +991,7 @@ class LoggingTransaction:
                     rowcount = self.txn.rowcount
                 except Exception:
                     rowcount = 0
-                _track_table_op(sql, secs, rowcount)
+                _track_table_op(sql, secs, rowcount, self.name)
                 _track_slow_statement(sql, secs, rowcount, args)
 
     def close(self) -> None:
