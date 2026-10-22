@@ -93,3 +93,66 @@ Not scoped or started yet -- this document exists to capture the shape of the
 problem discussed alongside the `guru/feat/mtxdb-exclusive` test-isolation fix
 in `tests/storage/test_state.py` (see that commit's message), not to claim any
 of the above is implemented.
+
+## Audit: what SQL state remains (partly verified)
+
+Scope is family 5 of the B2 list in `perf-track-b.md`. Not in scope:
+`event_to_state_groups` (family 2), `current_state_events` and
+`current_state_delta_stream` (ordering/stream data that stays in SQL), and
+`state_hamt_*` (payload already in mtxdb; SQL writes are rare, 21 of about
+12,000 node writes in the 984 s slice).
+
+The family is these tables in the state schema
+(`synapse/storage/schema/state/`):
+
+| Table                           | Seen in code                                                                                                 | Status                                    |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------ | ----------------------------------------- |
+| `state_groups`                  | written in `state/store.py` ~1855                                                                            | written on persist                        |
+| `state_group_edges`             | written ~1866, read by purge/deletion                                                                        | written on persist                        |
+| `state_group_id_seq`            | sequence behind `id`                                                                                         | allocator                                 |
+| `state_groups_persisting`       | `deletion.py` protocol, startup clear at ~108                                                                | coordination, not state content           |
+| `state_groups_pending_deletion` | `deletion.py`, `store.py` ~2428, ~2688                                                                       | coordination, not state content           |
+| `state_groups_state`            | deleted/purged (`store.py` ~2397-2416, ~2662); a comment at ~1775 says it is not written for embedded groups | legacy; still read/deleted for old groups |
+| `state_hamt_*` queue tables     | not traced here                                                                                              | unverified                                |
+
+`persisting` and `pending_deletion` are missing from the problem statement above
+but are the hottest of the set. `deletion.py` (~52-76) documents the protocol: a
+group is marked as about to be used, persisted, then unmarked, and deletion
+rechecks `pending_deletion` in its own transaction. Any replacement has to keep
+that guarantee against a concurrent deletion.
+
+### Cost, with the caveat
+
+The 530 s unit-test run summed `state_groups` 12.8 s, `persisting` 8.7 s and
+`pending_deletion` 7.4 s (28.9 s, 5.8%). That is summed SQL time, not wall time.
+The 984 s slice shows about 14 s across the same three, the same ratio at
+smaller scale.
+
+### Blockers, in order
+
+1. **Single writer.** State groups are created wherever state is resolved and a
+   context is built, which can be a worker, not only the events writer. Workers
+   use the SQL sequence today. If only the mtxdb owner may allocate ids and
+   write, those workers need an acknowledged call to the owner. This is the
+   shared constraint in `perf-track-b.md`.
+2. **Integer id coupling.** Tables, replication streams and caches address a
+   group by the integer id. Keep integer ids; seed the mtxdb counter above the
+   SQL sequence at the one-time import.
+3. **Coordination.** The `persisting` and `pending_deletion` protocol needs an
+   mtxdb equivalent, including the `FOR KEY SHARE` row lock taken in
+   `mark_state_groups_as_persisting`.
+4. **Crash gap.** A group written before its event is persisted can be orphaned.
+   That is what `persisting` and `pending_deletion` clean up today.
+
+### Order
+
+Last. Behind family 2 and `event_json`, and not before the single-writer
+decision. Per `goals.txt` there is no dual-write phase: a one-time import with a
+verifier and a durable completion marker, startup refusing to run if it is
+incomplete, then delete the SQL tables and the migration scaffolding.
+
+### Unverified
+
+The table list above is not a traced write-path audit. Still to check:
+`state_groups_state` writes under non-embedded configs, and the `state_hamt_*`
+queue tables.
