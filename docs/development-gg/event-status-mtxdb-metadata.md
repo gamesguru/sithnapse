@@ -1,8 +1,9 @@
 # Event status for mtxdb edge reads
 
-Status: design note; nothing implemented. This describes the mutable event state
-needed before the family-4 persist queries can read from mtxdb without SQL. See
-`perf-track-b-family4-edges-map.md` and
+Status: design note. The v1 edge format reset is committed; the status byte,
+rebuild and Rust persist reads are not implemented. This describes the mutable
+event state needed before the family-4 persist queries can read from mtxdb
+without SQL. See `perf-track-b-family4-edges-map.md` and
 `res/docs/2026-09-28-event-edges-sql-removal-plan.md`.
 
 ## Goal
@@ -30,11 +31,12 @@ event's own ID. Its format is:
 
 Reset the backward and forward edge payload formats to version 1. The backward
 record's status byte is mandatory. There are no releases, so there is no
-compatibility contract to preserve; v2 records are unsupported rather than
-decoded as “status unknown”.
+compatibility contract to preserve; pre-reset records are unsupported rather
+than decoded as “status unknown”.
 
 Existing local mtxdb edge data is rebuilt, not migrated in place: the v1 decoder
-rejects v2, and the read path falls back to SQL while the rebuild gate is open.
+accepts only v1, and the persist read is not enabled until the one-shot rebuild
+completes.
 
 Status bits:
 
@@ -67,16 +69,17 @@ prev list.
 ## Version and rebuild
 
 New writers always write format 1, including a `0` status byte for normal. There
-is no compatibility path for v2: the decoder rejects it.
+is no compatibility path for pre-reset records: the decoder accepts only v1.
 
-During the rebuild, a v2 record, a missing status byte, or any version/decode
-error means fall back to SQL. Do not interpret it as normal or as unknown. The
-rebuild rewrites every forward and backward edge record from SQL (or from event
-bodies if the SQL mirror is gone); after the gate every edge record is v1 and v2
-is unreachable.
+The rebuild is a one-shot pass that runs while the persist queries still read
+from SQL. A pre-reset record, a missing status byte, or any version/decode error
+is a rebuild failure; do not interpret it as normal or unknown, and do not add a
+runtime SQL fallback. The rebuild rewrites every forward and backward edge record
+from SQL (or from event bodies if the SQL mirror is gone). When it completes,
+every edge record is v1 and the persist read is enabled.
 
-An old writer would emit v2, which the new decoder rejects. After cutover,
-require the new writer.
+An old writer would emit the pre-reset layout, which the new decoder rejects.
+After cutover, require the new writer.
 
 ## Read path
 
@@ -96,24 +99,26 @@ For `_get_prevs_before_rejected`, traverse levels in Rust with a visited set.
 Read each frontier event's backward record once; use its status and prev list
 together. Do not call Python per level. If publication advances or a writer
 restarts and a snapshot returns `WouldBlock`, retry a bounded number of times
-inside Rust. After bounded retries, fail closed to SQL during migration; never
-interpret an incomplete snapshot as "no edges".
+inside Rust. After bounded retries, fail the read; never interpret an incomplete
+snapshot as "no edges", and do not fall back to SQL.
 
 The first query's saved workload had only 12 SQL result rows for 20,579
-candidates, so almost every call ends after the forward lookup. The rejected
-traversal can visit more records, and its backward records carry status for
-free; measure it separately.
+candidates; a later storage slice returned 8 rows for 5,102 candidates. Almost
+every call ends after the forward lookup. The rejected traversal can visit more
+records, and its backward records carry status for free; measure it separately.
 
 Keep the binding API layout-agnostic:
 
 ```text
-event_status_get_batch(room_id, event_ids) -> event_id -> status or unknown
+event_status_get_batch(room_id, event_ids) -> event_id -> status
 event_status_put_batch(room_id, rows, transaction=...) -> ()
 event_status_delete_batch(room_id, event_ids, transaction=...) -> ()
 ```
 
-Internally these read and update the backward payload. Python callers must not
-depend on the byte's position.
+A missing row means there is no backward record, not that the status is unknown.
+That is only valid for a normal event with no prevs; an abnormal event with no
+prevs gets a zero-edge record. Python callers must not depend on the byte's
+position.
 
 ## Mutation rules
 
@@ -126,7 +131,7 @@ is immutable, but it must not clobber concurrent edge or purge writes.
 | `_update_outliers_txn`                   | Set or clear outlier                                               |
 | Purge's retained-event outlier update    | Set outlier                                                        |
 | `_store_rejections_txn`                  | Set rejected                                                       |
-| `events_worker.py` accept/reject recheck | Set or clear rejected; currently not mirrored                      |
+| `events_worker.py` accept/reject recheck | Set or clear rejected; mirrored after commit                       |
 | Both rejection purge paths               | Clear or delete rejected status                                    |
 | Soft-fail state writes                   | Set/clear soft-failed; audit every mutation path                   |
 | Event purge (`event_edges_delete`)       | Tombstone the backward record; the empty payload clears status     |
@@ -171,15 +176,15 @@ does not close that cross-database gap.
 2. Rebuild all forward and backward edge records from SQL (`event_edges`, or
    `prev_events` from event bodies if the SQL mirror is already gone), writing
    v1 records with the derived status. Make the rebuild resumable and mark
-   completion. Until the gate closes, a v2 record or decode error means fall
-   back to SQL.
+   completion. A pre-reset record, a missing status byte, or any decode error is
+   a rebuild failure, not a SQL fallback.
 3. Verify against SQL for sampled records and exercise persist, de-outlier,
    purge's outlier flip, reject, re-reject, accept, soft-fail/un-soft-fail, and
    purge deletion. Check transaction overlays, the read-only worker's published
    view, and a status update racing an edge rewrite and a purge.
-4. After the verification gate, switch the two persist queries to the Rust
-   snapshot read. Keep the SQL/version fallback until the edge cutover makes a
-   forward miss authoritative.
+4. Once the rebuild is complete and the edge cutover makes a forward miss
+   authoritative, switch the two persist queries to the Rust snapshot read in
+   one step. Do not add a per-read SQL fallback.
 5. Stage body and edges in one cross-pool transaction. Then remove the persist
    SQL joins and, only after all other edge readers are migrated, retire the SQL
    edge mirror, outbox, and version gate.
@@ -196,15 +201,15 @@ must be explicit.
 - Audit every status mutation call site, especially soft-fail/un-soft-fail and
   the accept/reject recheck.
 - Confirm no consumer outside `embedded_edges.rs` parses the backward payload
-  strictly; the decoder accepts only v1, and v2 triggers the SQL fallback during
-  the rebuild.
+  strictly; the decoder accepts only v1, and pre-reset records are rebuild
+  failures.
 - Confirm the body-plus-edges call path can share one `MtxdbTransaction`; the
   current edge write is post-SQL-commit.
 - Confirm the tombstone/status race resolves to purge-wins.
-- Define the rebuild source and gate: SQL `event_edges` while it is
+- Define the rebuild source and completion marker: SQL `event_edges` while it is
   authoritative, else `prev_events` from event bodies. The rebuild must be
-  resumable, rewrite both forward and backward records as v1, and close the gate
-  only after a full pass.
+  resumable, rewrite both forward and backward records as v1, and enable the
+  read only after a full pass.
 
 ## Measurements
 
@@ -212,8 +217,8 @@ Instrument the Rust call with duration, candidate count, forward hits, backward
 and status records read, recursion levels, and `WouldBlock` retries. Compare
 these with `persist_prevs_total` and `persist_rejected_total`; the desired
 result is no SQL execution or `runInteraction` on the successful post-cutover
-path. Keep the SQL fallback visible during migration and count its use
-explicitly.
+path. Count decode failures and missing records; there is no fallback path to
+count.
 
 The layout removes a separate status lookup, but it is not yet a measured
 speedup. The persist slice is about 1.4-1.6% of wall time even if the reads were
