@@ -2957,6 +2957,11 @@ class EventsWorkerStore(SQLBaseStore):
 
         This can happen, for example, when resyncing state during a faster join.
 
+        Update SQL rejection data and schedule local event-cache invalidation.
+        When embedded event JSON is enabled, mirror the rejection change after
+        SQL commit without syncing the embedded engine. Mirror errors propagate
+        from the post-commit callback through runInteraction.
+
         It is the caller's responsibility to ensure that other workers are
         sent a notification so that they call `_invalidate_local_get_event_cache()`.
 

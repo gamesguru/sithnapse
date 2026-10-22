@@ -147,6 +147,11 @@ class EventsBackgroundUpdatesStore(
         db_conn: LoggingDatabaseConnection,
         hs: "HomeServer",
     ):
+        """Register event background updates and resolve stale Sliding Sync data.
+
+        Register mtxdb migration handlers when configured; their registration
+        does not enqueue the event-to-state-group or auth-chain-link migrations.
+        """
         super().__init__(database, db_conn, hs)
 
         self.db_pool.updates.register_background_update_handler(

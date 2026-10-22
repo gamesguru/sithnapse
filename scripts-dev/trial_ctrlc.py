@@ -134,6 +134,13 @@ def _flush_process_timings() -> None:
 
 
 def _aggregate_and_print_timings(timings_dir: str) -> None:
+    """Aggregate worker JSON snapshots in ``timings_dir`` into a report.
+
+    Write to stderr and, if it can be opened, append to
+    SYNAPSE_PG_TIMINGS_FILE. An unreadable directory or one with no
+    process snapshots produces no report. FFI totals exclude ``:cpu``
+    spans, which measure CPU time for spans already counted in wall time.
+    """
     timings_path = os.environ.get("SYNAPSE_PG_TIMINGS_FILE")
     out_file = None
     if timings_path:

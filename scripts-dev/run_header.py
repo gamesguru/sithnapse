@@ -106,8 +106,11 @@ class Baseline:
             return cls()
 
     def cpu_stall_percent(self) -> Optional[float]:
-        """Share of the run the machine had runnable work waiting for a cpu
-        (PSI), or None when pressure data is unavailable."""
+        """Percentage of elapsed time with runnable work waiting for a CPU (PSI).
+
+        Return None when CPU pressure data is unavailable or elapsed time
+        since the baseline is nonpositive.
+        """
         end = pressure_snapshot()
         wall = time.time() - self.wall
         if wall <= 0 or "cpu" not in end or "cpu" not in self.pressure:
@@ -141,7 +144,11 @@ _DEBUG_EXTENSION_BYTES = 60 * 1024 * 1024
 
 
 def rust_extension() -> str:
-    """Size, build time and a debug/release guess for the installed extension."""
+    """Describe the first matching Rust extension's size and modification time.
+
+    Guess debug/release from file size; return "?" if no extension is
+    found or its metadata cannot be read.
+    """
     try:
         paths = glob.glob(os.path.join(_REPO, "synapse", "synapse_rust*.so"))
         stat = os.stat(paths[0])
@@ -184,6 +191,10 @@ STALL_REVIEW_PERCENT = 25.0
 
 
 def load_lines(baseline: Baseline) -> list[str]:
+    """Return start/end load and run pressure lines for ``baseline``.
+
+    Append a review flag when CPU stall exceeds STALL_REVIEW_PERCENT.
+    """
     lines = [
         f"  {'load avg:':<14}{baseline.load} at start, {load_average()} at end "
         "(1/5/15 min)",
