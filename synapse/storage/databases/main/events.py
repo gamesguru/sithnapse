@@ -1050,19 +1050,27 @@ class PersistEventsStore:
 
     async def _get_events_which_are_prevs(self, event_ids: Iterable[str]) -> list[str]:
         """Filter the supplied list of event_ids to get those which are prev_events of
-        existing (non-outlier/rejected) events.
+        existing events that are not outliers, rejected, or soft-failed.
+
+        Missing child metadata is treated as not soft-failed after an optional
+        embedded lookup. Storage and metadata decoding errors propagate.
 
         Args:
             event_ids: event ids to filter
 
         Returns:
-            Filtered event ids
+            Matching event IDs, possibly repeated and in no guaranteed order.
         """
         results: list[str] = []
 
         def _get_events_which_are_prevs_txn(
             txn: LoggingTransaction, batch: Collection[str]
         ) -> None:
+            """Append IDs from ``batch`` referenced by eligible child events to results.
+
+            Exclude outlier, rejected, and soft-failed children. Missing metadata
+            is treated as not soft-failed after an optional embedded lookup.
+            """
             sql = """
             SELECT prev_event_id, internal_metadata, event_id
             FROM event_edges
@@ -1121,10 +1129,12 @@ class PersistEventsStore:
     ) -> set[str]:
         """Get soft-failed/rejected ancestors to remove from the extremities.
 
-        Given a set of events, find all those that have been soft-failed or
-        rejected. Returns those soft failed/rejected events and their prev
-        events (whether soft-failed/rejected or not), and recurses up the
-        prev-event graph until it finds no more soft-failed/rejected events.
+        Starting from the supplied events, collect the prev IDs of rejected
+        events and, when enabled, soft-failed events. Recurse through those
+        predecessors while they meet the same criteria. Only non-outlier events
+        with stored edges are traversed; a starting ID is not included merely
+        because it is rejected or soft-failed. Storage and metadata decoding
+        errors propagate.
 
         This is used to find extremities that are ancestors of new events, but
         are separated by soft failed events.
@@ -1135,7 +1145,8 @@ class PersistEventsStore:
             include_soft_failed: Soft-failed events are included in the search. If false, only
                 rejected events are included.
         Returns:
-            The previous events.
+            Predecessor IDs reached by the traversal, including accepted events
+            where traversal stops.
         """
 
         # The set of event_ids to return. This includes all soft-failed events
@@ -1145,6 +1156,11 @@ class PersistEventsStore:
         def _get_prevs_before_rejected_txn(
             txn: LoggingTransaction, batch: Collection[str]
         ) -> None:
+            """Add predecessors reached through rejected or enabled soft-failed events.
+
+            Start from ``batch`` and update existing_prevs, traversing only
+            non-outlier events with stored edges.
+            """
             to_recursively_check = batch
 
             while to_recursively_check:

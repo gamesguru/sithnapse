@@ -43,6 +43,12 @@ _FIELD = {
 
 class Log:
     def __init__(self, path: Path) -> None:
+        """Read a saved report, keeping the first occurrence of each metric.
+
+        Missing header fields become ``"?"``. Metrics store call counts and
+        per-call averages in milliseconds. Invalid text bytes are replaced;
+        file access errors propagate as OSError.
+        """
         text = path.read_text(errors="replace")
         self.path = path
         self.fields = {
@@ -55,6 +61,7 @@ class Log:
 
     @property
     def stall(self) -> float | None:
+        """Return the reported CPU stall percentage, or None if unavailable."""
         try:
             return float(self.fields["stall"])
         except ValueError:
@@ -62,6 +69,10 @@ class Log:
 
 
 def describe(label: str, logs: list[Log]) -> None:
+    """Print each log's run identity and load summary under ``label``.
+
+    Flag CPU stall strictly above STALL_REVIEW_PERCENT for review.
+    """
     print(f"{label}:")
     for log in logs:
         stall = log.stall
@@ -78,6 +89,11 @@ def describe(label: str, logs: list[Log]) -> None:
 
 
 def group_median(logs: list[Log], name: str) -> float | None:
+    """Return the median per-call average in milliseconds for ``name``.
+
+    Include only logs with at least MIN_CALLS for the metric; return None
+    when no log qualifies. Each qualifying log has equal weight.
+    """
     values = [
         log.metrics[name][1]
         for log in logs
@@ -87,6 +103,12 @@ def group_median(logs: list[Log], name: str) -> float | None:
 
 
 def main() -> int:
+    """Print run summaries and compare group medians from command-line logs.
+
+    Rank metrics with nonzero medians in both groups by descending B/A
+    ratio. Return zero on completion; file access errors propagate as
+    OSError, and argument parsing may raise SystemExit.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--a", nargs="+", type=Path, required=True)
     parser.add_argument("--b", nargs="+", type=Path, required=True)

@@ -269,6 +269,13 @@ def pop_dirty_tables() -> tuple[set[str], bool, list[str]]:
 def _track_table_op(
     sql: str, elapsed: float, rowcount: int = 0, txn_name: str | None = None
 ) -> None:
+    """Accumulate SQL timings by table and statement fingerprint.
+
+    ``elapsed`` is in seconds. Attribute the statement to the first table
+    matched in its SQL; ignore statements with no match. Strip a trailing
+    transaction ID from ``txn_name`` and use "(unnamed)" for a missing name.
+    Negative or non-integer row counts contribute zero rows.
+    """
     if "--" in sql or "/*" in sql:
         sql = _SQL_COMMENT_RE.sub(" ", sql)
     m = _TABLE_RE.search(sql)
@@ -345,7 +352,11 @@ def _track_slow_statement(
 
 
 def _track_sql_scheduling(elapsed: float, label: str | None = None) -> None:
-    """Record pool checkout/thread scheduling delay for the opt-in report."""
+    """Record pool checkout/thread scheduling delay in seconds.
+
+    Group totals by ``label``, using "(unlabelled)" for a missing or empty
+    label, for the opt-in report.
+    """
     global _SQL_SCHEDULING_TOTAL, _SQL_SCHEDULING_COUNT
     with _SQL_SCHEDULING_LOCK:
         _SQL_SCHEDULING_TOTAL += elapsed
@@ -357,6 +368,12 @@ def _track_sql_scheduling(elapsed: float, label: str | None = None) -> None:
 
 
 def _print_table_ops() -> None:
+    """Flush cumulative SQL timings when timing diagnostics are enabled.
+
+    With SYNAPSE_TIMINGS_RUN_DIR set, replace this process's JSON snapshot
+    and ignore filesystem errors. Otherwise, print table, fingerprint,
+    slow-statement, and scheduling summaries to the timing outputs.
+    """
     if not _PG_TIMINGS_ENABLED:
         return
     with _TABLE_OPS_LOCK:
@@ -945,6 +962,11 @@ class LoggingTransaction:
         *args: P.args,
         **kwargs: P.kwargs,
     ) -> R:
+        """Call a cursor operation with SQL converted to the driver's placeholders.
+
+        Forward the remaining arguments and return the operation's result.
+        Record query metrics even on failure; cursor operation errors propagate.
+        """
         # Generate a one-line version of the SQL to better log it.
         one_line_sql = self._make_sql_one_line(sql)
 
@@ -1540,6 +1562,11 @@ class DatabasePool:
         """
 
         async def _runInteraction() -> R:
+            """Run the transaction and its completion callbacks.
+
+            Return the transaction result after success callbacks finish. On an
+            exception, run exception callbacks and propagate the error.
+            """
             after_callbacks: list[_CallbackListEntry] = []
             async_after_callbacks: list[_AsyncCallbackListEntry] = []
             exception_callbacks: list[_CallbackListEntry] = []
@@ -1607,7 +1634,8 @@ class DatabasePool:
                 that are only a single query. Currently only affects postgres.
             isolation_level: Set the server isolation level for this transaction.
             sched_label: label under which the pool scheduling delay is
-                reported in the opt-in timings (defaults to `func.__name__`)
+                reported in the opt-in timings. A missing or empty label uses
+                `func.__name__`, or "(unlabelled)" if no name is available.
             kwargs: named args to pass to `func`
 
         Returns:
@@ -1627,6 +1655,11 @@ class DatabasePool:
         start_time = monotonic_time()
 
         def inner_func(conn: _PoolConnection, *args: P.args, **kwargs: P.kwargs) -> R:
+            """Run the callback on a pooled connection and return its result.
+
+            Apply the requested connection settings and reset autocommit afterward
+            when enabled. Connection and callback errors propagate.
+            """
             # We shouldn't be in a transaction. If we are then something
             # somewhere hasn't committed after doing work. (This is likely only
             # possible during startup, as `run*` will ensure changes are

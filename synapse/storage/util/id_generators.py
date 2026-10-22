@@ -383,6 +383,15 @@ class MultiWriterIdGenerator(AbstractStreamIdGenerator):
         tables: list[tuple[str, str, str]],
         sequence_name: str,
     ) -> None:
+        """Initialize writer positions and persisted progress from the database.
+
+        ``tables`` contains (table, instance column, ID column) entries.
+        ``sequence_name`` names the PostgreSQL sequence used to recover this
+        writer's position. Remove stale stream_positions rows when explicit
+        writers are configured, and initialize missing writers from persisted
+        progress. Internal positions use positive IDs even for negative streams.
+        Database errors propagate; the caller owns the connection's transaction.
+        """
         cur = db_conn.cursor(txn_name="_load_current_ids")
 
         # Load the current positions of all writers for the stream.

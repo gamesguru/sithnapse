@@ -345,6 +345,12 @@ def lock_wait_timing(lock: threading.Lock, tag: str) -> Iterator[None]:
 
 
 def _print_ffi_timings() -> None:
+    """Flush cumulative FFI diagnostics when enabled and timings exist.
+
+    With SYNAPSE_TIMINGS_RUN_DIR set, replace this process's JSON snapshot
+    and ignore filesystem errors. Otherwise, print summaries; totals exclude
+    ``:cpu`` spans already represented by their wall-time spans.
+    """
     if not _PG_TIMINGS_ENABLED:
         return
     lock = _FFI_TIMING_LOCK
@@ -581,7 +587,12 @@ _POOL_LABELS: dict[str, str] = {
 
 
 def _print_mtxdb_stats() -> None:
-    """Print an end-of-run mtxdb runtime stats report for all three pools."""
+    """Report runtime stats for the state, event, edges, and server-info pools.
+
+    Do nothing unless SYNAPSE_MTXDB_STATS is set and stats are available.
+    With SYNAPSE_TIMINGS_RUN_DIR set, replace this process's JSON snapshot
+    and ignore filesystem errors; otherwise, print to stderr.
+    """
     if not os.environ.get("SYNAPSE_MTXDB_STATS"):
         return
     try:

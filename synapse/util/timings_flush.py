@@ -91,6 +91,11 @@ if hasattr(os, "register_at_fork"):
 def _write_process_cpu() -> None:
     """Snapshot this process's cpu time against its wall time.
 
+    Replace proc_<pid>.json in SYNAPSE_TIMINGS_RUN_DIR when set; filesystem
+    errors are ignored. Both values are in seconds: CPU time is cumulative
+    since process start (or fork), while wall time starts at this module's
+    import (or the child fork hook).
+
     ``process_time`` sums every thread's user and system time. A low
     cpu/wall ratio only says the process spent its time off-cpu (descheduled,
     blocked on I/O or a lock, or idle); it cannot say which.
@@ -116,7 +121,11 @@ def _write_process_cpu() -> None:
 
 
 def register_periodic_flush(flusher: Callable[[], None]) -> None:
-    """Also call ``flusher`` every couple of seconds if a run dir is set."""
+    """Also call ``flusher`` every couple of seconds if a run dir is set.
+
+    Include process CPU/wall snapshots in the background flush cycle.
+    Exceptions from flushers are caught so later flushers can still run.
+    """
     if not os.environ.get("SYNAPSE_TIMINGS_RUN_DIR"):
         return
     with _lock:
