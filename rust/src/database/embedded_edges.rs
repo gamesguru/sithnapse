@@ -465,16 +465,26 @@ fn decode_identity(bytes: &[u8], offset: &mut usize) -> PyResult<String> {
 // --- Backward record ------------------------------------------------------
 //
 // Format version 1 (unreleased: no legacy decoder, nothing is deployed).
-// `[format_version: u8][self_identity][edge_count: u16]{[is_state: u8][parent_identity]}*`
+// `[format_version: u8][self_identity][edge_count: u16]{[is_state: u8][parent_identity]}*[status: u8]`
 //
 // Carries the record's own event id (`self_identity`) in the payload, not
 // just derivable from the (one-way hashed) node id it's stored under -- so a
 // full scan of the backward-edge collection can rebuild forward adjacency
 // directly (self_identity is the forward key, each parent_identity a member
 // of that key's child list), with no locator lookups or joins.
+//
+// The trailing status byte is mandatory. It carries the mutable event state a
+// persist read needs (outlier, rejected, soft-failed) without a second lookup
+// or a separate collection; see
+// `docs/development-gg/event-status-mtxdb-metadata.md`.
 const BACKWARD_EDGES_FORMAT_VERSION: u8 = 1;
 
-fn encode_backward_edges(self_identity: &str, edges: &[(String, bool)]) -> Vec<u8> {
+const EDGE_STATUS_OUTLIER: u8 = 0x01;
+const EDGE_STATUS_REJECTED: u8 = 0x02;
+const EDGE_STATUS_SOFT_FAILED: u8 = 0x04;
+const EDGE_STATUS_KNOWN: u8 = EDGE_STATUS_OUTLIER | EDGE_STATUS_REJECTED | EDGE_STATUS_SOFT_FAILED;
+
+fn encode_backward_edges(self_identity: &str, edges: &[(String, bool)], status: u8) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.push(BACKWARD_EDGES_FORMAT_VERSION);
     encode_identity(&mut buf, self_identity);
@@ -483,14 +493,15 @@ fn encode_backward_edges(self_identity: &str, edges: &[(String, bool)]) -> Vec<u
         buf.push(if *is_state { 1 } else { 0 });
         encode_identity(&mut buf, prev_id);
     }
+    buf.push(status);
     buf
 }
 
-/// Returns `(self_identity, edges)`. Errors (rather than truncating
+/// Returns `(self_identity, edges, status)`. Errors (rather than truncating
 /// silently) on anything short of a well-formed record: an unrecognized
-/// format version, an unknown identity tag, or a length that runs past the
-/// record's end.
-fn decode_backward_edges(bytes: &[u8]) -> PyResult<(String, Vec<(String, bool)>)> {
+/// format version, an unknown identity tag, a missing status byte, or a length
+/// that runs past the record's end.
+fn decode_backward_edges(bytes: &[u8]) -> PyResult<(String, Vec<(String, bool)>, u8)> {
     let version = *bytes.first().ok_or_else(|| {
         pyo3::exceptions::PyValueError::new_err("truncated event-edge record (empty)")
     })?;
@@ -517,7 +528,21 @@ fn decode_backward_edges(bytes: &[u8]) -> PyResult<(String, Vec<(String, bool)>)
         let prev_id = decode_identity(bytes, &mut offset)?;
         edges.push((prev_id, is_state_byte != 0));
     }
-    Ok((self_identity, edges))
+    let status = *bytes.get(offset).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err("truncated event-edge record (status)")
+    })?;
+    offset += 1;
+    if status & !EDGE_STATUS_KNOWN != 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "malformed event-edge record: unknown status bits {status:#04x}"
+        )));
+    }
+    if offset != bytes.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "malformed event-edge record: trailing bytes after status",
+        ));
+    }
+    Ok((self_identity, edges, status))
 }
 
 // --- Forward record --------------------------------------------------------
@@ -698,14 +723,14 @@ fn run_edge_occ(
 pub fn event_edges_put(
     py: Python<'_>,
     namespace: String,
-    rows: Vec<(String, String, String, bool)>, // (room_id, event_id, prev_event_id, is_state)
+    rows: Vec<(String, String, String, bool, u8)>, // (room_id, event_id, prev_event_id, is_state, status)
 ) -> PyResult<()> {
     assert_writable()?;
     // Rooms are known from the caller's own rows, before any lock is taken,
     // so lock ordering doesn't depend on anything read under the lock.
     let room_collections: Vec<[u8; 16]> = rows
         .iter()
-        .map(|(room_id, _, _, _)| prev_edges_room_id(&namespace, room_id))
+        .map(|(room_id, _, _, _, _)| prev_edges_room_id(&namespace, room_id))
         .collect();
     py.detach(|| {
         // Stage everything as one transaction when a shared WAL is open, so
@@ -757,19 +782,27 @@ pub fn event_edges_put(
 fn write_edges(
     target: &impl EdgeWriteTarget,
     namespace: &str,
-    rows: &[(String, String, String, bool)],
+    rows: &[(String, String, String, bool, u8)],
 ) -> PyResult<()> {
     let namespace = namespace.to_string();
     let engine = target;
 
-    let mut backward_map: HashMap<(String, String), Vec<(String, bool)>> = HashMap::new();
+    // Every row for one event carries the same status. A caller that disagrees
+    // with itself is a bug, so fail rather than silently picking one.
+    let mut backward_map: HashMap<(String, String), (Vec<(String, bool)>, u8)> = HashMap::new();
     let mut forward_map: HashMap<(String, String), Vec<String>> = HashMap::new();
 
-    for (room_id, event_id, prev_event_id, is_state) in rows {
-        backward_map
+    for (room_id, event_id, prev_event_id, is_state, status) in rows {
+        let entry = backward_map
             .entry((room_id.clone(), event_id.clone()))
-            .or_default()
-            .push((prev_event_id.clone(), *is_state));
+            .or_insert_with(|| (Vec::new(), *status));
+        if entry.1 != *status {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "conflicting edge status for event {event_id}: {:#04x} and {:#04x}",
+                entry.1, status
+            )));
+        }
+        entry.0.push((prev_event_id.clone(), *is_state));
         forward_map
             .entry((room_id.clone(), prev_event_id.clone()))
             .or_default()
@@ -780,11 +813,11 @@ fn write_edges(
     // Nested map deduplicates repeated locators within the batch.
     let mut locator_puts: HashMap<[u8; 16], HashMap<NodeId, NodeData>> = HashMap::new();
 
-    for ((room_id, event_id), edges) in backward_map {
+    for ((room_id, event_id), (edges, status)) in backward_map {
         let room_collection = prev_edges_room_id(&namespace, &room_id);
         let edge_node = event_edges_backward_node_id(&namespace, &event_id);
 
-        let encoded = encode_backward_edges(&event_id, &edges);
+        let encoded = encode_backward_edges(&event_id, &edges, status);
         dag_puts
             .entry(room_collection)
             .or_default()
@@ -892,7 +925,131 @@ fn write_edges(
     Ok(())
 }
 
-/// Read backward edges: given event_ids, returns `(event_id, Option<[(prev_event_id, is_state)]>)`
+/// Apply status-bit updates to existing backward records.
+///
+/// Each update is `(room_id, event_id, set_bits, clear_bits)`. The record is
+/// read and rewritten in the same version-bound transaction as an edge merge;
+/// `run_edge_occ` replays it if the record version moved. A missing or
+/// tombstoned record is a no-op: purge wins, and a late status writer must not
+/// resurrect the event.
+fn apply_status_updates(
+    target: &impl EdgeWriteTarget,
+    namespace: &str,
+    updates: &[(String, String, u8, u8)],
+) -> PyResult<()> {
+    // Merge repeated updates for the same event in caller order.
+    let mut grouped: HashMap<(String, String), Vec<(u8, u8)>> = HashMap::new();
+    for (room_id, event_id, set_bits, clear_bits) in updates {
+        if (set_bits | clear_bits) & !EDGE_STATUS_KNOWN != 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown edge status bits in update for {event_id}: set {set_bits:#04x}, clear {clear_bits:#04x}"
+            )));
+        }
+        grouped
+            .entry((room_id.clone(), event_id.clone()))
+            .or_default()
+            .push((*set_bits, *clear_bits));
+    }
+
+    let mut by_collection: HashMap<[u8; 16], Vec<(NodeId, String, Vec<(u8, u8)>)>> = HashMap::new();
+    for ((room_id, event_id), changes) in grouped {
+        let collection = prev_edges_room_id(namespace, &room_id);
+        let node = event_edges_backward_node_id(namespace, &event_id);
+        by_collection
+            .entry(collection)
+            .or_default()
+            .push((node, event_id, changes));
+    }
+
+    for (collection, items) in by_collection {
+        let node_ids: Vec<NodeId> = items.iter().map(|(node, _, _)| *node).collect();
+        let (found, versions) = target
+            .edge_get_record_versions(&collection, &node_ids)
+            .map_err(|e| map_transaction_error("get_many", e))?;
+        let mut puts = Vec::new();
+        for (index, (node, event_id, changes)) in items.iter().enumerate() {
+            let Some(data) = found[index].as_ref() else {
+                continue;
+            };
+            if data.bytes.is_empty() {
+                // Purge tombstone: status updates must not recreate the record.
+                continue;
+            }
+            let (self_identity, edges, mut status) = decode_backward_edges(&data.bytes)?;
+            if self_identity != *event_id {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "event-edge backward record identity mismatch: requested {event_id:?}, \
+                     record says {self_identity:?} (node id collision or corrupt write?)"
+                )));
+            }
+            let old_status = status;
+            for (set_bits, clear_bits) in changes {
+                status = (status | set_bits) & !clear_bits;
+            }
+            if status == old_status {
+                continue;
+            }
+            let version = versions.as_ref().map(|versions| versions[index]);
+            target
+                .edge_expect_record_version(&collection, node, version)
+                .map_err(|e| map_transaction_error("expect_record_version", e))?;
+            puts.push((
+                *node,
+                NodeData::new(bytes::Bytes::from(encode_backward_edges(
+                    event_id, &edges, status,
+                ))),
+            ));
+        }
+        if !puts.is_empty() {
+            target
+                .edge_put_many(collection, puts)
+                .map_err(|e| map_transaction_error("put_many", e))?;
+        }
+    }
+    Ok(())
+}
+
+/// Set or clear status bits on backward records, using the same optimistic
+/// record-version loop as edge merges. Tombstones are left alone.
+#[pyfunction]
+pub fn event_edges_set_status(
+    py: Python<'_>,
+    namespace: String,
+    updates: Vec<(String, String, u8, u8)>, // (room_id, event_id, set_bits, clear_bits)
+) -> PyResult<()> {
+    assert_writable()?;
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let room_collections: Vec<[u8; 16]> = updates
+        .iter()
+        .map(|(room_id, _, _, _)| prev_edges_room_id(&namespace, room_id))
+        .collect();
+    py.detach(|| match begin_internal_transaction()? {
+        Some(txn) => {
+            let mut body = |txn: &DatabaseTransaction<'static>| {
+                if let Some(outcome) =
+                    replay_read_contention(apply_status_updates(txn, &namespace, &updates))?
+                {
+                    return Ok(outcome);
+                }
+                match txn.commit() {
+                    Ok(()) => Ok(EdgeOccOutcome::Done),
+                    Err(error) if error.is_stale_read() => Ok(EdgeOccOutcome::Conflict),
+                    Err(error) => Err(map_transaction_error("commit", error)),
+                }
+            };
+            run_edge_occ(txn, &mut body)
+        }
+        None => {
+            let _guards = lock_rooms(room_collections);
+            let engine: &mtxdb::PackfileStorage = auth_chain_db()?;
+            apply_status_updates(engine, &namespace, &updates)
+        }
+    })
+}
+
+/// Read backward edges: given event_ids, returns `(event_id, Option<[(prev_event_id, is_state)]>, Option<status>)`
 ///
 /// Reads via `get_read_committed`, not plain `get_many`. In the common case
 /// (no writer transaction actively publishing right now) `get_read_committed`
@@ -912,7 +1069,7 @@ pub fn event_edges_get_backward(
     py: Python<'_>,
     namespace: String,
     event_ids: Vec<String>,
-) -> PyResult<Vec<(String, Option<Vec<(String, bool)>>)>> {
+) -> PyResult<Vec<(String, Option<Vec<(String, bool)>>, Option<u8>)>> {
     py.detach(|| {
         let engine = auth_chain_db()?;
         let node_ids: Vec<NodeId> = event_ids
@@ -958,7 +1115,7 @@ pub fn event_edges_get_backward(
             }
         }
 
-        let mut results: Vec<Option<Vec<(String, bool)>>> = vec![None; event_ids.len()];
+        let mut results: Vec<Option<(Vec<(String, bool)>, u8)>> = vec![None; event_ids.len()];
         for (collection, ids) in dag_ids {
             let node_ids_only: Vec<NodeId> = ids.iter().map(|(_, id)| *id).collect();
             let found = engine
@@ -967,7 +1124,7 @@ pub fn event_edges_get_backward(
             for ((position, _), value) in ids.into_iter().zip(found) {
                 if let Some(data) = value {
                     if !data.bytes.is_empty() {
-                        let (self_identity, edges) = decode_backward_edges(&data.bytes)?;
+                        let (self_identity, edges, status) = decode_backward_edges(&data.bytes)?;
                         // The record's own identity, carried in the payload
                         // precisely so a raw scan can rebuild forward
                         // adjacency without this lookup -- but on this
@@ -982,13 +1139,20 @@ pub fn event_edges_get_backward(
                                 event_ids[position]
                             )));
                         }
-                        results[position] = Some(edges);
+                        results[position] = Some((edges, status));
                     }
                 }
             }
         }
 
-        Ok(event_ids.into_iter().zip(results).collect())
+        Ok(event_ids
+            .into_iter()
+            .zip(results)
+            .map(|(event_id, found)| match found {
+                Some((edges, status)) => (event_id, Some(edges), Some(status)),
+                None => (event_id, None, None),
+            })
+            .collect())
     })
 }
 

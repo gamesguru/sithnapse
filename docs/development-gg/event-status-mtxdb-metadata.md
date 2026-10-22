@@ -74,9 +74,9 @@ is no compatibility path for pre-reset records: the decoder accepts only v1.
 The rebuild is a one-shot pass that runs while the persist queries still read
 from SQL. A pre-reset record, a missing status byte, or any version/decode error
 is a rebuild failure; do not interpret it as normal or unknown, and do not add a
-runtime SQL fallback. The rebuild rewrites every forward and backward edge record
-from SQL (or from event bodies if the SQL mirror is gone). When it completes,
-every edge record is v1 and the persist read is enabled.
+runtime SQL fallback. The rebuild rewrites every forward and backward edge
+record from SQL (or from event bodies if the SQL mirror is gone). When it
+completes, every edge record is v1 and the persist read is enabled.
 
 An old writer would emit the pre-reset layout, which the new decoder rejects.
 After cutover, require the new writer.
