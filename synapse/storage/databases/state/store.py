@@ -299,11 +299,6 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 self.EMBEDDED_DB_MIGRATION_UPDATE_NAME,
                 self._background_migrate_state_hamt_to_embedded,
             )
-            if self._embedded_db_is_writer:
-                hs.run_as_background_process(
-                    "enqueue_state_hamt_embedded_migration",
-                    self._enqueue_embedded_db_migration_if_needed,
-                )
 
     def _assert_embedded_db_writer(self) -> None:
         """Raise before attempting an mtxdb write on an instance that

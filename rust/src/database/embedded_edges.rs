@@ -494,10 +494,7 @@ fn decode_backward_edges(bytes: &[u8]) -> PyResult<(String, Vec<(String, bool)>)
     let version = *bytes.first().ok_or_else(|| {
         pyo3::exceptions::PyValueError::new_err("truncated event-edge record (empty)")
     })?;
-    // Version 2 was emitted by earlier builds of this unreleased format and
-    // has the same payload layout. Keep accepting it so existing stores remain
-    // readable without a rebuild.
-    if version != BACKWARD_EDGES_FORMAT_VERSION && version != 2 {
+    if version != BACKWARD_EDGES_FORMAT_VERSION {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "malformed event-edge record: unknown backward-edge format version {version}"
         )));
@@ -543,10 +540,7 @@ fn decode_forward_edges(bytes: &[u8]) -> PyResult<Vec<String>> {
     let version = *bytes.first().ok_or_else(|| {
         pyo3::exceptions::PyValueError::new_err("truncated event-edge record (empty)")
     })?;
-    // Version 2 was emitted by earlier builds of this unreleased format and
-    // has the same payload layout. Keep accepting it so existing stores remain
-    // readable without a rebuild.
-    if version != FORWARD_EDGES_FORMAT_VERSION && version != 2 {
+    if version != FORWARD_EDGES_FORMAT_VERSION {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "malformed event-edge record: unknown forward-edge format version {version}"
         )));
