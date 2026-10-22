@@ -344,7 +344,7 @@ main() {
   while IFS= read -r test_package; do
     # These MSCs are not implemented by this Synapse tree yet. Keep them out
     # of the default all-MSC run until their implementations are ported.
-    if [[ "${test_package##*/}" == "msc2836" || "${test_package##*/}" == "msc4500" ]]; then
+    if [[ "${test_package##*/}" == "msc2836" || "${test_package##*/}" == "msc4500" || "${test_package##*/}" == "msc4521" ]]; then
       echo "Skipping unsupported Complement test package: $test_package" >&2
       continue
     fi
@@ -1083,6 +1083,19 @@ run_one_pattern() {
           && rg -l --glob '*_test.go' "^func[[:space:]]+(${_batch_names[0]}$(printf '|%s' "${_batch_names[@]:1}"))\\b" tests 2>/dev/null \
           | xargs -r -n1 dirname | sed 's#^#./#' | sort -u || true
       )
+      # Drop packages excluded as unsupported above so a name filter cannot
+      # bring them back.
+      local -a supported_matched_pkgs=()
+      local _matched_pkg _supported_pkg
+      for _matched_pkg in "${matched_pkgs[@]}"; do
+        for _supported_pkg in "${packages[@]}"; do
+          if [ "$_matched_pkg" = "$_supported_pkg" ]; then
+            supported_matched_pkgs+=("$_matched_pkg")
+            break
+          fi
+        done
+      done
+      matched_pkgs=("${supported_matched_pkgs[@]}")
       if [ "${#matched_pkgs[@]}" -gt 0 ]; then
         packages=("${matched_pkgs[@]}")
         echo "Selected package(s) for $pattern: ${packages[*]}" >&2
