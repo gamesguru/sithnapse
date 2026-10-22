@@ -2193,27 +2193,16 @@ class SyncHandler:
             )
 
         num_events = 0
-        trace_timeline: dict[str, list[str]] = {}
 
         # debug for https://github.com/matrix-org/synapse/issues/9424
         for joined_room in sync_result_builder.joined:
-            event_ids = [event.event.event_id for event in joined_room.timeline.events]
-            num_events += len(event_ids)
-            if event_ids:
-                trace_timeline[joined_room.room_id] = event_ids
+            num_events += len(joined_room.timeline.events)
 
         log_kv(
             {
                 "joined_rooms_in_result": len(sync_result_builder.joined),
                 "events_in_result": num_events,
             }
-        )
-        logger.info(
-            "[sync-trace] worker=%s response timeline rooms=%s events=%d event_ids=%s",
-            self._instance_name,
-            sorted(trace_timeline),
-            num_events,
-            trace_timeline,
         )
 
         # Note, this needs to be after we collect `joined`, `invited`, `knocked` and
