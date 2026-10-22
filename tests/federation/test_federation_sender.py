@@ -190,6 +190,64 @@ class FederationSenderReceiptsTestCases(HomeserverTestCase):
             ],
         )
 
+    def test_send_receipts_thread_then_unthreaded(self) -> None:
+        """An unthreaded receipt must not replace a pending threaded one."""
+        mock_send_transaction = self.federation_transport_client.send_transaction
+        mock_send_transaction.return_value = {}
+
+        sender = self.hs.get_federation_sender()
+        # Hack so that we have a txn in-flight so we batch up read receipts
+        # below
+        sender.wake_destination("host2")
+        for thread in ("thread", None):
+            receipt = ReadReceipt(
+                "room_id",
+                "m.read",
+                "user_id",
+                ["event_id"],
+                thread_id=thread,
+                data={"ts": 1234},
+            )
+            defer.ensureDeferred(sender.send_read_receipt(receipt))
+
+        self.pump()
+
+        mock_send_transaction.assert_called_once()
+        json_cb = mock_send_transaction.call_args[0][1]
+        data = json_cb()
+        # Note that the ordering of the EDUs doesn't matter.
+        self.assertCountEqual(
+            data["edus"],
+            [
+                {
+                    "edu_type": EduTypes.RECEIPT,
+                    "content": {
+                        "room_id": {
+                            "m.read": {
+                                "user_id": {
+                                    "event_ids": ["event_id"],
+                                    "data": {"ts": 1234, "thread_id": "thread"},
+                                }
+                            }
+                        }
+                    },
+                },
+                {
+                    "edu_type": EduTypes.RECEIPT,
+                    "content": {
+                        "room_id": {
+                            "m.read": {
+                                "user_id": {
+                                    "event_ids": ["event_id"],
+                                    "data": {"ts": 1234},
+                                }
+                            }
+                        }
+                    },
+                },
+            ],
+        )
+
     def test_send_receipts_with_backoff_small_room(self) -> None:
         """Read receipt in small rooms should not be delayed"""
         mock_send_transaction = self.federation_transport_client.send_transaction
