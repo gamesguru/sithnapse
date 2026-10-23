@@ -638,22 +638,20 @@ class DeviceHandler:
         # current-state delta: the room's current state can be incomplete or
         # reset while the leave is being processed. Membership events are
         # persisted independently of that delta stream, so use them to fill in
-        # missed leave transitions. The current joined-room snapshot filters
-        # out rejected leaves and rooms the user has since rejoined.
+        # missed leave transitions. Ignore rejected events, and use the last
+        # accepted event in the range so a subsequent rejoin cancels a leave.
         membership_events = await self.store.get_membership_changes_for_user(
             user_id, from_token.room_key, now_token.room_key
         )
         last_membership_event_by_room: dict[str, EventBase] = {}
         for event in membership_events:
+            if event.rejected_reason is not None:
+                continue
             last_membership_event_by_room[event.room_id] = event
 
         for room_id, event in last_membership_event_by_room.items():
-            if room_id in joined_room_ids:
-                # A leave followed by a rejoin in the same sync range should
-                # not stop tracking the room.
+            if event.membership == Membership.JOIN:
                 newly_left_rooms.discard(room_id)
-                if event.membership == Membership.JOIN:
-                    newly_joined_rooms.add(room_id)
             elif event.membership in (Membership.LEAVE, Membership.BAN):
                 newly_joined_rooms.discard(room_id)
                 newly_left_rooms.add(room_id)
