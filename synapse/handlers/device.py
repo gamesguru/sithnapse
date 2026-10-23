@@ -792,9 +792,14 @@ class DeviceHandler:
 
         # Remove any users that we still share a room with.
         left_users_rooms = await self.store.get_rooms_for_users(newly_left_users)
-        for user_id, entries in left_users_rooms.items():
-            if any(rid in joined_room_ids for rid in entries):
-                newly_left_users.discard(user_id)
+        for left_user_id, entries in left_users_rooms.items():
+            # Ignore rooms the user has just left: their membership in the old
+            # room must not be treated as a room we still share with them.
+            if any(
+                rid in joined_room_ids and rid not in newly_left_rooms
+                for rid in entries
+            ):
+                newly_left_users.discard(left_user_id)
 
         return DeviceListUpdates(
             changed={
