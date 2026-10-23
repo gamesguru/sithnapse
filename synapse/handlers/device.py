@@ -42,6 +42,7 @@ from synapse.api.errors import (
     RequestSendFailed,
     SynapseError,
 )
+from synapse.events import EventBase
 from synapse.logging.opentracing import log_kv, set_tag, trace
 from synapse.metrics import SERVER_NAME_LABEL
 from synapse.metrics.background_process_metrics import (
@@ -632,6 +633,30 @@ class DeviceHandler:
             elif change.prev_membership == Membership.JOIN:
                 newly_joined_rooms.discard(change.room_id)
                 newly_left_rooms.add(change.room_id)
+
+        # A leave during a partial-state join may not appear as a useful
+        # current-state delta: the room's current state can be incomplete or
+        # reset while the leave is being processed. Membership events are
+        # persisted independently of that delta stream, so use them to fill in
+        # missed leave transitions. The current joined-room snapshot filters
+        # out rejected leaves and rooms the user has since rejoined.
+        membership_events = await self.store.get_membership_changes_for_user(
+            user_id, from_token.room_key, now_token.room_key
+        )
+        last_membership_event_by_room: dict[str, EventBase] = {}
+        for event in membership_events:
+            last_membership_event_by_room[event.room_id] = event
+
+        for room_id, event in last_membership_event_by_room.items():
+            if room_id in joined_room_ids:
+                # A leave followed by a rejoin in the same sync range should
+                # not stop tracking the room.
+                newly_left_rooms.discard(room_id)
+                if event.membership == Membership.JOIN:
+                    newly_joined_rooms.add(room_id)
+            elif event.membership in (Membership.LEAVE, Membership.BAN):
+                newly_joined_rooms.discard(room_id)
+                newly_left_rooms.add(room_id)
 
         # We now work out if any other users have since joined or left the rooms
         # the user is currently in.
