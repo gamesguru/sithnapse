@@ -257,9 +257,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.3"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03bb0e1cc970d482d121d9a1744999169b69a07470b3d644a7894e53fcaf4574"
+checksum = "38d28fb6aa7dd680b3ffd1a3e64e115c177bdba63c0ae7f9cd48129ff05c4fa0"
 dependencies = [
  "cmov",
 ]
@@ -1025,7 +1025,7 @@ dependencies = [
 [[package]]
 name = "mtxdb"
 version = "0.1.0-beta.2"
-source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=dev#7e129774f85bf3a6c0af783e015ecbed8b43217f"
+source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=dev#a3f491d56331fb55c13ed6d524aa6a50c01898fe"
 dependencies = [
  "arc-swap",
  "blake3",
@@ -1034,11 +1034,20 @@ dependencies = [
  "fs2",
  "memchr",
  "memmap2",
+ "mtxdb-log",
  "parking_lot",
  "rezzy-recon",
  "sha2",
  "zstd",
  "zstd-sys",
+]
+
+[[package]]
+name = "mtxdb-log"
+version = "0.1.0-beta.2"
+source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=dev#a3f491d56331fb55c13ed6d524aa6a50c01898fe"
+dependencies = [
+ "tracing",
 ]
 
 [[package]]
@@ -1453,12 +1462,13 @@ dependencies = [
 [[package]]
 name = "rezzy"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#87996819b463f94784069a96e4d35bddef5ada54"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#be30a3d4ac8f794d77830143fc09a64fea1ce3dd"
 dependencies = [
  "base64 0.23.1",
  "blake3",
  "hashbrown 0.17.1",
  "rezzy-json",
+ "rezzy-log",
  "rezzy-recon",
  "sha2",
 ]
@@ -1466,17 +1476,26 @@ dependencies = [
 [[package]]
 name = "rezzy-json"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#87996819b463f94784069a96e4d35bddef5ada54"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#be30a3d4ac8f794d77830143fc09a64fea1ce3dd"
 dependencies = [
  "ryu",
 ]
 
 [[package]]
+name = "rezzy-log"
+version = "0.6.0-rc.1"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#be30a3d4ac8f794d77830143fc09a64fea1ce3dd"
+dependencies = [
+ "tracing",
+]
+
+[[package]]
 name = "rezzy-recon"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#87996819b463f94784069a96e4d35bddef5ada54"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#be30a3d4ac8f794d77830143fc09a64fea1ce3dd"
 dependencies = [
  "base64 0.23.1",
+ "rezzy-log",
  "sha2",
 ]
 
@@ -1887,9 +1906,9 @@ dependencies = [
 
 [[package]]
 name = "tinystr"
-version = "0.8.4"
+version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1e27c91459209c2986af3dcf603a5a74a4368754ce37414f59acc971167f643"
+checksum = "abc840c238154d58f9e86b2792261edfde565a17696e1cda1a449de27979801a"
 dependencies = [
  "displaydoc",
  "serde_core",
@@ -2377,9 +2396,9 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "yoke"
-version = "0.8.3"
+version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "709fe23a0424b6a435d82152b1bd3fdfb0833487d5fa90d05d42762a9891fef5"
+checksum = "417ef3fcf6c300b7dbd25c85531a746931c02ad536f3cf4786ed1e88223340b3"
 dependencies = [
  "stable_deref_trait",
  "yoke-derive",
@@ -2439,9 +2458,9 @@ dependencies = [
 
 [[package]]
 name = "zerovec"
-version = "0.11.8"
+version = "0.11.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb0464e17806c1d976d5cba29399c7f08e516e279e2ba493f63123b5fca67dd8"
+checksum = "f58a2799cfe9a1670c7ea8edbd52ef8edb93cb37a7f83bf31ba9e35d9dae6a40"
 dependencies = [
  "serde",
  "yoke",
@@ -2451,9 +2470,9 @@ dependencies = [
 
 [[package]]
 name = "zerovec-derive"
-version = "0.11.6"
+version = "0.11.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34df6fc39dbd26ddc9c10e6a2984476e13acce22e64e4487636ef494369225da"
+checksum = "c3743ddbf47738d929cd1ae2e199d40d0162979dfe31aef8ae646d2bf00bf97a"
 dependencies = [
  "proc-macro2",
  "quote",

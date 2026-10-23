@@ -2098,6 +2098,16 @@ class PresenceEventSource(EventSource[int, UserPresenceState]):
             # We always care about our own presence.
             additional_users_interested_in.add(user_id)
 
+            # A partial-state room only has a server list from the join, not
+            # complete membership. Treat users on those servers as potentially
+            # sharing the room until the resync fills in membership state.
+            partial_state_servers: set[str] = set()
+            user_room_ids = await self.store.get_rooms_for_user(user_id)
+            for room_id in user_room_ids - self._rooms_to_exclude_from_presence:
+                servers = await self.store.get_partial_state_servers_at_join(room_id)
+                if servers:
+                    partial_state_servers.update(servers)
+
             if explicit_room_id:
                 user_ids = await self.store.get_users_in_room(explicit_room_id)
                 additional_users_interested_in.update(user_ids)
@@ -2146,6 +2156,11 @@ class PresenceEventSource(EventSource[int, UserPresenceState]):
                         for updated_user, rooms in rooms_by_user.items()
                         if not my_rooms.isdisjoint(rooms)
                     }
+                    sharing_users.update(
+                        updated_user
+                        for updated_user in updated_users
+                        if get_domain_from_id(updated_user) in partial_state_servers
+                    )
 
                     interested_and_updated_users = (
                         sharing_users.union(additional_users_interested_in)
@@ -2165,6 +2180,12 @@ class PresenceEventSource(EventSource[int, UserPresenceState]):
                         )
                     )
                     users_interested_in.update(additional_users_interested_in)
+                    if partial_state_servers:
+                        users_interested_in.update(
+                            await self.store.get_users_with_presence_on_servers(
+                                partial_state_servers
+                            )
+                        )
 
                     interested_and_updated_users = (
                         stream_change_cache.get_entities_changed(
@@ -2180,6 +2201,12 @@ class PresenceEventSource(EventSource[int, UserPresenceState]):
                     )
                 )
                 interested_and_updated_users.update(additional_users_interested_in)
+                if partial_state_servers:
+                    interested_and_updated_users.update(
+                        await self.store.get_users_with_presence_on_servers(
+                            partial_state_servers, include_offline=include_offline
+                        )
+                    )
 
             # Retrieve the current presence state for each user
             users_to_state = await self.get_presence_handler().current_state_for_users(
