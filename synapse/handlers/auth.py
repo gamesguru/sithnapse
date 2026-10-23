@@ -439,7 +439,6 @@ class AuthHandler:
         clientdict: dict[str, Any],
         description: str,
         get_new_session_data: Callable[[], JsonDict] | None = None,
-        require_existing_session: bool = False,
     ) -> tuple[dict, dict, str]:
         """
         Takes a dictionary sent by the client in the login / registration
@@ -469,11 +468,6 @@ class AuthHandler:
 
                 The keys of the returned data should be entries in
                 UIAuthSessionDataConstants.
-
-            require_existing_session:
-                if True, reject an auth payload without a session when an
-                existing session was already started with the same request
-                data.
 
         Returns:
             A tuple of (creds, params, session_id).
@@ -506,16 +500,6 @@ class AuthHandler:
 
         # If there's no session ID, create a new session.
         if not sid:
-            if (
-                require_existing_session
-                and authdict
-                and await self.store.get_ui_auth_session_for_clientdict(
-                    clientdict, uri, method
-                )
-                is not None
-            ):
-                raise SynapseError(401, "Missing UIA session", Codes.UNAUTHORIZED)
-
             new_session_data = get_new_session_data() if get_new_session_data else {}
 
             session = await self.store.create_ui_auth_session(

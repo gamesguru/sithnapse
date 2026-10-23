@@ -3575,29 +3575,29 @@ class SyncHandler:
                 # An out of band room won't have any state changes.
                 state = {}
 
-            summary: JsonDict | None = {}
-
-            # we include a summary in room responses when we're lazy loading
-            # members (as the client otherwise doesn't have enough info to form
-            # the name itself).
-            if not room_builder.out_of_band and (
-                # we recalculate the summary:
-                #   if there are membership changes in the timeline, or
-                #   if membership has changed during a gappy sync, or
-                #   if this is an initial sync.
-                any(ev.event.type == EventTypes.Member for ev in batch.events)
-                or (
-                    # XXX: this may include false positives in the form of LL
-                    # members which have snuck into state
-                    batch.limited and any(t == EventTypes.Member for (t, k) in state)
-                )
-                or since_token is None
-            ):
-                summary = await self.compute_summary(
-                    room_id, sync_config, batch, state, now_token
-                )
-
             if room_builder.rtype == "joined":
+                summary: JsonDict | None = {}
+
+                # Recalculate the room summary when membership changes or on
+                # initial sync.
+                if not room_builder.out_of_band and (
+                    # we recalculate the summary:
+                    #   if there are membership changes in the timeline, or
+                    #   if membership has changed during a gappy sync, or
+                    #   if this is an initial sync.
+                    any(ev.event.type == EventTypes.Member for ev in batch.events)
+                    or (
+                        # XXX: this may include false positives in the form of LL
+                        # members which have snuck into state
+                        batch.limited
+                        and any(t == EventTypes.Member for (t, k) in state)
+                    )
+                    or since_token is None
+                ):
+                    summary = await self.compute_summary(
+                        room_id, sync_config, batch, state, now_token
+                    )
+
                 unread_notifications: dict[str, int] = {}
 
                 room_sync = JoinedSyncResult(

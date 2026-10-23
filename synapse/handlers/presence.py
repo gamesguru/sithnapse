@@ -2102,8 +2102,16 @@ class PresenceEventSource(EventSource[int, UserPresenceState]):
             # complete membership. Treat users on those servers as potentially
             # sharing the room until the resync fills in membership state.
             partial_state_servers: set[str] = set()
-            user_room_ids = await self.store.get_rooms_for_user(user_id)
-            for room_id in user_room_ids - self._rooms_to_exclude_from_presence:
+            user_room_ids = (
+                await self.store.get_rooms_for_user(user_id)
+                - self._rooms_to_exclude_from_presence
+            )
+            partial_state_rooms = await self.store.is_partial_state_room_batched(
+                user_room_ids
+            )
+            for room_id, is_partial in partial_state_rooms.items():
+                if not is_partial:
+                    continue
                 servers = await self.store.get_partial_state_servers_at_join(room_id)
                 if servers:
                     partial_state_servers.update(servers)

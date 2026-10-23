@@ -1067,26 +1067,16 @@ class DeviceWorkerStore(RoomMemberWorkerStore, EndToEndKeyWorkerStore):
         self, user_ids: StrCollection
     ) -> set[str]:
         """Checks which of the given users we have cached the devices for."""
-        # Query the extremeties table directly rather than going through the
-        # cached accessor. Unsubscribing a user deletes this row, and a stale
-        # process-local cache entry must not make us keep using their devices.
-        rows = cast(
-            list[tuple[str, str]],
-            await self.db_pool.simple_select_many_batch(
-                table="device_lists_remote_extremeties",
-                column="user_id",
-                iterable=user_ids,
-                retcols=("user_id", "stream_id"),
-                desc="get_users_whose_devices_are_cached",
-            ),
-        )
+        user_map = await self.get_device_list_last_stream_id_for_remotes(user_ids)
 
         # We go and check if any of the users need to have their device lists
         # resynced. If they do then we remove them from the cached list.
         users_needing_resync = await self.get_user_ids_requiring_device_list_resync(
             user_ids
         )
-        user_ids_in_cache = {user_id for user_id, _ in rows} - users_needing_resync
+        user_ids_in_cache = {
+            user_id for user_id, stream_id in user_map.items() if stream_id
+        } - users_needing_resync
         return user_ids_in_cache
 
     @cached(num_args=2, tree=True)
@@ -1531,26 +1521,11 @@ class DeviceWorkerStore(RoomMemberWorkerStore, EndToEndKeyWorkerStore):
         txn: LoggingTransaction,
         user_id: str,
     ) -> None:
-        # An unsubscribed user's cached devices must not be served if we later
-        # learn about them through stale partial room state. Also clear any
-        # queued resync, which could otherwise recreate the subscription.
         self.db_pool.simple_delete_txn(
             txn,
             table="device_lists_remote_extremeties",
             keyvalues={"user_id": user_id},
         )
-        self.db_pool.simple_delete_txn(
-            txn,
-            table="device_lists_remote_cache",
-            keyvalues={"user_id": user_id},
-        )
-        self.db_pool.simple_delete_txn(
-            txn,
-            table="device_lists_remote_resync",
-            keyvalues={"user_id": user_id},
-        )
-        txn.call_after(self.get_cached_devices_for_user.invalidate, (user_id,))
-        txn.call_after(self._get_cached_user_device.invalidate, (user_id,))
         self._invalidate_cache_and_stream(
             txn, self.get_device_list_last_stream_id_for_remote, (user_id,)
         )

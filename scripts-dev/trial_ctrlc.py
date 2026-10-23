@@ -1014,8 +1014,6 @@ def _print_mtxdb_engine_stats(timings_dir: str) -> None:
                     for i, count in enumerate(lat.get("buckets", [])):
                         into["buckets"][i] += count
             acc = totals[pool]
-            for key in ("put_many_gate_wait_max_us", "put_many_total_max_us"):
-                acc[key] = max(acc[key], ps.get(key, 0) or 0)
             for key in (
                 "get_calls",
                 "get_misses",
@@ -1026,11 +1024,6 @@ def _print_mtxdb_engine_stats(timings_dir: str) -> None:
                 "index_clone_time_us",
                 "index_grow_count",
                 "index_rebuild_count",
-                "put_many_gate_wait_us",
-                "put_many_collection_wait_us",
-                "put_many_journal_us",
-                "put_many_pack_us",
-                "put_many_publish_us",
             ):
                 acc[key] += ps.get(key, 0) or 0
             for key, value in (ps.get("sync_totals") or {}).items():
@@ -1073,17 +1066,6 @@ def _print_mtxdb_engine_stats(timings_dir: str) -> None:
                 f" index_clone={fmt(pool_totals['index_clone_time_us'])}"
                 f" | index grows={pool_totals['index_grow_count']:,.0f}"
                 f" rebuilds={pool_totals['index_rebuild_count']:,.0f}",
-                file=err,
-            )
-        if pool_totals.get("put_many_total_max_us"):
-            print(
-                f"    put_many phases (summed): gate_wait={fmt(pool_totals['put_many_gate_wait_us'])}"
-                f" collection_wait={fmt(pool_totals['put_many_collection_wait_us'])}"
-                f" journal={fmt(pool_totals['put_many_journal_us'])}"
-                f" pack={fmt(pool_totals['put_many_pack_us'])}"
-                f" publish={fmt(pool_totals['put_many_publish_us'])}"
-                f" | max: gate_wait={fmt(pool_totals['put_many_gate_wait_max_us'])}"
-                f" call={fmt(pool_totals['put_many_total_max_us'])}",
                 file=err,
             )
         # The pools share one journal, so a physical commit is counted once, by

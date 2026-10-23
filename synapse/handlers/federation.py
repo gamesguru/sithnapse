@@ -2633,60 +2633,15 @@ class FederationHandler:
         if not local_users:
             return
 
-        remote_users = {
-            user_id
-            for user_id in await self.store.get_users_in_room(room_id)
-            if not self.is_mine_id(user_id)
-        }
-
-        # Stop tracking the remote users that we learned about while the room
-        # was partial. This both evicts their cached devices and ensures the
-        # next /keys/query refetches them. Do this *before* leaving: clients
-        # see the leave in /sync as soon as it is persisted, and a key query
-        # right after must not be answered from a cache we are about to drop.
-        #
-        # Don't use `handle_potentially_left_users` here: the abandoned room's
-        # current state can still show the local user as joined even though
-        # they have left, which would make it think we still share the room.
-        remote_user_rooms = await self.store.get_rooms_for_users(remote_users)
-        logger.info(
-            "Abandoning partial-state room %s: local users %s, remote users %s",
-            room_id,
-            sorted(local_users),
-            {
-                user_id: sorted(remote_user_rooms.get(user_id, frozenset()))
-                for user_id in remote_users
-            },
-        )
-        for user_id in remote_users:
-            other_rooms = remote_user_rooms.get(user_id, frozenset()) - {room_id}
-            if other_rooms:
-                await self.store.mark_remote_users_device_caches_as_stale((user_id,))
-            else:
-                await self.store.mark_remote_user_device_list_as_unsubscribed(user_id)
-                # Also queue a resync: this excludes the user from the cache
-                # even if a cache invalidation from the unsubscribe is stale.
-                await self.store.mark_remote_users_device_caches_as_stale((user_id,))
-
         member_handler = self.hs.get_room_member_handler()
         for user_id in local_users:
             try:
-                event_id, stream_ordering = await member_handler.update_membership(
+                await member_handler.update_membership(
                     requester=create_requester(user_id),
                     target=UserID.from_string(user_id),
                     room_id=room_id,
                     action=Membership.LEAVE,
                     ratelimit=False,
-                )
-                # A partial-state room's current state may not be recalculated
-                # after this leave, so update the local membership snapshot
-                # directly; otherwise we can still look like we share the room.
-                await self.store.set_local_current_membership(
-                    room_id,
-                    user_id,
-                    event_id,
-                    Membership.LEAVE,
-                    stream_ordering,
                 )
             except Exception:
                 logger.exception(
