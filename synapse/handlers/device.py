@@ -794,6 +794,9 @@ class DeviceHandler:
                 room_id,
                 since_token,
                 state_filter=StateFilter.from_types([(EventTypes.Member, None)]),
+                # Don't make a sync wait for a partial-state resync to finish;
+                # the members we know of are enough to say who we stop tracking.
+                await_full_state=False,
             )
             left_users = await self.store.get_joined_user_ids_from_state(
                 room_id, old_state_ids
