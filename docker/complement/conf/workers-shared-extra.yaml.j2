@@ -59,6 +59,14 @@ rc_federation:
   reject_limit: 99999
   concurrent: 3
 
+# Complement's fake federation servers deliberately fail requests (for example
+# /state_ids with a 500). With the default 10 minute minimum retry interval that
+# marks the fake server as down, and later /keys/query requests skip it instead
+# of making the federation request the tests expect.
+federation:
+  destination_min_retry_interval: 1s
+  destination_max_retry_interval: 5s
+
 rc_message:
   per_second: 9999
   burst_count: 9999
