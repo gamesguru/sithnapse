@@ -72,6 +72,7 @@ from synapse.types import (
     get_verify_key_from_cross_signing_key,
     is_compliant_user_id,
 )
+from synapse.types.state import StateFilter
 from synapse.util import stringutils
 from synapse.util.async_helpers import Linearizer
 from synapse.util.caches.expiringcache import ExpiringCache
@@ -787,7 +788,16 @@ class DeviceHandler:
 
         # Now find users that we no longer track
         for room_id in newly_left_rooms:
-            left_users = await self.store.get_users_in_room(room_id)
+            # Once our last local user leaves, the room's current state is
+            # dropped, so read the members from the state at the previous sync.
+            old_state_ids = await self._state_storage.get_state_ids_at(
+                room_id,
+                since_token,
+                state_filter=StateFilter.from_types([(EventTypes.Member, None)]),
+            )
+            left_users = await self.store.get_joined_user_ids_from_state(
+                room_id, old_state_ids
+            )
             newly_left_users.update(left_users)
 
         # Remove any users that we still share a room with.
