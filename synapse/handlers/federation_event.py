@@ -2144,6 +2144,7 @@ class FederationEventHandler:
 
             events_and_contexts_to_persist.append((event, context))
 
+        prep_start_ms = self._clock.time_msec()
         for i, event in enumerate(unseen_sorted_events):
             await prep(event)
 
@@ -2152,6 +2153,7 @@ class FederationEventHandler:
             # occasionally to ensure we don't block other work.
             if (i + 1) % 1000 == 0:
                 await self._clock.sleep(Duration(seconds=0))
+        persist_start_ms = self._clock.time_msec()
 
         if not has_rejected_events:
             # Check if any of the persisted events were rejected
@@ -2170,6 +2172,16 @@ class FederationEventHandler:
                 # during backfill should be marked as backfilled as well.
                 backfilled=True,
             )
+
+        persist_end_ms = self._clock.time_msec()
+        logger.info(
+            "Persisted %i outliers in room %s in %ims (auth checks %ims, persist %ims)",
+            len(events_and_contexts_to_persist),
+            room_id,
+            persist_end_ms - prep_start_ms,
+            persist_start_ms - prep_start_ms,
+            persist_end_ms - persist_start_ms,
+        )
 
         return has_rejected_events
 
