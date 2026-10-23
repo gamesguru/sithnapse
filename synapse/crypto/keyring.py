@@ -46,6 +46,7 @@ from synapse.api.errors import (
 )
 from synapse.config.key import TrustedKeyServer
 from synapse.events import EventBase
+from synapse.http.matrixfederationclient import StrictJsonParser
 from synapse.logging.context import make_deferred_yieldable, run_in_background
 from synapse.storage.keys import FetchKeyResult
 from synapse.synapse_rust.events import redact_event
@@ -60,6 +61,15 @@ if TYPE_CHECKING:
     from synapse.server import HomeServer
 
 logger = logging.getLogger(__name__)
+
+# MSC4499 per-response validation limits. A response beyond these is rejected as
+# malformed rather than truncated.
+MAX_ACTIVE_VERIFY_KEYS_PER_RESPONSE = 50
+MAX_OLD_VERIFY_KEYS_PER_RESPONSE = 3000
+
+# How far in the future an `old_verify_keys` entry's `expired_ts` may be before it
+# is treated as malformed, to allow for clock skew.
+MAX_EXPIRED_TS_SKEW_MS = 5 * 60 * 1000
 
 
 # List of Unpadded Base64 server signing keys that are known to be vulnerable to attack.
@@ -745,6 +755,37 @@ class BaseV2KeyFetcher(KeyFetcher):
         """
         ts_valid_until_ms = response_json["valid_until_ts"]
 
+        # MSC4499: reject a response that is oversized, or that gives two different
+        # key bodies for one key ID, as malformed before looking at any of it.
+        if len(response_json["verify_keys"]) > MAX_ACTIVE_VERIFY_KEYS_PER_RESPONSE:
+            raise KeyLookupError(
+                "Key response for %s has %i verify_keys, more than the limit of %i"
+                % (
+                    response_json.get("server_name"),
+                    len(response_json["verify_keys"]),
+                    MAX_ACTIVE_VERIFY_KEYS_PER_RESPONSE,
+                )
+            )
+        old_verify_keys_json = response_json.get("old_verify_keys", {})
+        if len(old_verify_keys_json) > MAX_OLD_VERIFY_KEYS_PER_RESPONSE:
+            raise KeyLookupError(
+                "Key response for %s has %i old_verify_keys, more than the limit of %i"
+                % (
+                    response_json.get("server_name"),
+                    len(old_verify_keys_json),
+                    MAX_OLD_VERIFY_KEYS_PER_RESPONSE,
+                )
+            )
+        for key_id, old_key_data in old_verify_keys_json.items():
+            active_key_data = response_json["verify_keys"].get(key_id)
+            if active_key_data is not None and decode_base64(
+                active_key_data["key"]
+            ) != decode_base64(old_key_data["key"]):
+                raise KeyLookupError(
+                    "Key response for %s gives different keys for %s in verify_keys "
+                    "and old_verify_keys" % (response_json.get("server_name"), key_id)
+                )
+
         # start by extracting the keys from the response, since they may be required
         # to validate the signature on the response.
         verify_keys = {}
@@ -779,7 +820,18 @@ class BaseV2KeyFetcher(KeyFetcher):
                 % (server_name,)
             )
 
+        max_expired_ts_ms = time_added_ms + MAX_EXPIRED_TS_SKEW_MS
         for key_id, key_data in response_json.get("old_verify_keys", {}).items():
+            if key_data["expired_ts"] > max_expired_ts_ms:
+                # MSC4499: a retired key claiming to expire in the future is
+                # malformed. Ignore just that entry, not the rest of the response.
+                logger.warning(
+                    "Ignoring old key %s for %s with expired_ts %s in the future",
+                    key_id,
+                    server_name,
+                    key_data["expired_ts"],
+                )
+                continue
             if is_signing_algorithm_supported(key_id):
                 key_base64 = key_data["key"]
                 key_bytes = decode_base64(key_base64)
@@ -1091,6 +1143,9 @@ class ServerKeyFetcher(BaseV2KeyFetcher):
                 destination=server_name,
                 path="/_matrix/key/v2/server",
                 ignore_backoff=True,
+                # MSC4499: a key response containing duplicate JSON object keys,
+                # at any depth, is malformed.
+                parser=StrictJsonParser(),
                 # we only give the remote server 10s to respond. It should be an
                 # easy request to handle, so if it doesn't reply within 10s, it's
                 # probably not going to.
