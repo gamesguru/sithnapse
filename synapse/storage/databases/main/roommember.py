@@ -722,17 +722,23 @@ class RoomMemberWorkerStore(EventsWorkerStore, CacheInvalidationWorkerStore):
         if not user_ids:
             return set()
 
+        # Require that at least one local user is still joined to the room
+        # according to `local_current_membership`. `current_state_events` can
+        # still list local users as joined after they leave a partial-state
+        # room, which would otherwise make us think we still share it.
         sql = """
-            SELECT state_key FROM current_state_events
+            SELECT cse.state_key FROM current_state_events cse
+            INNER JOIN local_current_membership lcm
+                ON lcm.room_id = cse.room_id AND lcm.membership = 'join'
             WHERE
-                type = 'm.room.member'
-                AND membership = 'join'
+                cse.type = 'm.room.member'
+                AND cse.membership = 'join'
                 AND %s
-            GROUP BY state_key
+            GROUP BY cse.state_key
         """
 
         clause, args = make_in_list_sql_clause(
-            self.database_engine, "state_key", user_ids
+            self.database_engine, "cse.state_key", user_ids
         )
 
         txn.execute(sql % (clause,), args)
