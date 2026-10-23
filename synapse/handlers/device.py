@@ -667,7 +667,9 @@ class DeviceHandler:
 
         # TODO: Only pull out membership events?
         state_changes = await self.store.get_current_state_deltas_for_rooms(
-            joined_room_ids, from_token=from_token.room_key, to_token=now_token.room_key
+            joined_room_ids | newly_left_rooms,
+            from_token=from_token.room_key,
+            to_token=now_token.room_key,
         )
         for delta in state_changes:
             if delta.event_type != EventTypes.Member:
@@ -715,6 +717,12 @@ class DeviceHandler:
                     if prev_membership not in joined_invited_knocked:
                         newly_joined_or_invited_or_knocked_users.add(delta.state_key)
                         newly_left_users.discard(delta.state_key)
+                    # A user can join after the sync token in a room the local
+                    # user leaves during this range. They won't be in the
+                    # previous-state snapshot used below, but we still need to
+                    # stop tracking their device list when we leave the room.
+                    if delta.room_id in newly_left_rooms:
+                        newly_left_users.add(delta.state_key)
                 elif prev_membership in joined_invited_knocked:
                     newly_joined_or_invited_or_knocked_users.discard(delta.state_key)
                     newly_left_users.add(delta.state_key)
@@ -836,6 +844,19 @@ class DeviceHandler:
                 for rid in entries
             ):
                 newly_left_users.discard(left_user_id)
+
+        # Telling the client that it no longer tracks these users is not enough:
+        # also evict them from our own cache, otherwise a subsequent /keys/query
+        # can still be served from the cache we just told the client to forget.
+        remote_left_users = {
+            left_user_id
+            for left_user_id in newly_left_users
+            if not self.hs.is_mine_id(left_user_id)
+        }
+        if remote_left_users:
+            await self.store.mark_remote_users_device_caches_as_stale(
+                remote_left_users
+            )
 
         return DeviceListUpdates(
             changed={
