@@ -612,7 +612,10 @@ class RegisterRestServlet(RestServlet):
                 request,
                 body,
                 "register a new account",
-                require_existing_session=True,
+                # Guest upgrades legitimately send the same registration body
+                # (including the guest token) again with an auth stage and no
+                # session; allow that flow to start a fresh UIA session.
+                require_existing_session=not guest_access_token,
             )
         except InteractiveAuthIncompleteError as e:
             # The user needs to provide more steps to complete auth.
