@@ -2664,6 +2664,9 @@ class FederationHandler:
                 await self.store.mark_remote_users_device_caches_as_stale((user_id,))
             else:
                 await self.store.mark_remote_user_device_list_as_unsubscribed(user_id)
+                # Also queue a resync: this excludes the user from the cache
+                # even if a cache invalidation from the unsubscribe is stale.
+                await self.store.mark_remote_users_device_caches_as_stale((user_id,))
 
         member_handler = self.hs.get_room_member_handler()
         for user_id in local_users:

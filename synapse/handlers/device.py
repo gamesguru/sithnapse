@@ -846,10 +846,9 @@ class DeviceHandler:
                 newly_left_users.discard(left_user_id)
 
         # Telling the client that it no longer tracks these users is not enough:
-        # also unsubscribe them locally, otherwise a subsequent /keys/query can
-        # still use the cached device list. Marking them stale would schedule a
-        # resync, which could immediately repopulate the cache while a partial
-        # room still appears to be shared.
+        # also unsubscribe them locally and mark them for resync. Unsubscribing
+        # removes the extremeties row; the resync marker additionally forces
+        # the cache check to miss even if a cached lookup is momentarily stale.
         remote_left_users = {
             left_user_id
             for left_user_id in newly_left_users
@@ -858,6 +857,10 @@ class DeviceHandler:
         for remote_left_user in remote_left_users:
             await self.store.mark_remote_user_device_list_as_unsubscribed(
                 remote_left_user
+            )
+        if remote_left_users:
+            await self.store.mark_remote_users_device_caches_as_stale(
+                remote_left_users
             )
 
         return DeviceListUpdates(
