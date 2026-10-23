@@ -4345,6 +4345,13 @@ fn stats_to_dict(
     d.set_item("put_many_fast_path_calls", s.put_many_fast_path_calls)?;
     d.set_item("put_many_clone_path_calls", s.put_many_clone_path_calls)?;
     d.set_item("index_clone_time_us", s.index_clone_time.as_micros() as u64)?;
+    d.set_item("put_many_gate_wait_us", s.put_many_gate_wait.as_micros() as u64)?;
+    d.set_item("put_many_gate_wait_max_us", s.put_many_gate_wait_max.as_micros() as u64)?;
+    d.set_item("put_many_collection_wait_us", s.put_many_collection_wait.as_micros() as u64)?;
+    d.set_item("put_many_journal_us", s.put_many_journal.as_micros() as u64)?;
+    d.set_item("put_many_pack_us", s.put_many_pack.as_micros() as u64)?;
+    d.set_item("put_many_publish_us", s.put_many_publish.as_micros() as u64)?;
+    d.set_item("put_many_total_max_us", s.put_many_total_max.as_micros() as u64)?;
     d.set_item("index_grow_count", s.index_grow_count)?;
     d.set_item("index_rebuild_count", s.index_rebuild_count)?;
     d.set_item("sync_calls", s.sync_calls)?;
