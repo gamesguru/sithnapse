@@ -27,6 +27,12 @@ include_profile_updates_in_sync: true
 background_updates:
   sleep_enabled: false
 
+## Media ##
+
+# Complement still exercises the unauthenticated /_matrix/media/v3 download and
+# thumbnail endpoints; keep them available in the test deployment.
+enable_authenticated_media: false
+
 ## Registration ##
 
 # Needed by Complement to register admin users
