@@ -53,10 +53,10 @@ observed_conflict = False
 # a conflict is not guaranteed by a single burst. Each burst uses its own
 # forward list and still asserts merge completeness, so a lost update fails
 # immediately instead of depending on the schedule.
-for burst in range(3):
+for burst in range(40):
     room_id = f"!occ-merge:test-{burst}"
     parent = f"$parent-{burst}"
-    children = [f"$child-{burst:02d}-{index:02d}" for index in range(16)]
+    children = [f"$child-{burst:02d}-{index:02d}" for index in range(32)]
 
     # Align every writer on one barrier so they read the same forward-list
     # version and race the same commit instead of serializing by chance.
@@ -97,7 +97,7 @@ for burst in range(3):
         observed_conflict = True
 
 assert observed_conflict, (
-    "the race did not exercise EdgeOccOutcome::Conflict and run_edge_occ replay: "
+    "the synchronized race bursts did not exercise OCC conflict replay: "
     f"before={conflicts_before}, after={m.event_edges_occ_conflicts()}"
 )
 """
