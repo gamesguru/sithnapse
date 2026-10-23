@@ -3530,6 +3530,9 @@ class SyncHandler:
                 or ephemeral
                 or full_state
                 or sticky_event_ids
+                # Archived rooms can still have state changes to report when
+                # the timeline is empty (e.g. a zero timeline limit).
+                or room_builder.rtype == "archived"
             ):
                 return
 
@@ -3579,7 +3582,6 @@ class SyncHandler:
             # the name itself).
             if (
                 not room_builder.out_of_band
-                and sync_config.filter_collection.lazy_load_members()
                 and (
                     # we recalculate the summary:
                     #   if there are membership changes in the timeline, or
