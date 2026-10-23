@@ -165,6 +165,7 @@ async def check_state_independent_auth_rules(
     event: "EventBase",
     batched_auth_events: Mapping[str, "EventBase"] | None = None,
     batched_rejections: Mapping[str, str] | None = None,
+    allow_rejected_auth_events: bool = False,
 ) -> None:
     """Check that an event complies with auth rules that are independent of room state
 
@@ -181,6 +182,10 @@ async def check_state_independent_auth_rules(
             yet, so their rejection is recorded neither on the event nor in the database,
             and the caller has to tell us. Needed for MSC4242 State DAG rooms, where
             rejection cascades through `prev_state_events`.
+        allow_rejected_auth_events: if True, do not reject the event when one of its
+            auth events was itself rejected. Used for joins in partial-state rooms,
+            where the local server may have rejected a membership event because it
+            was missing state; the event is re-checked against resolved state below.
 
     Raises:
         AuthError if the checks fail
@@ -253,7 +258,7 @@ async def check_state_independent_auth_rules(
             rejected_reason = prev_state_event.rejected_reason
             if rejected_reason is None and batched_rejections is not None:
                 rejected_reason = batched_rejections.get(prev_state_event.event_id)
-            if rejected_reason is not None:
+            if rejected_reason is not None and not allow_rejected_auth_events:
                 raise AuthError(
                     403,
                     f"During auth for event {event.event_id} in room {event.room_id}, event has a "
@@ -337,7 +342,7 @@ async def check_state_independent_auth_rules(
 
         # 2.3 ... If there are entries which were themselves rejected under the checks performed on receipt
         # of a PDU, reject.
-        if auth_event.rejected_reason:
+        if auth_event.rejected_reason and not allow_rejected_auth_events:
             raise AuthError(
                 403,
                 "During auth for event %s: found rejected event %s in the state"

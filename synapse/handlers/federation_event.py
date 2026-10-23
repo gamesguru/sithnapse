@@ -2617,9 +2617,9 @@ class FederationEventHandler:
                 # will reference that rejected membership event; let the
                 # state-based check below decide whether the join is valid.
                 allow_rejected_auth_events=(
-                    context.partial_state
-                    and event.type == EventTypes.Member
+                    event.type == EventTypes.Member
                     and event.membership == Membership.JOIN
+                    and await self._store.is_partial_state_room(event.room_id)
                 ),
             )
             check_state_dependent_auth_rules(event, claimed_auth_events)
