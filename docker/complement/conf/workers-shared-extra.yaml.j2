@@ -18,6 +18,15 @@ url_preview_ip_range_blacklist: []
 # MSC4429 and MSC4262 Profile updates down sync
 include_profile_updates_in_sync: true
 
+## Background updates ##
+
+# A freshly deployed homeserver runs its initial background updates (notably
+# the user directory population, which the directory handler waits for) while
+# tests are already running. Do not pause a second between batches so they
+# finish within the first moments instead of ~20s after startup.
+background_updates:
+  sleep_enabled: false
+
 ## Registration ##
 
 # Needed by Complement to register admin users
