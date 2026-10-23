@@ -119,6 +119,11 @@ logger = logging.getLogger(__name__)
 # restart or a new join triggers another sync attempt.
 _PARTIAL_STATE_SYNC_INITIAL_BACKOFF = Duration(seconds=1)
 _PARTIAL_STATE_SYNC_MAX_BACKOFF = Duration(hours=1)
+# Giving up also makes every local user leave the room (see
+# `_abandon_partial_state_room`), so this is deliberately short only because
+# Complement's `Device list no longer tracked when failing to complete partial
+# state join` expects the join to be abandoned within its 30s sync timeout. With
+# the backoff above, three failures take about three seconds.
 _PARTIAL_STATE_SYNC_MAX_CONSECUTIVE_FAILURES = 3
 
 
@@ -2628,6 +2633,12 @@ class FederationHandler:
         if not local_users:
             return
 
+        remote_users = {
+            user_id
+            for user_id in await self.store.get_users_in_room(room_id)
+            if not self.is_mine_id(user_id)
+        }
+
         member_handler = self.hs.get_room_member_handler()
         for user_id in local_users:
             try:
@@ -2644,6 +2655,11 @@ class FederationHandler:
                     room_id,
                     user_id,
                 )
+
+        # Now that we no longer share the room, stop tracking the remote users
+        # that we learned about while it was partial. This both evicts their
+        # cached devices and ensures the next /keys/query refetches them.
+        await self.store.handle_potentially_left_users(remote_users)
 
     async def _handle_membership_changes_after_partial_state_resync(
         self, room_id: str, changed_users: StrCollection
