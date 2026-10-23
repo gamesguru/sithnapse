@@ -2659,7 +2659,19 @@ class FederationHandler:
         # Now that we no longer share the room, stop tracking the remote users
         # that we learned about while it was partial. This both evicts their
         # cached devices and ensures the next /keys/query refetches them.
-        await self.store.handle_potentially_left_users(remote_users)
+        #
+        # Don't use `handle_potentially_left_users` here: the abandoned room's
+        # current state can still show the local user as joined even though
+        # they have left, which would make it think we still share the room.
+        remote_user_rooms = await self.store.get_rooms_for_users(remote_users)
+        for user_id in remote_users:
+            other_rooms = remote_user_rooms.get(user_id, frozenset()) - {room_id}
+            if other_rooms:
+                await self.store.mark_remote_users_device_caches_as_stale(
+                    (user_id,)
+                )
+            else:
+                await self.store.mark_remote_user_device_list_as_unsubscribed(user_id)
 
     async def _handle_membership_changes_after_partial_state_resync(
         self, room_id: str, changed_users: StrCollection
