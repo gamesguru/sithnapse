@@ -14,10 +14,11 @@ mkdir -p complement
 #    for pull requests, otherwise GITHUB_REF).
 # 2. Attempt to use the base branch, e.g. when merging into release-vX.Y
 #    (GITHUB_BASE_REF for pull requests).
-# 3. Use the default complement branch ("HEAD").
+# 3. Try a `dev` branch, where the fork keeps its runtime identity and skips.
+# 4. Use the default complement branch ("HEAD").
 COMPLEMENT_REPO="${COMPLEMENT_REPO:-matrix-org/complement}"
 
-for BRANCH_NAME in "$GITHUB_HEAD_REF" "$GITHUB_BASE_REF" "${GITHUB_REF#refs/heads/}" "HEAD"; do
+for BRANCH_NAME in "$GITHUB_HEAD_REF" "$GITHUB_BASE_REF" "${GITHUB_REF#refs/heads/}" "dev" "HEAD"; do
   # Skip empty branch names and merge commits.
   if [[ -z "$BRANCH_NAME" || $BRANCH_NAME =~ ^refs/pull/.* ]]; then
     continue
