@@ -2019,6 +2019,26 @@ class RoomMemberMasterHandler(RoomMemberHandler):
             remote_room_hosts, room_id, user.to_string(), content
         )
 
+        # Tell the remote servers in the room about our device list so that they
+        # start tracking it now that we share a room (spec: device list updates
+        # must be sent when a user joins a room containing servers that were not
+        # already receiving updates for them). Skip partial-state joins: the
+        # room is not fully joined yet, and a partial-state resync will send the
+        # updates once it has the full room state.
+        if not await self.store.is_partial_state_room(room_id):
+            try:
+                device_ids = list(
+                    (await self.store.get_devices_by_user(user.to_string())).keys()
+                )
+                if device_ids:
+                    await self.hs.get_device_handler().notify_device_update(
+                        user.to_string(), device_ids
+                    )
+            except Exception:
+                logger.exception(
+                    "Failed to send device list updates after joining %s", room_id
+                )
+
         # Check the room we just joined wasn't too large, if we didn't fetch the
         # complexity of it before.
         if check_complexity:
