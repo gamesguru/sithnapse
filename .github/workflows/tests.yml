@@ -942,9 +942,11 @@ jobs:
 
       # `cargo test` builds without pyo3's `extension-module` feature, so it
       # links the test binaries against libpython. The runner's system Python
-      # ships without its development library ("cannot find -lpython3.12").
-      - name: Install libpython development files
-        run: sudo apt-get install -y --no-install-recommends libpython3.12-dev
+      # ships without its development library ("cannot find -lpython3.12"), so
+      # use setup-python's 3.12, which includes libpython3.12.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
 
       - run: cargo test --locked
 
@@ -968,8 +970,9 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       # Linking the bench binaries needs libpython; see `cargo-test` above.
-      - name: Install libpython development files
-        run: sudo apt-get install -y --no-install-recommends libpython3.12-dev
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
 
       # RUSTUP_TOOLCHAIN outranks both `rustup default` and any toolchain
       # file, so pinning it here guarantees this step compiles the
