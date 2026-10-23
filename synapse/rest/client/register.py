@@ -612,6 +612,7 @@ class RegisterRestServlet(RestServlet):
                 request,
                 body,
                 "register a new account",
+                require_existing_session=True,
             )
         except InteractiveAuthIncompleteError as e:
             # The user needs to provide more steps to complete auth.
