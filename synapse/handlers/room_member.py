@@ -2019,22 +2019,6 @@ class RoomMemberMasterHandler(RoomMemberHandler):
             remote_room_hosts, room_id, user.to_string(), content
         )
 
-        # The remote servers in the room may not already be receiving device list
-        # updates for this user. Send our current device list so that they start
-        # tracking it now that we share a room (MSC4499 / spec device-list rules).
-        try:
-            device_ids = list(
-                (await self.store.get_devices_by_user(user.to_string())).keys()
-            )
-            if device_ids:
-                await self.hs.get_device_handler().notify_device_update(
-                    user.to_string(), device_ids
-                )
-        except Exception:
-            logger.exception(
-                "Failed to send device list updates after joining %s", room_id
-            )
-
         # Check the room we just joined wasn't too large, if we didn't fetch the
         # complexity of it before.
         if check_complexity:
