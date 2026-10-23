@@ -746,6 +746,26 @@ class DeviceHandler:
         )
         newly_left_users = set(newly_left_users)
 
+        # Augment the rooms reported by the room-sync path with the raw
+        # membership deltas. The room-sync path filters some rooms (for
+        # example partial-state rooms), but we still need to emit
+        # `device_lists.left` when the user leaves a room shared with a remote
+        # user.
+        membership_changes = (
+            await self.store.get_current_state_delta_membership_changes_for_user(
+                user_id,
+                from_key=since_token.room_key,
+                to_key=now_token.room_key,
+            )
+        )
+        additionally_left_rooms = {
+            change.room_id
+            for change in membership_changes
+            if change.prev_membership == Membership.JOIN
+            and change.membership != Membership.JOIN
+        }
+        newly_left_rooms = set(newly_left_rooms) | additionally_left_rooms
+
         # We want to figure out what user IDs the client should refetch
         # device keys for, and which users we aren't going to track changes
         # for anymore.
