@@ -138,6 +138,45 @@ class UIAuthWorkerStore(SQLBaseStore):
             description=result[3],
         )
 
+    async def get_ui_auth_session_for_clientdict(
+        self, clientdict: JsonDict, uri: str, method: str
+    ) -> UIAuthSessionData | None:
+        """Find a UIA session which the client may have accidentally omitted."""
+        clientdict_json = json_encoder.encode(clientdict)
+        rows = cast(
+            list[tuple[str, str, str, str, str, int]],
+            await self.db_pool.simple_select_list(
+                table="ui_auth_sessions",
+                keyvalues={
+                    "clientdict": clientdict_json,
+                    "uri": uri,
+                    "method": method,
+                },
+                retcols=(
+                    "session_id",
+                    "clientdict",
+                    "uri",
+                    "method",
+                    "description",
+                    "creation_time",
+                ),
+                desc="get_ui_auth_session_for_clientdict",
+            ),
+        )
+        if not rows:
+            return None
+
+        session_id, stored_clientdict, stored_uri, stored_method, description, _ = max(
+            rows, key=lambda row: row[5]
+        )
+        return UIAuthSessionData(
+            session_id,
+            clientdict=db_to_json(stored_clientdict),
+            uri=stored_uri,
+            method=stored_method,
+            description=description,
+        )
+
     async def mark_ui_auth_stage_complete(
         self,
         session_id: str,
