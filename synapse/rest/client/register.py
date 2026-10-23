@@ -579,14 +579,6 @@ class RegisterRestServlet(RestServlet):
             logger.warning("Ignoring initial_device_display_name without password")
             del body["initial_device_display_name"]
 
-        # Once a client starts a UIA flow, it must continue that flow using the
-        # session ID returned by the server. Otherwise an auth payload sent
-        # without a session would silently start a fresh flow and could complete
-        # the registration without the original session.
-        auth = body.get("auth")
-        if isinstance(auth, dict) and auth and not auth.get("session"):
-            raise SynapseError(401, "Missing UIA session", Codes.UNAUTHORIZED)
-
         session_id = self.auth_handler.get_session_id(body)
         registered_user_id = None
         password_hash = None
