@@ -138,14 +138,22 @@ jobs:
         continue-on-error: true
         # A failed Complement package can contain minutes of captured homeserver
         # logs. Keep status events for every test, but only send output belonging
-        # to failed tests to gotestfmt; the complete JSONL is uploaded below.
+        # to failed tests (or failed packages) to gotestfmt; the complete JSONL
+        # is uploaded below.
         run: |
           jq -Rsc '
             split("\n")
             | map(fromjson? // empty) as $events
             | [$events[] | select(.Action == "fail" and .Test != null) | .Test] as $failed_tests
+            | [$events[] | select(.Action == "fail" and .Test == null) | .Package] as $failed_packages
             | $events[]
-            | select(.Action != "output" or (.Test as $test | $failed_tests | index($test) != null))
+            | select(
+                .Action != "output"
+                or (if .Test != null
+                    then (.Test as $test | $failed_tests | index($test) != null)
+                    else (.Package as $pkg | $failed_packages | index($pkg) != null)
+                    end)
+              )
           ' synapse/tests/complement/main/logs.jsonl | gotestfmt -hide "successful-downloads,successful-tests,empty-packages"
 
       - name: Run in-repo Complement Tests
@@ -184,8 +192,15 @@ jobs:
             split("\n")
             | map(fromjson? // empty) as $events
             | [$events[] | select(.Action == "fail" and .Test != null) | .Test] as $failed_tests
+            | [$events[] | select(.Action == "fail" and .Test == null) | .Package] as $failed_packages
             | $events[]
-            | select(.Action != "output" or (.Test as $test | $failed_tests | index($test) != null))
+            | select(
+                .Action != "output"
+                or (if .Test != null
+                    then (.Test as $test | $failed_tests | index($test) != null)
+                    else (.Package as $pkg | $failed_packages | index($pkg) != null)
+                    end)
+              )
           ' synapse/tests/complement/in-repo/logs.jsonl | gotestfmt -hide "successful-downloads,successful-tests,empty-packages"
 
       - name: Print PostgreSQL statistics
