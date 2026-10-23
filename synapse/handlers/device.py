@@ -854,9 +854,7 @@ class DeviceHandler:
             if not self.hs.is_mine_id(left_user_id)
         }
         if remote_left_users:
-            await self.store.mark_remote_users_device_caches_as_stale(
-                remote_left_users
-            )
+            await self.store.mark_remote_users_device_caches_as_stale(remote_left_users)
 
         return DeviceListUpdates(
             changed={

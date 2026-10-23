@@ -2639,6 +2639,23 @@ class FederationHandler:
             if not self.is_mine_id(user_id)
         }
 
+        # Stop tracking the remote users that we learned about while the room
+        # was partial. This both evicts their cached devices and ensures the
+        # next /keys/query refetches them. Do this *before* leaving: clients
+        # see the leave in /sync as soon as it is persisted, and a key query
+        # right after must not be answered from a cache we are about to drop.
+        #
+        # Don't use `handle_potentially_left_users` here: the abandoned room's
+        # current state can still show the local user as joined even though
+        # they have left, which would make it think we still share the room.
+        remote_user_rooms = await self.store.get_rooms_for_users(remote_users)
+        for user_id in remote_users:
+            other_rooms = remote_user_rooms.get(user_id, frozenset()) - {room_id}
+            if other_rooms:
+                await self.store.mark_remote_users_device_caches_as_stale((user_id,))
+            else:
+                await self.store.mark_remote_user_device_list_as_unsubscribed(user_id)
+
         member_handler = self.hs.get_room_member_handler()
         for user_id in local_users:
             try:
@@ -2655,23 +2672,6 @@ class FederationHandler:
                     room_id,
                     user_id,
                 )
-
-        # Now that we no longer share the room, stop tracking the remote users
-        # that we learned about while it was partial. This both evicts their
-        # cached devices and ensures the next /keys/query refetches them.
-        #
-        # Don't use `handle_potentially_left_users` here: the abandoned room's
-        # current state can still show the local user as joined even though
-        # they have left, which would make it think we still share the room.
-        remote_user_rooms = await self.store.get_rooms_for_users(remote_users)
-        for user_id in remote_users:
-            other_rooms = remote_user_rooms.get(user_id, frozenset()) - {room_id}
-            if other_rooms:
-                await self.store.mark_remote_users_device_caches_as_stale(
-                    (user_id,)
-                )
-            else:
-                await self.store.mark_remote_user_device_list_as_unsubscribed(user_id)
 
     async def _handle_membership_changes_after_partial_state_resync(
         self, room_id: str, changed_users: StrCollection
