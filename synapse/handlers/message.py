@@ -1244,7 +1244,34 @@ class EventCreationHandler:
 
         # we know it was persisted, so must have a stream ordering
         assert ev.internal_metadata.stream_ordering
+
+        if ev.type == EventTypes.Tombstone and ev.is_state() and ev.state_key == "":
+            await self._transfer_state_for_manual_upgrade(ev)
+
         return ev, ev.internal_metadata.stream_ordering
+
+    async def _transfer_state_for_manual_upgrade(self, tombstone: EventBase) -> None:
+        """A client can upgrade a room by hand: create a new room naming the old one as
+        its predecessor, then send a tombstone into the old room. `upgrade_room` isn't
+        involved, so copy the users' push rules/tags and the room directory state here
+        once both halves are in place.
+        """
+        new_room_id = tombstone.content.get(EventContentFields.TOMBSTONE_SUCCESSOR_ROOM)
+        if not isinstance(new_room_id, str):
+            return
+
+        try:
+            predecessor = await self.store.get_room_predecessor(new_room_id)
+        except NotFoundError:
+            return
+
+        # The new room must claim this room as its predecessor.
+        if not predecessor or predecessor.get("room_id") != tombstone.room_id:
+            return
+
+        await self.hs.get_room_member_handler().transfer_room_state_on_room_upgrade(
+            tombstone.room_id, new_room_id
+        )
 
     @measure_func("create_new_client_event")
     async def create_new_client_event(
