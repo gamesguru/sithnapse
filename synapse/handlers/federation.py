@@ -2649,6 +2649,15 @@ class FederationHandler:
         # current state can still show the local user as joined even though
         # they have left, which would make it think we still share the room.
         remote_user_rooms = await self.store.get_rooms_for_users(remote_users)
+        logger.info(
+            "Abandoning partial-state room %s: local users %s, remote users %s",
+            room_id,
+            sorted(local_users),
+            {
+                user_id: sorted(remote_user_rooms.get(user_id, frozenset()))
+                for user_id in remote_users
+            },
+        )
         for user_id in remote_users:
             other_rooms = remote_user_rooms.get(user_id, frozenset()) - {room_id}
             if other_rooms:
@@ -2659,12 +2668,22 @@ class FederationHandler:
         member_handler = self.hs.get_room_member_handler()
         for user_id in local_users:
             try:
-                await member_handler.update_membership(
+                event_id, stream_ordering = await member_handler.update_membership(
                     requester=create_requester(user_id),
                     target=UserID.from_string(user_id),
                     room_id=room_id,
                     action=Membership.LEAVE,
                     ratelimit=False,
+                )
+                # A partial-state room's current state may not be recalculated
+                # after this leave, so update the local membership snapshot
+                # directly; otherwise we can still look like we share the room.
+                await self.store.set_local_current_membership(
+                    room_id,
+                    user_id,
+                    event_id,
+                    Membership.LEAVE,
+                    stream_ordering,
                 )
             except Exception:
                 logger.exception(

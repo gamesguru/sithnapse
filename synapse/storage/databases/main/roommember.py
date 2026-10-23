@@ -665,6 +665,39 @@ class RoomMemberWorkerStore(EventsWorkerStore, CacheInvalidationWorkerStore):
         )
         return is_server_notices_room
 
+    async def set_local_current_membership(
+        self,
+        room_id: str,
+        user_id: str,
+        event_id: str,
+        membership: str,
+        event_stream_ordering: int,
+    ) -> None:
+        """Record a local user's current membership without waiting for the
+        room's current state to be updated.
+
+        This is used when leaving a partial-state room: the leave event is
+        persisted, but the room's current state (and therefore the normal
+        `local_current_membership` update) may not have been recalculated yet.
+        """
+
+        def _set_local_current_membership_txn(txn: LoggingTransaction) -> None:
+            self.db_pool.simple_upsert_txn(
+                txn,
+                table="local_current_membership",
+                keyvalues={"room_id": room_id, "user_id": user_id},
+                values={
+                    "event_id": event_id,
+                    "membership": membership,
+                    "event_stream_ordering": event_stream_ordering,
+                },
+            )
+
+        await self.db_pool.runInteraction(
+            "set_local_current_membership",
+            _set_local_current_membership_txn,
+        )
+
     async def get_local_current_membership_for_user_in_room(
         self, user_id: str, room_id: str
     ) -> tuple[str | None, str | None]:
