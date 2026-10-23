@@ -1014,7 +1014,17 @@ def _print_mtxdb_engine_stats(timings_dir: str) -> None:
                     for i, count in enumerate(lat.get("buckets", [])):
                         into["buckets"][i] += count
             acc = totals[pool]
-            for key in ("get_calls", "get_misses", "cache_hits", "cache_misses"):
+            for key in (
+                "get_calls",
+                "get_misses",
+                "cache_hits",
+                "cache_misses",
+                "put_many_fast_path_calls",
+                "put_many_clone_path_calls",
+                "index_clone_time_us",
+                "index_grow_count",
+                "index_rebuild_count",
+            ):
                 acc[key] += ps.get(key, 0) or 0
             for key, value in (ps.get("sync_totals") or {}).items():
                 if isinstance(value, (int, float)):
@@ -1045,6 +1055,19 @@ def _print_mtxdb_engine_stats(timings_dir: str) -> None:
             f" | cache: {pool_totals['cache_hits']:,.0f} hits, {pool_totals['cache_misses']:,.0f} misses",
             file=err,
         )
+        # Write-path tail suspects: the first put_many after an open copies a
+        # memory-mapped index, a full index grows, and a failed grow rebuilds.
+        if pool_totals.get("put_many_fast_path_calls") or pool_totals.get(
+            "put_many_clone_path_calls"
+        ):
+            print(
+                f"    put_many path: fast={pool_totals['put_many_fast_path_calls']:,.0f}"
+                f" clone={pool_totals['put_many_clone_path_calls']:,.0f}"
+                f" index_clone={fmt(pool_totals['index_clone_time_us'])}"
+                f" | index grows={pool_totals['index_grow_count']:,.0f}"
+                f" rebuilds={pool_totals['index_rebuild_count']:,.0f}",
+                file=err,
+            )
         # The pools share one journal, so a physical commit is counted once, by
         # whichever call performed it; the rest found their target already
         # committed ("coalesced"). Real commits = calls that reached the journal
