@@ -399,11 +399,15 @@ main() {
   # (The prefix is stripped off before reaching the container.)
   export COMPLEMENT_SHARE_ENV_PREFIX=PASS_
 
-  # Identify Synapse to Complement's runtime skip registry by default. Set
-  # COMPLEMENT_NO_BLACKLIST=1 to run a diagnostic pass without that registry.
+  # Identify this server to Complement's runtime skip registry. Sithnapse is
+  # the default for this repository; override it when testing another server.
+  # COMPLEMENT_NO_BLACKLIST=1 keeps the diagnostic behavior of an unknown
+  # runtime, while a specific identity can be selected with
+  # COMPLEMENT_RUNTIME_HOMESERVER.
   test_tags=""
-  if [ -z "${COMPLEMENT_NO_BLACKLIST:-}" ]; then
-    test_tags="synapse_blacklist"
+  complement_runtime_homeserver="${COMPLEMENT_RUNTIME_HOMESERVER:-sithnapse}"
+  if [ -n "${COMPLEMENT_NO_BLACKLIST:-}" ]; then
+    complement_runtime_homeserver=""
   fi
 
   # It takes longer than 10m to run the whole suite.
@@ -1119,6 +1123,7 @@ run_one_pattern() {
 
   local -a flags=(
     -tags "$test_tags"
+    -ldflags "-X github.com/matrix-org/complement/runtime.Homeserver=${complement_runtime_homeserver}"
     -v
     -count=1
     -timeout "$test_timeout"
