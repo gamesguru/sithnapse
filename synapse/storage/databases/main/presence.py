@@ -307,9 +307,11 @@ class PresenceStore(PresenceBackgroundUpdateStore, CacheInvalidationWorkerStore)
         ) -> set[str]:
             server_clauses = ["user_id LIKE ?" for _ in server_names]
             args: list[str] = [f"%:{server_name}" for server_name in server_names]
-            sql = "SELECT user_id FROM presence_stream WHERE (" + " OR ".join(
-                server_clauses
-            ) + ")"
+            sql = (
+                "SELECT user_id FROM presence_stream WHERE ("
+                + " OR ".join(server_clauses)
+                + ")"
+            )
             if not include_offline:
                 sql += " AND state != ?"
                 args.append(PresenceState.OFFLINE)
