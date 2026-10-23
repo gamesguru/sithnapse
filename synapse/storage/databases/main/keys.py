@@ -42,6 +42,12 @@ logger = logging.getLogger(__name__)
 
 db_binary_type = memoryview
 
+# MSC4499: keep a bounded number of retired keys per server. Corroborated keys
+# (ones we previously saw active) have a later `ts_valid_until_ms` than keys
+# that were first learned as retired, so evicting the earliest-expiring retired
+# keys retains the corroborated tier first.
+MAX_RETIRED_SERVER_KEYS = 3000
+
 
 class KeyStore(CacheInvalidationWorkerStore):
     """Persistence for signature verification keys"""
@@ -240,6 +246,55 @@ class KeyStore(CacheInvalidationWorkerStore):
                     txn,
                     self.get_server_key_json_for_remote,
                     [(server_name, key_id) for key_id in keys_to_persist],
+                )
+
+            # MSC4499: bound the number of retired keys retained for a server.
+            # `ts_valid_until_ms` is only ever extended for a binding, so a key
+            # we saw active before retirement keeps a later validity timestamp
+            # than keys first observed as already-retired. Evicting the
+            # earliest expiring retired keys therefore drops uncorroborated
+            # bindings before corroborated ones.
+            txn.execute(
+                """
+                SELECT key_id FROM server_signature_keys
+                WHERE server_name = ?
+                    AND (ts_valid_until_ms IS NULL OR ts_valid_until_ms <= ?)
+                ORDER BY ts_valid_until_ms ASC NULLS FIRST
+                """,
+                (server_name, ts_added_ms),
+            )
+            retired_key_ids = [row[0] for row in txn]
+            excess = len(retired_key_ids) - MAX_RETIRED_SERVER_KEYS
+            if excess > 0:
+                evicted_key_ids = retired_key_ids[:excess]
+                placeholders = ", ".join("?" for _ in evicted_key_ids)
+                txn.execute(
+                    f"DELETE FROM server_signature_keys WHERE server_name = ? "
+                    f"AND key_id IN ({placeholders})",
+                    (server_name, *evicted_key_ids),
+                )
+                txn.execute(
+                    f"DELETE FROM server_keys_json WHERE server_name = ? "
+                    f"AND key_id IN ({placeholders})",
+                    (server_name, *evicted_key_ids),
+                )
+                for key_id in evicted_key_ids:
+                    txn.call_after(
+                        self._get_server_keys_json.invalidate,
+                        ((server_name, key_id),),
+                    )
+                self._send_invalidation_to_replication_bulk(
+                    txn,
+                    self._get_server_keys_json.__name__,
+                    [
+                        (json.dumps([server_name, key_id]),)
+                        for key_id in evicted_key_ids
+                    ],
+                )
+                self._invalidate_cache_and_stream_bulk(
+                    txn,
+                    self.get_server_key_json_for_remote,
+                    [(server_name, key_id) for key_id in evicted_key_ids],
                 )
 
             return final_keys
