@@ -2636,23 +2636,32 @@ class FederationHandler:
         # We may have cached remote device lists using the incomplete room
         # membership. If resync fails and we abandon the room, force subsequent
         # key queries to refetch those lists instead of serving that cache.
-        remote_users = {
-            user_id
-            for user_id in await self.store.get_users_in_room(room_id)
-            if not self.is_mine_id(user_id)
-        }
+        remote_users = await self.store.get_cached_remote_users_with_membership_in_room(
+            room_id
+        )
         if remote_users:
             await self.store.mark_remote_users_device_caches_as_stale(remote_users)
 
         member_handler = self.hs.get_room_member_handler()
         for user_id in local_users:
             try:
-                await member_handler.update_membership(
+                event_id, stream_ordering = await member_handler.update_membership(
                     requester=create_requester(user_id),
                     target=UserID.from_string(user_id),
                     room_id=room_id,
                     action=Membership.LEAVE,
                     ratelimit=False,
+                )
+                # A partial-state room's current state may not be recalculated
+                # after this leave, so update the local membership snapshot
+                # directly; otherwise we still look like we share the room and
+                # serve stale device lists for its remote members.
+                await self.store.set_local_current_membership(
+                    room_id,
+                    user_id,
+                    event_id,
+                    Membership.LEAVE,
+                    stream_ordering,
                 )
             except Exception:
                 logger.exception(
