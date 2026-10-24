@@ -2633,15 +2633,6 @@ class FederationHandler:
         if not local_users:
             return
 
-        # We may have cached remote device lists using the incomplete room
-        # membership. If resync fails and we abandon the room, force subsequent
-        # key queries to refetch those lists instead of serving that cache.
-        remote_users = await self.store.get_cached_remote_users_with_membership_in_room(
-            room_id
-        )
-        if remote_users:
-            await self.store.mark_remote_users_device_caches_as_stale(remote_users)
-
         member_handler = self.hs.get_room_member_handler()
         for user_id in local_users:
             try:
