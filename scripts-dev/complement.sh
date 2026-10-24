@@ -422,6 +422,10 @@ main() {
     # Use workers.
     export PASS_SYNAPSE_COMPLEMENT_USE_WORKERS=true
 
+    # Pass through the selected worker topology. If unset, the container
+    # defaults to the full production-like split.
+    export PASS_SYNAPSE_COMPLEMENT_WORKER_PROFILE="$SYNAPSE_COMPLEMENT_WORKER_PROFILE"
+
     # Pass through the workers defined. If none, it will be an empty string
     export PASS_SYNAPSE_WORKER_TYPES="$WORKER_TYPES"
 

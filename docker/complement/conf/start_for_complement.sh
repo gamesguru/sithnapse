@@ -70,6 +70,14 @@ if [[ -n "$SYNAPSE_COMPLEMENT_USE_WORKERS" ]]; then
   # -n True if the length of string is non-zero.
   # -z True if the length of string is zero.
   if [[ -z "$SYNAPSE_WORKER_TYPES" ]]; then
+    # `full` exercises the production-like process split, including sharded
+    # event persisters and device-list workers. `reduced` folds the smaller
+    # roles into one another and keeps one instance of each sharded worker; it
+    # is used for the PR/push lanes to cut process contention on 4-vCPU CI
+    # runners, while the nightly full-topology lane keeps the full split under
+    # test.
+    worker_profile="${SYNAPSE_COMPLEMENT_WORKER_PROFILE:-full}"
+
     # Under mtxdb, event persistence must stay on the main process, so no
     # dedicated event_persister workers are spawned at all. workers.py's
     # embedded_db_engine validation requires BOTH that there is exactly
@@ -87,25 +95,68 @@ if [[ -n "$SYNAPSE_COMPLEMENT_USE_WORKERS" ]]; then
     # background-updates poll loop runs unconditionally, and mtxdb writes
     # have no cross-instance coordination to survive a second concurrent
     # loop). Without it, the setting defaults back to main.
-    event_persister_entry="event_persister:2, "
-    background_worker_entry="background_worker, "
     if [[ -n "$SYNAPSE_EMBEDDED_DB_ENGINE" ]]; then
-      event_persister_entry=""
-      background_worker_entry=""
+      case "$worker_profile" in
+        full)
+          export SYNAPSE_WORKER_TYPES="\
+            event_creator, \
+            client_reader=client_reader+user_dir, \
+            media_repository, \
+            federation_receiver=federation_reader+federation_inbound, \
+            federation_sender, \
+            synchrotron, \
+            notifiers=pusher+appservice, \
+            device_lists:2, \
+            stream_writers=account_data+presence+receipts+to_device+typing"
+          ;;
+        reduced)
+          export SYNAPSE_WORKER_TYPES="\
+            event_creator=event_creator+client_reader+user_dir, \
+            media_repository=media_repository+pusher+appservice, \
+            federation_receiver=federation_reader+federation_inbound, \
+            federation_sender, \
+            synchrotron, \
+            device_lists, \
+            stream_writers=account_data+presence+receipts+to_device+typing"
+          ;;
+        *)
+          echo "Unknown SYNAPSE_COMPLEMENT_WORKER_PROFILE: $worker_profile" >&2
+          exit 1
+          ;;
+      esac
+    else
+      case "$worker_profile" in
+        full)
+          export SYNAPSE_WORKER_TYPES="\
+            event_persister:2, \
+            background_worker, \
+            event_creator, \
+            client_reader=client_reader+user_dir, \
+            media_repository, \
+            federation_receiver=federation_reader+federation_inbound, \
+            federation_sender, \
+            synchrotron, \
+            notifiers=pusher+appservice, \
+            device_lists:2, \
+            stream_writers=account_data+presence+receipts+to_device+typing"
+          ;;
+        reduced)
+          export SYNAPSE_WORKER_TYPES="\
+            event_persister, \
+            background_worker=background_worker+federation_sender, \
+            event_creator=event_creator+client_reader+user_dir, \
+            media_repository=media_repository+pusher+appservice, \
+            federation_receiver=federation_reader+federation_inbound, \
+            synchrotron, \
+            device_lists, \
+            stream_writers=account_data+presence+receipts+to_device+typing"
+          ;;
+        *)
+          echo "Unknown SYNAPSE_COMPLEMENT_WORKER_PROFILE: $worker_profile" >&2
+          exit 1
+          ;;
+      esac
     fi
-    export SYNAPSE_WORKER_TYPES="\
-      ${event_persister_entry}\
-      ${background_worker_entry}\
-      event_creator, \
-      client_reader=client_reader+user_dir, \
-      media_repository, \
-      federation_receiver=federation_reader+federation_inbound, \
-      federation_sender, \
-      synchrotron, \
-      notifiers=pusher+appservice, \
-      device_lists:2, \
-      stream_writers=account_data+presence+receipts+to_device+typing"
-
   fi
   log "Workers requested: $SYNAPSE_WORKER_TYPES"
   # adjust connection pool limits on worker mode as otherwise running lots of worker synapses

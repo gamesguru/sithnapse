@@ -75,6 +75,7 @@ jobs:
               - '.github/workflows/tests.yml'
               - 'scripts-dev/complement.sh'
               - '.github/workflows/complement_tests.yml'
+              - '.github/workflows/complement_workers_full.yml'
               - 'complement/**'
 
             linting:

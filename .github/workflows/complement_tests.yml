@@ -10,6 +10,16 @@ on:
       use_twisted_trunk:
         type: boolean
         default: false
+      worker_profile:
+        description: >
+          Worker process topology for the workers lanes. Use `reduced` on
+          PR/push runs and `full` for the nightly full-topology lane.
+        type: string
+        default: reduced
+      only_workers:
+        description: Only run the workers matrix rows.
+        type: boolean
+        default: false
 
 # Control the permissions granted to `GITHUB_TOKEN`.
 permissions:
@@ -25,6 +35,7 @@ env:
 
 jobs:
   complement:
+    if: ${{ !inputs.only_workers || matrix.arrangement == 'workers' }}
     runs-on: ubuntu-latest
     env:
       # Complement invokes this on the host before stopping each PostgreSQL
@@ -119,6 +130,7 @@ jobs:
         env:
           POSTGRES: ${{ (startsWith(matrix.database, 'Postgres')) && 1 || '' }}
           WORKERS: ${{ (matrix.arrangement == 'workers') && 1 || '' }}
+          SYNAPSE_COMPLEMENT_WORKER_PROFILE: ${{ inputs.worker_profile }}
           # complement.sh only honours the TEST_-scoped names (and blanks the
           # bare ones to keep a developer's production env out of containers),
           # so the engine/path MUST use the SYNAPSE_TEST_ prefix or the
@@ -170,6 +182,7 @@ jobs:
         env:
           POSTGRES: ${{ (startsWith(matrix.database, 'Postgres')) && 1 || '' }}
           WORKERS: ${{ (matrix.arrangement == 'workers') && 1 || '' }}
+          SYNAPSE_COMPLEMENT_WORKER_PROFILE: ${{ inputs.worker_profile }}
           # complement.sh only honours the TEST_-scoped names (and blanks the
           # bare ones to keep a developer's production env out of containers),
           # so the engine/path MUST use the SYNAPSE_TEST_ prefix or the
