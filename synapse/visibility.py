@@ -238,13 +238,6 @@ async def filter_and_transform_events_for_client(
                 )
                 return None
 
-            logger.error(
-                "Missing state for non-outlier event %s (%s, %s) in room %s",
-                event.event_id,
-                event.type,
-                event.state_key,
-                event.room_id,
-            )
             raise Exception(
                 "Missing state for event that is not user's own membership: "
                 f"{event.event_id} ({event.type}, {event.state_key}) in {event.room_id}"
