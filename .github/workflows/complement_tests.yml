@@ -122,6 +122,23 @@ jobs:
           uv lock
         working-directory: synapse
 
+      # Sample host load and per-container CPU for the whole run, so startup
+      # cost can be told apart from steady-state worker overhead. Paired with
+      # Complement's "deploy-timing" log line (startup-to-ready per homeserver).
+      - name: Start resource sampler
+        run: |
+          mkdir -p /tmp/complement-resources
+          nohup bash -c '
+            while true; do
+              ts=$(date +%s)
+              echo "$ts $(cut -d" " -f1-3 /proc/loadavg)" >> /tmp/complement-resources/loadavg.txt
+              docker stats --no-stream --format "$ts\t{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}" \
+                >> /tmp/complement-resources/docker_stats.tsv 2>/dev/null
+              sleep 5
+            done
+          ' > /dev/null 2>&1 &
+          echo $! > /tmp/complement-resources/sampler.pid
+
       - name: Run Complement Tests
         id: run_complement_tests
         run: |
@@ -216,6 +233,29 @@ jobs:
               )
           ' synapse/tests/complement/in-repo/logs.jsonl | gotestfmt -hide "successful-downloads,successful-tests,empty-packages"
 
+      - name: Summarise startup and CPU usage
+        if: always() && steps.run_complement_tests.outcome != 'skipped'
+        continue-on-error: true
+        run: |
+          kill "$(cat /tmp/complement-resources/sampler.pid)" 2>/dev/null || true
+          jq -r 'select(.Action == "output") | .Output' synapse/tests/complement/main/logs.jsonl \
+            | grep -o 'ready_after=[0-9.]*' | cut -d= -f2 | sort -n \
+            > /tmp/complement-resources/ready_after.txt || true
+          echo "Homeserver startup-to-ready (seconds):"
+          awk '{a[NR]=$1; s+=$1} END {
+            if (NR == 0) { print "  no deploy-timing lines (Complement checkout lacks them?)"; exit }
+            printf "  n=%d total=%.0f mean=%.2f p50=%.2f p90=%.2f max=%.2f\n",
+              NR, s, s/NR, a[int(NR*0.5)+1], a[int(NR*0.9)+1], a[NR] }' \
+            /tmp/complement-resources/ready_after.txt
+          echo "Host load average (1m) over the run:"
+          awk '{s+=$2; if ($2>m) m=$2} END { if (NR) printf "  samples=%d mean=%.2f max=%.2f\n", NR, s/NR, m }' \
+            /tmp/complement-resources/loadavg.txt
+          echo "Summed container CPU% per sample (400% = all 4 vCPUs):"
+          awk -F'\t' '{gsub("%","",$3); t[$1]+=$3} END {
+            for (k in t) { n++; s+=t[k]; if (t[k]>m) m=t[k] }
+            if (n) printf "  samples=%d mean=%.0f%% max=%.0f%%\n", n, s/n, m }' \
+            /tmp/complement-resources/docker_stats.tsv
+
       - name: Print PostgreSQL statistics
         if: ${{ always() && startsWith(matrix.database, 'Postgres') }}
         run: |
@@ -262,4 +302,12 @@ jobs:
             synapse/tests/complement/in-repo/logs.jsonl
             synapse/tests/complement/in-repo/results.jsonl
             synapse/.tmp/complement/*.jsonl
+          if-no-files-found: warn
+
+      - name: Upload resource samples
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ always() }}
+        with:
+          name: Complement resources - (${{ matrix.arrangement }}, ${{ matrix.database }})
+          path: /tmp/complement-resources
           if-no-files-found: warn
