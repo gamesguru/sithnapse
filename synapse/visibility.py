@@ -225,11 +225,19 @@ async def filter_and_transform_events_for_client(
         elif state_after_event is not None:
             user_membership_event = state_after_event.get((EventTypes.Member, user_id))
         else:
-            # unreachable!
-            raise Exception(
-                "Missing state for event that is not user's own membership: "
-                f"{event.event_id} ({event.type}, {event.state_key}) in {event.room_id}"
+            # This can happen if a worker observes a timeline event before the
+            # event-to-state-group mapping has reached it. Fail closed: an event
+            # whose visibility cannot be checked must not be sent to the client,
+            # and should not turn the entire /sync request into a 500.
+            logger.warning(
+                "Cannot determine visibility for event %s (%s, %s) in room %s: "
+                "no state at the event",
+                event.event_id,
+                event.type,
+                event.state_key,
+                event.room_id,
             )
+            return None
 
         user_membership = (
             user_membership_event.membership
