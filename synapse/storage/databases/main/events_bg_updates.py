@@ -147,6 +147,11 @@ class EventsBackgroundUpdatesStore(
         db_conn: LoggingDatabaseConnection,
         hs: "HomeServer",
     ):
+        """Register event background updates and resolve stale Sliding Sync data.
+
+        Register mtxdb migration handlers when configured; their registration
+        does not enqueue the event-to-state-group or auth-chain-link migrations.
+        """
         super().__init__(database, db_conn, hs)
 
         self.db_pool.updates.register_background_update_handler(
@@ -249,21 +254,11 @@ class EventsBackgroundUpdatesStore(
                 self.EMBEDDED_EVENT_TO_STATE_GROUP_MIGRATION_UPDATE_NAME,
                 self._background_migrate_event_to_state_groups_to_embedded,
             )
-            if hs.config.worker.run_background_tasks:
-                hs.run_as_background_process(
-                    "enqueue_event_to_state_group_embedded_migration",
-                    self._enqueue_event_to_state_group_embedded_migration_if_needed,
-                )
 
             self.db_pool.updates.register_background_update_handler(
                 self.EMBEDDED_EVENT_AUTH_CHAIN_LINKS_MIGRATION_UPDATE_NAME,
                 self._background_migrate_event_auth_chain_links_to_embedded,
             )
-            if hs.config.worker.run_background_tasks:
-                hs.run_as_background_process(
-                    "enqueue_event_auth_chain_links_embedded_migration",
-                    self._enqueue_event_auth_chain_links_embedded_migration_if_needed,
-                )
 
         ################################################################################
 

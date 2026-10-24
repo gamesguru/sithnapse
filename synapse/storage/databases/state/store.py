@@ -103,6 +103,16 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         hs: "HomeServer",
         state_deletion_store: "StateDeletionDataStore",
     ):
+        """Initialize state caches, ID allocation, and configured embedded storage.
+
+        Open mtxdb writable on the events writer and read-only elsewhere.
+        On the writer, arrange flushing, deletion cleanup, and shutdown hooks.
+        Register the HAMT migration handler without enqueueing the migration.
+
+        Raises:
+            RuntimeError: If an enabled embedded engine is unsupported or fails
+                to open.
+        """
         super().__init__(database, db_conn, hs)
         self._state_deletion_store = state_deletion_store
         self.server_name = hs.hostname
@@ -299,11 +309,6 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 self.EMBEDDED_DB_MIGRATION_UPDATE_NAME,
                 self._background_migrate_state_hamt_to_embedded,
             )
-            if self._embedded_db_is_writer:
-                hs.run_as_background_process(
-                    "enqueue_state_hamt_embedded_migration",
-                    self._enqueue_embedded_db_migration_if_needed,
-                )
 
     def _assert_embedded_db_writer(self) -> None:
         """Raise before attempting an mtxdb write on an instance that
@@ -1440,6 +1445,15 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         room_prefix: bytes,
         nodes: list[tuple[bytes, bytes]],
     ) -> None:
+        """Store ``(structural_hash, node_bytes)`` pairs for a room's HAMT.
+
+        With mtxdb configured, write only to the namespaced ``room_prefix``
+        collection, without syncing. Otherwise, insert into SQL using ``txn``,
+        leaving existing hashes unchanged. Storage errors propagate.
+
+        Raises:
+            RuntimeError: If an mtxdb write is attempted on a read-only instance.
+        """
         # Exclusive by configured engine -- not a dual-write. Written under
         # the namespaced, room-prefixed key (`database::core::node_key`) the
         # embedded engine's materialize/lookup BFS walk actually looks up --
@@ -1449,8 +1463,10 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             self._assert_embedded_db_writer()
             engine = get_embedded_engine(self._embedded_db_engine)
             _et = time.monotonic()
+            _ct = time.thread_time()
             engine.put_state_hamt_nodes(self._embedded_db_namespace, room_prefix, nodes)
             ffi_timing("ffi_put_hamt_nodes", time.monotonic() - _et)
+            ffi_timing("ffi_put_hamt_nodes:cpu", time.thread_time() - _ct)
             _state_timing("state_write_nodes_embedded", time.monotonic() - _et)
             _state_counter("state_write_nodes_embedded_batches")
             _state_counter("state_write_nodes_embedded_records", len(nodes))
@@ -1669,15 +1685,18 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                     pending_room_roots.append((state_group, root_value))
                     return
                 _et = time.monotonic()
+                _ct = time.thread_time()
                 inner_ns = engine.put_room_index(
                     self._embedded_db_namespace, [(state_group, room_prefix)]
                 )
                 ffi_timing("ffi_put_room_index", time.monotonic() - _et)
+                ffi_timing("ffi_put_room_index:cpu", time.thread_time() - _ct)
                 # Time inside the GIL-released write; the gap to the span
                 # above is argument conversion plus GIL re-acquisition.
                 if isinstance(inner_ns, int):
                     ffi_timing("ffi_put_room_index_inner", inner_ns / 1e9)
                 _et = time.monotonic()
+                _ct = time.thread_time()
                 engine.put_state_hamt_roots(
                     self._embedded_db_namespace,
                     room_prefix,
@@ -1685,6 +1704,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 )
                 elapsed = time.monotonic() - _et
                 ffi_timing("ffi_put_state_hamt_roots", elapsed)
+                ffi_timing("ffi_put_state_hamt_roots:cpu", time.thread_time() - _ct)
                 _state_counter("state_write_roots_embedded")
                 from synapse.storage.databases.state.bg_updates import (
                     _record_root_write_stats,
@@ -1914,6 +1934,8 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         """Generate and store state groups for a batch of events.
 
         Note that all the events must be in a linear chain (ie a <- b <- c).
+        The batch must be nonempty and belong to the supplied room. Contexts
+        are updated in place with their state groups and state-event deltas.
 
         Args:
             events_and_context: the events to generate and store a state groups for
@@ -1921,6 +1943,15 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             room_id: the id of the room the events were created for
             prev_group: the state group of the last event persisted before the batched events
             were created
+
+        Returns:
+            The input event/context pairs with updated contexts.
+
+        Raises:
+            IndexError: If the batch is empty.
+            Exception: If prev_group is missing. Storage errors also propagate.
+            RuntimeError: If a non-writer cannot prepare an embedded mirror
+                payload because state is incomplete or exceeds the entry limit.
         """
 
         # All events in the batch are in the same room (and hence share the
@@ -1958,7 +1989,8 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             Requires that we have the state as a delta from the last persisted state group.
 
             Returns:
-                A list of state groups
+                The updated event/context pairs and HAMT writes, each containing
+                (state_group, root_hash, lattice, nodes).
             """
 
             # We need to check that the prev group isn't about to be deleted
@@ -2081,6 +2113,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
 
             if pending_room_roots and self._embedded_db_engine == "mtxdb":
                 _et = time.monotonic()
+                _ct = time.thread_time()
                 engine = get_embedded_engine(self._embedded_db_engine)
                 # Index first, so a group's room is resolvable as soon as its
                 # root is.
@@ -2089,6 +2122,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                     [(sg, room_prefix) for sg, _ in pending_room_roots],
                 )
                 ffi_timing("ffi_put_room_index", time.monotonic() - _et)
+                ffi_timing("ffi_put_room_index:cpu", time.thread_time() - _ct)
                 if isinstance(inner_ns, int):
                     ffi_timing("ffi_put_room_index_inner", inner_ns / 1e9)
                 _et = time.monotonic()

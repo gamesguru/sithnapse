@@ -226,7 +226,10 @@ async def filter_and_transform_events_for_client(
             user_membership_event = state_after_event.get((EventTypes.Member, user_id))
         else:
             # unreachable!
-            raise Exception("Missing state for event that is not user's own membership")
+            raise Exception(
+                "Missing state for event that is not user's own membership: "
+                f"{event.event_id} ({event.type}, {event.state_key}) in {event.room_id}"
+            )
 
         user_membership = (
             user_membership_event.membership

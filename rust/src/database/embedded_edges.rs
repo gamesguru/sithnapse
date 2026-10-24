@@ -464,7 +464,7 @@ fn decode_identity(bytes: &[u8], offset: &mut usize) -> PyResult<String> {
 
 // --- Backward record ------------------------------------------------------
 //
-// Format version 2 (no legacy decoder: nothing is deployed yet).
+// Format version 1 (unreleased: no legacy decoder, nothing is deployed).
 // `[format_version: u8][self_identity][edge_count: u16]{[is_state: u8][parent_identity]}*`
 //
 // Carries the record's own event id (`self_identity`) in the payload, not
@@ -472,7 +472,7 @@ fn decode_identity(bytes: &[u8], offset: &mut usize) -> PyResult<String> {
 // full scan of the backward-edge collection can rebuild forward adjacency
 // directly (self_identity is the forward key, each parent_identity a member
 // of that key's child list), with no locator lookups or joins.
-const BACKWARD_EDGES_FORMAT_VERSION: u8 = 2;
+const BACKWARD_EDGES_FORMAT_VERSION: u8 = 1;
 
 fn encode_backward_edges(self_identity: &str, edges: &[(String, bool)]) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -522,9 +522,9 @@ fn decode_backward_edges(bytes: &[u8]) -> PyResult<(String, Vec<(String, bool)>)
 
 // --- Forward record --------------------------------------------------------
 //
-// Format version 2: `[format_version: u8][child_count: u32]{[child_identity]}*`.
+// Format version 1: `[format_version: u8][child_count: u32]{[child_identity]}*`.
 // Same identity tag scheme as the backward record, for the same size win.
-const FORWARD_EDGES_FORMAT_VERSION: u8 = 2;
+const FORWARD_EDGES_FORMAT_VERSION: u8 = 1;
 
 fn encode_forward_edges(children: &[String]) -> Vec<u8> {
     let mut buf = Vec::new();

@@ -665,6 +665,39 @@ class RoomMemberWorkerStore(EventsWorkerStore, CacheInvalidationWorkerStore):
         )
         return is_server_notices_room
 
+    async def set_local_current_membership(
+        self,
+        room_id: str,
+        user_id: str,
+        event_id: str,
+        membership: str,
+        event_stream_ordering: int,
+    ) -> None:
+        """Record a local user's current membership without waiting for the
+        room's current state to be updated.
+
+        This is used when leaving a partial-state room: the leave event is
+        persisted, but the room's current state (and therefore the normal
+        `local_current_membership` update) may not have been recalculated yet.
+        """
+
+        def _set_local_current_membership_txn(txn: LoggingTransaction) -> None:
+            self.db_pool.simple_upsert_txn(
+                txn,
+                table="local_current_membership",
+                keyvalues={"room_id": room_id, "user_id": user_id},
+                values={
+                    "event_id": event_id,
+                    "membership": membership,
+                    "event_stream_ordering": event_stream_ordering,
+                },
+            )
+
+        await self.db_pool.runInteraction(
+            "set_local_current_membership",
+            _set_local_current_membership_txn,
+        )
+
     async def get_local_current_membership_for_user_in_room(
         self, user_id: str, room_id: str
     ) -> tuple[str | None, str | None]:
@@ -722,17 +755,23 @@ class RoomMemberWorkerStore(EventsWorkerStore, CacheInvalidationWorkerStore):
         if not user_ids:
             return set()
 
+        # Require that at least one local user is still joined to the room
+        # according to `local_current_membership`. `current_state_events` can
+        # still list local users as joined after they leave a partial-state
+        # room, which would otherwise make us think we still share it.
         sql = """
-            SELECT state_key FROM current_state_events
+            SELECT cse.state_key FROM current_state_events cse
+            INNER JOIN local_current_membership lcm
+                ON lcm.room_id = cse.room_id AND lcm.membership = 'join'
             WHERE
-                type = 'm.room.member'
-                AND membership = 'join'
+                cse.type = 'm.room.member'
+                AND cse.membership = 'join'
                 AND %s
-            GROUP BY state_key
+            GROUP BY cse.state_key
         """
 
         clause, args = make_in_list_sql_clause(
-            self.database_engine, "state_key", user_ids
+            self.database_engine, "cse.state_key", user_ids
         )
 
         txn.execute(sql % (clause,), args)

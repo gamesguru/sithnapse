@@ -4558,6 +4558,11 @@ pub fn publish_signal_active(py: Python<'_>) -> PyResult<Py<PyDict>> {
     Ok(out.unbind())
 }
 
+/// Return runtime-stat dictionaries keyed by state, event_dag, auth_chain, and server_info.
+///
+/// When `take_diagnostics` is true, take and reset per-interval sync diagnostics;
+/// otherwise, leave them intact. Return a Python RuntimeError if mtxdb is not open,
+/// and propagate errors from constructing the Python dictionaries.
 fn stats_impl(py: Python<'_>, take_diagnostics: bool) -> PyResult<Py<PyDict>> {
     let snapshots = py.detach(
         || -> Result<
@@ -4573,6 +4578,7 @@ fn stats_impl(py: Python<'_>, take_diagnostics: bool) -> PyResult<Py<PyDict>> {
             let state_stats = pools.state.stats();
             let event_dag_stats = pools.event_dag.stats();
             let auth_chain_stats = pools.auth_chain.stats();
+            let server_info_stats = pools.server_info.stats();
             Ok(vec![
                 (
                     "state",
@@ -4603,6 +4609,16 @@ fn stats_impl(py: Python<'_>, take_diagnostics: bool) -> PyResult<Py<PyDict>> {
                         auth_chain_stats.sync_diagnostics.clone()
                     },
                     pools.auth_chain.read_journal_publish_signal_active(),
+                ),
+                (
+                    "server_info",
+                    server_info_stats.clone(),
+                    if take_diagnostics {
+                        pools.server_info.take_sync_diagnostics()
+                    } else {
+                        server_info_stats.sync_diagnostics.clone()
+                    },
+                    pools.server_info.read_journal_publish_signal_active(),
                 ),
             ])
         },

@@ -612,6 +612,9 @@ class RegisterRestServlet(RestServlet):
                 request,
                 body,
                 "register a new account",
+                # Guest upgrades retry with their guest token and auth stage but
+                # without the UIA session ID.
+                require_existing_session=not guest_access_token,
             )
         except InteractiveAuthIncompleteError as e:
             # The user needs to provide more steps to complete auth.

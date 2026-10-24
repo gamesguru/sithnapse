@@ -98,6 +98,9 @@ class CreateFilterRestServlet(RestServlet):
             raise AuthError(403, "Can only create filters for local users")
 
         content = parse_json_object_from_request(request)
+        # Validate before clamping the timeline limit, which assumes the limit is
+        # an integer and would otherwise turn an invalid filter into a 500.
+        self.filtering.check_valid_filter(content)
         set_timeline_upper_limit(content, self.hs.config.server.filter_timeline_limit)
 
         filter_id = await self.filtering.add_user_filter(

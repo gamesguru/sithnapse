@@ -23,7 +23,7 @@ import tempfile
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import IO, Any, Callable, Protocol, cast
+from typing import IO, Any, Callable, NamedTuple, Protocol, cast
 
 import run_header
 
@@ -47,6 +47,13 @@ class _TestResult(Protocol):
     def startTest(self, test: object) -> None: ...
 
     def stopTest(self, test: object) -> None: ...
+
+
+class _SqlFingerprint(NamedTuple):
+    calls: int
+    total_s: float
+    max_s: float
+    rows: int
 
 
 def _install_test_timing_logging(
@@ -127,6 +134,13 @@ def _flush_process_timings() -> None:
 
 
 def _aggregate_and_print_timings(timings_dir: str) -> None:
+    """Aggregate worker JSON snapshots in ``timings_dir`` into a report.
+
+    Write to stderr and, if it can be opened, append to
+    SYNAPSE_PG_TIMINGS_FILE. An unreadable directory or one with no
+    process snapshots produces no report. FFI totals exclude ``:cpu``
+    spans, which measure CPU time for spans already counted in wall time.
+    """
     timings_path = os.environ.get("SYNAPSE_PG_TIMINGS_FILE")
     out_file = None
     if timings_path:
@@ -171,6 +185,38 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
     out(f"\n=== Diagnostics aggregated from {len(worker_pids)} process(es) ===")
     for line in _run_identity():
         out(line)
+
+    proc_files = [f for f in files if f.startswith("proc_") and f.endswith(".json")]
+    if proc_files:
+        proc_samples: list[tuple[float, float, str]] = []
+        for fname in proc_files:
+            try:
+                with open(os.path.join(timings_dir, fname), encoding="utf-8") as pf:
+                    proc_data = json.load(pf)
+                proc_samples.append(
+                    (
+                        float(proc_data["cpu_s"]),
+                        float(proc_data["wall_s"]),
+                        fname[len("proc_") : -len(".json")],
+                    )
+                )
+            except (OSError, ValueError, KeyError):
+                continue
+        proc_samples = [p for p in proc_samples if p[1] > 0]
+        if proc_samples:
+            total_cpu = sum(p[0] for p in proc_samples)
+            total_wall = sum(p[1] for p in proc_samples)
+            out(
+                f"  {'process cpu:':<14}{total_cpu:,.0f}s cpu over "
+                f"{total_wall:,.0f}s wall in {len(proc_samples)} process(es) "
+                f"(cpu/wall {total_cpu / total_wall:.2f}; off-cpu time is "
+                "descheduling, I/O, lock waits or idle)"
+            )
+            lowest = sorted(proc_samples, key=lambda p: p[0] / p[1])[:3]
+            out(
+                f"  {'cpu/wall low:':<14}"
+                + ", ".join(f"pid {p[2]} {p[0] / p[1]:.2f}" for p in lowest)
+            )
 
     # 1. Lifecycle timings
     lc_lifecycle_counters: dict[str, int] = defaultdict(int)
@@ -336,7 +382,12 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
         sql_scheduling_total = 0.0
         sql_scheduling_count = 0
         sql_scheduling_samples: list[float] = []
+        sql_scheduling_by_label: dict[str, list[float]] = {}
         sql_slow_statements: list[tuple[float, str, int, int]] = []
+        sql_fingerprints: dict[tuple[str, str, str], _SqlFingerprint] = {}
+        # Older runs may still emit the per-transaction `desc-hex` name; strip
+        # it here so aggregation groups by the logical description.
+        txn_suffix_re = re.compile(r"-[0-9a-f]+$")
         for fname in sql_files:
             try:
                 with open(os.path.join(timings_dir, fname), encoding="utf-8") as sql_fh:
@@ -351,6 +402,25 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                 sql_scheduling_total += scheduling.get("total", 0.0)
                 sql_scheduling_count += scheduling.get("count", 0)
                 sql_scheduling_samples.extend(scheduling.get("latencies", []))
+                for label, (label_total, label_calls) in scheduling.get(
+                    "by_label", {}
+                ).items():
+                    acc = sql_scheduling_by_label.setdefault(label, [0.0, 0])
+                    acc[0] += label_total
+                    acc[1] += label_calls
+                for fingerprint in data.get("fingerprints", []):
+                    key = (
+                        str(fingerprint.get("table", "")),
+                        txn_suffix_re.sub("", str(fingerprint.get("txn", "(unnamed)"))),
+                        str(fingerprint.get("sql", "")),
+                    )
+                    prev = sql_fingerprints.get(key, _SqlFingerprint(0, 0.0, 0.0, 0))
+                    sql_fingerprints[key] = _SqlFingerprint(
+                        prev.calls + int(fingerprint.get("calls", 0)),
+                        prev.total_s + float(fingerprint.get("total_s", 0.0)),
+                        max(prev.max_s, float(fingerprint.get("max_s", 0.0))),
+                        prev.rows + int(fingerprint.get("rows", 0)),
+                    )
                 for elapsed, text, payload, rowcount in data.get("slow_statements", []):
                     sql_slow_statements.append((elapsed, text, payload, rowcount))
             except Exception as e:
@@ -409,6 +479,33 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
             out("=====================================")
             out("")
 
+        if sql_fingerprints:
+            ranked_fingerprints = sorted(
+                sql_fingerprints.items(), key=lambda item: item[1].total_s, reverse=True
+            )
+            out("=== SQL statement fingerprints (top 20 by total across workers) ===")
+            for (table, txn, sql), fp in ranked_fingerprints[:20]:
+                avg_ms = fp.total_s * 1000 / fp.calls if fp.calls else 0.0
+                out(
+                    f"  {fp.total_s * 1000:9.1f}ms  calls={fp.calls:>8,d}  "
+                    f"avg={avg_ms:7.3f}ms  max={fp.max_s * 1000:8.1f}ms  "
+                    f"rows={fp.rows:>9,d}  [{table}] {txn}: {sql[:240]}"
+                )
+            out("")
+            event_fingerprints = [
+                item for item in ranked_fingerprints if item[0][0] == "events"
+            ]
+            if event_fingerprints:
+                out("=== events SQL fingerprints (top 15 by total across workers) ===")
+                for (_table, txn, sql), fp in event_fingerprints[:15]:
+                    avg_ms = fp.total_s * 1000 / fp.calls if fp.calls else 0.0
+                    out(
+                        f"  {fp.total_s * 1000:9.1f}ms  calls={fp.calls:>8,d}  "
+                        f"avg={avg_ms:7.3f}ms  max={fp.max_s * 1000:8.1f}ms  "
+                        f"rows={fp.rows:>9,d}  {txn}: {sql[:240]}"
+                    )
+                out("")
+
         if sql_slow_statements:
             sql_slow_statements.sort(key=lambda entry: entry[0], reverse=True)
             out("=== Slowest SQL statements (all processes) ===")
@@ -440,6 +537,16 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                 f"max={sql_scheduling_samples[-1] * 1000:.3f}ms  "
                 f"samples={len(sql_scheduling_samples):,} (capped per process)"
             )
+            out("  transactions by scheduling delay (all labels):")
+            for label, (label_total, label_calls) in sorted(
+                sql_scheduling_by_label.items(),
+                key=lambda kv: kv[1][0],
+                reverse=True,
+            ):
+                out(
+                    f"  {label_total * 1000:10.1f}ms  calls={int(label_calls):>8,d}  "
+                    f"avg={label_total * 1000 / label_calls:7.3f}ms  {label}"
+                )
             out("======================================================")
             out("")
 
@@ -676,11 +783,17 @@ def _aggregate_and_print_timings(timings_dir: str) -> None:
                 ("TOTAL (all measured spans)", None),
                 ("TOTAL (excluding engine open)", "embedded_engine_open"),
             ):
+                # `<tag>:cpu` rows are the thread cpu time of a span already
+                # counted under `<tag>`; leave them out of the totals.
                 total_s = sum(
-                    elapsed for tag, elapsed in ffi_timings.items() if tag != excluded
+                    elapsed
+                    for tag, elapsed in ffi_timings.items()
+                    if tag != excluded and not tag.endswith(":cpu")
                 )
                 total_count = sum(
-                    count for tag, count in ffi_counts.items() if tag != excluded
+                    count
+                    for tag, count in ffi_counts.items()
+                    if tag != excluded and not tag.endswith(":cpu")
                 )
                 total_ms = total_s * 1000
                 total_avg_ms = (total_s / total_count) * 1000 if total_count else 0.0
@@ -901,7 +1014,17 @@ def _print_mtxdb_engine_stats(timings_dir: str) -> None:
                     for i, count in enumerate(lat.get("buckets", [])):
                         into["buckets"][i] += count
             acc = totals[pool]
-            for key in ("get_calls", "get_misses", "cache_hits", "cache_misses"):
+            for key in (
+                "get_calls",
+                "get_misses",
+                "cache_hits",
+                "cache_misses",
+                "put_many_fast_path_calls",
+                "put_many_clone_path_calls",
+                "index_clone_time_us",
+                "index_grow_count",
+                "index_rebuild_count",
+            ):
                 acc[key] += ps.get(key, 0) or 0
             for key, value in (ps.get("sync_totals") or {}).items():
                 if isinstance(value, (int, float)):
@@ -932,6 +1055,19 @@ def _print_mtxdb_engine_stats(timings_dir: str) -> None:
             f" | cache: {pool_totals['cache_hits']:,.0f} hits, {pool_totals['cache_misses']:,.0f} misses",
             file=err,
         )
+        # Write-path tail suspects: the first put_many after an open copies a
+        # memory-mapped index, a full index grows, and a failed grow rebuilds.
+        if pool_totals.get("put_many_fast_path_calls") or pool_totals.get(
+            "put_many_clone_path_calls"
+        ):
+            print(
+                f"    put_many path: fast={pool_totals['put_many_fast_path_calls']:,.0f}"
+                f" clone={pool_totals['put_many_clone_path_calls']:,.0f}"
+                f" index_clone={fmt(pool_totals['index_clone_time_us'])}"
+                f" | index grows={pool_totals['index_grow_count']:,.0f}"
+                f" rebuilds={pool_totals['index_rebuild_count']:,.0f}",
+                file=err,
+            )
         # The pools share one journal, so a physical commit is counted once, by
         # whichever call performed it; the rest found their target already
         # committed ("coalesced"). Real commits = calls that reached the journal

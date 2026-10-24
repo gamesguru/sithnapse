@@ -136,7 +136,25 @@ jobs:
       - name: Formatted Complement log (only failing tests shown)
         if: always() && steps.run_complement_tests.outcome != 'skipped'
         continue-on-error: true
-        run: jq -Rrc 'fromjson? // empty' synapse/tests/complement/main/logs.jsonl | gotestfmt -hide "successful-downloads,successful-tests,empty-packages"
+        # A failed Complement package can contain minutes of captured homeserver
+        # logs. Keep status events for every test, but only send output belonging
+        # to failed tests (or failed packages) to gotestfmt; the complete JSONL
+        # is uploaded below.
+        run: |
+          jq -Rsc '
+            split("\n")
+            | map(fromjson? // empty) as $events
+            | [$events[] | select(.Action == "fail" and .Test != null) | .Test] as $failed_tests
+            | [$events[] | select(.Action == "fail" and .Test == null) | .Package] as $failed_packages
+            | $events[]
+            | select(
+                .Action != "output"
+                or (if .Test != null
+                    then (.Test as $test | $failed_tests | index($test) != null)
+                    else (.Package as $pkg | $failed_packages | index($pkg) != null)
+                    end)
+              )
+          ' synapse/tests/complement/main/logs.jsonl | gotestfmt -hide "successful-downloads,successful-tests,empty-packages"
 
       - name: Run in-repo Complement Tests
         # Always run as long as we attempted to run the original Complement tests.
@@ -169,7 +187,21 @@ jobs:
       - name: Formatted in-repo Complement log (only failing tests shown)
         if: always() && steps.run_in_repo_complement_tests.outcome != 'skipped'
         continue-on-error: true
-        run: jq -Rrc 'fromjson? // empty' synapse/tests/complement/in-repo/logs.jsonl | gotestfmt -hide "successful-downloads,successful-tests,empty-packages"
+        run: |
+          jq -Rsc '
+            split("\n")
+            | map(fromjson? // empty) as $events
+            | [$events[] | select(.Action == "fail" and .Test != null) | .Test] as $failed_tests
+            | [$events[] | select(.Action == "fail" and .Test == null) | .Package] as $failed_packages
+            | $events[]
+            | select(
+                .Action != "output"
+                or (if .Test != null
+                    then (.Test as $test | $failed_tests | index($test) != null)
+                    else (.Package as $pkg | $failed_packages | index($pkg) != null)
+                    end)
+              )
+          ' synapse/tests/complement/in-repo/logs.jsonl | gotestfmt -hide "successful-downloads,successful-tests,empty-packages"
 
       - name: Print PostgreSQL statistics
         if: ${{ always() && startsWith(matrix.database, 'Postgres') }}

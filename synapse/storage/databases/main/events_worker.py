@@ -98,6 +98,10 @@ from synapse.storage.databases.main.embedded_event_json import (
     open_embedded_event_json_engine,
 )
 from synapse.storage.databases.main.embedded_redactions import get_redactions_batch
+from synapse.storage.databases.main.embedded_rejections import (
+    delete_rejections_batch,
+    put_rejection_batch,
+)
 from synapse.storage.types import Cursor
 from synapse.storage.util.id_generators import (
     AbstractStreamIdGenerator,
@@ -2953,6 +2957,11 @@ class EventsWorkerStore(SQLBaseStore):
 
         This can happen, for example, when resyncing state during a faster join.
 
+        Update SQL rejection data and schedule local event-cache invalidation.
+        When embedded event JSON is enabled, mirror the rejection change after
+        SQL commit without syncing the embedded engine. Mirror errors propagate
+        from the post-commit callback through runInteraction.
+
         It is the caller's responsibility to ensure that other workers are
         sent a notification so that they call `_invalidate_local_get_event_cache()`.
 
@@ -2971,12 +2980,20 @@ class EventsWorkerStore(SQLBaseStore):
                 "rejections",
                 keyvalues={"event_id": event_id},
             )
+            if self._embedded_event_json_enabled:
+                txn.call_after(
+                    delete_rejections_batch,
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
+                    [event_id],
+                )
         else:
             logger.info(
                 "Marking previously-processed event %s as rejected(%s)",
                 event_id,
                 rejection_reason,
             )
+            last_check = str(self.clock.time_msec())
             self.db_pool.simple_upsert_txn(
                 txn,
                 table="rejections",
@@ -2986,9 +3003,16 @@ class EventsWorkerStore(SQLBaseStore):
                     # `last_check` is a TEXT column, so store the timestamp as a
                     # string rather than relying on the driver to coerce an int.
                     # (Ideally we'd fix the schema, but that is non-trivial)
-                    "last_check": str(self.clock.time_msec()),
+                    "last_check": last_check,
                 },
             )
+            if self._embedded_event_json_enabled:
+                txn.call_after(
+                    put_rejection_batch,
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
+                    [(event_id, rejection_reason, last_check)],
+                )
         self.db_pool.simple_update_txn(
             txn,
             table="events",

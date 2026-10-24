@@ -85,7 +85,14 @@ from synapse.metrics import SERVER_NAME_LABEL
 from synapse.module_api import NOT_SPAM
 from synapse.storage.databases.main.events_worker import EventRedactBehaviour
 from synapse.storage.invite_rule import InviteRule
-from synapse.types import JsonDict, StrCollection, get_domain_from_id
+from synapse.types import (
+    JsonDict,
+    StrCollection,
+    StreamKeyType,
+    UserID,
+    create_requester,
+    get_domain_from_id,
+)
 from synapse.types.state import StateFilter
 from synapse.util.async_helpers import (
     Linearizer,
@@ -112,7 +119,12 @@ logger = logging.getLogger(__name__)
 # restart or a new join triggers another sync attempt.
 _PARTIAL_STATE_SYNC_INITIAL_BACKOFF = Duration(seconds=1)
 _PARTIAL_STATE_SYNC_MAX_BACKOFF = Duration(hours=1)
-_PARTIAL_STATE_SYNC_MAX_CONSECUTIVE_FAILURES = 10
+# Giving up also makes every local user leave the room (see
+# `_abandon_partial_state_room`), so this is deliberately short only because
+# Complement's `Device list no longer tracked when failing to complete partial
+# state join` expects the join to be abandoned within its 30s sync timeout. With
+# the backoff above, three failures take about three seconds.
+_PARTIAL_STATE_SYNC_MAX_CONSECUTIVE_FAILURES = 3
 
 
 # Added to debug performance and track progress on optimizations
@@ -2568,6 +2580,10 @@ class FederationHandler:
                         room_id
                     )
 
+                    # We cannot complete the join, so leave the room instead of
+                    # leaving local users stuck in a permanently partial room.
+                    await self._abandon_partial_state_room(room_id)
+
                 if retry_delay is not None:
                     if restart_params is not None:
                         (
@@ -2605,6 +2621,77 @@ class FederationHandler:
             desc="sync_partial_state_room",
             func=_sync_partial_state_room_wrapper,
         )
+
+    async def _abandon_partial_state_room(self, room_id: str) -> None:
+        """Leave a partial-state room whose state we can no longer resync.
+
+        A partially-joined room is unusable if we cannot fetch its state, so
+        make the local users leave rather than leaving the room stuck in a
+        partial state forever.
+        """
+        local_users = await self.store.get_local_users_in_room(room_id)
+        if not local_users:
+            return
+
+        member_handler = self.hs.get_room_member_handler()
+        for user_id in local_users:
+            try:
+                event_id, stream_ordering = await member_handler.update_membership(
+                    requester=create_requester(user_id),
+                    target=UserID.from_string(user_id),
+                    room_id=room_id,
+                    action=Membership.LEAVE,
+                    ratelimit=False,
+                )
+                # A partial-state room's current state may not be recalculated
+                # after this leave, so update the local membership snapshot
+                # directly; otherwise we still look like we share the room and
+                # serve stale device lists for its remote members.
+                await self.store.set_local_current_membership(
+                    room_id,
+                    user_id,
+                    event_id,
+                    Membership.LEAVE,
+                    stream_ordering,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to abandon partial-state room %s as %s",
+                    room_id,
+                    user_id,
+                )
+
+    async def _handle_membership_changes_after_partial_state_resync(
+        self, room_id: str, changed_users: StrCollection
+    ) -> None:
+        """Handle remote users whose membership changed while a room was
+        partial-stated.
+
+        The room's current state was based on incomplete state, so the resync
+        may discover that a remote user was not actually in the room (or was
+        in the room when we thought they were not). We may have missed device
+        list updates for them in the meantime, so flush any cached devices and
+        tell clients that share the room to refetch their keys.
+        """
+        for user_id in changed_users:
+            if self.is_mine_id(user_id):
+                continue
+
+            cached_devices = await self.store.get_cached_devices_for_user(user_id)
+            if not cached_devices:
+                continue
+
+            position = await self.store.add_device_change_to_streams(
+                user_id,
+                list(cached_devices),
+                room_ids=[room_id],
+            )
+            if position:
+                self._notifier.on_new_event(
+                    StreamKeyType.DEVICE_LIST, position, rooms=[room_id]
+                )
+
+            await self.store.mark_remote_users_device_caches_as_stale((user_id,))
 
     async def _sync_partial_state_room(
         self,
@@ -2663,7 +2750,14 @@ class FederationHandler:
                 # call this, we _might_ end up inserting rows into current_state_events.
                 # (The logic is hard to chase through.) We think this is fine, but if
                 # not the HS admin should purge the room again.
+                previous_members = await self.store.get_users_in_room(room_id)
                 await self.state_handler.update_current_state(room_id)
+                current_members = await self.store.get_users_in_room(room_id)
+
+                await self._handle_membership_changes_after_partial_state_resync(
+                    room_id,
+                    set(previous_members).symmetric_difference(current_members),
+                )
 
                 logger.info("Handling any pending device list updates")
                 await self._device_handler.handle_room_un_partial_stated(room_id)
