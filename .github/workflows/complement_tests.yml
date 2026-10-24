@@ -34,8 +34,34 @@ env:
   COMPLEMENT_REPO: "gamesguru/complement"
 
 jobs:
+  matrix:
+    # A job-level `if` cannot see `matrix`, and `include` rows cannot be
+    # filtered with expressions, so build the matrix here and drop the
+    # non-workers rows when only_workers is set.
+    runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.matrix.outputs.include }}
+    steps:
+      - id: matrix
+        env:
+          ONLY_WORKERS: ${{ inputs.only_workers }}
+        run: |
+          # The mtxdb lanes run with sync off: Complement containers are
+          # destroyed after every test, so the durable fsync path buys nothing.
+          include='[
+            {"arrangement": "monolith", "database": "SQLite"},
+            {"arrangement": "hybrid", "database": "SQLite (hybrid, mtxdb)", "mtxdb_sync_mode": "off"},
+            {"arrangement": "monolith", "database": "Postgres"},
+            {"arrangement": "hybrid", "database": "Postgres (hybrid, mtxdb)", "mtxdb_sync_mode": "off"},
+            {"arrangement": "workers", "database": "Postgres"},
+            {"arrangement": "workers", "database": "Postgres (hybrid, mtxdb)", "mtxdb_sync_mode": "off"}
+          ]'
+          echo "include=$(jq -c --argjson only "$ONLY_WORKERS" \
+            'map(select(($only | not) or .arrangement == "workers"))' <<< "$include")" \
+            >> "$GITHUB_OUTPUT"
+
   complement:
-    if: ${{ !inputs.only_workers || matrix.arrangement == 'workers' }}
+    needs: matrix
     runs-on: ubuntu-latest
     env:
       # Complement invokes this on the host before stopping each PostgreSQL
@@ -53,30 +79,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arrangement: monolith
-            database: SQLite
-
-          - arrangement: hybrid
-            database: SQLite (hybrid, mtxdb)
-            # Complement containers are destroyed after every test, so the
-            # durable fsync path buys nothing here. Keep this lane consistent
-            # with the Postgres mtxdb lanes and run with sync off for speed.
-            mtxdb_sync_mode: "off"
-
-          - arrangement: monolith
-            database: Postgres
-
-          - arrangement: hybrid
-            database: Postgres (hybrid, mtxdb)
-            mtxdb_sync_mode: "off"
-
-          - arrangement: workers
-            database: Postgres
-
-          - arrangement: workers
-            database: Postgres (hybrid, mtxdb)
-            mtxdb_sync_mode: "off"
+        include: ${{ fromJSON(needs.matrix.outputs.include) }}
 
     steps:
       - name: Checkout synapse codebase
