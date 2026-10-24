@@ -899,16 +899,29 @@ class ReceiptsWorkerStore(SQLBaseStore):
         rows: Iterable[Any],
     ) -> None:
         if stream_name == ReceiptsStream.NAME:
-            # Invalidate the caches before advancing the stream token. Otherwise
-            # a /sync running between the two can observe the new receipt
-            # position while still being served a cached result from before the
-            # receipt, then advance the client's since token past it.
+            rows = list(rows)
+            logger.info(
+                "[receipts-trace] RDATA instance=%s token=%s count=%d rows=%s",
+                instance_name,
+                token,
+                len(rows),
+                [
+                    (
+                        row.room_id,
+                        row.receipt_type,
+                        row.user_id,
+                        row.event_id,
+                        row.thread_id,
+                    )
+                    for row in rows[:20]
+                ],
+            )
+            self._receipts_id_gen.advance(instance_name, token)
             for row in rows:
                 self.invalidate_caches_for_receipt(
                     row.room_id, row.receipt_type, row.user_id
                 )
                 self._receipts_stream_cache.entity_has_changed(row.room_id, token)
-            self._receipts_id_gen.advance(instance_name, token)
 
         return super().process_replication_rows(stream_name, instance_name, token, rows)
 
@@ -916,6 +929,11 @@ class ReceiptsWorkerStore(SQLBaseStore):
         self, stream_name: str, instance_name: str, token: int
     ) -> None:
         if stream_name == ReceiptsStream.NAME:
+            logger.info(
+                "[receipts-trace] position instance=%s token=%s",
+                instance_name,
+                token,
+            )
             self._receipts_id_gen.advance(instance_name, token)
         super().process_replication_position(stream_name, instance_name, token)
 
