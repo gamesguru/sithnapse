@@ -228,7 +228,7 @@ async def filter_and_transform_events_for_client(
             if event.internal_metadata.is_outlier():
                 # Outliers have no state group. They cannot be used to determine
                 # the user's membership, so fail closed and omit the event.
-                logger.error(
+                logger.warning(
                     "Cannot determine visibility for outlier event %s (%s, %s) "
                     "in room %s: no state at the event",
                     event.event_id,

@@ -344,27 +344,26 @@ class ReceiptEventSource(EventSource[MultiWriterStreamToken, JsonMapping]):
             events, user.to_string()
         )
 
-        # Record the sync token range and returned receipts so that worker-stream
-        # ordering issues can be diagnosed from logs.
-        returned_receipts = [
-            (
-                event["room_id"],
-                event_id,
-                receipt_type,
-                user_id,
-                data.get("thread_id"),
-            )
-            for event in events
-            for event_id, receipt_types in event.get("content", {}).items()
-            for receipt_type, users in receipt_types.items()
-            for user_id, data in users.items()
-        ]
-        if returned_receipts:
-            logger.info(
+        # Temporary: record the sync token range and returned receipts so that
+        # worker-stream ordering issues can be diagnosed from DEBUG logs.
+        if logger.isEnabledFor(logging.DEBUG) and events:
+            logger.debug(
                 "[receipts-trace] sync from=%s to=%s receipts=%s",
                 from_key,
                 to_key,
-                returned_receipts,
+                [
+                    (
+                        event["room_id"],
+                        event_id,
+                        receipt_type,
+                        user_id,
+                        data.get("thread_id"),
+                    )
+                    for event in events
+                    for event_id, receipt_types in event.get("content", {}).items()
+                    for receipt_type, users in receipt_types.items()
+                    for user_id, data in users.items()
+                ],
             )
 
         return events, to_key

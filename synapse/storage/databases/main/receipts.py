@@ -900,7 +900,7 @@ class ReceiptsWorkerStore(SQLBaseStore):
     ) -> None:
         if stream_name == ReceiptsStream.NAME:
             rows = list(rows)
-            logger.info(
+            logger.debug(
                 "[receipts-trace] RDATA instance=%s token=%s count=%d rows=%s",
                 instance_name,
                 token,
@@ -929,7 +929,7 @@ class ReceiptsWorkerStore(SQLBaseStore):
         self, stream_name: str, instance_name: str, token: int
     ) -> None:
         if stream_name == ReceiptsStream.NAME:
-            logger.info(
+            logger.debug(
                 "[receipts-trace] position instance=%s token=%s",
                 instance_name,
                 token,
