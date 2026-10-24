@@ -55,6 +55,7 @@ class ReplicationRemoteJoinRestServlet(ReplicationEndpoint):
         super().__init__(hs)
 
         self.federation_handler = hs.get_federation_handler()
+        self.member_handler = hs.get_room_member_handler()
         self.store = hs.get_datastores().main
         self.clock = hs.get_clock()
 
@@ -96,6 +97,12 @@ class ReplicationRemoteJoinRestServlet(ReplicationEndpoint):
 
         event_id, stream_id = await self.federation_handler.do_invite_join(
             remote_room_hosts, room_id, user_id, event_content
+        )
+
+        # Unlike a join handled on this process, the worker that took the request
+        # never runs `_remote_join`, so send the device list update from here.
+        await self.member_handler.notify_device_list_after_remote_join(
+            room_id, user_id
         )
 
         return 200, {"event_id": event_id, "stream_id": stream_id}

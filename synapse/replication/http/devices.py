@@ -73,6 +73,13 @@ class ReplicationNotifyDeviceUpdateRestServlet(ReplicationEndpoint):
             span.set_tag("user_id", user_id)
             span.set_tag("device_ids", f"{device_ids!r}")
 
+        # The joining process can notify us about a user's devices immediately
+        # after persisting the join on another worker. The cache invalidation
+        # for `current_state_events` may not have reached this worker yet, so
+        # drop the cached room list to ensure we include the new room when
+        # calculating where to send device list updates.
+        self.store.get_rooms_for_user.invalidate((user_id,))
+
         await self.device_handler.notify_device_update(user_id, device_ids)
 
         return 200, {}
