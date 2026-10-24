@@ -845,6 +845,24 @@ class DeviceHandler:
             ):
                 newly_left_users.discard(left_user_id)
 
+        # This is the point where we know the users we are about to report as
+        # left, even if the abandoned room's current state does not contain
+        # them anymore. Make sure the next /keys/query does not reuse their
+        # cached device lists.
+        remote_left_users = {
+            left_user_id
+            for left_user_id in newly_left_users
+            if not self.hs.is_mine_id(left_user_id)
+        }
+        for remote_left_user in remote_left_users:
+            await self.store.mark_remote_user_device_list_as_unsubscribed(
+                remote_left_user
+            )
+        if remote_left_users:
+            await self.store.mark_remote_users_device_caches_as_stale(
+                remote_left_users
+            )
+
         return DeviceListUpdates(
             changed={
                 changed_user_id
