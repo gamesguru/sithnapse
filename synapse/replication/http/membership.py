@@ -101,9 +101,7 @@ class ReplicationRemoteJoinRestServlet(ReplicationEndpoint):
 
         # Unlike a join handled on this process, the worker that took the request
         # never runs `_remote_join`, so send the device list update from here.
-        await self.member_handler.notify_device_list_after_remote_join(
-            room_id, user_id
-        )
+        await self.member_handler.notify_device_list_after_remote_join(room_id, user_id)
 
         return 200, {"event_id": event_id, "stream_id": stream_id}
 
