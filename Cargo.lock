@@ -1025,7 +1025,7 @@ dependencies = [
 [[package]]
 name = "mtxdb"
 version = "0.1.0-beta.2"
-source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=dev#7a6ccb815d7586dc817a0078996f581c1d121520"
+source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=dev#35f4465976af98e23270d2e7ed30d0e7b2a95e61"
 dependencies = [
  "arc-swap",
  "blake3",
@@ -1034,20 +1034,11 @@ dependencies = [
  "fs2",
  "memchr",
  "memmap2",
- "mtxdb-log",
  "parking_lot",
  "rezzy-recon",
  "sha2",
  "zstd",
  "zstd-sys",
-]
-
-[[package]]
-name = "mtxdb-log"
-version = "0.1.0-beta.2"
-source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=dev#7a6ccb815d7586dc817a0078996f581c1d121520"
-dependencies = [
- "tracing",
 ]
 
 [[package]]
@@ -1462,7 +1453,7 @@ dependencies = [
 [[package]]
 name = "rezzy"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#be30a3d4ac8f794d77830143fc09a64fea1ce3dd"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#2323c54f4bbed8bbeb3eefe7b598c7456bc10a7b"
 dependencies = [
  "base64 0.23.1",
  "blake3",
@@ -1476,7 +1467,7 @@ dependencies = [
 [[package]]
 name = "rezzy-json"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#be30a3d4ac8f794d77830143fc09a64fea1ce3dd"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#2323c54f4bbed8bbeb3eefe7b598c7456bc10a7b"
 dependencies = [
  "ryu",
 ]
@@ -1484,7 +1475,7 @@ dependencies = [
 [[package]]
 name = "rezzy-log"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#be30a3d4ac8f794d77830143fc09a64fea1ce3dd"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#2323c54f4bbed8bbeb3eefe7b598c7456bc10a7b"
 dependencies = [
  "tracing",
 ]
@@ -1492,7 +1483,7 @@ dependencies = [
 [[package]]
 name = "rezzy-recon"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#be30a3d4ac8f794d77830143fc09a64fea1ce3dd"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#2323c54f4bbed8bbeb3eefe7b598c7456bc10a7b"
 dependencies = [
  "base64 0.23.1",
  "rezzy-log",
@@ -1741,9 +1732,9 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "smallvec"
-version = "1.16.3"
+version = "1.16.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b3dc8af474f516a851ff4bd12db780f948b9250ad37211e4eec0bccea54e01b"
+checksum = "d0d5d4b1981b8bbbb7aed204cae5726d683d5d6ac7e74ec54122ea28f315e7c8"
 
 [[package]]
 name = "socket2"

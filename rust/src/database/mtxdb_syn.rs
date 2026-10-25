@@ -2156,11 +2156,11 @@ mod wal_env_tests {
     }
 
     #[test]
-    fn wal_matrix_pool_policies_disables_state_compression() {
+    fn wal_matrix_pool_policies_disable_state_and_edge_compression() {
         let policies = mtxdb::matrix_pool_policies();
         assert!(!policies.for_shard(ShardType::State).compress);
         assert!(policies.for_shard(ShardType::EventDag).compress);
-        assert!(policies.for_shard(ShardType::Edges).compress);
+        assert!(!policies.for_shard(ShardType::Edges).compress);
     }
 }
 
@@ -2174,8 +2174,8 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
         // dense structural hashes, not text. zstd never shrinks them (see
         // mtxdb's own compression bench), so every write there was still
         // paying the compressor's full match-finding pass for nothing.
-        // The matrix pool policies disable compression for state while keeping
-        // it enabled for the event-DAG and auth-chain pools.
+        // The matrix pool policies disable compression for state and edge
+        // pools while keeping it enabled for event-DAG records.
         // The current MTXDB layout gives all pools beneath a database root one
         // shared WAL and writer lock. Open the root once so each pool attaches
         // as a shared member; opening the pools individually would make the
