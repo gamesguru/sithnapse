@@ -65,7 +65,7 @@ class FederationTestCase(unittest.FederatingHomeserverTestCase):
         self,
         cached_devices: dict[str, dict],
         last_stream_id: str | None,
-        changed_users: Collection[str] = ("@elsie:remote",),
+        changed_users: tuple[str, ...] = ("@elsie:remote",),
     ) -> tuple[AsyncMock, AsyncMock, Mock]:
         add_device_change = AsyncMock(return_value=1)
         mark_stale = AsyncMock()

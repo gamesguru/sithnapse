@@ -2678,8 +2678,8 @@ class FederationHandler:
                 continue
 
             cached_devices = await self.store.get_cached_devices_for_user(user_id)
-            last_stream_id = (
-                await self.store.get_device_list_last_stream_id_for_remote(user_id)
+            last_stream_id = await self.store.get_device_list_last_stream_id_for_remote(
+                user_id
             )
             if not cached_devices and last_stream_id is None:
                 # We have never cached a device snapshot for this user, so
