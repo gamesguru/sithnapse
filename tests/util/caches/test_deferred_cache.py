@@ -35,7 +35,7 @@ class DeferredCacheTestCase(TestCase):
     def setUp(self) -> None:
         super().setUp()
 
-        _, self.clock = get_clock()
+        self.reactor, self.clock = get_clock()
 
     def test_empty(self) -> None:
         cache: DeferredCache[str, int] = DeferredCache(
@@ -78,7 +78,7 @@ class DeferredCacheTestCase(TestCase):
 
         # The invalidation is queued to the reactor thread, where the cache is
         # owned, rather than running callbacks from the database thread.
-        self.clock._reactor.advance(0)
+        self.reactor.advance(0)
         with self.assertRaises(KeyError):
             cache.get("foo")
 
