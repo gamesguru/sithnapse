@@ -2161,6 +2161,7 @@ mod wal_env_tests {
         assert!(!policies.for_shard(ShardType::State).compress);
         assert!(policies.for_shard(ShardType::EventDag).compress);
         assert!(!policies.for_shard(ShardType::Edges).compress);
+        assert!(!policies.for_shard(ShardType::ServerInfo).compress);
     }
 }
 
