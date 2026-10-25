@@ -914,12 +914,19 @@ class FederationEventHandler:
                 and was_rejected != bool(context.rejected)
             ):
                 # The resync has shown that this membership event was accepted
-                # or rejected incorrectly while the room was partial. We may
-                # have missed device list updates for the user in the meantime,
-                # so make sure their cached devices are refetched.
-                await self._store.mark_remote_users_device_caches_as_stale(
-                    (event.state_key,)
+                # or rejected incorrectly while the room was partial. If we
+                # have devices cached for the user, they may have missed
+                # updates in the meantime, so make sure they are refetched.
+                # With no cached devices there is nothing to invalidate, and
+                # marking the user stale would make the retry loop fetch a list
+                # we have never needed.
+                cached_devices = await self._store.get_cached_devices_for_user(
+                    event.state_key
                 )
+                if cached_devices:
+                    await self._store.mark_remote_users_device_caches_as_stale(
+                        (event.state_key,)
+                    )
 
             self._state_storage_controller.notify_event_un_partial_stated(
                 event.event_id
