@@ -915,15 +915,21 @@ class FederationEventHandler:
             ):
                 # The resync has shown that this membership event was accepted
                 # or rejected incorrectly while the room was partial. If we
-                # have devices cached for the user, they may have missed
-                # updates in the meantime, so make sure they are refetched.
-                # With no cached devices there is nothing to invalidate, and
-                # marking the user stale would make the retry loop fetch a list
-                # we have never needed.
+                # have a cached device snapshot for the user, it may have
+                # missed updates in the meantime, so make sure it is refetched.
+                # With no snapshot there is nothing to invalidate, and marking
+                # the user stale would make the retry loop fetch a list we have
+                # never needed. An empty snapshot still counts: its stream ID
+                # records that we did query the user, just found no devices.
                 cached_devices = await self._store.get_cached_devices_for_user(
                     event.state_key
                 )
-                if cached_devices:
+                last_stream_id = (
+                    await self._store.get_device_list_last_stream_id_for_remote(
+                        event.state_key
+                    )
+                )
+                if cached_devices or last_stream_id is not None:
                     await self._store.mark_remote_users_device_caches_as_stale(
                         (event.state_key,)
                     )

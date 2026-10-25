@@ -2678,18 +2678,24 @@ class FederationHandler:
                 continue
 
             cached_devices = await self.store.get_cached_devices_for_user(user_id)
-            if not cached_devices:
+            last_stream_id = (
+                await self.store.get_device_list_last_stream_id_for_remote(user_id)
+            )
+            if not cached_devices and last_stream_id is None:
+                # We have never cached a device snapshot for this user, so
+                # there is nothing to invalidate or tell clients to refetch.
                 continue
 
-            position = await self.store.add_device_change_to_streams(
-                user_id,
-                list(cached_devices),
-                room_ids=[room_id],
-            )
-            if position:
-                self._notifier.on_new_event(
-                    StreamKeyType.DEVICE_LIST, position, rooms=[room_id]
+            if cached_devices:
+                position = await self.store.add_device_change_to_streams(
+                    user_id,
+                    list(cached_devices),
+                    room_ids=[room_id],
                 )
+                if position:
+                    self._notifier.on_new_event(
+                        StreamKeyType.DEVICE_LIST, position, rooms=[room_id]
+                    )
 
             await self.store.mark_remote_users_device_caches_as_stale((user_id,))
 

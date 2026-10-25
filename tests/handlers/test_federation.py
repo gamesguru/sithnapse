@@ -61,6 +61,76 @@ class FederationTestCase(unittest.FederatingHomeserverTestCase):
         self.store = hs.get_datastores().main
         return hs
 
+    def _handle_changed_remote_users(
+        self,
+        cached_devices: dict[str, dict],
+        last_stream_id: str | None,
+        changed_users: Collection[str] = ("@elsie:remote",),
+    ) -> tuple[AsyncMock, AsyncMock, Mock]:
+        add_device_change = AsyncMock(return_value=1)
+        mark_stale = AsyncMock()
+        notifier = Mock()
+
+        with (
+            patch.object(
+                self.store,
+                "get_cached_devices_for_user",
+                new=AsyncMock(return_value=cached_devices),
+            ),
+            patch.object(
+                self.store,
+                "get_device_list_last_stream_id_for_remote",
+                new=AsyncMock(return_value=last_stream_id),
+            ),
+            patch.object(
+                self.store,
+                "add_device_change_to_streams",
+                new=add_device_change,
+            ),
+            patch.object(
+                self.store,
+                "mark_remote_users_device_caches_as_stale",
+                new=mark_stale,
+            ),
+            patch.object(self.handler, "_notifier", new=notifier),
+        ):
+            self.get_success(
+                self.handler._handle_membership_changes_after_partial_state_resync(
+                    "!room:test", changed_users
+                )
+            )
+
+        return add_device_change, mark_stale, notifier
+
+    def test_membership_change_without_device_snapshot(self) -> None:
+        """A remote user we have never cached devices for is left alone."""
+        add_device_change, mark_stale, notifier = self._handle_changed_remote_users(
+            {}, None
+        )
+
+        add_device_change.assert_not_awaited()
+        mark_stale.assert_not_awaited()
+        notifier.on_new_event.assert_not_called()
+
+    def test_membership_change_with_empty_device_snapshot(self) -> None:
+        """An empty cached device list still has a snapshot to invalidate."""
+        add_device_change, mark_stale, _ = self._handle_changed_remote_users({}, "1")
+
+        add_device_change.assert_not_awaited()
+        mark_stale.assert_awaited_once_with(("@elsie:remote",))
+
+    def test_membership_change_with_cached_devices(self) -> None:
+        """A cached device list is invalidated and clients are notified."""
+        add_device_change, mark_stale, notifier = self._handle_changed_remote_users(
+            {"DEVICE": {"device_id": "DEVICE"}}, "1"
+        )
+
+        add_device_change.assert_awaited_once_with(
+            "@elsie:remote", ["DEVICE"], room_ids=["!room:test"]
+        )
+        mark_stale.assert_awaited_once_with(("@elsie:remote",))
+        notifier.on_new_event.assert_called_once()
+
     def test_exchange_revoked_invite(self) -> None:
         user_id = self.register_user("kermit", "test")
         tok = self.login("kermit", "test")
