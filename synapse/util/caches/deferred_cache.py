@@ -41,6 +41,7 @@ from twisted.python.failure import Failure
 
 from synapse.logging.context import PreserveLoggingContext
 from synapse.metrics import SERVER_NAME_LABEL
+from synapse.types import ISynapseReactor
 from synapse.util.async_helpers import ObservableDeferred
 from synapse.util.caches.lrucache import LruCache
 from synapse.util.caches.treecache import TreeCache, iterate_tree_cache_entry
@@ -73,6 +74,7 @@ class DeferredCache(Generic[KT, VT]):
     __slots__ = (
         "cache",
         "thread",
+        "_clock",
         "_pending_deferred_cache",
     )
 
@@ -136,6 +138,7 @@ class DeferredCache(Generic[KT, VT]):
             prune_unread_entries=prune_unread_entries,
         )
 
+        self._clock = clock
         self.thread: threading.Thread | None = None
 
     @property
@@ -396,6 +399,14 @@ class DeferredCache(Generic[KT, VT]):
         may be of lower cardinality than the TreeCache - in which case the whole
         subtree is deleted.
         """
+        # LruCache invalidation callbacks can run from __del__ when the last
+        # reference to an LruCache is released on a database thread. Keep the
+        # DeferredCache reactor-thread-only by marshalling the invalidation.
+        if self.thread is not None and self.thread is not threading.current_thread():
+            reactor = cast(ISynapseReactor, self._clock._reactor)
+            reactor.callFromThread(self.invalidate, key)
+            return
+
         self.check_thread()
         self.cache.del_multi(key)
 

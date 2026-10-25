@@ -19,11 +19,13 @@
 #
 #
 
+import threading
 from functools import partial
 
 from twisted.internet import defer
 
 from synapse.util.caches.deferred_cache import DeferredCache
+from synapse.util.caches.lrucache import LruCache
 
 from tests.server import get_clock
 from tests.unittest import TestCase
@@ -49,6 +51,36 @@ class DeferredCacheTestCase(TestCase):
         cache.prefill("foo", 123)
 
         self.assertEqual(self.successResultOf(cache.get("foo")), 123)
+
+    def test_cache_finalized_on_other_thread_marshals_invalidation(self) -> None:
+        cache: DeferredCache[str, int] = DeferredCache(
+            name="test", clock=self.clock, server_name="test_server"
+        )
+        cache.prefill("foo", 123)
+        self.assertEqual(self.successResultOf(cache.get("foo")), 123)
+
+        cache_to_finalize = LruCache[str, int](
+            max_size=10,
+            clock=self.clock,
+            server_name="test_server",
+            cache_name="test_source",
+        )
+        cache_to_finalize.set(
+            "source",
+            1,
+            callbacks=[lambda: cache.invalidate("foo")],
+        )
+        # LruCache.__del__ calls clear(), which may run on a database thread
+        # when that thread releases the final reference to the cache.
+        thread = threading.Thread(target=cache_to_finalize.__del__)
+        thread.start()
+        thread.join()
+
+        # The invalidation is queued to the reactor thread, where the cache is
+        # owned, rather than running callbacks from the database thread.
+        self.clock._reactor.advance(0)
+        with self.assertRaises(KeyError):
+            cache.get("foo")
 
     def test_hit_deferred(self) -> None:
         cache: DeferredCache[str, int] = DeferredCache(
