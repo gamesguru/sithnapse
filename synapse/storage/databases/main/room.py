@@ -3144,11 +3144,16 @@ class RoomStore(RoomBackgroundUpdateStore, RoomWorkerStore):
             keys=("room_id", "server_name"),
             values=[(room_id, s) for s in servers],
         )
+        # `is_partial_state_room` is computed from `get_partial_rooms`, so the
+        # set must be invalidated first. Workers apply these invalidations as
+        # separate replication rows; in the other order, a read between them
+        # would re-cache `is_partial_state_room` from the stale set and keep
+        # the stale answer after the set itself is invalidated.
+        self._invalidate_all_cache_and_stream(txn, self.get_partial_rooms)
         self._invalidate_cache_and_stream(txn, self.is_partial_state_room, (room_id,))
         self._invalidate_cache_and_stream(
             txn, self._get_partial_state_servers_at_join, (room_id,)
         )
-        self._invalidate_all_cache_and_stream(txn, self.get_partial_rooms)
         self._invalidate_all_cache_and_stream(txn, self.has_partial_state_rooms)
 
     async def write_partial_state_rooms_join_event_id(
@@ -3328,11 +3333,16 @@ class RoomStore(RoomBackgroundUpdateStore, RoomWorkerStore):
             table="partial_state_rooms",
             keyvalues={"room_id": room_id},
         )
+        # `is_partial_state_room` is computed from `get_partial_rooms`, so the
+        # set must be invalidated first. Workers apply these invalidations as
+        # separate replication rows; in the other order, a read between them
+        # would re-cache `is_partial_state_room` from the stale set and keep
+        # the stale answer after the set itself is invalidated.
+        self._invalidate_all_cache_and_stream(txn, self.get_partial_rooms)
         self._invalidate_cache_and_stream(txn, self.is_partial_state_room, (room_id,))
         self._invalidate_cache_and_stream(
             txn, self._get_partial_state_servers_at_join, (room_id,)
         )
-        self._invalidate_all_cache_and_stream(txn, self.get_partial_rooms)
         self._invalidate_all_cache_and_stream(txn, self.has_partial_state_rooms)
 
         DatabasePool.simple_insert_txn(

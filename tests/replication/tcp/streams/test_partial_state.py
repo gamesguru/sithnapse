@@ -18,6 +18,9 @@
 # [This file includes modifications made by New Vector Limited]
 #
 #
+from typing import Any
+from unittest.mock import patch
+
 from twisted.internet.defer import ensureDeferred
 
 from synapse.rest.client import room
@@ -70,6 +73,44 @@ class PartialStateStreamsTestCase(BaseMultiWorkerStreamTestCase):
         self.assertTrue(
             d.called, "get_current_hosts_in_room/await_full_state did not unblock"
         )
+
+    def test_is_partial_state_room_not_recached_from_stale_set(self) -> None:
+        """
+        A read on the worker between the replicated cache invalidations must not
+        leave `is_partial_state_room` stuck on True after the room is
+        un-partial-stated.
+
+        `is_partial_state_room` is computed from the cached `get_partial_rooms`
+        set, and the worker applies each invalidation as its own replication
+        row, possibly in separate batches. If the per-room cache is invalidated
+        first, a read in between re-caches it from the stale set.
+        """
+        room_id = self.helper.create_room_as("@bob:test")
+        self.get_success(
+            self.store.store_partial_state_room(room_id, {"serv1", "serv2"}, 0, "serv1")
+        )
+
+        worker = self.make_worker_hs("synapse.app.generic_worker")
+        worker_store = worker.get_datastores().main
+        self.reactor.advance(0.1)
+        self.assertTrue(self.get_success(worker_store.is_partial_state_room(room_id)))
+
+        # Read `is_partial_state_room` immediately after each invalidation the
+        # worker applies, as a concurrent request could.
+        original_invalidate = worker_store._attempt_to_invalidate_cache
+
+        def invalidate_then_read(cache_name: str, key: Any) -> bool:
+            result = original_invalidate(cache_name, key)
+            ensureDeferred(worker_store.is_partial_state_room(room_id))
+            return result
+
+        with patch.object(
+            worker_store, "_attempt_to_invalidate_cache", new=invalidate_then_read
+        ):
+            self.get_success(self.store.clear_partial_state_room(room_id))
+            self.reactor.advance(0.1)
+
+        self.assertFalse(self.get_success(worker_store.is_partial_state_room(room_id)))
 
     def test_un_partial_stated_event_cache_invalidation_over_replication(self) -> None:
         """
