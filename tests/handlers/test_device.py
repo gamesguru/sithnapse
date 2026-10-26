@@ -48,8 +48,10 @@ from synapse.rest.client import devices, login, register
 from synapse.server import HomeServer
 from synapse.storage.databases.main.appservice import _make_exclusive_regex
 from synapse.types import (
+    DeviceListUpdates,
     JsonDict,
     StateMap,
+    StreamToken,
     UserID,
     create_requester,
     get_domain_from_id,
@@ -83,6 +85,60 @@ class DeviceTestCase(unittest.HomeserverTestCase):
     def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
         # These tests assume that it starts 1000 seconds in.
         self.reactor.advance(1000)
+
+    def test_rejoin_detected_when_current_state_delta_is_missing_it(self) -> None:
+        """A leave followed by a join is a rejoin even if the join's prev_content
+        still says JOIN because the partial-state current state was stale.
+        """
+        room_id = "!room:remote"
+        leave = Mock(
+            room_id=room_id,
+            membership="leave",
+            rejected_reason=None,
+            unsigned={},
+        )
+        join = Mock(
+            room_id=room_id,
+            membership="join",
+            rejected_reason=None,
+            unsigned={"prev_content": {"membership": "join"}},
+        )
+        generate_sync_entry = AsyncMock(return_value=DeviceListUpdates())
+
+        with (
+            patch.object(
+                self.store,
+                "get_rooms_for_user",
+                new=AsyncMock(return_value={room_id}),
+            ),
+            patch.object(
+                self.store,
+                "get_current_state_delta_membership_changes_for_user",
+                new=AsyncMock(return_value=[]),
+            ),
+            patch.object(
+                self.store,
+                "get_membership_changes_for_user",
+                new=AsyncMock(return_value=[leave, join]),
+            ),
+            patch.object(
+                self.store,
+                "get_current_state_deltas_for_rooms",
+                new=AsyncMock(return_value=[]),
+            ),
+            patch.object(
+                self.handler,
+                "generate_sync_entry_for_device_list",
+                new=generate_sync_entry,
+            ),
+        ):
+            self.get_success(
+                self.handler.get_user_ids_changed("@user:local", StreamToken.START)
+            )
+
+        self.assertEqual(
+            generate_sync_entry.await_args.kwargs["newly_joined_rooms"], {room_id}
+        )
 
     def test_device_is_created_with_invalid_name(self) -> None:
         self.get_failure(
