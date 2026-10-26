@@ -847,19 +847,15 @@ class DeviceHandler:
 
         # This is the point where we know the users we are about to report as
         # left, even if the abandoned room's current state does not contain
-        # them anymore. Make sure the next /keys/query does not reuse their
-        # cached device lists.
-        remote_left_users = {
-            left_user_id
-            for left_user_id in newly_left_users
-            if not self.hs.is_mine_id(left_user_id)
-        }
-        for remote_left_user in remote_left_users:
-            await self.store.mark_remote_user_device_list_as_unsubscribed(
-                remote_left_user
-            )
-        if remote_left_users:
-            await self.store.mark_remote_users_device_caches_as_stale(remote_left_users)
+        # them anymore. Unsubscribing drops their device list extremity, so the
+        # next /keys/query refetches on demand instead of reusing the cache.
+        # Don't also mark them stale: that makes the resync retry loop fetch
+        # device lists for users we no longer share a room with.
+        for left_user_id in newly_left_users:
+            if not self.hs.is_mine_id(left_user_id):
+                await self.store.mark_remote_user_device_list_as_unsubscribed(
+                    left_user_id
+                )
 
         return DeviceListUpdates(
             changed={
