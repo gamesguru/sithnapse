@@ -88,7 +88,6 @@ from synapse.storage.invite_rule import InviteRule
 from synapse.types import (
     JsonDict,
     StrCollection,
-    StreamKeyType,
     UserID,
     create_requester,
     get_domain_from_id,
@@ -2693,15 +2692,11 @@ class FederationHandler:
                 continue
 
             if cached_devices:
-                position = await self.store.add_device_change_to_streams(
-                    user_id,
-                    list(cached_devices),
-                    room_ids=[room_id],
+                # Route through the device handler: only device list writers
+                # may add to the stream, and this may run on any worker.
+                await self._device_handler.notify_device_update(
+                    user_id, list(cached_devices), room_ids=[room_id]
                 )
-                if position:
-                    self._notifier.on_new_event(
-                        StreamKeyType.DEVICE_LIST, position, rooms=[room_id]
-                    )
 
             await self.store.mark_remote_users_device_caches_as_stale((user_id,))
 

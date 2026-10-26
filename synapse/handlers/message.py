@@ -1099,6 +1099,16 @@ class EventCreationHandler:
                 if event:
                     # we know it was persisted, so must have a stream ordering
                     assert event.internal_metadata.stream_ordering
+                    # The first attempt may have persisted the tombstone but
+                    # failed while transferring room state. Retrying with the
+                    # same transaction ID returns the stored event, so finish
+                    # the transfer here before returning it.
+                    if (
+                        event.type == EventTypes.Tombstone
+                        and event.is_state()
+                        and event.state_key == ""
+                    ):
+                        await self._transfer_state_for_manual_upgrade(event)
                     return (
                         event,
                         event.internal_metadata.stream_ordering,

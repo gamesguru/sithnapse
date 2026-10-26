@@ -655,6 +655,7 @@ class DeviceHandler:
 
         for room_id, event in last_membership_event_by_room.items():
             if event.membership == Membership.JOIN:
+                newly_joined_rooms.add(room_id)
                 newly_left_rooms.discard(room_id)
             elif event.membership in (Membership.LEAVE, Membership.BAN):
                 newly_joined_rooms.discard(room_id)
@@ -960,7 +961,10 @@ class DeviceHandler:
     @trace
     @measure_func("notify_device_update")
     async def notify_device_update(
-        self, user_id: str, device_ids: StrCollection
+        self,
+        user_id: str,
+        device_ids: StrCollection,
+        room_ids: StrCollection | None = None,
     ) -> None:
         """Notify that a user's device(s) has changed. Pokes the notifier, and
         remote servers if the user is local.
@@ -968,11 +972,14 @@ class DeviceHandler:
         Args:
             user_id: The Matrix ID of the user who's device list has been updated.
             device_ids: The device IDs that have changed.
+            room_ids: If given, scope the update to these rooms instead of every
+                room the user is in.
         """
         await self._notify_device_update_client(
             instance_name=random.choice(self._device_list_writers),
             user_id=user_id,
             device_ids=list(device_ids),
+            room_ids=None if room_ids is None else list(room_ids),
         )
 
     async def notify_user_signature_update(
@@ -1094,7 +1101,10 @@ class DeviceWriterHandler(DeviceHandler):
     @trace
     @measure_func("notify_device_update")
     async def notify_device_update(
-        self, user_id: str, device_ids: StrCollection
+        self,
+        user_id: str,
+        device_ids: StrCollection,
+        room_ids: StrCollection | None = None,
     ) -> None:
         """Notify that a user's device(s) has changed. Pokes the notifier, and
         remote servers if the user is local.
@@ -1102,12 +1112,15 @@ class DeviceWriterHandler(DeviceHandler):
         Args:
             user_id: The Matrix ID of the user who's device list has been updated.
             device_ids: The device IDs that have changed.
+            room_ids: If given, scope the update to these rooms instead of every
+                room the user is in.
         """
         if not device_ids:
             # No changes to notify about, so this is a no-op.
             return
 
-        room_ids = await self.store.get_rooms_for_user(user_id)
+        if room_ids is None:
+            room_ids = await self.store.get_rooms_for_user(user_id)
 
         position = await self.store.add_device_change_to_streams(
             user_id,

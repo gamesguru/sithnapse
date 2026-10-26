@@ -68,6 +68,72 @@ class _StubEventSourceStore:
 
 
 class EventAuthTestCase(unittest.TestCase):
+    def test_rejected_member_auth_events_in_partial_state(self) -> None:
+        """Only the sender's own join rejected for lack of partial state is forgiven;
+        a rejected invite (e.g. on an invite-only room) is not.
+        """
+        creator = "@creator:example.com"
+        user = "@user:remote.example"
+        create = _create_event(RoomVersions.V10, creator)
+        join_rules = _join_rules_event(RoomVersions.V10, creator, "invite")
+
+        def check(rejected: EventBase, allow: bool) -> None:
+            store = _StubEventSourceStore()
+            auth = [create, join_rules, rejected]
+            store.add_events(auth)
+            join = make_test_event(
+                {
+                    "room_id": TEST_ROOM_ID,
+                    **_maybe_get_event_id_dict_for_room_version(RoomVersions.V10),
+                    "type": "m.room.member",
+                    "sender": user,
+                    "state_key": user,
+                    "content": {"membership": "join"},
+                    "auth_events": _build_auth_dict_for_room_version(
+                        RoomVersions.V10, auth
+                    ),
+                },
+                room_version=RoomVersions.V10,
+            )
+            get_awaitable_result(
+                event_auth.check_state_independent_auth_rules(
+                    store, join, allow_rejected_auth_events=allow
+                )
+            )
+
+        rejected_join = _member_event(
+            RoomVersions.V10,
+            user,
+            "join",
+            rejected_reason=RejectedReason.PARTIAL_STATE_AUTH_ERROR,
+        )
+        check(rejected_join, allow=True)
+        with self.assertRaises(AuthError):
+            check(rejected_join, allow=False)
+
+        # A rejected invite is never forgiven, even for a partial-state reason.
+        rejected_invite = _member_event(
+            RoomVersions.V10,
+            user,
+            "invite",
+            sender=creator,
+            rejected_reason=RejectedReason.PARTIAL_STATE_AUTH_ERROR,
+        )
+        with self.assertRaises(AuthError):
+            check(rejected_invite, allow=True)
+
+        # A join rejected for any other reason is not forgiven.
+        with self.assertRaises(AuthError):
+            check(
+                _member_event(
+                    RoomVersions.V10,
+                    user,
+                    "join",
+                    rejected_reason=RejectedReason.AUTH_ERROR,
+                ),
+                allow=True,
+            )
+
     def test_rejected_auth_events(self) -> None:
         """
         Events that refer to rejected events in their auth events are rejected
@@ -1089,6 +1155,7 @@ def _member_event(
     membership: str,
     sender: str | None = None,
     additional_content: dict | None = None,
+    rejected_reason: str | None = None,
 ) -> EventBase:
     return make_test_event(
         {
@@ -1102,6 +1169,7 @@ def _member_event(
             "prev_events": [],
         },
         room_version=room_version,
+        rejected_reason=rejected_reason,
     )
 
 

@@ -18,6 +18,7 @@
 # [This file includes modifications made by New Vector Limited]
 #
 #
+import json
 from typing import Any, cast
 
 import attr
@@ -29,6 +30,13 @@ from synapse.storage.database import LoggingTransaction
 from synapse.types import JsonDict
 from synapse.util import stringutils
 from synapse.util.json import json_encoder
+
+
+def _canonical_clientdict_json(clientdict: JsonDict) -> str:
+    """Encode a clientdict with sorted keys so equal dicts serialize identically."""
+    return json.dumps(
+        clientdict, sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
 
 
 @attr.s(slots=True, auto_attribs=True)
@@ -83,8 +91,9 @@ class UIAuthWorkerStore(SQLBaseStore):
         Raises:
             StoreError if a unique session ID cannot be generated.
         """
-        # The clientdict gets stored as JSON.
-        clientdict_json = json_encoder.encode(clientdict)
+        # The clientdict gets stored as JSON with sorted keys, so that lookups
+        # by `get_ui_auth_session_for_clientdict` ignore key order.
+        clientdict_json = _canonical_clientdict_json(clientdict)
 
         # autogen a session ID and try to create it. We may clash, so just
         # try a few times till one goes through, giving up eventually.
@@ -143,37 +152,87 @@ class UIAuthWorkerStore(SQLBaseStore):
     ) -> UIAuthSessionData | None:
         """Find the newest UIA session matching the encoded parameters, URI, and method.
 
-        clientdict should omit the auth field. Matching uses its serialized JSON,
-        including key order. Return None if no session matches; serialization
-        and database errors propagate.
+        clientdict should omit the auth field. Matching uses its sorted-key
+        serialized JSON, so reordered keys match. Stored parameters are decoded
+        and canonicalized too, so sessions created before this behavior was
+        introduced continue to match. Return None if no session matches;
+        serialization and database errors propagate.
         """
-        clientdict_json = json_encoder.encode(clientdict)
-        rows = cast(
-            list[tuple[str, str, str, str, str, int]],
-            await self.db_pool.simple_select_list(
-                table="ui_auth_sessions",
-                keyvalues={
-                    "clientdict": clientdict_json,
-                    "uri": uri,
-                    "method": method,
-                },
-                retcols=(
-                    "session_id",
-                    "clientdict",
-                    "uri",
-                    "method",
-                    "description",
-                    "creation_time",
-                ),
-                desc="get_ui_auth_session_for_clientdict",
-            ),
+        canonical_json = _canonical_clientdict_json(clientdict)
+
+        def _get_txn(txn: LoggingTransaction) -> tuple[str, str, str, str, str] | None:
+            """Return the newest matching session, examining one candidate at a time."""
+            last_creation_time: int | None = None
+            last_session_id: str | None = None
+
+            while True:
+                if last_creation_time is None:
+                    txn.execute(
+                        """
+                        SELECT session_id, clientdict, uri, method, description,
+                               creation_time
+                        FROM ui_auth_sessions
+                        WHERE uri = ? AND method = ?
+                        ORDER BY creation_time DESC, session_id DESC
+                        LIMIT 1
+                        """,
+                        (uri, method),
+                    )
+                else:
+                    txn.execute(
+                        """
+                        SELECT session_id, clientdict, uri, method, description,
+                               creation_time
+                        FROM ui_auth_sessions
+                        WHERE uri = ? AND method = ?
+                          AND (creation_time < ?
+                               OR (creation_time = ? AND session_id < ?))
+                        ORDER BY creation_time DESC, session_id DESC
+                        LIMIT 1
+                        """,
+                        (
+                            uri,
+                            method,
+                            last_creation_time,
+                            last_creation_time,
+                            last_session_id,
+                        ),
+                    )
+
+                row = txn.fetchone()
+                if row is None:
+                    return None
+
+                (
+                    session_id,
+                    stored_clientdict,
+                    stored_uri,
+                    stored_method,
+                    description,
+                    creation_time,
+                ) = row
+                if (
+                    _canonical_clientdict_json(db_to_json(stored_clientdict))
+                    == canonical_json
+                ):
+                    return (
+                        session_id,
+                        stored_clientdict,
+                        stored_uri,
+                        stored_method,
+                        description,
+                    )
+
+                last_creation_time = creation_time
+                last_session_id = session_id
+
+        row = await self.db_pool.runInteraction(
+            "get_ui_auth_session_for_clientdict", _get_txn
         )
-        if not rows:
+        if row is None:
             return None
 
-        session_id, stored_clientdict, stored_uri, stored_method, description, _ = max(
-            rows, key=lambda row: row[5]
-        )
+        session_id, stored_clientdict, stored_uri, stored_method, description = row
         return UIAuthSessionData(
             session_id,
             clientdict=db_to_json(stored_clientdict),
@@ -250,8 +309,9 @@ class UIAuthWorkerStore(SQLBaseStore):
             clientdict:
                 The dictionary from the client root level, not the 'auth' key.
         """
-        # The clientdict gets stored as JSON.
-        clientdict_json = json_encoder.encode(clientdict)
+        # The clientdict gets stored as JSON with sorted keys, so that lookups
+        # by `get_ui_auth_session_for_clientdict` ignore key order.
+        clientdict_json = _canonical_clientdict_json(clientdict)
 
         await self.db_pool.simple_update_one(
             table="ui_auth_sessions",

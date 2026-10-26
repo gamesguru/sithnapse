@@ -1870,8 +1870,13 @@ class DeviceWorkerStore(RoomMemberWorkerStore, EndToEndKeyWorkerStore):
                 to_token,
                 len(room_ids),
                 len(changed_room_ids),
-                sorted(changed_users) if changed_users is not None else "too old",
+                len(changed_users) if changed_users is not None else "too old",
             )
+            if changed_users is not None and logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "Device-list room-change lookup returned changed users: %s",
+                    sorted(changed_users),
+                )
         return changed_users
 
     async def get_all_device_list_changes(self, from_id: int, to_id: int) -> set[str]:

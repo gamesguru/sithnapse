@@ -213,6 +213,9 @@ class EduTypes:
 class RejectedReason:
     AUTH_ERROR: Final = "auth_error"
     OVERSIZED_EVENT: Final = "oversized_event"
+    # An auth failure in a partial-state room, where the state needed to auth
+    # the event may simply have been missing.
+    PARTIAL_STATE_AUTH_ERROR: Final = "partial_state_auth_error"
 
 
 class RoomCreationPreset:

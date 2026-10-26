@@ -37,6 +37,7 @@ from typing import (
 from prometheus_client import Gauge
 
 from twisted.internet import defer
+from twisted.python import threadable
 from twisted.python.failure import Failure
 
 from synapse.logging.context import PreserveLoggingContext
@@ -399,14 +400,20 @@ class DeferredCache(Generic[KT, VT]):
         may be of lower cardinality than the TreeCache - in which case the whole
         subtree is deleted.
 
-        Once the cache has an owning thread, calls from other threads queue
-        invalidation on the reactor asynchronously. Invalidation also
+        Calls from a thread other than the owning thread (or, before the cache
+        has an owner, any non-reactor thread) queue invalidation on the reactor
+        asynchronously. Invalidation also
         discards pending lookups for the key and runs their invalidation callbacks.
         """
         # LruCache invalidation callbacks can run from __del__ when the last
         # reference to an LruCache is released on a database thread. Keep the
         # DeferredCache reactor-thread-only by marshalling the invalidation.
-        if self.thread is not None and self.thread is not threading.current_thread():
+        # Until a thread has used the cache, only the reactor thread may claim it.
+        if self.thread is None:
+            off_owner_thread = not threadable.isInIOThread()
+        else:
+            off_owner_thread = self.thread is not threading.current_thread()
+        if off_owner_thread:
             reactor = cast(ISynapseReactor, self._clock._reactor)
             reactor.callFromThread(self.invalidate, key)
             return

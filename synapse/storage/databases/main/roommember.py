@@ -693,6 +693,17 @@ class RoomMemberWorkerStore(EventsWorkerStore, CacheInvalidationWorkerStore):
                     "event_stream_ordering": event_stream_ordering,
                 },
             )
+            self._invalidate_cache_and_stream(
+                txn, self.get_local_users_in_room, (room_id,)
+            )
+            self._invalidate_cache_and_stream(
+                txn,
+                self._get_rooms_for_local_user_where_membership_is_inner,
+                (user_id,),
+            )
+            self._invalidate_cache_and_stream(
+                txn, self.get_invited_rooms_for_local_user, (user_id,)
+            )
 
         await self.db_pool.runInteraction(
             "set_local_current_membership",

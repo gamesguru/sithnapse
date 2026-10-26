@@ -2725,7 +2725,13 @@ class FederationEventHandler:
                 event,
                 e,
             )
-            context.rejected = RejectedReason.AUTH_ERROR
+            context.rejected = (
+                RejectedReason.PARTIAL_STATE_AUTH_ERROR
+                if context.partial_state
+                and event.type == EventTypes.Member
+                and event.membership == Membership.JOIN
+                else RejectedReason.AUTH_ERROR
+            )
 
     @trace
     async def _maybe_kick_guest_users(self, event: EventBase) -> None:
