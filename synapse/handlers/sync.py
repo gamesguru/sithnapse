@@ -3074,13 +3074,9 @@ class SyncHandler:
         for event in membership_change_events:
             mem_change_events_by_room_id.setdefault(event.room_id, []).append(event)
 
-        # A room which became fully-stated during this sync period must be
-        # presented as newly joined in `rooms.join` so the client receives its
-        # full state. It is not a membership join, though, and must not trigger
-        # presence or device-list updates for every room member.
-        forced_newly_joined_room_ids = sync_result_builder.forced_newly_joined_room_ids
-        newly_joined_room_ids_for_response = set(forced_newly_joined_room_ids)
-        newly_joined_rooms: list[str] = []
+        newly_joined_rooms: list[str] = list(
+            sync_result_builder.forced_newly_joined_room_ids
+        )
         newly_left_rooms: list[str] = []
         room_entries: list[RoomSyncResultBuilder] = []
         invited: list[InvitedSyncResult] = []
@@ -3257,10 +3253,7 @@ class SyncHandler:
         for room_id in sync_result_builder.joined_room_ids:
             room_entry = room_to_events.get(room_id, None)
 
-            newly_joined = (
-                room_id in newly_joined_room_ids_for_response
-                or room_id in newly_joined_rooms
-            )
+            newly_joined = room_id in newly_joined_rooms
             if room_entry:
                 events, start_key, _ = room_entry
                 # We want to return the events in ascending order (the last event is the
