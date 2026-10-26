@@ -2039,6 +2039,18 @@ class PresenceEventSource(EventSource[int, UserPresenceState]):
         include_offline: bool = True,
         service: ApplicationService | None = None,
     ) -> tuple[list[UserPresenceState], int]:
+        """Return current presence updates for users visible to the syncing user.
+
+        Use changes after from_key, or all visible presence when it is None.
+        Include users on servers known to be in the user's partial-state rooms,
+        plus users selected by the presence router or explicit_room_id. Exclude
+        offline states when include_offline is False.
+
+        Return the updates and current presence token. Updates can exceed that
+        token and be repeated in later calls; return no updates when from_key
+        already equals it. The limit, room_ids, is_guest, and service arguments
+        are unused. Storage and presence-provider errors propagate.
+        """
         # The process for getting presence events are:
         #  1. Get the rooms the user is in.
         #  2. Get the list of user in the rooms.

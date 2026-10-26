@@ -94,9 +94,8 @@ def _write_process_cpu() -> None:
     """Snapshot this process's cpu time against its wall time.
 
     Replace proc_<pid>.json in SYNAPSE_TIMINGS_RUN_DIR when set; filesystem
-    errors are ignored. Both values are in seconds: CPU time is cumulative
-    since process start (or fork), while wall time starts at this module's
-    import (or the child fork hook).
+    errors are ignored. Both values are in seconds since this module's import
+    or the most recent child fork hook, which resets both baselines.
 
     ``process_time`` sums every thread's user and system time. A low
     cpu/wall ratio only says the process spent its time off-cpu (descheduled,

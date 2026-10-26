@@ -2468,6 +2468,12 @@ class FederationHandler:
         """
 
         async def _sync_partial_state_room_wrapper() -> None:
+            """Run one room resync, scheduling retries or abandoning a failed join.
+
+            Resync exceptions count toward the retry limit; a concurrent join can
+            request a fresh attempt. When retries end, release abandonment waiters
+            and attempt to make local users leave the room.
+            """
             if room_id in self._active_partial_state_syncs:
                 # Another local user has joined the room while there is already a
                 # partial state sync running. This implies that there is a new join
@@ -2627,7 +2633,9 @@ class FederationHandler:
 
         A partially-joined room is unusable if we cannot fetch its state, so
         make the local users leave rather than leaving the room stuck in a
-        partial state forever.
+        partial state forever. Update each successful leave's local membership
+        snapshot. Failures for individual users are caught so other users can
+        still leave; failure to load the initial user list propagates.
         """
         local_users = await self.store.get_local_users_in_room(room_id)
         if not local_users:
@@ -2670,8 +2678,10 @@ class FederationHandler:
         The room's current state was based on incomplete state, so the resync
         may discover that a remote user was not actually in the room (or was
         in the room when we thought they were not). We may have missed device
-        list updates for them in the meantime, so flush any cached devices and
-        tell clients that share the room to refetch their keys.
+        list updates for them in the meantime, so mark existing device snapshots
+        stale and notify the room about cached devices. Skip local users and
+        remote users with no cached snapshot, including no recorded stream ID.
+        Storage errors propagate.
         """
         for user_id in changed_users:
             if self.is_mine_id(user_id):

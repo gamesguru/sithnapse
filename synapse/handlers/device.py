@@ -597,6 +597,10 @@ class DeviceHandler:
     ) -> DeviceListUpdates:
         """Get list of users that have had the devices updated, or have newly
         joined a room, that `user_id` may be interested in.
+
+        Return users with device changes and users no longer sharing a room since
+        from_token, including leaves from partial-state rooms. Remote users reported
+        as left are unsubscribed from device-list tracking.
         """
 
         set_tag("user_id", user_id)
@@ -772,8 +776,15 @@ class DeviceHandler:
     ) -> DeviceListUpdates:
         """Generate the DeviceListUpdates section of sync
 
+        Read membership at since_token for rooms the user left, without waiting
+        for partial-state resync. Unsubscribe remote users no longer sharing a
+        room. Input sets are not modified; storage errors propagate.
+
         Args:
-            sync_result_builder
+            user_id: User receiving the sync response
+            since_token: Previous sync position
+            now_token: Current position for device-change lookups
+            joined_room_ids: Rooms the user is currently joined to
             newly_joined_rooms: Set of rooms user has joined since previous sync
             newly_joined_or_invited_or_knocked_users: Set of users that have joined,
                 been invited to a room or are knocking on a room since
@@ -781,6 +792,10 @@ class DeviceHandler:
             newly_left_rooms: Set of rooms user has left since previous sync
             newly_left_users: Set of users that have left a room we're in since
                 previous sync
+
+        Returns:
+            Users whose keys should be refreshed and users no longer tracked,
+            excluding nonlocal user IDs that are not spec compliant.
         """
         # Take a copy since these fields will be mutated later.
         newly_joined_or_invited_or_knocked_users = set(

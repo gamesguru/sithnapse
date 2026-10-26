@@ -736,8 +736,10 @@ class BaseV2KeyFetcher(KeyFetcher):
         GET /_matrix/key/v2/server, or a single entry from the list returned by
         POST /_matrix/key/v2/query.
 
-        Checks that each signature in the response that claims to come from the origin
-        server is valid, and that there is at least one such signature.
+        Validates an origin-server signature using a supported active key.
+        Rejects responses with more than 50 active or 3,000 retired keys, or
+        different active and retired key bodies for the same ID. Ignores retired
+        entries whose expiry is more than five minutes after time_added_ms.
 
         Stores the json in server_keys_json so that it can be used for future responses
         to /_matrix/key/v2/query.
@@ -749,10 +751,17 @@ class BaseV2KeyFetcher(KeyFetcher):
 
             response_json: the json-decoded Server Keys response object
 
-            time_added_ms: the timestamp to record in server_keys_json
+            time_added_ms: the timestamp in milliseconds since the Unix epoch
+                to record in server_keys_json and use for retired-key expiry checks
 
         Returns:
-            Map from key_id to result object
+            Map from key_id to result object, after storage conflict resolution.
+
+        Raises:
+            KeyLookupError: If key-count limits are exceeded, active and retired
+                key bodies conflict, or no usable origin signature is present.
+            SignatureVerifyException: If the selected origin signature is invalid.
+                Key decoding and storage errors also propagate.
         """
         processing_started = time.perf_counter()
         ts_valid_until_ms = response_json["valid_until_ts"]
@@ -1130,7 +1139,7 @@ class ServerKeyFetcher(BaseV2KeyFetcher):
     async def get_server_verify_keys_v2_direct(
         self, server_name: str
     ) -> dict[str, FetchKeyResult]:
-        """
+        """Fetch and store a server's keys directly, rejecting duplicate JSON keys.
 
         Args:
             server_name: Server to request keys from

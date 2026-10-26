@@ -52,6 +52,7 @@ class ReplicationRemoteJoinRestServlet(ReplicationEndpoint):
     PATH_ARGS = ("room_id", "user_id")
 
     def __init__(self, hs: "HomeServer"):
+        """Initialize the handlers and store used to perform remote joins."""
         super().__init__(hs)
 
         self.federation_handler = hs.get_federation_handler()
@@ -87,6 +88,11 @@ class ReplicationRemoteJoinRestServlet(ReplicationEndpoint):
     async def _handle_request(  # type: ignore[override]
         self, request: SynapseRequest, content: JsonDict, room_id: str, user_id: str
     ) -> tuple[int, JsonDict]:
+        """Join via the supplied remote hosts and announce the user's devices.
+
+        Attach the deserialized requester to the request. Return status 200 with
+        the join event_id and stream_id. Join and notification errors propagate.
+        """
         remote_room_hosts = content["remote_room_hosts"]
         event_content = content["content"]
 

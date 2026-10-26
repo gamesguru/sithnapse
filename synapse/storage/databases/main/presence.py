@@ -298,6 +298,9 @@ class PresenceStore(PresenceBackgroundUpdateStore, CacheInvalidationWorkerStore)
 
         Partial-state joins know which servers were in the room, but may not
         yet know the room membership of users on those servers.
+
+        Return an empty set for no servers. Exclude offline users when
+        include_offline is False. Database errors propagate.
         """
         if not server_names:
             return set()
@@ -305,6 +308,7 @@ class PresenceStore(PresenceBackgroundUpdateStore, CacheInvalidationWorkerStore)
         def _get_users_with_presence_on_servers_txn(
             txn: LoggingTransaction,
         ) -> set[str]:
+            """Select user IDs matching the server suffixes and offline filter."""
             server_clauses = ["user_id LIKE ?" for _ in server_names]
             args: list[str] = [f"%:{server_name}" for server_name in server_names]
             sql = (

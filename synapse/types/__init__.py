@@ -1627,7 +1627,12 @@ class SlidingSyncStreamToken:
     @staticmethod
     @cancellable
     async def from_string(store: "DataStore", string: str) -> "SlidingSyncStreamToken":
-        """Creates a SlidingSyncStreamToken from its textual representation."""
+        """Creates a SlidingSyncStreamToken from its textual representation.
+
+        Raises:
+            SlidingSyncUnknownPosition: If parsing or loading the token fails,
+                signaling M_UNKNOWN_POS (400). Cancellation propagates unchanged.
+        """
         try:
             connection_position_str, stream_token_str = string.split("/", 1)
             connection_position = int(connection_position_str)

@@ -331,6 +331,9 @@ class PerDestinationQueue:
         """Add a RR to the list to be sent. Doesn't start the transmission loop yet
         (see flush_read_receipts_for_room)
 
+        Replace a queued receipt for the same room, receipt type, user, and
+        thread. For that room/type/user, keep different threads in separate EDUs.
+
         Args:
             receipt: receipt to be queued
         """

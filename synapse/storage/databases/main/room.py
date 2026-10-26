@@ -3142,6 +3142,12 @@ class RoomStore(RoomBackgroundUpdateStore, RoomWorkerStore):
         device_lists_stream_id: int,
         joined_via: str,
     ) -> None:
+        """Record a partial join and schedule invalidation of partial-state caches.
+
+        Store servers known at join, the device-list position at join, and the
+        server joined_via; leave the join event ID unset until it is persisted.
+        Database errors propagate.
+        """
         DatabasePool.simple_insert_txn(
             txn,
             table="partial_state_rooms",
@@ -3338,6 +3344,12 @@ class RoomStore(RoomBackgroundUpdateStore, RoomWorkerStore):
         room_id: str,
         un_partial_state_room_stream_id: int,
     ) -> None:
+        """Clear a room's partial-state records and emit its completion stream row.
+
+        Schedule cache invalidations and remove pending remote device updates no
+        longer needed by any partial-state room. Database errors propagate;
+        clear_partial_state_room converts integrity errors to None.
+        """
         DatabasePool.simple_delete_txn(
             txn,
             table="partial_state_rooms_servers",

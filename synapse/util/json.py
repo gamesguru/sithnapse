@@ -68,6 +68,9 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     The standard decoder silently keeps the last value for a repeated key, which
     lets an attacker present different content to parsers that disagree about
     which value wins.
+
+    Raises:
+        ValueError: If any key occurs more than once, even with the same value.
     """
     result: dict[str, Any] = {}
     for key, value in pairs:

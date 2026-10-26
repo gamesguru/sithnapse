@@ -103,7 +103,13 @@ async def filter_and_transform_events_for_client(
     Returns:
         The filtered events, wrapped in FilteredEvent with the requesting user's
         membership at each event annotated for use during serialization (MSC4115).
-        The events are returned in the same order.
+        The events are returned in the same order. Outliers without state are
+        omitted unless they are the user's own membership events.
+
+    Raises:
+        Exception: If a visible non-outlier other than the user's own membership
+            event lacks the state needed to annotate membership. Storage errors
+            also propagate.
     """
     # Filter out events that have been soft failed so that we don't relay them
     # to clients, unless they're a server admin and want that to happen.
@@ -177,6 +183,11 @@ async def filter_and_transform_events_for_client(
             ] = await storage.main.get_retention_policy_for_room(room_id)
 
     def allowed(event: EventBase) -> FilteredEvent | None:
+        """Return a visible event with membership attached, or None if filtered out.
+
+        Omit outliers lacking state unless they are the user's own membership.
+        Raise Exception if another event lacks the state needed for annotation.
+        """
         state_after_event = event_id_to_state.get(event.event_id)
         filtered = _check_client_allowed_to_see_event(
             user_id=user_id,

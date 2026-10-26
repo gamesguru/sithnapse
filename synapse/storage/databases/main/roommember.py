@@ -682,6 +682,7 @@ class RoomMemberWorkerStore(EventsWorkerStore, CacheInvalidationWorkerStore):
         """
 
         def _set_local_current_membership_txn(txn: LoggingTransaction) -> None:
+            """Insert or replace the local membership snapshot with the supplied event."""
             self.db_pool.simple_upsert_txn(
                 txn,
                 table="local_current_membership",
@@ -752,6 +753,12 @@ class RoomMemberWorkerStore(EventsWorkerStore, CacheInvalidationWorkerStore):
         txn: LoggingTransaction,
         user_ids: Collection[str],
     ) -> set[str]:
+        """Return supplied users joined to a room with a joined local user.
+
+        Use local_current_membership to check local joins, since current room state
+        may lag leaves from partial-state rooms. Return an empty set for no users;
+        database errors propagate.
+        """
         if not user_ids:
             return set()
 

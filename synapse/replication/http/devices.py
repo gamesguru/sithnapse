@@ -66,6 +66,11 @@ class ReplicationNotifyDeviceUpdateRestServlet(ReplicationEndpoint):
     async def _handle_request(  # type: ignore[override]
         self, request: Request, content: JsonDict, user_id: str
     ) -> tuple[int, JsonDict]:
+        """Invalidate the user's cached rooms, then notify the device writer.
+
+        Read device_ids from content and return (200, {}) after notification.
+        Notification errors propagate.
+        """
         device_ids = content["device_ids"]
 
         span = active_span()

@@ -898,6 +898,10 @@ class ReceiptsWorkerStore(SQLBaseStore):
         token: int,
         rows: Iterable[Any],
     ) -> None:
+        """Advance receipt writer progress and invalidate caches for changed receipts.
+
+        Mark affected rooms changed at token, then delegate to the base store.
+        """
         if stream_name == ReceiptsStream.NAME:
             rows = list(rows)
             logger.debug(
@@ -928,6 +932,7 @@ class ReceiptsWorkerStore(SQLBaseStore):
     def process_replication_position(
         self, stream_name: str, instance_name: str, token: int
     ) -> None:
+        """Advance the named writer's receipt position, then delegate to the base store."""
         if stream_name == ReceiptsStream.NAME:
             logger.debug(
                 "[receipts-trace] position instance=%s token=%s",

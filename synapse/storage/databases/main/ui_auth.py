@@ -141,7 +141,12 @@ class UIAuthWorkerStore(SQLBaseStore):
     async def get_ui_auth_session_for_clientdict(
         self, clientdict: JsonDict, uri: str, method: str
     ) -> UIAuthSessionData | None:
-        """Find a UIA session which the client may have accidentally omitted."""
+        """Find the newest UIA session matching the encoded parameters, URI, and method.
+
+        clientdict should omit the auth field. Matching uses its serialized JSON,
+        including key order. Return None if no session matches; serialization
+        and database errors propagate.
+        """
         clientdict_json = json_encoder.encode(clientdict)
         rows = cast(
             list[tuple[str, str, str, str, str, int]],

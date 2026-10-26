@@ -62,18 +62,26 @@ class KeyStore(CacheInvalidationWorkerStore):
         response_json: JsonDict,
     ) -> dict[str, FetchKeyResult]:
         """Stores the keys for the given server that we got from `from_server`,
-        atomically enforcing MSC4499 First Seen Wins.
+        atomically enforcing MSC4499 First Seen Wins, except that direct origin
+        responses may replace conflicting provisional notary bindings.
+
+        Retain at most 3,000 retired keys per server, evicting keys with unknown
+        or earliest expiry first. Retired means expiry is absent or at most
+        ts_added_ms. Eviction removes stored key responses and invalidates caches.
+        Encoding and storage errors propagate.
 
         Args:
             server_name: The owner of the keys
             from_server: Which server we got the keys from
-            ts_added_ms: When we're adding the keys
+            ts_added_ms: When we're adding the keys, in milliseconds since
+                the Unix epoch
             verify_keys: The decoded keys
             response_json: The full *signed* response JSON that contains the keys.
 
         Returns:
-            The authoritative map of key_id -> FetchKeyResult (retaining any
-            previously-bound key bodies on collision).
+            Map of supplied key IDs to results, retaining stored results on
+            collisions unless the origin overrides a notary binding. The map
+            can include retired keys evicted by this call.
         """
 
         key_json_bytes = encode_canonical_json(response_json)
@@ -82,6 +90,11 @@ class KeyStore(CacheInvalidationWorkerStore):
         def store_server_keys_response_txn(
             txn: LoggingTransaction,
         ) -> dict[str, FetchKeyResult]:
+            """Resolve key bindings, store signed responses, and evict excess retired keys.
+
+            Schedule cache invalidations and return results for the supplied key IDs,
+            including any retired keys evicted in this transaction.
+            """
             txn_started = time.perf_counter()
             final_keys: dict[str, FetchKeyResult] = dict(verify_keys)
             keys_to_persist: dict[str, FetchKeyResult] = dict(verify_keys)

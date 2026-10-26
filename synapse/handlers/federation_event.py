@@ -861,6 +861,10 @@ class FederationEventHandler:
     ) -> None:
         """Recalculate the state at an event as part of a de-partial-stating process
 
+        If a remote membership event changes rejection status, mark any existing
+        device snapshot stale. Return without updating the event if its newly
+        computed context still has partial state.
+
         Args:
             destination: server to request full state from
             event: partial-state event to be de-partial-stated
@@ -2564,6 +2568,7 @@ class FederationEventHandler:
         Raises:
             AuthError if we were unable to find copies of the event's auth events.
                (Most other failures just cause us to set `context.rejected`.)
+            EventSizeError if the event is too large to persist at all.
         """
         # This method should only be used for non-outliers
         assert not event.internal_metadata.outlier

@@ -1135,6 +1135,22 @@ class EventCreationHandler:
         prev_state_events: StrCollection | None = None,
         delay_id: str | None = None,
     ) -> tuple[EventBase, int]:
+        """Create and persist a nonmembership event while the caller holds room locks.
+
+        Arguments have the same meaning as in `create_and_send_nonmember_event`.
+        For an empty or omitted prev_event_ids, require the requester to be joined.
+        After persisting a tombstone, attempt the matching manual-upgrade transfer.
+
+        Returns:
+            The persisted event (possibly an existing duplicate) and its stream ordering.
+
+        Raises:
+            AuthError: If the membership check fails.
+            SynapseError: If policy or spam checks reject the event.
+            PartialStateConflictError: If persistence still conflicts after five attempts.
+                Other event-creation, persistence, and upgrade-transfer errors propagate;
+                a transfer failure occurs after the event has been persisted.
+        """
         room_id = event_dict["room_id"]
 
         # If we don't have any prev event IDs specified then we need to
@@ -1255,6 +1271,11 @@ class EventCreationHandler:
         its predecessor, then send a tombstone into the old room. `upgrade_room` isn't
         involved, so copy the users' push rules/tags and the room directory state here
         once both halves are in place.
+
+        Return without transferring if the replacement ID is not a string, the
+        replacement room is unknown, or its predecessor does not match. A missing
+        room's NotFoundError is caught. Other room-lookup and directory-update
+        errors propagate; the transfer helper catches failures copying user state.
         """
         new_room_id = tombstone.content.get(EventContentFields.TOMBSTONE_SUCCESSOR_ROOM)
         if not isinstance(new_room_id, str):

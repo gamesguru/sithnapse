@@ -253,6 +253,13 @@ class StrictJsonParser(JsonParser):
     """A `JsonParser` which also rejects objects with duplicate keys at any depth."""
 
     def finish(self) -> JsonDict:
+        """Decode the buffered response as a JSON object.
+
+        Raises:
+            ValueError: If the JSON is malformed, contains duplicate object keys
+                at any depth, uses NaN, Infinity, or -Infinity constants, or is
+                not an object.
+        """
         result = strict_json_decoder.decode(self._buffer.getvalue())
         if not self._validate(result):
             raise ValueError(

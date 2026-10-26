@@ -398,6 +398,10 @@ class DeferredCache(Generic[KT, VT]):
         If the cache is backed by a TreeCache, then "key" must be a tuple, but
         may be of lower cardinality than the TreeCache - in which case the whole
         subtree is deleted.
+
+        Once the cache has an owning thread, calls from other threads queue
+        invalidation on the reactor asynchronously. Invalidation also
+        discards pending lookups for the key and runs their invalidation callbacks.
         """
         # LruCache invalidation callbacks can run from __del__ when the last
         # reference to an LruCache is released on a database thread. Keep the

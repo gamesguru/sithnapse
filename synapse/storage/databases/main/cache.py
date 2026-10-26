@@ -341,6 +341,13 @@ class CacheInvalidationWorkerStore(SQLBaseStore):
         super().process_replication_position(stream_name, instance_name, token)
 
     def _process_event_stream_row(self, token: int, row: EventsStreamRow) -> None:
+        """Invalidate event or room-state caches and advance their change markers.
+
+        Use token as the change position for the supplied replication row.
+
+        Raises:
+            Exception: If the events-stream row type is unknown.
+        """
         # This is needed to avoid a circular import.
         from synapse.storage.databases.main.events import (
             SLIDING_SYNC_RELEVANT_STATE_SET,

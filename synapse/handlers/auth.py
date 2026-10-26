@@ -459,6 +459,7 @@ class AuthHandler:
 
             clientdict: The dictionary from the client root level, not the
                         'auth' key: this method prompts for auth if none is sent.
+                        The 'auth' key is removed from this dictionary in place.
 
             description: A human readable string to be displayed to the user that
                          describes the operation happening on their account.
@@ -470,8 +471,9 @@ class AuthHandler:
                 The keys of the returned data should be entries in
                 UIAuthSessionDataConstants.
 
-            require_existing_session: If True, reject an auth payload without a
-                session when a matching UIA session already exists.
+            require_existing_session: If True, reject a nonempty auth payload
+                without a session ID when a session matches the remaining request
+                parameters, URI, and method.
 
         Returns:
             A tuple of (creds, params, session_id).
@@ -487,6 +489,9 @@ class AuthHandler:
         Raises:
             InteractiveAuthIncompleteError if the client has not yet completed
                 all the stages in any of the permitted flows.
+            SynapseError: With status 401 for an omitted required session ID,
+                400 for an unknown session ID, or 403 if the session's URI or
+                method has changed. Storage errors also propagate.
         """
 
         sid: str | None = None

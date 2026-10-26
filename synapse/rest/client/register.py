@@ -470,6 +470,22 @@ class RegisterRestServlet(RestServlet):
 
     @interactive_auth_handler
     async def on_POST(self, request: SynapseRequest) -> tuple[int, JsonDict]:
+        """Handle user, guest, or application-service account registration.
+
+        Normal registration uses UIA and reuses the account on completed-session
+        retries. A retry with nonempty auth but no session ID is rejected
+        when the remaining request parameters match an existing session, except
+        for guest upgrades. Successful requests return status 200 and registration
+        details, including tokens when requested and permitted. When UIA requires
+        further stages, the decorator converts InteractiveAuthIncompleteError
+        into a 401 response with the available flows and session.
+
+        Raises:
+            NotApprovedError: If a newly registered account requires approval.
+            SynapseError: For invalid or disallowed requests, including a required
+                UIA session ID omitted on retry (401). Authentication, rate-limit,
+                and storage errors also propagate.
+        """
         body = parse_json_object_from_request(request)
         # Only the `auth` field is validated here. The raw body is kept because
         # `check_ui_auth` stores it when it creates a new UIA session.
