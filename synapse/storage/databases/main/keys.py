@@ -23,6 +23,7 @@ import hashlib
 import itertools
 import json
 import logging
+import time
 from typing import Iterable, Mapping, cast
 
 from canonicaljson import encode_canonical_json
@@ -76,12 +77,15 @@ class KeyStore(CacheInvalidationWorkerStore):
         """
 
         key_json_bytes = encode_canonical_json(response_json)
+        interaction_started = time.perf_counter()
 
         def store_server_keys_response_txn(
             txn: LoggingTransaction,
         ) -> dict[str, FetchKeyResult]:
+            txn_started = time.perf_counter()
             final_keys: dict[str, FetchKeyResult] = dict(verify_keys)
             keys_to_persist: dict[str, FetchKeyResult] = dict(verify_keys)
+            per_key_started = time.perf_counter()
 
             # ----------------------------------------------------------------
             # MSC4499 conflict resolution: insert-and-reload.
@@ -206,6 +210,9 @@ class KeyStore(CacheInvalidationWorkerStore):
                     )
                     keys_to_persist.pop(key_id, None)
 
+            per_key_seconds = time.perf_counter() - per_key_started
+            post_key_started = time.perf_counter()
+
             if keys_to_persist:
                 self.db_pool.simple_upsert_many_txn(
                     txn,
@@ -291,17 +298,48 @@ class KeyStore(CacheInvalidationWorkerStore):
                         for key_id in evicted_key_ids
                     ],
                 )
+
                 self._invalidate_cache_and_stream_bulk(
                     txn,
                     self.get_server_key_json_for_remote,
                     [(server_name, key_id) for key_id in evicted_key_ids],
                 )
 
+            post_key_seconds = time.perf_counter() - post_key_started
+            txn_seconds = time.perf_counter() - txn_started
+            if txn_seconds >= 0.5:
+                logger.info(
+                    "Slow server-key response transaction for %s from %s: "
+                    "input_keys=%d persisted_keys=%d retired_keys=%d "
+                    "evicted_keys=%d per_key_sql=%.3fs post_key_sql=%.3fs "
+                    "txn=%.3fs",
+                    server_name,
+                    from_server,
+                    len(verify_keys),
+                    len(keys_to_persist),
+                    len(retired_key_ids),
+                    excess if excess > 0 else 0,
+                    per_key_seconds,
+                    post_key_seconds,
+                    txn_seconds,
+                )
+
             return final_keys
 
-        return await self.db_pool.runInteraction(
+        result = await self.db_pool.runInteraction(
             "store_server_keys_response", store_server_keys_response_txn
         )
+        interaction_seconds = time.perf_counter() - interaction_started
+        if interaction_seconds >= 0.5:
+            logger.info(
+                "Slow server-key response store await for %s from %s: "
+                "input_keys=%d interaction=%.3fs",
+                server_name,
+                from_server,
+                len(verify_keys),
+                interaction_seconds,
+            )
+        return result
 
     @cached()
     def _get_server_keys_json(

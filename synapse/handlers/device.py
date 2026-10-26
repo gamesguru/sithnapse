@@ -740,6 +740,16 @@ class DeviceHandler:
             newly_left_users=newly_left_users,
         )
 
+        if from_token.device_list_key != now_token.device_list_key:
+            logger.info(
+                "Device-list sync for %s advanced from %s to %s: changed=%s left=%s",
+                user_id,
+                from_token.device_list_key,
+                now_token.device_list_key,
+                sorted(device_list_updates.changed),
+                sorted(device_list_updates.left),
+            )
+
         log_kv(
             {
                 "changed": device_list_updates.changed,

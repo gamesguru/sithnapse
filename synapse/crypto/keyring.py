@@ -21,6 +21,7 @@
 
 import abc
 import logging
+import time
 from contextlib import ExitStack
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Callable, Iterable
@@ -753,6 +754,7 @@ class BaseV2KeyFetcher(KeyFetcher):
         Returns:
             Map from key_id to result object
         """
+        processing_started = time.perf_counter()
         ts_valid_until_ms = response_json["valid_until_ts"]
 
         # MSC4499: reject a response that is oversized, or that gives two different
@@ -846,13 +848,31 @@ class BaseV2KeyFetcher(KeyFetcher):
         # key ID has already been persisted (either previously or concurrently),
         # the original binding is retained, the colliding candidate is dropped,
         # and the authoritative keys are returned to the caller.
-        return await self.store.store_server_keys_response(
+        validation_seconds = time.perf_counter() - processing_started
+        store_started = time.perf_counter()
+        result = await self.store.store_server_keys_response(
             server_name=server_name,
             from_server=from_server,
             ts_added_ms=time_added_ms,
             verify_keys=verify_keys,
             response_json=response_json,
         )
+        store_seconds = time.perf_counter() - store_started
+        total_seconds = time.perf_counter() - processing_started
+        if total_seconds >= 0.5:
+            logger.info(
+                "Slow server-key response processing for %s from %s: "
+                "active_keys=%d retired_keys=%d validation=%.3fs "
+                "store=%.3fs total=%.3fs",
+                server_name,
+                from_server,
+                len(response_json["verify_keys"]),
+                len(old_verify_keys_json),
+                validation_seconds,
+                store_seconds,
+                total_seconds,
+            )
+        return result
 
 
 class PerspectivesKeyFetcher(BaseV2KeyFetcher):

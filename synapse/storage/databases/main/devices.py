@@ -1810,6 +1810,14 @@ class DeviceWorkerStore(RoomMemberWorkerStore, EndToEndKeyWorkerStore):
             room_ids, from_token.stream
         )
         if not changed_room_ids:
+            if from_token.stream < to_token.get_max_stream_pos():
+                logger.info(
+                    "Device-list room-change cache found no candidate rooms for "
+                    "stream range %s..%s (queried_rooms=%d)",
+                    from_token,
+                    to_token,
+                    len(room_ids),
+                )
             return set()
 
         def _get_device_list_changes_in_rooms_txn(
@@ -1850,10 +1858,21 @@ class DeviceWorkerStore(RoomMemberWorkerStore, EndToEndKeyWorkerStore):
 
             return changes
 
-        return await self.db_pool.runInteraction(
+        changed_users = await self.db_pool.runInteraction(
             "get_device_list_changes_in_rooms",
             _get_device_list_changes_in_rooms_txn,
         )
+        if from_token.stream < to_token.get_max_stream_pos():
+            logger.info(
+                "Device-list room-change lookup for stream range %s..%s "
+                "(queried_rooms=%d, candidate_rooms=%d) returned %s",
+                from_token,
+                to_token,
+                len(room_ids),
+                len(changed_room_ids),
+                sorted(changed_users) if changed_users is not None else "too old",
+            )
+        return changed_users
 
     async def get_all_device_list_changes(self, from_id: int, to_id: int) -> set[str]:
         """Return the set of rooms where devices have changed since the given
