@@ -73,7 +73,6 @@ from synapse.types import (
     JsonValue,
     MultiWriterStreamToken,
     MutableStateMap,
-    PersistedEventPosition,
     Requester,
     RoomStreamToken,
     StateKey,
@@ -3864,22 +3863,6 @@ class SyncResultBuilder:
                     (e.event for e in joined_sync.timeline.events),
                 )
                 for event in it:
-                    # Forced rooms are sent as newly joined so eager clients
-                    # receive full state after partial-state resync. Their
-                    # historical membership events must not be interpreted as
-                    # joins in this sync, but membership events persisted
-                    # after the client's since token still count.
-                    if joined_sync.room_id in self.forced_newly_joined_room_ids:
-                        stream_ordering = event.internal_metadata.stream_ordering
-                        if stream_ordering is not None:
-                            instance_name = (
-                                event.internal_metadata.instance_name or "master"
-                            )
-                            if not PersistedEventPosition(
-                                instance_name, stream_ordering
-                            ).persisted_after(self.since_token.room_key):
-                                continue
-
                     if event.type == EventTypes.Member:
                         if (
                             event.membership == Membership.JOIN

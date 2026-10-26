@@ -1103,54 +1103,6 @@ class DeviceListSyncTestCase(unittest.HomeserverTestCase):
             self.assertIn(compliant_user_id, device_lists)
             self.assertNotIn(non_compliant_user_id, device_lists)
 
-    def test_un_partial_stated_room_does_not_add_members_to_device_lists_changed(
-        self,
-    ) -> None:
-        """Tests that when a room transitions from partial-state to fully-stated,
-        an eager incremental sync presents the room as newly joined (so full state
-        is sent), but does NOT treat it as a membership join in device-list sync
-        (i.e. existing room members including the caller are not added to
-        device_lists.changed).
-        """
-        bob_user_id = self.register_user("bob", "ponyponypony")
-        bob_access_token = self.login(bob_user_id, "ponyponypony")
-
-        alice_user_id = self.register_user("alice", "correcthorse")
-        alice_access_token = self.login(alice_user_id, "correcthorse")
-
-        # Create room and have both Bob and Alice join
-        room_id = self.helper.create_room_as(
-            bob_user_id, is_public=True, tok=bob_access_token
-        )
-        self.helper.join(room_id, alice_user_id, tok=alice_access_token)
-
-        # Bob syncs initially
-        channel = self.make_request("GET", "/sync", access_token=bob_access_token)
-        self.assertEqual(channel.code, 200, channel.json_body)
-        since_token = channel.json_body["next_batch"]
-
-        # Mark room as partial-stated, then clear it (simulating resync completion)
-        store = self.hs.get_datastores().main
-        self.get_success(
-            store.store_partial_state_room(room_id, {"serv1", "serv2"}, 0, "serv1")
-        )
-        self.get_success(store.clear_partial_state_room(room_id))
-
-        # Bob syncs incrementally with eager sync (no lazy-load)
-        channel = self.make_request(
-            "GET", f"/sync?since={since_token}", access_token=bob_access_token
-        )
-        self.assertEqual(channel.code, 200, channel.json_body)
-
-        # The room should be present under joined rooms
-        joined_rooms = channel.json_body.get("rooms", {}).get("join", {})
-        self.assertIn(room_id, joined_rooms)
-
-        # But device_lists.changed should NOT contain Bob or Alice
-        changed_devices = channel.json_body.get("device_lists", {}).get("changed", [])
-        self.assertNotIn(bob_user_id, changed_devices, channel.json_body)
-        self.assertNotIn(alice_user_id, changed_devices, channel.json_body)
-
 
 class DeviceOneTimeKeysSyncTestCase(unittest.HomeserverTestCase):
     """
