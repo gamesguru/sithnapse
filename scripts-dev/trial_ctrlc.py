@@ -1043,7 +1043,7 @@ def _print_mtxdb_engine_stats(timings_dir: str) -> None:
     print(
         f"\n=== mtxdb runtime stats (summed over {processes} process(es)) ===", file=err
     )
-    for pool in ("state", "event_dag", "auth_chain"):
+    for pool in ("state", "event_dag", "auth_chain", "server_info"):
         pool_totals = totals.get(pool)
         if not pool_totals:
             continue

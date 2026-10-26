@@ -16,8 +16,10 @@ bookkeeping, not state content:
 The `id` column is the load-bearing part: every other table, replication stream,
 and cache addresses a state group by this small integer, not by its
 content-derived identity (see below). "We don't need SQL state groups" means
-moving all three of the above into mtxdb too, so state has no SQL footprint at
-all under the embedded engine.
+moving all three of the above into mtxdb too. They are only part of the
+migration: removing the remaining SQL footprint also covers
+`state_groups_persisting`, `state_groups_pending_deletion` and legacy
+`state_groups_state` data (see the audit below).
 
 ## Why this isn't a quick swap
 

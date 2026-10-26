@@ -779,11 +779,13 @@ class RoomMemberWorkerStore(EventsWorkerStore, CacheInvalidationWorkerStore):
         # room, which would otherwise make us think we still share it.
         sql = """
             SELECT cse.state_key FROM current_state_events cse
-            INNER JOIN local_current_membership lcm
-                ON lcm.room_id = cse.room_id AND lcm.membership = 'join'
             WHERE
                 cse.type = 'm.room.member'
                 AND cse.membership = 'join'
+                AND EXISTS (
+                    SELECT 1 FROM local_current_membership lcm
+                    WHERE lcm.room_id = cse.room_id AND lcm.membership = 'join'
+                )
                 AND %s
             GROUP BY cse.state_key
         """
