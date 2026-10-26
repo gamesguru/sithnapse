@@ -21,6 +21,7 @@
 from typing import (
     TYPE_CHECKING,
     Any,
+    Collection,
     Iterable,
     Mapping,
     cast,
@@ -289,6 +290,43 @@ class PresenceStore(PresenceBackgroundUpdateStore, CacheInvalidationWorkerStore)
             )
             for user_id, state, last_active_ts, last_federation_update_ts, last_user_sync_ts, status_msg, currently_active in rows
         }
+
+    async def get_users_with_presence_on_servers(
+        self, server_names: Collection[str], include_offline: bool = True
+    ) -> set[str]:
+        """Return users with stored presence whose server is in `server_names`.
+
+        Partial-state joins know which servers were in the room, but may not
+        yet know the room membership of users on those servers.
+
+        Return an empty set for no servers. Exclude offline users when
+        include_offline is False. Database errors propagate.
+        """
+        if not server_names:
+            return set()
+
+        def _get_users_with_presence_on_servers_txn(
+            txn: LoggingTransaction,
+        ) -> set[str]:
+            """Select user IDs matching the server suffixes and offline filter."""
+            server_clauses = ["user_id LIKE ?" for _ in server_names]
+            args: list[str] = [f"%:{server_name}" for server_name in server_names]
+            sql = (
+                "SELECT user_id FROM presence_stream WHERE ("
+                + " OR ".join(server_clauses)
+                + ")"
+            )
+            if not include_offline:
+                sql += " AND state != ?"
+                args.append(PresenceState.OFFLINE)
+
+            txn.execute(sql, args)
+            return {row[0] for row in txn}
+
+        return await self.db_pool.runInteraction(
+            "get_users_with_presence_on_servers",
+            _get_users_with_presence_on_servers_txn,
+        )
 
     async def should_user_receive_full_presence_with_token(
         self,
