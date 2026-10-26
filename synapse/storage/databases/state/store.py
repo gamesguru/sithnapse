@@ -273,6 +273,10 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             # latter regardless of the former, or it silently fails (sync)
             # or never runs anywhere (drain/migrate) on such a topology.
             if self._embedded_db_is_writer:
+                hs.run_as_background_process(
+                    "enqueue_state_hamt_embedded_migration",
+                    self._enqueue_embedded_db_migration_if_needed,
+                )
                 hs.get_clock().looping_call(
                     self._drain_embedded_state_hamt_root_deletion_queue,
                     Duration(minutes=5),

@@ -260,6 +260,16 @@ class EventsBackgroundUpdatesStore(
                 self._background_migrate_event_auth_chain_links_to_embedded,
             )
 
+            if hs.get_instance_name() in hs.config.worker.writers.events:
+                hs.run_as_background_process(
+                    "enqueue_event_to_state_group_embedded_migration",
+                    self._enqueue_event_to_state_group_embedded_migration_if_needed,
+                )
+                hs.run_as_background_process(
+                    "enqueue_event_auth_chain_links_embedded_migration",
+                    self._enqueue_event_auth_chain_links_embedded_migration_if_needed,
+                )
+
         ################################################################################
 
         # bg updates for replacing stream_ordering with a BIGINT
