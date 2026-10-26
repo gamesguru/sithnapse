@@ -366,14 +366,19 @@ async def check_state_independent_auth_rules(
 def _is_forgivable_partial_state_rejection(
     event: "EventBase", auth_event: "EventBase"
 ) -> bool:
-    """Whether `auth_event` was rejected only because a partial-state room lacked
-    the state to auth it, and is a join or leave (e.g. a kick) of the same user.
+    """Whether the sender's own join should be forgiven because a rejected auth
+    event was rejected only by missing partial-state.
 
-    Rejected invites and bans, other users' memberships and rejections for any
-    other reason are never forgiven.
+    `event` must be a self-join, and `auth_event` must be that same user's earlier
+    join or leave (e.g. a kick) rejected for lack of partial state. Rejected
+    invites and bans, other users' memberships, and rejections for any other reason
+    are never forgiven.
     """
     return (
-        auth_event.rejected_reason == RejectedReason.PARTIAL_STATE_AUTH_ERROR
+        event.type == EventTypes.Member
+        and event.membership == Membership.JOIN
+        and event.sender == auth_event.state_key
+        and auth_event.rejected_reason == RejectedReason.PARTIAL_STATE_AUTH_ERROR
         and auth_event.type == EventTypes.Member
         and auth_event.state_key == event.state_key
         and auth_event.membership in (Membership.JOIN, Membership.LEAVE)

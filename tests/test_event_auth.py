@@ -77,7 +77,12 @@ class EventAuthTestCase(unittest.TestCase):
         create = _create_event(RoomVersions.V10, creator)
         join_rules = _join_rules_event(RoomVersions.V10, creator, "invite")
 
-        def check(rejected: EventBase, allow: bool) -> None:
+        def check(
+            rejected: EventBase,
+            allow: bool,
+            current_membership: str = "join",
+            current_sender: str = user,
+        ) -> None:
             store = _StubEventSourceStore()
             auth = [create, join_rules, rejected]
             store.add_events(auth)
@@ -86,9 +91,9 @@ class EventAuthTestCase(unittest.TestCase):
                     "room_id": TEST_ROOM_ID,
                     **_maybe_get_event_id_dict_for_room_version(RoomVersions.V10),
                     "type": "m.room.member",
-                    "sender": user,
+                    "sender": current_sender,
                     "state_key": user,
-                    "content": {"membership": "join"},
+                    "content": {"membership": current_membership},
                     "auth_events": _build_auth_dict_for_room_version(
                         RoomVersions.V10, auth
                     ),
@@ -110,6 +115,16 @@ class EventAuthTestCase(unittest.TestCase):
         check(rejected_join, allow=True)
         with self.assertRaises(AuthError):
             check(rejected_join, allow=False)
+
+        # A kick by another user must not be forgiven just because the target's
+        # rejected join appears in its auth events.
+        with self.assertRaises(AuthError):
+            check(
+                rejected_join,
+                allow=True,
+                current_membership="leave",
+                current_sender=creator,
+            )
 
         # A kick rejected for lack of state is forgiven too: the user may rejoin.
         check(
