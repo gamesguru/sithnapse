@@ -23,10 +23,12 @@ MAKE_FULL_SCHEMA_SCRIPT = REPO_ROOT / "scripts-dev" / "make_full_schema.sh"
 
 
 def python_env_runner() -> list[str]:
-    """Return an uv runner without resolving a lockless tree twice."""
+    """Return an uv runner that never re-syncs.
 
-    if (REPO_ROOT / "uv.lock").exists():
-        return ["uv", "run"]
+    `install_dependencies` has already synced the tree. A second sync under
+    faketime (the clock is pinned to 2001) can rebuild the Rust extension, which
+    is slow enough to look like a hang.
+    """
 
     return ["uv", "run", "--no-sync"]
 
