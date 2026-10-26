@@ -1490,10 +1490,22 @@ class PresenceHandler(BasePresenceHandler):
     async def incoming_presence(self, origin: str, content: JsonDict) -> None:
         """Called when we receive a `m.presence` EDU from a remote server."""
         if not self._track_presence:
+            logger.info(
+                "Ignoring m.presence EDU from %s: presence tracking is off", origin
+            )
             return
 
         now = self.clock.time_msec()
         updates = []
+        logger.info(
+            "Received m.presence EDU from %s with %i updates: %s",
+            origin,
+            len(content.get("push", [])),
+            [
+                (p.get("user_id"), p.get("presence"), p.get("last_active_ago"))
+                for p in content.get("push", [])
+            ],
+        )
         for push in content.get("push", []):
             # A "push" contains a list of presence that we are probably interested
             # in.
@@ -1540,6 +1552,12 @@ class PresenceHandler(BasePresenceHandler):
 
             prev_state = await self.current_state_for_user(user_id)
             updates.append(prev_state.copy_and_replace(**new_fields))
+            logger.info(
+                "Applying m.presence update for %s: %s -> %s",
+                user_id,
+                prev_state.state,
+                presence_state,
+            )
 
         if updates:
             federation_presence_counter.labels(
