@@ -2633,7 +2633,11 @@ class FederationEventHandler:
             logger.warning(
                 "While checking auth of %r against auth_events: %s", event, e
             )
-            context.rejected = RejectedReason.AUTH_ERROR
+            context.rejected = (
+                RejectedReason.PARTIAL_STATE_AUTH_ERROR
+                if context.partial_state and event.type == EventTypes.Member
+                else RejectedReason.AUTH_ERROR
+            )
             return
 
         if supports_msc4242_state_dag(event):
@@ -2727,9 +2731,7 @@ class FederationEventHandler:
             )
             context.rejected = (
                 RejectedReason.PARTIAL_STATE_AUTH_ERROR
-                if context.partial_state
-                and event.type == EventTypes.Member
-                and event.membership == Membership.JOIN
+                if context.partial_state and event.type == EventTypes.Member
                 else RejectedReason.AUTH_ERROR
             )
 
