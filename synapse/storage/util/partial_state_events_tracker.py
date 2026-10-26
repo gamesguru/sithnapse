@@ -220,6 +220,21 @@ class PartialCurrentStateTracker:
             if not has_partial_state:
                 return
 
+            # The cached answer can be stale on a worker: the un-partial-stated
+            # notification and the cache invalidations arrive over separate
+            # replication streams, and a stale True here would wait forever
+            # for a notification that has already been delivered. Partial-state
+            # rooms are rare, so confirm against the database before waiting.
+            if not await self._store.is_partial_state_room_uncached(room_id):
+                logger.warning(
+                    "Cached partial-state flag for room %s was stale; "
+                    "the room already has full state",
+                    room_id,
+                )
+                self._store.is_partial_state_room.invalidate((room_id,))
+                self._store.get_partial_rooms.invalidate_all()
+                return
+
             logger.info(
                 "Awaiting un-partial-stating of room %s",
                 room_id,

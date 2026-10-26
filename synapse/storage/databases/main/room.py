@@ -1896,6 +1896,21 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
         # added to or removed from partial_state_rooms.
         return room_id in await self.get_partial_rooms()
 
+    async def is_partial_state_room_uncached(self, room_id: str) -> bool:
+        """Like `is_partial_state_room`, but always reads the database.
+
+        For confirming a cached True before waiting on it: on a worker the
+        cache can briefly lag the un-partial-stated notification.
+        """
+        row = await self.db_pool.simple_select_one_onecol(
+            table="partial_state_rooms",
+            keyvalues={"room_id": room_id},
+            retcol="room_id",
+            allow_none=True,
+            desc="is_partial_state_room_uncached",
+        )
+        return row is not None
+
     @cachedList(cached_method_name="is_partial_state_room", list_name="room_ids")
     async def is_partial_state_room_batched(
         self, room_ids: StrCollection
