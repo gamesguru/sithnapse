@@ -184,8 +184,8 @@ async def check_state_independent_auth_rules(
             and the caller has to tell us. Needed for MSC4242 State DAG rooms, where
             rejection cascades through `prev_state_events`.
         allow_rejected_auth_events: if True, do not reject the event when one of its
-            auth events is the sender's own join that was rejected for lack of
-            state in a partial-state room (`PARTIAL_STATE_AUTH_ERROR`); the event
+            auth events is a join or leave (e.g. a kick) of the same user that was
+            rejected for lack of state in a partial-state room (`PARTIAL_STATE_AUTH_ERROR`); the event
             is re-checked against resolved state below. Other rejected auth
             events (including rejected invites), and rejected `prev_state_events`,
             still reject the event.
@@ -367,16 +367,16 @@ def _is_forgivable_partial_state_rejection(
     event: "EventBase", auth_event: "EventBase"
 ) -> bool:
     """Whether `auth_event` was rejected only because a partial-state room lacked
-    the state to auth it, and is the sender's own earlier join.
+    the state to auth it, and is a join or leave (e.g. a kick) of the same user.
 
-    Rejected invites, other users' memberships and rejections for any other reason
-    are never forgiven.
+    Rejected invites and bans, other users' memberships and rejections for any
+    other reason are never forgiven.
     """
     return (
         auth_event.rejected_reason == RejectedReason.PARTIAL_STATE_AUTH_ERROR
         and auth_event.type == EventTypes.Member
         and auth_event.state_key == event.state_key
-        and auth_event.membership == Membership.JOIN
+        and auth_event.membership in (Membership.JOIN, Membership.LEAVE)
     )
 
 

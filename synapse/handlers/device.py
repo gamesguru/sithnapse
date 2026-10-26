@@ -648,9 +648,17 @@ class DeviceHandler:
             user_id, from_token.room_key, now_token.room_key
         )
         last_membership_event_by_room: dict[str, EventBase] = {}
+        rooms_rejoined_after_leave: set[str] = set()
         for event in membership_events:
             if event.rejected_reason is not None:
                 continue
+            previous_event = last_membership_event_by_room.get(event.room_id)
+            if (
+                event.membership == Membership.JOIN
+                and previous_event is not None
+                and previous_event.membership in (Membership.LEAVE, Membership.BAN)
+            ):
+                rooms_rejoined_after_leave.add(event.room_id)
             last_membership_event_by_room[event.room_id] = event
 
         for room_id, event in last_membership_event_by_room.items():
@@ -664,7 +672,10 @@ class DeviceHandler:
                     if isinstance(prev_content, dict)
                     else None
                 )
-                if prev_membership != Membership.JOIN:
+                if (
+                    room_id in rooms_rejoined_after_leave
+                    or prev_membership != Membership.JOIN
+                ):
                     newly_joined_rooms.add(room_id)
                 newly_left_rooms.discard(room_id)
             elif event.membership in (Membership.LEAVE, Membership.BAN):

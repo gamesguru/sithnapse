@@ -111,6 +111,18 @@ class EventAuthTestCase(unittest.TestCase):
         with self.assertRaises(AuthError):
             check(rejected_join, allow=False)
 
+        # A kick rejected for lack of state is forgiven too: the user may rejoin.
+        check(
+            _member_event(
+                RoomVersions.V10,
+                user,
+                "leave",
+                sender=creator,
+                rejected_reason=RejectedReason.PARTIAL_STATE_AUTH_ERROR,
+            ),
+            allow=True,
+        )
+
         # A rejected invite is never forgiven, even for a partial-state reason.
         rejected_invite = _member_event(
             RoomVersions.V10,
