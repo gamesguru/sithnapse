@@ -587,7 +587,7 @@ _POOL_LABELS: dict[str, str] = {
 
 
 def _print_mtxdb_stats() -> None:
-    """Report runtime stats for the state, event, edges, and server-info pools.
+    """Report runtime stats for all four pools: state, event_dag, auth_chain, server_info.
 
     Do nothing unless SYNAPSE_MTXDB_STATS is set and stats are available.
     With SYNAPSE_TIMINGS_RUN_DIR set, replace this process's JSON snapshot

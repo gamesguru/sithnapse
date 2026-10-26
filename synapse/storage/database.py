@@ -30,6 +30,7 @@ import threading
 import time
 import types
 from collections import defaultdict, deque
+from dataclasses import dataclass
 from time import monotonic as monotonic_time
 from typing import (
     IO,
@@ -734,6 +735,13 @@ _AsyncCallbackListEntry = tuple[
 
 P = ParamSpec("P")
 R = TypeVar("R")
+
+
+@dataclass(frozen=True)
+class _SchedulingLabel:
+    """Private channel for passing a SQL scheduling diagnostic label."""
+
+    label: str
 
 
 class LoggingTransaction:
@@ -1585,9 +1593,9 @@ class DatabasePool:
                         exception_callbacks,
                         func,
                         *args,
+                        _SchedulingLabel(desc),
                         db_autocommit=db_autocommit,
                         isolation_level=isolation_level,
-                        scheduling_label=desc,
                         **kwargs,
                     )
 
@@ -1619,7 +1627,6 @@ class DatabasePool:
         *args: Any,
         db_autocommit: bool = False,
         isolation_level: int | None = None,
-        scheduling_label: str | None = None,
         **kwargs: Any,
     ) -> R:
         """Wraps the .runWithConnection() method on the underlying db_pool.
@@ -1633,15 +1640,15 @@ class DatabasePool:
                 i.e. outside of a transaction. This is useful for transaction
                 that are only a single query. Currently only affects postgres.
             isolation_level: Set the server isolation level for this transaction.
-            scheduling_label: label under which the pool scheduling delay is
-                reported in the opt-in timings. A missing or empty label uses
-                `func.__name__`, or "(unlabelled)" if no name is available.
             kwargs: named args to pass to `func`
 
         Returns:
             The result of func
         """
-        scheduling_label = scheduling_label or getattr(func, "__name__", None)
+        scheduling_label = getattr(func, "__name__", None)
+        if args and isinstance(args[-1], _SchedulingLabel):
+            scheduling_label = args[-1].label or scheduling_label
+            args = args[:-1]
         curr_context = current_context()
         if not curr_context:
             logger.warning(
