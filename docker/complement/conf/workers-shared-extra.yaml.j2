@@ -148,6 +148,9 @@ allow_device_name_lookup_over_federation: true
 ## Experimental Features ##
 
 experimental_features:
+  # Complement expects an unfinishable partial-state join to be abandoned
+  # within its 30s sync timeout.
+  partial_state_sync_max_consecutive_failures: 3
   # MSC3389: relation-preserving redactions and room version.
   msc3389_enabled: true
   # Enable support for polls

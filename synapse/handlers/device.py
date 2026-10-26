@@ -876,11 +876,17 @@ class DeviceHandler:
         # next /keys/query refetches on demand instead of reusing the cache.
         # Don't also mark them stale: that makes the resync retry loop fetch
         # device lists for users we no longer share a room with.
-        for left_user_id in newly_left_users:
-            if not self.hs.is_mine_id(left_user_id):
-                await self.store.mark_remote_user_device_list_as_unsubscribed(
-                    left_user_id
-                )
+        #
+        # `newly_left_users` is only relative to the requester, so check
+        # server-wide that no other local user still shares a room with them
+        # before dropping the cache they all rely on.
+        await self.store.handle_potentially_left_users(
+            {
+                left_user_id
+                for left_user_id in newly_left_users
+                if not self.hs.is_mine_id(left_user_id)
+            }
+        )
 
         return DeviceListUpdates(
             changed={

@@ -113,18 +113,13 @@ logger = logging.getLogger(__name__)
 #
 # Retry scheduling uses exponential backoff: the delay doubles after each
 # consecutive failure, starting at _PARTIAL_STATE_SYNC_INITIAL_BACKOFF and
-# capped at _PARTIAL_STATE_SYNC_MAX_BACKOFF. After
-# _PARTIAL_STATE_SYNC_MAX_CONSECUTIVE_FAILURES consecutive failures we stop
-# retrying entirely, logging a warning and leaving the room partial until a
-# restart or a new join triggers another sync attempt.
+# capped at _PARTIAL_STATE_SYNC_MAX_BACKOFF. After the configured number of
+# consecutive failures we stop retrying automatically, log a warning, and
+# abandon the join so local users are not left in a permanently partial room.
+# The limit is configurable so tests can exercise that path quickly while
+# ordinary deployments tolerate a longer transient outage.
 _PARTIAL_STATE_SYNC_INITIAL_BACKOFF = Duration(seconds=1)
 _PARTIAL_STATE_SYNC_MAX_BACKOFF = Duration(hours=1)
-# Giving up also makes every local user leave the room (see
-# `_abandon_partial_state_room`), so this is deliberately short only because
-# Complement's `Device list no longer tracked when failing to complete partial
-# state join` expects the join to be abandoned within its 30s sync timeout. With
-# the backoff above, three failures take about three seconds.
-_PARTIAL_STATE_SYNC_MAX_CONSECUTIVE_FAILURES = 3
 
 
 # Added to debug performance and track progress on optimizations
@@ -2551,14 +2546,15 @@ class FederationHandler:
                 # Determine whether to schedule a retry and with what delay.
                 # On success, reset the failure counter. On failure, compute an
                 # exponential backoff delay and cap retries at
-                # _PARTIAL_STATE_SYNC_MAX_CONSECUTIVE_FAILURES.
+                # the configured limit.
                 retry_delay: Duration | None = None
                 if sync_failed and is_still_partial_state_room:
                     failure_count = (
                         self._partial_state_sync_failure_counts.get(room_id, 0) + 1
                     )
                     self._partial_state_sync_failure_counts[room_id] = failure_count
-                    if failure_count >= _PARTIAL_STATE_SYNC_MAX_CONSECUTIVE_FAILURES:
+                    max_failures = self.hs.config.experimental.partial_state_sync_max_consecutive_failures
+                    if failure_count >= max_failures:
                         logger.warning(
                             "Giving up on resynchronising partial-state room %s "
                             "after %d consecutive failures",
@@ -2586,7 +2582,7 @@ class FederationHandler:
                         room_id
                     )
 
-                    # We cannot complete the join, so leave the room instead of
+                    # The room cannot be completed, so leave it instead of
                     # leaving local users stuck in a permanently partial room.
                     await self._abandon_partial_state_room(room_id)
 

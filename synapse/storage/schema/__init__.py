@@ -193,6 +193,8 @@ Changes in SCHEMA_VERSION = 96
       room purge commits.
     - Change `delayed_events` primary key to be globally unique rather than
       scoped to a user localpart (MSC4140).
+    - Add `seen_active` to `server_signature_keys` so retired-key eviction keeps
+      keys that were once active.
     - Add the durable publication and rebuild-checkpoint tables for the
       embedded forward-edge index.
 """

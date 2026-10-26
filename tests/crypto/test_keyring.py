@@ -449,6 +449,62 @@ class KeyringTestCase(unittest.HomeserverTestCase):
         mock_fetcher1.get_keys.assert_called_once()
         mock_fetcher2.get_keys.assert_called_once()
 
+    def test_retired_key_eviction_keeps_previously_active_keys(self) -> None:
+        """Keys seen active before retirement are evicted after never-active ones."""
+        store = self.hs.get_datastores().main
+        active_key = signedjson.key.generate_signing_key("active")
+        retired_key_1 = signedjson.key.generate_signing_key("retired1")
+        retired_key_2 = signedjson.key.generate_signing_key("retired2")
+
+        ts_added_ms = 1_000_000
+        self.get_success(
+            store.store_server_keys_response(
+                "server1",
+                from_server="server1",
+                ts_added_ms=ts_added_ms,
+                verify_keys={
+                    get_key_id(active_key): FetchKeyResult(
+                        get_verify_key(active_key), ts_added_ms + 10_000
+                    )
+                },
+                response_json={},
+            )
+        )
+
+        later_ts = ts_added_ms + 20_000
+        with patch("synapse.storage.databases.main.keys.MAX_RETIRED_SERVER_KEYS", 2):
+            self.get_success(
+                store.store_server_keys_response(
+                    "server1",
+                    from_server="server1",
+                    ts_added_ms=later_ts,
+                    verify_keys={
+                        get_key_id(retired_key_1): FetchKeyResult(
+                            get_verify_key(retired_key_1), 0
+                        ),
+                        get_key_id(retired_key_2): FetchKeyResult(
+                            get_verify_key(retired_key_2), 0
+                        ),
+                    },
+                    response_json={},
+                )
+            )
+
+        self.assertIsNotNone(
+            self.get_success(
+                store.db_pool.simple_select_one_onecol(
+                    "server_signature_keys",
+                    keyvalues={
+                        "server_name": "server1",
+                        "key_id": get_key_id(active_key),
+                    },
+                    retcol="key_id",
+                    allow_none=True,
+                )
+            ),
+            "the key previously seen active was evicted before never-active keys",
+        )
+
 
 @logcontext_clean
 class ServerKeyFetcherTestCase(unittest.HomeserverTestCase):

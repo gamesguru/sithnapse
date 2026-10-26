@@ -43,10 +43,10 @@ logger = logging.getLogger(__name__)
 
 db_binary_type = memoryview
 
-# MSC4499: keep a bounded number of retired keys per server. Corroborated keys
-# (ones we previously saw active) have a later `ts_valid_until_ms` than keys
-# that were first learned as retired, so evicting the earliest-expiring retired
-# keys retains the corroborated tier first.
+# MSC4499: keep a bounded number of retired keys per server. Evict keys first
+# learned as already retired before those we previously saw active (whose
+# signatures may still need verifying), then evict by earliest expiry within
+# each tier.
 MAX_RETIRED_SERVER_KEYS = 3000
 
 
@@ -65,10 +65,11 @@ class KeyStore(CacheInvalidationWorkerStore):
         atomically enforcing MSC4499 First Seen Wins, except that direct origin
         responses may replace conflicting provisional notary bindings.
 
-        Retain at most 3,000 retired keys per server, evicting keys with unknown
-        or earliest expiry first. Retired means expiry is absent or at most
-        ts_added_ms. Eviction removes stored key responses and invalidates caches.
-        Encoding and storage errors propagate.
+        Retain at most 3,000 retired keys per server. Evict keys never seen
+        active before those that were, then unknown or earliest expiry first.
+        Retired means expiry is absent or at most ts_added_ms. Eviction removes
+        stored key responses and invalidates caches. Encoding and storage errors
+        propagate.
 
         Args:
             server_name: The owner of the keys
@@ -125,14 +126,16 @@ class KeyStore(CacheInvalidationWorkerStore):
 
             for key_id in list(keys_to_persist.keys()):
                 fetch_result = keys_to_persist[key_id]
+                # Active (not yet retired) when fetched; see the eviction below.
+                active_now = fetch_result.valid_until_ts > ts_added_ms
 
                 # Step 1: INSERT ... ON CONFLICT DO NOTHING.
                 txn.execute(
                     """
                     INSERT INTO server_signature_keys
                         (server_name, key_id, from_server, ts_added_ms,
-                         verify_key, ts_valid_until_ms)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                         verify_key, ts_valid_until_ms, seen_active)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT (server_name, key_id) DO NOTHING
                     """,
                     (
@@ -142,37 +145,44 @@ class KeyStore(CacheInvalidationWorkerStore):
                         ts_added_ms,
                         db_binary_type(fetch_result.verify_key.encode()),
                         fetch_result.valid_until_ts,
+                        active_now,
                     ),
                 )
 
                 # Step 2: Re-read the authoritative row.
                 txn.execute(
                     """
-                    SELECT verify_key, ts_valid_until_ms, from_server
+                    SELECT verify_key, ts_valid_until_ms, from_server, seen_active
                     FROM server_signature_keys
                     WHERE server_name = ? AND key_id = ?
                     """,
                     (server_name, key_id),
                 )
-                row = cast(tuple[bytes | memoryview, int | None, str], txn.fetchone())
+                row = cast(
+                    tuple[bytes | memoryview, int | None, str, bool], txn.fetchone()
+                )
                 assert row is not None
-                stored_key_raw, stored_ts, stored_from_server = row
+                stored_key_raw, stored_ts, stored_from_server, stored_seen_active = row
+                seen_active = bool(stored_seen_active) or active_now
                 stored_key_bytes = bytes(stored_key_raw)
 
                 # Step 3: Compare stored key body against candidate.
                 if stored_key_bytes == fetch_result.verify_key.encode():
                     # Same key body (refresh) -- preserve original from_server.
                     stored_ts = stored_ts if stored_ts is not None else 0
-                    if stored_ts < fetch_result.valid_until_ts:
+                    if stored_ts < fetch_result.valid_until_ts or (
+                        seen_active and not stored_seen_active
+                    ):
                         txn.execute(
                             """
                             UPDATE server_signature_keys
-                            SET ts_valid_until_ms = ?, ts_added_ms = ?
+                            SET ts_valid_until_ms = ?, ts_added_ms = ?, seen_active = ?
                             WHERE server_name = ? AND key_id = ?
                             """,
                             (
                                 fetch_result.valid_until_ts,
                                 ts_added_ms,
+                                seen_active,
                                 server_name,
                                 key_id,
                             ),
@@ -194,7 +204,8 @@ class KeyStore(CacheInvalidationWorkerStore):
                         """
                         UPDATE server_signature_keys
                         SET from_server = ?, ts_added_ms = ?,
-                            ts_valid_until_ms = ?, verify_key = ?
+                            ts_valid_until_ms = ?, verify_key = ?,
+                            seen_active = ?
                         WHERE server_name = ? AND key_id = ?
                         """,
                         (
@@ -202,6 +213,7 @@ class KeyStore(CacheInvalidationWorkerStore):
                             ts_added_ms,
                             fetch_result.valid_until_ts,
                             db_binary_type(fetch_result.verify_key.encode()),
+                            seen_active,
                             server_name,
                             key_id,
                         ),
@@ -269,17 +281,15 @@ class KeyStore(CacheInvalidationWorkerStore):
                 )
 
             # MSC4499: bound the number of retired keys retained for a server.
-            # `ts_valid_until_ms` is only ever extended for a binding, so a key
-            # we saw active before retirement keeps a later validity timestamp
-            # than keys first observed as already-retired. Evicting the
-            # earliest expiring retired keys therefore drops uncorroborated
-            # bindings before corroborated ones.
+            # Keys we saw active before retirement may have signed events we
+            # still need to verify, so evict keys first observed as already
+            # retired before them, and within each tier the earliest expiring.
             txn.execute(
                 """
                 SELECT key_id FROM server_signature_keys
                 WHERE server_name = ?
                     AND (ts_valid_until_ms IS NULL OR ts_valid_until_ms <= ?)
-                ORDER BY ts_valid_until_ms ASC NULLS FIRST
+                ORDER BY seen_active ASC, ts_valid_until_ms ASC NULLS FIRST
                 """,
                 (server_name, ts_added_ms),
             )
