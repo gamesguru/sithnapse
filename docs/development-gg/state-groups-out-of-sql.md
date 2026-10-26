@@ -75,18 +75,15 @@ needs its own pass for `id`/`room_id`/`event_id`/edges specifically.
 
 ## Suggested order of work
 
-1. Bootstrap-safe id allocation via mtxdb (writer-only, SQL fallback for
-   read-only workers), landed and soak-tested on its own first -- this is useful
-   independent of the rest, and de-risks the trickiest correctness trap
-   (bootstrap seeding) in isolation.
-2. Mirror `state_groups`/`state_group_edges` writes into mtxdb alongside SQL
-   (dual-write, matching how HAMT roots/nodes were transitioned), with reads
-   still preferring SQL.
-3. Background migration to backfill mtxdb for pre-existing groups, mirroring
-   `_background_backfill_state_hamt_roots`.
-4. Flip reads in `purge_events.py`/`deletion.py`/`bg_updates.py` to mtxdb, one
+Per `goals.txt` there is no dual-write or background-migration phase. After
+family 2 and `event_json`, and after the single-writer decision:
+
+1. One-time import of existing groups and edges, seeding the mtxdb id counter
+   above the SQL sequence, with a verifier and a durable completion marker.
+2. Startup refuses to run while the import is incomplete.
+3. Flip reads in `purge_events.py`/`deletion.py`/`bg_updates.py` to mtxdb, one
    call site at a time, each with its own test coverage.
-5. Drop the SQL writes/tables once nothing reads them, and update
+4. Delete the SQL tables and the migration scaffolding, and update
    `synapse_port_db.py` accordingly.
 
 Not scoped or started yet -- this document exists to capture the shape of the

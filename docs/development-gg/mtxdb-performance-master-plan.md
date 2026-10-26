@@ -464,9 +464,12 @@ recovery source until the final cutover:
 10. **Cut over authority, then retire SQL use.** Only after correctness,
     recovery, and performance gates pass, make mtxdb the normal write authority
     and stop steady-state SQL blob writes. Keep SQL fallback and backfill
-    available for a defined compatibility window. Remove SQL fallback and cease
-    maintaining the two SQL tables only in a separately reviewed final
-    migration, with an operational recovery procedure.
+    available for a defined compatibility window, but only for key bindings
+    created before cutover; bindings created or replaced afterward must be
+    recovered from current mtxdb data so a miss never returns an obsolete
+    binding. Remove SQL fallback and cease maintaining the two SQL tables only
+    in a separately reviewed final migration, with an operational recovery
+    procedure.
 
 Current status: physical `ServerInfo` pool/layout and wrapper opening are
 present; collection schema/API, server-info counters, Synapse integration,

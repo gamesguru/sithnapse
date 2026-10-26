@@ -27,7 +27,7 @@ mtxdb:
 - `ShardType::ServerInfo` (`mtpl-server-info`, magic `SINF`) exists in
   `layout.rs`, `ShardType::ALL`, the pool policy (uncompressed) and the journal.
 
-sithnapse:
+Synapse:
 
 - `rust/src/database/mtxdb_syn.rs` maps shard index 3 to `ServerInfo` and opens
   the pool (`server_info_db()`), but read-only workers open it as a durable
