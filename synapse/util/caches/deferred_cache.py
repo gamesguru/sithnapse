@@ -37,7 +37,6 @@ from typing import (
 from prometheus_client import Gauge
 
 from twisted.internet import defer
-from twisted.python import threadable
 from twisted.python.failure import Failure
 
 from synapse.logging.context import PreserveLoggingContext
@@ -408,9 +407,10 @@ class DeferredCache(Generic[KT, VT]):
         # LruCache invalidation callbacks can run from __del__ when the last
         # reference to an LruCache is released on a database thread. Keep the
         # DeferredCache reactor-thread-only by marshalling the invalidation.
-        # Until a thread has used the cache, only the reactor thread may claim it.
+        # Until a thread has used the cache, only the main (reactor) thread may
+        # claim it.
         if self.thread is None:
-            off_owner_thread = not threadable.isInIOThread()
+            off_owner_thread = threading.current_thread() is not threading.main_thread()
         else:
             off_owner_thread = self.thread is not threading.current_thread()
         if off_owner_thread:
