@@ -83,8 +83,8 @@ class FederationTestCase(unittest.FederatingHomeserverTestCase):
                 new=AsyncMock(return_value=last_stream_id),
             ),
             patch.object(
-                self.store,
-                "add_device_change_to_streams",
+                self.handler._device_handler,
+                "notify_device_update",
                 new=add_device_change,
             ),
             patch.object(
@@ -92,7 +92,7 @@ class FederationTestCase(unittest.FederatingHomeserverTestCase):
                 "mark_remote_users_device_caches_as_stale",
                 new=mark_stale,
             ),
-            patch.object(self.handler, "_notifier", new=notifier),
+            patch.object(self.handler._device_handler, "notifier", new=notifier),
         ):
             self.get_success(
                 self.handler._handle_membership_changes_after_partial_state_resync(
@@ -129,7 +129,6 @@ class FederationTestCase(unittest.FederatingHomeserverTestCase):
             "@elsie:remote", ["DEVICE"], room_ids=["!room:test"]
         )
         mark_stale.assert_awaited_once_with(("@elsie:remote",))
-        notifier.on_new_event.assert_called_once()
 
     def test_exchange_revoked_invite(self) -> None:
         user_id = self.register_user("kermit", "test")
