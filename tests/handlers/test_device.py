@@ -136,9 +136,9 @@ class DeviceTestCase(unittest.HomeserverTestCase):
                 self.handler.get_user_ids_changed("@user:local", StreamToken.START)
             )
 
-        self.assertEqual(
-            generate_sync_entry.await_args.kwargs["newly_joined_rooms"], {room_id}
-        )
+        await_args = generate_sync_entry.await_args
+        assert await_args is not None
+        self.assertEqual(await_args.kwargs["newly_joined_rooms"], {room_id})
 
     def test_device_is_created_with_invalid_name(self) -> None:
         self.get_failure(
