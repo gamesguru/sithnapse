@@ -655,7 +655,17 @@ class DeviceHandler:
 
         for room_id, event in last_membership_event_by_room.items():
             if event.membership == Membership.JOIN:
-                newly_joined_rooms.add(room_id)
+                # A join -> join event is a profile change, not a rejoin. Only
+                # count the join if the previous accepted membership was not
+                # already JOIN (or if no previous content was available).
+                prev_content = event.unsigned.get("prev_content")
+                prev_membership = (
+                    prev_content.get("membership")
+                    if isinstance(prev_content, dict)
+                    else None
+                )
+                if prev_membership != Membership.JOIN:
+                    newly_joined_rooms.add(room_id)
                 newly_left_rooms.discard(room_id)
             elif event.membership in (Membership.LEAVE, Membership.BAN):
                 newly_joined_rooms.discard(room_id)
