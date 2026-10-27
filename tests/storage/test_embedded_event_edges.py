@@ -44,7 +44,6 @@ from synapse.storage.databases.main.embedded_common import (
 )
 from synapse.storage.databases.main.embedded_event_edges import (
     _retry_on_contention,
-    check_event_edges_migration_complete,
     classify_event_edge_fallback,
     delete_event_edges_batch,
     drain_edge_index_outbox,
@@ -2205,66 +2204,3 @@ class EventEdgesSqlOnlyMetricTestCase(EventEdgesStorageIntegrationTestCase):
             - failures_before,
             1,
         )
-
-
-class EventEdgesMigrationGateTestCase(EventEdgesStorageIntegrationTestCase):
-    """`check_event_edges_migration_complete`: Blocker 1's hard precondition
-    for the (not-yet-shipped) release that removes the SQL `event_edges`
-    insert -- `res/docs/2026-09-28-event-edges-sql-removal-plan.md`.
-
-    Reuses `EventEdgesStorageIntegrationTestCase.prepare` for a homeserver
-    with the embedded edges engine enabled and writable.
-    """
-
-    def _make_migration_incomplete(self) -> None:
-        """Reinsert `event_edges_migrate_mtxdb` as pending, matching the
-        idiom in `test_migrate_mtxdb_background_update_is_retired_noop`."""
-        self.get_success(
-            self.store.db_pool.simple_insert(
-                table="background_updates",
-                values={
-                    "update_name": "event_edges_migrate_mtxdb",
-                    "progress_json": "{}",
-                },
-            )
-        )
-        self.store.db_pool.updates._all_done = False
-        self.store.db_pool.updates._completed_background_updates.discard(
-            "event_edges_migrate_mtxdb"
-        )
-
-    def test_no_op_while_flag_false(self) -> None:
-        """`EVENT_EDGES_SQL_INSERT_REMOVED` is False today: the check must
-        never raise, regardless of migration state, since there is nothing
-        to protect yet (the SQL fallback still exists)."""
-        self._make_migration_incomplete()
-
-        self.get_success(check_event_edges_migration_complete(self.hs))
-
-    @mock.patch.object(
-        embedded_event_edges_module, "EVENT_EDGES_SQL_INSERT_REMOVED", True
-    )
-    def test_no_raise_when_writer_and_migration_complete(self) -> None:
-        """With the flag on and the migration already complete (the default
-        state of a fresh test homeserver -- every background update is
-        marked done), the check must be silent."""
-        self.get_success(check_event_edges_migration_complete(self.hs))
-
-    @mock.patch.object(
-        embedded_event_edges_module, "EVENT_EDGES_SQL_INSERT_REMOVED", True
-    )
-    def test_no_op_for_non_writer_process(self) -> None:
-        """With the flag on and the migration incomplete, a process that
-        isn't the events-stream writer must not be blocked -- it never
-        writes event_edges itself, so it has nothing to protect against.
-        `embedded_event_edges_is_writable` is config-derived (not a store
-        attribute), so it's mocked directly rather than mutated on the
-        store."""
-        self._make_migration_incomplete()
-
-        with mock.patch.object(
-            embedded_event_edges_module,
-            "embedded_event_edges_is_writable",
-            return_value=False,
-        ):
-            self.get_success(check_event_edges_migration_complete(self.hs))

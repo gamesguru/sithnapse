@@ -1,1 +1,26 @@
 completely remove sql-mtxdb dual-writes. Completely make mtxdb authoritative where it wants to be. Do NOT have any configuration option to go back. Only go forward. There is no "if event json embedded is enabled" since we have only one direction to flow: forward. Simplicity to the max. Total control.
+
+
+== Event edges: forward-only plan (added 2026-10-27) ==
+Today: SQL `event_edges` is still written (dual write) and read as a fallback;
+mtxdb is gated behind `_embedded_event_edges_enabled` and a SQL
+`room_edge_source_version` clock. That is the toggle + way-back the goals forbid.
+
+Phase 1 (dead toggle code, no behaviour change):
+  - delete EVENT_EDGES_SQL_INSERT_REMOVED, EventEdgesMigrationIncompleteError,
+    check_event_edges_migration_complete (+ call in synapse/app/_base.py, + tests)
+  - delete event_edges_fwd_is_authoritative; readers stop calling it
+Phase 2 (readers mtxdb-only):
+  - get_successor_events / is_event_next_to_forward_gap read only mtxdb; drop
+    the SQL fallback, repair_edge_index_from_sql and fallback counters
+  - drop the room_edge_source_version SQL clock; mtxdb owns its own version
+Phase 3 (writers mtxdb-only):
+  - persist edges straight to mtxdb; drop the SQL event_edges INSERT, the
+    edge_index_outbox + drain, bump_room_edge_source_version
+  - make embedded_db_engine=mtxdb non-optional (no `_embedded_*_enabled`)
+Phase 4 (schema/migration):
+  - decide the one-time import of pre-existing SQL edges (96/05
+    event_edges_migrate_mtxdb); then drop event_edges, edge_index_outbox,
+    room_edge_source_version tables. Rows only in SQL are lost without it.
+Other readers of SQL event_edges still to port: event_federation.py
+(~2097, ~2487, ~2857), purge_events.py, stats.py.

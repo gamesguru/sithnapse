@@ -2660,14 +2660,7 @@ class EventsWorkerStore(SQLBaseStore):
             "This function relies on `event_edges` and `event_forward_extremities` which won't be filled in for `outliers`."
         )
 
-        # Resolved before runInteraction: the txn closure below is sync. A
-        # completed legacy background update does not prove FWD completeness;
-        # only the offline verifier's marker can authorize this read path.
-        from synapse.storage.databases.main.embedded_event_edges import (
-            event_edges_fwd_is_authoritative,
-        )
-
-        embedded_edges_trustworthy = await event_edges_fwd_is_authoritative(self)
+        embedded_edges_trustworthy = self._embedded_event_edges_enabled
 
         def is_event_next_to_gap_txn(txn: LoggingTransaction) -> bool:
             # If the event in question is a forward extremity, we will just

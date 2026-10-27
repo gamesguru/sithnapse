@@ -2885,14 +2885,7 @@ class EventFederationWorkerStore(
         """
         started = time.monotonic()
 
-        # A warm FWD generation is not proof of completeness. Only the
-        # offline verifier may grant this authority marker; until then SQL is
-        # the source of truth and FWD remains a write-side projection.
-        from synapse.storage.databases.main.embedded_event_edges import (
-            event_edges_fwd_is_authoritative,
-        )
-
-        if await event_edges_fwd_is_authoritative(self):
+        if getattr(self, "_embedded_event_edges_enabled", False):
             from synapse.storage.databases.main.embedded_event_edges import (
                 classify_event_edge_fallback,
                 get_event_edges_forward_batch,
