@@ -42,7 +42,6 @@ from synapse.storage.databases.main.embedded_common import (
 )
 from synapse.storage.databases.main.embedded_event_edges import (
     _retry_on_contention,
-    classify_event_edge_fallback,
     delete_event_edges_batch,
     event_edge_publish_signal_gauge,
     flush_edge_writes,
@@ -53,7 +52,6 @@ from synapse.storage.databases.main.embedded_event_edges import (
     queue_edge_write,
     queued_edge_write_count,
     record_event_edge_read,
-    record_event_edge_repair,
     register_publish_signal_gauge,
 )
 from synapse.synapse_rust import mtxdb_engine
@@ -939,31 +937,10 @@ class EventEdgeReaderMetricsTestCase(TestCase):
         server = "metrics-" + uuid4().hex
         record_event_edge_read(server, "successor", "hit")
         record_event_edge_read(server, "successor", "sql_only")
-        record_event_edge_read(server, "gap", "stale")
+        record_event_edge_read(server, "gap", "miss")
         self.assertEqual(_reads(server, "successor", "hit"), 1)
         self.assertEqual(_reads(server, "successor", "sql_only"), 1)
-        self.assertEqual(_reads(server, "gap", "stale"), 1)
-        self.assertEqual(_reads(server, "gap", "miss"), 0)
-
-    def test_classify_event_edge_fallback(self) -> None:
-        self.assertEqual(classify_event_edge_fallback(None), "unavailable")
-        self.assertEqual(classify_event_edge_fallback(mock.Mock(stale=True)), "stale")
-        self.assertEqual(classify_event_edge_fallback(mock.Mock(stale=False)), "miss")
-
-    def test_repair_counts_attempts_and_rows_separately(self) -> None:
-        server = "repair-" + uuid4().hex
-        record_event_edge_repair(server, "successor", True, 5)
-        record_event_edge_repair(server, "successor", False)
-        kw = {"path": "successor", "server_name": server}
-        self.assertEqual(
-            _sample("synapse_event_edges_repairs_total", result="ok", **kw), 1
-        )
-        self.assertEqual(
-            _sample("synapse_event_edges_repairs_total", result="failed", **kw), 1
-        )
-        self.assertEqual(_sample("synapse_event_edges_repaired_rows_total", **kw), 5)
-        # Repairs must not leak into the lookup counter's units.
-        self.assertEqual(_reads(server, "successor", "hit"), 0)
+        self.assertEqual(_reads(server, "gap", "miss"), 1)
 
     def test_publish_signal_gauge_reports_each_pool(self) -> None:
         hs = mock.Mock()
@@ -1090,7 +1067,7 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         # process, one active flush coalescer). Drain the coalesced edge-write
         # queues and shut down this test's coalescer so queued rows, tombstones,
         # pending delayed flush calls, and dirty EVENT_DAG/EJSON pools cannot
-        # leak into the next test and perturb its FWD source-version match.
+        # leak into the next test's process-global mtxdb state.
         try:
             flush_edge_writes()
             embedded_common.close_coalescer()
@@ -1101,17 +1078,12 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         """Advance the reactor past the coalescer's actual debounce window."""
         self.reactor.advance(self._flush_delay_secs + 0.1)
 
-    def test_event_edges_mirrored_on_persistence(self) -> None:
-        """When events are persisted, event_edges are dual-written to mtxdb."""
+    def test_event_edges_stored_in_mtxdb_on_persistence(self) -> None:
+        """When mtxdb is authoritative, persisted edges are stored there."""
         res1 = self.helper.send(self.room_id, "first", tok=self.tok)
         e1_id = res1["event_id"]
         res2 = self.helper.send(self.room_id, "second", tok=self.tok)
         e2_id = res2["event_id"]
-
-        # Edge writes are coalesced in-process; drain the queue so the mirror
-        # reflects them (in production the next flush / threshold / shutdown
-        # would do this, but the test asserts immediately).
-        flush_edge_writes(self.store._embedded_db_namespace)
 
         # e2 should have e1 in its backward edges in mtxdb
         backward = get_event_edges_backward_batch(

@@ -10,7 +10,7 @@ use mtxdb::{
     derive_collection_id, derive_group_full_id, derive_member_collection_id_from_group,
     CollectionMetadata, DatabaseLayout, FrameIdPolicy, GroupCommitConfig, NodeData, NodeId,
     PackfileStorage, PayloadPolicy, RecordIdentityRule, ShardType, StorageEngine,
-    MEMBER_NAMESPACE_FWD, MEMBER_NAMESPACE_INTL,
+    MEMBER_NAMESPACE_INTL,
 };
 use mtxdb::{Database, DatabaseTransaction};
 use once_cell::sync::OnceCell;
@@ -1854,123 +1854,6 @@ pub(crate) fn auth_chain_closure_room_id(_namespace: &str, room_id: &str) -> [u8
 pub(crate) fn prev_edges_room_id(_namespace: &str, room_id: &str) -> [u8; 16] {
     let group_digest = group_full_logical_id(room_id.as_bytes());
     member_collection_id(*b"PREV", &group_digest)
-}
-
-/// The generation-scoped collection used by the forward edge index.
-pub(crate) fn forward_edges_room_id(room_id: &str, generation: u32) -> [u8; 16] {
-    let canonical = format!("{room_id}\0{generation}");
-    let group_digest = group_full_logical_id(canonical.as_bytes());
-    member_collection_id(MEMBER_NAMESPACE_FWD, &group_digest)
-}
-
-pub(crate) const ROOM_FORWARD_META_COLLECTION: [u8; 16] = *b"room-fwd-meta-v1";
-
-pub(crate) fn room_forward_meta_node_id(room_id: &str) -> NodeId {
-    let mut hasher = Sha256::new();
-    hasher.update(b"synapse:room-forward-meta:");
-    hasher.update(room_id.as_bytes());
-    let digest = hasher.finalize();
-    digest[..16]
-        .try_into()
-        .expect("SHA-256 digest is at least 16 bytes")
-}
-
-pub(crate) fn encode_room_forward_meta(
-    active_generation: u32,
-    published_source_version: u64,
-) -> [u8; 16] {
-    let mut bytes = [0u8; 16];
-    bytes[0] = 1;
-    bytes[4..8].copy_from_slice(&active_generation.to_be_bytes());
-    bytes[8..16].copy_from_slice(&published_source_version.to_be_bytes());
-    bytes
-}
-
-pub(crate) fn decode_room_forward_meta(bytes: &[u8]) -> PyResult<(u32, u64)> {
-    // Version 1 was first written as a 20-byte value with four reserved
-    // trailing zero bytes. Accept those values while writing the compact
-    // 16-byte representation so existing databases remain readable.
-    if !matches!(bytes.len(), 16 | 20)
-        || bytes[0] != 1
-        || bytes[1..4] != [0, 0, 0]
-        || (bytes.len() == 20 && bytes[16..20] != [0, 0, 0, 0])
-    {
-        return Err(pyo3::exceptions::PyRuntimeError::new_err(
-            "malformed room forward metadata",
-        ));
-    }
-    Ok((
-        u32::from_be_bytes(bytes[4..8].try_into().unwrap()),
-        u64::from_be_bytes(bytes[8..16].try_into().unwrap()),
-    ))
-}
-
-#[cfg(test)]
-mod room_forward_meta_tests {
-    use super::{decode_room_forward_meta, encode_room_forward_meta};
-
-    #[test]
-    fn compact_encoding_and_legacy_width_are_readable() {
-        let encoded = encode_room_forward_meta(7, 0x0102_0304_0506_0708);
-        assert_eq!(encoded.len(), 16);
-        assert_eq!(
-            decode_room_forward_meta(&encoded).unwrap(),
-            (7, 0x0102_0304_0506_0708)
-        );
-
-        let mut legacy = [0; 20];
-        legacy[..16].copy_from_slice(&encoded);
-        assert_eq!(
-            decode_room_forward_meta(&legacy).unwrap(),
-            (7, 0x0102_0304_0506_0708)
-        );
-        legacy[19] = 1;
-        assert!(decode_room_forward_meta(&legacy).is_err());
-    }
-}
-
-pub(crate) fn read_room_forward_meta(room_id: &str) -> PyResult<Option<(u32, u64)>> {
-    let value = auth_chain_db()?
-        .get_read_committed(
-            &ROOM_FORWARD_META_COLLECTION,
-            &[room_forward_meta_node_id(room_id)],
-        )
-        .map_err(map_read_storage_error)?
-        .into_iter()
-        .next()
-        .flatten();
-    value
-        .map(|data| decode_room_forward_meta(&data.bytes))
-        .transpose()
-}
-
-#[pyfunction]
-pub fn room_forward_meta_get(room_id: String) -> PyResult<Option<(u32, u64)>> {
-    read_room_forward_meta(&room_id)
-}
-
-/// Low-level generation pointer/coverage write. Call only after the referenced
-/// generation has been fully populated and caught up. Active-generation delta
-/// writes must update FWD and metadata together through the transaction API.
-pub(crate) fn room_forward_meta_put(
-    room_id: String,
-    active_generation: u32,
-    published_source_version: u64,
-) -> PyResult<()> {
-    assert_writable()?;
-    auth_chain_db()?
-        .put_many(
-            &ROOM_FORWARD_META_COLLECTION,
-            &[(
-                room_forward_meta_node_id(&room_id),
-                NodeData::from_slice(&encode_room_forward_meta(
-                    active_generation,
-                    published_source_version,
-                )),
-            )],
-        )
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-    Ok(())
 }
 
 /// Distinct tag prefixes keep the counter, forward mapping, reverse
@@ -4756,7 +4639,6 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(auth_chain_children_get, m)?)?;
     m.add_function(wrap_pyfunction!(auth_chain_children_append, m)?)?;
     m.add_function(wrap_pyfunction!(auth_chain_purge_room, m)?)?;
-    m.add_function(wrap_pyfunction!(room_forward_meta_get, m)?)?;
     m.add_function(wrap_pyfunction!(batch_get, m)?)?;
     m.add_function(wrap_pyfunction!(batch_put, m)?)?;
     m.add_function(wrap_pyfunction!(batch_delete, m)?)?;

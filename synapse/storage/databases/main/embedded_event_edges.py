@@ -12,22 +12,17 @@
 # <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
 
-"""Mirrors `event_edges` (backward and forward event DAG edges) into the
-embedded mtxdb event_dag keyspace.
+"""Stores `event_edges` (backward and forward event DAG edges) in the
+configured authoritative backend.
 
 Design:
 - Backward edges: `event_id -> [(prev_event_id, is_state)]`. Cryptographically
   immutable once an event is created.
 - Forward edges: `prev_event_id -> [child_event_id]`. Deduplicated and appended
   as new children arrive under RMW_LOCK.
-- Locators are primarily owned by `embedded_event_json`; `event_edges_put`
-  re-publishes them for every event a row touches (see the Rust doc), so
-  repaired/backfilled edges for legacy events still resolve.
-
-Reads are mtxdb-first with SQL fallback:
-  mtxdb lookup
-    ├─ complete -> return mtxdb result
-    └─ missing/incomplete -> query SQL, repair mtxdb, return SQL result
+- In mtxdb mode, locators are primarily owned by `embedded_event_json`;
+  `event_edges_put` re-publishes them for every event a row touches (see the
+  Rust doc), so backfilled edges for legacy events still resolve.
 
 Writes are coalesced per namespace: ``queue_edge_write`` accumulates rows
 across post-commit callbacks, ``flush_edge_writes`` drains them in a single
@@ -44,7 +39,7 @@ import logging
 import threading
 import time
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Callable, Iterable, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Callable, Iterable, TypeVar
 
 from prometheus_client import Counter
 
@@ -68,14 +63,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
-
-
-class ForwardEdgeMap(dict[str, list[str] | None]):
-    """Forward edges plus whether the embedded index was stale."""
-
-    def __init__(self, *args: Any, stale: bool = False, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self.stale = stale
 
 
 # ---------------------------------------------------------------------------
@@ -295,36 +282,17 @@ def open_embedded_event_edges_engine(hs: HomeServer) -> bool:
 event_edge_reads_counter = Counter(
     "synapse_event_edges_reads",
     "Lookups of event edges by caller (`path`) and outcome, one increment per "
-    "lookup so the outcomes sum to the total lookup rate: `hit` (served from "
-    "mtxdb), `miss` (no entry; SQL fallback), `stale` (source-version "
-    "mismatch; SQL fallback), `unavailable` (successor-only: room could not be "
-    "resolved, so "
-    "mtxdb was not queried), and `sql_only` (authority gate closed or engine "
-    "disabled, mtxdb not consulted). SQL-read removal needs all fallback "
-    "outcomes at ~0 on every process. Unlike the opt-in ffi counters "
-    "this is always on.",
+    "lookup so the outcomes sum to the total lookup rate: `hit` or `miss` "
+    "when served from mtxdb, and `sql_only` when the SQL backend is "
+    "authoritative. Unlike the opt-in ffi counters this is always on.",
     labelnames=["path", "outcome", SERVER_NAME_LABEL],
-)
-
-event_edge_repairs_counter = Counter(
-    "synapse_event_edges_repairs",
-    "Repairs of the mtxdb forward index from SQL after a fallback read, by "
-    "`path` and `result` (`ok`/`failed`), counted per repair attempt.",
-    labelnames=["path", "result", SERVER_NAME_LABEL],
-)
-
-event_edge_repaired_rows_counter = Counter(
-    "synapse_event_edges_repaired_rows",
-    "SQL edge rows copied into mtxdb by successful repairs.",
-    labelnames=["path", SERVER_NAME_LABEL],
 )
 
 event_edge_publish_signal_gauge = LaterGauge(
     name="synapse_event_edges_publish_signal_active",
     desc="1 if the read-only mtxdb handle for this pool mapped the writer's "
-    "publish signal (strict cross-process freshness), 0 if it is on the "
-    "stat-based fallback. Every reader must report 1 before SQL reads are "
-    "removed.",
+    "publish signal for strict cross-process freshness, 0 if it uses the "
+    "stat-based fallback.",
     labelnames=["pool", SERVER_NAME_LABEL],
 )
 
@@ -333,20 +301,6 @@ event_edge_publish_signal_gauge = LaterGauge(
 def _event_edge_read_metric(path: str, outcome: str, server_name: str) -> Any:
     return event_edge_reads_counter.labels(
         path=path, outcome=outcome, **{SERVER_NAME_LABEL: server_name}
-    )
-
-
-@lru_cache(maxsize=16)
-def _event_edge_repair_metric(path: str, result: str, server_name: str) -> Any:
-    return event_edge_repairs_counter.labels(
-        path=path, result=result, **{SERVER_NAME_LABEL: server_name}
-    )
-
-
-@lru_cache(maxsize=8)
-def _event_edge_repaired_rows_metric(path: str, server_name: str) -> Any:
-    return event_edge_repaired_rows_counter.labels(
-        path=path, **{SERVER_NAME_LABEL: server_name}
     )
 
 
@@ -366,29 +320,9 @@ def _log_missing_publish_signal_api_once() -> None:
     )
 
 
-def classify_event_edge_fallback(forward_map: Any | None) -> str:
-    """Name why an embedded lookup did not produce a hit.
-
-    ``None`` means mtxdb was never queried (e.g. the room could not be
-    resolved), which must not be counted as a lookup that missed.
-    """
-    if forward_map is None:
-        return "unavailable"
-    return "stale" if forward_map.stale else "miss"
-
-
 def record_event_edge_read(server_name: str, path: str, outcome: str) -> None:
     """Count one event-edge lookup (see `event_edge_reads_counter`)."""
     _event_edge_read_metric(path, outcome, server_name).inc()
-
-
-def record_event_edge_repair(
-    server_name: str, path: str, ok: bool, rows: int = 0
-) -> None:
-    """Count one repair attempt and, if it succeeded, the rows it copied."""
-    _event_edge_repair_metric(path, "ok" if ok else "failed", server_name).inc()
-    if ok and rows:
-        _event_edge_repaired_rows_metric(path, server_name).inc(rows)
 
 
 def register_publish_signal_gauge(hs: HomeServer) -> None:
@@ -823,9 +757,8 @@ def put_event_edges_batch(
         # Under a shared WAL, `event_edges_put` runs the optimistic loop
         # `run_edge_occ` internally: it replays collection-version conflicts up
         # to `MAX_OCC_ATTEMPTS` and only then raises a retryable
-        # `BlockingIOError`, which nothing else here would catch -- unlike the
-        # forward-outbox and generation-delta writes, which already retry. Do
-        # the same for event persistence rather than surfacing contention.
+        # `BlockingIOError`. Retry here rather than surfacing transient
+        # contention to event persistence.
         _retry_on_contention(lambda: event_edges_put(namespace, row_list))
         elapsed = time.monotonic() - _et
         ffi_timing("ffi_event_edges_put", elapsed)
@@ -1037,64 +970,16 @@ def get_event_edges_backward_batch(
 
 def get_event_edges_forward_batch(
     namespace: str,
-    room_id_or_prev_event_ids: str | list[str],
-    expected_source_version: int | None = None,
-    prev_event_ids: list[str] | None = None,
-) -> ForwardEdgeMap:
-    """Reads forward child edges for `prev_event_ids`.
-
-    ``stale`` is set when the embedded index cannot satisfy the requested
-    source version. A missing key in a non-stale result means that the queried
-    event is not present in the index.
-    """
-    if prev_event_ids is None:
-        # Keep the established helper contract for benchmarks and tests. The
-        # gated path below is used by production callers that have room and
-        # source-version context.
-        legacy_prev_event_ids = cast(list[str], room_id_or_prev_event_ids)
-        if not legacy_prev_event_ids:
-            return ForwardEdgeMap()
-        with mirror_timing("event_edges_get_forward"):
-            from synapse.synapse_rust.mtxdb_engine import event_edges_get_forward
-
-            results = _retry_on_contention(
-                lambda: event_edges_get_forward(namespace, legacy_prev_event_ids)
-            )
-            return ForwardEdgeMap(results)
-
-    if (
-        not isinstance(room_id_or_prev_event_ids, str)
-        or expected_source_version is None
-    ):
-        raise TypeError("room_id and expected_source_version are required together")
-    room_id = room_id_or_prev_event_ids
+    prev_event_ids: list[str],
+) -> dict[str, list[str] | None]:
+    """Read forward child edges for `prev_event_ids` from the authoritative store."""
     if not prev_event_ids:
-        return ForwardEdgeMap()
-
+        return {}
     with mirror_timing("event_edges_get_forward"):
-        from synapse.synapse_rust.mtxdb_engine import event_edges_get_forward_gated
+        from synapse.synapse_rust.mtxdb_engine import event_edges_get_forward
 
-        _et = time.monotonic()
-        gated_results: Any = _retry_on_contention(
-            lambda: event_edges_get_forward_gated(
-                namespace, room_id, expected_source_version, prev_event_ids
-            )
+        results = _retry_on_contention(
+            lambda: event_edges_get_forward(namespace, prev_event_ids)
         )
-        elapsed = time.monotonic() - _et
-        ffi_timing("ffi_event_edges_get_forward", elapsed)
         ffi_batch_size("event_edges_get_forward", len(prev_event_ids))
-
-        status, *payload = gated_results
-        logger.debug(
-            "get_event_edges_forward_batch: room_id=%s expected_source_version=%s count=%s status=%s",
-            room_id,
-            expected_source_version,
-            len(prev_event_ids),
-            status,
-        )
-        if status == "version_mismatch":
-            ffi_count("event_edges_version_mismatches", 1)
-            return ForwardEdgeMap(stale=True)
-        if status != "hit":
-            raise RuntimeError(f"unexpected forward edge result: {status!r}")
-        return ForwardEdgeMap(cast(list[tuple[str, list[str] | None]], payload[0]))
+        return dict(results)
