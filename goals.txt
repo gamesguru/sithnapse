@@ -24,3 +24,15 @@ Phase 4 (schema/migration):
     room_edge_source_version tables. Rows only in SQL are lost without it.
 Other readers of SQL event_edges still to port: event_federation.py
 (~2097, ~2487, ~2857), purge_events.py, stats.py.
+
+Phase 3 survey (2026-10-27): the post-commit put_event_edges_batch to mtxdb
+already exists in events.py `_handle_mult_prev_events`; the SQL INSERT, outbox
+and source-version bump beside it are the only dual-write left. They cannot go
+until every SQL reader of event_edges is ported to mtxdb (backward/forward
+batch APIs exist): events_worker.py ~2743 and ~2932; event_federation.py ~2101
+(auth/backfill walk), ~2487, ~2857; events.py ~1076, ~1171; purge_events.py
+~288, ~553 (join events + edges, need rewriting); events_bg_updates.py ~329,
+~899, ~964; _scripts/state_repair.py. Also tests default to no embedded engine,
+so mtxdb must become non-optional in test config first.
+Order: (a) make embedded engine mandatory in config + test harness, (b) port
+readers one at a time, (c) drop SQL insert/outbox/version, (d) drop tables.
