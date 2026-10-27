@@ -1438,15 +1438,18 @@ class EventEdgesMigrationTestCase(EventEdgesStorageIntegrationTestCase):
         )
 
     def _set_marker(self, backend: str) -> None:
-        self.get_success(
-            self.store.db_pool.runInteraction(
-                "set_edge_backend",
-                lambda txn: txn.execute(
-                    "UPDATE edge_backend SET backend = ? WHERE lock = 'X'",
-                    (backend,),
-                ),
+        def _set(txn: Any) -> None:
+            txn.execute(
+                "UPDATE edge_backend SET backend = ? WHERE lock = 'X'",
+                (backend,),
             )
-        )
+            if txn.rowcount == 0:
+                txn.execute(
+                    "INSERT INTO edge_backend (lock, backend) VALUES ('X', ?)",
+                    (backend,),
+                )
+
+        self.get_success(self.store.db_pool.runInteraction("set_edge_backend", _set))
 
     def _sql_edge_count(self) -> int:
         def _count(txn: Any) -> int:
@@ -1609,14 +1612,18 @@ class EventEdgesBackendMarkerTestCase(EventEdgesStorageIntegrationTestCase):
     hold the migrated edges."""
 
     def _set_marker(self, backend: str) -> None:
-        self.get_success(
-            self.store.db_pool.runInteraction(
-                "set_marker",
-                lambda txn: txn.execute(
-                    "UPDATE edge_backend SET backend = ?", (backend,)
-                ),
+        def _set(txn: Any) -> None:
+            txn.execute(
+                "UPDATE edge_backend SET backend = ? WHERE lock = 'X'",
+                (backend,),
             )
-        )
+            if txn.rowcount == 0:
+                txn.execute(
+                    "INSERT INTO edge_backend (lock, backend) VALUES ('X', ?)",
+                    (backend,),
+                )
+
+        self.get_success(self.store.db_pool.runInteraction("set_marker", _set))
 
     def _check(self, configured: str) -> None:
         with mock.patch.object(
