@@ -529,6 +529,15 @@ async def _migrate_mtxdb_edges_to_sql(
 
     def _clear(txn: Any) -> None:
         txn.execute("DELETE FROM event_edges")
+        # The SQL-only background index update may have been skipped while
+        # mtxdb was authoritative. Recreate the composite key needed by the
+        # idempotent upserts below when migrating back to SQL.
+        txn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "event_edges_event_id_prev_event_id_idx "
+            "ON event_edges (event_id, prev_event_id)"
+        )
+        txn.execute("DROP INDEX IF EXISTS ev_edges_id")
 
     await store.db_pool.runInteraction("migrate_event_edges_clear_sql", _clear)
 
