@@ -1626,6 +1626,18 @@ class EventEdgesSqlOnlyMetricTestCase(EventEdgesStorageIntegrationTestCase):
 class EventEdgesMigrationTestCase(EventEdgesStorageIntegrationTestCase):
     """Manual SQL <-> mtxdb edge migration and its marker handoff."""
 
+    def _migrate(self, **kwargs: Any) -> Any:
+        # This module opens one process-global mtxdb fixture even when the
+        # homeserver config is SQL-only. Tell the migration code that fixture
+        # is available; the ordinary integration fixture enables edge reads
+        # and writes on the stores without changing the homeserver config.
+        with mock.patch.object(
+            embedded_event_edges_module,
+            "open_embedded_event_edges_engine",
+            return_value=True,
+        ):
+            return self.get_success(migrate_event_edges(self.hs, **kwargs))
+
     def _marker(self) -> str:
         return self.get_success(
             self.store.db_pool.simple_select_one_onecol(
@@ -1659,20 +1671,29 @@ class EventEdgesMigrationTestCase(EventEdgesStorageIntegrationTestCase):
         child_id = self.helper.send(self.room_id, "child", tok=self.tok)["event_id"]
         ns = self.store._embedded_db_namespace
         flush_edge_writes(ns)
+        self.get_success(
+            self.store.db_pool.runInteraction(
+                "clear_sql_edges",
+                lambda txn: txn.execute("DELETE FROM event_edges"),
+            )
+        )
         self.assertEqual(self._sql_edge_count(), 0)
         self._set_marker("sql")
 
-        failure = self.get_failure(
-            migrate_event_edges(self.hs, target="mtxdb"), RuntimeError
-        )
+        with mock.patch.object(
+            embedded_event_edges_module,
+            "open_embedded_event_edges_engine",
+            return_value=True,
+        ):
+            failure = self.get_failure(
+                migrate_event_edges(self.hs, target="mtxdb"), RuntimeError
+            )
         self.assertIn("marker may be stale", str(failure.value))
         backward = get_event_edges_backward_batch(ns, [child_id])
         self.assertIn((parent_id, False), backward.get(child_id) or [])
 
         # Explicitly adopting the existing mtxdb data flips the stale marker.
-        result = self.get_success(
-            migrate_event_edges(self.hs, target="mtxdb", source="mtxdb")
-        )
+        result = self._migrate(target="mtxdb", source="mtxdb")
         self.assertEqual(result["already"], 1)
         self.assertEqual(self._marker(), "mtxdb")
 
@@ -1684,6 +1705,12 @@ class EventEdgesMigrationTestCase(EventEdgesStorageIntegrationTestCase):
         flush_edge_writes(ns)
         # Simulate the pre-migration state: the edge is in SQL, not mtxdb.
         delete_event_edges_batch(ns, [child_id])
+        self.get_success(
+            self.store.db_pool.runInteraction(
+                "clear_sql_edges",
+                lambda txn: txn.execute("DELETE FROM event_edges"),
+            )
+        )
         self.get_success(
             self.store.db_pool.simple_insert(
                 table="event_edges",
@@ -1697,7 +1724,7 @@ class EventEdgesMigrationTestCase(EventEdgesStorageIntegrationTestCase):
         )
         self._set_marker("sql")
 
-        result = self.get_success(migrate_event_edges(self.hs, target="mtxdb"))
+        result = self._migrate(target="mtxdb")
 
         self.assertEqual(result["source"], "sql")
         self.assertEqual(result["target"], "mtxdb")
@@ -1726,7 +1753,7 @@ class EventEdgesMigrationTestCase(EventEdgesStorageIntegrationTestCase):
             )
         )
 
-        result = self.get_success(migrate_event_edges(self.hs, target="sql"))
+        result = self._migrate(target="sql")
 
         self.assertEqual(result["source"], "mtxdb")
         self.assertEqual(result["target"], "sql")
@@ -1743,6 +1770,46 @@ class EventEdgesMigrationTestCase(EventEdgesStorageIntegrationTestCase):
             )
         )
         self.assertNotIn(child_id, stale)
+
+
+class EventEdgesBackendAdoptionTestCase(HomeserverTestCase):
+    """A database with no events adopts whatever backend it is configured for."""
+
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
+        self.hs = hs
+        self.store = hs.get_datastores().main
+
+    def test_empty_database_adopts_configured_backend(self) -> None:
+        def _count(txn: Any) -> tuple[int, str]:
+            txn.execute("SELECT COUNT(*) FROM events")
+            events = int(txn.fetchone()[0])
+            txn.execute("SELECT backend FROM edge_backend WHERE lock = 'X'")
+            row = txn.fetchone()
+            return events, str(row[0]) if row else "sql"
+
+        events, marker = self.get_success(
+            self.store.db_pool.runInteraction("inspect_empty_db", _count)
+        )
+        self.assertEqual(events, 0)
+        self.assertEqual(marker, "sql")
+
+        with mock.patch.object(
+            embedded_event_edges_module,
+            "configured_event_edges_backend",
+            return_value="mtxdb",
+        ):
+            self.get_success(
+                embedded_event_edges_module.check_event_edges_backend(self.hs)
+            )
+
+        self.assertEqual(
+            self.get_success(
+                self.store.db_pool.simple_select_one_onecol(
+                    "edge_backend", {"lock": "X"}, "backend"
+                )
+            ),
+            "mtxdb",
+        )
 
 
 class EventEdgesBackendMarkerTestCase(EventEdgesStorageIntegrationTestCase):
