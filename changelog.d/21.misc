@@ -1,1 +1,1 @@
-Improve timing diagnostic snapshots, name-filtered Complement package selection, and make the docs formatting target self-contained. Add `synapse_event_edges_migrate` for manual event-edge migration between SQL and mtxdb, and refuse startup when the configured backend does not match the migrated data.
+Improve timing diagnostic snapshots, name-filtered Complement package selection, and make the docs formatting target self-contained.

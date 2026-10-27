@@ -1,0 +1,1 @@
+Make the event-edge store single-backend: edges live in either SQL or mtxdb, never both. Add `synapse_event_edges_migrate` for manual migration between them, refuse startup when the configured backend does not match the migrated data, and stage mtxdb edge writes in the persist transaction.
