@@ -2156,13 +2156,24 @@ mod wal_env_tests {
     }
 
     #[test]
-    fn wal_matrix_pool_policies_disable_state_and_edge_compression() {
-        let policies = mtxdb::matrix_pool_policies();
+    fn wal_matrix_pool_policies_disable_state_edge_and_server_info_compression() {
+        let policies = super::synapse_pool_policies();
         assert!(!policies.for_shard(ShardType::State).compress);
         assert!(policies.for_shard(ShardType::EventDag).compress);
         assert!(!policies.for_shard(ShardType::Edges).compress);
         assert!(!policies.for_shard(ShardType::ServerInfo).compress);
     }
+}
+
+/// Matrix pool policies with Synapse's edge-compression override.
+///
+/// mtxdb's Matrix defaults keep edge compression enabled, but auth-chain edge
+/// records are small and dense; every write would pay for a compression pass
+/// that usually falls back to the raw frame. Keep edges uncompressed.
+fn synapse_pool_policies() -> mtxdb::PoolPolicies {
+    let mut policies = mtxdb::matrix_pool_policies();
+    policies.for_shard_mut(ShardType::Edges).compress = false;
+    policies
 }
 
 #[pyfunction]
@@ -2175,21 +2186,19 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
         // dense structural hashes, not text. zstd never shrinks them (see
         // mtxdb's own compression bench), so every write there was still
         // paying the compressor's full match-finding pass for nothing.
-        // The matrix pool policies disable compression for state and edge
-        // pools while keeping it enabled for event-DAG records.
+        // Disable compression for state, edge, and server-info pools while
+        // keeping it enabled for event-DAG records.
         // The current MTXDB layout gives all pools beneath a database root one
         // shared WAL and writer lock. Open the root once so each pool attaches
         // as a shared member; opening the pools individually would make the
         // second pool try to acquire the root lock a second time.
-        let shared_database = Database::open_with_policies(
-            std::path::PathBuf::from(&path),
-            mtxdb::matrix_pool_policies(),
-        )
-        .map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "failed to open shared mtxdb database: {e}"
-            ))
-        })?;
+        let shared_database =
+            Database::open_with_policies(std::path::PathBuf::from(&path), synapse_pool_policies())
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "failed to open shared mtxdb database: {e}"
+                    ))
+                })?;
         let state = shared_database.pool(ShardType::State).clone();
         let event_dag = shared_database.pool(ShardType::EventDag).clone();
         let auth_chain = shared_database.pool(ShardType::Edges).clone();
