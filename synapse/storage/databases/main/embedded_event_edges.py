@@ -24,12 +24,16 @@ Design:
   `event_edges_put` re-publishes them for every event a row touches (see the
   Rust doc), so backfilled edges for legacy events still resolve.
 
-Writes are coalesced per namespace: ``queue_edge_write`` accumulates rows
-across post-commit callbacks, ``flush_edge_writes`` drains them in a single
-FFI call when the queue exceeds ``_EDGE_WRITE_THRESHOLD``, and the commit
-aware flush coalescer (embedded_common._FlushCoalescer) drains any remainder
-on its bounded debounce timer.  Drained rows are only dropped from the queue
-after a successful FFI write; a failed write is re-queued for retry.
+The persist path writes edges directly before the SQL COMMIT: staged in the
+persist's mtxdb transaction when one is available, otherwise applied through
+``put_event_edges_batch``.  It no longer enqueues a post-commit callback.
+
+The coalescing queue (``queue_edge_write`` / ``flush_edge_writes``) remains as
+an internal utility used by tests and explicit callers: rows are drained in a
+single FFI call when the queue exceeds ``_EDGE_WRITE_THRESHOLD``, and the commit
+aware flush coalescer (embedded_common._FlushCoalescer) drains any remainder on
+its bounded debounce timer.  Drained rows are only dropped from the queue after
+a successful FFI write; a failed write is re-queued for retry.
 """
 
 from __future__ import annotations

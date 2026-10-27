@@ -949,17 +949,15 @@ pub fn event_edges_get_forward(
         // `Some(false)` -- present but empty -- is `event_edges_delete`'s
         // explicit tombstone, and the child is dropped. `None` -- no record
         // at all -- is NOT the same as a tombstone: it is a legacy or
-        // partially-mirrored event whose backward edge was never written
-        // (see the module doc comment on repair and backfill). Silently
-        // keeping or dropping that child either hides it or fabricates
-        // certainty this code doesn't have, so instead the child's *parent*
-        // is treated as an incomplete lookup and returned as `None` --
-        // exactly the same "embedded miss" signal `event_edges_get_forward`
-        // already returns when the forward node itself doesn't exist.
-        // Callers (e.g. `get_successor_events` in event_federation.py)
-        // already handle that `None` by falling back to SQL and re-queuing
-        // a repair write for the gap via `queue_edge_write`, so this reuses
-        // existing self-healing rather than inventing a new contract.
+        // partially-mirrored event whose backward edge was never written.
+        // Silently keeping or dropping that child either hides it or
+        // fabricates certainty this code doesn't have, so instead the child's
+        // *parent* is treated as an incomplete lookup and returned as `None`
+        // -- exactly the same "embedded miss" signal this function already
+        // returns when the forward node itself doesn't exist. There is no SQL
+        // fallback in mtxdb mode; callers treat the miss as "no known
+        // successors". A manual verify/repair pass is the recovery path for
+        // these gaps.
         let mut live: HashMap<([u8; 16], String), Option<bool>> = HashMap::new();
         for (collection, children) in &mut child_lookup {
             children.sort_unstable();

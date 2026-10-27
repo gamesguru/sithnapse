@@ -22,13 +22,13 @@ a lossy cache and validates each returned child against its backward edge:
 
 - a non-empty backward record means the child is live;
 - a present empty record is an explicit deletion tombstone and is filtered;
-- a missing backward record is an incomplete/legacy mirror and must preserve the
-  SQL-fallback path rather than being silently dropped.
+- a missing backward record is an incomplete/legacy edge and is not silently
+  kept or dropped.
 
 If the forward result is incomplete because a child’s backward record is
-missing, the read returns a miss so Synapse can query SQL. If all returned
-children are tombstoned, the result is empty/missing according to the existing
-fallback contract.
+missing, the read returns a miss. In mtxdb mode there is no SQL fallback, so
+callers treat that miss as “no known successors” rather than querying SQL. If
+all returned children are tombstoned, the result is also a miss.
 
 The purge path also avoids draining the entire namespace edge queue. Rows owned
 by purged events are canceled under the namespace lock; unrelated rows remain
@@ -57,7 +57,8 @@ Before treating this as a permanent storage policy, measure and test:
 - forward-read latency and batch sizes;
 - deleting one child while retaining siblings;
 - deleting all children;
-- missing/legacy backward records and SQL fallback;
+- missing/legacy backward records and the miss behavior (no SQL fallback in
+  mtxdb mode);
 - concurrent puts and deletes;
 - restart and recovery behavior;
 - forward-list growth over time.

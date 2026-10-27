@@ -207,7 +207,7 @@ def ffi_batch_size(tag: str, size: int) -> None:
 #
 # Every timer above brackets the duration of a call this module knows
 # about. None of them can see time spent *before* a call starts -- e.g. a
-# txn.call_after callback (queue_edge_write, a coalescer flush, sync_now)
+# txn.call_after callback (an event-JSON sync, a coalescer flush, sync_now)
 # blocking the Twisted reactor thread delays every other pending reactor
 # callback in the process, including unrelated tests' code that never
 # touches mtxdb. That delay is invisible to ffi_timing/mirror_timing and
