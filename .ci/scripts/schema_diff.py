@@ -34,11 +34,24 @@ def python_env_runner() -> list[str]:
 
 
 def install_dependencies() -> None:
-    """Install dependencies for the currently checked-out tree."""
+    """Install dependencies for the currently checked-out tree.
+
+    Always reinstall the local package: switching between the PR and its base
+    changes the Rust sources, and `uv sync` otherwise leaves the extension
+    built for the other commit in place. Importing synapse then aborts with
+    "Rust module outdated".
+    """
 
     lockfile = REPO_ROOT / "uv.lock"
     had_lockfile = lockfile.exists()
-    cmd = ["uv", "sync", "--extra", "postgres"]
+    cmd = [
+        "uv",
+        "sync",
+        "--extra",
+        "postgres",
+        "--reinstall-package",
+        "matrix-synapse",
+    ]
     if had_lockfile:
         cmd.append("--locked")
 
