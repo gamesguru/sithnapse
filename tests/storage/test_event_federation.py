@@ -1204,7 +1204,10 @@ class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
 
         put_event_edges_batch(
             self.store._embedded_db_namespace,
-            [(room_id, event_id, prev_event_id, False) for event_id, prev_event_id in edges],
+            [
+                (room_id, event_id, prev_event_id, False)
+                for event_id, prev_event_id in edges
+            ],
             sync=True,
         )
 
@@ -1427,9 +1430,7 @@ class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
         self.get_success(
             self.store.db_pool.runInteraction("populate_backfill_outlier", populate_db)
         )
-        self._mirror_edges_to_mtxdb(
-            room_id, [("$e2", "$e1"), ("$e3", "$e2")]
-        )
+        self._mirror_edges_to_mtxdb(room_id, [("$e2", "$e1"), ("$e3", "$e2")])
 
         def backfill(seed: str) -> set[str]:
             return self.get_success(

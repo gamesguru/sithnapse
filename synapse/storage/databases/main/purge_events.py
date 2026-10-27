@@ -581,7 +581,9 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
                 clause, args = make_in_list_sql_clause(
                     self.database_engine, "event_id", list(child_ids)
                 )
-                txn.execute(f"SELECT COALESCE(MIN(depth), 0) FROM events WHERE {clause}", args)
+                txn.execute(
+                    f"SELECT COALESCE(MIN(depth), 0) FROM events WHERE {clause}", args
+                )
                 (min_depth,) = cast(tuple[int], txn.fetchone())
             else:
                 min_depth = 0

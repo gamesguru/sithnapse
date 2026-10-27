@@ -1081,9 +1081,7 @@ class PersistEventsStore:
                 forward = get_event_edges_forward_batch(
                     self._embedded_db_namespace, list(batch)
                 )
-                ffi_timing(
-                    "persist_prevs_mtxdb_forward", time.monotonic() - _t
-                )
+                ffi_timing("persist_prevs_mtxdb_forward", time.monotonic() - _t)
                 parents_by_child: dict[str, list[str]] = {}
                 for parent_id, children in forward.items():
                     if not children:
@@ -1117,12 +1115,8 @@ class PersistEventsStore:
                 if not rows:
                     return
 
-                missing_meta_ids = [
-                    event_id for event_id, meta in rows if meta is None
-                ]
-                meta_by_id = self._get_embedded_event_metadata(
-                    txn, missing_meta_ids
-                )
+                missing_meta_ids = [event_id for event_id, meta in rows if meta is None]
+                meta_by_id = self._get_embedded_event_metadata(txn, missing_meta_ids)
 
                 for event_id, meta in rows:
                     if meta is None:
@@ -1234,9 +1228,7 @@ class PersistEventsStore:
                     backward = get_event_edges_backward_batch(
                         self._embedded_db_namespace, to_recursively_check
                     )
-                    ffi_timing(
-                        "persist_rejected_mtxdb_backward", time.monotonic() - _t
-                    )
+                    ffi_timing("persist_rejected_mtxdb_backward", time.monotonic() - _t)
                     present = [
                         event_id
                         for event_id in to_recursively_check
@@ -1322,9 +1314,7 @@ class PersistEventsStore:
                 missing_meta_ids = [
                     event_id for event_id, _, meta, _ in rows if meta is None
                 ]
-                meta_by_id = self._get_embedded_event_metadata(
-                    txn, missing_meta_ids
-                )
+                meta_by_id = self._get_embedded_event_metadata(txn, missing_meta_ids)
 
                 for event_id, prev_event_id, metadata, rejected in rows:
                     if prev_event_id in existing_prevs:

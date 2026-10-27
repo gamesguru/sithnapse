@@ -51,6 +51,7 @@ from synapse.storage.databases.main.embedded_event_edges import (
     flush_edge_writes,
     get_event_edges_backward_batch,
     get_event_edges_forward_batch,
+    migrate_event_edges,
     put_event_edges_batch,
     queue_edge_write,
     queued_edge_write_count,
@@ -1620,6 +1621,128 @@ class EventEdgesSqlOnlyMetricTestCase(EventEdgesStorageIntegrationTestCase):
             self.get_success(self.store.get_successor_events(parent_id)), []
         )
         self.assertEqual(_reads(sn, "successor", "miss") - miss0, 1)
+
+
+class EventEdgesMigrationTestCase(EventEdgesStorageIntegrationTestCase):
+    """Manual SQL <-> mtxdb edge migration and its marker handoff."""
+
+    def _marker(self) -> str:
+        return self.get_success(
+            self.store.db_pool.simple_select_one_onecol(
+                "edge_backend", {"lock": "X"}, "backend"
+            )
+        )
+
+    def _set_marker(self, backend: str) -> None:
+        self.get_success(
+            self.store.db_pool.runInteraction(
+                "set_edge_backend",
+                lambda txn: txn.execute(
+                    "UPDATE edge_backend SET backend = ? WHERE lock = 'X'",
+                    (backend,),
+                ),
+            )
+        )
+
+    def _sql_edge_count(self) -> int:
+        def _count(txn: Any) -> int:
+            txn.execute("SELECT COUNT(*) FROM event_edges")
+            row = txn.fetchone()
+            return int(row[0]) if row else 0
+
+        return self.get_success(
+            self.store.db_pool.runInteraction("count_sql_edges", _count)
+        )
+
+    def test_stale_sql_marker_refuses_to_wipe_mtxdb(self) -> None:
+        parent_id = self.helper.send(self.room_id, "parent", tok=self.tok)["event_id"]
+        child_id = self.helper.send(self.room_id, "child", tok=self.tok)["event_id"]
+        ns = self.store._embedded_db_namespace
+        flush_edge_writes(ns)
+        self.assertEqual(self._sql_edge_count(), 0)
+        self._set_marker("sql")
+
+        failure = self.get_failure(
+            migrate_event_edges(self.hs, target="mtxdb"), RuntimeError
+        )
+        self.assertIn("marker may be stale", str(failure.value))
+        backward = get_event_edges_backward_batch(ns, [child_id])
+        self.assertIn((parent_id, False), backward.get(child_id) or [])
+
+        # Explicitly adopting the existing mtxdb data flips the stale marker.
+        result = self.get_success(
+            migrate_event_edges(self.hs, target="mtxdb", source="mtxdb")
+        )
+        self.assertEqual(result["already"], 1)
+        self.assertEqual(self._marker(), "mtxdb")
+
+    def test_sql_to_mtxdb_copies_and_flips_marker(self) -> None:
+        parent_id = self.helper.send(self.room_id, "parent", tok=self.tok)["event_id"]
+        child_id = self.helper.send(self.room_id, "child", tok=self.tok)["event_id"]
+        ns = self.store._embedded_db_namespace
+
+        flush_edge_writes(ns)
+        # Simulate the pre-migration state: the edge is in SQL, not mtxdb.
+        delete_event_edges_batch(ns, [child_id])
+        self.get_success(
+            self.store.db_pool.simple_insert(
+                table="event_edges",
+                values={
+                    "event_id": child_id,
+                    "prev_event_id": parent_id,
+                    "room_id": self.room_id,
+                    "is_state": False,
+                },
+            )
+        )
+        self._set_marker("sql")
+
+        result = self.get_success(migrate_event_edges(self.hs, target="mtxdb"))
+
+        self.assertEqual(result["source"], "sql")
+        self.assertEqual(result["target"], "mtxdb")
+        self.assertEqual(result["edges"], 1)
+        self.assertEqual(self._marker(), "mtxdb")
+        backward = get_event_edges_backward_batch(ns, [child_id])
+        self.assertIn((parent_id, False), backward.get(child_id) or [])
+
+    def test_mtxdb_to_sql_replaces_stale_rows_and_flips_marker(self) -> None:
+        parent_id = self.helper.send(self.room_id, "parent", tok=self.tok)["event_id"]
+        child_id = self.helper.send(self.room_id, "child", tok=self.tok)["event_id"]
+        ns = self.store._embedded_db_namespace
+
+        flush_edge_writes(ns)
+        self._set_marker("mtxdb")
+        # A stale SQL row from before the switch must not survive the rebuild.
+        self.get_success(
+            self.store.db_pool.simple_insert(
+                table="event_edges",
+                values={
+                    "event_id": parent_id,
+                    "prev_event_id": child_id,
+                    "room_id": self.room_id,
+                    "is_state": False,
+                },
+            )
+        )
+
+        result = self.get_success(migrate_event_edges(self.hs, target="sql"))
+
+        self.assertEqual(result["source"], "mtxdb")
+        self.assertEqual(result["target"], "sql")
+        self.assertEqual(self._marker(), "sql")
+        rows = self.get_success(
+            self.store.db_pool.simple_select_onecol(
+                "event_edges", {"event_id": child_id}, "prev_event_id"
+            )
+        )
+        self.assertIn(parent_id, rows)
+        stale = self.get_success(
+            self.store.db_pool.simple_select_onecol(
+                "event_edges", {"event_id": parent_id}, "prev_event_id"
+            )
+        )
+        self.assertNotIn(child_id, stale)
 
 
 class EventEdgesBackendMarkerTestCase(EventEdgesStorageIntegrationTestCase):

@@ -860,9 +860,7 @@ class EventsBackgroundUpdatesStore(
         if not parent_ids:
             return []
 
-        forward = get_event_edges_forward_batch(
-            self._embedded_db_namespace, parent_ids
-        )
+        forward = get_event_edges_forward_batch(self._embedded_db_namespace, parent_ids)
         parents_by_child: dict[str, list[str]] = {}
         for parent_id in parent_ids:
             for child_id in forward.get(parent_id) or ():
@@ -1019,9 +1017,7 @@ class EventsBackgroundUpdatesStore(
                 soft_failed_events_to_lookup = set(to_defer)
 
                 if getattr(self, "_embedded_event_edges_enabled", False):
-                    recursive_rows: list[
-                        tuple[str, str, Any | None, bool]
-                    ] = [
+                    recursive_rows: list[tuple[str, str, Any | None, bool]] = [
                         (prev_event_id, event_id, metadata, rejected)
                         for prev_event_id, event_id, metadata, rejected, _outlier in (
                             self._get_edge_child_rows_mtxdb(

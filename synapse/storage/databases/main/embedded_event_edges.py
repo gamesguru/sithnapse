@@ -598,10 +598,334 @@ async def check_event_edges_backend(hs: HomeServer) -> None:
     if stored != configured:
         raise EventEdgesBackendMismatchError(
             f"Event edges are stored in {stored!r} but this server is configured "
-            f"for {configured!r}. Refusing to start: run the event-edges migration "
-            f"(--to {configured}) first, or restore the previous embedded_db "
-            "configuration."
+            f"for {configured!r}. Refusing to start: stop Synapse and run "
+            f"`synapse_event_edges_migrate --to {configured}` with your config, "
+            "or restore the previous embedded_db configuration."
         )
+
+
+async def _get_event_edges_backend(store: Any) -> str:
+    def _txn(txn: Any) -> str:
+        txn.execute("SELECT backend FROM edge_backend WHERE lock = 'X'")
+        row = txn.fetchone()
+        return str(row[0]) if row else "sql"
+
+    return await store.db_pool.runInteraction("get_event_edges_backend", _txn)
+
+
+async def _set_event_edges_backend(store: Any, backend: str) -> None:
+    def _txn(txn: Any) -> None:
+        txn.execute("UPDATE edge_backend SET backend = ? WHERE lock = 'X'", (backend,))
+        if txn.rowcount == 0:
+            txn.execute(
+                "INSERT INTO edge_backend (lock, backend) VALUES ('X', ?)",
+                (backend,),
+            )
+
+    await store.db_pool.runInteraction("set_event_edges_backend", _txn)
+
+
+async def _migrate_sql_edges_to_mtxdb(
+    store: Any, namespace: str, batch_size: int
+) -> dict[str, int]:
+    """Reconcile every SQL-backed event's edges into mtxdb.
+
+    The marker is not flipped here. Each event is compared against its
+    backward mtxdb record; only mismatches are rewritten (delete then put), so
+    a rerun after an interrupted migration is both safe and cheap.
+    """
+    total_edges = 0
+    changed_events = 0
+    last_event_id = ""
+
+    while True:
+
+        def _read(txn: Any) -> tuple[list[tuple[str, str]], dict[str, list[Any]]]:
+            txn.execute(
+                "SELECT event_id, room_id FROM events "
+                "WHERE event_id > ? ORDER BY event_id LIMIT ?",
+                (last_event_id, batch_size),
+            )
+            events = txn.fetchall()
+            if not events:
+                return [], {}
+
+            event_ids = [event_id for event_id, _room_id in events]
+            clause, args = make_in_list_sql_clause(
+                store.database_engine, "event_id", event_ids
+            )
+            txn.execute(
+                "SELECT event_id, prev_event_id, room_id, is_state "
+                f"FROM event_edges WHERE {clause}",
+                args,
+            )
+            edges_by_event: dict[str, list[Any]] = collections.defaultdict(list)
+            for event_id, prev_event_id, room_id, is_state in txn:
+                edges_by_event[event_id].append(
+                    (prev_event_id, bool(is_state), room_id)
+                )
+            return events, edges_by_event
+
+        events, edges_by_event = await store.db_pool.runInteraction(
+            "migrate_event_edges_read_sql", _read
+        )
+        if not events:
+            break
+
+        event_ids = [event_id for event_id, _room_id in events]
+        current = get_event_edges_backward_batch(namespace, event_ids)
+        to_delete: list[str] = []
+        rows_to_put: list[EdgeRow] = []
+
+        for event_id, room_id in events:
+            desired_rows = edges_by_event.get(event_id, [])
+            desired = {
+                (prev_event_id, is_state) for prev_event_id, is_state, _ in desired_rows
+            }
+            current_edges = current.get(event_id)
+            if desired != set(current_edges or ()):
+                changed_events += 1
+                if current_edges:
+                    to_delete.append(event_id)
+                rows_to_put.extend(
+                    (edge_room_id or room_id, event_id, prev_event_id, is_state)
+                    for prev_event_id, is_state, edge_room_id in desired_rows
+                )
+            total_edges += len(desired)
+
+        if to_delete:
+            delete_event_edges_batch(namespace, to_delete)
+        if rows_to_put:
+            put_event_edges_batch(namespace, rows_to_put, sync=True)
+
+        last_event_id = events[-1][0]
+
+    sync_now(pools=[Pool.EVENT_DAG])
+    return {"edges": total_edges, "changed_events": changed_events}
+
+
+async def _migrate_mtxdb_edges_to_sql(
+    store: Any, namespace: str, batch_size: int
+) -> dict[str, int]:
+    """Replace the SQL edge table with the mtxdb backward records.
+
+    mtxdb is the source while the marker says so, so stale SQL rows must be
+    removed rather than merged. The SQL copy is rebuilt in batches with an
+    upsert, making a rerun after an interruption idempotent.
+    """
+
+    def _clear(txn: Any) -> None:
+        txn.execute("DELETE FROM event_edges")
+
+    await store.db_pool.runInteraction("migrate_event_edges_clear_sql", _clear)
+
+    total_edges = 0
+    last_event_id = ""
+
+    while True:
+
+        def _read(txn: Any) -> list[tuple[str, str]]:
+            txn.execute(
+                "SELECT event_id, room_id FROM events "
+                "WHERE event_id > ? ORDER BY event_id LIMIT ?",
+                (last_event_id, batch_size),
+            )
+            return txn.fetchall()
+
+        events = await store.db_pool.runInteraction(
+            "migrate_event_edges_read_events", _read
+        )
+        if not events:
+            break
+
+        current = get_event_edges_backward_batch(
+            namespace, [event_id for event_id, _room_id in events]
+        )
+        rows: list[tuple[str, str, str, bool]] = []
+        for event_id, room_id in events:
+            for prev_event_id, is_state in current.get(event_id) or ():
+                rows.append((event_id, prev_event_id, room_id, bool(is_state)))
+
+        if rows:
+
+            def _write(txn: Any) -> None:
+                store.db_pool.simple_upsert_many_txn(
+                    txn,
+                    table="event_edges",
+                    key_names=("event_id", "prev_event_id"),
+                    key_values=[
+                        (event_id, prev_event_id)
+                        for event_id, prev_event_id, _room_id, _is_state in rows
+                    ],
+                    value_names=("room_id", "is_state"),
+                    value_values=[
+                        (room_id, is_state)
+                        for _event_id, _prev_event_id, room_id, is_state in rows
+                    ],
+                )
+
+            await store.db_pool.runInteraction("migrate_event_edges_write_sql", _write)
+            total_edges += len(rows)
+
+        last_event_id = events[-1][0]
+
+    return {"edges": total_edges}
+
+
+async def _count_sql_event_edges(store: Any) -> int:
+    def _txn(txn: Any) -> int:
+        txn.execute("SELECT COUNT(*) FROM event_edges")
+        row = txn.fetchone()
+        return int(row[0]) if row else 0
+
+    return await store.db_pool.runInteraction("count_event_edges", _txn)
+
+
+async def _count_mtxdb_event_edges(
+    store: Any, namespace: str, batch_size: int = 1000
+) -> int:
+    total = 0
+    last_event_id = ""
+
+    while True:
+
+        def _read(txn: Any) -> list[str]:
+            txn.execute(
+                "SELECT event_id FROM events WHERE event_id > ? "
+                "ORDER BY event_id LIMIT ?",
+                (last_event_id, batch_size),
+            )
+            return [row[0] for row in txn]
+
+        event_ids = await store.db_pool.runInteraction(
+            "count_mtxdb_edges_read_events", _read
+        )
+        if not event_ids:
+            return total
+
+        backward = get_event_edges_backward_batch(namespace, event_ids)
+        total += sum(len(edges or ()) for edges in backward.values())
+        last_event_id = event_ids[-1]
+
+
+async def _count_event_edges(
+    store: Any, backend: str, namespace: str
+) -> tuple[int, int]:
+    """Return ``(edges, events)`` for the given backend."""
+
+    def _count_events(txn: Any) -> int:
+        txn.execute("SELECT COUNT(*) FROM events")
+        row = txn.fetchone()
+        return int(row[0]) if row else 0
+
+    events = await store.db_pool.runInteraction("count_event_rows", _count_events)
+    if backend == "sql":
+        return await _count_sql_event_edges(store), events
+    return await _count_mtxdb_event_edges(store, namespace), events
+
+
+async def migrate_event_edges(
+    hs: HomeServer,
+    *,
+    target: str,
+    source: str | None = None,
+    force: bool = False,
+    batch_size: int = 1000,
+    mtxdb_path: str | None = None,
+) -> dict[str, int | str]:
+    """Move event edges between the SQL table and mtxdb.
+
+    The operator must stop Synapse first. ``target`` must be the backend the
+    process is configured to use after the migration. The stored marker is the
+    default source; pass ``source`` to override a stale marker. The marker is
+    flipped only after the copy is verified.
+    """
+    if target not in ("sql", "mtxdb"):
+        raise ValueError(f"unknown event-edges backend: {target!r}")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+
+    store = hs.get_datastores().main
+    namespace = store._embedded_db_namespace
+    stored = await _get_event_edges_backend(store)
+
+    if source is None:
+        source = stored
+    if source not in ("sql", "mtxdb"):
+        raise ValueError(f"unknown source event-edges backend: {source!r}")
+
+    # mtxdb must be open for either side of the migration. Open it read-only
+    # when it is only the source; the target side must be writable.
+    if target == "mtxdb" or source == "mtxdb":
+        if not open_embedded_event_edges_engine(hs):
+            path = mtxdb_path or hs.config.database.embedded_db_path
+            if not path:
+                raise RuntimeError(
+                    "mtxdb is not configured; set embedded_db.engine/path or "
+                    "pass --mtxdb-path"
+                )
+            from synapse.storage.databases.embedded_engine import get_embedded_engine
+            from synapse.storage.databases.main.embedded_common import (
+                _set_engine_configured,
+            )
+
+            engine = get_embedded_engine("mtxdb")
+            if target == "mtxdb":
+                engine.open_client(path)
+            else:
+                engine.open_client_read_only(path)
+            _set_engine_configured()
+
+    if source == target:
+        edges, events = await _count_event_edges(store, target, namespace)
+        if edges == 0 and events > 1 and not force:
+            raise RuntimeError(
+                f"{target} has no event edges but the database has {events} events; "
+                "refusing to adopt it. Pass --force if that is genuinely intended."
+            )
+        await _set_event_edges_backend(store, target)
+        return {
+            "source": source,
+            "target": target,
+            "edges": edges,
+            "changed_events": 0,
+            "already": 1,
+        }
+
+    source_edges, _source_events = await _count_event_edges(store, source, namespace)
+    target_edges, _target_events = await _count_event_edges(store, target, namespace)
+    if source_edges == 0 and target_edges > 0 and not force:
+        raise RuntimeError(
+            f"{source} has no event edges but {target} has {target_edges}; the "
+            f"marker may be stale. Pass --from {target} to adopt the existing "
+            f"data, or --force to overwrite it with an empty {source}."
+        )
+
+    if target == "mtxdb":
+        result = await _migrate_sql_edges_to_mtxdb(store, namespace, batch_size)
+        source_edges = await _count_sql_event_edges(store)
+        if source_edges != result["edges"]:
+            raise RuntimeError(
+                "event-edges migration verification failed: "
+                f"SQL has {source_edges} rows but {result['edges']} were reconciled"
+            )
+    else:
+        result = await _migrate_mtxdb_edges_to_sql(store, namespace, batch_size)
+        target_edges = await _count_sql_event_edges(store)
+        if target_edges != result["edges"]:
+            raise RuntimeError(
+                "event-edges migration verification failed: "
+                f"mtxdb had {result['edges']} rows but SQL has {target_edges}"
+            )
+
+    await _set_event_edges_backend(store, target)
+    return {
+        "source": source,
+        "target": target,
+        "edges": result["edges"],
+        "changed_events": result.get("changed_events", 0),
+        "already": 0,
+    }
 
 
 def put_event_edges_batch(

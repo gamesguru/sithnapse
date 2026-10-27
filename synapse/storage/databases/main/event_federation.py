@@ -2036,8 +2036,7 @@ class EventFederationWorkerStore(
             self.database_engine, "event_id", list({c for c, _ in candidates})
         )
         txn.execute(
-            f"SELECT event_id, depth FROM events WHERE {child_clause} "
-            "AND depth <= ?",
+            f"SELECT event_id, depth FROM events WHERE {child_clause} AND depth <= ?",
             (*child_args, nearby_depth),
         )
         depth_by_id: dict[str, int] = dict(txn)
