@@ -746,6 +746,15 @@ fn write_edges(
     Ok(())
 }
 
+/// Stage `event_edges_put`'s records in an existing persist transaction.
+pub(crate) fn stage_event_edges(
+    txn: &DatabaseTransaction<'_>,
+    namespace: &str,
+    rows: &[(String, String, String, bool)],
+) -> PyResult<()> {
+    write_edges(txn, namespace, rows)
+}
+
 /// Read backward edges: given event_ids, returns `(event_id, Option<[(prev_event_id, is_state)]>)`
 ///
 /// Reads via `get_read_committed`, not plain `get_many`. In the common case

@@ -1354,8 +1354,8 @@ class PersistEventsStore:
         sticky_events_to_un_soft_fail: Set[str] = frozenset(),
         newly_joined_servers: Set[str] = frozenset(),
     ) -> None:
-        """Persist events, staging the embedded event-JSON writes in one mtxdb
-        transaction that commits with this SQL transaction.
+        """Persist events, staging embedded event-JSON and (with the shared
+        WAL) edge writes in one mtxdb transaction that commits before SQL.
 
         The staged writes are invisible to every reader until `commit()`. They
         are committed here, at the end of the body and before the SQL COMMIT,
@@ -1413,7 +1413,10 @@ class PersistEventsStore:
             )
             commit_started = True
             _ct = time.monotonic()
-            engine_seconds = mtxdb_txn.commit()
+            # A stale OCC expectation means a concurrent event-DAG write
+            # invalidated this staged transaction. Surface it as retryable so
+            # the SQL interaction rolls back and retries the whole persist.
+            engine_seconds = mtxdb_txn.commit_retryable()
             total_seconds = time.monotonic() - _ct
             ffi_timing("ffi_txn_commit", total_seconds)
             ffi_timing("ffi_txn_commit_engine", engine_seconds)
@@ -1625,6 +1628,7 @@ class PersistEventsStore:
                 txn,
                 events=[ev for ev, _ in de_outliered_events],
                 update_backward_extremities=False,
+                mtxdb_txn=mtxdb_txn,
             )
 
         if new_forward_extremities:
@@ -1663,6 +1667,7 @@ class PersistEventsStore:
             events_and_contexts=events_and_contexts,
             all_events_and_contexts=all_events_and_contexts,
             inhibit_local_membership_updates=inhibit_local_membership_updates,
+            mtxdb_txn=mtxdb_txn,
         )
 
         # We call this last as it assumes we've inserted the events into
@@ -3998,6 +4003,7 @@ class PersistEventsStore:
         events_and_contexts: list[EventPersistencePair],
         all_events_and_contexts: list[EventPersistencePair],
         inhibit_local_membership_updates: bool = False,
+        mtxdb_txn: "MtxdbTransaction | None" = None,
     ) -> None:
         """Update all the miscellaneous tables for new events
 
@@ -4011,6 +4017,9 @@ class PersistEventsStore:
                 from being updated by these events. This should be set to True
                 for backfilled events because backfilled events in the past do
                 not affect the current local state.
+            mtxdb_txn: The persist's embedded transaction, if one is open.
+                Event edges are staged in it so they commit with the event
+                JSON, before the SQL COMMIT.
         """
 
         # Insert all the push actions into the event_push_actions table.
@@ -4038,7 +4047,9 @@ class PersistEventsStore:
         # Update the event_forward_extremities, event_backward_extremities and
         # event_edges tables.
         self._handle_mult_prev_events(
-            txn, events=[event for event, _ in events_and_contexts]
+            txn,
+            events=[event for event, _ in events_and_contexts],
+            mtxdb_txn=mtxdb_txn,
         )
 
         for event, _ in events_and_contexts:
@@ -4868,6 +4879,7 @@ class PersistEventsStore:
         txn: LoggingTransaction,
         events: list[EventBase],
         update_backward_extremities: bool = True,
+        mtxdb_txn: "MtxdbTransaction | None" = None,
     ) -> None:
         """
         For the given event, update the event edges table and forward and
@@ -4901,22 +4913,23 @@ class PersistEventsStore:
                 for e_id in ev.prev_event_ids()
             ]
             if edge_rows:
-                # MTXDB is authoritative when embedded event edges are
-                # enabled: the event is visible once this transaction commits,
-                # so its edges must be committed to MTXDB too.  Write the batch
-                # directly instead of enqueueing it on the coalescer --
-                # `put_event_edges_batch(sync=True)` drains the EVENT_DAG pool,
-                # which calls back into the edge queue's flush path, so routing
-                # this through `flush_edge_writes()` would try to re-take the
-                # non-reentrant per-namespace flush lock and self-deadlock.
-                txn.call_after(
-                    put_event_edges_batch,
+                # Write edges before the SQL COMMIT, never from a post-commit
+                # callback: a callback could be lost to a crash or fail without
+                # aborting the persist, leaving a committed event with no
+                # edges and no recovery path. With the shared WAL, stage them
+                # beside the event JSON so both are all-or-nothing. Without
+                # one, write directly: the persist's in-transaction EVENT_DAG
+                # barrier then makes them durable before SQL commits. A SQL
+                # rollback can leave orphan edges, the same trade-off event
+                # JSON already makes, but a committed event cannot lack them.
+                #
+                # Do not route this through `flush_edge_writes()`: its
+                # sync=True path drains the coalescer and would try to re-take
+                # the non-reentrant per-namespace flush lock from here.
+                put_event_edges_batch(
                     self._embedded_db_namespace,
                     edge_rows,
-                    # The post-commit write is visible immediately; durability
-                    # is handled by the EVENT_DAG coalescer according to the
-                    # configured sync mode.
-                    sync=False,
+                    transaction=mtxdb_txn,
                 )
                 txn.call_after(mark_dirty, Pool.EVENT_DAG)
 

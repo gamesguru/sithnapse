@@ -328,6 +328,34 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
         self.assertEqual(forward_after["$p1"], ["$e2"])
         self.assertIsNone(forward_after["$p2"])
 
+    def test_put_event_edges_batch_stages_in_transaction(self) -> None:
+        """Edges passed a transaction are invisible until that transaction commits."""
+        transaction = mtxdb_engine.begin_transaction()
+        if transaction is None:
+            self.skipTest("mtxdb shared WAL is not enabled")
+
+        namespace = "test-edges-staged"
+        committed = False
+        try:
+            put_event_edges_batch(
+                namespace,
+                [(self.room_id, "$staged", "$parent", False)],
+                transaction=transaction,
+            )
+            self.assertIsNone(
+                get_event_edges_backward_batch(namespace, ["$staged"])["$staged"]
+            )
+            transaction.commit()
+            committed = True
+        finally:
+            if not committed:
+                transaction.abort()
+
+        self.assertEqual(
+            get_event_edges_backward_batch(namespace, ["$staged"])["$staged"],
+            [("$parent", False)],
+        )
+
     def test_queues_are_namespace_partitioned(self) -> None:
         """Rows queued under one namespace never flush under another, and a
         no-namespace flush drains every namespace separately."""
@@ -1100,10 +1128,9 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
     @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
     def test_below_threshold_edge_committed_synchronously(self) -> None:
         """In authoritative MTXDB mode a persisted edge is committed to mtxdb
-        synchronously in the persistence transaction's post-commit callback --
-        it is already visible on the next read and is never left waiting in
-        the coalescer, even below the batch threshold and with fsync disabled
-        (`no_sync`)."""
+        synchronously in the persistence transaction -- it is already visible
+        on the next read and is never left waiting in the coalescer, even
+        below the batch threshold and with fsync disabled (`no_sync`)."""
         ns = self.store._embedded_db_namespace
         # Force the no-sync path so the test proves the edge commit is not
         # coupled to whether the sync coalescer actually fsyncs.
@@ -1275,15 +1302,22 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
             )
         )
 
+        mtxdb_txn = mtxdb_engine.begin_transaction()
+        if mtxdb_txn is None:
+            self.skipTest("mtxdb shared WAL is not enabled")
+
         def bad_txn(txn: LoggingTransaction) -> None:
-            persist_store._handle_mult_prev_events(txn, [mock_ev])
+            persist_store._handle_mult_prev_events(txn, [mock_ev], mtxdb_txn=mtxdb_txn)
             raise RuntimeError("simulated transaction failure")
 
-        failure = self.get_failure(
-            self.store.db_pool.runInteraction("test_abort", bad_txn),
-            RuntimeError,
-        )
-        self.assertEqual(str(failure.value), "simulated transaction failure")
+        try:
+            failure = self.get_failure(
+                self.store.db_pool.runInteraction("test_abort", bad_txn),
+                RuntimeError,
+            )
+            self.assertEqual(str(failure.value), "simulated transaction failure")
+        finally:
+            mtxdb_txn.abort()
 
         # Check mtxdb: fake_id is NOT in mtxdb backward edges
         back = get_event_edges_backward_batch(

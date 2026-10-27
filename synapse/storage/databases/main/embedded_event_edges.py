@@ -59,6 +59,7 @@ from synapse.storage.databases.main.embedded_common import (
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
+    from synapse.synapse_rust.mtxdb_engine import MtxdbTransaction
 
 logger = logging.getLogger(__name__)
 
@@ -741,10 +742,16 @@ def put_event_edges_batch(
     rows: Iterable[EdgeRow],
     *,
     sync: bool = False,
+    transaction: "MtxdbTransaction | None" = None,
 ) -> None:
     """Batch put event edges into mtxdb.
 
     `rows`: `(room_id, event_id, prev_event_id, is_state)`.
+
+    With a `transaction`, the write is staged in the persist's existing mtxdb
+    transaction instead of applied immediately. It becomes visible when that
+    transaction commits, which happens before the SQL COMMIT, so a committed
+    event cannot be left without edges. `sync` is ignored for staged writes.
     """
     row_list = list(rows)
     if not row_list:
@@ -754,6 +761,14 @@ def put_event_edges_batch(
         from synapse.synapse_rust.mtxdb_engine import event_edges_put
 
         _et = time.monotonic()
+        if transaction is not None:
+            transaction.event_edges_put(namespace, row_list)
+            elapsed = time.monotonic() - _et
+            ffi_timing("ffi_event_edges_put", elapsed)
+            ffi_count("event_edges_put_rows", len(row_list))
+            ffi_batch_size("event_edges_put", len(row_list))
+            return
+
         # Under a shared WAL, `event_edges_put` runs the optimistic loop
         # `run_edge_occ` internally: it replays collection-version conflicts up
         # to `MAX_OCC_ATTEMPTS` and only then raises a retryable

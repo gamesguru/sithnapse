@@ -3458,6 +3458,16 @@ impl PyMtxdbTransaction {
         })
     }
 
+    /// Stage what `event_edges_put` would write, without touching the pool.
+    fn event_edges_put(
+        &self,
+        py: Python<'_>,
+        namespace: String,
+        rows: Vec<(String, String, String, bool)>,
+    ) -> PyResult<()> {
+        py.detach(|| super::embedded_edges::stage_event_edges(&self.inner, &namespace, &rows))
+    }
+
     /// Publish every staged write as one group. After an error, the writes may
     /// or may not have been published, so the transaction must not be aborted.
     ///
@@ -3469,6 +3479,21 @@ impl PyMtxdbTransaction {
             self.inner
                 .commit()
                 .map_err(|e| map_transaction_error("commit", e))?;
+            Ok(started.elapsed().as_secs_f64())
+        })
+    }
+
+    /// Commit for event persistence, where a stale expectation means the
+    /// surrounding SQL transaction must be retried from the beginning.
+    pub fn commit_retryable(&self, py: Python<'_>) -> PyResult<f64> {
+        py.detach(|| {
+            let started = std::time::Instant::now();
+            self.inner.commit().map_err(|error| match error {
+                error @ StorageError::StaleRead { .. } => {
+                    pyo3::exceptions::PyBlockingIOError::new_err(error.to_string())
+                }
+                other => map_transaction_error("commit", other),
+            })?;
             Ok(started.elapsed().as_secs_f64())
         })
     }

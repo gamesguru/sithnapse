@@ -149,9 +149,7 @@ def main() -> None:
             elif command == "edges_get":
                 # edges_get <prev_event_id>
                 (prev_event_id,) = args
-                forward = get_event_edges_forward_batch(
-                    namespace, [prev_event_id]
-                )
+                forward = get_event_edges_forward_batch(namespace, [prev_event_id])
                 reply = json.dumps(forward)
             elif command == "fsyncs":
                 reply = str(_fsyncs())
