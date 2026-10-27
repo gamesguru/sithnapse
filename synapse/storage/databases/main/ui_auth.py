@@ -161,70 +161,47 @@ class UIAuthWorkerStore(SQLBaseStore):
         canonical_json = _canonical_clientdict_json(clientdict)
 
         def _get_txn(txn: LoggingTransaction) -> tuple[str, str, str, str, str] | None:
-            """Return the newest matching session, examining one candidate at a time."""
-            last_creation_time: int | None = None
-            last_session_id: str | None = None
+            """Return the newest matching session, including legacy JSON rows."""
+            txn.execute(
+                """
+                SELECT session_id, clientdict, uri, method, description
+                FROM ui_auth_sessions
+                WHERE uri = ? AND method = ? AND clientdict = ?
+                ORDER BY creation_time DESC, session_id DESC
+                LIMIT 1
+                """,
+                (uri, method, canonical_json),
+            )
+            row = txn.fetchone()
+            if row is not None:
+                return (row[0], row[1], row[2], row[3], row[4])
 
-            while True:
-                if last_creation_time is None:
-                    txn.execute(
-                        """
-                        SELECT session_id, clientdict, uri, method, description,
-                               creation_time
-                        FROM ui_auth_sessions
-                        WHERE uri = ? AND method = ?
-                        ORDER BY creation_time DESC, session_id DESC
-                        LIMIT 1
-                        """,
-                        (uri, method),
-                    )
-                else:
-                    txn.execute(
-                        """
-                        SELECT session_id, clientdict, uri, method, description,
-                               creation_time
-                        FROM ui_auth_sessions
-                        WHERE uri = ? AND method = ?
-                          AND (creation_time < ?
-                               OR (creation_time = ? AND session_id < ?))
-                        ORDER BY creation_time DESC, session_id DESC
-                        LIMIT 1
-                        """,
-                        (
-                            uri,
-                            method,
-                            last_creation_time,
-                            last_creation_time,
-                            last_session_id,
-                        ),
-                    )
-
-                row = txn.fetchone()
-                if row is None:
-                    return None
-
-                (
-                    session_id,
-                    stored_clientdict,
-                    stored_uri,
-                    stored_method,
-                    description,
-                    creation_time,
-                ) = row
-                if (
-                    _canonical_clientdict_json(db_to_json(stored_clientdict))
-                    == canonical_json
-                ):
-                    return (
-                        session_id,
-                        stored_clientdict,
-                        stored_uri,
-                        stored_method,
-                        description,
-                    )
-
-                last_creation_time = creation_time
-                last_session_id = session_id
+            # Before clientdicts were stored with sorted keys, their JSON text
+            # could differ despite representing the same dictionary. Keep this
+            # compatibility path for sessions created with that format.
+            txn.execute(
+                """
+                SELECT session_id, clientdict, uri, method, description
+                FROM ui_auth_sessions
+                WHERE uri = ? AND method = ?
+                ORDER BY creation_time DESC, session_id DESC
+                """,
+                (uri, method),
+            )
+            while rows := txn.fetchmany(100):
+                for legacy_row in rows:
+                    if (
+                        _canonical_clientdict_json(db_to_json(legacy_row[1]))
+                        == canonical_json
+                    ):
+                        return (
+                            legacy_row[0],
+                            legacy_row[1],
+                            legacy_row[2],
+                            legacy_row[3],
+                            legacy_row[4],
+                        )
+            return None
 
         row = await self.db_pool.runInteraction(
             "get_ui_auth_session_for_clientdict", _get_txn
