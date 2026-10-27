@@ -10,7 +10,9 @@
 
 mtxdb's Python binding owns process-global pools, so a writer and a read-only
 worker cannot share an interpreter: the test drives each in its own process.
-Commands arrive on stdin, one per line, and each is answered with one line.
+It prints "IMPORTED" once its imports finish, then waits for an "open" line
+before opening the store and printing "READY". Commands then arrive on stdin,
+one per line, and each is answered with one line.
 
 `event_json_put`/`event_json_get` go through the production
 `embedded_event_json` helpers (not raw `batch_put`/`batch_get`): the point of
@@ -71,6 +73,12 @@ def _fsyncs() -> int:
 def main() -> None:
     role, path = sys.argv[1], sys.argv[2]
     namespace = sys.argv[3] if len(sys.argv) > 3 else "vis"
+    # Importing Synapse is the slow part of starting this process. Report it
+    # done, then wait for "open": the test starts several processes at once so
+    # their imports overlap, while still opening the writer before any reader.
+    print("IMPORTED", flush=True)
+    if sys.stdin.readline().strip() != "open":
+        return
     if role == "writer":
         mtxdb_engine.open_client(path)
     else:

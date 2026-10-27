@@ -186,6 +186,16 @@ async def resolve_events_with_store(
     # branch.
     to_fetch = {eid for eid in full_conflicted_set if eid not in event_map}
     to_fetch.update(eid for eid in unconflicted_state.values() if eid not in event_map)
+    # Events already in the in-flight map may have auth ancestors that were
+    # persisted and dropped from it. Walk their auth edges too, or a conflicted
+    # event can be handed to the resolver without the auth events it cites.
+    for event in list(event_map.values()):
+        auth_ids = (
+            event.prev_state_events
+            if supports_msc4242_state_dag(event)
+            else event.auth_event_ids()
+        )
+        to_fetch.update(aid for aid in auth_ids if aid not in event_map)
     _gg_prefetch_start = time.monotonic()
     _gg_prefetch_rounds = 0
     _gg_prefetch_requested = 0
@@ -495,11 +505,7 @@ async def _resolve_conflicted_set_with_rust(
 
             _gg_rust_res_start = time.monotonic()
             resolved_state_rust: StateMap[str] = rust_res.resolve_v2_via_lattice_fold(
-                dict(
-                    unconflicted_state
-                    if room_version.state_res == StateResolutionVersions.V2_1
-                    else base_state
-                ),
+                dict(base_state),
                 list(full_conflicted_set),
                 event_map,
                 # Pass the actual room version so rezzy can select V2.2 for
@@ -516,10 +522,11 @@ async def _resolve_conflicted_set_with_rust(
                 (time.monotonic() - _gg_rust_res_start) * 1000,
             )
             if room_version.state_res == StateResolutionVersions.V2_1:
-                # Rezzy receives the full unconflicted state so it can build
-                # the V2.1 mainline, but the cache stores only the resolution
-                # of the conflicted subgraph. The caller layers the
-                # unconflicted state back on via ChainMap.
+                # Rezzy starts from the restricted V2.1 base (create,
+                # join-rules, power) and restores those agreed values at its
+                # final merge. The cache stores only the resolution of the
+                # conflicted subgraph; the caller layers the full unconflicted
+                # state back on via ChainMap.
                 resolved_state_rust = {
                     key: event_id
                     for key, event_id in resolved_state_rust.items()

@@ -52,9 +52,11 @@ class ReplicationRemoteJoinRestServlet(ReplicationEndpoint):
     PATH_ARGS = ("room_id", "user_id")
 
     def __init__(self, hs: "HomeServer"):
+        """Initialize the handlers and store used to perform remote joins."""
         super().__init__(hs)
 
         self.federation_handler = hs.get_federation_handler()
+        self.member_handler = hs.get_room_member_handler()
         self.store = hs.get_datastores().main
         self.clock = hs.get_clock()
 
@@ -86,6 +88,11 @@ class ReplicationRemoteJoinRestServlet(ReplicationEndpoint):
     async def _handle_request(  # type: ignore[override]
         self, request: SynapseRequest, content: JsonDict, room_id: str, user_id: str
     ) -> tuple[int, JsonDict]:
+        """Join via the supplied remote hosts and announce the user's devices.
+
+        Attach the deserialized requester to the request. Return status 200 with
+        the join event_id and stream_id. Join and notification errors propagate.
+        """
         remote_room_hosts = content["remote_room_hosts"]
         event_content = content["content"]
 
@@ -97,6 +104,10 @@ class ReplicationRemoteJoinRestServlet(ReplicationEndpoint):
         event_id, stream_id = await self.federation_handler.do_invite_join(
             remote_room_hosts, room_id, user_id, event_content
         )
+
+        # Unlike a join handled on this process, the worker that took the request
+        # never runs `_remote_join`, so send the device list update from here.
+        await self.member_handler.notify_device_list_after_remote_join(room_id, user_id)
 
         return 200, {"event_id": event_id, "stream_id": stream_id}
 

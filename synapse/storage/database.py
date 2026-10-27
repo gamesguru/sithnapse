@@ -30,6 +30,7 @@ import threading
 import time
 import types
 from collections import defaultdict, deque
+from dataclasses import dataclass
 from time import monotonic as monotonic_time
 from typing import (
     IO,
@@ -143,6 +144,8 @@ _SQL_SCHEDULING_LOCK = threading.Lock()
 _SQL_SCHEDULING_TOTAL: float = 0.0
 _SQL_SCHEDULING_COUNT: int = 0
 _SQL_SCHEDULING_LATENCIES: deque[float] = deque(maxlen=4096)
+# transaction description -> [total delay, calls], for the opt-in report.
+_SQL_SCHEDULING_BY_LABEL: dict[str, list[float]] = {}
 
 _TABLE_RE = re.compile(
     r"(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM|FROM|JOIN)\s+(\w+)",
@@ -150,6 +153,54 @@ _TABLE_RE = re.compile(
 )
 
 _SQL_COMMENT_RE = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
+_TXN_SUFFIX_RE = re.compile(r"-[0-9a-f]+$")
+
+# Per-statement SQL fingerprints, opt-in with the rest of `SYNAPSE_PG_TIMINGS`.
+# A per-table total says which table is expensive but not which shape of query
+# is responsible: 170k calls costing 0.3ms each and a handful of slow scans
+# look identical in that table. Keying by `(table, transaction name, normalized
+# SQL)` separates them, and keeping `rows` distinguishes an INSERT from a
+# 0-row miss and a 1-row point lookup from a batched IN (?) query.
+# Protected by `_TABLE_OPS_LOCK`.
+_SQL_FINGERPRINTS: dict[tuple[str, str, str], list] = {}
+
+# Placeholder forms seen after `convert_param_style` (`%s`) and before it (`?`).
+_SQL_PLACEHOLDER_RE = r"(?:\?|%s)"
+_SQL_IN_LIST_RE = re.compile(
+    rf"\bIN\s*\(\s*{_SQL_PLACEHOLDER_RE}"
+    rf"(?:\s*,\s*{_SQL_PLACEHOLDER_RE})+\s*\)",
+    re.IGNORECASE,
+)
+_SQL_VALUES_LIST_RE = re.compile(
+    rf"\bVALUES\s*\(\s*{_SQL_PLACEHOLDER_RE}"
+    rf"(?:\s*,\s*{_SQL_PLACEHOLDER_RE})*\s*\)"
+    rf"(?:\s*,\s*\(\s*{_SQL_PLACEHOLDER_RE}"
+    rf"(?:\s*,\s*{_SQL_PLACEHOLDER_RE})*\s*\))+",
+    re.IGNORECASE,
+)
+_SQL_DOLLAR_LITERAL_RE = re.compile(
+    r"\$(?:[A-Za-z_]\w*)?\$.*?\$(?:[A-Za-z_]\w*)?\$", re.DOTALL
+)
+# Bare numeric literals (including `$1`-style placeholders). Word boundaries
+# keep digits inside identifiers (`events_2`) intact.
+_SQL_NUMBER_RE = re.compile(r"(?<![\w.])\d+(?:\.\d+)?(?![\w.])")
+
+
+def _sql_fingerprint(sql: str) -> str:
+    """Normalize a statement into a stable shape for per-shape accounting."""
+    if "--" in sql or "/*" in sql:
+        sql = _SQL_COMMENT_RE.sub(" ", sql)
+    # Dollar-quoted bodies can contain quotes, so mask them before the
+    # single-quote pass; then mask the remaining string and numeric literals.
+    sql = _SQL_DOLLAR_LITERAL_RE.sub("?", sql)
+    sql = _SQL_STRING_LITERAL_RE.sub("?", sql)
+    sql = _SQL_NUMBER_RE.sub("?", sql)
+    # Canonicalize the driver's placeholder style before collapsing batches.
+    sql = sql.replace("%s", "?")
+    # Variable-size batches must not split into one key per arity.
+    sql = _SQL_IN_LIST_RE.sub("IN (?)", sql)
+    sql = _SQL_VALUES_LIST_RE.sub("VALUES (?+)", sql)
+    return " ".join(sql.split())
 
 
 def _timings_print(*args: object) -> None:
@@ -216,13 +267,25 @@ def pop_dirty_tables() -> tuple[set[str], bool, list[str]]:
         return dirty, had_ddl, triggers
 
 
-def _track_table_op(sql: str, elapsed: float, rowcount: int = 0) -> None:
+def _track_table_op(
+    sql: str, elapsed: float, rowcount: int = 0, txn_name: str | None = None
+) -> None:
+    """Accumulate SQL timings by table and statement fingerprint.
+
+    ``elapsed`` is in seconds. Attribute the statement to the first table
+    matched in its SQL; ignore statements with no match. Strip a trailing
+    transaction ID from ``txn_name`` and use "(unnamed)" for a missing name.
+    Negative or non-integer row counts contribute zero rows.
+    """
     if "--" in sql or "/*" in sql:
         sql = _SQL_COMMENT_RE.sub(" ", sql)
     m = _TABLE_RE.search(sql)
     if not m:
         return
     table = m.group(1).lower()
+    fingerprint = _sql_fingerprint(sql)
+    txn = _TXN_SUFFIX_RE.sub("", txn_name) if txn_name else "(unnamed)"
+    rows = max(rowcount, 0) if isinstance(rowcount, int) else 0
     with _TABLE_OPS_LOCK:
         _TABLE_OPS[table] += elapsed
         _TABLE_OPS_COUNTS[table] += 1
@@ -233,6 +296,13 @@ def _track_table_op(sql: str, elapsed: float, rowcount: int = 0) -> None:
         # instrumentation into a hard crash of the actual query it's timing.
         if isinstance(rowcount, int):
             _TABLE_OPS_ROWS[table] += max(rowcount, 0)
+        entry = _SQL_FINGERPRINTS.setdefault(
+            (table, txn, fingerprint), [0, 0.0, 0.0, 0]
+        )
+        entry[0] += 1
+        entry[1] += elapsed
+        entry[2] = max(entry[2], elapsed)
+        entry[3] += rows
 
 
 # Quoted string literals, including doubled quotes inside them. Masked in the
@@ -282,16 +352,29 @@ def _track_slow_statement(
             del _SLOW_STATEMENTS[_SLOW_STATEMENTS_KEPT:]
 
 
-def _track_sql_scheduling(elapsed: float) -> None:
-    """Record pool checkout/thread scheduling delay for the opt-in report."""
+def _track_sql_scheduling(elapsed: float, label: str | None = None) -> None:
+    """Record pool checkout/thread scheduling delay in seconds.
+
+    Group totals by ``label``, using "(unlabelled)" for a missing or empty
+    label, for the opt-in report.
+    """
     global _SQL_SCHEDULING_TOTAL, _SQL_SCHEDULING_COUNT
     with _SQL_SCHEDULING_LOCK:
         _SQL_SCHEDULING_TOTAL += elapsed
         _SQL_SCHEDULING_COUNT += 1
         _SQL_SCHEDULING_LATENCIES.append(elapsed)
+        entry = _SQL_SCHEDULING_BY_LABEL.setdefault(label or "(unlabelled)", [0.0, 0])
+        entry[0] += elapsed
+        entry[1] += 1
 
 
 def _print_table_ops() -> None:
+    """Flush cumulative SQL timings when timing diagnostics are enabled.
+
+    With SYNAPSE_TIMINGS_RUN_DIR set, replace this process's JSON snapshot
+    and ignore filesystem errors. Otherwise, print table, fingerprint,
+    slow-statement, and scheduling summaries to the timing outputs.
+    """
     if not _PG_TIMINGS_ENABLED:
         return
     with _TABLE_OPS_LOCK:
@@ -300,6 +383,7 @@ def _print_table_ops() -> None:
         table_ops = dict(_TABLE_OPS)
         table_counts = dict(_TABLE_OPS_COUNTS)
         table_rows = dict(_TABLE_OPS_ROWS)
+        fingerprints = {key: list(value) for key, value in _SQL_FINGERPRINTS.items()}
         slow_statements = sorted(_SLOW_STATEMENTS, key=lambda e: e[0], reverse=True)[
             :_SLOW_STATEMENTS_KEPT
         ]
@@ -308,6 +392,7 @@ def _print_table_ops() -> None:
         scheduling_total = _SQL_SCHEDULING_TOTAL
         scheduling_count = _SQL_SCHEDULING_COUNT
         scheduling_samples = sorted(_SQL_SCHEDULING_LATENCIES)
+        scheduling_by_label = {k: list(v) for k, v in _SQL_SCHEDULING_BY_LABEL.items()}
 
     if not table_ops and not scheduling_count:
         return
@@ -316,6 +401,7 @@ def _print_table_ops() -> None:
         "total": scheduling_total,
         "count": scheduling_count,
         "latencies": scheduling_samples,
+        "by_label": scheduling_by_label,
     }
 
     run_dir = os.environ.get("SYNAPSE_TIMINGS_RUN_DIR")
@@ -333,6 +419,18 @@ def _print_table_ops() -> None:
                         "rows": table_rows,
                         "scheduling": scheduling,
                         "slow_statements": slow_statements,
+                        "fingerprints": [
+                            {
+                                "table": table,
+                                "txn": txn,
+                                "sql": fp,
+                                "calls": entry[0],
+                                "total_s": entry[1],
+                                "max_s": entry[2],
+                                "rows": entry[3],
+                            }
+                            for (table, txn, fp), entry in fingerprints.items()
+                        ],
                     },
                     f,
                 )
@@ -391,6 +489,20 @@ def _print_table_ops() -> None:
     _timings_print("=====================================")
     _timings_print("")
 
+    if fingerprints:
+        ranked_fingerprints = sorted(
+            fingerprints.items(), key=lambda kv: kv[1][1], reverse=True
+        )[:30]
+        _timings_print("=== Per-statement SQL fingerprints (top 30 by total) ===")
+        for (table, txn, fp), (calls, total_s, max_s, rows) in ranked_fingerprints:
+            avg_ms = (total_s / calls) * 1000 if calls else 0.0
+            _timings_print(
+                f"  {total_s * 1000:9.1f}ms  calls={calls:>7,d}  "
+                f"avg={avg_ms:7.3f}ms  max={max_s * 1000:8.1f}ms  "
+                f"rows={rows:>8,d}  [{table}] {txn}: {fp[:180]}"
+            )
+        _timings_print("")
+
     if slow_statements:
         _timings_print(
             f"=== Slowest SQL statements (over {_SLOW_STATEMENT_THRESHOLD_S * 1000:.0f} ms) ==="
@@ -417,6 +529,14 @@ def _print_table_ops() -> None:
             f"p99={percentile(0.99) * 1000:.3f}ms  "
             f"max={samples[-1] * 1000:.3f}ms"
         )
+        _timings_print("  transactions by scheduling delay (all labels):")
+        for label, (label_total, label_calls) in sorted(
+            scheduling_by_label.items(), key=lambda kv: kv[1][0], reverse=True
+        ):
+            _timings_print(
+                f"  {label_total * 1000:10.1f}ms  calls={int(label_calls):>8,d}  "
+                f"avg={label_total * 1000 / label_calls:7.3f}ms  {label}"
+            )
         _timings_print("======================================================")
         _timings_print("")
 
@@ -615,6 +735,13 @@ _AsyncCallbackListEntry = tuple[
 
 P = ParamSpec("P")
 R = TypeVar("R")
+
+
+@dataclass(frozen=True)
+class _SchedulingLabel:
+    """Private channel for passing a SQL scheduling diagnostic label."""
+
+    label: str
 
 
 class LoggingTransaction:
@@ -843,6 +970,11 @@ class LoggingTransaction:
         *args: P.args,
         **kwargs: P.kwargs,
     ) -> R:
+        """Call a cursor operation with SQL converted to the driver's placeholders.
+
+        Forward the remaining arguments and return the operation's result.
+        Record query metrics even on failure; cursor operation errors propagate.
+        """
         # Generate a one-line version of the SQL to better log it.
         one_line_sql = self._make_sql_one_line(sql)
 
@@ -889,7 +1021,7 @@ class LoggingTransaction:
                     rowcount = self.txn.rowcount
                 except Exception:
                     rowcount = 0
-                _track_table_op(sql, secs, rowcount)
+                _track_table_op(sql, secs, rowcount, self.name)
                 _track_slow_statement(sql, secs, rowcount, args)
 
     def close(self) -> None:
@@ -1438,6 +1570,11 @@ class DatabasePool:
         """
 
         async def _runInteraction() -> R:
+            """Run the transaction and its completion callbacks.
+
+            Return the transaction result after success callbacks finish. On an
+            exception, run exception callbacks and propagate the error.
+            """
             after_callbacks: list[_CallbackListEntry] = []
             async_after_callbacks: list[_AsyncCallbackListEntry] = []
             exception_callbacks: list[_CallbackListEntry] = []
@@ -1456,6 +1593,7 @@ class DatabasePool:
                         exception_callbacks,
                         func,
                         *args,
+                        _SchedulingLabel(desc),
                         db_autocommit=db_autocommit,
                         isolation_level=isolation_level,
                         **kwargs,
@@ -1507,6 +1645,10 @@ class DatabasePool:
         Returns:
             The result of func
         """
+        scheduling_label = getattr(func, "__name__", None)
+        if args and isinstance(args[-1], _SchedulingLabel):
+            scheduling_label = args[-1].label or scheduling_label
+            args = args[:-1]
         curr_context = current_context()
         if not curr_context:
             logger.warning(
@@ -1520,6 +1662,11 @@ class DatabasePool:
         start_time = monotonic_time()
 
         def inner_func(conn: _PoolConnection, *args: P.args, **kwargs: P.kwargs) -> R:
+            """Run the callback on a pooled connection and return its result.
+
+            Apply the requested connection settings and reset autocommit afterward
+            when enabled. Connection and callback errors propagate.
+            """
             # We shouldn't be in a transaction. If we are then something
             # somewhere hasn't committed after doing work. (This is likely only
             # possible during startup, as `run*` will ensure changes are
@@ -1540,7 +1687,7 @@ class DatabasePool:
                         **{SERVER_NAME_LABEL: self.server_name}
                     ).observe(sched_duration_sec)
                     if _PG_TIMINGS_ENABLED:
-                        _track_sql_scheduling(sched_duration_sec)
+                        _track_sql_scheduling(sched_duration_sec, scheduling_label)
                     context.add_database_scheduled(sched_duration_sec)
 
                     if self._txn_limit > 0:

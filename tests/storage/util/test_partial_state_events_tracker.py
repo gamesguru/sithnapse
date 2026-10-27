@@ -129,8 +129,19 @@ class PartialStateEventsTrackerTestCase(TestCase):
 
 class PartialCurrentStateTrackerTestCase(TestCase):
     def setUp(self) -> None:
-        self.mock_store = mock.Mock(spec_set=["is_partial_state_room"])
+        self.mock_store = mock.Mock(
+            spec_set=[
+                "is_partial_state_room",
+                "is_partial_state_room_uncached",
+                "get_partial_rooms",
+            ]
+        )
         self.mock_store.is_partial_state_room = mock.AsyncMock()
+        # Cache invalidation is synchronous, unlike the lookup itself.
+        self.mock_store.is_partial_state_room.invalidate = mock.Mock()
+        self.mock_store.is_partial_state_room_uncached = mock.AsyncMock(
+            return_value=True
+        )
 
         self.tracker = PartialCurrentStateTracker(self.mock_store)
 
@@ -150,6 +161,19 @@ class PartialCurrentStateTrackerTestCase(TestCase):
         # notifying that the room has been de-partial-stated should unblock
         self.tracker.notify_un_partial_stated("room_id")
         self.successResultOf(d)
+
+    def test_stale_cached_partial_flag_does_not_block(self) -> None:
+        """A stale cached True must not wait for a notification that was
+        already delivered: the database is checked before waiting.
+        """
+        self.mock_store.is_partial_state_room.return_value = True
+        self.mock_store.is_partial_state_room_uncached.return_value = False
+
+        self.successResultOf(ensureDeferred(self.tracker.await_full_state("room_id")))
+        self.mock_store.is_partial_state_room.invalidate.assert_called_once_with(
+            ("room_id",)
+        )
+        self.mock_store.get_partial_rooms.invalidate_all.assert_called_once_with()
 
     def test_resync_abandoned_unblocks_opted_in_waiters_only(self) -> None:
         # Giving up on a resync wakes waiters which opted in (so that they can

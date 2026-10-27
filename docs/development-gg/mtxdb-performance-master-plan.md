@@ -53,12 +53,13 @@ totals were well under one second per pool.
 
 ## Existing mtxdb layout
 
-The current Synapse wrapper has three physical pools:
+The current Synapse wrapper has four physical pools:
 
 ```text
 state
 event_dag
 auth_chain
+server_info
 ```
 
 Each pool can contain multiple logical collections. The existing model is a
@@ -79,8 +80,12 @@ it is not required for the initial design.
 
 ## Design principles
 
-1. SQL remains the source of truth for data whose ordering and transactional
-   semantics have not been reproduced in mtxdb.
+1. Legacy baseline, not the agreed direction: SQL remains the source of truth
+   for data whose ordering and transactional semantics have not been reproduced
+   in mtxdb. For data migrated to mtxdb, mtxdb is the authority and duplicate
+   SQL writes are removed (see `perf-track-b.md` B2). Data that deliberately
+   stays SQL-authoritative keeps this rule, and only that data may use an SQL
+   outbox.
 2. mtxdb records must be refreshable by read-only workers without reopening the
    process or rebuilding the entire store.
 3. Every offload must have an explicit fallback and rebuild path.
@@ -212,31 +217,36 @@ The mtxdb implementation is MSC4499-aligned only if it preserves:
 The `KEYS` collection may retain multiple raw source responses. `SIGN` must
 remain the authoritative result of conflict resolution.
 
-There is currently no mtxdb implementation or public document providing these
-server-info collections. This plan is a design proposal, not a claim of
-completed MSC4499 compliance.
+The `ServerInfo` shard and its shared-database pool are present in mtxdb and
+opened by the Synapse Rust wrapper. The pool is currently empty and has no
+KEYS/SIGN collections or Synapse read/write path. This plan is therefore a
+design proposal for the data API and migration, not a claim of completed MSC4499
+compliance.
 
 The steady-state authority must be mtxdb, not SQL. Keeping SQL as the writer
 authority and duplicating every response into mtxdb would retain the measured
-`server_keys_json` write hotspot and create an inefficient dual-write path.
-SQL may remain temporarily as a migration/read-recovery fallback, but normal
-key writes must perform MSC4499 resolution in mtxdb and must not write the SQL
-blob table on every fetch.
+`server_keys_json` write hotspot and create an inefficient dual-write path. SQL
+may remain temporarily as a migration/read-recovery fallback, but normal key
+writes must perform MSC4499 resolution in mtxdb and must not write the SQL blob
+table on every fetch.
 
 This also means a Python read-then-write sequence is insufficient for `SIGN`:
 the mtxdb layer needs an atomic compare-and-set/upsert primitive, or a single
-serialized mtxdb writer that owns the resolution. A standalone pool without
-such a primitive cannot safely claim MSC4499 concurrency compliance.
+serialized mtxdb writer that owns the resolution. A standalone pool without such
+a primitive cannot safely claim MSC4499 concurrency compliance.
 
-`SIGN` and `KEYS` publication are atomic within a single `DatabaseTransaction` across the shared pools.
-An accepted `SIGN` binding with a failed `KEYS` blob write would leave the
-authoritative collections inconsistent; using `SharedDatabase` guarantees joint publication across all four pools.
+`SIGN` and `KEYS` publication are atomic within a single `DatabaseTransaction`
+across the shared pools. An accepted `SIGN` binding with a failed `KEYS` blob
+write would leave the authoritative collections inconsistent; using
+`SharedDatabase` guarantees joint publication across all four pools.
 
-**`DatabaseTransaction` and Pool Layout Integration:**
-Rather than building an un-transactional Path A prototype, `server_info` is integrated directly as a fourth physical pool (`ShardType::ServerInfo` / `mtpl-server-info`) in mtxdb.
-
-- **Transaction Scope**: `ShardType::ALL` includes `ServerInfo`. `SharedDatabase` and `PoolPolicies` manage all 4 pools under shared WAL and single `begin_transaction()` semantics.
-- **Layout Migration**: Existing mtxdb database roots automatically create/upgrade the `mtpl-server-info` pool directory when opening `DatabaseLayout`, ensuring backwards compatibility without re-initializing the database as fresh.
+**Pool and transaction integration already present:** `ShardType::ServerInfo`
+(`mtpl-server-info`) is included in the layout, pool policies, and
+`SharedDatabase`; existing roots create/upgrade the pool on open. The remaining
+work is to add the logical collections and use the shared transaction API for
+atomic KEYS/SIGN publication. Confirm the exact crash and refresh guarantees of
+the shared transaction path while implementing the collection API; do not assume
+pool membership alone proves those guarantees.
 
 ## Phase 3: event and room-state fan-out
 
@@ -331,13 +341,13 @@ The first presence optimizations should be Synapse-level:
 - measure notifier wakeups, stream rows written, rows read, and serialized
   presence bytes separately.
 
-Presence should not be put into the durable `server_info` pool or the
-room/event pools. Its state is mutable and high-churn, and its main cost is
-fan-out and notification scheduling rather than large shared blobs.
+Presence should not be put into the durable `server_info` pool or the room/event
+pools. Its state is mutable and high-churn, and its main cost is fan-out and
+notification scheduling rather than large shared blobs.
 
 ### Presence mtxdb design, staged
 
-The first experiment should be a CURRENT-only design in a separate fourth
+The first experiment should be a CURRENT-only design in a separate fifth
 `ephemeral` pool:
 
 ```text
@@ -352,9 +362,9 @@ PostgreSQL cost before adding a more complicated incremental-read structure.
 Reads fall back to SQL on a miss, and writes are coalesced per user before a
 batch commit.
 
-If CURRENT-only reads are insufficient for incremental `/sync`, version two
-adds a bounded pool-level change index rather than putting change records under
-each user:
+If CURRENT-only reads are insufficient for incremental `/sync`, version two adds
+a bounded pool-level change index rather than putting change records under each
+user:
 
 ```text
 PRESENCE_BATCH/<revision_u64_be> -> coalesced changed user IDs
@@ -369,12 +379,11 @@ This requires explicit horizon tracking, range reads, bounded retention, and a
 well-defined refresh contract for read-only workers. A pool commit revision is
 not automatically a usable sync token until those semantics exist.
 
-The fourth pool is a design blocker, not an implemented feature. We must
-decide whether it participates in the shared WAL/group-commit coordinator or
-is an independent `PackfileStorage`. Presence does not need an atomic
-transaction with event/state writes, so an independent pool may be the simpler
-first implementation. Either choice must define checkpoint, refresh,
-`request_durable`, wait-durable, compaction, and crash-recovery behavior.
+Presence does not need an atomic transaction with event/state writes, so an
+independent pool may be the simpler first implementation. Either choice must
+define checkpoint, refresh, `request_durable`, wait-durable, compaction, and
+crash-recovery behavior. If pursued, this presence experiment would use a
+separate ephemeral pool (a fifth physical pool), not `server_info`.
 
 ## Phase 5: device lists and federation metadata
 
@@ -406,18 +415,65 @@ initialization. Audit:
 This work is independent of mtxdb and may produce a faster result than moving
 small tables.
 
-## Migration strategy
+## Phase 2 implementation plan: server keys authority
 
-The migration goes directly to the production `ShardType::ServerInfo` integration in `SharedDatabase` (avoiding temporary standalone non-transactional prototype work):
+The physical pool integration is complete; the logical data path is not. Do the
+work in these stages, keeping each stage reviewable and preserving SQL as the
+recovery source until the final cutover:
 
-1. Land `ShardType::ServerInfo` (`mtpl-server-info`) in mtxdb (`layout.rs`, `ShardType::ALL`, `PoolPolicies`, `SharedDatabase.pools`, `matrix_pool_policies()`), including automatic layout upgrade for existing mtxdb database roots.
-2. Expose `server_info` KEYS/SIGN Rust collections and PyO3 functions in `mtxdb_syn.rs`.
-3. Implement MSC4499 `SIGN` first-seen-wins CAS directly in the shared `DatabaseTransaction` spanning `SIGN` and `KEYS` atomically.
-4. Wire Synapse `store_server_keys_response` writes directly to mtxdb (no steady-state SQL dual writes).
-5. Add mtxdb-first reads (`KEYS`/`SIGN`) with temporary SQL fallback for pre-migration rows.
-6. Backfill existing SQL `server_keys_json` and `server_signature_keys` rows into mtxdb.
-7. Run crash/recovery and concurrent MSC4499 verification tests.
-8. Remove SQL fallback reads and stop maintaining `server_keys_json` and `server_signature_keys` SQL tables after validation.
+1. **Specify records and invariants.** Finalize KEYS/SIGN key encoding,
+   serialization/versioning, lookup by `(server_name, key_id)`, source
+   provenance, validity rules, and MSC4499 conflict outcomes. Document how
+   legacy SQL rows map, including conflicts or incomplete rows.
+2. **Instrument the pool and APIs.** Add counters for KEYS/SIGN reads,
+   hits/misses, writes, CAS outcomes, refresh count/bytes/time, and fallback
+   reads. Expose them through the existing diagnostics path. Keep labels bounded
+   (no server names or key IDs).
+3. **Implement the mtxdb collection API.** Add Rust collection operations and
+   narrow PyO3 wrappers. Reads must support point and batched lookups. Writes
+   must return explicit CAS results and errors; do not expose an API that lets
+   callers bypass SIGN conflict resolution.
+4. **Make publication atomic.** In one shared `DatabaseTransaction`, write the
+   raw KEYS response and apply SIGN first-seen-wins/CAS. Define behavior for
+   duplicate responses, direct-origin replacement of provisional data, rejected
+   conflicts, expired bindings, retries, and transaction aborts. Verify
+   committed data becomes visible to read-only workers through the documented
+   refresh mechanism.
+5. **Integrate writes behind a migration mode.** Route validated responses
+   through mtxdb. Keep existing SQL behavior as an explicit compatibility mode
+   during development; do not perform a Python-level read-then-write CAS. Record
+   enough diagnostics to compare accepted writes and fallback activity.
+6. **Read mtxdb first with SQL fallback.** Serve KEYS and authoritative SIGN
+   from mtxdb; fall back to SQL for misses while migration is incomplete. Define
+   whether a fallback result is merely returned or repaired into mtxdb, and
+   ensure repair cannot overwrite a newer authoritative binding.
+7. **Backfill safely.** Add a resumable, idempotent backfill from both SQL
+   tables. Resolve rows through the same SIGN rules as live writes. Track
+   progress and conflicts, and make restart/retry safe. Do not delete or stop
+   updating SQL during this stage.
+8. **Validate failure and concurrency cases.** Cover simultaneous first
+   sightings, provisional-to-direct replacement, conflicting direct keys,
+   duplicate/reordered responses, invalid signatures, transaction abort, crash
+   around commit, restart, stale read-only worker refresh, partial backfill, and
+   SQL fallback. Assert SQL and mtxdb agree wherever both have data.
+9. **Measure the hot path.** Compare matched PostgreSQL-only and hybrid runs
+   with the same test set, worker topology, compiler, and runner conditions.
+   Report wall time separately from aggregate SQL time. Confirm the targeted SQL
+   upsert cost falls, fallback stays bounded, refresh cost is bounded, and no
+   new contention or I/O regression appears.
+10. **Cut over authority, then retire SQL use.** Only after correctness,
+    recovery, and performance gates pass, make mtxdb the normal write authority
+    and stop steady-state SQL blob writes. Keep SQL fallback and backfill
+    available for a defined compatibility window, but only for key bindings
+    created before cutover; bindings created or replaced afterward must be
+    recovered from current mtxdb data so a miss never returns an obsolete
+    binding. Remove SQL fallback and cease maintaining the two SQL tables only
+    in a separately reviewed final migration, with an operational recovery
+    procedure.
+
+Current status: physical `ServerInfo` pool/layout and wrapper opening are
+present; collection schema/API, server-info counters, Synapse integration,
+backfill, and migration tests are not implemented.
 
 ## Acceptance gates
 
@@ -432,19 +488,21 @@ A change is ready to land only when:
 - read-only workers see committed records without manual restart;
 - SQL fallback and backfill paths are tested;
 - MSC4499 collision and concurrent-writer tests pass for key storage;
-- no production data loss is possible if mtxdb is absent or rebuilt.
+- no production data loss is possible if mtxdb is absent or rebuilt;
+- server-key SQL writes are removed from the steady-state path before claiming a
+  performance win for this phase;
+- CAS outcomes, SQL fallback, backfill progress, and refresh cost are visible in
+  diagnostics without high-cardinality labels.
 
 ## Immediate next actions
 
-1. Add mtxdb runtime counters for server-info reads, misses, refreshes, and
-   bytes.
-2. Design the `server_info` pool and parent/member collection API.
-3. Implement atomic `SIGN` compare-and-set and authoritative `KEYS`/`SIGN`
-   writes in mtxdb; do not add steady-state SQL dual writes.
-4. Add concurrent MSC4499 tests for `SIGN` compare-and-set behavior and
-   crash/recovery tests for joint `SIGN`/`KEYS` publication.
-5. Profile device-list polling and worker startup separately.
-6. Implement the presence CURRENT-only experiment in an isolated ephemeral
-   pool, if the presence read profile justifies it.
-7. Only then evaluate moving `current_state_delta_stream` and additional
+1. Finalize KEYS/SIGN record and MSC4499 transition semantics.
+2. Add server-info counters and specify the collection/API (the physical pool
+   already exists).
+3. Implement atomic KEYS/SIGN operations and Synapse routing with temporary SQL
+   fallback; then backfill and validate before authority cutover.
+4. Profile device-list polling and worker startup separately.
+5. Implement the presence CURRENT-only experiment in a separate ephemeral pool
+   only if its read profile justifies it.
+6. Only then evaluate moving `current_state_delta_stream` and additional
    client-sync reads.

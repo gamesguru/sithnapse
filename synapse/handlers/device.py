@@ -42,6 +42,7 @@ from synapse.api.errors import (
     RequestSendFailed,
     SynapseError,
 )
+from synapse.events import EventBase
 from synapse.logging.opentracing import log_kv, set_tag, trace
 from synapse.metrics import SERVER_NAME_LABEL
 from synapse.metrics.background_process_metrics import (
@@ -72,6 +73,7 @@ from synapse.types import (
     get_verify_key_from_cross_signing_key,
     is_compliant_user_id,
 )
+from synapse.types.state import StateFilter
 from synapse.util import stringutils
 from synapse.util.async_helpers import Linearizer
 from synapse.util.caches.expiringcache import ExpiringCache
@@ -595,6 +597,10 @@ class DeviceHandler:
     ) -> DeviceListUpdates:
         """Get list of users that have had the devices updated, or have newly
         joined a room, that `user_id` may be interested in.
+
+        Return users with device changes and users no longer sharing a room since
+        from_token, including leaves from partial-state rooms. Remote users reported
+        as left are unsubscribed from device-list tracking.
         """
 
         set_tag("user_id", user_id)
@@ -632,6 +638,50 @@ class DeviceHandler:
                 newly_joined_rooms.discard(change.room_id)
                 newly_left_rooms.add(change.room_id)
 
+        # A leave during a partial-state join may not appear as a useful
+        # current-state delta: the room's current state can be incomplete or
+        # reset while the leave is being processed. Membership events are
+        # persisted independently of that delta stream, so use them to fill in
+        # missed leave transitions. Ignore rejected events, and use the last
+        # accepted event in the range so a subsequent rejoin cancels a leave.
+        membership_events = await self.store.get_membership_changes_for_user(
+            user_id, from_token.room_key, now_token.room_key
+        )
+        last_membership_event_by_room: dict[str, EventBase] = {}
+        rooms_rejoined_after_leave: set[str] = set()
+        for event in membership_events:
+            if event.rejected_reason is not None:
+                continue
+            previous_event = last_membership_event_by_room.get(event.room_id)
+            if (
+                event.membership == Membership.JOIN
+                and previous_event is not None
+                and previous_event.membership in (Membership.LEAVE, Membership.BAN)
+            ):
+                rooms_rejoined_after_leave.add(event.room_id)
+            last_membership_event_by_room[event.room_id] = event
+
+        for room_id, event in last_membership_event_by_room.items():
+            if event.membership == Membership.JOIN:
+                # A join -> join event is a profile change, not a rejoin. Only
+                # count the join if the previous accepted membership was not
+                # already JOIN (or if no previous content was available).
+                prev_content = event.unsigned.get("prev_content")
+                prev_membership = (
+                    prev_content.get("membership")
+                    if isinstance(prev_content, dict)
+                    else None
+                )
+                if (
+                    room_id in rooms_rejoined_after_leave
+                    or prev_membership != Membership.JOIN
+                ):
+                    newly_joined_rooms.add(room_id)
+                newly_left_rooms.discard(room_id)
+            elif event.membership in (Membership.LEAVE, Membership.BAN):
+                newly_joined_rooms.discard(room_id)
+                newly_left_rooms.add(room_id)
+
         # We now work out if any other users have since joined or left the rooms
         # the user is currently in.
 
@@ -643,7 +693,9 @@ class DeviceHandler:
 
         # TODO: Only pull out membership events?
         state_changes = await self.store.get_current_state_deltas_for_rooms(
-            joined_room_ids, from_token=from_token.room_key, to_token=now_token.room_key
+            joined_room_ids | newly_left_rooms,
+            from_token=from_token.room_key,
+            to_token=now_token.room_key,
         )
         for delta in state_changes:
             if delta.event_type != EventTypes.Member:
@@ -691,6 +743,12 @@ class DeviceHandler:
                     if prev_membership not in joined_invited_knocked:
                         newly_joined_or_invited_or_knocked_users.add(delta.state_key)
                         newly_left_users.discard(delta.state_key)
+                    # A user can join after the sync token in a room the local
+                    # user leaves during this range. They won't be in the
+                    # previous-state snapshot used below, but we still need to
+                    # stop tracking their device list when we leave the room.
+                    if delta.room_id in newly_left_rooms:
+                        newly_left_users.add(delta.state_key)
                 elif prev_membership in joined_invited_knocked:
                     newly_joined_or_invited_or_knocked_users.discard(delta.state_key)
                     newly_left_users.add(delta.state_key)
@@ -707,6 +765,16 @@ class DeviceHandler:
             newly_left_rooms=newly_left_rooms,
             newly_left_users=newly_left_users,
         )
+
+        if from_token.device_list_key != now_token.device_list_key:
+            logger.info(
+                "Device-list sync for %s advanced from %s to %s: changed=%s left=%s",
+                user_id,
+                from_token.device_list_key,
+                now_token.device_list_key,
+                sorted(device_list_updates.changed),
+                sorted(device_list_updates.left),
+            )
 
         log_kv(
             {
@@ -730,8 +798,15 @@ class DeviceHandler:
     ) -> DeviceListUpdates:
         """Generate the DeviceListUpdates section of sync
 
+        Read membership at since_token for rooms the user left, without waiting
+        for partial-state resync. Unsubscribe remote users no longer sharing a
+        room. Input sets are not modified; storage errors propagate.
+
         Args:
-            sync_result_builder
+            user_id: User receiving the sync response
+            since_token: Previous sync position
+            now_token: Current position for device-change lookups
+            joined_room_ids: Rooms the user is currently joined to
             newly_joined_rooms: Set of rooms user has joined since previous sync
             newly_joined_or_invited_or_knocked_users: Set of users that have joined,
                 been invited to a room or are knocking on a room since
@@ -739,6 +814,10 @@ class DeviceHandler:
             newly_left_rooms: Set of rooms user has left since previous sync
             newly_left_users: Set of users that have left a room we're in since
                 previous sync
+
+        Returns:
+            Users whose keys should be refreshed and users no longer tracked,
+            excluding nonlocal user IDs that are not spec compliant.
         """
         # Take a copy since these fields will be mutated later.
         newly_joined_or_invited_or_knocked_users = set(
@@ -787,14 +866,49 @@ class DeviceHandler:
 
         # Now find users that we no longer track
         for room_id in newly_left_rooms:
-            left_users = await self.store.get_users_in_room(room_id)
+            # Once our last local user leaves, the room's current state is
+            # dropped, so read the members from the state at the previous sync.
+            old_state_ids = await self._state_storage.get_state_ids_at(
+                room_id,
+                since_token,
+                state_filter=StateFilter.from_types([(EventTypes.Member, None)]),
+                # Don't make a sync wait for a partial-state resync to finish;
+                # the members we know of are enough to say who we stop tracking.
+                await_full_state=False,
+            )
+            left_users = await self.store.get_joined_user_ids_from_state(
+                room_id, old_state_ids
+            )
             newly_left_users.update(left_users)
 
         # Remove any users that we still share a room with.
         left_users_rooms = await self.store.get_rooms_for_users(newly_left_users)
-        for user_id, entries in left_users_rooms.items():
-            if any(rid in joined_room_ids for rid in entries):
-                newly_left_users.discard(user_id)
+        for left_user_id, entries in left_users_rooms.items():
+            # Ignore rooms the user has just left: their membership in the old
+            # room must not be treated as a room we still share with them.
+            if any(
+                rid in joined_room_ids and rid not in newly_left_rooms
+                for rid in entries
+            ):
+                newly_left_users.discard(left_user_id)
+
+        # This is the point where we know the users we are about to report as
+        # left, even if the abandoned room's current state does not contain
+        # them anymore. Unsubscribing drops their device list extremity, so the
+        # next /keys/query refetches on demand instead of reusing the cache.
+        # Don't also mark them stale: that makes the resync retry loop fetch
+        # device lists for users we no longer share a room with.
+        #
+        # `newly_left_users` is only relative to the requester, so check
+        # server-wide that no other local user still shares a room with them
+        # before dropping the cache they all rely on.
+        await self.store.handle_potentially_left_users(
+            {
+                left_user_id
+                for left_user_id in newly_left_users
+                if not self.hs.is_mine_id(left_user_id)
+            }
+        )
 
         return DeviceListUpdates(
             changed={
@@ -868,7 +982,10 @@ class DeviceHandler:
     @trace
     @measure_func("notify_device_update")
     async def notify_device_update(
-        self, user_id: str, device_ids: StrCollection
+        self,
+        user_id: str,
+        device_ids: StrCollection,
+        room_ids: StrCollection | None = None,
     ) -> None:
         """Notify that a user's device(s) has changed. Pokes the notifier, and
         remote servers if the user is local.
@@ -876,11 +993,14 @@ class DeviceHandler:
         Args:
             user_id: The Matrix ID of the user who's device list has been updated.
             device_ids: The device IDs that have changed.
+            room_ids: If given, scope the update to these rooms instead of every
+                room the user is in.
         """
         await self._notify_device_update_client(
             instance_name=random.choice(self._device_list_writers),
             user_id=user_id,
             device_ids=list(device_ids),
+            room_ids=None if room_ids is None else list(room_ids),
         )
 
     async def notify_user_signature_update(
@@ -1002,7 +1122,10 @@ class DeviceWriterHandler(DeviceHandler):
     @trace
     @measure_func("notify_device_update")
     async def notify_device_update(
-        self, user_id: str, device_ids: StrCollection
+        self,
+        user_id: str,
+        device_ids: StrCollection,
+        room_ids: StrCollection | None = None,
     ) -> None:
         """Notify that a user's device(s) has changed. Pokes the notifier, and
         remote servers if the user is local.
@@ -1010,12 +1133,15 @@ class DeviceWriterHandler(DeviceHandler):
         Args:
             user_id: The Matrix ID of the user who's device list has been updated.
             device_ids: The device IDs that have changed.
+            room_ids: If given, scope the update to these rooms instead of every
+                room the user is in.
         """
         if not device_ids:
             # No changes to notify about, so this is a no-op.
             return
 
-        room_ids = await self.store.get_rooms_for_user(user_id)
+        if room_ids is None:
+            room_ids = await self.store.get_rooms_for_user(user_id)
 
         position = await self.store.add_device_change_to_streams(
             user_id,

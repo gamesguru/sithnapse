@@ -231,6 +231,86 @@ class FederationEventHandlerTests(unittest.FederatingHomeserverTestCase):
         )
         self.assertEqual(encrypted_handlers_saw_persisted, [True, True])
 
+    def _update_state_for_flipped_membership(
+        self, cached_devices: dict[str, JsonDict], last_stream_id: str | None
+    ) -> mock.AsyncMock:
+        """De-partial-state a remote membership event whose rejection flips from
+        accepted to rejected, and return the mocked stale-marking store method.
+        """
+        event = mock.Mock()
+        event.event_id = "$kick"
+        event.type = EventTypes.Member
+        event.state_key = "@elsie:remote"
+        event.rejected_reason = None
+
+        context = mock.Mock(rejected=False, partial_state=False)
+
+        async def check_event_auth(
+            origin: str | None, event: EventBase, context: EventContext
+        ) -> None:
+            context.rejected = "auth_error"
+
+        handler = self.hs.get_federation_event_handler()
+        store = self.hs.get_datastores().main
+        mark_stale = mock.AsyncMock()
+
+        with (
+            mock.patch.object(
+                handler,
+                "_compute_event_context_with_maybe_missing_prevs",
+                new=mock.AsyncMock(return_value=context),
+            ),
+            mock.patch.object(
+                handler,
+                "_check_event_auth",
+                new=mock.AsyncMock(side_effect=check_event_auth),
+            ),
+            mock.patch.object(
+                store, "update_state_for_partial_state_event", new=mock.AsyncMock()
+            ),
+            mock.patch.object(
+                store,
+                "get_cached_devices_for_user",
+                new=mock.AsyncMock(return_value=cached_devices),
+            ),
+            mock.patch.object(
+                store,
+                "get_device_list_last_stream_id_for_remote",
+                new=mock.AsyncMock(return_value=last_stream_id),
+            ),
+            mock.patch.object(
+                store, "mark_remote_users_device_caches_as_stale", new=mark_stale
+            ),
+        ):
+            self.get_success(
+                handler.update_state_for_partial_state_event("remote", event)
+            )
+
+        return mark_stale
+
+    def test_partial_state_rejection_flip_without_cached_snapshot(self) -> None:
+        """A remote user we have never fetched devices for is not marked stale,
+        so the resync retry loop does not query their device list.
+        """
+        mark_stale = self._update_state_for_flipped_membership({}, None)
+        mark_stale.assert_not_awaited()
+
+    def test_partial_state_rejection_flip_with_cached_devices(self) -> None:
+        """A remote user with cached devices is marked stale, since they may
+        have missed device list updates while the room was partial-stated.
+        """
+        mark_stale = self._update_state_for_flipped_membership(
+            {"DEVICE": {"device_id": "DEVICE"}}, "1"
+        )
+        mark_stale.assert_awaited_once_with(("@elsie:remote",))
+
+    def test_partial_state_rejection_flip_with_empty_cached_snapshot(self) -> None:
+        """An empty cached device list is still a snapshot, so it is refreshed
+        after a rejection flip just like a non-empty one.
+        """
+        mark_stale = self._update_state_for_flipped_membership({}, "1")
+        mark_stale.assert_awaited_once_with(("@elsie:remote",))
+
     def test_process_pulled_event_with_missing_state(self) -> None:
         """Ensure that we correctly handle pulled events with lots of missing state
 

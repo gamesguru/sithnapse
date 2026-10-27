@@ -10,6 +10,16 @@ on:
       use_twisted_trunk:
         type: boolean
         default: false
+      worker_profile:
+        description: >
+          Worker process topology for the workers lanes. Use `reduced` on
+          PR/push runs and `full` for the nightly full-topology lane.
+        type: string
+        default: reduced
+      only_workers:
+        description: Only run the workers matrix rows.
+        type: boolean
+        default: false
 
 # Control the permissions granted to `GITHUB_TOKEN`.
 permissions:
@@ -24,7 +34,34 @@ env:
   COMPLEMENT_REPO: "gamesguru/complement"
 
 jobs:
+  matrix:
+    # A job-level `if` cannot see `matrix`, and `include` rows cannot be
+    # filtered with expressions, so build the matrix here and drop the
+    # non-workers rows when only_workers is set.
+    runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.matrix.outputs.include }}
+    steps:
+      - id: matrix
+        env:
+          ONLY_WORKERS: ${{ inputs.only_workers }}
+        run: |
+          # The mtxdb lanes run with sync off: Complement containers are
+          # destroyed after every test, so the durable fsync path buys nothing.
+          include='[
+            {"arrangement": "monolith", "database": "SQLite"},
+            {"arrangement": "hybrid", "database": "SQLite (hybrid, mtxdb)", "mtxdb_sync_mode": "off"},
+            {"arrangement": "monolith", "database": "Postgres"},
+            {"arrangement": "hybrid", "database": "Postgres (hybrid, mtxdb)", "mtxdb_sync_mode": "off"},
+            {"arrangement": "workers", "database": "Postgres"},
+            {"arrangement": "workers", "database": "Postgres (hybrid, mtxdb)", "mtxdb_sync_mode": "off"}
+          ]'
+          echo "include=$(jq -c --argjson only "$ONLY_WORKERS" \
+            'map(select(($only | not) or .arrangement == "workers"))' <<< "$include")" \
+            >> "$GITHUB_OUTPUT"
+
   complement:
+    needs: matrix
     runs-on: ubuntu-latest
     env:
       # Complement invokes this on the host before stopping each PostgreSQL
@@ -42,30 +79,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arrangement: monolith
-            database: SQLite
-
-          - arrangement: hybrid
-            database: SQLite (hybrid, mtxdb)
-            # Complement containers are destroyed after every test, so the
-            # durable fsync path buys nothing here. Keep this lane consistent
-            # with the Postgres mtxdb lanes and run with sync off for speed.
-            mtxdb_sync_mode: "off"
-
-          - arrangement: monolith
-            database: Postgres
-
-          - arrangement: hybrid
-            database: Postgres (hybrid, mtxdb)
-            mtxdb_sync_mode: "off"
-
-          - arrangement: workers
-            database: Postgres
-
-          - arrangement: workers
-            database: Postgres (hybrid, mtxdb)
-            mtxdb_sync_mode: "off"
+        include: ${{ fromJSON(needs.matrix.outputs.include) }}
 
     steps:
       - name: Checkout synapse codebase
@@ -111,6 +125,23 @@ jobs:
           uv lock
         working-directory: synapse
 
+      # Sample host load and per-container CPU for the whole run, so startup
+      # cost can be told apart from steady-state worker overhead. Paired with
+      # Complement's "deploy-timing" log line (startup-to-ready per homeserver).
+      - name: Start resource sampler
+        run: |
+          mkdir -p /tmp/complement-resources
+          nohup bash -c '
+            while true; do
+              ts=$(date +%s)
+              echo "$ts $(cut -d" " -f1-3 /proc/loadavg)" >> /tmp/complement-resources/loadavg.txt
+              docker stats --no-stream --format "$ts\t{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}" \
+                >> /tmp/complement-resources/docker_stats.tsv 2>/dev/null
+              sleep 5
+            done
+          ' > /dev/null 2>&1 &
+          echo $! > /tmp/complement-resources/sampler.pid
+
       - name: Run Complement Tests
         id: run_complement_tests
         run: |
@@ -119,6 +150,7 @@ jobs:
         env:
           POSTGRES: ${{ (startsWith(matrix.database, 'Postgres')) && 1 || '' }}
           WORKERS: ${{ (matrix.arrangement == 'workers') && 1 || '' }}
+          SYNAPSE_COMPLEMENT_WORKER_PROFILE: ${{ inputs.worker_profile }}
           # complement.sh only honours the TEST_-scoped names (and blanks the
           # bare ones to keep a developer's production env out of containers),
           # so the engine/path MUST use the SYNAPSE_TEST_ prefix or the
@@ -136,7 +168,25 @@ jobs:
       - name: Formatted Complement log (only failing tests shown)
         if: always() && steps.run_complement_tests.outcome != 'skipped'
         continue-on-error: true
-        run: jq -Rrc 'fromjson? // empty' synapse/tests/complement/main/logs.jsonl | gotestfmt -hide "successful-downloads,successful-tests,empty-packages"
+        # A failed Complement package can contain minutes of captured homeserver
+        # logs. Keep status events for every test, but only send output belonging
+        # to failed tests (or failed packages) to gotestfmt; the complete JSONL
+        # is uploaded below.
+        run: |
+          jq -Rsc '
+            split("\n")
+            | map(fromjson? // empty) as $events
+            | [$events[] | select(.Action == "fail" and .Test != null) | .Test] as $failed_tests
+            | [$events[] | select(.Action == "fail" and .Test == null) | .Package] as $failed_packages
+            | $events[]
+            | select(
+                .Action != "output"
+                or (if .Test != null
+                    then (.Test as $test | $failed_tests | index($test) != null)
+                    else (.Package as $pkg | $failed_packages | index($pkg) != null)
+                    end)
+              )
+          ' synapse/tests/complement/main/logs.jsonl | gotestfmt -hide "successful-downloads,successful-tests,empty-packages"
 
       - name: Run in-repo Complement Tests
         # Always run as long as we attempted to run the original Complement tests.
@@ -152,6 +202,7 @@ jobs:
         env:
           POSTGRES: ${{ (startsWith(matrix.database, 'Postgres')) && 1 || '' }}
           WORKERS: ${{ (matrix.arrangement == 'workers') && 1 || '' }}
+          SYNAPSE_COMPLEMENT_WORKER_PROFILE: ${{ inputs.worker_profile }}
           # complement.sh only honours the TEST_-scoped names (and blanks the
           # bare ones to keep a developer's production env out of containers),
           # so the engine/path MUST use the SYNAPSE_TEST_ prefix or the
@@ -169,7 +220,44 @@ jobs:
       - name: Formatted in-repo Complement log (only failing tests shown)
         if: always() && steps.run_in_repo_complement_tests.outcome != 'skipped'
         continue-on-error: true
-        run: jq -Rrc 'fromjson? // empty' synapse/tests/complement/in-repo/logs.jsonl | gotestfmt -hide "successful-downloads,successful-tests,empty-packages"
+        run: |
+          jq -Rsc '
+            split("\n")
+            | map(fromjson? // empty) as $events
+            | [$events[] | select(.Action == "fail" and .Test != null) | .Test] as $failed_tests
+            | [$events[] | select(.Action == "fail" and .Test == null) | .Package] as $failed_packages
+            | $events[]
+            | select(
+                .Action != "output"
+                or (if .Test != null
+                    then (.Test as $test | $failed_tests | index($test) != null)
+                    else (.Package as $pkg | $failed_packages | index($pkg) != null)
+                    end)
+              )
+          ' synapse/tests/complement/in-repo/logs.jsonl | gotestfmt -hide "successful-downloads,successful-tests,empty-packages"
+
+      - name: Summarise startup and CPU usage
+        if: always() && steps.run_complement_tests.outcome != 'skipped'
+        continue-on-error: true
+        run: |
+          kill "$(cat /tmp/complement-resources/sampler.pid)" 2>/dev/null || true
+          jq -r 'select(.Action == "output") | .Output' synapse/tests/complement/main/logs.jsonl \
+            | grep -o 'ready_after=[0-9.]*' | cut -d= -f2 | sort -n \
+            > /tmp/complement-resources/ready_after.txt || true
+          echo "Homeserver startup-to-ready (seconds):"
+          awk '{a[NR]=$1; s+=$1} END {
+            if (NR == 0) { print "  no deploy-timing lines (Complement checkout lacks them?)"; exit }
+            printf "  n=%d total=%.0f mean=%.2f p50=%.2f p90=%.2f max=%.2f\n",
+              NR, s, s/NR, a[int(NR*0.5)+1], a[int(NR*0.9)+1], a[NR] }' \
+            /tmp/complement-resources/ready_after.txt
+          echo "Host load average (1m) over the run:"
+          awk '{s+=$2; if ($2>m) m=$2} END { if (NR) printf "  samples=%d mean=%.2f max=%.2f\n", NR, s/NR, m }' \
+            /tmp/complement-resources/loadavg.txt
+          echo "Summed container CPU% per sample (400% = all 4 vCPUs):"
+          awk -F'\t' '{gsub("%","",$3); t[$1]+=$3} END {
+            for (k in t) { n++; s+=t[k]; if (t[k]>m) m=t[k] }
+            if (n) printf "  samples=%d mean=%.0f%% max=%.0f%%\n", n, s/n, m }' \
+            /tmp/complement-resources/docker_stats.tsv
 
       - name: Print PostgreSQL statistics
         if: ${{ always() && startsWith(matrix.database, 'Postgres') }}
@@ -217,4 +305,12 @@ jobs:
             synapse/tests/complement/in-repo/logs.jsonl
             synapse/tests/complement/in-repo/results.jsonl
             synapse/.tmp/complement/*.jsonl
+          if-no-files-found: warn
+
+      - name: Upload resource samples
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ always() }}
+        with:
+          name: Complement resources - (${{ matrix.arrangement }}, ${{ matrix.database }})
+          path: /tmp/complement-resources
           if-no-files-found: warn

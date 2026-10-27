@@ -1490,10 +1490,22 @@ class PresenceHandler(BasePresenceHandler):
     async def incoming_presence(self, origin: str, content: JsonDict) -> None:
         """Called when we receive a `m.presence` EDU from a remote server."""
         if not self._track_presence:
+            logger.info(
+                "Ignoring m.presence EDU from %s: presence tracking is off", origin
+            )
             return
 
         now = self.clock.time_msec()
         updates = []
+        logger.info(
+            "Received m.presence EDU from %s with %i updates: %s",
+            origin,
+            len(content.get("push", [])),
+            [
+                (p.get("user_id"), p.get("presence"), p.get("last_active_ago"))
+                for p in content.get("push", [])
+            ],
+        )
         for push in content.get("push", []):
             # A "push" contains a list of presence that we are probably interested
             # in.
@@ -1540,6 +1552,12 @@ class PresenceHandler(BasePresenceHandler):
 
             prev_state = await self.current_state_for_user(user_id)
             updates.append(prev_state.copy_and_replace(**new_fields))
+            logger.info(
+                "Applying m.presence update for %s: %s -> %s",
+                user_id,
+                prev_state.state,
+                presence_state,
+            )
 
         if updates:
             federation_presence_counter.labels(
@@ -2021,6 +2039,18 @@ class PresenceEventSource(EventSource[int, UserPresenceState]):
         include_offline: bool = True,
         service: ApplicationService | None = None,
     ) -> tuple[list[UserPresenceState], int]:
+        """Return current presence updates for users visible to the syncing user.
+
+        Use changes after from_key, or all visible presence when it is None.
+        Include users on servers known to be in the user's partial-state rooms,
+        plus users selected by the presence router or explicit_room_id. Exclude
+        offline states when include_offline is False.
+
+        Return the updates and current presence token. Updates can exceed that
+        token and be repeated in later calls; return no updates when from_key
+        already equals it. The limit, room_ids, is_guest, and service arguments
+        are unused. Storage and presence-provider errors propagate.
+        """
         # The process for getting presence events are:
         #  1. Get the rooms the user is in.
         #  2. Get the list of user in the rooms.
@@ -2098,6 +2128,24 @@ class PresenceEventSource(EventSource[int, UserPresenceState]):
             # We always care about our own presence.
             additional_users_interested_in.add(user_id)
 
+            # A partial-state room only has a server list from the join, not
+            # complete membership. Treat users on those servers as potentially
+            # sharing the room until the resync fills in membership state.
+            partial_state_servers: set[str] = set()
+            user_room_ids = (
+                await self.store.get_rooms_for_user(user_id)
+                - self._rooms_to_exclude_from_presence
+            )
+            partial_state_rooms = await self.store.is_partial_state_room_batched(
+                user_room_ids
+            )
+            for room_id, is_partial in partial_state_rooms.items():
+                if not is_partial:
+                    continue
+                servers = await self.store.get_partial_state_servers_at_join(room_id)
+                if servers:
+                    partial_state_servers.update(servers)
+
             if explicit_room_id:
                 user_ids = await self.store.get_users_in_room(explicit_room_id)
                 additional_users_interested_in.update(user_ids)
@@ -2146,6 +2194,11 @@ class PresenceEventSource(EventSource[int, UserPresenceState]):
                         for updated_user, rooms in rooms_by_user.items()
                         if not my_rooms.isdisjoint(rooms)
                     }
+                    sharing_users.update(
+                        updated_user
+                        for updated_user in updated_users
+                        if get_domain_from_id(updated_user) in partial_state_servers
+                    )
 
                     interested_and_updated_users = (
                         sharing_users.union(additional_users_interested_in)
@@ -2165,6 +2218,12 @@ class PresenceEventSource(EventSource[int, UserPresenceState]):
                         )
                     )
                     users_interested_in.update(additional_users_interested_in)
+                    if partial_state_servers:
+                        users_interested_in.update(
+                            await self.store.get_users_with_presence_on_servers(
+                                partial_state_servers
+                            )
+                        )
 
                     interested_and_updated_users = (
                         stream_change_cache.get_entities_changed(
@@ -2180,6 +2239,12 @@ class PresenceEventSource(EventSource[int, UserPresenceState]):
                     )
                 )
                 interested_and_updated_users.update(additional_users_interested_in)
+                if partial_state_servers:
+                    interested_and_updated_users.update(
+                        await self.store.get_users_with_presence_on_servers(
+                            partial_state_servers, include_offline=include_offline
+                        )
+                    )
 
             # Retrieve the current presence state for each user
             users_to_state = await self.get_presence_handler().current_state_for_users(

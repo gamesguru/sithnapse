@@ -88,6 +88,16 @@ class CreateFilterRestServlet(RestServlet):
     async def on_POST(
         self, request: SynapseRequest, user_id: str
     ) -> tuple[int, JsonDict]:
+        """Validate and store a filter for the authenticated local user.
+
+        Clamp the timeline limit to the configured maximum after validation.
+        Return status 200 with the stored filter_id as a string.
+
+        Raises:
+            AuthError: If user_id is nonlocal or differs from the requester.
+            SynapseError: With status 400 for an invalid filter. Request parsing,
+                authentication, and storage errors also propagate.
+        """
         target_user = UserID.from_string(user_id)
         requester = await self.auth.get_user_by_req(request)
 
@@ -98,6 +108,9 @@ class CreateFilterRestServlet(RestServlet):
             raise AuthError(403, "Can only create filters for local users")
 
         content = parse_json_object_from_request(request)
+        # Validate before clamping the timeline limit, which assumes the limit is
+        # an integer and would otherwise turn an invalid filter into a 500.
+        self.filtering.check_valid_filter(content)
         set_timeline_upper_limit(content, self.hs.config.server.filter_timeline_limit)
 
         filter_id = await self.filtering.add_user_filter(

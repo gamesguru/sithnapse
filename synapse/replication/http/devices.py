@@ -42,7 +42,8 @@ class ReplicationNotifyDeviceUpdateRestServlet(ReplicationEndpoint):
         POST /_synapse/replication/notify_device_update/:user_id
 
         {
-            "device_ids": ["JLAFKJWSCS", "JLAFKJWSCS"]
+            "device_ids": ["JLAFKJWSCS", "JLAFKJWSCS"],
+            "room_ids": ["!room:example.org"]  // optional
         }
     """
 
@@ -59,13 +60,18 @@ class ReplicationNotifyDeviceUpdateRestServlet(ReplicationEndpoint):
 
     @staticmethod
     async def _serialize_payload(  # type: ignore[override]
-        user_id: str, device_ids: list[str]
+        user_id: str, device_ids: list[str], room_ids: list[str] | None = None
     ) -> JsonDict:
-        return {"device_ids": device_ids}
+        return {"device_ids": device_ids, "room_ids": room_ids}
 
     async def _handle_request(  # type: ignore[override]
         self, request: Request, content: JsonDict, user_id: str
     ) -> tuple[int, JsonDict]:
+        """Invalidate the user's cached rooms, then notify the device writer.
+
+        Read device_ids and optional room_ids from content and return (200, {}) after notification.
+        Notification errors propagate.
+        """
         device_ids = content["device_ids"]
 
         span = active_span()
@@ -73,7 +79,16 @@ class ReplicationNotifyDeviceUpdateRestServlet(ReplicationEndpoint):
             span.set_tag("user_id", user_id)
             span.set_tag("device_ids", f"{device_ids!r}")
 
-        await self.device_handler.notify_device_update(user_id, device_ids)
+        # The joining process can notify us about a user's devices immediately
+        # after persisting the join on another worker. The cache invalidation
+        # for `current_state_events` may not have reached this worker yet, so
+        # drop the cached room list to ensure we include the new room when
+        # calculating where to send device list updates.
+        self.store.get_rooms_for_user.invalidate((user_id,))
+
+        await self.device_handler.notify_device_update(
+            user_id, device_ids, room_ids=content.get("room_ids")
+        )
 
         return 200, {}
 

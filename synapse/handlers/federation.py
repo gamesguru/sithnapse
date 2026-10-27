@@ -85,7 +85,13 @@ from synapse.metrics import SERVER_NAME_LABEL
 from synapse.module_api import NOT_SPAM
 from synapse.storage.databases.main.events_worker import EventRedactBehaviour
 from synapse.storage.invite_rule import InviteRule
-from synapse.types import JsonDict, StrCollection, get_domain_from_id
+from synapse.types import (
+    JsonDict,
+    StrCollection,
+    UserID,
+    create_requester,
+    get_domain_from_id,
+)
 from synapse.types.state import StateFilter
 from synapse.util.async_helpers import (
     Linearizer,
@@ -106,13 +112,13 @@ logger = logging.getLogger(__name__)
 #
 # Retry scheduling uses exponential backoff: the delay doubles after each
 # consecutive failure, starting at _PARTIAL_STATE_SYNC_INITIAL_BACKOFF and
-# capped at _PARTIAL_STATE_SYNC_MAX_BACKOFF. After
-# _PARTIAL_STATE_SYNC_MAX_CONSECUTIVE_FAILURES consecutive failures we stop
-# retrying entirely, logging a warning and leaving the room partial until a
-# restart or a new join triggers another sync attempt.
+# capped at _PARTIAL_STATE_SYNC_MAX_BACKOFF. After the configured number of
+# consecutive failures we stop retrying automatically, log a warning, and
+# abandon the join so local users are not left in a permanently partial room.
+# The limit is configurable so tests can exercise that path quickly while
+# ordinary deployments tolerate a longer transient outage.
 _PARTIAL_STATE_SYNC_INITIAL_BACKOFF = Duration(seconds=1)
 _PARTIAL_STATE_SYNC_MAX_BACKOFF = Duration(hours=1)
-_PARTIAL_STATE_SYNC_MAX_CONSECUTIVE_FAILURES = 10
 
 
 # Added to debug performance and track progress on optimizations
@@ -2456,6 +2462,12 @@ class FederationHandler:
         """
 
         async def _sync_partial_state_room_wrapper() -> None:
+            """Run one room resync, scheduling retries or abandoning a failed join.
+
+            Resync exceptions count toward the retry limit; a concurrent join can
+            request a fresh attempt. When retries end, release abandonment waiters
+            and attempt to make local users leave the room.
+            """
             if room_id in self._active_partial_state_syncs:
                 # Another local user has joined the room while there is already a
                 # partial state sync running. This implies that there is a new join
@@ -2533,14 +2545,15 @@ class FederationHandler:
                 # Determine whether to schedule a retry and with what delay.
                 # On success, reset the failure counter. On failure, compute an
                 # exponential backoff delay and cap retries at
-                # _PARTIAL_STATE_SYNC_MAX_CONSECUTIVE_FAILURES.
+                # the configured limit.
                 retry_delay: Duration | None = None
                 if sync_failed and is_still_partial_state_room:
                     failure_count = (
                         self._partial_state_sync_failure_counts.get(room_id, 0) + 1
                     )
                     self._partial_state_sync_failure_counts[room_id] = failure_count
-                    if failure_count >= _PARTIAL_STATE_SYNC_MAX_CONSECUTIVE_FAILURES:
+                    max_failures = self.hs.config.experimental.partial_state_sync_max_consecutive_failures
+                    if failure_count >= max_failures:
                         logger.warning(
                             "Giving up on resynchronising partial-state room %s "
                             "after %d consecutive failures",
@@ -2567,6 +2580,10 @@ class FederationHandler:
                     self._storage_controllers.state._partial_state_room_tracker.notify_resync_abandoned(
                         room_id
                     )
+
+                    # The room cannot be completed, so leave it instead of
+                    # leaving local users stuck in a permanently partial room.
+                    await self._abandon_partial_state_room(room_id)
 
                 if retry_delay is not None:
                     if restart_params is not None:
@@ -2605,6 +2622,83 @@ class FederationHandler:
             desc="sync_partial_state_room",
             func=_sync_partial_state_room_wrapper,
         )
+
+    async def _abandon_partial_state_room(self, room_id: str) -> None:
+        """Leave a partial-state room whose state we can no longer resync.
+
+        A partially-joined room is unusable if we cannot fetch its state, so
+        make the local users leave rather than leaving the room stuck in a
+        partial state forever. Update each successful leave's local membership
+        snapshot. Failures for individual users are caught so other users can
+        still leave; failure to load the initial user list propagates.
+        """
+        local_users = await self.store.get_local_users_in_room(room_id)
+        if not local_users:
+            return
+
+        member_handler = self.hs.get_room_member_handler()
+        for user_id in local_users:
+            try:
+                event_id, stream_ordering = await member_handler.update_membership(
+                    requester=create_requester(user_id),
+                    target=UserID.from_string(user_id),
+                    room_id=room_id,
+                    action=Membership.LEAVE,
+                    ratelimit=False,
+                )
+                # A partial-state room's current state may not be recalculated
+                # after this leave, so update the local membership snapshot
+                # directly; otherwise we still look like we share the room and
+                # serve stale device lists for its remote members.
+                await self.store.set_local_current_membership(
+                    room_id,
+                    user_id,
+                    event_id,
+                    Membership.LEAVE,
+                    stream_ordering,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to abandon partial-state room %s as %s",
+                    room_id,
+                    user_id,
+                )
+
+    async def _handle_membership_changes_after_partial_state_resync(
+        self, room_id: str, changed_users: StrCollection
+    ) -> None:
+        """Handle remote users whose membership changed while a room was
+        partial-stated.
+
+        The room's current state was based on incomplete state, so the resync
+        may discover that a remote user was not actually in the room (or was
+        in the room when we thought they were not). We may have missed device
+        list updates for them in the meantime, so mark existing device snapshots
+        stale and notify the room about cached devices. Skip local users and
+        remote users with no cached snapshot, including no recorded stream ID.
+        Storage errors propagate.
+        """
+        for user_id in changed_users:
+            if self.is_mine_id(user_id):
+                continue
+
+            cached_devices = await self.store.get_cached_devices_for_user(user_id)
+            last_stream_id = await self.store.get_device_list_last_stream_id_for_remote(
+                user_id
+            )
+            if not cached_devices and last_stream_id is None:
+                # We have never cached a device snapshot for this user, so
+                # there is nothing to invalidate or tell clients to refetch.
+                continue
+
+            if cached_devices:
+                # Route through the device handler: only device list writers
+                # may add to the stream, and this may run on any worker.
+                await self._device_handler.notify_device_update(
+                    user_id, list(cached_devices), room_ids=[room_id]
+                )
+
+            await self.store.mark_remote_users_device_caches_as_stale((user_id,))
 
     async def _sync_partial_state_room(
         self,
@@ -2663,7 +2757,14 @@ class FederationHandler:
                 # call this, we _might_ end up inserting rows into current_state_events.
                 # (The logic is hard to chase through.) We think this is fine, but if
                 # not the HS admin should purge the room again.
+                previous_members = await self.store.get_users_in_room(room_id)
                 await self.state_handler.update_current_state(room_id)
+                current_members = await self.store.get_users_in_room(room_id)
+
+                await self._handle_membership_changes_after_partial_state_resync(
+                    room_id,
+                    set(previous_members).symmetric_difference(current_members),
+                )
 
                 logger.info("Handling any pending device list updates")
                 await self._device_handler.handle_room_un_partial_stated(room_id)

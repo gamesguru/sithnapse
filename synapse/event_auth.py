@@ -48,6 +48,7 @@ from synapse.api.constants import (
     EventTypes,
     JoinRules,
     Membership,
+    RejectedReason,
 )
 from synapse.api.errors import (
     AuthError,
@@ -165,6 +166,7 @@ async def check_state_independent_auth_rules(
     event: "EventBase",
     batched_auth_events: Mapping[str, "EventBase"] | None = None,
     batched_rejections: Mapping[str, str] | None = None,
+    allow_rejected_auth_events: bool = False,
 ) -> None:
     """Check that an event complies with auth rules that are independent of room state
 
@@ -181,6 +183,12 @@ async def check_state_independent_auth_rules(
             yet, so their rejection is recorded neither on the event nor in the database,
             and the caller has to tell us. Needed for MSC4242 State DAG rooms, where
             rejection cascades through `prev_state_events`.
+        allow_rejected_auth_events: if True, do not reject the event when one of its
+            auth events is a join or leave (e.g. a kick) of the same user that was
+            rejected for lack of state in a partial-state room (`PARTIAL_STATE_AUTH_ERROR`); the event
+            is re-checked against resolved state below. Other rejected auth
+            events (including rejected invites), and rejected `prev_state_events`,
+            still reject the event.
 
     Raises:
         AuthError if the checks fail
@@ -337,7 +345,10 @@ async def check_state_independent_auth_rules(
 
         # 2.3 ... If there are entries which were themselves rejected under the checks performed on receipt
         # of a PDU, reject.
-        if auth_event.rejected_reason:
+        if auth_event.rejected_reason and not (
+            allow_rejected_auth_events
+            and _is_forgivable_partial_state_rejection(event, auth_event)
+        ):
             raise AuthError(
                 403,
                 "During auth for event %s: found rejected event %s in the state"
@@ -350,6 +361,28 @@ async def check_state_independent_auth_rules(
     creation_event = auth_dict.get((EventTypes.Create, ""), None)
     if not creation_event:
         raise AuthError(403, "No create event in auth events")
+
+
+def _is_forgivable_partial_state_rejection(
+    event: "EventBase", auth_event: "EventBase"
+) -> bool:
+    """Whether the sender's own join should be forgiven because a rejected auth
+    event was rejected only by missing partial-state.
+
+    `event` must be a self-join, and `auth_event` must be that same user's earlier
+    join or leave (e.g. a kick) rejected for lack of partial state. Rejected
+    invites and bans, other users' memberships, and rejections for any other reason
+    are never forgiven.
+    """
+    return (
+        event.type == EventTypes.Member
+        and event.membership == Membership.JOIN
+        and event.sender == auth_event.state_key
+        and auth_event.rejected_reason == RejectedReason.PARTIAL_STATE_AUTH_ERROR
+        and auth_event.type == EventTypes.Member
+        and auth_event.state_key == event.state_key
+        and auth_event.membership in (Membership.JOIN, Membership.LEAVE)
+    )
 
 
 def check_state_dependent_auth_rules(

@@ -21,6 +21,7 @@
 
 import abc
 import logging
+import time
 from contextlib import ExitStack
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Callable, Iterable
@@ -46,6 +47,7 @@ from synapse.api.errors import (
 )
 from synapse.config.key import TrustedKeyServer
 from synapse.events import EventBase
+from synapse.http.matrixfederationclient import StrictJsonParser
 from synapse.logging.context import make_deferred_yieldable, run_in_background
 from synapse.storage.keys import FetchKeyResult
 from synapse.synapse_rust.events import redact_event
@@ -60,6 +62,15 @@ if TYPE_CHECKING:
     from synapse.server import HomeServer
 
 logger = logging.getLogger(__name__)
+
+# MSC4499 per-response validation limits. A response beyond these is rejected as
+# malformed rather than truncated.
+MAX_ACTIVE_VERIFY_KEYS_PER_RESPONSE = 50
+MAX_OLD_VERIFY_KEYS_PER_RESPONSE = 3000
+
+# How far in the future an `old_verify_keys` entry's `expired_ts` may be before it
+# is treated as malformed, to allow for clock skew.
+MAX_EXPIRED_TS_SKEW_MS = 5 * 60 * 1000
 
 
 # List of Unpadded Base64 server signing keys that are known to be vulnerable to attack.
@@ -725,8 +736,10 @@ class BaseV2KeyFetcher(KeyFetcher):
         GET /_matrix/key/v2/server, or a single entry from the list returned by
         POST /_matrix/key/v2/query.
 
-        Checks that each signature in the response that claims to come from the origin
-        server is valid, and that there is at least one such signature.
+        Validates an origin-server signature using a supported active key.
+        Rejects responses with more than 50 active or 3,000 retired keys, or
+        different active and retired key bodies for the same ID. Ignores retired
+        entries whose expiry is more than five minutes after time_added_ms.
 
         Stores the json in server_keys_json so that it can be used for future responses
         to /_matrix/key/v2/query.
@@ -738,12 +751,51 @@ class BaseV2KeyFetcher(KeyFetcher):
 
             response_json: the json-decoded Server Keys response object
 
-            time_added_ms: the timestamp to record in server_keys_json
+            time_added_ms: the timestamp in milliseconds since the Unix epoch
+                to record in server_keys_json and use for retired-key expiry checks
 
         Returns:
-            Map from key_id to result object
+            Map from key_id to result object, after storage conflict resolution.
+
+        Raises:
+            KeyLookupError: If key-count limits are exceeded, active and retired
+                key bodies conflict, or no usable origin signature is present.
+            SignatureVerifyException: If the selected origin signature is invalid.
+                Key decoding and storage errors also propagate.
         """
+        processing_started = time.perf_counter()
         ts_valid_until_ms = response_json["valid_until_ts"]
+
+        # MSC4499: reject a response that is oversized, or that gives two different
+        # key bodies for one key ID, as malformed before looking at any of it.
+        if len(response_json["verify_keys"]) > MAX_ACTIVE_VERIFY_KEYS_PER_RESPONSE:
+            raise KeyLookupError(
+                "Key response for %s has %i verify_keys, more than the limit of %i"
+                % (
+                    response_json.get("server_name"),
+                    len(response_json["verify_keys"]),
+                    MAX_ACTIVE_VERIFY_KEYS_PER_RESPONSE,
+                )
+            )
+        old_verify_keys_json = response_json.get("old_verify_keys", {})
+        if len(old_verify_keys_json) > MAX_OLD_VERIFY_KEYS_PER_RESPONSE:
+            raise KeyLookupError(
+                "Key response for %s has %i old_verify_keys, more than the limit of %i"
+                % (
+                    response_json.get("server_name"),
+                    len(old_verify_keys_json),
+                    MAX_OLD_VERIFY_KEYS_PER_RESPONSE,
+                )
+            )
+        for key_id, old_key_data in old_verify_keys_json.items():
+            active_key_data = response_json["verify_keys"].get(key_id)
+            if active_key_data is not None and decode_base64(
+                active_key_data["key"]
+            ) != decode_base64(old_key_data["key"]):
+                raise KeyLookupError(
+                    "Key response for %s gives different keys for %s in verify_keys "
+                    "and old_verify_keys" % (response_json.get("server_name"), key_id)
+                )
 
         # start by extracting the keys from the response, since they may be required
         # to validate the signature on the response.
@@ -779,7 +831,18 @@ class BaseV2KeyFetcher(KeyFetcher):
                 % (server_name,)
             )
 
+        max_expired_ts_ms = time_added_ms + MAX_EXPIRED_TS_SKEW_MS
         for key_id, key_data in response_json.get("old_verify_keys", {}).items():
+            if key_data["expired_ts"] > max_expired_ts_ms:
+                # MSC4499: a retired key claiming to expire in the future is
+                # malformed. Ignore just that entry, not the rest of the response.
+                logger.warning(
+                    "Ignoring old key %s for %s with expired_ts %s in the future",
+                    key_id,
+                    server_name,
+                    key_data["expired_ts"],
+                )
+                continue
             if is_signing_algorithm_supported(key_id):
                 key_base64 = key_data["key"]
                 key_bytes = decode_base64(key_base64)
@@ -794,13 +857,31 @@ class BaseV2KeyFetcher(KeyFetcher):
         # key ID has already been persisted (either previously or concurrently),
         # the original binding is retained, the colliding candidate is dropped,
         # and the authoritative keys are returned to the caller.
-        return await self.store.store_server_keys_response(
+        validation_seconds = time.perf_counter() - processing_started
+        store_started = time.perf_counter()
+        result = await self.store.store_server_keys_response(
             server_name=server_name,
             from_server=from_server,
             ts_added_ms=time_added_ms,
             verify_keys=verify_keys,
             response_json=response_json,
         )
+        store_seconds = time.perf_counter() - store_started
+        total_seconds = time.perf_counter() - processing_started
+        if total_seconds >= 0.5:
+            logger.info(
+                "Slow server-key response processing for %s from %s: "
+                "active_keys=%d retired_keys=%d validation=%.3fs "
+                "store=%.3fs total=%.3fs",
+                server_name,
+                from_server,
+                len(response_json["verify_keys"]),
+                len(old_verify_keys_json),
+                validation_seconds,
+                store_seconds,
+                total_seconds,
+            )
+        return result
 
 
 class PerspectivesKeyFetcher(BaseV2KeyFetcher):
@@ -1058,7 +1139,7 @@ class ServerKeyFetcher(BaseV2KeyFetcher):
     async def get_server_verify_keys_v2_direct(
         self, server_name: str
     ) -> dict[str, FetchKeyResult]:
-        """
+        """Fetch and store a server's keys directly, rejecting duplicate JSON keys.
 
         Args:
             server_name: Server to request keys from
@@ -1091,6 +1172,9 @@ class ServerKeyFetcher(BaseV2KeyFetcher):
                 destination=server_name,
                 path="/_matrix/key/v2/server",
                 ignore_backoff=True,
+                # MSC4499: a key response containing duplicate JSON object keys,
+                # at any depth, is malformed.
+                parser=StrictJsonParser(),
                 # we only give the remote server 10s to respond. It should be an
                 # easy request to handle, so if it doesn't reply within 10s, it's
                 # probably not going to.

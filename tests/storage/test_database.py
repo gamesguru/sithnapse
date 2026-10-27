@@ -144,6 +144,37 @@ class ExecuteScriptTestCase(unittest.HomeserverTestCase):
             )
         )
 
+    def test_scheduling_label_is_a_callback_argument(self) -> None:
+        """The scheduling diagnostic label must not shadow a callback kwarg."""
+
+        def run_connection(
+            conn: LoggingDatabaseConnection, scheduling_label: str
+        ) -> str:
+            return scheduling_label
+
+        self.assertEqual(
+            self.get_success(
+                self.db_pool.runWithConnection(
+                    run_connection, scheduling_label="connection-label"
+                )
+            ),
+            "connection-label",
+        )
+
+        def run_transaction(txn: LoggingTransaction, scheduling_label: str) -> str:
+            return scheduling_label
+
+        self.assertEqual(
+            self.get_success(
+                self.db_pool.runInteraction(
+                    "scheduling_label",
+                    run_transaction,
+                    scheduling_label="transaction-label",
+                )
+            ),
+            "transaction-label",
+        )
+
     def test_transaction(self) -> None:
         """Test that all statements are run in a single transaction."""
 

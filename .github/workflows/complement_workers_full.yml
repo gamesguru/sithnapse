@@ -1,0 +1,23 @@
+# Exercise the full production-like worker topology once a day. PR and push
+# Complement runs use the reduced topology in complement_tests.yml to avoid
+# spending most of the suite contending for a 4-vCPU runner.
+name: Complement workers (full topology)
+
+on:
+  schedule:
+    - cron: 0 5 * * *
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  complement:
+    uses: ./.github/workflows/complement_tests.yml
+    with:
+      only_workers: true
+      worker_profile: full

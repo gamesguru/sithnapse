@@ -861,6 +861,10 @@ class FederationEventHandler:
     ) -> None:
         """Recalculate the state at an event as part of a de-partial-stating process
 
+        If a remote membership event changes rejection status, mark any existing
+        device snapshot stale. Return without updating the event if its newly
+        computed context still has partial state.
+
         Args:
             destination: server to request full state from
             event: partial-state event to be de-partial-stated
@@ -897,6 +901,8 @@ class FederationEventHandler:
                 )
                 return
 
+            was_rejected = event.rejected_reason is not None
+
             # since the state at this event has changed, we should now re-evaluate
             # whether it should have been rejected. We must already have all of the
             # auth events (from last time we went round this path), so there is no
@@ -904,6 +910,34 @@ class FederationEventHandler:
             await self._check_event_auth(None, event, context)
 
             await self._store.update_state_for_partial_state_event(event, context)
+
+            if (
+                event.type == EventTypes.Member
+                and event.state_key is not None
+                and not self._is_mine_id(event.state_key)
+                and was_rejected != bool(context.rejected)
+            ):
+                # The resync has shown that this membership event was accepted
+                # or rejected incorrectly while the room was partial. If we
+                # have a cached device snapshot for the user, it may have
+                # missed updates in the meantime, so make sure it is refetched.
+                # With no snapshot there is nothing to invalidate, and marking
+                # the user stale would make the retry loop fetch a list we have
+                # never needed. An empty snapshot still counts: its stream ID
+                # records that we did query the user, just found no devices.
+                cached_devices = await self._store.get_cached_devices_for_user(
+                    event.state_key
+                )
+                last_stream_id = (
+                    await self._store.get_device_list_last_stream_id_for_remote(
+                        event.state_key
+                    )
+                )
+                if cached_devices or last_stream_id is not None:
+                    await self._store.mark_remote_users_device_caches_as_stale(
+                        (event.state_key,)
+                    )
+
             self._state_storage_controller.notify_event_un_partial_stated(
                 event.event_id
             )
@@ -2534,6 +2568,7 @@ class FederationEventHandler:
         Raises:
             AuthError if we were unable to find copies of the event's auth events.
                (Most other failures just cause us to set `context.rejected`.)
+            EventSizeError if the event is too large to persist at all.
         """
         # This method should only be used for non-outliers
         assert not event.internal_metadata.outlier
@@ -2579,13 +2614,30 @@ class FederationEventHandler:
         #   4. Passes authorization rules based on the event’s auth events,
         #      otherwise it is rejected.
         try:
-            await check_state_independent_auth_rules(self._store, event)
+            await check_state_independent_auth_rules(
+                self._store,
+                event,
+                # In a partial-state room we may have rejected a membership
+                # event simply because we were missing the state needed to
+                # auth it. If a remote user then rejoins, their join event
+                # will reference that rejected membership event; let the
+                # state-based check below decide whether the join is valid.
+                allow_rejected_auth_events=(
+                    event.type == EventTypes.Member
+                    and event.membership == Membership.JOIN
+                    and await self._store.is_partial_state_room(event.room_id)
+                ),
+            )
             check_state_dependent_auth_rules(event, claimed_auth_events)
         except AuthError as e:
             logger.warning(
                 "While checking auth of %r against auth_events: %s", event, e
             )
-            context.rejected = RejectedReason.AUTH_ERROR
+            context.rejected = (
+                RejectedReason.PARTIAL_STATE_AUTH_ERROR
+                if context.partial_state and event.type == EventTypes.Member
+                else RejectedReason.AUTH_ERROR
+            )
             return
 
         if supports_msc4242_state_dag(event):
@@ -2677,7 +2729,11 @@ class FederationEventHandler:
                 event,
                 e,
             )
-            context.rejected = RejectedReason.AUTH_ERROR
+            context.rejected = (
+                RejectedReason.PARTIAL_STATE_AUTH_ERROR
+                if context.partial_state and event.type == EventTypes.Member
+                else RejectedReason.AUTH_ERROR
+            )
 
     @trace
     async def _maybe_kick_guest_users(self, event: EventBase) -> None:

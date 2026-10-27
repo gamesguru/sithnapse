@@ -1896,6 +1896,21 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
         # added to or removed from partial_state_rooms.
         return room_id in await self.get_partial_rooms()
 
+    async def is_partial_state_room_uncached(self, room_id: str) -> bool:
+        """Like `is_partial_state_room`, but always reads the database.
+
+        For confirming a cached True before waiting on it: on a worker the
+        cache can briefly lag the un-partial-stated notification.
+        """
+        row = await self.db_pool.simple_select_one_onecol(
+            table="partial_state_rooms",
+            keyvalues={"room_id": room_id},
+            retcol="room_id",
+            allow_none=True,
+            desc="is_partial_state_room_uncached",
+        )
+        return row is not None
+
     @cachedList(cached_method_name="is_partial_state_room", list_name="room_ids")
     async def is_partial_state_room_batched(
         self, room_ids: StrCollection
@@ -3127,6 +3142,12 @@ class RoomStore(RoomBackgroundUpdateStore, RoomWorkerStore):
         device_lists_stream_id: int,
         joined_via: str,
     ) -> None:
+        """Record a partial join and schedule invalidation of partial-state caches.
+
+        Store servers known at join, the device-list position at join, and the
+        server joined_via; leave the join event ID unset until it is persisted.
+        Database errors propagate.
+        """
         DatabasePool.simple_insert_txn(
             txn,
             table="partial_state_rooms",
@@ -3144,11 +3165,16 @@ class RoomStore(RoomBackgroundUpdateStore, RoomWorkerStore):
             keys=("room_id", "server_name"),
             values=[(room_id, s) for s in servers],
         )
+        # `is_partial_state_room` is computed from `get_partial_rooms`, so the
+        # set must be invalidated first. Workers apply these invalidations as
+        # separate replication rows; in the other order, a read between them
+        # would re-cache `is_partial_state_room` from the stale set and keep
+        # the stale answer after the set itself is invalidated.
+        self._invalidate_all_cache_and_stream(txn, self.get_partial_rooms)
         self._invalidate_cache_and_stream(txn, self.is_partial_state_room, (room_id,))
         self._invalidate_cache_and_stream(
             txn, self._get_partial_state_servers_at_join, (room_id,)
         )
-        self._invalidate_all_cache_and_stream(txn, self.get_partial_rooms)
         self._invalidate_all_cache_and_stream(txn, self.has_partial_state_rooms)
 
     async def write_partial_state_rooms_join_event_id(
@@ -3318,6 +3344,12 @@ class RoomStore(RoomBackgroundUpdateStore, RoomWorkerStore):
         room_id: str,
         un_partial_state_room_stream_id: int,
     ) -> None:
+        """Clear a room's partial-state records and emit its completion stream row.
+
+        Schedule cache invalidations and remove pending remote device updates no
+        longer needed by any partial-state room. Database errors propagate;
+        clear_partial_state_room converts integrity errors to None.
+        """
         DatabasePool.simple_delete_txn(
             txn,
             table="partial_state_rooms_servers",
@@ -3328,11 +3360,16 @@ class RoomStore(RoomBackgroundUpdateStore, RoomWorkerStore):
             table="partial_state_rooms",
             keyvalues={"room_id": room_id},
         )
+        # `is_partial_state_room` is computed from `get_partial_rooms`, so the
+        # set must be invalidated first. Workers apply these invalidations as
+        # separate replication rows; in the other order, a read between them
+        # would re-cache `is_partial_state_room` from the stale set and keep
+        # the stale answer after the set itself is invalidated.
+        self._invalidate_all_cache_and_stream(txn, self.get_partial_rooms)
         self._invalidate_cache_and_stream(txn, self.is_partial_state_room, (room_id,))
         self._invalidate_cache_and_stream(
             txn, self._get_partial_state_servers_at_join, (room_id,)
         )
-        self._invalidate_all_cache_and_stream(txn, self.get_partial_rooms)
         self._invalidate_all_cache_and_stream(txn, self.has_partial_state_rooms)
 
         DatabasePool.simple_insert_txn(

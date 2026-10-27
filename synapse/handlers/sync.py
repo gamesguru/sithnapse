@@ -2193,27 +2193,16 @@ class SyncHandler:
             )
 
         num_events = 0
-        trace_timeline: dict[str, list[str]] = {}
 
         # debug for https://github.com/matrix-org/synapse/issues/9424
         for joined_room in sync_result_builder.joined:
-            event_ids = [event.event.event_id for event in joined_room.timeline.events]
-            num_events += len(event_ids)
-            if event_ids:
-                trace_timeline[joined_room.room_id] = event_ids
+            num_events += len(joined_room.timeline.events)
 
         log_kv(
             {
                 "joined_rooms_in_result": len(sync_result_builder.joined),
                 "events_in_result": num_events,
             }
-        )
-        logger.info(
-            "[sync-trace] worker=%s response timeline rooms=%s events=%d event_ids=%s",
-            self._instance_name,
-            sorted(trace_timeline),
-            num_events,
-            trace_timeline,
         )
 
         # Note, this needs to be after we collect `joined`, `invited`, `knocked` and
@@ -3541,6 +3530,9 @@ class SyncHandler:
                 or ephemeral
                 or full_state
                 or sticky_event_ids
+                # Archived rooms can still have state changes to report when
+                # the timeline is empty (e.g. a zero timeline limit).
+                or room_builder.rtype == "archived"
             ):
                 return
 
@@ -3583,15 +3575,12 @@ class SyncHandler:
                 # An out of band room won't have any state changes.
                 state = {}
 
-            summary: JsonDict | None = {}
+            if room_builder.rtype == "joined":
+                summary: JsonDict | None = {}
 
-            # we include a summary in room responses when we're lazy loading
-            # members (as the client otherwise doesn't have enough info to form
-            # the name itself).
-            if (
-                not room_builder.out_of_band
-                and sync_config.filter_collection.lazy_load_members()
-                and (
+                # Recalculate the room summary when membership changes or on
+                # initial sync.
+                if not room_builder.out_of_band and (
                     # we recalculate the summary:
                     #   if there are membership changes in the timeline, or
                     #   if membership has changed during a gappy sync, or
@@ -3604,13 +3593,11 @@ class SyncHandler:
                         and any(t == EventTypes.Member for (t, k) in state)
                     )
                     or since_token is None
-                )
-            ):
-                summary = await self.compute_summary(
-                    room_id, sync_config, batch, state, now_token
-                )
+                ):
+                    summary = await self.compute_summary(
+                        room_id, sync_config, batch, state, now_token
+                    )
 
-            if room_builder.rtype == "joined":
                 unread_notifications: dict[str, int] = {}
 
                 room_sync = JoinedSyncResult(

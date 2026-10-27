@@ -10,6 +10,8 @@ Importable too: `Baseline()` snapshots the machine, `header_lines()` and
 `load_lines()` format it.
 """
 
+import datetime
+import glob
 import json
 import os
 import re
@@ -103,6 +105,18 @@ class Baseline:
         except (OSError, ValueError, KeyError):
             return cls()
 
+    def cpu_stall_percent(self) -> Optional[float]:
+        """Percentage of elapsed time with runnable work waiting for a CPU (PSI).
+
+        Return None when CPU pressure data is unavailable or elapsed time
+        since the baseline is nonpositive.
+        """
+        end = pressure_snapshot()
+        wall = time.time() - self.wall
+        if wall <= 0 or "cpu" not in end or "cpu" not in self.pressure:
+            return None
+        return 100 * (end["cpu"] - self.pressure["cpu"]) / wall
+
     def pressure_summary(self) -> str:
         """Share of the run stalled on cpu/io/memory (PSI) and in iowait, which
         load average cannot separate."""
@@ -122,6 +136,31 @@ class Baseline:
         return ", ".join(parts)
 
 
+# A debug maturin build of the extension is about ten times the size of a
+# release build (172 MB against 17 MB here). The size is a heuristic, not a
+# build flag, but it is enough to stop a debug build being compared with a
+# release one unnoticed.
+_DEBUG_EXTENSION_BYTES = 60 * 1024 * 1024
+
+
+def rust_extension() -> str:
+    """Describe the first matching Rust extension's size and modification time.
+
+    Guess debug/release from file size; return "?" if no extension is
+    found or its metadata cannot be read.
+    """
+    try:
+        paths = glob.glob(os.path.join(_REPO, "synapse", "synapse_rust*.so"))
+        stat = os.stat(paths[0])
+    except (IndexError, OSError):
+        return "?"
+    built = datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
+    profile = "debug" if stat.st_size > _DEBUG_EXTENSION_BYTES else "release"
+    return (
+        f"{profile} (size heuristic), {stat.st_size / 1_048_576:.0f} MB, built {built}"
+    )
+
+
 def header_lines(
     extra: list[tuple[str, str]], baseline: Optional[Baseline] = None
 ) -> list[str]:
@@ -136,6 +175,7 @@ def header_lines(
         ),
         ("branch", git("rev-parse", "--abbrev-ref", "HEAD")),
         ("mtxdb pin", mtxdb_pin()),
+        ("rust ext", rust_extension()),
         ("cpus", str(os.cpu_count())),
         *extra,
     ]
@@ -144,12 +184,30 @@ def header_lines(
     return [f"  {label + ':':<14}{value}" for label, value in rows]
 
 
+# A review flag, not a verdict: per-call timings from a run with this much cpu
+# stall inflate (see res/logs), so check the stall before comparing two runs.
+# The threshold has not been validated against enough runs to be a hard cutoff.
+STALL_REVIEW_PERCENT = 25.0
+
+
 def load_lines(baseline: Baseline) -> list[str]:
-    return [
+    """Return start/end load and run pressure lines for ``baseline``.
+
+    Append a review flag when CPU stall exceeds STALL_REVIEW_PERCENT.
+    """
+    lines = [
         f"  {'load avg:':<14}{baseline.load} at start, {load_average()} at end "
         "(1/5/15 min)",
         f"  {'pressure:':<14}{baseline.pressure_summary()} (over the run)",
     ]
+    stall = baseline.cpu_stall_percent()
+    if stall is not None and stall > STALL_REVIEW_PERCENT:
+        lines.append(
+            f"  {'review:':<14}cpu stall {stall:.1f}% is over "
+            f"{STALL_REVIEW_PERCENT:.0f}%; per-call timings may be inflated "
+            "when compared with a lower-stall run"
+        )
+    return lines
 
 
 def main() -> None:

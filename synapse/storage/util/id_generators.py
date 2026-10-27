@@ -383,6 +383,15 @@ class MultiWriterIdGenerator(AbstractStreamIdGenerator):
         tables: list[tuple[str, str, str]],
         sequence_name: str,
     ) -> None:
+        """Initialize writer positions and persisted progress from the database.
+
+        ``tables`` contains (table, instance column, ID column) entries.
+        ``sequence_name`` names the PostgreSQL sequence used to recover this
+        writer's position. Remove stale stream_positions rows when explicit
+        writers are configured, and initialize missing writers from persisted
+        progress. Internal positions use positive IDs even for negative streams.
+        Database errors propagate; the caller owns the connection's transaction.
+        """
         cur = db_conn.cursor(txn_name="_load_current_ids")
 
         # Load the current positions of all writers for the stream.
@@ -391,27 +400,34 @@ class MultiWriterIdGenerator(AbstractStreamIdGenerator):
             # important if we add back a writer after a long time; we want to
             # consider that a "new" writer, rather than using the old stale
             # entry here.
-            clause, args = make_in_list_sql_clause(
-                self._db.engine, "instance_name", self._writers, negative=True
-            )
-
-            sql = f"""
-                DELETE FROM stream_positions
-                WHERE
-                    stream_name = ?
-                    AND {clause}
-            """
-            cur.execute(sql, [self._stream_name] + args)
-
+            #
+            # We read the rows first and only issue the DELETE if one of them
+            # is stale. That is the same result as deleting first, minus a
+            # round trip per stream on the usual startup where nothing is
+            # stale.
             sql = """
                 SELECT instance_name, stream_id FROM stream_positions
                 WHERE stream_name = ?
             """
             cur.execute(sql, (self._stream_name,))
+            position_rows = cur.fetchall()
+
+            if any(instance not in self._writers for instance, _ in position_rows):
+                clause, args = make_in_list_sql_clause(
+                    self._db.engine, "instance_name", self._writers, negative=True
+                )
+
+                sql = f"""
+                    DELETE FROM stream_positions
+                    WHERE
+                        stream_name = ?
+                        AND {clause}
+                """
+                cur.execute(sql, [self._stream_name] + args)
 
             self._current_positions = {
                 instance: stream_id * self._return_factor
-                for instance, stream_id in cur
+                for instance, stream_id in position_rows
                 if instance in self._writers
             }
 

@@ -18,6 +18,21 @@ url_preview_ip_range_blacklist: []
 # MSC4429 and MSC4262 Profile updates down sync
 include_profile_updates_in_sync: true
 
+## Background updates ##
+
+# A freshly deployed homeserver runs its initial background updates (notably
+# the user directory population, which the directory handler waits for) while
+# tests are already running. Do not pause a second between batches so they
+# finish within the first moments instead of ~20s after startup.
+background_updates:
+  sleep_enabled: false
+
+## Media ##
+
+# Complement still exercises the unauthenticated /_matrix/media/v3 download and
+# thumbnail endpoints; keep them available in the test deployment.
+enable_authenticated_media: false
+
 ## Registration ##
 
 # Needed by Complement to register admin users
@@ -43,6 +58,17 @@ rc_federation:
   sleep_delay: 500
   reject_limit: 99999
   concurrent: 3
+
+# Complement's fake federation servers deliberately fail requests (for example
+# /state_ids with a 500). With the default 10 minute minimum retry interval that
+# marks the fake server as down, and later /keys/query requests skip it instead
+# of making the federation request the tests expect.
+federation:
+  # Complement's fake servers deliberately fail requests (for example
+  # /state_ids with a 500). Disable retry backoff so a later /keys/query still
+  # makes the federation request the tests expect.
+  destination_min_retry_interval: 0s
+  destination_max_retry_interval: 0s
 
 rc_message:
   per_second: 9999
@@ -122,6 +148,9 @@ allow_device_name_lookup_over_federation: true
 ## Experimental Features ##
 
 experimental_features:
+  # Complement expects an unfinishable partial-state join to be abandoned
+  # within its 30s sync timeout.
+  partial_state_sync_max_consecutive_failures: 3
   # MSC3389: relation-preserving redactions and room version.
   msc3389_enabled: true
   # Enable support for polls

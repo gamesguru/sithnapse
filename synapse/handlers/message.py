@@ -1099,6 +1099,16 @@ class EventCreationHandler:
                 if event:
                     # we know it was persisted, so must have a stream ordering
                     assert event.internal_metadata.stream_ordering
+                    # The first attempt may have persisted the tombstone but
+                    # failed while transferring room state. Retrying with the
+                    # same transaction ID returns the stored event, so finish
+                    # the transfer here before returning it.
+                    if (
+                        event.type == EventTypes.Tombstone
+                        and event.is_state()
+                        and event.state_key == ""
+                    ):
+                        await self._transfer_state_for_manual_upgrade(event)
                     return (
                         event,
                         event.internal_metadata.stream_ordering,
@@ -1135,6 +1145,22 @@ class EventCreationHandler:
         prev_state_events: StrCollection | None = None,
         delay_id: str | None = None,
     ) -> tuple[EventBase, int]:
+        """Create and persist a nonmembership event while the caller holds room locks.
+
+        Arguments have the same meaning as in `create_and_send_nonmember_event`.
+        For an empty or omitted prev_event_ids, require the requester to be joined.
+        After persisting a tombstone, attempt the matching manual-upgrade transfer.
+
+        Returns:
+            The persisted event (possibly an existing duplicate) and its stream ordering.
+
+        Raises:
+            AuthError: If the membership check fails.
+            SynapseError: If policy or spam checks reject the event.
+            PartialStateConflictError: If persistence still conflicts after five attempts.
+                Other event-creation, persistence, and upgrade-transfer errors propagate;
+                a transfer failure occurs after the event has been persisted.
+        """
         room_id = event_dict["room_id"]
 
         # If we don't have any prev event IDs specified then we need to
@@ -1244,7 +1270,39 @@ class EventCreationHandler:
 
         # we know it was persisted, so must have a stream ordering
         assert ev.internal_metadata.stream_ordering
+
+        if ev.type == EventTypes.Tombstone and ev.is_state() and ev.state_key == "":
+            await self._transfer_state_for_manual_upgrade(ev)
+
         return ev, ev.internal_metadata.stream_ordering
+
+    async def _transfer_state_for_manual_upgrade(self, tombstone: EventBase) -> None:
+        """A client can upgrade a room by hand: create a new room naming the old one as
+        its predecessor, then send a tombstone into the old room. `upgrade_room` isn't
+        involved, so copy the users' push rules/tags and the room directory state here
+        once both halves are in place.
+
+        Return without transferring if the replacement ID is not a string, the
+        replacement room is unknown, or its predecessor does not match. A missing
+        room's NotFoundError is caught. Other room-lookup and directory-update
+        errors propagate; the transfer helper catches failures copying user state.
+        """
+        new_room_id = tombstone.content.get(EventContentFields.TOMBSTONE_SUCCESSOR_ROOM)
+        if not isinstance(new_room_id, str):
+            return
+
+        try:
+            predecessor = await self.store.get_room_predecessor(new_room_id)
+        except NotFoundError:
+            return
+
+        # The new room must claim this room as its predecessor.
+        if not predecessor or predecessor.get("room_id") != tombstone.room_id:
+            return
+
+        await self.hs.get_room_member_handler().transfer_room_state_on_room_upgrade(
+            tombstone.room_id, new_room_id
+        )
 
     @measure_func("create_new_client_event")
     async def create_new_client_event(

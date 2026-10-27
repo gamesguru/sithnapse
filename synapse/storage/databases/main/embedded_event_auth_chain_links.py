@@ -82,7 +82,9 @@ def put_chain_links_batch(
     links: list[tuple[int, int, int, int]],
     sync: bool = False,
 ) -> None:
-    """`links`: `(origin_chain_id, origin_sequence_number, target_chain_id,
+    """Store auth-chain links in the embedded engine; empty batches do nothing.
+
+    `links`: `(origin_chain_id, origin_sequence_number, target_chain_id,
     target_sequence_number)`.
 
     `sync`: defaults to `False` -- an fsync here is a whole-device cache
@@ -91,13 +93,18 @@ def put_chain_links_batch(
     standalone (not already covered by another sync in the same logical
     transaction) and where losing the last few seconds of these edges on a
     crash is unacceptable.
+
+    Unsupported or missing engine names raise RuntimeError for nonempty batches.
+    Engine write and sync errors propagate.
     """
     if not links:
         return
     with mirror_timing("put_auth_chain_links"):
         _et = time.monotonic()
+        _ct = time.thread_time()
         get_embedded_engine(engine_name).put_auth_chain_links_batch(namespace, links)
         ffi_timing("ffi_put_auth_chain_links", time.monotonic() - _et)
+        ffi_timing("ffi_put_auth_chain_links:cpu", time.thread_time() - _ct)
         if sync:
             sync_now(pools=[Pool.AUTH_CHAIN])
 

@@ -87,7 +87,7 @@ from synapse.metrics import SERVER_NAME_LABEL
 from synapse.types import JsonDict
 from synapse.util.async_helpers import AwakenableSleeper, Linearizer, timeout_deferred
 from synapse.util.clock import Clock
-from synapse.util.json import json_decoder
+from synapse.util.json import json_decoder, strict_json_decoder
 from synapse.util.metrics import Measure
 from synapse.util.stringutils import parse_and_validate_server_name
 
@@ -247,6 +247,25 @@ class JsonParser(_BaseJsonParser[JsonDict]):
     @staticmethod
     def _validate(v: Any) -> bool:
         return isinstance(v, dict)
+
+
+class StrictJsonParser(JsonParser):
+    """A `JsonParser` which also rejects objects with duplicate keys at any depth."""
+
+    def finish(self) -> JsonDict:
+        """Decode the buffered response as a JSON object.
+
+        Raises:
+            ValueError: If the JSON is malformed, contains duplicate object keys
+                at any depth, uses NaN, Infinity, or -Infinity constants, or is
+                not an object.
+        """
+        result = strict_json_decoder.decode(self._buffer.getvalue())
+        if not self._validate(result):
+            raise ValueError(
+                f"Received incorrect JSON value: {result.__class__.__name__}"
+            )
+        return cast(JsonDict, result)
 
 
 class LegacyJsonSendParser(_BaseJsonParser[tuple[int, JsonDict]]):

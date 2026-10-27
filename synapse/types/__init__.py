@@ -68,7 +68,7 @@ from twisted.internet.interfaces import (
     IReactorUNIX,
 )
 
-from synapse.api.errors import Codes, SynapseError
+from synapse.api.errors import Codes, SlidingSyncUnknownPosition, SynapseError
 from synapse.synapse_rust.types import Requester
 from synapse.util.cancellation import cancellable
 from synapse.util.stringutils import parse_and_validate_server_name
@@ -1627,7 +1627,12 @@ class SlidingSyncStreamToken:
     @staticmethod
     @cancellable
     async def from_string(store: "DataStore", string: str) -> "SlidingSyncStreamToken":
-        """Creates a SlidingSyncStreamToken from its textual representation."""
+        """Creates a SlidingSyncStreamToken from its textual representation.
+
+        Raises:
+            SlidingSyncUnknownPosition: If parsing or loading the token fails,
+                signaling M_UNKNOWN_POS (400). Cancellation propagates unchanged.
+        """
         try:
             connection_position_str, stream_token_str = string.split("/", 1)
             connection_position = int(connection_position_str)
@@ -1640,7 +1645,9 @@ class SlidingSyncStreamToken:
         except CancelledError:
             raise
         except Exception:
-            raise SynapseError(400, "Invalid stream token")
+            # A `pos` we cannot parse is one we do not recognise, so tell the client
+            # to start a new connection (MSC4186 `M_UNKNOWN_POS`).
+            raise SlidingSyncUnknownPosition("Invalid stream token")
 
     async def to_string(self, store: "DataStore") -> str:
         """Serializes the token to a string"""

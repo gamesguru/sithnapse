@@ -4,7 +4,12 @@ from typing import TYPE_CHECKING
 import attr
 from typing_extensions import TypeAlias
 
-from synapse.api.errors import Codes, NotFoundError, SynapseError
+from synapse.api.errors import (
+    Codes,
+    NotFoundError,
+    SlidingSyncUnknownPosition,
+    SynapseError,
+)
 from synapse.http.server import HttpServer
 from synapse.http.servlet import (
     RestServlet,
@@ -185,7 +190,9 @@ class ThreadSubscriptionsPaginationRestServlet(RestServlet):
                     start_stream_id = (
                         sliding_sync_pos.stream_token.thread_subscriptions_key
                     )
-                except ValueError:
+                except SlidingSyncUnknownPosition:
+                    # Report an invalid `to` as M_INVALID_PARAM here, rather than
+                    # the M_UNKNOWN_POS that sliding sync consumers expect.
                     raise SynapseError(
                         HTTPStatus.BAD_REQUEST,
                         "`to` is not a valid token",

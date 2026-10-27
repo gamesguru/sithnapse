@@ -60,3 +60,28 @@ json_encoder = json.JSONEncoder(
 
 # Create a custom decoder to reject Python extensions to JSON.
 json_decoder = json.JSONDecoder(parse_constant=_reject_invalid_json)
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Build an object from its key/value pairs, refusing duplicate keys.
+
+    The standard decoder silently keeps the last value for a repeated key, which
+    lets an attacker present different content to parsers that disagree about
+    which value wins.
+
+    Raises:
+        ValueError: If any key occurs more than once, even with the same value.
+    """
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate JSON object key: %r" % (key,))
+        result[key] = value
+    return result
+
+
+# Like `json_decoder`, but also rejects any object (at any depth) that contains
+# the same key more than once.
+strict_json_decoder = json.JSONDecoder(
+    parse_constant=_reject_invalid_json, object_pairs_hook=_reject_duplicate_keys
+)

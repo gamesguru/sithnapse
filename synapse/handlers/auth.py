@@ -439,6 +439,7 @@ class AuthHandler:
         clientdict: dict[str, Any],
         description: str,
         get_new_session_data: Callable[[], JsonDict] | None = None,
+        require_existing_session: bool = False,
     ) -> tuple[dict, dict, str]:
         """
         Takes a dictionary sent by the client in the login / registration
@@ -458,6 +459,7 @@ class AuthHandler:
 
             clientdict: The dictionary from the client root level, not the
                         'auth' key: this method prompts for auth if none is sent.
+                        The 'auth' key is removed from this dictionary in place.
 
             description: A human readable string to be displayed to the user that
                          describes the operation happening on their account.
@@ -468,6 +470,10 @@ class AuthHandler:
 
                 The keys of the returned data should be entries in
                 UIAuthSessionDataConstants.
+
+            require_existing_session: If True, reject a nonempty auth payload
+                without a session ID when a session matches the remaining request
+                parameters, URI, and method.
 
         Returns:
             A tuple of (creds, params, session_id).
@@ -483,6 +489,9 @@ class AuthHandler:
         Raises:
             InteractiveAuthIncompleteError if the client has not yet completed
                 all the stages in any of the permitted flows.
+            SynapseError: With status 401 for an omitted required session ID,
+                400 for an unknown session ID, or 403 if the session's URI or
+                method has changed. Storage errors also propagate.
         """
 
         sid: str | None = None
@@ -500,6 +509,16 @@ class AuthHandler:
 
         # If there's no session ID, create a new session.
         if not sid:
+            if (
+                require_existing_session
+                and authdict
+                and await self.store.get_ui_auth_session_for_clientdict(
+                    clientdict, uri, method
+                )
+                is not None
+            ):
+                raise SynapseError(401, "Missing UIA session", Codes.UNAUTHORIZED)
+
             new_session_data = get_new_session_data() if get_new_session_data else {}
 
             session = await self.store.create_ui_auth_session(

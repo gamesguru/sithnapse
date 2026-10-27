@@ -128,6 +128,7 @@ BOOLEAN_COLUMNS = {
     "room_memberships": ["participant"],
     "room_stats_state": ["is_federatable"],
     "rooms": ["is_public", "has_auth_chain_index"],
+    "server_signature_keys": ["seen_active"],
     "sliding_sync_joined_rooms": ["is_encrypted"],
     "sliding_sync_membership_snapshots": [
         "has_known_state",

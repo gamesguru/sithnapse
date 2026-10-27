@@ -898,7 +898,28 @@ class ReceiptsWorkerStore(SQLBaseStore):
         token: int,
         rows: Iterable[Any],
     ) -> None:
+        """Advance receipt writer progress and invalidate caches for changed receipts.
+
+        Mark affected rooms changed at token, then delegate to the base store.
+        """
         if stream_name == ReceiptsStream.NAME:
+            rows = list(rows)
+            logger.debug(
+                "[receipts-trace] RDATA instance=%s token=%s count=%d rows=%s",
+                instance_name,
+                token,
+                len(rows),
+                [
+                    (
+                        row.room_id,
+                        row.receipt_type,
+                        row.user_id,
+                        row.event_id,
+                        row.thread_id,
+                    )
+                    for row in rows[:20]
+                ],
+            )
             self._receipts_id_gen.advance(instance_name, token)
             for row in rows:
                 self.invalidate_caches_for_receipt(
@@ -911,7 +932,13 @@ class ReceiptsWorkerStore(SQLBaseStore):
     def process_replication_position(
         self, stream_name: str, instance_name: str, token: int
     ) -> None:
+        """Advance the named writer's receipt position, then delegate to the base store."""
         if stream_name == ReceiptsStream.NAME:
+            logger.debug(
+                "[receipts-trace] position instance=%s token=%s",
+                instance_name,
+                token,
+            )
             self._receipts_id_gen.advance(instance_name, token)
         super().process_replication_position(stream_name, instance_name, token)
 

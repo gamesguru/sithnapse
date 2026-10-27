@@ -331,6 +331,9 @@ class PerDestinationQueue:
         """Add a RR to the list to be sent. Doesn't start the transmission loop yet
         (see flush_read_receipts_for_room)
 
+        Replace a queued receipt for the same room, receipt type, user, and
+        thread. For that room/type/user, keep different threads in separate EDUs.
+
         Args:
             receipt: receipt to be queued
         """
@@ -354,9 +357,10 @@ class PerDestinationQueue:
             )
             # If this room ID, receipt type, user ID is not in this EDU, OR if
             # the full tuple matches, use the current EDU.
+            existing_receipt = receipt_content.get(receipt.user_id)
             if (
-                receipt.user_id not in receipt_content
-                or receipt_content[receipt.user_id].get("thread_id")
+                existing_receipt is None
+                or existing_receipt.get("data", {}).get("thread_id")
                 == receipt.thread_id
             ):
                 receipt_content[receipt.user_id] = serialized_receipt

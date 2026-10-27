@@ -319,5 +319,18 @@ class ExperimentalConfig(Config):
         # MSC4491: Invite reasons in room creation
         self.msc4491_enabled: bool = experimental.get("msc4491_enabled", False)
 
+        # How many consecutive failed attempts to finish a partial-state join are
+        # tolerated before the join is abandoned and local users leave the room.
+        # Attempts back off exponentially from one second, so the default of 10
+        # tolerates roughly eight minutes of outage. Complement sets this low.
+        self.partial_state_sync_max_consecutive_failures: int = experimental.get(
+            "partial_state_sync_max_consecutive_failures", 10
+        )
+        if self.partial_state_sync_max_consecutive_failures < 1:
+            raise ConfigError(
+                "experimental_features.partial_state_sync_max_consecutive_failures "
+                "must be at least 1"
+            )
+
         # MSC4512: Delegating parts of the C-S and S-S API to application services
         self.msc4512_enabled: bool = experimental.get("msc4512_enabled", False)

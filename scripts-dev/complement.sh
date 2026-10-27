@@ -344,7 +344,7 @@ main() {
   while IFS= read -r test_package; do
     # These MSCs are not implemented by this Synapse tree yet. Keep them out
     # of the default all-MSC run until their implementations are ported.
-    if [[ "${test_package##*/}" == "msc2836" || "${test_package##*/}" == "msc4500" ]]; then
+    if [[ "${test_package##*/}" == "msc2836" || "${test_package##*/}" == "msc4500" || "${test_package##*/}" == "msc4521" ]]; then
       echo "Skipping unsupported Complement test package: $test_package" >&2
       continue
     fi
@@ -399,11 +399,15 @@ main() {
   # (The prefix is stripped off before reaching the container.)
   export COMPLEMENT_SHARE_ENV_PREFIX=PASS_
 
-  # Identify Synapse to Complement's runtime skip registry by default. Set
-  # COMPLEMENT_NO_BLACKLIST=1 to run a diagnostic pass without that registry.
+  # Identify this server to Complement's runtime skip registry. Sithnapse is
+  # the default for this repository; override it when testing another server.
+  # COMPLEMENT_NO_BLACKLIST=1 keeps the diagnostic behavior of an unknown
+  # runtime, while a specific identity can be selected with
+  # COMPLEMENT_RUNTIME_HOMESERVER.
   test_tags=""
-  if [ -z "${COMPLEMENT_NO_BLACKLIST:-}" ]; then
-    test_tags="synapse_blacklist"
+  complement_runtime_homeserver="${COMPLEMENT_RUNTIME_HOMESERVER:-sithnapse}"
+  if [ -n "${COMPLEMENT_NO_BLACKLIST:-}" ]; then
+    complement_runtime_homeserver=""
   fi
 
   # It takes longer than 10m to run the whole suite.
@@ -417,6 +421,10 @@ main() {
   if [[ -n "$WORKERS" ]]; then
     # Use workers.
     export PASS_SYNAPSE_COMPLEMENT_USE_WORKERS=true
+
+    # Pass through the selected worker topology. If unset, the container
+    # defaults to the full production-like split.
+    export PASS_SYNAPSE_COMPLEMENT_WORKER_PROFILE="$SYNAPSE_COMPLEMENT_WORKER_PROFILE"
 
     # Pass through the workers defined. If none, it will be an empty string
     export PASS_SYNAPSE_WORKER_TYPES="$WORKER_TYPES"
@@ -1073,9 +1081,11 @@ run_one_pattern() {
     _batch_names=("${BASH_REMATCH[1]}")
   fi
 
-  if [ "${#_batch_names[@]}" -gt 0 ]; then
+  # The in-repo package list intentionally uses the Go wildcard ./tests/...
+  # rather than concrete package paths, so exact package narrowing only
+  # applies to the external Complement checkout.
+  if [ "${#_batch_names[@]}" -gt 0 ] && [ -z "$use_in_repo_tests" ]; then
     local _base_dir="$COMPLEMENT_DIR"
-    if [ -n "$use_in_repo_tests" ]; then _base_dir="${repo_root}/complement"; fi
     if command -v rg &>/dev/null; then
       local -a matched_pkgs=()
       mapfile -t matched_pkgs < <(
@@ -1083,6 +1093,19 @@ run_one_pattern() {
           && rg -l --glob '*_test.go' "^func[[:space:]]+(${_batch_names[0]}$(printf '|%s' "${_batch_names[@]:1}"))\\b" tests 2>/dev/null \
           | xargs -r -n1 dirname | sed 's#^#./#' | sort -u || true
       )
+      # Drop packages excluded as unsupported above so a name filter cannot
+      # bring them back.
+      local -a supported_matched_pkgs=()
+      local _matched_pkg _supported_pkg
+      for _matched_pkg in "${matched_pkgs[@]}"; do
+        for _supported_pkg in "${packages[@]}"; do
+          if [ "$_matched_pkg" = "$_supported_pkg" ]; then
+            supported_matched_pkgs+=("$_matched_pkg")
+            break
+          fi
+        done
+      done
+      matched_pkgs=("${supported_matched_pkgs[@]}")
       if [ "${#matched_pkgs[@]}" -gt 0 ]; then
         packages=("${matched_pkgs[@]}")
         echo "Selected package(s) for $pattern: ${packages[*]}" >&2
@@ -1104,6 +1127,7 @@ run_one_pattern() {
 
   local -a flags=(
     -tags "$test_tags"
+    -ldflags "-X github.com/matrix-org/complement/runtime.Homeserver=${complement_runtime_homeserver}"
     -v
     -count=1
     -timeout "$test_timeout"

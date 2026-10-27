@@ -19,6 +19,7 @@ journaled-but-unfsynced visibility is exercised through the real event-JSON
 path a worker uses.
 """
 
+import atexit
 import json
 import os
 import shutil
@@ -45,7 +46,8 @@ class _Process:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             # Kept separate from stdout, not merged: stdout is a strict
-            # line protocol (the first line must be exactly "READY"), and
+            # line protocol (the first lines must be exactly "IMPORTED" and
+            # "READY"), and
             # anything else that writes to stderr during import -- a
             # deprecation warning, a C-level/Rust warning, an unrelated
             # future log line -- would otherwise land on that same stream
@@ -59,12 +61,28 @@ class _Process:
             text=True,
             env=env,
         )
-        ready = self._stdout().readline().strip()
-        if ready != "READY":
+        self._role = role
+
+    def open(self) -> "_Process":
+        """Wait for the process's imports, then open the store.
+
+        Construction only spawns the process, so callers can start several and
+        let their slow Synapse imports overlap before opening each in turn.
+        """
+        self._expect("IMPORTED")
+        self._stdin().write("open\n")
+        self._stdin().flush()
+        self._expect("READY")
+        return self
+
+    def _expect(self, line: str) -> None:
+        got = self._stdout().readline().strip()
+        if got != line:
             stderr_output = self._proc.stderr.read() if self._proc.stderr else ""
             self.close()
             raise AssertionError(
-                f"{role} process failed to start: {ready!r}\nstderr:\n{stderr_output}"
+                f"{self._role} process failed to start: expected {line!r}, "
+                f"got {got!r}\nstderr:\n{stderr_output}"
             )
 
     def _stdin(self) -> IO[str]:
@@ -129,18 +147,91 @@ class _Process:
                     stream.close()
 
 
-class MtxdbJournalVisibilityTestCase(unittest.TestCase):
+class _VisibilityTestCase(unittest.TestCase):
+    """Keep the expensive Synapse/Rust imports to one pair of processes.
+
+    Each worker startup imports the full Synapse package. These tests use
+    unique keys/rooms, so sharing the writer and stale reader within a class
+    preserves the cross-process assertions without paying that import cost
+    for every test method.
+    """
+
+    namespace = "vis"
+    store_prefix = "test-mtxdb-visibility-"
+
     def setUp(self) -> None:
-        self.store_dir = tempfile.mkdtemp(prefix="test-mtxdb-visibility-")
-        self.addCleanup(shutil.rmtree, self.store_dir, ignore_errors=True)
-        self.writer = _Process("writer", self.store_dir)
-        self.addCleanup(self.writer.close)
+        if not _visibility_fixtures:
+            _start_visibility_fixtures(
+                {
+                    cls.namespace: cls.store_prefix
+                    for cls in _VisibilityTestCase.__subclasses__()
+                }
+            )
+        fixture = _visibility_fixtures[self.namespace]
+        self.store_dir = fixture.store_dir
+        self.writer = fixture.writer
+        self._stale_reader = fixture.reader
 
     def _reader(self) -> _Process:
-        reader = _Process("reader", self.store_dir)
-        self.addCleanup(reader.close)
-        return reader
+        return self._stale_reader
 
+    def _new_reader(self) -> _Process:
+        """A reader opened now, after whatever the test has written so far.
+
+        Uses the pre-spawned spare, whose imports are already done, the first
+        time; any later call spawns a fresh process.
+        """
+        fixture = _visibility_fixtures[self.namespace]
+        reader = fixture.spare_reader or _Process(
+            "reader", self.store_dir, self.namespace
+        )
+        fixture.spare_reader = None
+        self.addCleanup(reader.close)
+        return reader.open()
+
+
+class _Fixture:
+    def __init__(self, store_dir: str, namespace: str) -> None:
+        self.store_dir = store_dir
+        self.writer = _Process("writer", store_dir, namespace)
+        self.reader = _Process("reader", store_dir, namespace)
+        self.spare_reader: _Process | None = _Process("reader", store_dir, namespace)
+
+    def close(self) -> None:
+        for process in (self.spare_reader, self.reader, self.writer):
+            if process is not None:
+                process.close()
+        shutil.rmtree(self.store_dir, ignore_errors=True)
+
+
+_visibility_fixtures: dict[str, _Fixture] = {}
+
+
+def _start_visibility_fixtures(store_prefixes: dict[str, str]) -> None:
+    """Spawn every store's processes at once, so all their imports overlap.
+
+    Each writer is opened before its readers: a read-only open needs the store
+    the writer creates.
+    """
+    for namespace, prefix in store_prefixes.items():
+        _visibility_fixtures[namespace] = _Fixture(
+            tempfile.mkdtemp(prefix=prefix), namespace
+        )
+    for fixture in _visibility_fixtures.values():
+        fixture.writer.open()
+    for fixture in _visibility_fixtures.values():
+        fixture.reader.open()
+
+
+def _close_visibility_fixtures() -> None:
+    for fixture in _visibility_fixtures.values():
+        fixture.close()
+
+
+atexit.register(_close_visibility_fixtures)
+
+
+class MtxdbJournalVisibilityTestCase(_VisibilityTestCase):
     def test_a_write_is_visible_to_a_stale_worker_without_fsync(self) -> None:
         """A worker opened *before* the write sees it at once, with no fsync.
 
@@ -159,11 +250,12 @@ class MtxdbJournalVisibilityTestCase(unittest.TestCase):
 
     def test_worker_opened_after_the_write_sees_it(self) -> None:
         """A worker that starts later (late-started or restarted) sees it too."""
-        self.writer.call(f"put {_STATE_KEY} value")
+        key = f"{_STATE_KEY}:late"
+        self.writer.call(f"put {key} value")
 
-        reader = self._reader()
+        reader = self._new_reader()
 
-        self.assertEqual(reader.get(_STATE_KEY), "value")
+        self.assertEqual(reader.get(key), "value")
         self.assertEqual(self.writer.call("fsyncs"), "0")
 
     def test_many_writes_are_all_visible(self) -> None:
@@ -193,7 +285,7 @@ _EVENT_JSON_ROOM = "!vis:test"
 _EVENT_JSON_NS = "vis-event-json"
 
 
-class MtxdbEventJsonVisibilityTestCase(unittest.TestCase):
+class MtxdbEventJsonVisibilityTestCase(_VisibilityTestCase):
     """The real event-JSON read path against a journaled-but-unfsynced write.
 
     In exclusive mode event JSON has no SQL copy, so a stale worker that could
@@ -204,16 +296,8 @@ class MtxdbEventJsonVisibilityTestCase(unittest.TestCase):
     record through the journal, never through an open-time rescan.
     """
 
-    def setUp(self) -> None:
-        self.store_dir = tempfile.mkdtemp(prefix="test-mtxdb-event-json-vis-")
-        self.addCleanup(shutil.rmtree, self.store_dir, ignore_errors=True)
-        self.writer = _Process("writer", self.store_dir, _EVENT_JSON_NS)
-        self.addCleanup(self.writer.close)
-
-    def _reader(self) -> _Process:
-        reader = _Process("reader", self.store_dir, _EVENT_JSON_NS)
-        self.addCleanup(reader.close)
-        return reader
+    namespace = _EVENT_JSON_NS
+    store_prefix = "test-mtxdb-event-json-vis-"
 
     def test_event_json_is_visible_to_a_stale_worker_once_written(self) -> None:
         reader = self._reader()
@@ -250,11 +334,10 @@ class MtxdbEventJsonVisibilityTestCase(unittest.TestCase):
         self.assertEqual(self.writer.call("fsyncs"), "0")
 
 
-_EDGES_ROOM = "!vis-edges:test"
 _EDGES_NS = "vis-event-edges"
 
 
-class MtxdbEventEdgesVisibilityTestCase(unittest.TestCase):
+class MtxdbEventEdgesVisibilityTestCase(_VisibilityTestCase):
     """The real event-edges forward read path across processes.
 
     `get_event_edges_forward_batch` (the gated helper behind
@@ -266,23 +349,15 @@ class MtxdbEventEdgesVisibilityTestCase(unittest.TestCase):
     path, not the raw engine.
     """
 
-    def setUp(self) -> None:
-        self.store_dir = tempfile.mkdtemp(prefix="test-mtxdb-edges-vis-")
-        self.addCleanup(shutil.rmtree, self.store_dir, ignore_errors=True)
-        self.writer = _Process("writer", self.store_dir, _EDGES_NS)
-        self.addCleanup(self.writer.close)
-
-    def _reader(self) -> _Process:
-        reader = _Process("reader", self.store_dir, _EDGES_NS)
-        self.addCleanup(reader.close)
-        return reader
+    namespace = _EDGES_NS
+    store_prefix = "test-mtxdb-edges-vis-"
 
     def test_unpublished_index_is_not_a_hit(self) -> None:
         """A worker must not serve an unpublished forward index as complete."""
         reader = self._reader()
 
         self.assertEqual(
-            reader.edges_get(_EDGES_ROOM, 1, "$pe1:test"),
+            reader.edges_get("!unpublished:test", 1, "$pe1:test"),
             {},
             "an unpublished forward index must be a miss, not a hit",
         )
@@ -291,10 +366,11 @@ class MtxdbEventEdgesVisibilityTestCase(unittest.TestCase):
         """A worker opened before the write sees the published edge, no fsync."""
         reader = self._reader()
 
-        self.writer.edges_publish(_EDGES_ROOM, 0, 1, "$child1:test", "$pe2:test")
+        room_id = "!published:test"
+        self.writer.edges_publish(room_id, 0, 1, "$child1:test", "$pe2:test")
 
         self.assertEqual(
-            reader.edges_get(_EDGES_ROOM, 1, "$pe2:test"),
+            reader.edges_get(room_id, 1, "$pe2:test"),
             {"$pe2:test": ["$child1:test"]},
         )
         self.assertEqual(self.writer.call("fsyncs"), "0")
@@ -307,13 +383,14 @@ class MtxdbEventEdgesVisibilityTestCase(unittest.TestCase):
         """
         reader = self._reader()
 
-        self.writer.edges_publish(_EDGES_ROOM, 0, 1, "$child1:test", "$pe3:test")
+        room_id = "!repeat-publish:test"
+        self.writer.edges_publish(room_id, 0, 1, "$child1:test", "$pe3:test")
         self.assertEqual(
-            reader.edges_get(_EDGES_ROOM, 1, "$pe3:test"),
+            reader.edges_get(room_id, 1, "$pe3:test"),
             {"$pe3:test": ["$child1:test"]},
         )
 
-        self.writer.edges_publish(_EDGES_ROOM, 0, 2, "$child2:test", "$pe3:test")
-        children = reader.edges_get(_EDGES_ROOM, 2, "$pe3:test").get("$pe3:test") or []
+        self.writer.edges_publish(room_id, 0, 2, "$child2:test", "$pe3:test")
+        children = reader.edges_get(room_id, 2, "$pe3:test").get("$pe3:test") or []
         self.assertEqual(set(children), {"$child1:test", "$child2:test"})
         self.assertEqual(self.writer.call("fsyncs"), "0")

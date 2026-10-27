@@ -1,0 +1,1 @@
+completely remove sql-mtxdb dual-writes. Completely make mtxdb authoritative where it wants to be. Do NOT have any configuration option to go back. Only go forward. There is no "if event json embedded is enabled" since we have only one direction to flow: forward. Simplicity to the max. Total control.

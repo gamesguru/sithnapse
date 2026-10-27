@@ -287,6 +287,22 @@ def _quote_ident(identifier: str) -> str:
 
 _TABLES_TO_TRUNCATE_CACHE: list[str] | None = None
 
+# One open autocommit connection per recycled test database, reused by every
+# reset instead of reconnecting each time (about 2-3 ms per test). Dropped when
+# the database is dropped and in forked children (see
+# `_reset_db_drop_state_after_fork`); any error evicts it so the next reset
+# reconnects.
+_RESET_CONNECTIONS: dict[str, Any] = {}
+
+
+def _evict_reset_connection(test_db: str) -> None:
+    conn = _RESET_CONNECTIONS.pop(test_db, None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
 
 def _reset_recycled_postgres_db(
     test_db: str,
@@ -298,14 +314,17 @@ def _reset_recycled_postgres_db(
     _t0 = time.monotonic()
     _phase = _t0
     try:
-        conn = db_engine.module.connect(
-            dbname=test_db,
-            user=POSTGRES_USER,
-            host=POSTGRES_HOST,
-            port=POSTGRES_PORT,
-            password=POSTGRES_PASSWORD,
-        )
-        db_engine.attempt_to_set_autocommit(conn, True)
+        conn = _RESET_CONNECTIONS.get(test_db)
+        if conn is None or conn.closed != 0:
+            conn = db_engine.module.connect(
+                dbname=test_db,
+                user=POSTGRES_USER,
+                host=POSTGRES_HOST,
+                port=POSTGRES_PORT,
+                password=POSTGRES_PASSWORD,
+            )
+            db_engine.attempt_to_set_autocommit(conn, True)
+            _RESET_CONNECTIONS[test_db] = conn
         cur = conn.cursor()
         _pg_timing("db_reset_connect", time.monotonic() - _phase, test_name=test_name)
 
@@ -402,12 +421,12 @@ def _reset_recycled_postgres_db(
 
         _phase = time.monotonic()
         cur.close()
-        conn.close()
         _pg_timing("db_reset_close", time.monotonic() - _phase, test_name=test_name)
         _pg_timing("db_recycle_reset", time.monotonic() - _t0, test_name=test_name)
         _pg_counter("recycle_reset_success")
         return True
     except Exception as e:
+        _evict_reset_connection(test_db)
         _pg_counter("recycle_reset_failed")
         warnings.warn(
             f"Failed to reset recycled DB {test_db}: {e}. Falling back to fresh clone.",
@@ -427,6 +446,8 @@ def _reset_db_drop_state_after_fork() -> None:
     _RECYCLED_PG_DB = None
     _RECYCLED_PG_DB_IN_USE = False
     _PREV_TEST_HAD_DDL = False
+    # The parent's connections are shared sockets; the child must not use them.
+    _RESET_CONNECTIONS.clear()
 
 
 if hasattr(os, "register_at_fork"):
@@ -459,6 +480,7 @@ def _drop_test_db(
 
     _drop_t0 = time.monotonic()
     dropped = False
+    _evict_reset_connection(test_db)
 
     if conn is None or conn.closed != 0 or cur is None or cur.closed:
         _t_conn = time.monotonic()

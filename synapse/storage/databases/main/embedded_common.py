@@ -345,6 +345,12 @@ def lock_wait_timing(lock: threading.Lock, tag: str) -> Iterator[None]:
 
 
 def _print_ffi_timings() -> None:
+    """Flush cumulative FFI diagnostics when enabled and timings exist.
+
+    With SYNAPSE_TIMINGS_RUN_DIR set, replace this process's JSON snapshot
+    and ignore filesystem errors. Otherwise, print summaries; totals exclude
+    ``:cpu`` spans already represented by their wall-time spans.
+    """
     if not _PG_TIMINGS_ENABLED:
         return
     lock = _FFI_TIMING_LOCK
@@ -426,8 +432,18 @@ def _print_ffi_timings() -> None:
         ("TOTAL (all measured spans)", None),
         ("TOTAL (excluding engine open)", "embedded_engine_open"),
     ):
-        total_s = sum(elapsed for tag, elapsed in timings.items() if tag != excluded)
-        total_count = sum(count for tag, count in counts.items() if tag != excluded)
+        # `<tag>:cpu` rows are the thread cpu time of a span already counted
+        # under `<tag>`; leave them out of the totals.
+        total_s = sum(
+            elapsed
+            for tag, elapsed in timings.items()
+            if tag != excluded and not tag.endswith(":cpu")
+        )
+        total_count = sum(
+            count
+            for tag, count in counts.items()
+            if tag != excluded and not tag.endswith(":cpu")
+        )
         total_ms = total_s * 1000
         total_avg_ms = (total_s / total_count) * 1000 if total_count else 0.0
         _ffi_timings_print(
@@ -563,11 +579,20 @@ if _PG_TIMINGS_ENABLED:
 # Display names for the stats keys. The keys keep their older names
 # (`event_dag`, `auth_chain`); the report says `event` (event JSON) and `edges`
 # (previous-event and auth-chain edges, mtxdb's `ShardType::Edges`).
-_POOL_LABELS: dict[str, str] = {"event_dag": "event", "auth_chain": "edges"}
+_POOL_LABELS: dict[str, str] = {
+    "event_dag": "event",
+    "auth_chain": "edges",
+    "server_info": "server-info",
+}
 
 
 def _print_mtxdb_stats() -> None:
-    """Print an end-of-run mtxdb runtime stats report for all three pools."""
+    """Report runtime stats for all four pools: state, event_dag, auth_chain, server_info.
+
+    Do nothing unless SYNAPSE_MTXDB_STATS is set and stats are available.
+    With SYNAPSE_TIMINGS_RUN_DIR set, replace this process's JSON snapshot
+    and ignore filesystem errors; otherwise, print to stderr.
+    """
     if not os.environ.get("SYNAPSE_MTXDB_STATS"):
         return
     try:
@@ -604,7 +629,7 @@ def _print_mtxdb_stats() -> None:
         return f"{us / 1_000_000:.2f}s"
 
     print("\n=== mtxdb runtime stats ===", file=out)
-    for pool_name in ("state", "event_dag", "auth_chain"):
+    for pool_name in ("state", "event_dag", "auth_chain", "server_info"):
         ps = s.get(pool_name, {})
         if not ps:
             continue
@@ -910,7 +935,7 @@ def _mtxdb_snapshot_once() -> None:
         return 0.0 if last is None else value - last
 
     segments: list[str] = []
-    for pool in ("state", "event_dag", "auth_chain"):
+    for pool in ("state", "event_dag", "auth_chain", "server_info"):
         ps = s.get(pool, {})
         if not ps:
             continue
