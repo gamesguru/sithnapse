@@ -1620,3 +1620,44 @@ class EventEdgesSqlOnlyMetricTestCase(EventEdgesStorageIntegrationTestCase):
             self.get_success(self.store.get_successor_events(parent_id)), []
         )
         self.assertEqual(_reads(sn, "successor", "miss") - miss0, 1)
+
+
+class EventEdgesBackendMarkerTestCase(EventEdgesStorageIntegrationTestCase):
+    """`check_event_edges_backend`: startup refuses a backend that does not
+    hold the migrated edges."""
+
+    def _set_marker(self, backend: str) -> None:
+        self.get_success(
+            self.store.db_pool.runInteraction(
+                "set_marker",
+                lambda txn: txn.execute(
+                    "UPDATE edge_backend SET backend = ?", (backend,)
+                ),
+            )
+        )
+
+    def _check(self, configured: str) -> None:
+        with mock.patch.object(
+            embedded_event_edges_module,
+            "configured_event_edges_backend",
+            return_value=configured,
+        ):
+            self.get_success(
+                embedded_event_edges_module.check_event_edges_backend(self.hs)
+            )
+
+    def test_matching_backend_starts(self) -> None:
+        self._set_marker("mtxdb")
+        self._check("mtxdb")
+
+    def test_mismatch_with_events_panics(self) -> None:
+        self._set_marker("sql")
+        with mock.patch.object(
+            embedded_event_edges_module,
+            "configured_event_edges_backend",
+            return_value="mtxdb",
+        ):
+            self.get_failure(
+                embedded_event_edges_module.check_event_edges_backend(self.hs),
+                embedded_event_edges_module.EventEdgesBackendMismatchError,
+            )

@@ -674,6 +674,16 @@ async def start(hs: "HomeServer", *, freeze: bool = True) -> None:
     server_name = hs.hostname
     reactor = hs.get_reactor()
 
+    from synapse.storage.databases.main.embedded_event_edges import (
+        EventEdgesBackendMismatchError,
+        check_event_edges_backend,
+    )
+
+    try:
+        await check_event_edges_backend(hs)
+    except EventEdgesBackendMismatchError as e:
+        quit_with_error(str(e))
+
     # We want to use a separate thread pool for the resolver so that large
     # numbers of DNS requests don't starve out other users of the threadpool.
     resolver_threadpool = ThreadPool(name="gai_resolver")

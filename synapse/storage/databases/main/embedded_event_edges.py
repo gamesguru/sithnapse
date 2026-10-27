@@ -557,6 +557,53 @@ def embedded_event_edges_is_writable(hs: HomeServer) -> bool:
     )
 
 
+class EventEdgesBackendMismatchError(Exception):
+    """The configured event-edges backend does not hold the migrated data."""
+
+
+def configured_event_edges_backend(hs: HomeServer) -> str:
+    return "mtxdb" if open_embedded_event_edges_engine(hs) else "sql"
+
+
+async def check_event_edges_backend(hs: HomeServer) -> None:
+    """Refuse to start unless the configured backend is the one that holds the
+    event edges.
+
+    A database with no events yet adopts the configured backend. Otherwise the
+    stored marker must match; switching backends is a manual migration.
+
+    Raises:
+        EventEdgesBackendMismatchError: on a mismatch.
+    """
+    store = hs.get_datastores().main
+    configured = configured_event_edges_backend(hs)
+    pool = store.db_pool
+
+    def _txn(txn: Any) -> str:
+        txn.execute("SELECT backend FROM edge_backend WHERE lock = 'X'")
+        row = txn.fetchone()
+        stored = row[0] if row else "sql"
+        if stored != configured:
+            txn.execute("SELECT 1 FROM events LIMIT 1")
+            if txn.fetchone() is None:
+                txn.execute("DELETE FROM edge_backend")
+                txn.execute(
+                    "INSERT INTO edge_backend (lock, backend) VALUES ('X', ?)",
+                    (configured,),
+                )
+                return configured
+        return str(stored)
+
+    stored = await pool.runInteraction("check_event_edges_backend", _txn)
+    if stored != configured:
+        raise EventEdgesBackendMismatchError(
+            f"Event edges are stored in {stored!r} but this server is configured "
+            f"for {configured!r}. Refusing to start: run the event-edges migration "
+            f"(--to {configured}) first, or restore the previous embedded_db "
+            "configuration."
+        )
+
+
 def put_event_edges_batch(
     namespace: str,
     rows: Iterable[EdgeRow],
