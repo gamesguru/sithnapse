@@ -1102,7 +1102,8 @@ class EventCreationHandler:
                     # The first attempt may have persisted the tombstone but
                     # failed while transferring room state. Retrying with the
                     # same transaction ID returns the stored event, so finish
-                    # the transfer here before returning it.
+                    # the transfer here before returning it. Per-user progress
+                    # tracking skips users whose state was already copied.
                     if (
                         event.type == EventTypes.Tombstone
                         and event.is_state()

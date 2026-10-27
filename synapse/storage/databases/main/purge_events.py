@@ -23,12 +23,16 @@ import logging
 from typing import Any, cast
 
 from synapse.api.errors import SynapseError
-from synapse.storage.database import LoggingTransaction, user_is_local_like_pattern
+from synapse.storage.database import (
+    LoggingTransaction,
+    make_in_list_sql_clause,
+    user_is_local_like_pattern,
+)
 from synapse.storage.databases.main import CacheInvalidationWorkerStore
 from synapse.storage.databases.main.embedded_common import Pool, sync_now
 from synapse.storage.databases.main.embedded_event_edges import (
     delete_event_edges_batch,
-    record_edge_index_deletes_txn,
+    get_event_edges_forward_batch,
 )
 from synapse.storage.databases.main.embedded_event_json import delete_event_json_batch
 from synapse.storage.databases.main.embedded_event_to_state_group import (
@@ -283,13 +287,27 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
         # We calculate the new entries for the backward extremities by finding
         # events to be purged that are pointed to by events we're not going to
         # purge.
-        txn.execute(
-            "SELECT DISTINCT e.event_id FROM events_to_purge AS e"
-            " INNER JOIN event_edges AS ed ON e.event_id = ed.prev_event_id"
-            " LEFT JOIN events_to_purge AS ep2 ON ed.event_id = ep2.event_id"
-            " WHERE ep2.event_id IS NULL"
-        )
-        new_backwards_extrems = txn.fetchall()
+        if getattr(self, "_embedded_event_edges_enabled", False):
+            purge_ids = {event_id for event_id, _ in event_rows}
+            forward = get_event_edges_forward_batch(
+                self._embedded_db_namespace, list(purge_ids)
+            )
+            new_backwards_extrems = [
+                (event_id,)
+                for event_id in purge_ids
+                if any(
+                    child_id not in purge_ids
+                    for child_id in (forward.get(event_id) or ())
+                )
+            ]
+        else:
+            txn.execute(
+                "SELECT DISTINCT e.event_id FROM events_to_purge AS e"
+                " INNER JOIN event_edges AS ed ON e.event_id = ed.prev_event_id"
+                " LEFT JOIN events_to_purge AS ep2 ON ed.event_id = ep2.event_id"
+                " WHERE ep2.event_id IS NULL"
+            )
+            new_backwards_extrems = txn.fetchall()
 
         logger.info("[purge] replacing backward extremities: %r", new_backwards_extrems)
 
@@ -398,7 +416,6 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             redacted_event_ids = [redacts for (redacts,) in txn if redacts is not None]
 
         # Delete all remote non-state events
-        record_edge_index_deletes_txn(self.db_pool, txn, purged_event_ids)
         for table in (
             "event_edges",
             "events",
@@ -545,18 +562,43 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
         # We do this by calculating the minimum depth of the backwards
         # extremities. However, the events in event_backward_extremities
         # are ones we don't have yet so we need to look at the events that
-        # point to it via event_edges table.
-        txn.execute(
-            """
-            SELECT COALESCE(MIN(depth), 0)
-            FROM event_backward_extremities AS eb
-            INNER JOIN event_edges AS eg ON eg.prev_event_id = eb.event_id
-            INNER JOIN events AS e ON e.event_id = eg.event_id
-            WHERE eb.room_id = ?
-        """,
-            (room_id,),
-        )
-        (min_depth,) = cast(tuple[int], txn.fetchone())
+        # point to them.
+        if getattr(self, "_embedded_event_edges_enabled", False):
+            txn.execute(
+                "SELECT event_id FROM event_backward_extremities WHERE room_id = ?",
+                (room_id,),
+            )
+            extremity_ids = [event_id for (event_id,) in txn]
+            forward = get_event_edges_forward_batch(
+                self._embedded_db_namespace, extremity_ids
+            )
+            child_ids = {
+                child_id
+                for children in forward.values()
+                for child_id in (children or ())
+            }
+            if child_ids:
+                clause, args = make_in_list_sql_clause(
+                    self.database_engine, "event_id", list(child_ids)
+                )
+                txn.execute(
+                    f"SELECT COALESCE(MIN(depth), 0) FROM events WHERE {clause}", args
+                )
+                (min_depth,) = cast(tuple[int], txn.fetchone())
+            else:
+                min_depth = 0
+        else:
+            txn.execute(
+                """
+                SELECT COALESCE(MIN(depth), 0)
+                FROM event_backward_extremities AS eb
+                INNER JOIN event_edges AS eg ON eg.prev_event_id = eb.event_id
+                INNER JOIN events AS e ON e.event_id = eg.event_id
+                WHERE eb.room_id = ?
+            """,
+                (room_id,),
+            )
+            (min_depth,) = cast(tuple[int], txn.fetchone())
 
         logger.info("[purge] updating room_depth to %d", min_depth)
 
@@ -704,7 +746,6 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             )
 
         # Now we delete tables which lack an index on `room_id` but have one on `event_id`
-        record_edge_index_deletes_txn(self.db_pool, txn, room_event_ids)
         for table in purge_room_tables_with_event_id_index:
             logger.info("[purge] removing from %s", table)
 

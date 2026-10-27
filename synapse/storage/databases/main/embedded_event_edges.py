@@ -12,29 +12,28 @@
 # <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
 
-"""Mirrors `event_edges` (backward and forward event DAG edges) into the
-embedded mtxdb event_dag keyspace.
+"""Stores `event_edges` (backward and forward event DAG edges) in the
+configured authoritative backend.
 
 Design:
 - Backward edges: `event_id -> [(prev_event_id, is_state)]`. Cryptographically
   immutable once an event is created.
 - Forward edges: `prev_event_id -> [child_event_id]`. Deduplicated and appended
   as new children arrive under RMW_LOCK.
-- Locators are primarily owned by `embedded_event_json`; `event_edges_put`
-  re-publishes them for every event a row touches (see the Rust doc), so
-  repaired/backfilled edges for legacy events still resolve.
+- In mtxdb mode, locators are primarily owned by `embedded_event_json`;
+  `event_edges_put` re-publishes them for every event a row touches (see the
+  Rust doc), so backfilled edges for legacy events still resolve.
 
-Reads are mtxdb-first with SQL fallback:
-  mtxdb lookup
-    ├─ complete -> return mtxdb result
-    └─ missing/incomplete -> query SQL, repair mtxdb, return SQL result
+The persist path writes edges directly before the SQL COMMIT: staged in the
+persist's mtxdb transaction when one is available, otherwise applied through
+``put_event_edges_batch``.  It no longer enqueues a post-commit callback.
 
-Writes are coalesced per namespace: ``queue_edge_write`` accumulates rows
-across post-commit callbacks, ``flush_edge_writes`` drains them in a single
-FFI call when the queue exceeds ``_EDGE_WRITE_THRESHOLD``, and the commit
-aware flush coalescer (embedded_common._FlushCoalescer) drains any remainder
-on its bounded debounce timer.  Drained rows are only dropped from the queue
-after a successful FFI write; a failed write is re-queued for retry.
+The coalescing queue (``queue_edge_write`` / ``flush_edge_writes``) remains as
+an internal utility used by tests and explicit callers: rows are drained in a
+single FFI call when the queue exceeds ``_EDGE_WRITE_THRESHOLD``, and the commit
+aware flush coalescer (embedded_common._FlushCoalescer) drains any remainder on
+its bounded debounce timer.  Drained rows are only dropped from the queue after
+a successful FFI write; a failed write is re-queued for retry.
 """
 
 from __future__ import annotations
@@ -43,9 +42,8 @@ import collections
 import logging
 import threading
 import time
-import uuid
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Callable, Iterable, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Callable, Iterable, TypeVar
 
 from prometheus_client import Counter
 
@@ -65,143 +63,11 @@ from synapse.storage.databases.main.embedded_common import (
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
+    from synapse.synapse_rust.mtxdb_engine import MtxdbTransaction
 
 logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
-
-
-class ForwardEdgeMap(dict[str, list[str] | None]):
-    """Forward edges plus whether the embedded index was stale."""
-
-    def __init__(self, *args: Any, stale: bool = False, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self.stale = stale
-
-
-def bump_room_edge_source_version(txn: Any, room_id: str) -> int:
-    """Atomically increment and return a room's edge source version.
-
-    Both the insert and delete paths advance the version inside the caller's
-    SQL transaction, so the outbox rows and the version they are tagged with
-    commit or roll back together. The increment must be atomic: a read followed
-    by a write lets two concurrent transactions observe the same version and
-    both publish it, duplicating a version in the stream and breaking the
-    strictly-increasing replay cursor. `UPDATE ... RETURNING` (via an upsert on
-    first use) serializes writers on the row lock instead.
-    """
-    txn.execute(
-        """
-        INSERT INTO room_edge_source_version (room_id, source_version)
-        VALUES (?, 1)
-        ON CONFLICT (room_id) DO UPDATE
-        SET source_version = room_edge_source_version.source_version + 1
-        RETURNING source_version
-        """,
-        (room_id,),
-    )
-    row = txn.fetchone()
-    if row is None:
-        raise RuntimeError("room_edge_source_version upsert returned no row")
-    return int(row[0])
-
-
-def record_edge_index_deletes_txn(db_pool: Any, txn: Any, event_ids: list[str]) -> None:
-    """Record edge deletions before SQL purge removes the source rows.
-
-    The mutation and its source-version advance run in the caller's SQL
-    transaction, so an outbox consumer can never observe a deletion that was
-    rolled back or miss one that committed.
-    """
-    if not event_ids:
-        return
-
-    placeholders = ", ".join("?" for _ in event_ids)
-    txn.execute(
-        f"""
-        SELECT ev.room_id, ee.event_id, ee.prev_event_id
-        FROM event_edges AS ee
-        JOIN events AS ev ON ev.event_id = ee.event_id
-        WHERE ee.event_id IN ({placeholders})
-        """,
-        event_ids,
-    )
-    rows_by_room: dict[str, list[tuple[str, str]]] = collections.defaultdict(list)
-    for room_id, event_id, prev_event_id in txn:
-        rows_by_room[room_id].append((event_id, prev_event_id))
-
-    for room_id, rows in rows_by_room.items():
-        rows = list(dict.fromkeys(rows))
-        source_version = bump_room_edge_source_version(txn, room_id)
-        db_pool.simple_insert_many_txn(
-            txn,
-            table="edge_index_outbox",
-            keys=(
-                "room_id",
-                "source_version",
-                "event_id",
-                "prev_event_id",
-                "operation",
-            ),
-            values=[
-                (room_id, source_version, event_id, prev_event_id, "delete")
-                for event_id, prev_event_id in rows
-            ],
-        )
-
-
-def record_edge_index_repairs_txn(
-    db_pool: Any,
-    txn: Any,
-    room_id: str,
-    prev_event_id: str,
-    event_ids: list[str],
-) -> int | None:
-    """Add a SQL-fallback repair to the room's ordered forward-index outbox.
-
-    The repair gets a fresh room source version, just like a normal edge
-    mutation. The outbox drainer can then apply it together with every earlier
-    pending room mutation before advancing the FWD completeness watermark.
-    """
-    event_ids = list(dict.fromkeys(event_ids))
-    if not event_ids:
-        return None
-
-    source_versions = record_edge_index_inserts_txn(
-        db_pool, txn, {room_id: [(event_id, prev_event_id) for event_id in event_ids]}
-    )
-    return source_versions.get(room_id)
-
-
-def record_edge_index_inserts_txn(
-    db_pool: Any,
-    txn: Any,
-    rows_by_room: dict[str, list[tuple[str, str]]],
-) -> dict[str, int]:
-    """Record forward-index inserts in the ordered outbox."""
-    source_versions = {}
-    for room_id, rows in rows_by_room.items():
-        rows = list(dict.fromkeys(rows))
-        if not rows:
-            continue
-        source_version = bump_room_edge_source_version(txn, room_id)
-        db_pool.simple_insert_many_txn(
-            txn,
-            table="edge_index_outbox",
-            keys=(
-                "room_id",
-                "source_version",
-                "event_id",
-                "prev_event_id",
-                "operation",
-            ),
-            values=[
-                (room_id, source_version, event_id, prev_event_id, "insert")
-                for event_id, prev_event_id in rows
-            ],
-        )
-        source_versions[room_id] = source_version
-    return source_versions
 
 
 # ---------------------------------------------------------------------------
@@ -421,36 +287,17 @@ def open_embedded_event_edges_engine(hs: HomeServer) -> bool:
 event_edge_reads_counter = Counter(
     "synapse_event_edges_reads",
     "Lookups of event edges by caller (`path`) and outcome, one increment per "
-    "lookup so the outcomes sum to the total lookup rate: `hit` (served from "
-    "mtxdb), `miss` (no entry; SQL fallback), `stale` (source-version "
-    "mismatch; SQL fallback), `unavailable` (successor-only: room could not be "
-    "resolved, so "
-    "mtxdb was not queried), and `sql_only` (authority gate closed or engine "
-    "disabled, mtxdb not consulted). SQL-read removal needs all fallback "
-    "outcomes at ~0 on every process. Unlike the opt-in ffi counters "
-    "this is always on.",
+    "lookup so the outcomes sum to the total lookup rate: `hit` or `miss` "
+    "when served from mtxdb, and `sql_only` when the SQL backend is "
+    "authoritative. Unlike the opt-in ffi counters this is always on.",
     labelnames=["path", "outcome", SERVER_NAME_LABEL],
-)
-
-event_edge_repairs_counter = Counter(
-    "synapse_event_edges_repairs",
-    "Repairs of the mtxdb forward index from SQL after a fallback read, by "
-    "`path` and `result` (`ok`/`failed`), counted per repair attempt.",
-    labelnames=["path", "result", SERVER_NAME_LABEL],
-)
-
-event_edge_repaired_rows_counter = Counter(
-    "synapse_event_edges_repaired_rows",
-    "SQL edge rows copied into mtxdb by successful repairs.",
-    labelnames=["path", SERVER_NAME_LABEL],
 )
 
 event_edge_publish_signal_gauge = LaterGauge(
     name="synapse_event_edges_publish_signal_active",
     desc="1 if the read-only mtxdb handle for this pool mapped the writer's "
-    "publish signal (strict cross-process freshness), 0 if it is on the "
-    "stat-based fallback. Every reader must report 1 before SQL reads are "
-    "removed.",
+    "publish signal for strict cross-process freshness, 0 if it uses the "
+    "stat-based fallback.",
     labelnames=["pool", SERVER_NAME_LABEL],
 )
 
@@ -459,20 +306,6 @@ event_edge_publish_signal_gauge = LaterGauge(
 def _event_edge_read_metric(path: str, outcome: str, server_name: str) -> Any:
     return event_edge_reads_counter.labels(
         path=path, outcome=outcome, **{SERVER_NAME_LABEL: server_name}
-    )
-
-
-@lru_cache(maxsize=16)
-def _event_edge_repair_metric(path: str, result: str, server_name: str) -> Any:
-    return event_edge_repairs_counter.labels(
-        path=path, result=result, **{SERVER_NAME_LABEL: server_name}
-    )
-
-
-@lru_cache(maxsize=8)
-def _event_edge_repaired_rows_metric(path: str, server_name: str) -> Any:
-    return event_edge_repaired_rows_counter.labels(
-        path=path, **{SERVER_NAME_LABEL: server_name}
     )
 
 
@@ -492,29 +325,9 @@ def _log_missing_publish_signal_api_once() -> None:
     )
 
 
-def classify_event_edge_fallback(forward_map: Any | None) -> str:
-    """Name why an embedded lookup did not produce a hit.
-
-    ``None`` means mtxdb was never queried (e.g. the room could not be
-    resolved), which must not be counted as a lookup that missed.
-    """
-    if forward_map is None:
-        return "unavailable"
-    return "stale" if forward_map.stale else "miss"
-
-
 def record_event_edge_read(server_name: str, path: str, outcome: str) -> None:
     """Count one event-edge lookup (see `event_edge_reads_counter`)."""
     _event_edge_read_metric(path, outcome, server_name).inc()
-
-
-def record_event_edge_repair(
-    server_name: str, path: str, ok: bool, rows: int = 0
-) -> None:
-    """Count one repair attempt and, if it succeeded, the rows it copied."""
-    _event_edge_repair_metric(path, "ok" if ok else "failed", server_name).inc()
-    if ok and rows:
-        _event_edge_repaired_rows_metric(path, server_name).inc(rows)
 
 
 def register_publish_signal_gauge(hs: HomeServer) -> None:
@@ -557,81 +370,384 @@ def embedded_event_edges_is_writable(hs: HomeServer) -> bool:
     )
 
 
-# Flip to True only in the same release that actually removes the SQL
-# ``event_edges`` INSERT (``_handle_mult_prev_events``,
-# ``synapse/storage/databases/main/events.py``) and the SQL fallback reads in
-# ``get_successor_events``/``is_event_next_to_forward_gap``. Until then this
-# stays False and `check_event_edges_migration_complete` is a deliberate
-# no-op -- there is nothing to protect yet, since the SQL fallback still
-# covers every server regardless of migration progress. See
-# `res/docs/2026-09-28-event-edges-sql-removal-plan.md`'s "Blocker 1":
-# a server that upgrades to the insert-dropping release while still
-# mid-migration would have rows that exist only in mtxdb, with nothing left
-# to fall back to -- this is the hard precondition that catches that,
-# modeled on `prepare_database.py`'s worker schema-version check
-# (`UpgradeDatabaseException`/`OUTDATED_SCHEMA_ON_WORKER_ERROR`), but for the
-# events-stream writer specifically rather than every worker, and checked
-# after the async datastore layer is up (`has_completed_background_update`
-# needs it) rather than during synchronous schema prep.
-EVENT_EDGES_SQL_INSERT_REMOVED = False
+class EventEdgesBackendMismatchError(Exception):
+    """The configured event-edges backend does not hold the migrated data."""
 
 
-async def event_edges_fwd_is_authoritative(store: Any) -> bool:
-    """Whether embedded MTXDB event edges are enabled for this store.
-
-    Operators are responsible for importing and validating existing edges
-    before enabling MTXDB. Once enabled, MTXDB is authoritative.
-    """
-    return bool(getattr(store, "_embedded_event_edges_enabled", False))
+def configured_event_edges_backend(hs: HomeServer) -> str:
+    return "mtxdb" if open_embedded_event_edges_engine(hs) else "sql"
 
 
-class EventEdgesMigrationIncompleteError(Exception):
-    """Raised by `check_event_edges_migration_complete` when this process is
-    the events-stream writer, the SQL `event_edges` insert has been removed
-    (`EVENT_EDGES_SQL_INSERT_REMOVED = True`), and embedded event edges are
-    not enabled for this store.
+async def check_event_edges_backend(hs: HomeServer) -> None:
+    """Refuse to start unless the configured backend is the one that holds the
+    event edges.
 
-    Deliberately a plain exception, not a process exit: the caller (expected
-    to be a fatal startup check, e.g. `synapse.app._base.start`) decides how
-    to fail the process. Keeping the decision here pure and the exit
-    mechanism at the call site is what makes this testable without a real
-    `sys.exit` in the test run.
-    """
-
-
-async def check_event_edges_migration_complete(hs: HomeServer) -> None:
-    """Fatal precondition for the release that removes the SQL `event_edges`
-    insert: refuse to let this process act as the events-stream writer
-    unless embedded event edges are enabled (and therefore authoritative) for
-    this store.
-
-    A no-op today (`EVENT_EDGES_SQL_INSERT_REMOVED` is False) and a no-op on
-    every process that isn't the events-stream writer -- workers don't write
-    `event_edges` themselves, and a schema-version mismatch on an outdated
-    worker is already caught elsewhere
-    (`prepare_database.py`'s `OUTDATED_SCHEMA_ON_WORKER_ERROR`).
+    A database with no events yet adopts the configured backend. Otherwise the
+    stored marker must match; switching backends is a manual migration.
 
     Raises:
-        EventEdgesMigrationIncompleteError: if this process is the writer,
-        the SQL insert has been removed, and embedded event edges are not
-        enabled.
+        EventEdgesBackendMismatchError: on a mismatch.
     """
-    if not EVENT_EDGES_SQL_INSERT_REMOVED:
-        return
-    if not embedded_event_edges_is_writable(hs):
-        return
+    store = hs.get_datastores().main
+    configured = configured_event_edges_backend(hs)
+    pool = store.db_pool
 
-    if await event_edges_fwd_is_authoritative(hs.get_datastores().main):
-        return
+    def _txn(txn: Any) -> str:
+        txn.execute("SELECT backend FROM edge_backend WHERE lock = 'X'")
+        row = txn.fetchone()
+        stored = row[0] if row else "sql"
+        if stored != configured:
+            txn.execute("SELECT 1 FROM events LIMIT 1")
+            if txn.fetchone() is None:
+                txn.execute("DELETE FROM edge_backend")
+                txn.execute(
+                    "INSERT INTO edge_backend (lock, backend) VALUES ('X', ?)",
+                    (configured,),
+                )
+                return configured
+        return str(stored)
 
-    raise EventEdgesMigrationIncompleteError(
-        "This server has not enabled authoritative embedded event edges, but "
-        "this release no longer writes event_edges to SQL. Starting would "
-        "leave rows written from this point on with no SQL fallback and no "
-        "proof that mtxdb contains a complete forward index.\n\n"
-        "Import and validate existing edges, then enable the embedded event "
-        "edges backend before starting this version."
-    )
+    stored = await pool.runInteraction("check_event_edges_backend", _txn)
+    if stored != configured:
+        raise EventEdgesBackendMismatchError(
+            f"Event edges are stored in {stored!r} but this server is configured "
+            f"for {configured!r}. Refusing to start: stop Synapse and run "
+            f"`synapse_event_edges_migrate --to {configured}` with your config, "
+            "or restore the previous embedded_db configuration."
+        )
+
+
+async def _get_event_edges_backend(store: Any) -> str:
+    def _txn(txn: Any) -> str:
+        txn.execute("SELECT backend FROM edge_backend WHERE lock = 'X'")
+        row = txn.fetchone()
+        return str(row[0]) if row else "sql"
+
+    return await store.db_pool.runInteraction("get_event_edges_backend", _txn)
+
+
+async def _set_event_edges_backend(store: Any, backend: str) -> None:
+    def _txn(txn: Any) -> None:
+        txn.execute("UPDATE edge_backend SET backend = ? WHERE lock = 'X'", (backend,))
+        if txn.rowcount == 0:
+            txn.execute(
+                "INSERT INTO edge_backend (lock, backend) VALUES ('X', ?)",
+                (backend,),
+            )
+
+    await store.db_pool.runInteraction("set_event_edges_backend", _txn)
+
+
+async def _migrate_sql_edges_to_mtxdb(
+    store: Any, namespace: str, batch_size: int
+) -> dict[str, int]:
+    """Reconcile every SQL-backed event's edges into mtxdb.
+
+    The marker is not flipped here. Each event is compared against its
+    backward mtxdb record; only mismatches are rewritten (delete then put), so
+    a rerun after an interrupted migration is both safe and cheap.
+    """
+    total_edges = 0
+    changed_events = 0
+    last_event_id = ""
+
+    while True:
+
+        def _read(txn: Any) -> tuple[list[tuple[str, str]], dict[str, list[Any]]]:
+            txn.execute(
+                "SELECT event_id, room_id FROM events "
+                "WHERE event_id > ? ORDER BY event_id LIMIT ?",
+                (last_event_id, batch_size),
+            )
+            events = txn.fetchall()
+            if not events:
+                return [], {}
+
+            event_ids = [event_id for event_id, _room_id in events]
+            clause, args = make_in_list_sql_clause(
+                store.database_engine, "event_id", event_ids
+            )
+            txn.execute(
+                "SELECT event_id, prev_event_id, room_id, is_state "
+                f"FROM event_edges WHERE {clause}",
+                args,
+            )
+            edges_by_event: dict[str, list[Any]] = collections.defaultdict(list)
+            for event_id, prev_event_id, room_id, is_state in txn:
+                edges_by_event[event_id].append(
+                    (prev_event_id, bool(is_state), room_id)
+                )
+            return events, edges_by_event
+
+        events, edges_by_event = await store.db_pool.runInteraction(
+            "migrate_event_edges_read_sql", _read
+        )
+        if not events:
+            break
+
+        event_ids = [event_id for event_id, _room_id in events]
+        current = get_event_edges_backward_batch(namespace, event_ids)
+        to_delete: list[str] = []
+        rows_to_put: list[EdgeRow] = []
+
+        for event_id, room_id in events:
+            desired_rows = edges_by_event.get(event_id, [])
+            desired = {
+                (prev_event_id, is_state) for prev_event_id, is_state, _ in desired_rows
+            }
+            current_edges = current.get(event_id)
+            if desired != set(current_edges or ()):
+                changed_events += 1
+                if current_edges:
+                    to_delete.append(event_id)
+                rows_to_put.extend(
+                    (edge_room_id or room_id, event_id, prev_event_id, is_state)
+                    for prev_event_id, is_state, edge_room_id in desired_rows
+                )
+            total_edges += len(desired)
+
+        if to_delete:
+            delete_event_edges_batch(namespace, to_delete)
+        if rows_to_put:
+            put_event_edges_batch(namespace, rows_to_put, sync=True)
+
+        last_event_id = events[-1][0]
+
+    sync_now(pools=[Pool.EVENT_DAG])
+    return {"edges": total_edges, "changed_events": changed_events}
+
+
+async def _migrate_mtxdb_edges_to_sql(
+    store: Any, namespace: str, batch_size: int
+) -> dict[str, int]:
+    """Replace the SQL edge table with the mtxdb backward records.
+
+    mtxdb is the source while the marker says so, so stale SQL rows must be
+    removed rather than merged. The SQL copy is rebuilt in batches with an
+    upsert, making a rerun after an interruption idempotent.
+    """
+
+    def _clear(txn: Any) -> None:
+        txn.execute("DELETE FROM event_edges")
+        # The SQL-only background index update may have been skipped while
+        # mtxdb was authoritative. Recreate the composite key needed by the
+        # idempotent upserts below when migrating back to SQL.
+        txn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "event_edges_event_id_prev_event_id_idx "
+            "ON event_edges (event_id, prev_event_id)"
+        )
+        txn.execute("DROP INDEX IF EXISTS ev_edges_id")
+
+    await store.db_pool.runInteraction("migrate_event_edges_clear_sql", _clear)
+
+    total_edges = 0
+    last_event_id = ""
+
+    while True:
+
+        def _read(txn: Any) -> list[tuple[str, str]]:
+            txn.execute(
+                "SELECT event_id, room_id FROM events "
+                "WHERE event_id > ? ORDER BY event_id LIMIT ?",
+                (last_event_id, batch_size),
+            )
+            return txn.fetchall()
+
+        events = await store.db_pool.runInteraction(
+            "migrate_event_edges_read_events", _read
+        )
+        if not events:
+            break
+
+        current = get_event_edges_backward_batch(
+            namespace, [event_id for event_id, _room_id in events]
+        )
+        rows: list[tuple[str, str, str, bool]] = []
+        for event_id, room_id in events:
+            for prev_event_id, is_state in current.get(event_id) or ():
+                rows.append((event_id, prev_event_id, room_id, bool(is_state)))
+
+        if rows:
+
+            def _write(txn: Any) -> None:
+                store.db_pool.simple_upsert_many_txn(
+                    txn,
+                    table="event_edges",
+                    key_names=("event_id", "prev_event_id"),
+                    key_values=[
+                        (event_id, prev_event_id)
+                        for event_id, prev_event_id, _room_id, _is_state in rows
+                    ],
+                    value_names=("room_id", "is_state"),
+                    value_values=[
+                        (room_id, is_state)
+                        for _event_id, _prev_event_id, room_id, is_state in rows
+                    ],
+                )
+
+            await store.db_pool.runInteraction("migrate_event_edges_write_sql", _write)
+            total_edges += len(rows)
+
+        last_event_id = events[-1][0]
+
+    return {"edges": total_edges}
+
+
+async def _count_sql_event_edges(store: Any) -> int:
+    def _txn(txn: Any) -> int:
+        txn.execute("SELECT COUNT(*) FROM event_edges")
+        row = txn.fetchone()
+        return int(row[0]) if row else 0
+
+    return await store.db_pool.runInteraction("count_event_edges", _txn)
+
+
+async def _count_mtxdb_event_edges(
+    store: Any, namespace: str, batch_size: int = 1000
+) -> int:
+    total = 0
+    last_event_id = ""
+
+    while True:
+
+        def _read(txn: Any) -> list[str]:
+            txn.execute(
+                "SELECT event_id FROM events WHERE event_id > ? "
+                "ORDER BY event_id LIMIT ?",
+                (last_event_id, batch_size),
+            )
+            return [row[0] for row in txn]
+
+        event_ids = await store.db_pool.runInteraction(
+            "count_mtxdb_edges_read_events", _read
+        )
+        if not event_ids:
+            return total
+
+        backward = get_event_edges_backward_batch(namespace, event_ids)
+        total += sum(len(edges or ()) for edges in backward.values())
+        last_event_id = event_ids[-1]
+
+
+async def _count_event_edges(
+    store: Any, backend: str, namespace: str
+) -> tuple[int, int]:
+    """Return ``(edges, events)`` for the given backend."""
+
+    def _count_events(txn: Any) -> int:
+        txn.execute("SELECT COUNT(*) FROM events")
+        row = txn.fetchone()
+        return int(row[0]) if row else 0
+
+    events = await store.db_pool.runInteraction("count_event_rows", _count_events)
+    if backend == "sql":
+        return await _count_sql_event_edges(store), events
+    return await _count_mtxdb_event_edges(store, namespace), events
+
+
+async def migrate_event_edges(
+    hs: HomeServer,
+    *,
+    target: str,
+    source: str | None = None,
+    force: bool = False,
+    batch_size: int = 1000,
+    mtxdb_path: str | None = None,
+) -> dict[str, int | str]:
+    """Move event edges between the SQL table and mtxdb.
+
+    The operator must stop Synapse first. ``target`` must be the backend the
+    process is configured to use after the migration. The stored marker is the
+    default source; pass ``source`` to override a stale marker. The marker is
+    flipped only after the copy is verified.
+    """
+    if target not in ("sql", "mtxdb"):
+        raise ValueError(f"unknown event-edges backend: {target!r}")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+
+    store = hs.get_datastores().main
+    namespace = store._embedded_db_namespace
+    stored = await _get_event_edges_backend(store)
+
+    if source is None:
+        source = stored
+    if source not in ("sql", "mtxdb"):
+        raise ValueError(f"unknown source event-edges backend: {source!r}")
+
+    # mtxdb must be open for either side of the migration. Open it read-only
+    # when it is only the source; the target side must be writable.
+    if target == "mtxdb" or source == "mtxdb":
+        if not open_embedded_event_edges_engine(hs):
+            path = mtxdb_path or hs.config.database.embedded_db_path
+            if not path:
+                raise RuntimeError(
+                    "mtxdb is not configured; set embedded_db.engine/path or "
+                    "pass --mtxdb-path"
+                )
+            from synapse.storage.databases.embedded_engine import get_embedded_engine
+            from synapse.storage.databases.main.embedded_common import (
+                _set_engine_configured,
+            )
+
+            engine = get_embedded_engine("mtxdb")
+            if target == "mtxdb":
+                engine.open_client(path)
+            else:
+                engine.open_client_read_only(path)
+            _set_engine_configured()
+
+    if source == target:
+        edges, events = await _count_event_edges(store, target, namespace)
+        if edges == 0 and events > 1 and not force:
+            raise RuntimeError(
+                f"{target} has no event edges but the database has {events} events; "
+                "refusing to adopt it. Pass --force if that is genuinely intended."
+            )
+        await _set_event_edges_backend(store, target)
+        return {
+            "source": source,
+            "target": target,
+            "edges": edges,
+            "changed_events": 0,
+            "already": 1,
+        }
+
+    source_edges, _source_events = await _count_event_edges(store, source, namespace)
+    target_edges, _target_events = await _count_event_edges(store, target, namespace)
+    if source_edges == 0 and target_edges > 0 and not force:
+        raise RuntimeError(
+            f"{source} has no event edges but {target} has {target_edges}; the "
+            f"marker may be stale. Pass --from {target} to adopt the existing "
+            f"data, or --force to overwrite it with an empty {source}."
+        )
+
+    if target == "mtxdb":
+        result = await _migrate_sql_edges_to_mtxdb(store, namespace, batch_size)
+        source_edges = await _count_sql_event_edges(store)
+        if source_edges != result["edges"]:
+            raise RuntimeError(
+                "event-edges migration verification failed: "
+                f"SQL has {source_edges} rows but {result['edges']} were reconciled"
+            )
+    else:
+        result = await _migrate_mtxdb_edges_to_sql(store, namespace, batch_size)
+        target_edges = await _count_sql_event_edges(store)
+        if target_edges != result["edges"]:
+            raise RuntimeError(
+                "event-edges migration verification failed: "
+                f"mtxdb had {result['edges']} rows but SQL has {target_edges}"
+            )
+
+    await _set_event_edges_backend(store, target)
+    return {
+        "source": source,
+        "target": target,
+        "edges": result["edges"],
+        "changed_events": result.get("changed_events", 0),
+        "already": 0,
+    }
 
 
 def put_event_edges_batch(
@@ -639,10 +755,16 @@ def put_event_edges_batch(
     rows: Iterable[EdgeRow],
     *,
     sync: bool = False,
+    transaction: "MtxdbTransaction | None" = None,
 ) -> None:
     """Batch put event edges into mtxdb.
 
     `rows`: `(room_id, event_id, prev_event_id, is_state)`.
+
+    With a `transaction`, the write is staged in the persist's existing mtxdb
+    transaction instead of applied immediately. It becomes visible when that
+    transaction commits, which happens before the SQL COMMIT, so a committed
+    event cannot be left without edges. `sync` is ignored for staged writes.
     """
     row_list = list(rows)
     if not row_list:
@@ -652,12 +774,19 @@ def put_event_edges_batch(
         from synapse.synapse_rust.mtxdb_engine import event_edges_put
 
         _et = time.monotonic()
+        if transaction is not None:
+            transaction.event_edges_put(namespace, row_list)
+            elapsed = time.monotonic() - _et
+            ffi_timing("ffi_event_edges_put", elapsed)
+            ffi_count("event_edges_put_rows", len(row_list))
+            ffi_batch_size("event_edges_put", len(row_list))
+            return
+
         # Under a shared WAL, `event_edges_put` runs the optimistic loop
         # `run_edge_occ` internally: it replays collection-version conflicts up
         # to `MAX_OCC_ATTEMPTS` and only then raises a retryable
-        # `BlockingIOError`, which nothing else here would catch -- unlike the
-        # forward-outbox and generation-delta writes, which already retry. Do
-        # the same for event persistence rather than surfacing contention.
+        # `BlockingIOError`. Retry here rather than surfacing transient
+        # contention to event persistence.
         _retry_on_contention(lambda: event_edges_put(namespace, row_list))
         elapsed = time.monotonic() - _et
         ffi_timing("ffi_event_edges_put", elapsed)
@@ -869,576 +998,16 @@ def get_event_edges_backward_batch(
 
 def get_event_edges_forward_batch(
     namespace: str,
-    room_id_or_prev_event_ids: str | list[str],
-    expected_source_version: int | None = None,
-    prev_event_ids: list[str] | None = None,
-) -> ForwardEdgeMap:
-    """Reads forward child edges for `prev_event_ids`.
-
-    ``stale`` is set when the embedded index cannot satisfy the requested
-    source version. A missing key in a non-stale result means that the queried
-    event is not present in the index.
-    """
-    if prev_event_ids is None:
-        # Keep the established helper contract for benchmarks and tests. The
-        # gated path below is used by production callers that have room and
-        # source-version context.
-        legacy_prev_event_ids = cast(list[str], room_id_or_prev_event_ids)
-        if not legacy_prev_event_ids:
-            return ForwardEdgeMap()
-        with mirror_timing("event_edges_get_forward"):
-            from synapse.synapse_rust.mtxdb_engine import event_edges_get_forward
-
-            results = _retry_on_contention(
-                lambda: event_edges_get_forward(namespace, legacy_prev_event_ids)
-            )
-            return ForwardEdgeMap(results)
-
-    if (
-        not isinstance(room_id_or_prev_event_ids, str)
-        or expected_source_version is None
-    ):
-        raise TypeError("room_id and expected_source_version are required together")
-    room_id = room_id_or_prev_event_ids
+    prev_event_ids: list[str],
+) -> dict[str, list[str] | None]:
+    """Read forward child edges for `prev_event_ids` from the authoritative store."""
     if not prev_event_ids:
-        return ForwardEdgeMap()
-
+        return {}
     with mirror_timing("event_edges_get_forward"):
-        from synapse.synapse_rust.mtxdb_engine import event_edges_get_forward_gated
+        from synapse.synapse_rust.mtxdb_engine import event_edges_get_forward
 
-        _et = time.monotonic()
-        gated_results: Any = _retry_on_contention(
-            lambda: event_edges_get_forward_gated(
-                namespace, room_id, expected_source_version, prev_event_ids
-            )
+        results = _retry_on_contention(
+            lambda: event_edges_get_forward(namespace, prev_event_ids)
         )
-        elapsed = time.monotonic() - _et
-        ffi_timing("ffi_event_edges_get_forward", elapsed)
         ffi_batch_size("event_edges_get_forward", len(prev_event_ids))
-
-        status, *payload = gated_results
-        logger.debug(
-            "get_event_edges_forward_batch: room_id=%s expected_source_version=%s count=%s status=%s",
-            room_id,
-            expected_source_version,
-            len(prev_event_ids),
-            status,
-        )
-        if status == "version_mismatch":
-            ffi_count("event_edges_version_mismatches", 1)
-            return ForwardEdgeMap(stale=True)
-        if status != "hit":
-            raise RuntimeError(f"unexpected forward edge result: {status!r}")
-        return ForwardEdgeMap(cast(list[tuple[str, list[str] | None]], payload[0]))
-
-
-async def drain_edge_index_outbox(
-    store: Any,
-    limit: int = 256,
-    *,
-    namespace: str = "synapse",
-    room_id: str | None = None,
-) -> bool:
-    """Publish one room's durable edge mutations into the active FWD generation.
-
-    SQL rows are acknowledged only after Rust commits both the FWD updates and
-    publication watermark in one mtxdb transaction. The worker lock is held
-    before the batch is re-read, preventing stale snapshots from racing a
-    second drainer or a generation swap.
-    """
-    if limit <= 0:
-        return False
-
-    def _room(txn: Any) -> str | None:
-        if room_id is None:
-            txn.execute(
-                "SELECT room_id FROM edge_index_outbox "
-                "ORDER BY room_id, source_version LIMIT 1"
-            )
-        else:
-            txn.execute(
-                "SELECT room_id FROM edge_index_outbox "
-                "WHERE room_id = ? ORDER BY source_version LIMIT 1",
-                (room_id,),
-            )
-        row = txn.fetchone()
-        return None if row is None else str(row[0])
-
-    room_id = await store.db_pool.runInteraction("edge_outbox_room", _room)
-    if room_id is None:
-        return False
-
-    locks = store.hs.get_worker_locks_handler()
-    async with locks.acquire_lock("embedded_edge_index_outbox", room_id):
-        from synapse.synapse_rust.mtxdb_engine import (
-            event_edges_apply_forward_outbox,
-            room_forward_meta_get,
-        )
-
-        meta = _retry_on_contention(lambda: room_forward_meta_get(room_id))
-        generation, published = meta if meta is not None else (0, 0)
-
-        def _rows(txn: Any) -> list[tuple[str, int, str, str]]:
-            txn.execute(
-                "SELECT event_id, source_version, prev_event_id, operation "
-                "FROM edge_index_outbox "
-                "WHERE room_id = ? AND source_version > ? "
-                "ORDER BY source_version, event_id, prev_event_id, operation "
-                "LIMIT ?",
-                (room_id, published, limit),
-            )
-            rows = [(str(a), int(b), str(c), str(d)) for a, b, c, d in txn]
-            if not rows:
-                return []
-
-            # Never publish a watermark while only part of a source-version
-            # group has been applied: several edge rows intentionally share
-            # one room version. Complete the final group even if it takes the
-            # batch over `limit`.
-            max_version = max(row[1] for row in rows)
-            txn.execute(
-                "SELECT event_id, source_version, prev_event_id, operation "
-                "FROM edge_index_outbox "
-                "WHERE room_id = ? AND source_version > ? "
-                "AND source_version <= ? "
-                "ORDER BY source_version, event_id, prev_event_id, operation",
-                (room_id, published, max_version),
-            )
-            return [(str(a), int(b), str(c), str(d)) for a, b, c, d in txn]
-
-        rows = await store.db_pool.runInteraction("edge_outbox_rows", _rows)
-
-        def _ack_through(txn: Any, published_version: int) -> int:
-            now_ms = int(time.time() * 1000)
-            txn.execute(
-                "SELECT MIN(last_replayed_source_version) "
-                "FROM room_edge_rebuild_checkpoints "
-                "WHERE room_id = ? AND lease_expires_at_ms >= ?",
-                (room_id, now_ms),
-            )
-            row = txn.fetchone()
-            safe_version = (
-                published_version
-                if row is None or row[0] is None
-                else min(published_version, int(row[0]))
-            )
-            txn.execute(
-                "DELETE FROM edge_index_outbox "
-                "WHERE room_id = ? AND source_version <= ?",
-                (room_id, safe_version),
-            )
-            return txn.rowcount
-
-        if not rows:
-            # A process can crash after the mtxdb commit and before the SQL
-            # acknowledgement. The watermark makes those rows already
-            # published; remove them so they do not permanently block the
-            # room's queue.
-            deleted = await store.db_pool.runInteraction(
-                "edge_outbox_ack_stale",
-                _ack_through,
-                published,
-            )
-            return bool(deleted)
-
-        max_version = max(row[1] for row in rows)
-        ffi_rows = [
-            (event_id, prev_id, operation) for event_id, _, prev_id, operation in rows
-        ]
-        _retry_on_contention(
-            lambda: event_edges_apply_forward_outbox(
-                namespace, room_id, generation, max_version, ffi_rows
-            )
-        )
-
-        await store.db_pool.runInteraction("edge_outbox_ack", _ack_through, max_version)
-        ffi_count("event_edges_outbox_rows", len(rows))
-        return True
-
-
-async def repair_edge_index_from_sql(
-    store: Any,
-    namespace: str,
-    room_id: str,
-    prev_event_id: str,
-    event_ids: list[str],
-) -> None:
-    """Repair a SQL-fallback miss through the ordered FWD outbox.
-
-    The PREV mirror is still queued for compatibility, while the repair is
-    recorded as a fresh SQL outbox version. Draining that room applies all
-    earlier pending changes before it advances the FWD completeness watermark;
-    a parent-only repair must never claim the room-wide index is complete.
-    """
-
-    def _enqueue_repair(txn: Any) -> int | None:
-        clause, clause_args = make_in_list_sql_clause(
-            txn.database_engine, "event_id", event_ids
-        )
-        txn.execute(
-            f"SELECT event_id FROM edge_index_outbox "
-            f"WHERE room_id = ? AND prev_event_id = ? "
-            f"AND operation = 'insert' AND {clause}",
-            (room_id, prev_event_id, *clause_args),
-        )
-        pending = {str(row[0]) for row in txn}
-        event_ids_to_repair = [
-            event_id for event_id in event_ids if event_id not in pending
-        ]
-        if not event_ids_to_repair:
-            return None
-        return record_edge_index_repairs_txn(
-            store.db_pool, txn, room_id, prev_event_id, event_ids_to_repair
-        )
-
-    await store.db_pool.runInteraction("record_edge_index_repair", _enqueue_repair)
-    rows = await store.db_pool.simple_select_list(
-        table="event_edges",
-        keyvalues={"prev_event_id": prev_event_id},
-        retcols=("event_id", "is_state"),
-        desc="repair_edge_index_from_sql",
-    )
-    # SQLite stores BOOLEAN as 0/1, and `event_edges_put` wants a real bool.
-    queue_edge_write(
-        namespace,
-        [
-            (room_id, event_id, prev_event_id, bool(is_state))
-            for event_id, is_state in rows
-        ],
-    )
-    # The ordinary worker continues draining other rooms. Target this room so
-    # a pending or newly-created repair can make the next gated read an
-    # embedded hit now.
-    # Any incomplete backlog remains durable in SQL and is picked up by the
-    # regular worker; the current request already has its correct SQL result.
-    await drain_edge_index_outbox(store, namespace=namespace, room_id=room_id)
-
-
-async def acquire_rebuild_checkpoint(
-    store: Any,
-    room_id: str,
-    start_source_version: int,
-    *,
-    rebuild_id: str | None = None,
-    lease_duration_ms: int = 60_000,
-) -> str:
-    """Register a durable outbox consumer lease for a room rebuild."""
-    rebuild_id = rebuild_id or str(uuid.uuid4())
-    expires_at = int(time.time() * 1000) + lease_duration_ms
-
-    def _insert(txn: Any) -> None:
-        txn.execute(
-            "INSERT INTO room_edge_rebuild_checkpoints "
-            "(room_id, rebuild_id, start_source_version, "
-            "last_replayed_source_version, lease_expires_at_ms) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (
-                room_id,
-                rebuild_id,
-                start_source_version,
-                start_source_version,
-                expires_at,
-            ),
-        )
-
-    await store.db_pool.runInteraction("acquire_rebuild_checkpoint", _insert)
-    return rebuild_id
-
-
-async def heartbeat_rebuild_checkpoint(
-    store: Any,
-    room_id: str,
-    rebuild_id: str,
-    replayed_source_version: int,
-    *,
-    lease_duration_ms: int = 60_000,
-) -> None:
-    """Advance a rebuild lease monotonically and extend its expiry."""
-    expires_at = int(time.time() * 1000) + lease_duration_ms
-
-    def _update(txn: Any) -> None:
-        txn.execute(
-            "UPDATE room_edge_rebuild_checkpoints "
-            "SET last_replayed_source_version = CASE "
-            "WHEN last_replayed_source_version < ? THEN ? "
-            "ELSE last_replayed_source_version END, "
-            "lease_expires_at_ms = ? "
-            "WHERE room_id = ? AND rebuild_id = ?",
-            (
-                replayed_source_version,
-                replayed_source_version,
-                expires_at,
-                room_id,
-                rebuild_id,
-            ),
-        )
-        if txn.rowcount != 1:
-            raise RuntimeError("edge rebuild checkpoint disappeared")
-
-    await store.db_pool.runInteraction("heartbeat_rebuild_checkpoint", _update)
-
-
-async def release_rebuild_checkpoint(store: Any, room_id: str, rebuild_id: str) -> None:
-    """Release a rebuild lease; the next drain can reclaim retained rows."""
-
-    def _delete(txn: Any) -> None:
-        txn.execute(
-            "DELETE FROM room_edge_rebuild_checkpoints "
-            "WHERE room_id = ? AND rebuild_id = ?",
-            (room_id, rebuild_id),
-        )
-
-    await store.db_pool.runInteraction("release_rebuild_checkpoint", _delete)
-
-
-async def enqueue_retired_generation(store: Any, room_id: str, generation: int) -> None:
-    """Record a generation for deferred GC; do not delete it yet."""
-    retired_at_ms = int(time.time() * 1000)
-
-    def _insert(txn: Any) -> None:
-        txn.execute(
-            "INSERT INTO room_edge_retired_generations "
-            "(room_id, generation, retired_at_ms) VALUES (?, ?, ?) "
-            "ON CONFLICT (room_id, generation) DO NOTHING",
-            (room_id, generation, retired_at_ms),
-        )
-
-    await store.db_pool.runInteraction("enqueue_retired_edge_generation", _insert)
-
-
-async def gc_retired_forward_generations(
-    store: Any,
-    *,
-    grace_period_ms: int = 600_000,
-    limit: int = 32,
-) -> bool:
-    """Drop retired generations after the configured reader grace period."""
-    cutoff_ms = int(time.time() * 1000) - grace_period_ms
-
-    def _candidates(txn: Any) -> list[tuple[str, int]]:
-        txn.execute(
-            "SELECT room_id, generation FROM room_edge_retired_generations "
-            "WHERE retired_at_ms <= ? ORDER BY retired_at_ms LIMIT ?",
-            (cutoff_ms, limit),
-        )
-        return [(str(room_id), int(generation)) for room_id, generation in txn]
-
-    candidates = await store.db_pool.runInteraction(
-        "fetch_retired_edge_generations", _candidates
-    )
-    if not candidates:
-        return False
-
-    from synapse.synapse_rust.mtxdb_engine import (
-        event_edges_drop_generation,
-        room_forward_meta_get,
-    )
-
-    did_work = False
-    locks = store.hs.get_worker_locks_handler()
-    for room_id, retired_generation in candidates:
-        async with locks.acquire_lock("embedded_edge_index_outbox", room_id):
-            meta = _retry_on_contention(lambda: room_forward_meta_get(room_id))
-            if meta is None or meta[0] <= retired_generation:
-                continue
-
-            _retry_on_contention(
-                lambda: event_edges_drop_generation(room_id, retired_generation)
-            )
-
-            def _ack(txn: Any) -> None:
-                txn.execute(
-                    "DELETE FROM room_edge_retired_generations "
-                    "WHERE room_id = ? AND generation = ?",
-                    (room_id, retired_generation),
-                )
-
-            await store.db_pool.runInteraction("ack_retired_edge_generation", _ack)
-            did_work = True
-
-    return did_work
-
-
-async def rebuild_room_forward_index(
-    store: Any,
-    room_id: str,
-    *,
-    batch_size: int = 1000,
-    namespace: str = "synapse",
-) -> bool:
-    """Build and publish a complete forward index generation for one room."""
-    if batch_size <= 0:
-        raise ValueError("batch_size must be positive")
-
-    from synapse.synapse_rust.mtxdb_engine import (
-        event_edges_apply_forward_generation_delta,
-        event_edges_build_generation_batch,
-        event_edges_reset_generation,
-        room_forward_meta_get,
-        room_forward_meta_swap,
-    )
-
-    locks = store.hs.get_worker_locks_handler()
-    # Register at zero while taking the initial snapshot version. This closes
-    # the window in which a drainer could truncate the stream before the lease
-    # exists; the checkpoint is advanced to the snapshot version afterwards.
-    async with locks.acquire_lock("embedded_edge_index_outbox", room_id):
-        meta = _retry_on_contention(lambda: room_forward_meta_get(room_id))
-        active_generation = meta[0] if meta is not None else 0
-        rebuild_id = await acquire_rebuild_checkpoint(store, room_id, 0)
-        try:
-
-            def _source_version(txn: Any) -> int:
-                txn.execute(
-                    "SELECT source_version FROM room_edge_source_version "
-                    "WHERE room_id = ?",
-                    (room_id,),
-                )
-                row = txn.fetchone()
-                return int(row[0]) if row else 0
-
-            start_version = await store.db_pool.runInteraction(
-                "get_rebuild_source_version", _source_version
-            )
-            await heartbeat_rebuild_checkpoint(
-                store, room_id, rebuild_id, start_version
-            )
-        except BaseException:
-            await release_rebuild_checkpoint(store, room_id, rebuild_id)
-            raise
-
-    target_generation = active_generation + 1
-    last_prev_id = ""
-
-    try:
-        _retry_on_contention(
-            lambda: event_edges_reset_generation(room_id, target_generation)
-        )
-        # Select parent keys first, then fetch every child for those parents.
-        # This prevents a single parent's adjacency list being split across
-        # build batches and overwritten by the next batch.
-        while True:
-
-            def _parent_batch(txn: Any) -> list[str]:
-                txn.execute(
-                    "SELECT DISTINCT ee.prev_event_id "
-                    "FROM event_edges AS ee JOIN events AS ev "
-                    "ON ev.event_id = ee.event_id "
-                    "WHERE ev.room_id = ? AND ee.prev_event_id > ? "
-                    "ORDER BY ee.prev_event_id LIMIT ?",
-                    (room_id, last_prev_id, batch_size),
-                )
-                return [str(row[0]) for row in txn]
-
-            parents = await store.db_pool.runInteraction(
-                "fetch_rebuild_parents", _parent_batch
-            )
-            if not parents:
-                break
-
-            first_parent, last_parent = parents[0], parents[-1]
-
-            def _edge_batch(txn: Any) -> list[tuple[str, str]]:
-                txn.execute(
-                    "SELECT ee.prev_event_id, ee.event_id "
-                    "FROM event_edges AS ee JOIN events AS ev "
-                    "ON ev.event_id = ee.event_id "
-                    "WHERE ev.room_id = ? AND ee.prev_event_id >= ? "
-                    "AND ee.prev_event_id <= ? "
-                    "ORDER BY ee.prev_event_id, ee.event_id",
-                    (room_id, first_parent, last_parent),
-                )
-                return [(str(prev), str(child)) for prev, child in txn]
-
-            raw_edges = await store.db_pool.runInteraction(
-                "fetch_rebuild_edges", _edge_batch
-            )
-            grouped: dict[str, list[str]] = collections.defaultdict(list)
-            for prev_id, child_id in raw_edges:
-                grouped[prev_id].append(child_id)
-            _retry_on_contention(
-                lambda: event_edges_build_generation_batch(
-                    namespace, room_id, target_generation, list(grouped.items())
-                )
-            )
-            last_prev_id = last_parent
-
-        last_replayed = start_version
-        while True:
-
-            def _outbox_batch(txn: Any) -> list[tuple[str, int, str, str]]:
-                txn.execute(
-                    "SELECT event_id, source_version, prev_event_id, operation "
-                    "FROM edge_index_outbox WHERE room_id = ? "
-                    "AND source_version > ? ORDER BY source_version, event_id "
-                    "LIMIT ?",
-                    (room_id, last_replayed, batch_size),
-                )
-                rows = [(str(a), int(b), str(c), str(d)) for a, b, c, d in txn]
-                if not rows:
-                    return []
-                max_version = max(row[1] for row in rows)
-                txn.execute(
-                    "SELECT event_id, source_version, prev_event_id, operation "
-                    "FROM edge_index_outbox WHERE room_id = ? "
-                    "AND source_version > ? AND source_version <= ? "
-                    "ORDER BY source_version, event_id, prev_event_id, operation",
-                    (room_id, last_replayed, max_version),
-                )
-                return [(str(a), int(b), str(c), str(d)) for a, b, c, d in txn]
-
-            rows = await store.db_pool.runInteraction(
-                "fetch_rebuild_outbox", _outbox_batch
-            )
-            if not rows:
-                break
-            max_version = max(row[1] for row in rows)
-            _retry_on_contention(
-                lambda: event_edges_apply_forward_generation_delta(
-                    namespace,
-                    room_id,
-                    target_generation,
-                    [(row[0], row[2], row[3]) for row in rows],
-                )
-            )
-            last_replayed = max_version
-            await heartbeat_rebuild_checkpoint(
-                store, room_id, rebuild_id, last_replayed
-            )
-
-        async with locks.acquire_lock("embedded_edge_index_outbox", room_id):
-
-            def _final(txn: Any) -> tuple[int, list[tuple[str, str, str]]]:
-                txn.execute(
-                    "SELECT source_version FROM room_edge_source_version "
-                    "WHERE room_id = ?",
-                    (room_id,),
-                )
-                row = txn.fetchone()
-                current_version = int(row[0]) if row else 0
-                txn.execute(
-                    "SELECT event_id, prev_event_id, operation "
-                    "FROM edge_index_outbox WHERE room_id = ? "
-                    "AND source_version > ? ORDER BY source_version, event_id",
-                    (room_id, last_replayed),
-                )
-                return current_version, [(str(a), str(b), str(c)) for a, b, c in txn]
-
-            final_version, final_rows = await store.db_pool.runInteraction(
-                "fetch_final_rebuild_outbox", _final
-            )
-            if final_rows:
-                _retry_on_contention(
-                    lambda: event_edges_apply_forward_generation_delta(
-                        namespace, room_id, target_generation, final_rows
-                    )
-                )
-            _retry_on_contention(
-                lambda: room_forward_meta_swap(
-                    room_id, target_generation, final_version
-                )
-            )
-            await enqueue_retired_generation(store, room_id, active_generation)
-        return True
-    finally:
-        await release_rebuild_checkpoint(store, room_id, rebuild_id)
+        return dict(results)

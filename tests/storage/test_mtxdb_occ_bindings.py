@@ -71,6 +71,22 @@ retry.expect_collection_version(0, collection, current)
 retry.put(0, collection, key, b"retried")
 retry.commit()
 assert m.recheck_collection_version(0, collection, current + 1)
+
+# Event persistence needs a stale staged commit to enter the SQL transaction's
+# retry path, while the generic commit above retains its typed StaleReadError.
+retryable = txn()
+records, expected = retryable.get_with_collection_version(0, collection, [key])
+writer = txn()
+writer.put(0, collection, other_key, b"newer")
+writer.commit()
+retryable.expect_collection_version(0, collection, expected)
+retryable.put(0, collection, key, b"must-not-publish")
+try:
+    retryable.commit_retryable()
+except BlockingIOError:
+    pass
+else:
+    raise AssertionError("stale retryable transaction unexpectedly committed")
 """
 
 

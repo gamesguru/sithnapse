@@ -1,5 +1,13 @@
 # Family 4 map: `event_edges`, `edge_index_outbox`, `room_edge_source_version`
 
+> **Historical status (2026-10-27).** The outbox, source-version clock, SQL
+> fallback, repair-from-SQL path, and generation machinery described below have
+> been removed. Edges now use exactly one authoritative backend per config (SQL
+> or mtxdb), with a manual `synapse_event_edges_migrate --to sql|mtxdb` switch
+> and a startup marker check. The measurements and call-site map are retained as
+> a snapshot of the pre-cutover tree; they are not a description of current
+> code.
+
 Dependency map for B2 family 4 (see `perf-track-b.md`). Only the measurement
 labels are implemented (`a912896dd7`). Line numbers are from the tree at the
 time of writing.

@@ -32,7 +32,6 @@ class _BackgroundUpdates:
     REPLACE_STREAM_ORDERING_COLUMN = "replace_stream_ordering_column"
 
     EVENT_EDGES_REPLACE_INDEX = "event_edges_replace_index"
-    EVENT_EDGES_MIGRATE_MTXDB = "event_edges_migrate_mtxdb"
 
     EVENTS_POPULATE_STATE_KEY_REJECTIONS = "events_populate_state_key_rejections"
 

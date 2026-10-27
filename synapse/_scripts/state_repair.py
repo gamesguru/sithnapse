@@ -15,7 +15,7 @@ from twisted.internet import defer, reactor as reactor_
 from synapse.config.homeserver import HomeServerConfig
 from synapse.server import HomeServer
 from synapse.storage import DataStore
-from synapse.storage.database import LoggingTransaction
+from synapse.storage.database import LoggingTransaction, make_in_list_sql_clause
 from synapse.types import ISynapseReactor
 
 reactor = cast(ISynapseReactor, reactor_)
@@ -74,7 +74,9 @@ def _event_rows(rows: Sequence[tuple[Any, ...]]) -> list[dict[str, Any]]:
     ]
 
 
-def _discover_room_txn(txn: LoggingTransaction, room_id: str) -> dict[str, Any]:
+def _discover_room_txn(
+    txn: LoggingTransaction, room_id: str, store: Any
+) -> dict[str, Any]:
     txn.execute("SELECT room_version FROM rooms WHERE room_id = ?", (room_id,))
     room_row = txn.fetchone()
 
@@ -118,15 +120,42 @@ def _discover_room_txn(txn: LoggingTransaction, room_id: str) -> dict[str, Any]:
     )
     rejected_count = _count_from_row(txn.fetchone())
 
-    txn.execute(
-        """
-        SELECT COUNT(*) FROM event_edges AS edge
-        LEFT JOIN events AS prev ON prev.event_id = edge.prev_event_id
-        WHERE edge.room_id = ? AND prev.event_id IS NULL
-        """,
-        (room_id,),
-    )
-    missing_prev_event_edges = _count_from_row(txn.fetchone())
+    if getattr(store, "_embedded_event_edges_enabled", False):
+        from synapse.storage.databases.main.embedded_event_edges import (
+            get_event_edges_backward_batch,
+        )
+
+        txn.execute("SELECT event_id FROM events WHERE room_id = ?", (room_id,))
+        room_event_ids = [row[0] for row in txn]
+        backward = get_event_edges_backward_batch(
+            store._embedded_db_namespace, room_event_ids
+        )
+        prev_event_ids = [
+            prev_event_id
+            for edges in backward.values()
+            if edges
+            for prev_event_id, _is_state in edges
+        ]
+        missing_prev_event_edges = 0
+        if prev_event_ids:
+            clause, args = make_in_list_sql_clause(
+                store.database_engine, "event_id", list(set(prev_event_ids))
+            )
+            txn.execute(f"SELECT event_id FROM events WHERE {clause}", args)
+            existing = {row[0] for row in txn}
+            missing_prev_event_edges = sum(
+                1 for prev_event_id in prev_event_ids if prev_event_id not in existing
+            )
+    else:
+        txn.execute(
+            """
+            SELECT COUNT(*) FROM event_edges AS edge
+            LEFT JOIN events AS prev ON prev.event_id = edge.prev_event_id
+            WHERE edge.room_id = ? AND prev.event_id IS NULL
+            """,
+            (room_id,),
+        )
+        missing_prev_event_edges = _count_from_row(txn.fetchone())
 
     return {
         "room_id": room_id,
@@ -219,6 +248,7 @@ async def _run_command(
                     "synapse_state_repair_check_room",
                     _discover_room_txn,
                     room_id,
+                    store,
                 )
             )
         elif command == "list-rejected":

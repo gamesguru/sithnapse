@@ -22,15 +22,12 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use mtxdb::{DatabaseTransaction, NodeData, NodeId, ShardType, StorageEngine};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyTuple};
-use pyo3::IntoPyObjectExt;
+use pyo3::types::PyDict;
 use sha2::{Digest, Sha256};
 
 use super::mtxdb_syn::{
-    assert_writable, auth_chain_db, begin_internal_transaction, decode_room_forward_meta,
-    encode_room_forward_meta, event_locator_collection_id, event_node_id, forward_edges_room_id,
-    map_read_storage_error, map_transaction_error, map_transaction_io_error, prev_edges_room_id,
-    room_forward_meta_node_id, room_forward_meta_put, ROOM_FORWARD_META_COLLECTION,
+    assert_writable, auth_chain_db, begin_internal_transaction, event_locator_collection_id,
+    event_node_id, map_read_storage_error, map_transaction_error, prev_edges_room_id,
 };
 
 /// Records read together with the per-record write versions the caller must
@@ -126,149 +123,6 @@ impl EdgeWriteTarget for DatabaseTransaction<'_> {
     }
 
     fn edge_expect_record_version(
-        &self,
-        collection: &[u8; 16],
-        node_id: &NodeId,
-        version: Option<u64>,
-    ) -> Result<(), mtxdb::storage::StorageError> {
-        match version {
-            Some(version) => self
-                .expect_record_version(ShardType::Edges, *collection, *node_id, version)
-                .map_err(mtxdb::storage::StorageError::Io),
-            None => Ok(()),
-        }
-    }
-}
-
-trait ForwardWriteTarget {
-    fn forward_get_many(
-        &self,
-        collection: &[u8; 16],
-        ids: &[NodeId],
-    ) -> Result<Vec<Option<NodeData>>, mtxdb::storage::StorageError>;
-    fn forward_put_many(
-        &self,
-        collection: [u8; 16],
-        pairs: Vec<(NodeId, NodeData)>,
-    ) -> Result<(), mtxdb::storage::StorageError>;
-    fn forward_put_meta(
-        &self,
-        room_id: &str,
-        generation: u32,
-        published_source_version: u64,
-    ) -> Result<(), mtxdb::storage::StorageError>;
-
-    /// Read records together with each record's write version. See
-    /// [`EdgeWriteTarget::edge_get_record_versions`].
-    fn forward_get_record_versions(
-        &self,
-        collection: &[u8; 16],
-        ids: &[NodeId],
-    ) -> VersionedEdgeRead {
-        self.forward_get_many(collection, ids)
-            .map(|found| (found, None))
-    }
-
-    /// Stage a precondition that `node_id`'s write version is unchanged at
-    /// commit. See [`EdgeWriteTarget::edge_expect_record_version`].
-    fn forward_expect_record_version(
-        &self,
-        collection: &[u8; 16],
-        node_id: &NodeId,
-        version: Option<u64>,
-    ) -> Result<(), mtxdb::storage::StorageError> {
-        let _ = (collection, node_id, version);
-        Ok(())
-    }
-}
-
-impl ForwardWriteTarget for mtxdb::PackfileStorage {
-    fn forward_get_many(
-        &self,
-        collection: &[u8; 16],
-        ids: &[NodeId],
-    ) -> Result<Vec<Option<NodeData>>, mtxdb::storage::StorageError> {
-        StorageEngine::get_many(self, collection, ids)
-    }
-
-    fn forward_put_many(
-        &self,
-        collection: [u8; 16],
-        pairs: Vec<(NodeId, NodeData)>,
-    ) -> Result<(), mtxdb::storage::StorageError> {
-        StorageEngine::put_many(self, &collection, &pairs).map(|_| ())
-    }
-
-    fn forward_put_meta(
-        &self,
-        room_id: &str,
-        generation: u32,
-        published_source_version: u64,
-    ) -> Result<(), mtxdb::storage::StorageError> {
-        StorageEngine::put_many(
-            self,
-            &ROOM_FORWARD_META_COLLECTION,
-            &[(
-                room_forward_meta_node_id(room_id),
-                NodeData::from_slice(&encode_room_forward_meta(
-                    generation,
-                    published_source_version,
-                )),
-            )],
-        )
-        .map(|_| ())
-    }
-}
-
-impl ForwardWriteTarget for DatabaseTransaction<'_> {
-    fn forward_get_many(
-        &self,
-        collection: &[u8; 16],
-        ids: &[NodeId],
-    ) -> Result<Vec<Option<NodeData>>, mtxdb::storage::StorageError> {
-        self.get(ShardType::Edges, collection, ids)
-    }
-
-    fn forward_put_many(
-        &self,
-        collection: [u8; 16],
-        pairs: Vec<(NodeId, NodeData)>,
-    ) -> Result<(), mtxdb::storage::StorageError> {
-        for (node, data) in pairs {
-            self.put(ShardType::Edges, collection, node, &data)
-                .map_err(mtxdb::storage::StorageError::Io)?;
-        }
-        Ok(())
-    }
-
-    fn forward_put_meta(
-        &self,
-        room_id: &str,
-        generation: u32,
-        published_source_version: u64,
-    ) -> Result<(), mtxdb::storage::StorageError> {
-        self.put(
-            ShardType::Edges,
-            ROOM_FORWARD_META_COLLECTION,
-            room_forward_meta_node_id(room_id),
-            &NodeData::from_slice(&encode_room_forward_meta(
-                generation,
-                published_source_version,
-            )),
-        )
-        .map_err(mtxdb::storage::StorageError::Io)
-    }
-
-    fn forward_get_record_versions(
-        &self,
-        collection: &[u8; 16],
-        ids: &[NodeId],
-    ) -> VersionedEdgeRead {
-        self.get_with_record_versions(ShardType::Edges, collection, ids)
-            .map(|(found, versions)| (found, Some(versions)))
-    }
-
-    fn forward_expect_record_version(
         &self,
         collection: &[u8; 16],
         node_id: &NodeId,
@@ -892,6 +746,15 @@ fn write_edges(
     Ok(())
 }
 
+/// Stage `event_edges_put`'s records in an existing persist transaction.
+pub(crate) fn stage_event_edges(
+    txn: &DatabaseTransaction<'_>,
+    namespace: &str,
+    rows: &[(String, String, String, bool)],
+) -> PyResult<()> {
+    write_edges(txn, namespace, rows)
+}
+
 /// Read backward edges: given event_ids, returns `(event_id, Option<[(prev_event_id, is_state)]>)`
 ///
 /// Reads via `get_read_committed`, not plain `get_many`. In the common case
@@ -1086,17 +949,15 @@ pub fn event_edges_get_forward(
         // `Some(false)` -- present but empty -- is `event_edges_delete`'s
         // explicit tombstone, and the child is dropped. `None` -- no record
         // at all -- is NOT the same as a tombstone: it is a legacy or
-        // partially-mirrored event whose backward edge was never written
-        // (see the module doc comment on repair and backfill). Silently
-        // keeping or dropping that child either hides it or fabricates
-        // certainty this code doesn't have, so instead the child's *parent*
-        // is treated as an incomplete lookup and returned as `None` --
-        // exactly the same "embedded miss" signal `event_edges_get_forward`
-        // already returns when the forward node itself doesn't exist.
-        // Callers (e.g. `get_successor_events` in event_federation.py)
-        // already handle that `None` by falling back to SQL and re-queuing
-        // a repair write for the gap via `queue_edge_write`, so this reuses
-        // existing self-healing rather than inventing a new contract.
+        // partially-mirrored event whose backward edge was never written.
+        // Silently keeping or dropping that child either hides it or
+        // fabricates certainty this code doesn't have, so instead the child's
+        // *parent* is treated as an incomplete lookup and returned as `None`
+        // -- exactly the same "embedded miss" signal this function already
+        // returns when the forward node itself doesn't exist. There is no SQL
+        // fallback in mtxdb mode; callers treat the miss as "no known
+        // successors". A manual verify/repair pass is the recovery path for
+        // these gaps.
         let mut live: HashMap<([u8; 16], String), Option<bool>> = HashMap::new();
         for (collection, children) in &mut child_lookup {
             children.sort_unstable();
@@ -1151,407 +1012,6 @@ pub fn event_edges_get_forward(
     })
 }
 
-/// Read the generation-scoped forward index after checking its publication
-/// watermark. A lagging or uninitialized index is an expected cache miss, so
-/// it is returned as a tagged tuple for the Python caller to fall back to SQL.
-/// Storage and decoding failures remain exceptions.
-#[pyfunction]
-pub fn event_edges_get_forward_gated(
-    py: Python<'_>,
-    namespace: String,
-    room_id: String,
-    expected_source_version: u64,
-    prev_event_ids: Vec<String>,
-) -> PyResult<Py<PyAny>> {
-    enum ReadResult {
-        VersionMismatch { published: u64, expected: u64 },
-        Hit(Vec<(String, Option<Vec<String>>)>),
-    }
-
-    let read_result = py.detach(|| -> PyResult<ReadResult> {
-        let engine = auth_chain_db()?;
-        let node_ids: Vec<NodeId> = prev_event_ids
-            .iter()
-            .map(|id| event_edges_forward_node_id(&namespace, id))
-            .collect();
-        // Pin one overlay boundary while resolving metadata and its
-        // generation-selected FWD collection. The former meta -> FWD -> meta
-        // seqlock could exhaust under a rebuild swap and spuriously force SQL
-        // fallback; this snapshot cannot straddle that publication.
-        let snapshot = engine.read_snapshot().map_err(map_read_storage_error)?;
-        let meta_node = room_forward_meta_node_id(&room_id);
-        let meta = snapshot
-            .get(&ROOM_FORWARD_META_COLLECTION, &[meta_node])
-            .map_err(map_read_storage_error)?
-            .into_iter()
-            .next()
-            .flatten();
-        let Some(meta) = meta else {
-            return Ok(ReadResult::VersionMismatch {
-                published: 0,
-                expected: expected_source_version,
-            });
-        };
-        let (generation, published_version) = decode_room_forward_meta(&meta.bytes)?;
-        if published_version != expected_source_version {
-            return Ok(ReadResult::VersionMismatch {
-                published: published_version,
-                expected: expected_source_version,
-            });
-        }
-
-        let collection = forward_edges_room_id(&room_id, generation);
-        let found = snapshot
-            .get(&collection, &node_ids)
-            .map_err(map_read_storage_error)?;
-        let mut rows = Vec::with_capacity(prev_event_ids.len());
-        for (event_id, value) in prev_event_ids.iter().zip(found) {
-            let children = value
-                .filter(|data| !data.bytes.is_empty())
-                .map(|data| decode_forward_edges(&data.bytes))
-                .transpose()?;
-            rows.push((event_id.clone(), children));
-        }
-        Ok(ReadResult::Hit(rows))
-    })?;
-
-    match read_result {
-        ReadResult::VersionMismatch {
-            published,
-            expected,
-        } => {
-            let result = PyTuple::new(
-                py,
-                [
-                    "version_mismatch".into_bound_py_any(py)?,
-                    published.into_bound_py_any(py)?,
-                    expected.into_bound_py_any(py)?,
-                ],
-            )?;
-            Ok(result.unbind().into())
-        }
-        ReadResult::Hit(rows) => {
-            let py_rows = PyList::empty(py);
-            for (event_id, children) in rows {
-                let item = PyTuple::new(
-                    py,
-                    [
-                        event_id.into_bound_py_any(py)?,
-                        children.into_bound_py_any(py)?,
-                    ],
-                )?;
-                py_rows.append(item)?;
-            }
-            let result = PyTuple::new(
-                py,
-                ["hit".into_bound_py_any(py)?, py_rows.into_bound_py_any(py)?],
-            )?;
-            Ok(result.unbind().into())
-        }
-    }
-}
-
-/// Apply one room's outbox delta to its active generation and publish the
-/// watermark in the same mtxdb transaction. Replaying the same rows is safe:
-/// inserts are deduplicated and deletes are idempotent.
-#[pyfunction]
-pub fn event_edges_apply_forward_outbox(
-    py: Python<'_>,
-    namespace: String,
-    room_id: String,
-    generation: u32,
-    published_source_version: u64,
-    rows: Vec<(String, String, String)>, // (event_id, prev_event_id, operation)
-) -> PyResult<()> {
-    assert_writable()?;
-    if rows.is_empty() {
-        return Ok(());
-    }
-
-    py.detach(|| match begin_internal_transaction()? {
-        // Only the per-room forward generation is version-bound; the shared
-        // room-metadata collection is deliberately left out of the expectation
-        // set so one room's watermark write can't conflict with another's.
-        Some(txn) => {
-            let mut body = |txn: &DatabaseTransaction<'static>| {
-                if let Some(outcome) = replay_read_contention(apply_forward_delta(
-                    txn, &namespace, &room_id, generation, &rows,
-                ))? {
-                    return Ok(outcome);
-                }
-                txn.forward_put_meta(&room_id, generation, published_source_version)
-                    .map_err(|e| map_transaction_error("put_metadata", e))?;
-                match txn.commit() {
-                    Ok(()) => Ok(EdgeOccOutcome::Done),
-                    Err(error) if error.is_stale_read() => Ok(EdgeOccOutcome::Conflict),
-                    Err(error) => Err(map_transaction_error("commit", error)),
-                }
-            };
-            run_edge_occ(txn, &mut body)
-        }
-        None => {
-            let room_collection = forward_edges_room_id(&room_id, generation);
-            let _guards = lock_rooms([room_collection]);
-            let engine = auth_chain_db()?;
-            apply_forward_delta(engine.as_ref(), &namespace, &room_id, generation, &rows)?;
-            engine
-                .forward_put_meta(&room_id, generation, published_source_version)
-                .map_err(|e| map_transaction_error("put_metadata", e))
-        }
-    })
-}
-
-/// Apply outbox deltas to an inactive generation without changing the active
-/// room metadata. Rebuild workers use this while constructing G+1; readers
-/// remain on G until `room_forward_meta_swap` succeeds.
-#[pyfunction]
-pub fn event_edges_apply_forward_generation_delta(
-    py: Python<'_>,
-    namespace: String,
-    room_id: String,
-    generation: u32,
-    rows: Vec<(String, String, String)>,
-) -> PyResult<()> {
-    assert_writable()?;
-    if rows.is_empty() {
-        return Ok(());
-    }
-
-    py.detach(|| match begin_internal_transaction()? {
-        Some(txn) => {
-            let mut body = |txn: &DatabaseTransaction<'static>| {
-                if let Some(outcome) = replay_read_contention(apply_forward_delta(
-                    txn, &namespace, &room_id, generation, &rows,
-                ))? {
-                    return Ok(outcome);
-                }
-                match txn.commit() {
-                    Ok(()) => Ok(EdgeOccOutcome::Done),
-                    Err(error) if error.is_stale_read() => Ok(EdgeOccOutcome::Conflict),
-                    Err(error) => Err(map_transaction_error("commit", error)),
-                }
-            };
-            run_edge_occ(txn, &mut body)
-        }
-        None => {
-            let collection = forward_edges_room_id(&room_id, generation);
-            let _guards = lock_rooms([collection]);
-            let engine = auth_chain_db()?;
-            apply_forward_delta(engine.as_ref(), &namespace, &room_id, generation, &rows)
-        }
-    })
-}
-
-/// Write forward adjacency records into an inactive generation. This does
-/// not change room metadata, so readers continue using the current generation
-/// until the caller performs the final pointer swap.
-#[pyfunction]
-pub fn event_edges_build_generation_batch(
-    py: Python<'_>,
-    namespace: String,
-    room_id: String,
-    target_generation: u32,
-    edges: Vec<(String, Vec<String>)>, // (prev_event_id, child_event_ids)
-) -> PyResult<()> {
-    assert_writable()?;
-    if edges.is_empty() {
-        return Ok(());
-    }
-
-    py.detach(|| {
-        let collection = forward_edges_room_id(&room_id, target_generation);
-        let _guards = lock_rooms([collection]);
-        let pairs = edges
-            .into_iter()
-            .map(|(prev_event_id, children)| {
-                (
-                    event_edges_forward_node_id(&namespace, &prev_event_id),
-                    NodeData::new(bytes::Bytes::from(encode_forward_edges(&children))),
-                )
-            })
-            .collect();
-
-        match begin_internal_transaction()? {
-            Some(txn) => {
-                txn.forward_put_many(collection, pairs)
-                    .map_err(|e| map_transaction_error("put_generation", e))?;
-                txn.commit().map_err(|e| map_transaction_error("commit", e))
-            }
-            None => auth_chain_db()?
-                .put_many(&collection, &pairs)
-                .map(|_| ())
-                .map_err(|e| map_transaction_error("put_generation", e)),
-        }
-    })
-}
-
-/// Remove all records from an inactive generation before rebuilding it. The
-/// active metadata pointer is untouched, so readers remain on the old
-/// generation while the replacement is reset and repopulated.
-#[pyfunction]
-pub fn event_edges_reset_generation(
-    py: Python<'_>,
-    room_id: String,
-    target_generation: u32,
-) -> PyResult<()> {
-    assert_writable()?;
-    py.detach(|| {
-        let collection = forward_edges_room_id(&room_id, target_generation);
-        let _guards = lock_rooms([collection]);
-        match begin_internal_transaction()? {
-            Some(txn) => {
-                txn.delete_collection(ShardType::Edges, collection)
-                    .map_err(|e| map_transaction_io_error("delete_generation", e))?;
-                txn.commit().map_err(|e| map_transaction_error("commit", e))
-            }
-            None => auth_chain_db()?
-                .delete_collection(&collection)
-                .map_err(|e| map_transaction_error("delete_generation", e)),
-        }
-    })
-}
-
-/// Publish an already-built generation by updating its room metadata record.
-/// The caller must hold the cross-process room lock and validate the
-/// source-version catch-up boundary before calling this.
-#[pyfunction]
-pub fn room_forward_meta_swap(
-    room_id: String,
-    target_generation: u32,
-    target_source_version: u64,
-) -> PyResult<()> {
-    room_forward_meta_put(room_id, target_generation, target_source_version)
-}
-
-/// Drop an inactive generation. Callers must only invoke this after the
-/// reader-epoch/grace-period policy has established that no worker can still
-/// be reading the generation.
-#[pyfunction]
-pub fn event_edges_drop_generation(
-    py: Python<'_>,
-    room_id: String,
-    retired_generation: u32,
-) -> PyResult<()> {
-    assert_writable()?;
-    py.detach(|| {
-        let collection = forward_edges_room_id(&room_id, retired_generation);
-        let _guards = lock_rooms([collection]);
-        match begin_internal_transaction()? {
-            Some(txn) => {
-                txn.delete_collection(ShardType::Edges, collection)
-                    .map_err(|e| map_transaction_io_error("drop_generation", e))?;
-                txn.commit().map_err(|e| map_transaction_error("commit", e))
-            }
-            None => auth_chain_db()?
-                .delete_collection(&collection)
-                .map_err(|e| map_transaction_error("drop_generation", e)),
-        }
-    })
-}
-
-fn apply_forward_delta(
-    target: &impl ForwardWriteTarget,
-    namespace: &str,
-    room_id: &str,
-    generation: u32,
-    rows: &[(String, String, String)],
-) -> PyResult<()> {
-    let collection = forward_edges_room_id(room_id, generation);
-    // Fold the rows into a per-parent, per-child last-operation-wins map rather
-    // than a set of additions and removals. Rows arrive in `source_version`
-    // order, so a later row for the same `(parent, child)` pair overrides an
-    // earlier one regardless of operation. A pair of sets cannot express that:
-    // applying every removal before every addition would let an earlier insert
-    // resurrect a pair that a later delete removed.
-    let mut deltas: HashMap<String, HashMap<String, bool>> = HashMap::new();
-    for (event_id, prev_event_id, operation) in rows {
-        let is_insert = match operation.as_str() {
-            "insert" => true,
-            "delete" => false,
-            other => {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "unknown edge-index outbox operation: {other}"
-                )));
-            }
-        };
-        deltas
-            .entry(prev_event_id.clone())
-            .or_default()
-            .insert(event_id.clone(), is_insert);
-    }
-
-    let mut parents: Vec<String> = deltas.keys().cloned().collect();
-    parents.sort_unstable();
-    let node_ids: Vec<NodeId> = parents
-        .iter()
-        .map(|parent| event_edges_forward_node_id(namespace, parent))
-        .collect();
-    // Read each parent's forward list at its known write version and require
-    // that version to hold at commit, so a concurrent merge into the same
-    // parent is a `StaleRead` (validated before the append) rather than a lost
-    // update, while merges into different parents do not conflict.
-    let (existing, versions) = target
-        .forward_get_record_versions(&collection, &node_ids)
-        .map_err(|e| map_transaction_error("get_many", e))?;
-    for (index, node_id) in node_ids.iter().enumerate() {
-        let version = versions.as_ref().map(|versions| versions[index]);
-        target
-            .forward_expect_record_version(&collection, node_id, version)
-            .map_err(|e| map_transaction_error("expect_record_version", e))?;
-    }
-
-    let mut puts = Vec::with_capacity(parents.len());
-    for (parent, existing) in parents.into_iter().zip(existing) {
-        let state = deltas
-            .remove(&parent)
-            .expect("every sorted parent has a delta");
-        let mut children = match existing {
-            Some(data) if !data.bytes.is_empty() => decode_forward_edges(&data.bytes)?,
-            _ => Vec::new(),
-        };
-        for (child, is_insert) in state {
-            if is_insert {
-                if !children.iter().any(|existing| existing == &child) {
-                    children.push(child);
-                }
-            } else {
-                children.retain(|existing| existing != &child);
-            }
-        }
-        // Sort and dedup so the encoded payload is byte-stable across replays
-        // and independent of the (unordered) map iteration above.
-        children.sort_unstable();
-        children.dedup();
-        puts.push((
-            event_edges_forward_node_id(namespace, &parent),
-            NodeData::new(bytes::Bytes::from(encode_forward_edges(&children))),
-        ));
-    }
-
-    target
-        .forward_put_many(collection, puts)
-        .map_err(|e| map_transaction_error("put_many", e))?;
-    Ok(())
-}
-
-/// Tombstone backward edges for purged events.
-///
-/// Deliberately does NOT touch parents' forward lists. Splicing a purged
-/// child out of every distinct parent's forward node used to require a
-/// read-modify-write per parent (`forward_read` + `mutate_write` phases,
-/// dominating delete latency under normal churn) purely to keep those lists
-/// exact. Instead, forward lists are left stale and `event_edges_get_forward`
-/// filters out any child whose backward edge is now tombstoned (or missing)
-/// before returning it — the same backward-edge lookup this function already
-/// pays for, just done at read time instead of write time. This trades
-/// forward-list exactness (and unbounded list growth until compaction) for a
-/// delete that no longer pays for other parents' list sizes.
-///
-/// NOTE: this makes forward lists a lossy cache that must always be read
-/// through the backward-edge filter in `event_edges_get_forward` — never
-/// consumed raw. A stale entry is silently dropped at read time, not
-/// resurrected; nothing about it can be relied on to reflect current state
-/// without that filter.
 #[pyfunction]
 pub fn event_edges_delete(
     py: Python<'_>,
@@ -1689,16 +1149,6 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(event_edges_occ_conflicts, m)?)?;
     m.add_function(wrap_pyfunction!(event_edges_get_backward, m)?)?;
     m.add_function(wrap_pyfunction!(event_edges_get_forward, m)?)?;
-    m.add_function(wrap_pyfunction!(event_edges_get_forward_gated, m)?)?;
-    m.add_function(wrap_pyfunction!(event_edges_apply_forward_outbox, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        event_edges_apply_forward_generation_delta,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(event_edges_build_generation_batch, m)?)?;
-    m.add_function(wrap_pyfunction!(event_edges_reset_generation, m)?)?;
-    m.add_function(wrap_pyfunction!(room_forward_meta_swap, m)?)?;
-    m.add_function(wrap_pyfunction!(event_edges_drop_generation, m)?)?;
     m.add_function(wrap_pyfunction!(event_edges_delete, m)?)?;
     Ok(())
 }

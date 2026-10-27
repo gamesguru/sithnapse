@@ -1232,7 +1232,7 @@ class EventsPersistenceStorageController:
         # Remove any events which are prev_events of any existing events.
         existing_prevs: Collection[
             str
-        ] = await self.persist_events_store._get_events_which_are_prevs(result)
+        ] = await self.persist_events_store._get_events_which_are_prevs(result, room_id)
         result.difference_update(existing_prevs)
 
         # Finally handle the case where the new events have soft-failed prev

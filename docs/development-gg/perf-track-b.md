@@ -128,10 +128,11 @@ locks, device-list coordination, push queues, delayed events):
    fallback, scaffolding and table.
 3. `event_json`: backfill, convert remaining SQL joins, drop fallback and table.
    The SQL `events` table stays.
-4. `event_edges`, `edge_index_outbox`, `room_edge_source_version`: rebuild edges
-   in mtxdb from canonical event JSON; remove the SQL write, outbox and gate
-   once recovery is proven. `forward-index-design-spec.md` must be revised
-   first.
+4. `event_edges`: cut over to exactly one authoritative backend per config (SQL
+   or mtxdb), with a manual backend migration and a startup marker check. mtxdb
+   edge writes are staged with event JSON; there is no SQL outbox,
+   source-version clock, or runtime SQL fallback. The SQL table remains as dead
+   data in mtxdb mode until the index/purge-list cleanup is done.
 5. `state_groups`, `state_group_edges`, `state_group_id_seq`
    ([family-5 state map](perf-track-b-family5-state-map.md),
    [state-groups-out-of-sql.md](state-groups-out-of-sql.md)): broadest change,
@@ -151,8 +152,9 @@ SQL cost per family (`res/logs/2026-10-21-trial-tests-530s.log`, 5,767 tests,
 is a unit-test run, not a federation workload, and the log does not split reads
 from writes:
 
-- Family 4: `event_edges` 18.3 s (43,754 calls, 31,282 rows) plus
-  `edge_index_outbox` 4.5 s = 22.7 s (4.6%).
+- Family 4 (pre-cutover measurement): `event_edges` 18.3 s (43,754 calls, 31,282
+  rows) plus the now-removed `edge_index_outbox` 4.5 s = 22.7 s (4.6%). Current
+  code has no edge outbox.
 - Family 5: `state_groups` 12.8 s, `state_groups_persisting` 8.7 s,
   `state_groups_pending_deletion` 7.4 s (42,728 calls, 206 rows) = 28.9 s
   (5.8%). `state_group_edges` is under the top-30 cutoff (4.2 s).

@@ -1,5 +1,13 @@
 # Event status for mtxdb persist reads
 
+> **Partially superseded (2026-10-27).** The edge backend cutover has landed:
+> exactly one of SQL or mtxdb is authoritative per config, selected by
+> `embedded_db`, with no dual-write, outbox, source-version gate, or runtime SQL
+> fallback. Backend changes use the manual `synapse_event_edges_migrate` command
+> and startup refuses a marker/config mismatch. The per-event status records
+> described here are still not implemented; references below to dual-writing
+> during migration are historical.
+
 Status: design note. The v1 edge-format reset is committed; per-event status
 records, rebuild, and Rust persist reads are not implemented. See
 `perf-track-b-family4-edges-map.md` and

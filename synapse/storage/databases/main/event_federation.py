@@ -2001,6 +2001,83 @@ class EventFederationWorkerStore(
 
     @trace
     @tag_args
+    def _get_backfill_points_mtxdb(
+        self,
+        txn: LoggingTransaction,
+        room_id: str,
+        nearby_depth: int,
+        limit: int,
+    ) -> list[tuple[str, int]]:
+        """mtxdb-backed equivalent of ``get_backfill_points_in_room_txn``."""
+        from synapse.storage.databases.main.embedded_event_edges import (
+            get_event_edges_forward_batch,
+        )
+
+        txn.execute(
+            "SELECT event_id FROM event_backward_extremities WHERE room_id = ?",
+            (room_id,),
+        )
+        extremity_ids = [event_id for (event_id,) in txn]
+        if not extremity_ids:
+            return []
+
+        forward = get_event_edges_forward_batch(
+            self._embedded_db_namespace, extremity_ids
+        )
+        candidates = [
+            (child_id, extremity_id)
+            for extremity_id in extremity_ids
+            for child_id in (forward.get(extremity_id) or ())
+        ]
+        if not candidates:
+            return []
+
+        child_clause, child_args = make_in_list_sql_clause(
+            self.database_engine, "event_id", list({c for c, _ in candidates})
+        )
+        txn.execute(
+            f"SELECT event_id, depth FROM events WHERE {child_clause} AND depth <= ?",
+            (*child_args, nearby_depth),
+        )
+        depth_by_id: dict[str, int] = dict(txn)
+
+        extremity_clause, extremity_args = make_in_list_sql_clause(
+            self.database_engine, "event_id", extremity_ids
+        )
+        txn.execute(
+            "SELECT event_id, num_attempts, last_attempt_ts "
+            "FROM event_failed_pull_attempts "
+            f"WHERE room_id = ? AND {extremity_clause}",
+            (room_id, *extremity_args),
+        )
+        failed_attempts = {
+            event_id: (num_attempts, last_attempt_ts)
+            for event_id, num_attempts, last_attempt_ts in txn
+        }
+
+        now = self.clock.time_msec()
+        results: list[tuple[str, int]] = []
+        for child_id, extremity_id in candidates:
+            depth = depth_by_id.get(child_id)
+            if depth is None:
+                continue
+            failed = failed_attempts.get(extremity_id)
+            if failed is not None:
+                num_attempts, last_attempt_ts = failed
+                backoff = (
+                    1
+                    << min(
+                        num_attempts,
+                        BACKFILL_EVENT_EXPONENTIAL_BACKOFF_MAXIMUM_DOUBLING_STEPS,
+                    )
+                ) * BACKFILL_EVENT_EXPONENTIAL_BACKOFF_STEP_MILLISECONDS
+                if now < last_attempt_ts + backoff:
+                    continue
+            results.append((extremity_id, depth))
+
+        results.sort(key=lambda row: (row[1], row[0]), reverse=True)
+        return results[:limit]
+
     async def get_backfill_points_in_room(
         self,
         room_id: str,
@@ -2076,6 +2153,11 @@ class EventFederationWorkerStore(
         def get_backfill_points_in_room_txn(
             txn: LoggingTransaction, room_id: str
         ) -> list[tuple[str, int]]:
+            if getattr(self, "_embedded_event_edges_enabled", False):
+                return self._get_backfill_points_mtxdb(
+                    txn, room_id, nearby_depth, limit
+                )
+
             # Assemble a tuple lookup of event_id -> depth for the oldest events
             # we know of in the room. Backwards extremities are the oldest
             # events we know of in the room but we only know of them because
@@ -2482,6 +2564,42 @@ class EventFederationWorkerStore(
         Returns:
             List of prev events that the backfill queue can process
         """
+        if getattr(self, "_embedded_event_edges_enabled", False):
+            from synapse.storage.databases.main.embedded_event_edges import (
+                get_event_edges_backward_batch,
+            )
+
+            backward = get_event_edges_backward_batch(
+                self._embedded_db_namespace, [event_id]
+            )
+            prev_ids = [
+                prev_event_id
+                for prev_event_id, _is_state in (backward.get(event_id) or ())
+            ]
+            if not prev_ids:
+                return []
+            clause, args = make_in_list_sql_clause(
+                self.database_engine, "event_id", prev_ids
+            )
+            txn.execute(
+                f"""
+                SELECT depth, stream_ordering, event_id, type FROM events
+                WHERE NOT outlier AND {clause}
+                ORDER BY depth DESC, stream_ordering DESC
+                LIMIT ?
+                """,
+                (*args, limit),
+            )
+            return [
+                BackfillQueueNavigationItem(
+                    depth=row[0],
+                    stream_ordering=row[1],
+                    event_id=row[2],
+                    type=row[3],
+                )
+                for row in txn
+            ]
+
         # Look for the prev_event_id connected to the given event_id
         connected_prev_event_query = """
             SELECT depth, stream_ordering, prev_event_id, events.type FROM event_edges
@@ -2820,6 +2938,60 @@ class EventFederationWorkerStore(
         latest_events: list[str],
         limit: int,
     ) -> list[str]:
+        if getattr(self, "_embedded_event_edges_enabled", False):
+            from synapse.storage.databases.main.embedded_event_edges import (
+                get_event_edges_backward_batch,
+            )
+
+            seen_events = set(earliest_events)
+            latest_clause, latest_args = make_in_list_sql_clause(
+                self.database_engine,
+                "event_id",
+                set(latest_events) - seen_events,
+            )
+            txn.execute(
+                f"SELECT event_id FROM events WHERE {latest_clause} AND room_id = ?",
+                (*latest_args, room_id),
+            )
+            front = {event_id for (event_id,) in txn}
+            mtxdb_results: list[str] = []
+
+            while front and len(mtxdb_results) < limit:
+                backward = get_event_edges_backward_batch(
+                    self._embedded_db_namespace, list(front)
+                )
+                candidates = {
+                    prev_event_id
+                    for edges in backward.values()
+                    if edges
+                    for prev_event_id, _is_state in edges
+                } - seen_events
+                if not candidates:
+                    break
+
+                candidate_clause, candidate_args = make_in_list_sql_clause(
+                    self.database_engine, "event_id", list(candidates)
+                )
+                txn.execute(
+                    f"SELECT event_id FROM events WHERE {candidate_clause} "
+                    "AND room_id = ?",
+                    (*candidate_args, room_id),
+                )
+                new_results = {event_id for (event_id,) in txn} - seen_events
+                if not new_results:
+                    break
+
+                limited_results = list(
+                    itertools.islice(new_results, limit - len(mtxdb_results))
+                )
+                new_front = set(limited_results)
+                seen_events |= new_front
+                mtxdb_results.extend(limited_results)
+                front = new_front
+
+            mtxdb_results.reverse()
+            return mtxdb_results
+
         # It's OK that this has not been filtered by correct-room,
         # because we will only compare based on event ID from the events
         # we happen to run into.
@@ -2885,147 +3057,31 @@ class EventFederationWorkerStore(
         """
         started = time.monotonic()
 
-        # A warm FWD generation is not proof of completeness. Only the
-        # offline verifier may grant this authority marker; until then SQL is
-        # the source of truth and FWD remains a write-side projection.
         from synapse.storage.databases.main.embedded_event_edges import (
-            event_edges_fwd_is_authoritative,
-        )
-
-        if await event_edges_fwd_is_authoritative(self):
-            from synapse.storage.databases.main.embedded_event_edges import (
-                classify_event_edge_fallback,
-                get_event_edges_forward_batch,
-                record_event_edge_read,
-                record_event_edge_repair,
-                repair_edge_index_from_sql,
-            )
-
-            forward_map = None
-            sql_started = time.monotonic()
-            room_id = await self.db_pool.simple_select_one_onecol(
-                table="events",
-                keyvalues={"event_id": event_id},
-                retcol="room_id",
-                allow_none=True,
-                desc="get_successor_events_room_id",
-            )
-            if room_id is None:
-                room_id = await self.db_pool.simple_select_one_onecol(
-                    table="event_backward_extremities",
-                    keyvalues={"event_id": event_id},
-                    retcol="room_id",
-                    allow_none=True,
-                    desc="get_successor_events_backward_extremity_room_id",
-                )
-            ffi_timing(
-                "event_edges_successor_room_lookup", time.monotonic() - sql_started
-            )
-            if room_id is not None:
-                sql_started = time.monotonic()
-                source_version = await self.db_pool.simple_select_one_onecol(
-                    table="room_edge_source_version",
-                    keyvalues={"room_id": room_id},
-                    retcol="source_version",
-                    allow_none=True,
-                    desc="get_successor_events_source_version",
-                )
-                ffi_timing(
-                    "event_edges_successor_source_version",
-                    time.monotonic() - sql_started,
-                )
-                embedded_started = time.monotonic()
-                forward_map = get_event_edges_forward_batch(
-                    self._embedded_db_namespace,
-                    room_id,
-                    int(source_version or 0),
-                    [event_id],
-                )
-                ffi_timing(
-                    "event_edges_successor_embedded_read",
-                    time.monotonic() - embedded_started,
-                )
-                successors = None if forward_map.stale else forward_map.get(event_id)
-                logger.debug(
-                    "get_successor_events: event_id=%s room_id=%s source_version=%s hit=%s",
-                    event_id,
-                    room_id,
-                    source_version,
-                    successors is not None,
-                )
-                if successors is not None:
-                    ffi_count("event_edges_successor_hits", 1)
-                    record_event_edge_read(self.server_name, "successor", "hit")
-                    ffi_timing(
-                        "event_edges_successor_total", time.monotonic() - started
-                    )
-                    return successors
-
-            ffi_count("event_edges_successor_fallbacks", 1)
-            record_event_edge_read(
-                self.server_name,
-                "successor",
-                classify_event_edge_fallback(forward_map),
-            )
-            sql_started = time.monotonic()
-            sql_res = await self.db_pool.simple_select_onecol(
-                table="event_edges",
-                keyvalues={"prev_event_id": event_id},
-                retcol="event_id",
-                desc="get_successor_events",
-            )
-            logger.debug(
-                "get_successor_events fallback: event_id=%s successor_count=%s",
-                event_id,
-                len(sql_res),
-            )
-            ffi_timing(
-                "event_edges_successor_sql_fallback", time.monotonic() - sql_started
-            )
-            if sql_res and getattr(self, "_embedded_event_edges_writable", False):
-                if room_id is None:
-                    room_id = await self.db_pool.simple_select_one_onecol(
-                        table="events",
-                        keyvalues={"event_id": sql_res[0]},
-                        retcol="room_id",
-                        allow_none=True,
-                        desc="get_successor_events_repair_room_id",
-                    )
-                if room_id is not None:
-                    try:
-                        repair_started = time.monotonic()
-                        # The gated path already resolved this event's immutable
-                        # room id before reading the source-version watermark.
-                        # Reusing it avoids a second SQL round trip on every
-                        # repair-triggering miss.
-                        await repair_edge_index_from_sql(
-                            self,
-                            self._embedded_db_namespace,
-                            room_id,
-                            event_id,
-                            sql_res,
-                        )
-                        ffi_count("event_edges_successor_repairs", len(sql_res))
-                        record_event_edge_repair(
-                            self.server_name, "successor", True, len(sql_res)
-                        )
-                        ffi_timing(
-                            "event_edges_successor_repair",
-                            time.monotonic() - repair_started,
-                        )
-                    except Exception:
-                        record_event_edge_repair(self.server_name, "successor", False)
-                        logger.debug(
-                            "Failed to repair forward edge for %s",
-                            event_id,
-                            exc_info=True,
-                        )
-            ffi_timing("event_edges_successor_total", time.monotonic() - started)
-            return sql_res
-
-        from synapse.storage.databases.main.embedded_event_edges import (
+            get_event_edges_forward_batch,
             record_event_edge_read,
         )
+
+        if getattr(self, "_embedded_event_edges_enabled", False):
+            embedded_started = time.monotonic()
+            forward_map = get_event_edges_forward_batch(
+                self._embedded_db_namespace, [event_id]
+            )
+            ffi_timing(
+                "event_edges_successor_embedded_read",
+                time.monotonic() - embedded_started,
+            )
+            successors = forward_map.get(event_id)
+            if successors is not None:
+                ffi_count("event_edges_successor_hits", 1)
+                record_event_edge_read(self.server_name, "successor", "hit")
+                ffi_timing("event_edges_successor_total", time.monotonic() - started)
+                return successors
+
+            ffi_count("event_edges_successor_misses", 1)
+            record_event_edge_read(self.server_name, "successor", "miss")
+            ffi_timing("event_edges_successor_total", time.monotonic() - started)
+            return []
 
         record_event_edge_read(self.server_name, "successor", "sql_only")
         sql_started = time.monotonic()

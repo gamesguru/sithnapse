@@ -206,6 +206,44 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
             self._flag_existing_quarantined_media,
         )
 
+    async def get_room_upgrade_user_transfer_progress(
+        self, old_room_id: str, new_room_id: str
+    ) -> dict[str, tuple[bool, bool]]:
+        rows = await self.db_pool.simple_select_list(
+            table="room_upgrade_user_transfers",
+            keyvalues={"old_room_id": old_room_id, "new_room_id": new_room_id},
+            retcols=("user_id", "tags_transferred", "push_rules_transferred"),
+            desc="get_room_upgrade_user_transfer_progress",
+        )
+        return {
+            user_id: (tags_done, push_done) for user_id, tags_done, push_done in rows
+        }
+
+    async def mark_room_upgrade_user_transfer_progress(
+        self,
+        old_room_id: str,
+        new_room_id: str,
+        user_id: str,
+        *,
+        tags_transferred: bool | None = None,
+        push_rules_transferred: bool | None = None,
+    ) -> None:
+        values = {}
+        if tags_transferred is not None:
+            values["tags_transferred"] = tags_transferred
+        if push_rules_transferred is not None:
+            values["push_rules_transferred"] = push_rules_transferred
+        await self.db_pool.simple_upsert(
+            table="room_upgrade_user_transfers",
+            keyvalues={
+                "old_room_id": old_room_id,
+                "new_room_id": new_room_id,
+                "user_id": user_id,
+            },
+            values=values,
+            desc="mark_room_upgrade_user_transfer_progress",
+        )
+
     async def _flag_existing_quarantined_media(
         self, progress: JsonDict, batch_size: int
     ) -> int:

@@ -1193,6 +1193,24 @@ class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
         _, event_id = next_staged_event_info
         self.assertEqual(event_id, "$fake_event_id_500")
 
+    def _mirror_edges_to_mtxdb(
+        self, room_id: str, edges: list[tuple[str, str]]
+    ) -> None:
+        if not getattr(self.store, "_embedded_event_edges_enabled", False):
+            return
+        from synapse.storage.databases.main.embedded_event_edges import (
+            put_event_edges_batch,
+        )
+
+        put_event_edges_batch(
+            self.store._embedded_db_namespace,
+            [
+                (room_id, event_id, prev_event_id, False)
+                for event_id, prev_event_id in edges
+            ],
+            sync=True,
+        )
+
     def _setup_room_for_backfill_tests(self) -> _BackfillSetupInfo:
         """
         Sets up a room with various events and backward extremities to test
@@ -1351,6 +1369,14 @@ class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
                 populate_db,
             )
         )
+        self._mirror_edges_to_mtxdb(
+            room_id,
+            [
+                (event_id, prev_event_id)
+                for event_id in our_server_events
+                for prev_event_id in event_graph[event_id]
+            ],
+        )
 
         return _BackfillSetupInfo(room_id=room_id, depth_map=depth_map)
 
@@ -1404,6 +1430,7 @@ class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
         self.get_success(
             self.store.db_pool.runInteraction("populate_backfill_outlier", populate_db)
         )
+        self._mirror_edges_to_mtxdb(room_id, [("$e2", "$e1"), ("$e3", "$e2")])
 
         def backfill(seed: str) -> set[str]:
             return self.get_success(

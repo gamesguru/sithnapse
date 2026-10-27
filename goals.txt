@@ -1,1 +1,45 @@
-completely remove sql-mtxdb dual-writes. Completely make mtxdb authoritative where it wants to be. Do NOT have any configuration option to go back. Only go forward. There is no "if event json embedded is enabled" since we have only one direction to flow: forward. Simplicity to the max. Total control.
+EVENT EDGES — CURRENT STATE (2026-10-27)
+
+Exactly one edge backend is authoritative per config: SQL or mtxdb. There is
+no dual-write and no silent SQL fallback.
+
+- `embedded_db`/mtxdb config selects mtxdb; its absence selects SQL.
+- The `edge_backend` marker records which backend actually holds the migrated
+  edges.
+- Migration is manual: `synapse_event_edges_migrate --to sql|mtxdb` (with
+  `--config`, optional `--from`, `--force`, `--batch-size`, `--mtxdb-path`).
+  It is never a background update.
+- Startup hard-fails when the configured backend and the marker disagree, and
+  the error names the migrate command.
+- A fresh/empty database adopts whatever backend is configured.
+- Event-edge records are stored uncompressed.
+
+Implemented:
+
+- SQL and mtxdb backends, with every edge reader and writer selecting exactly
+  one. mtxdb reads do not fall back to SQL.
+- Backend marker, adoption/mismatch checks, manual migration CLI, and startup
+  check.
+- Edge writes from event persistence happen before the SQL COMMIT: staged in
+  the persist's mtxdb transaction with event JSON when the shared WAL is
+  available; otherwise written directly and covered by the existing
+  in-transaction EVENT_DAG durability barrier.
+- Staged OCC conflicts at commit are surfaced as retryable so the whole persist
+  retries.
+- Removed the SQL outbox, source-version clock, repair-from-SQL path, retired
+  generation machinery, and the gated forward-read fallback.
+
+Open:
+
+- A manual verify/repair command for events that lost edges before the
+  in-transaction write fix. New writes cannot leave a committed event without
+  edges.
+- SQL `event_edges` table/index and purge-list cleanup for deployments that
+  migrated to mtxdb. The SQL rows currently remain as dead data.
+- Full CI validation.
+
+Historical note: the earlier "no config to go back" forward-only plan is
+superseded. SQL remains a supported backend selected by config; changing
+backends requires the manual migration above. Historical phasing text from the
+old plan is intentionally not repeated here because it describes the removed
+outbox/version-gate design.
