@@ -246,11 +246,14 @@ def main() -> None:
             # The base's Cargo.lock may pin a git dependency revision that has
             # since been force-pushed or squashed away upstream, which makes
             # its Rust build unresolvable. The schema does not depend on that
-            # revision, so build the base with the head's lockfile.
+            # revision, so build the base with the head's lockfile. Use the
+            # saved SHA, not `head_ref`: CI checks out a detached HEAD, where
+            # `head_ref` is literally "HEAD" and this would restore the base's
+            # broken lockfile instead.
             subprocess.run(
-                ["git", "checkout", head_ref, "--", "Cargo.lock"],
+                ["git", "checkout", after_sha, "--", "Cargo.lock"],
                 cwd=REPO_ROOT,
-                check=False,
+                check=True,
             )
 
             # Refresh dependencies
@@ -260,6 +263,13 @@ def main() -> None:
             run_make_full_schema(before_dir, schema_script)
         finally:
             print("Returning to HEAD...", file=sys.stderr)
+            # Drop the head Cargo.lock we installed for the base build; the
+            # stash (or the destination branch) owns any real local changes.
+            subprocess.run(
+                ["git", "checkout", "--", "Cargo.lock"],
+                cwd=REPO_ROOT,
+                check=True,
+            )
             subprocess.run(
                 [
                     "git",
