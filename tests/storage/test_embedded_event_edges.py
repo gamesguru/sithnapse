@@ -1410,16 +1410,16 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         event_id = self._persist_message(soft_failed=True)
 
         sql, mtxdb = self._edge_views(event_id)
-        self.assertTrue(sql)
-        self.assertEqual(sql, mtxdb)
+        self.assertEqual(sql, [], "mtxdb stores must not dual-write event_edges")
+        self.assertTrue(mtxdb)
 
     def test_outlier_event_gets_edges(self) -> None:
         """Outliers are not filtered from edge writes."""
         event_id = self._persist_message(outlier=True)
 
         sql, mtxdb = self._edge_views(event_id)
-        self.assertTrue(sql)
-        self.assertEqual(sql, mtxdb)
+        self.assertEqual(sql, [], "mtxdb stores must not dual-write event_edges")
+        self.assertTrue(mtxdb)
 
     def test_rejected_event_gets_no_edges(self) -> None:
         """A rejected event is stored and recorded in `rejections`, but the
@@ -1543,535 +1543,14 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         successors = self.get_success(self.store.get_successor_events(e1_id))
         self.assertIn(e2_id, successors)
 
-    @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
-    def test_sql_fallback_and_repair_on_missing_mtxdb_edges(self) -> None:
-        """SQL fallback returns edges missing from mtxdb and repairs the local store.
-
-        This is a same-process test: it verifies that after the coalesced flush
-        fires, the same in-process mtxdb handle reflects the repaired edge when
-        read through the read-only (non-writable) code path.  It does NOT verify
-        cross-worker or cross-process visibility; that requires a separate
-        read-only engine handle or a genuine multi-process integration test.
-
-        The metric assertions confirm that the final read-only query was served
-        from the embedded store (hit counter up, fallback counter flat) rather
-        than silently succeeding through the SQL fallback path.
-        """
-        res1 = self.helper.send(self.room_id, "parent", tok=self.tok)
-        p_id = res1["event_id"]
-        res2 = self.helper.send(self.room_id, "child", tok=self.tok)
-        c_id = res2["event_id"]
-
-        ns = self.store._embedded_db_namespace
-        # Persist the coalesced edges, then simulate a post-commit mirror write
-        # that never landed by deleting the edge directly at the FFI layer.
-        # Deliberately NOT `delete_event_edges_batch`: that records a purge
-        # tombstone and this scenario is a lost write, not a purge.  (The purge
-        # tombstone + SQL-fallback repair case is `test_sql_fallback_repairs_preserved_row2_edge_despite_purge`.)
-        flush_edge_writes(ns)
-        mtxdb_engine.event_edges_delete(ns, [c_id])
-
-        # Verify mtxdb has no forward edge for p_id
-        fwd_miss = get_event_edges_forward_batch(ns, [p_id])
-        self.assertIsNone(fwd_miss.get(p_id))
-
-        # Querying successor events falls back to SQL, successfully finding c_id,
-        # and queues a repair of the mtxdb forward edge.  The read is served
-        # by SQL; the repair only lands in mtxdb on the next coalesced flush.
-        sn = self.store.server_name
-        stale0 = _reads(sn, "successor", "stale")
-        ok0 = _sample(
-            "synapse_event_edges_repairs_total",
-            path="successor",
-            result="ok",
-            server_name=sn,
-        )
-        rows0 = _sample(
-            "synapse_event_edges_repaired_rows_total", path="successor", server_name=sn
-        )
-        successors = self.get_success(self.store.get_successor_events(p_id))
-        self.assertIn(c_id, successors)
-        self.assertEqual(_reads(sn, "successor", "stale") - stale0, 1)
-        self.assertEqual(
-            _sample(
-                "synapse_event_edges_repairs_total",
-                path="successor",
-                result="ok",
-                server_name=sn,
-            )
-            - ok0,
-            1,
-        )
-        self.assertEqual(
-            _sample(
-                "synapse_event_edges_repaired_rows_total",
-                path="successor",
-                server_name=sn,
-            )
-            - rows0,
-            len(successors),
-        )
-
-        # Advance the reactor past the flush window so the coalescer drains
-        # the queued repair (and syncs EVENT_DAG).  Use FLUSH_DELAY_SECS plus
-        # a small margin so the test is not fragile to floating-point
-        # boundaries or minor changes to the delay value.
-        self._advance_past_flush_window()
-
-        # Now mtxdb has been repaired in-process.
-        fwd_repaired = get_event_edges_forward_batch(ns, [p_id])
-        self.assertIn(c_id, fwd_repaired.get(p_id) or [])
-
-        # Exercise the read-only code path after the coalesced flush.
-        # writable=False routes through the embedded read path (no SQL write).
-        # enable_ffi_counting() activates counters only for this block so the
-        # assertion is isolated from any other test activity and does not add
-        # overhead to production deployments where diagnostics are disabled.
-        self.store._embedded_event_edges_writable = False
-        hits_before = REGISTRY.get_sample_value(
-            "synapse_event_edges_reads_total",
-            {
-                "path": "successor",
-                "outcome": "hit",
-                "server_name": self.store.server_name,
-            },
-        )
-        with enable_ffi_counting():
-            reader_successors = self.get_success(self.store.get_successor_events(p_id))
-            self.assertIn(c_id, reader_successors)
-
-            # The query must have been an embedded hit, not a SQL fallback.
-            self.assertEqual(
-                get_ffi_count("event_edges_successor_hits"),
-                1,
-                "expected exactly one embedded hit for the read-only query",
-            )
-            self.assertEqual(
-                get_ffi_count("event_edges_successor_fallbacks"),
-                0,
-                "expected no SQL fallback for the read-only query after repair",
-            )
-        hits_after = REGISTRY.get_sample_value(
-            "synapse_event_edges_reads_total",
-            {
-                "path": "successor",
-                "outcome": "hit",
-                "server_name": self.store.server_name,
-            },
-        )
-        self.assertEqual((hits_after or 0) - (hits_before or 0), 1)
-
-    @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
-    def test_sql_fallback_repairs_preserved_row2_edge_despite_purge(self) -> None:
-        """SQL keeps the live-child → purged-parent `event_edges` row (a
-        backward extremity).  Even after a genuine purge tombstoned the parent,
-        the SQL fallback still returns that edge and the repair enqueue is
-        accepted: the tombstone is owner-based, so it only blocks rows whose
-        own event_id is purged -- the child is not.  Without the owner-based
-        filter this repair would be suppressed for the tombstone's TTL."""
-        res1 = self.helper.send(self.room_id, "parent", tok=self.tok)
-        p_id = res1["event_id"]
-        res2 = self.helper.send(self.room_id, "child", tok=self.tok)
-        c_id = res2["event_id"]
-
-        ns = self.store._embedded_db_namespace
-        flush_edge_writes(ns)
-
-        # True purge of the parent: records an owner-based tombstone for p_id.
-        delete_event_edges_batch(ns, [p_id])
-
-        # Simulate the child's forward edge write never landing in mtxdb.
-        mtxdb_engine.event_edges_delete(ns, [c_id])
-        fwd_miss = get_event_edges_forward_batch(ns, [p_id])
-        self.assertIsNone(fwd_miss.get(p_id))
-
-        # get_successor_events falls back to the preserved SQL row and queues
-        # the repair (child, purged parent).  The parent's tombstone must not
-        # suppress it.
-        successors = self.get_success(self.store.get_successor_events(p_id))
-        self.assertIn(c_id, successors)
-
-        self._advance_past_flush_window()
-
-        # The preserved row[2] edge is repaired in mtxdb despite the tombstone.
-        fwd_repaired = get_event_edges_forward_batch(ns, [p_id])
-        self.assertIn(c_id, fwd_repaired.get(p_id) or [])
-
-    @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
-    def test_outbox_recovers_edge_publication_after_simulated_crash(self) -> None:
-        """Crash between the SQL commit and the post-commit mtxdb edge write.
-
-        The SQL transaction commits the event, its authoritative `event_edges`
-        row, and a durable `edge_index_outbox` row. If the process dies before
-        the post-commit mtxdb write lands, the publication worker must recover
-        the forward index from the outbox, and it must acknowledge (delete) the
-        outbox rows only after the mtxdb commit -- never before.
-        """
-        from synapse.storage.database import LoggingTransaction
-
-        ns = self.store._embedded_db_namespace
-        room_id = self.room_id
-
-        def _sql_scalar(query: str, args: tuple[Any, ...]) -> Any:
-            def _txn(txn: LoggingTransaction) -> Any:
-                txn.execute(query, args)
-                row = txn.fetchone()
-                assert row is not None
-                return row[0]
-
-            return self.get_success(
-                self.store.db_pool.runInteraction("crash_injection_sql", _txn)
-            )
-
-        outbox_count_query = "SELECT COUNT(*) FROM edge_index_outbox WHERE room_id = ?"
-
-        with (
-            # Model the crash: the post-commit mtxdb write is attempted, but it
-            # never lands. The SQL transaction still commits the event and its
-            # durable outbox row.
-            mock.patch(
-                "synapse.storage.databases.main.events.put_event_edges_batch"
-            ) as direct_write,
-            # Keep the background publication loop from draining the outbox
-            # before the test has inspected it; the real drainer is invoked
-            # explicitly below.
-            mock.patch(
-                "synapse.storage.databases.main.events_worker.drain_edge_index_outbox"
-            ),
-        ):
-            res1 = self.helper.send(room_id, "parent", tok=self.tok)
-            p_id = res1["event_id"]
-            res2 = self.helper.send(room_id, "child", tok=self.tok)
-            c_id = res2["event_id"]
-
-            self.assertTrue(
-                direct_write.called,
-                "the post-commit mtxdb write should have been attempted",
-            )
-
-            # Step 1: SQL is authoritative and the outbox row is durable.
-            self.assertEqual(
-                _sql_scalar(
-                    "SELECT COUNT(*) FROM event_edges "
-                    "WHERE event_id = ? AND prev_event_id = ?",
-                    (c_id, p_id),
-                ),
-                1,
-                "the authoritative SQL edge must be committed",
-            )
-            self.assertGreater(
-                _sql_scalar(outbox_count_query, (room_id,)),
-                0,
-                "the event transaction must commit a durable outbox row",
-            )
-
-            source_version = int(
-                _sql_scalar(
-                    "SELECT source_version FROM room_edge_source_version "
-                    "WHERE room_id = ?",
-                    (room_id,),
-                )
-            )
-
-            # Step 2: the crash left mtxdb unpublished -- the gated read is a
-            # version mismatch, not a (possibly partial) hit.
-            self.assertTrue(
-                get_event_edges_forward_batch(
-                    ns, room_id, source_version, [p_id]
-                ).stale,
-                "an unpublished forward index must not be served as a hit",
-            )
-
-            # Step 3: run the publication worker.
-            self.assertTrue(
-                self.get_success(
-                    drain_edge_index_outbox(self.store, namespace=ns, room_id=room_id)
-                ),
-                "the drainer should have had outbox rows to apply",
-            )
-
-            # Step 4: the forward index is now complete and published, and only
-            # now have the outbox rows been acknowledged.
-            self.assertIn(
-                c_id,
-                (
-                    get_event_edges_forward_batch(
-                        ns, room_id, source_version, [p_id]
-                    ).get(p_id)
-                    or []
-                ),
-                "the drainer must publish the pending forward edge",
-            )
-            self.assertEqual(
-                _sql_scalar(outbox_count_query, (room_id,)),
-                0,
-                "outbox rows must be acknowledged only after mtxdb publication",
-            )
-
-        # The gated production read path now serves a complete, published hit
-        # rather than falling back to SQL.
-        with enable_ffi_counting():
-            successors = self.get_success(self.store.get_successor_events(p_id))
-            self.assertIn(c_id, successors)
-            self.assertEqual(
-                get_ffi_count("event_edges_successor_hits"),
-                1,
-                "expected the recovered read to be an embedded hit",
-            )
-            self.assertEqual(
-                get_ffi_count("event_edges_successor_fallbacks"),
-                0,
-                "expected no SQL fallback after the outbox drained",
-            )
-
-    @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
-    def test_migrate_mtxdb_background_update_is_retired_noop(self) -> None:
-        """The online `event_edges_migrate_mtxdb` background update is retired:
-        FWD authority now requires a stopped-writer offline rebuild, so driving
-        it to completion must NOT mirror legacy SQL-only rows into mtxdb. Those
-        rows stay served from SQL until the offline rebuild runs."""
-        ns = self.store._embedded_db_namespace
-        assert self.persist_store is not None
-
-        # SQL-only: disable the mirror before these events persist, so the
-        # only place this edge exists afterward is the SQL event_edges row,
-        # exactly like a pre-existing server's history.
-        self.persist_store._embedded_event_edges_writable = False
-        res1 = self.helper.send(self.room_id, "legacy-parent", tok=self.tok)
-        p_id = res1["event_id"]
-        res2 = self.helper.send(self.room_id, "legacy-child", tok=self.tok)
-        c_id = res2["event_id"]
-        self.persist_store._embedded_event_edges_writable = True
-
-        flush_edge_writes(ns)
-        self.assertIsNone(
-            get_event_edges_backward_batch(ns, [c_id]).get(c_id),
-            "the mirror-disabled write must not have reached mtxdb",
-        )
-        self.assertIsNone(
-            get_event_edges_forward_batch(ns, [p_id]).get(p_id),
-            "the mirror-disabled write must not have reached mtxdb",
-        )
-
-        # Re-register the background update (a fresh test DB already marks it
-        # complete) and drive it to completion, the same pattern
-        # test_events_bg_updates.py uses.
-        self.get_success(
-            self.store.db_pool.simple_insert(
-                table="background_updates",
-                values={
-                    "update_name": "event_edges_migrate_mtxdb",
-                    "progress_json": "{}",
-                },
-            )
-        )
-        # has_completed_background_updates() caches _all_done=True forever
-        # once it's observed an empty table -- which it already has by now,
-        # via reactor pumps inside the register_user/login/send calls above.
-        # Reset it so wait_for_background_updates() re-checks the DB instead
-        # of trusting the stale cache (test_events_bg_updates.py's
-        # TestRedactionsRecheckBgUpdate does the same for the same reason).
-        self.store.db_pool.updates._all_done = False
-        self.wait_for_background_updates()
-
-        # The legacy edge is still in SQL, and the SQL fallback keeps serving
-        # it.
-        sql_prev = self.get_success(
-            self.store.db_pool.simple_select_onecol(
-                table="event_edges",
-                keyvalues={"event_id": c_id},
-                retcol="prev_event_id",
-                desc="legacy_event_edges_prev",
-            )
-        )
-        self.assertIn(p_id, sql_prev, "legacy event_edges row must remain in SQL")
-
-        # ...but the retired online migration must not publish it to mtxdb;
-        # only the offline rebuild does that.
-        self.assertIsNone(
-            get_event_edges_backward_batch(ns, [c_id]).get(c_id),
-            "the retired online migration must not mirror legacy rows",
-        )
-        self.assertIsNone(
-            get_event_edges_forward_batch(ns, [p_id]).get(p_id),
-            "the retired online migration must not mirror legacy rows",
-        )
-
-    @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
-    def test_get_successor_events_gates_on_mtxdb_migration_completion(self) -> None:
-        """A parent with two children -- one legacy (SQL-only, predates the
-        mirror), one mirrored (a live post-enable write) -- gives mtxdb a
-        forward list that is non-empty but *incomplete*: `[mirrored_child]`,
-        missing `legacy_child`. `get_successor_events`'s fallback is
-        miss-triggered (`successors is not None`), so it cannot detect a
-        partial hit as anything other than a hit. Confirms it does not try:
-        while `event_edges_migrate_mtxdb` is incomplete, both children must
-        come back (the all-SQL path, gated shut); once complete, both must
-        still come back (mtxdb now has both, backfill covered the legacy
-        one)."""
-        ns = self.store._embedded_db_namespace
-
-        parent_res = self.helper.send(self.room_id, "gate-parent", tok=self.tok)
-        parent_id = parent_res["event_id"]
-
-        # Two children of the same parent, inserted directly (a real forked
-        # DAG needs auth-event plumbing this test doesn't need): one SQL-only
-        # (the legacy shape), one also mirrored (the live post-enable shape).
-        legacy_child = "$gate-legacy-child:test"
-        mirrored_child = "$gate-mirrored-child:test"
-        for child_id in (legacy_child, mirrored_child):
-            self.get_success(
-                self.store.db_pool.simple_insert(
-                    table="events",
-                    values={
-                        "event_id": child_id,
-                        "room_id": self.room_id,
-                        "topological_ordering": 1,
-                        "depth": 1,
-                        "type": "m.test",
-                        "sender": self.user_id,
-                        "processed": True,
-                        "outlier": False,
-                    },
-                )
-            )
-            self.get_success(
-                self.store.db_pool.simple_insert(
-                    table="event_edges",
-                    values={"event_id": child_id, "prev_event_id": parent_id},
-                )
-            )
-        put_event_edges_batch(ns, [(self.room_id, mirrored_child, parent_id, False)])
-
-        # Sanity: mtxdb's forward list for parent_id is now a real hit, but
-        # an incomplete one -- exactly the shape the gate exists for.
-        raw_forward = get_event_edges_forward_batch(ns, [parent_id])
-        self.assertEqual(raw_forward.get(parent_id), [mirrored_child])
-
-        # event_edges_migrate_mtxdb is not registered as pending in a fresh
-        # test DB (it's marked complete, like every other background update),
-        # so has_completed_background_update already reports True. Reinsert
-        # it and reset the cache to actually exercise the gate being closed
-        # (test_migrate_mtxdb_background_update_mirrors_legacy_rows's idiom).
-        self.get_success(
-            self.store.db_pool.simple_insert(
-                table="background_updates",
-                values={
-                    "update_name": "event_edges_migrate_mtxdb",
-                    "progress_json": "{}",
-                },
-            )
-        )
-        self.store.db_pool.updates._all_done = False
-        self.store.db_pool.updates._completed_background_updates.discard(
-            "event_edges_migrate_mtxdb"
-        )
-
-        # Gate closed: must take the all-SQL path and return both children,
-        # not the incomplete mtxdb list.
-        sn = self.store.server_name
-        stale0 = _reads(sn, "successor", "stale")
-        successors = self.get_success(self.store.get_successor_events(parent_id))
-        self.assertEqual(_reads(sn, "successor", "stale") - stale0, 1)
-        self.assertEqual(
-            set(successors),
-            {legacy_child, mirrored_child},
-            "gate closed: must not trust the incomplete mtxdb hit",
-        )
-
-        # Drive the background update to completion: it mirrors the legacy
-        # child too, so mtxdb's forward list becomes complete.
-        self.wait_for_background_updates()
-
-        hit0 = _reads(sn, "successor", "hit")
-        successors_after = self.get_success(self.store.get_successor_events(parent_id))
-        self.assertEqual(_reads(sn, "successor", "hit") - hit0, 1)
-        self.assertEqual(
-            set(successors_after),
-            {legacy_child, mirrored_child},
-            "gate open: mtxdb must now be complete (backfill mirrored the "
-            "legacy child), so the hit is correct",
-        )
-
-    @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
-    def test_is_event_next_to_forward_gap_gates_on_mtxdb_migration_completion(
-        self,
-    ) -> None:
-        """Same partial-hit shape as
-        `test_get_successor_events_gates_on_mtxdb_migration_completion`, for
-        `is_event_next_to_forward_gap`'s independent gate
-        (`embedded_edges_trustworthy`, resolved before `runInteraction` since
-        its txn closure is sync). `parent` has a real (non-rejected) child,
-        so it must never be reported as a forward gap, gate open or closed --
-        the gate exists so an incomplete mtxdb hit can't override that by
-        claiming `children == []` when the mirror simply hasn't caught up."""
-        ns = self.store._embedded_db_namespace
-
-        parent_res = self.helper.send(self.room_id, "fg-gate-parent", tok=self.tok)
-        parent_id = parent_res["event_id"]
-        parent_event = self.get_success(self.store.get_event(parent_id))
-
-        legacy_child = "$fg-gate-legacy-child:test"
-        mirrored_child = "$fg-gate-mirrored-child:test"
-        for child_id in (legacy_child, mirrored_child):
-            self.get_success(
-                self.store.db_pool.simple_insert(
-                    table="events",
-                    values={
-                        "event_id": child_id,
-                        "room_id": self.room_id,
-                        "topological_ordering": 1,
-                        "depth": 1,
-                        "type": "m.test",
-                        "sender": self.user_id,
-                        "processed": True,
-                        "outlier": False,
-                    },
-                )
-            )
-            self.get_success(
-                self.store.db_pool.simple_insert(
-                    table="event_edges",
-                    values={"event_id": child_id, "prev_event_id": parent_id},
-                )
-            )
-        put_event_edges_batch(ns, [(self.room_id, mirrored_child, parent_id, False)])
-
-        self.get_success(
-            self.store.db_pool.simple_insert(
-                table="background_updates",
-                values={
-                    "update_name": "event_edges_migrate_mtxdb",
-                    "progress_json": "{}",
-                },
-            )
-        )
-        self.store.db_pool.updates._all_done = False
-        self.store.db_pool.updates._completed_background_updates.discard(
-            "event_edges_migrate_mtxdb"
-        )
-
-        self.assertFalse(
-            self.get_success(self.store.is_event_next_to_forward_gap(parent_event)),
-            "gate closed: a real child exists, must not be reported as a gap",
-        )
-
-        self.wait_for_background_updates()
-
-        self.assertFalse(
-            self.get_success(self.store.is_event_next_to_forward_gap(parent_event)),
-            "gate open: still a real child, still not a gap",
-        )
-
 
 class EventEdgesSqlOnlyMetricTestCase(EventEdgesStorageIntegrationTestCase):
     """With the embedded backend off for a store, lookups bypass mtxdb and must
     still be counted, so `sql_only` gives a denominator for all lookups."""
 
     @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
-    def test_gap_lookup_counts_hit_then_fallback(self) -> None:
-        """`is_event_next_to_forward_gap` records a hit from mtxdb, and a
-        `stale` once the SQL source version moves ahead."""
+    def test_gap_lookup_counts_hit(self) -> None:
+        """`is_event_next_to_forward_gap` records an mtxdb hit."""
         parent_id = self.helper.send(self.room_id, "gap-parent", tok=self.tok)[
             "event_id"
         ]
@@ -2079,7 +1558,6 @@ class EventEdgesSqlOnlyMetricTestCase(EventEdgesStorageIntegrationTestCase):
         parent = self.get_success(self.store.get_event(parent_id))
         ns = self.store._embedded_db_namespace
         flush_edge_writes(ns)
-        self.get_success(drain_edge_index_outbox(self.store, namespace=ns))
         sn = self.store.server_name
 
         hit0 = _reads(sn, "gap", "hit")
@@ -2089,28 +1567,14 @@ class EventEdgesSqlOnlyMetricTestCase(EventEdgesStorageIntegrationTestCase):
         self.assertEqual(
             _reads(sn, "gap", "hit") - hit0,
             1,
-            [_reads(sn, "gap", o) for o in ("hit", "miss", "stale", "sql_only")],
+            [_reads(sn, "gap", o) for o in ("hit", "miss", "sql_only")],
         )
 
-        # Advance the SQL source version past what mtxdb has published, so the
-        # embedded result is stale and the lookup must be counted as such.
-        self.get_success(
-            self.store.db_pool.runInteraction(
-                "bump_source_version",
-                lambda txn: txn.execute(
-                    "UPDATE room_edge_source_version SET source_version = "
-                    "source_version + 1 WHERE room_id = ?",
-                    (self.room_id,),
-                ),
-            )
-        )
         hit1 = _reads(sn, "gap", "hit")
-        stale0 = _reads(sn, "gap", "stale")
         self.assertFalse(
             self.get_success(self.store.is_event_next_to_forward_gap(parent))
         )
-        self.assertEqual(_reads(sn, "gap", "hit"), hit1)
-        self.assertEqual(_reads(sn, "gap", "stale") - stale0, 1)
+        self.assertEqual(_reads(sn, "gap", "hit") - hit1, 1)
 
     @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
     def test_disabled_embedded_edges_count_sql_only_on_both_callers(self) -> None:
@@ -2130,16 +1594,16 @@ class EventEdgesSqlOnlyMetricTestCase(EventEdgesStorageIntegrationTestCase):
         self.assertEqual(_reads(sn, "gap", "sql_only") - gap0, 1)
 
     @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
-    def test_unresolvable_successor_lookup_counts_unavailable(self) -> None:
+    def test_unresolvable_successor_lookup_counts_miss(self) -> None:
         sn = self.store.server_name
-        unavailable0 = _reads(sn, "successor", "unavailable")
+        miss0 = _reads(sn, "successor", "miss")
         self.assertEqual(
             self.get_success(
                 self.store.get_successor_events("$unknown-event:example.org")
             ),
             [],
         )
-        self.assertEqual(_reads(sn, "successor", "unavailable") - unavailable0, 1)
+        self.assertEqual(_reads(sn, "successor", "miss") - miss0, 1)
 
     @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
     def test_successor_lookup_counts_a_clean_miss(self) -> None:
@@ -2156,51 +1620,3 @@ class EventEdgesSqlOnlyMetricTestCase(EventEdgesStorageIntegrationTestCase):
             self.get_success(self.store.get_successor_events(parent_id)), []
         )
         self.assertEqual(_reads(sn, "successor", "miss") - miss0, 1)
-
-    @skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
-    def test_failed_successor_repair_counts_fallback_once(self) -> None:
-        parent_id = self.helper.send(
-            self.room_id, "failed-repair-parent", tok=self.tok
-        )["event_id"]
-        child_id = self.helper.send(self.room_id, "failed-repair-child", tok=self.tok)[
-            "event_id"
-        ]
-        ns = self.store._embedded_db_namespace
-        flush_edge_writes(ns)
-        mtxdb_engine.event_edges_delete(ns, [child_id])
-
-        server = self.store.server_name
-        outcomes = ("hit", "miss", "stale", "sql_only", "unavailable")
-        reads_before = {
-            outcome: _reads(server, "successor", outcome) for outcome in outcomes
-        }
-        failures_before = _sample(
-            "synapse_event_edges_repairs_total",
-            path="successor",
-            result="failed",
-            server_name=server,
-        )
-        with mock.patch(
-            "synapse.storage.databases.main.embedded_event_edges.repair_edge_index_from_sql",
-            side_effect=RuntimeError("simulated repair failure"),
-        ):
-            successors = self.get_success(self.store.get_successor_events(parent_id))
-
-        self.assertIn(child_id, successors)
-        self.assertEqual(
-            sum(
-                _reads(server, "successor", outcome) - before
-                for outcome, before in reads_before.items()
-            ),
-            1,
-        )
-        self.assertEqual(
-            _sample(
-                "synapse_event_edges_repairs_total",
-                path="successor",
-                result="failed",
-                server_name=server,
-            )
-            - failures_before,
-            1,
-        )

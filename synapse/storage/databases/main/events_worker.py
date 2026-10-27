@@ -85,8 +85,6 @@ from synapse.storage.database import (
 )
 from synapse.storage.databases.main.embedded_common import ffi_count
 from synapse.storage.databases.main.embedded_event_edges import (
-    classify_event_edge_fallback,
-    drain_edge_index_outbox,
     embedded_event_edges_is_writable,
     gc_retired_forward_generations,
     open_embedded_event_edges_engine,
@@ -340,12 +338,6 @@ class EventsWorkerStore(SQLBaseStore):
 
         if hs.config.worker.run_background_tasks:
             if embedded_event_edges_is_writable(hs):
-                self.clock.looping_call(
-                    lambda: drain_edge_index_outbox(
-                        self, namespace=self._embedded_db_namespace
-                    ),
-                    Duration(seconds=1),
-                )
                 self.clock.looping_call(
                     lambda: gc_retired_forward_generations(self),
                     Duration(minutes=5),
@@ -2703,42 +2695,30 @@ class EventsWorkerStore(SQLBaseStore):
                     get_event_edges_forward_batch,
                 )
 
-                txn.execute(
-                    "SELECT source_version FROM room_edge_source_version WHERE room_id = ?",
-                    (event.room_id,),
-                )
-                source_version_row = txn.fetchone()
-                source_version = int(source_version_row[0]) if source_version_row else 0
                 forward_map = get_event_edges_forward_batch(
-                    self._embedded_db_namespace,
-                    event.room_id,
-                    source_version,
-                    [event.event_id],
+                    self._embedded_db_namespace, [event.event_id]
                 )
-                children = (
-                    None if forward_map.stale else forward_map.get(event.event_id)
-                )
-                if children is not None:
-                    ffi_count("event_edges_gap_hits", 1)
-                    record_event_edge_read(self.server_name, "gap", "hit")
-                    if not children:
-                        return True
-                    clause, args = make_in_list_sql_clause(
-                        self.database_engine, "event_id", children
-                    )
-                    txn.execute(f"SELECT event_id FROM rejections WHERE {clause}", args)
-                    rejected_children = {r[0] for r in txn}
-                    if any(c not in rejected_children for c in children):
-                        return False
+                children = forward_map.get(event.event_id)
+                if children is None:
+                    ffi_count("event_edges_gap_misses", 1)
+                    record_event_edge_read(self.server_name, "gap", "miss")
                     return True
-                ffi_count("event_edges_gap_fallbacks", 1)
-                record_event_edge_read(
-                    self.server_name, "gap", classify_event_edge_fallback(forward_map)
+                ffi_count("event_edges_gap_hits", 1)
+                record_event_edge_read(self.server_name, "gap", "hit")
+                if not children:
+                    return True
+                clause, args = make_in_list_sql_clause(
+                    self.database_engine, "event_id", children
                 )
+                txn.execute(f"SELECT event_id FROM rejections WHERE {clause}", args)
+                rejected_children = {r[0] for r in txn}
+                if any(c not in rejected_children for c in children):
+                    return False
+                return True
 
-            # Check to see whether the event in question is already referenced
-            # by another event. If we don't see any edges, we're next to a
-            # forward gap.
+            # Non-mtxdb stores keep the legacy SQL edge table. On an mtxdb
+            # store the branch above is authoritative: a missing forward record
+            # means no known children, so this event is next to a forward gap.
             forward_edge_query = """
                 SELECT 1 FROM event_edges
                 /* Check to make sure the event referencing our event in question is not rejected */
@@ -2906,9 +2886,8 @@ class EventsWorkerStore(SQLBaseStore):
             room_id,
         )
 
-    @staticmethod
     def _get_partial_state_events_batch_txn(
-        txn: LoggingTransaction, room_id: str
+        self, txn: LoggingTransaction, room_id: str
     ) -> list[str]:
         # we want to work through the events from oldest to newest, so
         # we only want events whose prev_events do *not* have partial state - hence
@@ -2923,6 +2902,56 @@ class EventsWorkerStore(SQLBaseStore):
         # hard to do much about.
         #
         # See also: https://github.com/matrix-org/synapse/issues/13001
+        if getattr(self, "_embedded_event_edges_enabled", False):
+            from synapse.storage.databases.main.embedded_event_edges import (
+                get_event_edges_backward_batch,
+            )
+
+            txn.execute(
+                """
+                SELECT event_id FROM partial_state_events AS pse
+                    JOIN events USING (event_id)
+                WHERE pse.room_id = ?
+                ORDER BY events.stream_ordering
+                LIMIT 1000
+                """,
+                (room_id,),
+            )
+            candidates = [row[0] for row in txn]
+            if not candidates:
+                return []
+
+            backward = get_event_edges_backward_batch(
+                self._embedded_db_namespace, candidates
+            )
+            prev_ids = {
+                prev_event_id
+                for event_id in candidates
+                for prev_event_id, _is_state in (backward.get(event_id) or ())
+            }
+            partial_prevs: set[str] = set()
+            if prev_ids:
+                clause, args = make_in_list_sql_clause(
+                    self.database_engine, "event_id", list(prev_ids)
+                )
+                txn.execute(
+                    f"SELECT event_id FROM partial_state_events WHERE {clause}",
+                    args,
+                )
+                partial_prevs = {row[0] for row in txn}
+
+            ready: list[str] = []
+            for event_id in candidates:
+                if any(
+                    prev_event_id in partial_prevs
+                    for prev_event_id, _is_state in (backward.get(event_id) or ())
+                ):
+                    continue
+                ready.append(event_id)
+                if len(ready) >= 100:
+                    break
+            return ready
+
         txn.execute(
             """
             SELECT event_id FROM partial_state_events AS pse
