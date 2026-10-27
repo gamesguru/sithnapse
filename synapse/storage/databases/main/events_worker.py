@@ -86,7 +86,6 @@ from synapse.storage.database import (
 from synapse.storage.databases.main.embedded_common import ffi_count
 from synapse.storage.databases.main.embedded_event_edges import (
     embedded_event_edges_is_writable,
-    gc_retired_forward_generations,
     open_embedded_event_edges_engine,
     record_event_edge_read,
     register_publish_signal_gauge,
@@ -337,11 +336,6 @@ class EventsWorkerStore(SQLBaseStore):
         )
 
         if hs.config.worker.run_background_tasks:
-            if embedded_event_edges_is_writable(hs):
-                self.clock.looping_call(
-                    lambda: gc_retired_forward_generations(self),
-                    Duration(minutes=5),
-                )
             # We periodically clean out old transaction ID mappings
             self.clock.looping_call(
                 self._cleanup_old_transaction_ids,
