@@ -243,6 +243,16 @@ def main() -> None:
         try:
             subprocess.run(["git", "checkout", args.base], cwd=REPO_ROOT, check=True)
 
+            # The base's Cargo.lock may pin a git dependency revision that has
+            # since been force-pushed or squashed away upstream, which makes
+            # its Rust build unresolvable. The schema does not depend on that
+            # revision, so build the base with the head's lockfile.
+            subprocess.run(
+                ["git", "checkout", head_ref, "--", "Cargo.lock"],
+                cwd=REPO_ROOT,
+                check=False,
+            )
+
             # Refresh dependencies
             print("Installing dependencies for base commit...", file=sys.stderr)
             install_dependencies()
