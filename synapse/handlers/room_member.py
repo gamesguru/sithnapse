@@ -1440,7 +1440,7 @@ class RoomMemberHandler(metaclass=abc.ABCMeta):
         return False, []
 
     async def transfer_room_state_on_room_upgrade(
-        self, old_room_id: str, room_id: str
+        self, old_room_id: str, room_id: str, copy_user_state: bool = True
     ) -> None:
         """Upon our server becoming aware of an upgraded room, either by upgrading a room
         ourselves or joining one, we can transfer over information from the previous room.
@@ -1451,12 +1451,19 @@ class RoomMemberHandler(metaclass=abc.ABCMeta):
         Args:
             old_room_id: The ID of the old room
             room_id: The ID of the new room
+            copy_user_state: Whether to copy tags/push rules. A retry of a
+                partially completed upgrade passes False so that tag changes
+                the users made in the new room are not overwritten.
         """
         logger.info("Transferring room state from %s to %s", old_room_id, room_id)
 
-        # Find all local users that were in the old room and copy over each user's state
-        local_users = await self.store.get_local_users_in_room(old_room_id)
-        await self.copy_user_state_on_room_upgrade(old_room_id, room_id, local_users)
+        if copy_user_state:
+            # Find all local users that were in the old room and copy over each
+            # user's state
+            local_users = await self.store.get_local_users_in_room(old_room_id)
+            await self.copy_user_state_on_room_upgrade(
+                old_room_id, room_id, local_users
+            )
 
         # Add new room to the room directory if the old room was there
         # Remove old room from the room directory
