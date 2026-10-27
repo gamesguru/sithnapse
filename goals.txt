@@ -1,3 +1,5 @@
+REVISED 2026-10-27: sql-only is a supported mode and operators may switch sql <-> mtxdb either way. Exactly one backend is authoritative per config: no dual-write, no silent SQL fallback. Migration is MANUAL (an operator-run command, never a background update). On startup Synapse must hard-fail (panic) if the configured backend does not hold the migrated data, with a message naming the migrate command. The "no config to go back" line below is superseded.
+
 completely remove sql-mtxdb dual-writes. Completely make mtxdb authoritative where it wants to be. Do NOT have any configuration option to go back. Only go forward. There is no "if event json embedded is enabled" since we have only one direction to flow: forward. Simplicity to the max. Total control.
 
 
@@ -36,3 +38,5 @@ batch APIs exist): events_worker.py ~2743 and ~2932; event_federation.py ~2101
 so mtxdb must become non-optional in test config first.
 Order: (a) make embedded engine mandatory in config + test harness, (b) port
 readers one at a time, (c) drop SQL insert/outbox/version, (d) drop tables.
+
+Revised plan consequences: phases 3/4 become per-backend instead of "delete SQL": keep both implementations selected by config, remove the dual-write (outbox, source-version clock, repair-from-SQL, SQL fallback reads), replace the 96/05 background update with a manual migrate command (--to sql|mtxdb), and add a startup backend-marker check that refuses to start on mismatch.
