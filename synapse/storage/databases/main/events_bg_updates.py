@@ -323,15 +323,32 @@ class EventsBackgroundUpdatesStore(
 
         ################################################################################
 
-        self.db_pool.updates.register_background_index_update(
-            _BackgroundUpdates.EVENT_EDGES_REPLACE_INDEX,
-            index_name="event_edges_event_id_prev_event_id_idx",
-            table="event_edges",
-            columns=["event_id", "prev_event_id"],
-            unique=True,
-            # the old index which just covered event_id is now redundant.
-            replaces_index="ev_edges_id",
-        )
+        if getattr(self, "_embedded_event_edges_enabled", False):
+            # Delta 71 may have queued this SQL index update before the server
+            # was switched to mtxdb. Consume the queued update without doing
+            # SQL edge work; the index is irrelevant while SQL edges are dead.
+            async def skip_event_edges_index_update(
+                progress: JsonDict, batch_size: int
+            ) -> int:
+                await self.db_pool.updates._end_background_update(
+                    _BackgroundUpdates.EVENT_EDGES_REPLACE_INDEX
+                )
+                return 1
+
+            self.db_pool.updates.register_background_update_handler(
+                _BackgroundUpdates.EVENT_EDGES_REPLACE_INDEX,
+                skip_event_edges_index_update,
+            )
+        else:
+            self.db_pool.updates.register_background_index_update(
+                _BackgroundUpdates.EVENT_EDGES_REPLACE_INDEX,
+                index_name="event_edges_event_id_prev_event_id_idx",
+                table="event_edges",
+                columns=["event_id", "prev_event_id"],
+                unique=True,
+                # the old index which just covered event_id is now redundant.
+                replaces_index="ev_edges_id",
+            )
 
         self.db_pool.updates.register_background_update_handler(
             _BackgroundUpdates.EVENTS_POPULATE_STATE_KEY_REJECTIONS,
