@@ -1102,17 +1102,14 @@ class EventCreationHandler:
                     # The first attempt may have persisted the tombstone but
                     # failed while transferring room state. Retrying with the
                     # same transaction ID returns the stored event, so finish
-                    # the transfer here before returning it. User state was
-                    # already copied (and may since have been edited), so only
-                    # redo the idempotent room directory update.
+                    # the transfer here before returning it. Per-user progress
+                    # tracking skips users whose state was already copied.
                     if (
                         event.type == EventTypes.Tombstone
                         and event.is_state()
                         and event.state_key == ""
                     ):
-                        await self._transfer_state_for_manual_upgrade(
-                            event, copy_user_state=False
-                        )
+                        await self._transfer_state_for_manual_upgrade(event)
                     return (
                         event,
                         event.internal_metadata.stream_ordering,
@@ -1280,9 +1277,7 @@ class EventCreationHandler:
 
         return ev, ev.internal_metadata.stream_ordering
 
-    async def _transfer_state_for_manual_upgrade(
-        self, tombstone: EventBase, copy_user_state: bool = True
-    ) -> None:
+    async def _transfer_state_for_manual_upgrade(self, tombstone: EventBase) -> None:
         """A client can upgrade a room by hand: create a new room naming the old one as
         its predecessor, then send a tombstone into the old room. `upgrade_room` isn't
         involved, so copy the users' push rules/tags and the room directory state here
@@ -1307,7 +1302,7 @@ class EventCreationHandler:
             return
 
         await self.hs.get_room_member_handler().transfer_room_state_on_room_upgrade(
-            tombstone.room_id, new_room_id, copy_user_state=copy_user_state
+            tombstone.room_id, new_room_id
         )
 
     @measure_func("create_new_client_event")
