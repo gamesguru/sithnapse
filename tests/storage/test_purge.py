@@ -40,10 +40,6 @@ from synapse.storage.databases.main.embedded_redactions import (
     get_redactions_batch,
     put_redaction_batch,
 )
-from synapse.storage.databases.main.embedded_rejections import (
-    get_rejections_batch,
-    put_rejection_batch,
-)
 from synapse.types.state import StateFilter
 from synapse.types.storage import _BackgroundUpdates
 from synapse.util.clock import Clock
@@ -125,19 +121,15 @@ class PurgeTests(HomeserverTestCase):
             )
         )
         put_redaction_batch(engine, namespace, [(target_id, redaction_id, True)])
-        put_rejection_batch(engine, namespace, [(target_id, "test rejection", "1")])
 
     def _assert_mirrors(
         self, engine: str, namespace: str, target_id: str, present: bool
     ) -> None:
         redactions = get_redactions_batch(engine, namespace, [target_id])
-        rejections = get_rejections_batch(engine, namespace, [target_id])
         if present:
             self.assertIn(target_id, redactions)
-            self.assertIn(target_id, rejections)
         else:
             self.assertNotIn(target_id, redactions)
-            self.assertNotIn(target_id, rejections)
 
     def test_purge_history(self) -> None:
         """

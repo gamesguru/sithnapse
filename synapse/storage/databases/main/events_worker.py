@@ -95,10 +95,6 @@ from synapse.storage.databases.main.embedded_event_json import (
     open_embedded_event_json_engine,
 )
 from synapse.storage.databases.main.embedded_redactions import get_redactions_batch
-from synapse.storage.databases.main.embedded_rejections import (
-    delete_rejections_batch,
-    put_rejection_batch,
-)
 from synapse.storage.types import Cursor
 from synapse.storage.util.id_generators import (
     AbstractStreamIdGenerator,
@@ -2996,13 +2992,6 @@ class EventsWorkerStore(SQLBaseStore):
                 "rejections",
                 keyvalues={"event_id": event_id},
             )
-            if self._embedded_event_json_enabled:
-                txn.call_after(
-                    delete_rejections_batch,
-                    self._embedded_db_engine,
-                    self._embedded_db_namespace,
-                    [event_id],
-                )
         else:
             logger.info(
                 "Marking previously-processed event %s as rejected(%s)",
@@ -3022,13 +3011,6 @@ class EventsWorkerStore(SQLBaseStore):
                     "last_check": last_check,
                 },
             )
-            if self._embedded_event_json_enabled:
-                txn.call_after(
-                    put_rejection_batch,
-                    self._embedded_db_engine,
-                    self._embedded_db_namespace,
-                    [(event_id, rejection_reason, last_check)],
-                )
         self.db_pool.simple_update_txn(
             txn,
             table="events",

@@ -99,7 +99,6 @@ from synapse.storage.databases.main.embedded_redactions import (
     put_redaction_batch,
     set_have_censored_batch,
 )
-from synapse.storage.databases.main.embedded_rejections import put_rejection_batch
 from synapse.storage.databases.main.event_federation import EventFederationStore
 from synapse.storage.databases.main.events_worker import EventCacheEntry
 from synapse.storage.databases.main.search import SearchEntry
@@ -4708,15 +4707,6 @@ class PersistEventsStore:
                 "last_check": last_check,
             },
         )
-
-        # Mirror into the embedded engine if configured -- flat point lookup,
-        # see embedded_rejections.py.
-        if getattr(self, "_embedded_event_json_enabled", False):
-            put_rejection_batch(
-                self._embedded_db_engine,
-                self._embedded_db_namespace,
-                [(event_id, reason, last_check)],
-            )
 
     def _store_event_state_mappings_txn(
         self,

@@ -41,7 +41,6 @@ from synapse.storage.databases.main.embedded_event_to_state_group import (
     get_state_group_for_events_batch,
 )
 from synapse.storage.databases.main.embedded_redactions import delete_redactions_batch
-from synapse.storage.databases.main.embedded_rejections import delete_rejections_batch
 from synapse.storage.databases.main.state import StateGroupWorkerStore
 from synapse.storage.engines import PostgresEngine
 from synapse.storage.engines._base import IsolationLevel
@@ -403,9 +402,6 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
 
         # Capture redaction targets before deleting the redactions rows by their
         # own event IDs. The embedded redaction mirror is keyed by `redacts`.
-        purged_event_ids = [
-            event_id for event_id, should_delete in event_rows if should_delete
-        ]
         redacted_event_ids: list[str] = []
         if getattr(self, "_embedded_event_json_enabled", False):
             txn.execute(
@@ -436,18 +432,12 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             )
 
         # Remove the corresponding flat-KV entries after the SQL rows have
-        # been deleted. Redactions use their target (`redacts`) as the key;
-        # rejections use the purged event ID.
+        # been deleted, keyed by the redaction's target (`redacts`).
         if getattr(self, "_embedded_event_json_enabled", False):
             delete_redactions_batch(
                 self._embedded_db_engine,
                 self._embedded_db_namespace,
                 redacted_event_ids,
-            )
-            delete_rejections_batch(
-                self._embedded_db_engine,
-                self._embedded_db_namespace,
-                purged_event_ids,
             )
 
         # The `event_json` DELETE above only removed the SQL rows; the
@@ -770,11 +760,6 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
                 self._embedded_db_engine,
                 self._embedded_db_namespace,
                 room_redacted_event_ids,
-            )
-            delete_rejections_batch(
-                self._embedded_db_engine,
-                self._embedded_db_namespace,
-                room_event_ids,
             )
 
         # As in _purge_history_txn: the event_json DELETE above only cleared
