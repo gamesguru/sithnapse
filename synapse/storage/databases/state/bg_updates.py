@@ -1371,13 +1371,8 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
         """Fetch `(room_prefix, root_structural_hash, room_id)` for each of
         `groups` that has a published HAMT root, from the embedded engine --
         the configured store, used exclusively. A group still missing after
-        that is NOT silently re-fetched from SQL: once the embedded engine
-        is configured it's the source of truth for new data, so a real miss
-        means either genuine corruption or (the one legitimate exception)
-        that `EMBEDDED_DB_MIGRATION_UPDATE_NAME` hasn't finished copying
-        this group's pre-existing SQL row over yet -- see
-        `_background_migrate_state_hamt_to_embedded`. Only in that bounded,
-        explicit window does this fall back to SQL.
+        that is NOT re-fetched from SQL: the embedded engine is the only
+        source, so a miss is a real miss.
 
         `groups` is a bare list of `state_group` ints spanning arbitrary,
         unknown rooms by design (this is the generic materialize/lookup-by
@@ -1389,63 +1384,14 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
         engine = get_embedded_engine(getattr(self, "_embedded_db_engine", None))
         namespace = getattr(self, "_embedded_db_namespace", None)
         found: dict[int, tuple[bytes, bytes, str]] = {}
-        still_missing: list[int] = []
 
         roots = engine.get_state_hamt_roots_bulk(namespace, groups)
         for group, root in zip(groups, roots):
+            # A miss is a real miss: no SQL read alongside mtxdb.
             if root is None:
-                still_missing.append(group)
                 continue
             room_prefix, root_hash, room_id = root
             found[group] = (bytes(room_prefix), bytes(root_hash), room_id)
-        if not still_missing:
-            return found
-
-        migration_name = getattr(
-            self, "EMBEDDED_DB_MIGRATION_UPDATE_NAME", "state_hamt_embedded_migration"
-        )
-        txn.execute(
-            "SELECT 1 FROM background_updates WHERE update_name = ?",
-            (migration_name,),
-        )
-        migration_pending = txn.fetchone() is not None
-        if not migration_pending:
-            # Not a migration window -- these groups are genuinely missing
-            # from the configured store. Let the caller's normal
-            # missing-group handling (raise-unless-legacy-pre-v95) decide,
-            # rather than masking it with a legacy-SQL read here.
-            return found
-
-        root_rows = self.db_pool.simple_select_many_txn(
-            txn,
-            table="state_hamt_roots",
-            column="state_group",
-            iterable=still_missing,
-            keyvalues={},
-            retcols=("state_group", "room_prefix", "root_structural_hash"),
-        )
-        if not root_rows:
-            return found
-        roots = {
-            int(group): (bytes(room_prefix), bytes(root_hash))
-            for group, room_prefix, root_hash in root_rows
-        }
-        room_id_rows = self.db_pool.simple_select_many_txn(
-            txn,
-            table="state_groups",
-            column="id",
-            iterable=list(roots.keys()),
-            keyvalues={},
-            retcols=("id", "room_id"),
-        )
-        room_ids = {int(group): room_id for group, room_id in room_id_rows}
-        found.update(
-            {
-                group: (room_prefix, root_hash, room_ids[group])
-                for group, (room_prefix, root_hash) in roots.items()
-                if group in room_ids
-            }
-        )
         return found
 
     def _materialize_state_hamts_from_embedded_txn(

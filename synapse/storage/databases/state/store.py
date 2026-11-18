@@ -93,7 +93,6 @@ MAX_MIRROR_STATE_ENTRIES = 100_000
 class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
     """A data store for fetching/storing state groups."""
 
-    EMBEDDED_DB_MIGRATION_UPDATE_NAME = "state_hamt_embedded_migration"
     MAX_MIRROR_STATE_ENTRIES = MAX_MIRROR_STATE_ENTRIES
 
     def __init__(
@@ -273,10 +272,6 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             # latter regardless of the former, or it silently fails (sync)
             # or never runs anywhere (drain/migrate) on such a topology.
             if self._embedded_db_is_writer:
-                hs.run_as_background_process(
-                    "enqueue_state_hamt_embedded_migration",
-                    self._enqueue_embedded_db_migration_if_needed,
-                )
                 hs.get_clock().looping_call(
                     self._drain_embedded_state_hamt_root_deletion_queue,
                     Duration(minutes=5),
@@ -308,11 +303,6 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                     eventType="shutdown",
                     shutdown_func=self._flush_coalescer.close,
                 )
-
-            self.db_pool.updates.register_background_update_handler(
-                self.EMBEDDED_DB_MIGRATION_UPDATE_NAME,
-                self._background_migrate_state_hamt_to_embedded,
-            )
 
     def _assert_embedded_db_writer(self) -> None:
         """Raise before attempting an mtxdb write on an instance that
@@ -549,155 +539,6 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 }
             ],
         )
-
-    async def _enqueue_embedded_db_migration_if_needed(self) -> None:
-        """Turning on the embedded engine doesn't retroactively move
-        existing `state_hamt_nodes`/`state_hamt_roots` SQL rows into it --
-        new writes go exclusively to whichever engine is configured (see
-        `_persist_state_hamt_txn`), but old data written before the switch
-        stays SQL-only until this migration copies it over.
-
-        `has_completed_background_update` isn't a reliable "already
-        enqueued?" check here: it short-circuits to `True` once the
-        updater's own poll loop has run dry and set `_all_done` (which will
-        already be true on almost every real startup, since this row is
-        inserted at runtime rather than being a schema-declared update the
-        loop knew about from the start) -- that would make this a no-op
-        forever, never actually inserting the row. `simple_upsert` on the
-        primary key is what actually makes this idempotent (a second call
-        updates the existing row's non-key columns to the same values
-        rather than erroring or duplicating); `start_doing_background_updates`
-        unconditionally resets `_all_done` and restarts the poll loop so a
-        freshly-inserted row is picked up even if the loop had already gone
-        idle.
-        """
-        await self.db_pool.simple_upsert(
-            table="background_updates",
-            keyvalues={"update_name": self.EMBEDDED_DB_MIGRATION_UPDATE_NAME},
-            values={},
-            insertion_values={"progress_json": "{}"},
-            desc="enqueue_state_hamt_embedded_migration",
-        )
-        self.db_pool.updates.start_doing_background_updates()
-
-    async def _background_migrate_state_hamt_to_embedded(
-        self, progress: dict, batch_size: int
-    ) -> int:
-        """Copy existing SQL `state_hamt_roots` rows (and, per root, every
-        node reachable from it) into the embedded engine, for data written
-        before `embedded_db_engine` was turned on. New writes never need
-        this -- they already go straight to the configured engine
-        exclusively -- this only backfills history.
-
-        Existing SQL rows are left in place rather than deleted: harmless
-        once migrated (nothing reads them anymore -- see
-        `_fetch_hamt_roots_for_embedded_txn`), and keeping them means
-        turning the embedded engine back off doesn't lose data.
-        """
-        last_state_group = progress.get("last_state_group", 0)
-
-        def get_batch_txn(
-            txn: LoggingTransaction,
-        ) -> list[tuple[int, bytes, bytes, bytes, str]]:
-            txn.execute(
-                """
-                SELECT hr.state_group, hr.room_prefix, hr.root_structural_hash,
-                       hr.root_lattice, sg.room_id
-                FROM state_hamt_roots hr
-                INNER JOIN state_groups sg ON sg.id = hr.state_group
-                WHERE hr.state_group > ?
-                ORDER BY hr.state_group
-                LIMIT ?
-                """,
-                (last_state_group, batch_size),
-            )
-            return cast(
-                list[tuple[int, bytes, bytes, bytes, str]],
-                [
-                    (
-                        state_group,
-                        bytes(room_prefix),
-                        bytes(root_hash),
-                        bytes(lattice) if lattice is not None else b"",
-                        room_id,
-                    )
-                    for state_group, room_prefix, root_hash, lattice, room_id in txn
-                ],
-            )
-
-        rows = await self.db_pool.runInteraction(
-            f"{self.EMBEDDED_DB_MIGRATION_UPDATE_NAME}_select", get_batch_txn
-        )
-
-        if not rows:
-            await self.db_pool.updates._end_background_update(
-                self.EMBEDDED_DB_MIGRATION_UPDATE_NAME
-            )
-            return 0
-
-        from synapse.synapse_rust import state_hamt
-
-        engine_name = self._embedded_db_engine
-        assert engine_name is not None
-        engine = get_embedded_engine(engine_name)
-
-        def migrate_one_txn(
-            txn: LoggingTransaction,
-            state_group: int,
-            room_prefix: bytes,
-            root_hash: bytes,
-            lattice: bytes,
-            room_id: str,
-        ) -> None:
-            nodes: dict[bytes, bytes] = {}
-            frontier = [root_hash]
-            while frontier:
-                fetched = self.db_pool.simple_select_many_txn(
-                    txn,
-                    table="state_hamt_nodes",
-                    column="structural_hash",
-                    iterable=[bytearray(h) for h in frontier if h not in nodes],
-                    keyvalues={},
-                    retcols=("structural_hash", "node_bytes"),
-                )
-                frontier = []
-                for node_hash, node_bytes in fetched:
-                    node_hash = bytes(node_hash)
-                    node_bytes = bytes(node_bytes)
-                    if node_hash in nodes:
-                        continue
-                    nodes[node_hash] = node_bytes
-                    frontier.extend(
-                        bytes(child)
-                        for child in state_hamt.node_child_hashes(node_bytes)
-                    )
-            engine.put_state_hamt_nodes(
-                self._embedded_db_namespace, room_prefix, list(nodes.items())
-            )
-            if lattice:
-                self._store_state_hamt_root_embedded_txn(
-                    state_group, room_prefix, root_hash, lattice, room_id
-                )
-
-        def migrate_batch_txn(txn: LoggingTransaction) -> None:
-            for state_group, room_prefix, root_hash, lattice, room_id in rows:
-                migrate_one_txn(
-                    txn, state_group, room_prefix, root_hash, lattice, room_id
-                )
-            # Mark dirty after SQL commit.  Migration is idempotent, so a
-            # crash mid-batch just re-does work on restart.
-            txn.call_after(mark_dirty, Pool.STATE)
-            self.db_pool.updates._background_update_progress_txn(
-                txn,
-                self.EMBEDDED_DB_MIGRATION_UPDATE_NAME,
-                {"last_state_group": rows[-1][0]},
-            )
-
-        await self.db_pool.runInteraction(
-            self.EMBEDDED_DB_MIGRATION_UPDATE_NAME, migrate_batch_txn
-        )
-
-        return len(rows)
 
     @trace
     @tag_args
@@ -1270,11 +1111,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                     prev_root_hash, prev_lattice = embedded_root
                 else:
                     _state_counter("state_root_embedded_misses")
-            if prev_root_hash is None and (
-                not mtxdb_active or self._embedded_db_migration_pending_txn(txn)
-            ):
-                if mtxdb_active:
-                    _state_counter("state_root_sql_fallback_migration")
+            if prev_root_hash is None and not mtxdb_active:
                 _st = time.monotonic()
                 prev_root = self.db_pool.simple_select_one_txn(
                     txn,
@@ -1306,12 +1143,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             _state_timing("state_read_node_embedded", time.monotonic() - _et)
             if root_node_bytes is None:
                 _state_counter("state_node_embedded_misses")
-        if root_node_bytes is None and (
-            self._embedded_db_engine != "mtxdb"
-            or self._embedded_db_migration_pending_txn(txn)
-        ):
-            if self._embedded_db_engine == "mtxdb":
-                _state_counter("state_node_sql_fallback_migration")
+        if root_node_bytes is None and self._embedded_db_engine != "mtxdb":
             _st = time.monotonic()
             root_node_bytes = self.db_pool.simple_select_one_onecol_txn(
                 txn,
@@ -1497,18 +1329,6 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         _state_timing("state_write_nodes_sql", time.monotonic() - _st)
         _state_counter("state_write_nodes_sql_batches")
         _state_counter("state_write_nodes_sql_records", len(nodes))
-
-    def _embedded_db_migration_pending_txn(self, txn: LoggingTransaction) -> bool:
-        """Whether `EMBEDDED_DB_MIGRATION_UPDATE_NAME` is still queued or
-        running -- the one bounded, explicit window where reading SQL
-        alongside the embedded engine is legitimate rather than silent
-        self-healing. See `_background_migrate_state_hamt_to_embedded`.
-        """
-        txn.execute(
-            "SELECT 1 FROM background_updates WHERE update_name = ?",
-            (self.EMBEDDED_DB_MIGRATION_UPDATE_NAME,),
-        )
-        return txn.fetchone() is not None
 
     def _get_embedded_db_root(
         self, room_prefix: bytes, state_group: int
