@@ -2343,9 +2343,18 @@ class HAMTStructuralKeyRegressionTest(HomeserverTestCase):
         # This catches regressions where the macaroon secret or another
         # ambient key leaks into the structural hash -- a mere length check
         # would pass regardless of what fed the hash, so pin the exact bytes.
+        #
+        # The structural hash was re-pinned for rezzy 8ee8ea3, which routes
+        # HAMT keys by their encoded bytes instead of the Rust `Hash` stream
+        # (rezzy keeps the old routing behind `legacy_key_path_hash`). That
+        # changes the tree shape, and therefore the root structural hash, but
+        # not the content: the lattice-derived `state_group_id` below is
+        # byte-identical to the pre-change value. If the two ever move
+        # together, suspect content encoding or ambient key material rather
+        # than tree layout.
         self.assertEqual(
             hash_a.hex(),
-            "46a91b55f48cdb7e5e628395c65c3699a3af8bc81954886b59f972345fecc139",
+            "f9c4f2ecc0b8a7bb280b958969434f708a9148823ad62c7fc63be243c7ed8fe8",
         )
         self.assertEqual(
             sg_a.hex(),
