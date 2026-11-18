@@ -1388,6 +1388,8 @@ The following options are related to configuring timeout and retry logic for one
 
 This setting has the following sub-options:
 
+* `allow_partial_state` (boolean): Whether to use partial-state federation joins when possible. When false, Synapse requests full room state during joins. Defaults to `true`.
+
 * `client_timeout` (duration): Timeout for the federation requests. Defaults to `"60s"`.
 
 * `max_short_retry_delay` (duration): Maximum delay to be used for the short retry algo. Defaults to `"2s"`.

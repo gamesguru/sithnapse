@@ -62,6 +62,11 @@ class FederationConfig(Config):
             "allow_device_name_lookup_over_federation", False
         )
 
+        # Partial-state joins reduce the amount of room state needed during
+        # federation joins. Some deployments may prefer to always request the
+        # full room state instead.
+        self.allow_partial_state = federation_config.get("allow_partial_state", True)
+
         # Allow for the configuration of timeout, max request retries
         # and min/max retry delays in the matrix federation client.
         self.client_timeout_ms = Config.parse_duration(

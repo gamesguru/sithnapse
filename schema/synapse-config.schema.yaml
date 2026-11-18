@@ -1714,6 +1714,13 @@ properties:
       options, these values apply across all requests for a given destination
       and the state of the backoff is stored in the database.
     properties:
+      allow_partial_state:
+        type: boolean
+        description: >-
+          Whether to use partial-state federation joins when possible. When
+          false, Synapse requests full room state during joins. Defaults to
+          true.
+        default: true
       client_timeout:
         $ref: "#/$defs/duration"
         description: Timeout for the federation requests.
