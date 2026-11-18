@@ -4148,6 +4148,8 @@ This setting has the following sub-options:
 
 * `server_stats_endpoint_enabled` (boolean): Enable the authenticated `/_synapse/client/server_stats` endpoint. Requests require a server-admin access token. This is disabled by default. Defaults to `false`.
 
+* `public_user_count_enabled` (boolean): Enable the unauthenticated `/_synapse/client/public_stats` endpoint, which exposes only the total registered user count. This is disabled by default. Defaults to `false`.
+
 Example configuration:
 ```yaml
 stats:

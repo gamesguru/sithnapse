@@ -793,6 +793,19 @@
         // default and requires both an admin token and stats.server_stats_endpoint_enabled.
         let dbStatsLoaded = false;
         try {
+          const publicStatsRes = await fetch("/_synapse/client/public_stats");
+          if (publicStatsRes.ok) {
+            const stats = await publicStatsRes.json();
+            if (typeof stats.total_users === "number") {
+              const soulsEl = document.getElementById("stat-souls");
+              if (soulsEl) soulsEl.textContent = stats.total_users.toLocaleString();
+              const soulsSubEl = document.getElementById("stat-souls-sub");
+              if (soulsSubEl) soulsSubEl.textContent = "REGISTERED DB SOULS";
+            }
+          }
+        } catch (e) {}
+
+        try {
           const statsRes = token
             ? await fetch("/_synapse/client/server_stats", {
                 headers: { Authorization: `Bearer ${token}` },
@@ -970,9 +983,9 @@
           const sanctumsEl = document.getElementById("stat-sanctums");
 
           if (soulsEl && soulsEl.textContent === "...") {
-            soulsEl.textContent = "LOCKED";
+            soulsEl.textContent = "UNAVAILABLE";
             if (soulsSubEl)
-              soulsSubEl.textContent = "AUTH REQUIRED FOR DB COUNT";
+              soulsSubEl.textContent = "PUBLIC COUNT NOT ENABLED";
           }
           if (galacticEl && galacticEl.textContent === "...") {
             galacticEl.textContent = "0";

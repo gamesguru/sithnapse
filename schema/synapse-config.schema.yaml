@@ -5222,6 +5222,13 @@ properties:
           Requests require a server-admin access token. This is disabled by
           default.
         default: false
+      public_user_count_enabled:
+        type: boolean
+        description: >-
+          Enable the unauthenticated `/_synapse/client/public_stats` endpoint,
+          which exposes only the total registered user count. This is disabled
+          by default.
+        default: false
     examples:
       - enabled: false
   server_notices:
