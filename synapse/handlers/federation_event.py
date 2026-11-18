@@ -104,6 +104,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+class IncompleteStateError(Exception):
+    """Raised when the state before an event could not be fully fetched.
+
+    Accepting the event against the state we did manage to fetch would
+    authorise it against the wrong state, so callers must not degrade to a
+    partial state map when this is raised.
+    """
+
+
 soft_failed_event_counter = Counter(
     "synapse_federation_soft_failed_events_total",
     "Events received over federation that we marked as soft_failed",
@@ -344,31 +354,60 @@ class FederationEventHandler:
                     logger.info("Found all missing prev_events")
 
             if missing_prevs:
-                # since this event was pushed to us, it is possible for it to
-                # become the only forward-extremity in the room, and we would then
-                # trust its state to be the state for the whole room. This is very
-                # bad. Further, if the event was pushed to us, there is no excuse
-                # for us not to have all the prev_events. (XXX: apart from
-                # min_depth?)
-                #
-                # We therefore reject any such events.
-                logger.warning(
-                    "Rejecting: failed to fetch %d prev events: %s",
-                    len(missing_prevs),
-                    shortstr(missing_prevs),
-                )
-                raise FederationError(
-                    "ERROR",
-                    403,
-                    (
-                        "Your server isn't divulging details about prev_events "
-                        "referenced in this event."
-                    ),
-                    affected=pdu.event_id,
-                )
+                # A forwarded event can legitimately reference a prev_event we
+                # cannot fetch (the remote has lost it, or is withholding it).
+                # For a non-state event we can still keep it: authorise it
+                # against the known prev_events and leave the missing one as a
+                # backward extremity (a forward gap) to be filled by backfill.
+                # State events are rejected because authorising them against a
+                # state that is missing a branch could reset the room state.
+                known_prevs = prevs - missing_prevs
+                if not pdu.is_state() and known_prevs:
+                    logger.warning(
+                        "Accepting %s with %d unfetchable prev_events %s as a "
+                        "forward gap (known prev_events: %s)",
+                        event_id,
+                        len(missing_prevs),
+                        shortstr(missing_prevs),
+                        shortstr(known_prevs),
+                    )
+                    # We are going to build the context from the known prevs
+                    # plus whatever state the remote can still give us.
+                else:
+                    # since this event was pushed to us, it is possible for it to
+                    # become the only forward-extremity in the room, and we would then
+                    # trust its state to be the state for the whole room. This is very
+                    # bad. Further, if the event was pushed to us, there is no excuse
+                    # for us not to have all the prev_events. (XXX: apart from
+                    # min_depth?)
+                    #
+                    # We therefore reject any such events.
+                    logger.warning(
+                        "Rejecting: failed to fetch %d prev events: %s",
+                        len(missing_prevs),
+                        shortstr(missing_prevs),
+                    )
+                    raise FederationError(
+                        "ERROR",
+                        403,
+                        (
+                            "Your server isn't divulging details about prev_events "
+                            "referenced in this event."
+                        ),
+                        affected=pdu.event_id,
+                    )
 
         try:
-            context = await self._state_handler.compute_event_context(pdu)
+            if missing_prevs:
+                # Only reachable for the non-state forward-gap case above.
+                # Ignore a recent failed pull for the missing prev: by
+                # definition it could not be fetched, and we are explicitly
+                # accepting the event against the prevs we do have.
+                context = await self._compute_event_context_with_maybe_missing_prevs(
+                    origin, pdu, ignore_pull_backoff=True
+                )
+            else:
+                context = await self._state_handler.compute_event_context(pdu)
             await self._process_received_pdu(origin, pdu, context)
         except PartialStateConflictError:
             # The room was un-partial stated while we were processing the PDU.
@@ -377,7 +416,12 @@ class FederationEventHandler:
                 "Room %s was un-partial stated while processing the PDU, trying again.",
                 room_id,
             )
-            context = await self._state_handler.compute_event_context(pdu)
+            if missing_prevs:
+                context = await self._compute_event_context_with_maybe_missing_prevs(
+                    origin, pdu, ignore_pull_backoff=True
+                )
+            else:
+                context = await self._state_handler.compute_event_context(pdu)
             await self._process_received_pdu(origin, pdu, context)
 
     async def try_on_receive_pdu_batch(
@@ -1092,6 +1136,42 @@ class FederationEventHandler:
         logger.info("Got %d prev_events", len(missing_events))
         await self._process_pulled_events(origin, missing_events, backfilled=False)
 
+        # Some servers answer /get_missing_events with an empty or truncated
+        # batch even though they can serve the missing events via /event. Fetch
+        # any prev_events that are still missing directly rather than rejecting
+        # the pushed event. This mirrors what /backfill would do.
+        seen = await self._store.have_events_in_timeline(prevs)
+        still_missing = prevs - seen
+        if still_missing:
+            logger.info(
+                "Fetching %d prev_events directly from %s: %s",
+                len(still_missing),
+                origin,
+                shortstr(still_missing),
+            )
+            room_version = await self._store.get_room_version(room_id)
+            fetched_pdus = []
+            for prev_event_id in still_missing:
+                try:
+                    pulled = await self._federation_client.get_pdu(
+                        [origin], prev_event_id, room_version, timeout=10000
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Failed to fetch prev_event %s directly from %s: %s",
+                        prev_event_id,
+                        origin,
+                        e,
+                    )
+                    continue
+                if pulled is not None:
+                    fetched_pdus.append(pulled.pdu)
+
+            if fetched_pdus:
+                await self._process_pulled_events(
+                    origin, fetched_pdus, backfilled=False
+                )
+
     @trace
     async def _process_pulled_events(
         self, origin: str, events: Collection[EventBase], backfilled: bool
@@ -1386,7 +1466,7 @@ class FederationEventHandler:
 
     @trace
     async def _compute_event_context_with_maybe_missing_prevs(
-        self, dest: str, event: EventBase
+        self, dest: str, event: EventBase, *, ignore_pull_backoff: bool = False
     ) -> EventContext:
         """Build an EventContext structure for a non-outlier event whose prev_events may
         be missing.
@@ -1437,7 +1517,9 @@ class FederationEventHandler:
         # try it again so soon. Since we have to fetch all of the prev_events, we can
         # bail early here if we find any to ignore.
         prevs_with_pull_backoff = (
-            await self._store.get_event_ids_to_not_pull_from_backoff(
+            {}
+            if ignore_pull_backoff
+            else await self._store.get_event_ids_to_not_pull_from_backoff(
                 room_id, missing_prevs
             )
         )
@@ -1500,11 +1582,33 @@ class FederationEventHandler:
                     # note that if any of the missing prevs share missing state or
                     # auth events, the requests to fetch those events are deduped
                     # by the get_pdu_cache in federation_client.
-                    remote_state_map = (
-                        await self._get_state_ids_after_missing_prev_event(
-                            dest, room_id, missing_prev
+                    try:
+                        remote_state_map = (
+                            await self._get_state_ids_after_missing_prev_event(
+                                dest,
+                                room_id,
+                                missing_prev,
+                                require_complete_state=not partial_state,
+                            )
                         )
-                    )
+                    except IncompleteStateError:
+                        raise
+                    except Exception as e:
+                        # A forward gap whose parent we cannot fetch at all
+                        # (the remote has no state for it) is tolerated for
+                        # non-state events: resolve against the prev events we
+                        # do have. The gap stays a backward extremity and is
+                        # filled by backfill later.
+                        logger.warning(
+                            "_compute_event_context_with_maybe_missing_prevs(event_id=%s): "
+                            "failed to fetch state for missing prev_event %s from %s: %s. "
+                            "Continuing with the state we already have.",
+                            event_id,
+                            missing_prev,
+                            dest,
+                            e,
+                        )
+                        continue
 
                     state_maps.append(remote_state_map)
 
@@ -1529,6 +1633,19 @@ class FederationEventHandler:
                     self._store, self._state_deletion_store
                 ),
             )
+
+            if not state_map:
+                # We could not establish any state before the event (for
+                # example every missing prev_event's state lookup failed). Do
+                # not pretend the empty map is the state before the event:
+                # authorising against it is exactly the state-reset risk this
+                # method exists to avoid.
+                raise FederationError(
+                    "ERROR",
+                    403,
+                    "Unable to compute the state before the event",
+                    affected=event_id,
+                )
 
         except Exception as e:
             logger.warning(
@@ -1555,6 +1672,7 @@ class FederationEventHandler:
         destination: str,
         room_id: str,
         event_id: str,
+        require_complete_state: bool = False,
     ) -> StateMap[str]:
         """Requests all of the room state at a given event from a remote homeserver.
 
@@ -1648,7 +1766,28 @@ class FederationEventHandler:
         #   request
         if (len(missing_event_ids) * 10) >= len(auth_event_ids) + len(state_event_ids):
             logger.debug("Requesting complete state from remote")
-            await self._get_state_and_persist(destination, room_id, event_id)
+            try:
+                await self._get_state_and_persist(destination, room_id, event_id)
+            except (
+                HttpResponseException,
+                RequestSendFailed,
+                NotRetryingDestination,
+            ) as e:
+                # Some servers only implement /state_ids (or the aggregate
+                # /state call fails transiently). Fall back to fetching the
+                # state/auth events listed in the /state_ids response.
+                logger.warning(
+                    "Failed to fetch complete state at %s from %s (%s); "
+                    "falling back to fetching the missing state/auth events individually",
+                    event_id,
+                    destination,
+                    e,
+                )
+                await self._get_events_and_persist(
+                    destination=destination,
+                    room_id=room_id,
+                    event_ids=missing_event_ids,
+                )
         else:
             logger.debug("Fetching %i events from remote", len(missing_event_ids))
             await self._get_events_and_persist(
@@ -1717,6 +1856,15 @@ class FederationEventHandler:
                 SynapseTags.RESULT_PREFIX + "failed_to_fetch.length",
                 str(len(failed_to_fetch)),
             )
+            if require_complete_state:
+                # The caller is about to authorise a new event against this
+                # state. Authorising against an incomplete state can accept an
+                # event the real state would reject (for example a member event
+                # that was later banned), so fail instead of degrading.
+                raise IncompleteStateError(
+                    "Failed to fetch state events %s needed to authorise an "
+                    "event at %s" % (sorted(failed_to_fetch), event_id)
+                )
 
         if remote_event.is_state() and remote_event.rejected_reason is None:
             state_map[(remote_event.type, remote_event.state_key)] = (

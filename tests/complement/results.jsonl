@@ -160,7 +160,7 @@
 {"Action":"fail","Test":"TestFederationBackfillAheadOfStaleCursor"}
 {"Action":"pass","Test":"TestFederationBackfilledHistoryReachableFromPrevBatch"}
 {"Action":"fail","Test":"TestFederationForwardGapWithManyOpenGapsStaysBounded"}
-{"Action":"fail","Test":"TestFederationForwardMessagesDoesNotRepeatFailedGap"}
+{"Action":"pass","Test":"TestFederationForwardMessagesDoesNotRepeatFailedGap"}
 {"Action":"fail","Test":"TestFederationForwardMessagesFillsGapBehindWedgedOne"}
 {"Action":"fail","Test":"TestFederationJoinedRoomFillsPartitionHoleBehindWedgedGap"}
 {"Action":"pass","Test":"TestFederationKeyUploadQuery"}
