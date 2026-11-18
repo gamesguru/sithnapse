@@ -28,10 +28,28 @@ fn parse_pool_tag(pool_tag: u8) -> PyResult<ShardType> {
     match pool_tag {
         0 => Ok(ShardType::State),
         1 => Ok(ShardType::EventDag),
+        // The pool tags are a documented stable ABI. The former Edges shard
+        // now lives in State, so tag 2 keeps working without creating a
+        // second handle or a duplicate sync/stats entry.
+        2 => Ok(ShardType::State),
         3 => Ok(ShardType::ServerInfo),
         _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "invalid mtxdb pool tag {pool_tag}; expected 0 (state), 1 (event DAG), or 3 (server info)"
+            "invalid mtxdb pool tag {pool_tag}; expected 0 (state), 1 (event DAG), 2 (edges, stored in state), or 3 (server info)"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod pool_tag_tests {
+    use super::{parse_pool_tag, ShardType};
+
+    #[test]
+    fn historical_edges_tag_maps_to_state() {
+        assert_eq!(parse_pool_tag(0).unwrap(), ShardType::State);
+        assert_eq!(parse_pool_tag(1).unwrap(), ShardType::EventDag);
+        assert_eq!(parse_pool_tag(2).unwrap(), ShardType::State);
+        assert_eq!(parse_pool_tag(3).unwrap(), ShardType::ServerInfo);
+        assert!(parse_pool_tag(4).is_err());
     }
 }
 
@@ -3303,8 +3321,8 @@ type PyRecordVersions = PyResult<(Vec<Option<Vec<u8>>>, Vec<u64>)>;
 #[pymethods]
 impl PyMtxdbTransaction {
     /// Read records and the collection's logical version from one visibility
-    /// boundary. Pool tags are stable: 0=state, 1=event DAG, 2=edges, 3=server
-    /// info. Collection and node IDs must each be 16 bytes. Records are
+    /// boundary. Pool tags are stable: 0=state, 1=event DAG, 2=edges (now
+    /// stored in state), 3=server info. Collection and node IDs must each be 16 bytes. Records are
     /// returned in node_ids order as bytes or None.
     pub fn get_with_collection_version(
         &self,
