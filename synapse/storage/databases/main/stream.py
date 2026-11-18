@@ -1913,6 +1913,33 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
         )
         return RoomStreamToken(topological=row[1], stream=row[0])
 
+    async def get_topological_token_for_stream_position(
+        self, room_id: str, stream_key: int
+    ) -> RoomStreamToken | None:
+        """Resolve a stream position in a room to a historic (topological) token.
+
+        Forward pagination from a stream-only token compares `stream_ordering`
+        alone, which can never return backfilled events (they have negative
+        stream orderings). Pinning the token to the newest timeline event at or
+        before the position lets the page compare `(topological, stream)`
+        instead.
+
+        Returns None if the room has no timeline event at or before the position.
+        """
+        rows = await self.db_pool.execute(
+            "get_topological_token_for_stream_position",
+            """
+            SELECT topological_ordering, stream_ordering FROM events
+            WHERE room_id = ? AND stream_ordering <= ? AND NOT outlier
+            ORDER BY stream_ordering DESC LIMIT 1
+            """,
+            room_id,
+            stream_key,
+        )
+        if not rows:
+            return None
+        return RoomStreamToken(topological=rows[0][0], stream=rows[0][1])
+
     async def get_current_topological_token(self, room_id: str, stream_key: int) -> int:
         """Gets the topological token in a room after or at the given stream
         ordering.

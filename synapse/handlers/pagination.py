@@ -513,6 +513,19 @@ class PaginationHandler:
             # `/messages` should still works with live tokens when manually provided.
             assert from_token.room_key.topological is not None
 
+        if (
+            pagin_config.direction == Direction.FORWARDS
+            and from_token.room_key.topological is None
+        ):
+            # A stream-only token (e.g. a sync `prev_batch`) cannot see
+            # backfilled events, whose stream orderings are negative. Pin it to
+            # a topological position so forward pages can include them.
+            pinned = await self.store.get_topological_token_for_stream_position(
+                room_id, from_token.room_key.stream
+            )
+            if pinned is not None:
+                from_token = from_token.copy_and_replace(StreamKeyType.ROOM, pinned)
+
         room_token = from_token.room_key
 
         (membership, member_event_id) = (None, None)
