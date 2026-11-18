@@ -2897,49 +2897,57 @@ class EventsWorkerStore(SQLBaseStore):
                 get_event_edges_backward_batch,
             )
 
-            txn.execute(
-                """
-                SELECT event_id FROM partial_state_events AS pse
-                    JOIN events USING (event_id)
-                WHERE pse.room_id = ?
-                ORDER BY events.stream_ordering
-                LIMIT 1000
-                """,
-                (room_id,),
-            )
-            candidates = [row[0] for row in txn]
-            if not candidates:
-                return []
-
-            backward = get_event_edges_backward_batch(
-                self._embedded_db_namespace, candidates
-            )
-            prev_ids = {
-                prev_event_id
-                for event_id in candidates
-                for prev_event_id, _is_state in (backward.get(event_id) or ())
-            }
-            partial_prevs: set[str] = set()
-            if prev_ids:
-                clause, args = make_in_list_sql_clause(
-                    self.database_engine, "event_id", list(prev_ids)
-                )
-                txn.execute(
-                    f"SELECT event_id FROM partial_state_events WHERE {clause}",
-                    args,
-                )
-                partial_prevs = {row[0] for row in txn}
-
             ready: list[str] = []
-            for event_id in candidates:
-                if any(
-                    prev_event_id in partial_prevs
-                    for prev_event_id, _is_state in (backward.get(event_id) or ())
-                ):
-                    continue
-                ready.append(event_id)
-                if len(ready) >= 100:
+            offset = 0
+            while len(ready) < 100:
+                txn.execute(
+                    """
+                    SELECT event_id FROM partial_state_events AS pse
+                        JOIN events USING (event_id)
+                    WHERE pse.room_id = ?
+                    ORDER BY events.stream_ordering
+                    LIMIT 1000 OFFSET ?
+                    """,
+                    (room_id, offset),
+                )
+                candidates = [row[0] for row in txn]
+                if not candidates:
                     break
+                offset += len(candidates)
+
+                backward = get_event_edges_backward_batch(
+                    self._embedded_db_namespace, candidates
+                )
+                prev_ids = {
+                    prev_event_id
+                    for event_id in candidates
+                    for prev_event_id, _is_state in (backward.get(event_id) or ())
+                }
+                partial_prevs: set[str] = set()
+                prev_id_list = list(prev_ids)
+                # Keep SQLite below its bind-variable limit even for events
+                # with unusually large predecessor sets.
+                for start in range(0, len(prev_id_list), 500):
+                    clause, args = make_in_list_sql_clause(
+                        self.database_engine,
+                        "event_id",
+                        prev_id_list[start : start + 500],
+                    )
+                    txn.execute(
+                        f"SELECT event_id FROM partial_state_events WHERE {clause}",
+                        args,
+                    )
+                    partial_prevs.update(row[0] for row in txn)
+
+                for event_id in candidates:
+                    if any(
+                        prev_event_id in partial_prevs
+                        for prev_event_id, _is_state in (backward.get(event_id) or ())
+                    ):
+                        continue
+                    ready.append(event_id)
+                    if len(ready) >= 100:
+                        break
             return ready
 
         txn.execute(

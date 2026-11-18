@@ -1532,6 +1532,44 @@ class EventEdgesMigrationTestCase(EventEdgesStorageIntegrationTestCase):
         backward = get_event_edges_backward_batch(ns, [child_id])
         self.assertIn((parent_id, False), backward.get(child_id) or [])
 
+    def test_sql_to_mtxdb_retires_stale_purged_successors(self) -> None:
+        parent_id = self.helper.send(self.room_id, "parent", tok=self.tok)["event_id"]
+        child_id = self.helper.send(self.room_id, "child", tok=self.tok)["event_id"]
+        stale_child_id = "$purged-child:example.org"
+        ns = self.store._embedded_db_namespace
+
+        flush_edge_writes(ns)
+        self.get_success(
+            self.store.db_pool.runInteraction(
+                "clear_sql_edges_for_stale_successor_test",
+                lambda txn: txn.execute("DELETE FROM event_edges"),
+            )
+        )
+        self.get_success(
+            self.store.db_pool.simple_insert(
+                table="event_edges",
+                values={
+                    "event_id": child_id,
+                    "prev_event_id": parent_id,
+                    "room_id": self.room_id,
+                    "is_state": False,
+                },
+            )
+        )
+        # Model an event purged while SQL was authoritative: its SQL edge and
+        # event row are gone, but the old mtxdb forward edge remains live.
+        put_event_edges_batch(
+            ns, [(self.room_id, stale_child_id, parent_id, False)], sync=True
+        )
+        self._set_marker("sql")
+
+        result = self._migrate(target="mtxdb")
+
+        self.assertEqual(result["target"], "mtxdb")
+        self.assertEqual(
+            self.get_success(self.store.get_successor_events(parent_id)), [child_id]
+        )
+
     def test_mtxdb_to_sql_replaces_stale_rows_and_flips_marker(self) -> None:
         parent_id = self.helper.send(self.room_id, "parent", tok=self.tok)["event_id"]
         child_id = self.helper.send(self.room_id, "child", tok=self.tok)["event_id"]

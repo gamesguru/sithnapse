@@ -453,7 +453,9 @@ async def _migrate_sql_edges_to_mtxdb(
 
     while True:
 
-        def _read(txn: Any) -> tuple[list[tuple[str, str]], dict[str, list[Any]]]:
+        def _read(
+            txn: Any,
+        ) -> tuple[list[tuple[str, str]], dict[str, list[Any]], dict[str, set[str]]]:
             txn.execute(
                 "SELECT event_id, room_id FROM events "
                 "WHERE event_id > ? ORDER BY event_id LIMIT ?",
@@ -461,7 +463,7 @@ async def _migrate_sql_edges_to_mtxdb(
             )
             events = txn.fetchall()
             if not events:
-                return [], {}
+                return [], {}, {}
 
             event_ids = [event_id for event_id, _room_id in events]
             clause, args = make_in_list_sql_clause(
@@ -477,9 +479,20 @@ async def _migrate_sql_edges_to_mtxdb(
                 edges_by_event[event_id].append(
                     (prev_event_id, bool(is_state), room_id)
                 )
-            return events, edges_by_event
+            parent_clause, parent_args = make_in_list_sql_clause(
+                store.database_engine, "prev_event_id", event_ids
+            )
+            txn.execute(
+                "SELECT event_id, prev_event_id FROM event_edges "
+                f"WHERE {parent_clause}",
+                parent_args,
+            )
+            children_by_parent: dict[str, set[str]] = collections.defaultdict(set)
+            for event_id, prev_event_id in txn:
+                children_by_parent[prev_event_id].add(event_id)
+            return events, edges_by_event, children_by_parent
 
-        events, edges_by_event = await store.db_pool.runInteraction(
+        events, edges_by_event, children_by_parent = await store.db_pool.runInteraction(
             "migrate_event_edges_read_sql", _read
         )
         if not events:
@@ -487,6 +500,37 @@ async def _migrate_sql_edges_to_mtxdb(
 
         event_ids = [event_id for event_id, _room_id in events]
         current = get_event_edges_backward_batch(namespace, event_ids)
+
+        # SQL may have been authoritative while Synapse ran without mtxdb
+        # configured. In that window purges cannot tombstone the embedded
+        # mirror, so a later migration must retire purged children left in
+        # parents' forward lists before the marker is switched back.
+        current_forward = get_event_edges_forward_batch(namespace, event_ids)
+        stale_child_candidates = {
+            child_id
+            for parent_id, children in current_forward.items()
+            for child_id in (children or ())
+            if child_id not in children_by_parent.get(parent_id, set())
+        }
+        stale_child_ids: set[str] = set()
+        stale_candidates = list(stale_child_candidates)
+        for start in range(0, len(stale_candidates), 500):
+            candidate_batch = stale_candidates[start : start + 500]
+
+            def _existing(txn: Any) -> set[str]:
+                clause, args = make_in_list_sql_clause(
+                    store.database_engine, "event_id", candidate_batch
+                )
+                txn.execute(f"SELECT event_id FROM events WHERE {clause}", args)
+                return {row[0] for row in txn}
+
+            existing = await store.db_pool.runInteraction(
+                "migrate_event_edges_check_stale_children", _existing
+            )
+            stale_child_ids.update(set(candidate_batch) - existing)
+        if stale_child_ids:
+            delete_event_edges_batch(namespace, list(stale_child_ids))
+
         to_delete: list[str] = []
         rows_to_put: list[EdgeRow] = []
 
