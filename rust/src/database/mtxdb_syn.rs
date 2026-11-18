@@ -26,13 +26,11 @@ create_exception!(
 
 fn parse_pool_tag(pool_tag: u8) -> PyResult<ShardType> {
     match pool_tag {
-        0 => Ok(ShardType::State),
-        1 => Ok(ShardType::EventDag),
-        // Tag 2 was the Edges pool, which is now part of State. It is retired,
-        // not aliased: one pool has one tag.
-        3 => Ok(ShardType::ServerInfo),
+        0 => Ok(ShardType::EventDag),
+        1 => Ok(ShardType::State),
+        2 => Ok(ShardType::ServerInfo),
         _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "invalid mtxdb pool tag {pool_tag}; expected 0 (state), 1 (event DAG), or 3 (server info)"
+            "invalid mtxdb pool tag {pool_tag}; expected 0 (event DAG), 1 (state), or 2 (server info)"
         ))),
     }
 }
@@ -42,13 +40,11 @@ mod pool_tag_tests {
     use super::{parse_pool_tag, ShardType};
 
     #[test]
-    fn each_pool_has_exactly_one_tag_and_the_retired_edges_tag_is_rejected() {
-        assert_eq!(parse_pool_tag(0).unwrap(), ShardType::State);
-        assert_eq!(parse_pool_tag(1).unwrap(), ShardType::EventDag);
-        assert_eq!(parse_pool_tag(3).unwrap(), ShardType::ServerInfo);
-        // 2 was Edges, which merged into State.
-        assert!(parse_pool_tag(2).is_err());
-        assert!(parse_pool_tag(4).is_err());
+    fn pool_tags_are_contiguous_and_one_per_pool() {
+        assert_eq!(parse_pool_tag(0).unwrap(), ShardType::EventDag);
+        assert_eq!(parse_pool_tag(1).unwrap(), ShardType::State);
+        assert_eq!(parse_pool_tag(2).unwrap(), ShardType::ServerInfo);
+        assert!(parse_pool_tag(3).is_err());
     }
 }
 
@@ -3320,9 +3316,9 @@ type PyRecordVersions = PyResult<(Vec<Option<Vec<u8>>>, Vec<u64>)>;
 #[pymethods]
 impl PyMtxdbTransaction {
     /// Read records and the collection's logical version from one visibility
-    /// boundary. Pool tags: 0=state, 1=event DAG, 3=server info (2 was
-    /// edges and is retired). Collection and node IDs must each be 16 bytes.
-    /// Records are returned in node_ids order as bytes or None.
+    /// boundary. Pool tags: 0=event DAG, 1=state, 2=server info.
+    /// Collection and node IDs must each be 16 bytes. Records are returned in
+    /// node_ids order as bytes or None.
     pub fn get_with_collection_version(
         &self,
         py: Python<'_>,
