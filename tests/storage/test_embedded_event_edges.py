@@ -266,7 +266,7 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
         coalescer = _FlushCoalescer(clock)
         _set_coalescer(coalescer)
         try:
-            coalescer._dirty.add(embedded_common.Pool.AUTH_CHAIN)
+            coalescer._dirty.add(embedded_common.Pool.STATE)
             with (
                 mock.patch(
                     "synapse.storage.databases.main.embedded_common._drain_edge_writes",
@@ -277,7 +277,7 @@ class EmbeddedEventEdgesTestCase(unittest.TestCase):
                 ),
             ):
                 coalescer.sync_now(pools=[embedded_common.Pool.EVENT_DAG])
-            self.assertIn(embedded_common.Pool.AUTH_CHAIN, coalescer._dirty)
+            self.assertIn(embedded_common.Pool.STATE, coalescer._dirty)
             self.assertIsNotNone(coalescer._delayed_call)
             assert coalescer._delayed_call is not None
             self.assertAlmostEqual(
@@ -978,7 +978,6 @@ class EventEdgeReaderMetricsTestCase(TestCase):
         fake.publish_signal_active.return_value = {
             "state": True,
             "event_dag": False,
-            "auth_chain": True,
         }
         with mock.patch(
             "synapse.storage.databases.embedded_engine.get_embedded_engine",
@@ -989,7 +988,6 @@ class EventEdgeReaderMetricsTestCase(TestCase):
                 for pool, expected in (
                     ("state", 1.0),
                     ("event_dag", 0.0),
-                    ("auth_chain", 1.0),
                 ):
                     self.assertEqual(
                         REGISTRY.get_sample_value(

@@ -91,7 +91,6 @@ class SyncDisabledPublicationTestCase(TestCase):
             engine.sync.assert_not_called()
             engine.sync_state.assert_not_called()
             engine.sync_event_dag.assert_not_called()
-            engine.sync_auth_chain.assert_not_called()
             self.assertEqual(engine.mock_calls, [])
 
     def test_sync_now_with_durability_off_is_a_noop(self) -> None:

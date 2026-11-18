@@ -66,7 +66,7 @@ def _fsyncs() -> int:
     stats = mtxdb_engine.stats()
     return sum(
         int((stats.get(pool) or {}).get("sync_totals", {}).get("calls", 0))
-        for pool in ("state", "event_dag", "auth_chain")
+        for pool in ("state", "event_dag", "server_info")
     )
 
 

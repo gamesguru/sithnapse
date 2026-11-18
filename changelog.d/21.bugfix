@@ -1,0 +1,1 @@
+Adapt the embedded mtxdb store to the merged Edges shard: auth-chain and previous-event records now use the state pool, and edge sync, stats, durable-wait and checkpoint handling no longer duplicate the state pool. Stores that still have a separate legacy edges pool are not migrated in place and must be rebuilt or re-imported.

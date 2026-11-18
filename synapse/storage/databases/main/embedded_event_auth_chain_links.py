@@ -106,7 +106,7 @@ def put_chain_links_batch(
         ffi_timing("ffi_put_auth_chain_links", time.monotonic() - _et)
         ffi_timing("ffi_put_auth_chain_links:cpu", time.thread_time() - _ct)
         if sync:
-            sync_now(pools=[Pool.AUTH_CHAIN])
+            sync_now(pools=[Pool.STATE])
 
 
 def get_chain_links_batch(
@@ -161,4 +161,4 @@ def delete_chain_links_batch(
         )
         ffi_timing("ffi_delete_auth_chain_links", time.monotonic() - _et)
         if sync:
-            sync_now(pools=[Pool.AUTH_CHAIN])
+            sync_now(pools=[Pool.STATE])

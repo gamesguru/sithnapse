@@ -326,7 +326,7 @@ class EventsTestCase(HomeserverTestCase):
         # `mark_dirty(EVENT_DAG)` is the edge writes' own coalescing.)
         self.assertLess(
             calls.index(barriers[0]),
-            calls.index(("call_after_mark_dirty", (Pool.AUTH_CHAIN,))),
+            calls.index(("call_after_mark_dirty", (Pool.STATE,))),
         )
 
     @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
@@ -343,7 +343,7 @@ class EventsTestCase(HomeserverTestCase):
             publish_at_commit=True, action="join"
         )
 
-        for pool in (Pool.STATE, Pool.AUTH_CHAIN, Pool.EVENT_DAG):
+        for pool in (Pool.STATE, Pool.EVENT_DAG):
             self.assertIn(
                 ("call_after_mark_dirty", (pool,)),
                 calls,
@@ -357,14 +357,14 @@ class EventsTestCase(HomeserverTestCase):
 
     @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
     def test_auth_event_takes_one_in_txn_barrier_by_default(self) -> None:
-        """`always` covers an auth event with one barrier over all three pools."""
+        """`always` covers an auth event with one barrier over both pools."""
         calls, _ = self._persist_message_recording_event_json_sync(
             publish_at_commit=False, action="join"
         )
 
         self.assertEqual(
             [call for call in calls if call[0] == "sync"],
-            [("sync", (Pool.STATE, Pool.AUTH_CHAIN, Pool.EVENT_DAG))],
+            [("sync", (Pool.STATE, Pool.EVENT_DAG))],
         )
         self.assertFalse([call for call in calls if call[0] == "call_after_sync_now"])
 

@@ -1784,7 +1784,7 @@ class PersistEventsStore:
                 if barrier_in_txn:
                     maybe_sync(
                         SyncTier.DURABLE,
-                        pools=[Pool.STATE, Pool.AUTH_CHAIN, Pool.EVENT_DAG],
+                        pools=[Pool.STATE, Pool.EVENT_DAG],
                     )
                 else:
                     # `interval`/`off`: the reason for this barrier is that
@@ -1794,7 +1794,6 @@ class PersistEventsStore:
                     # through the coalescer, as the mode says. (A `sync_now`
                     # from `call_after` would fsync on the reactor thread.)
                     txn.call_after(mark_dirty, Pool.STATE)
-                    txn.call_after(mark_dirty, Pool.AUTH_CHAIN)
                     txn.call_after(mark_dirty, Pool.EVENT_DAG)
             elif self._embedded_event_json_enabled and needs_state_barrier:
                 if barrier_in_txn:
@@ -1816,9 +1815,10 @@ class PersistEventsStore:
                 # A live state event can also have written chain-cover links
                 # (see `calculate_chain_cover_index_for_events`) even when its
                 # type is not in `AUTH_CHAIN_EVENT_TYPES`. Those links have no
-                # SQL fallback, so keep them on the coalescer rather than
-                # dropping the AUTH_CHAIN dirty mark entirely.
-                txn.call_after(mark_dirty, Pool.AUTH_CHAIN)
+                # SQL fallback and are not covered by a coalescer mark in every
+                # mode (notably `interval`/`off` above), so keep one on the
+                # state pool they now share.
+                txn.call_after(mark_dirty, Pool.STATE)
             else:
                 if barrier_in_txn and wrote_event_json:
                     # Outliers and the like have no state barrier, but their
@@ -1826,7 +1826,6 @@ class PersistEventsStore:
                     # the row it belongs to commits.
                     maybe_sync(SyncTier.DURABLE, pools=[Pool.EVENT_DAG])
                 txn.call_after(mark_dirty, Pool.STATE)
-                txn.call_after(mark_dirty, Pool.AUTH_CHAIN)
 
     def _persist_event_auth_chain_txn(
         self,

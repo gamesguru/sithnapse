@@ -1,4 +1,8 @@
-//! Embedded Event Edges storage in the `edges` mtxdb packfile storage pool.
+//! Embedded Event Edges storage in the mtxdb state pool.
+//!
+//! mtxdb merged the former `Edges` shard type into `State`; auth-chain and
+//! previous-event records share that physical pool but use their own `AUTH`
+//! and `PREV` collection namespaces.
 //!
 //! Stores the DAG edges connecting Matrix events:
 //! - Backward edges: `event_id -> [(prev_event_id, is_state)]` (immutable, write-once).
@@ -26,8 +30,8 @@ use pyo3::types::PyDict;
 use sha2::{Digest, Sha256};
 
 use super::mtxdb_syn::{
-    assert_writable, auth_chain_db, begin_internal_transaction, event_locator_collection_id,
-    event_node_id, map_read_storage_error, map_transaction_error, prev_edges_room_id,
+    assert_writable, begin_internal_transaction, event_locator_collection_id, event_node_id,
+    map_read_storage_error, map_transaction_error, prev_edges_room_id, state_db,
 };
 
 /// Records read together with the per-record write versions the caller must
@@ -93,7 +97,7 @@ impl EdgeWriteTarget for mtxdb::PackfileStorage {
     }
 }
 
-/// Stages into the edges pool instead of writing the live pool: every
+/// Stages into the state pool instead of writing the live pool: every
 /// `put_many` below becomes one `DatabaseTransaction::put` per record, and
 /// nothing is visible or durable until the caller commits.
 impl EdgeWriteTarget for DatabaseTransaction<'_> {
@@ -102,7 +106,7 @@ impl EdgeWriteTarget for DatabaseTransaction<'_> {
         collection: &[u8; 16],
         ids: &[NodeId],
     ) -> Result<Vec<Option<NodeData>>, mtxdb::storage::StorageError> {
-        self.get(ShardType::Edges, collection, ids)
+        self.get(ShardType::State, collection, ids)
     }
 
     fn edge_put_many(
@@ -111,14 +115,14 @@ impl EdgeWriteTarget for DatabaseTransaction<'_> {
         pairs: Vec<(NodeId, NodeData)>,
     ) -> Result<(), mtxdb::storage::StorageError> {
         for (node, data) in pairs {
-            self.put(ShardType::Edges, collection, node, &data)
+            self.put(ShardType::State, collection, node, &data)
                 .map_err(mtxdb::storage::StorageError::Io)?;
         }
         Ok(())
     }
 
     fn edge_get_record_versions(&self, collection: &[u8; 16], ids: &[NodeId]) -> VersionedEdgeRead {
-        self.get_with_record_versions(ShardType::Edges, collection, ids)
+        self.get_with_record_versions(ShardType::State, collection, ids)
             .map(|(found, versions)| (found, Some(versions)))
     }
 
@@ -130,7 +134,7 @@ impl EdgeWriteTarget for DatabaseTransaction<'_> {
     ) -> Result<(), mtxdb::storage::StorageError> {
         match version {
             Some(version) => self
-                .expect_record_version(ShardType::Edges, *collection, *node_id, version)
+                .expect_record_version(ShardType::State, *collection, *node_id, version)
                 .map_err(mtxdb::storage::StorageError::Io),
             None => Ok(()),
         }
@@ -535,7 +539,7 @@ fn run_edge_occ(
     ))
 }
 
-/// Batch put event edges into the room-aware PREV collection in the Edges pool:
+/// Batch put event edges into the room-aware PREV collection in the state pool:
 /// 1. Backward edges: `event_id -> [(prev_event_id, is_state)]`
 /// 2. Forward edges: `prev_event_id -> [child_event_id]` (appended and deduplicated)
 ///
@@ -594,7 +598,7 @@ pub fn event_edges_put(
             }
             None => {
                 let _guards = lock_rooms(room_collections);
-                let engine: &mtxdb::PackfileStorage = auth_chain_db()?;
+                let engine: &mtxdb::PackfileStorage = state_db()?;
                 write_edges(engine, &namespace, &rows)
             }
         }
@@ -777,7 +781,7 @@ pub fn event_edges_get_backward(
     event_ids: Vec<String>,
 ) -> PyResult<Vec<(String, Option<Vec<(String, bool)>>)>> {
     py.detach(|| {
-        let engine = auth_chain_db()?;
+        let engine = state_db()?;
         let node_ids: Vec<NodeId> = event_ids
             .iter()
             .map(|id| event_node_id(&namespace, id))
@@ -866,7 +870,7 @@ pub fn event_edges_get_forward(
     prev_event_ids: Vec<String>,
 ) -> PyResult<Vec<(String, Option<Vec<String>>)>> {
     py.detach(|| {
-        let engine = auth_chain_db()?;
+        let engine = state_db()?;
         let node_ids: Vec<NodeId> = prev_event_ids
             .iter()
             .map(|id| event_node_id(&namespace, id))
@@ -1031,7 +1035,7 @@ pub fn event_edges_delete(
             // work done here -- without that split, a slow call can't be
             // attributed to mtxdb vs. the FFI boundary.
             let closure_started = std::time::Instant::now();
-            let engine = auth_chain_db()?;
+            let engine = state_db()?;
             // Locator resolution is a plain read, not a read-modify-write, so
             // it happens without any lock (see the module-level doc and
             // `lock_rooms`).
@@ -1452,7 +1456,7 @@ mod tests {
                 .collect();
             event_edges_put(py, ns.to_string(), rows).expect("put children");
 
-            let engine = auth_chain_db().expect("edge engine");
+            let engine = state_db().expect("edge engine");
             let collection = prev_edges_room_id(ns, room);
             let node = event_edges_forward_node_id(ns, parent);
 

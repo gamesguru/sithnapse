@@ -28,10 +28,9 @@ fn parse_pool_tag(pool_tag: u8) -> PyResult<ShardType> {
     match pool_tag {
         0 => Ok(ShardType::State),
         1 => Ok(ShardType::EventDag),
-        2 => Ok(ShardType::Edges),
         3 => Ok(ShardType::ServerInfo),
         _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "invalid mtxdb pool tag {pool_tag}; expected 0 (state), 1 (event DAG), 2 (edges), or 3 (server info)"
+            "invalid mtxdb pool tag {pool_tag}; expected 0 (state), 1 (event DAG), or 3 (server info)"
         ))),
     }
 }
@@ -97,7 +96,6 @@ use crate::database::hamt_store::{NodeStore, ROOM_PREFIX_LEN};
 struct MtxdbPools {
     state: Arc<PackfileStorage>,
     event_dag: Arc<PackfileStorage>,
-    auth_chain: Arc<PackfileStorage>,
     server_info: Arc<PackfileStorage>,
     shared_database: Option<Database>,
 }
@@ -192,16 +190,12 @@ fn pools() -> PyResult<&'static MtxdbPools> {
         .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("mtxdb not opened"))
 }
 
-fn state_db() -> PyResult<&'static Arc<PackfileStorage>> {
+pub(crate) fn state_db() -> PyResult<&'static Arc<PackfileStorage>> {
     Ok(&pools()?.state)
 }
 
 pub(crate) fn event_dag_db() -> PyResult<&'static Arc<PackfileStorage>> {
     Ok(&pools()?.event_dag)
-}
-
-pub(crate) fn auth_chain_db() -> PyResult<&'static Arc<PackfileStorage>> {
-    Ok(&pools()?.auth_chain)
 }
 
 pub(crate) fn server_info_db() -> PyResult<&'static Arc<PackfileStorage>> {
@@ -276,7 +270,6 @@ fn db_for_shard_type(shard_type: ShardType) -> PyResult<&'static Arc<PackfileSto
     match shard_type {
         ShardType::State => state_db(),
         ShardType::EventDag => event_dag_db(),
-        ShardType::Edges => auth_chain_db(),
         ShardType::ServerInfo => server_info_db(),
     }
 }
@@ -459,7 +452,7 @@ fn deduplicate_root_node_pairs(
 //   member namespace (`STAT`, `EVNT`, `PREV`, `AUTH`), role, and schema.
 //
 // Metadata & Hierarchy Distinctions:
-// - Physical pool:      State / Events / Edges (known from layout handle)
+// - Physical pool:      State (incl. edges) / Events (known from layout handle)
 // - Member namespace:   STAT / EVNT / PREV / AUTH
 // - Group canonical ID: !room:server
 // - Group full logical: derived 256-bit BLAKE3 digest
@@ -1232,7 +1225,7 @@ mod room_index {
     /// written -- a roughly-constant per-call tax that scaled with cache
     /// occupancy, not with actual write volume. Mirrors the dirty-only
     /// fsync `PackfileStorage::sync()` (mtxdb-core) already does for the
-    /// three pools proper.
+    /// physical pools.
     static DIRTY: Mutex<Option<HashSet<u8>>> = Mutex::new(None);
 
     /// Shard for a namespace, from its already-computed digest. Callers hash
@@ -2039,24 +2032,20 @@ mod wal_env_tests {
     }
 
     #[test]
-    fn wal_matrix_pool_policies_disable_state_edge_and_server_info_compression() {
+    fn wal_matrix_pool_policies_disable_state_and_server_info_compression() {
         let policies = super::synapse_pool_policies();
         assert!(!policies.for_shard(ShardType::State).compress);
         assert!(policies.for_shard(ShardType::EventDag).compress);
-        assert!(!policies.for_shard(ShardType::Edges).compress);
         assert!(!policies.for_shard(ShardType::ServerInfo).compress);
     }
 }
 
-/// Matrix pool policies with Synapse's edge-compression override.
+/// Matrix pool policies with Synapse's compression overrides.
 ///
-/// mtxdb's Matrix defaults keep edge compression enabled, but auth-chain edge
-/// records are small and dense; every write would pay for a compression pass
-/// that usually falls back to the raw frame. Keep edges uncompressed.
+/// Edge records now share the State pool, whose default policy already keeps
+/// compression off for their small, dense payloads.
 fn synapse_pool_policies() -> mtxdb::PoolPolicies {
-    let mut policies = mtxdb::matrix_pool_policies();
-    policies.for_shard_mut(ShardType::Edges).compress = false;
-    policies
+    mtxdb::matrix_pool_policies()
 }
 
 #[pyfunction]
@@ -2069,8 +2058,8 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
         // dense structural hashes, not text. zstd never shrinks them (see
         // mtxdb's own compression bench), so every write there was still
         // paying the compressor's full match-finding pass for nothing.
-        // Disable compression for state, edge, and server-info pools while
-        // keeping it enabled for event-DAG records.
+        // Disable compression for the state and server-info pools while
+        // keeping it enabled for event-DAG records. Edge records share state.
         // The current MTXDB layout gives all pools beneath a database root one
         // shared WAL and writer lock. Open the root once so each pool attaches
         // as a shared member; opening the pools individually would make the
@@ -2084,7 +2073,6 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
                 })?;
         let state = shared_database.pool(ShardType::State).clone();
         let event_dag = shared_database.pool(ShardType::EventDag).clone();
-        let auth_chain = shared_database.pool(ShardType::Edges).clone();
         let server_info = shared_database.pool(ShardType::ServerInfo).clone();
         // A single writer's in-memory index is authoritative for every key it
         // has written, so a negative lookup is a true miss: refreshing would
@@ -2092,7 +2080,7 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
         // a full rescan) to rediscover nothing. Read-only workers keep the
         // default (refresh on) to observe records this writer appends. See
         // mtxdb-core's `PackfileStorage::set_refresh_on_miss`.
-        for store in [&state, &event_dag, &auth_chain, &server_info] {
+        for store in [&state, &event_dag, &server_info] {
             store.set_refresh_on_miss(false);
         }
         // The journal is the read-committed overlay's source of truth for
@@ -2114,12 +2102,10 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
             let interval = std::time::Duration::from_secs(min_interval_secs);
             state.set_checkpoint_rewrite_budget(interval, max_bytes);
             event_dag.set_checkpoint_rewrite_budget(interval, max_bytes);
-            auth_chain.set_checkpoint_rewrite_budget(interval, max_bytes);
         }
         let _ = DBS.set(MtxdbPools {
             state,
             event_dag,
-            auth_chain,
             server_info,
             shared_database: Some(shared_database),
         });
@@ -2191,7 +2177,6 @@ pub fn open_client_read_only(py: Python<'_>, path: String) -> PyResult<()> {
         };
         let state = open_pool(ShardType::State, "state")?;
         let event_dag = open_pool(ShardType::EventDag, "event-dag")?;
-        let auth_chain = open_pool(ShardType::Edges, "edges")?;
         // ServerInfo has no read path in Synapse yet. Opening this empty pool
         // through the shared read-journal overlay races checkpoint coverage
         // on databases whose WAL contains only edge/event mutations, making
@@ -2221,20 +2206,18 @@ pub fn open_client_read_only(py: Python<'_>, path: String) -> PyResult<()> {
         // at info only in WAL mode, and demote it to debug otherwise.
         let state_signal_active = state.read_journal_publish_signal_active();
         let event_dag_signal_active = event_dag.read_journal_publish_signal_active();
-        let auth_chain_signal_active = auth_chain.read_journal_publish_signal_active();
         if wal_enabled() {
             log::info!(
-                "mtxdb read-only worker opened: publish_signal_active state={state_signal_active} event_dag={event_dag_signal_active} edges={auth_chain_signal_active}",
+                "mtxdb read-only worker opened: publish_signal_active state={state_signal_active} event_dag={event_dag_signal_active}",
             );
         } else {
             log::debug!(
-                "mtxdb read-only worker opened (snapshot, no publish signal): state={state_signal_active} event_dag={event_dag_signal_active} edges={auth_chain_signal_active}",
+                "mtxdb read-only worker opened (snapshot, no publish signal): state={state_signal_active} event_dag={event_dag_signal_active}",
             );
         }
         let _ = DBS.set(MtxdbPools {
             state,
             event_dag,
-            auth_chain,
             server_info,
             shared_database: None,
         });
@@ -2309,7 +2292,7 @@ pub fn get_auth_chain_links_batch(
     chain_ids: Vec<i64>,
 ) -> PyResult<Vec<AuthChainLinksForChain>> {
     py.detach(|| {
-        let engine = auth_chain_db()?;
+        let engine = state_db()?;
         let room_id = namespace_room_id(&namespace);
         let node_ids: Vec<NodeId> = chain_ids.iter().map(|&c| chain_node_id(c)).collect();
 
@@ -2347,7 +2330,7 @@ pub fn put_auth_chain_links_batch(
             let _guard = RMW_LOCK.lock().map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}"))
             })?;
-            let engine = auth_chain_db()?;
+            let engine = state_db()?;
             let room_id = namespace_room_id(&namespace);
 
             let mut grouped: HashMap<i64, Vec<(i64, i64, i64)>> = HashMap::new();
@@ -2406,7 +2389,7 @@ pub fn delete_auth_chain_links_batch(namespace: String, pairs: Vec<(i64, i64)>) 
             let _guard = RMW_LOCK.lock().map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}"))
             })?;
-            let engine = auth_chain_db()?;
+            let engine = state_db()?;
             let room_id = namespace_room_id(&namespace);
 
             let mut grouped: HashMap<i64, HashSet<i64>> = HashMap::new();
@@ -2470,7 +2453,7 @@ pub fn get_or_create_short_ids(
             let _guard = RMW_LOCK.lock().map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}"))
             })?;
-            let engine = db_for_shard_type(ShardType::Edges)?;
+            let engine = db_for_shard_type(ShardType::State)?;
             let collection = auth_chain_closure_room_id(&namespace, &room_id);
 
             let mut out = Vec::with_capacity(event_ids.len());
@@ -2604,7 +2587,7 @@ pub fn resolve_short_ids_to_event_ids(
     short_ids: Vec<u32>,
 ) -> PyResult<Vec<Option<String>>> {
     py.detach(|| {
-        let engine = db_for_shard_type(ShardType::Edges)?;
+        let engine = db_for_shard_type(ShardType::State)?;
         let collection = auth_chain_closure_room_id(&namespace, &room_id);
         let node_ids: Vec<NodeId> = short_ids
             .iter()
@@ -2643,7 +2626,7 @@ pub fn auth_chain_edges_get(
     short_ids: Vec<u32>,
 ) -> PyResult<Vec<Option<Vec<u32>>>> {
     py.detach(|| {
-        let engine = db_for_shard_type(ShardType::Edges)?;
+        let engine = db_for_shard_type(ShardType::State)?;
         let collection = auth_chain_closure_room_id(&namespace, &room_id);
         let node_ids: Vec<NodeId> = short_ids
             .iter()
@@ -2676,7 +2659,7 @@ pub fn auth_chain_edges_put(
 ) -> PyResult<()> {
     assert_writable()?;
     py.detach(|| {
-        let engine = db_for_shard_type(ShardType::Edges)?;
+        let engine = db_for_shard_type(ShardType::State)?;
         let collection = auth_chain_closure_room_id(&namespace, &room_id);
         let pairs: Vec<(NodeId, NodeData)> = rows
             .into_iter()
@@ -2716,7 +2699,7 @@ pub fn auth_chain_children_get(
     short_ids: Vec<u32>,
 ) -> PyResult<Vec<Option<Vec<u32>>>> {
     py.detach(|| {
-        let engine = db_for_shard_type(ShardType::Edges)?;
+        let engine = db_for_shard_type(ShardType::State)?;
         let collection = auth_chain_closure_room_id(&namespace, &room_id);
         let node_ids: Vec<NodeId> = short_ids
             .iter()
@@ -2756,7 +2739,7 @@ pub fn auth_chain_children_append(
             let _guard = RMW_LOCK.lock().map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}"))
             })?;
-            let engine = db_for_shard_type(ShardType::Edges)?;
+            let engine = db_for_shard_type(ShardType::State)?;
             let collection = auth_chain_closure_room_id(&namespace, &room_id);
 
             // Aggregate by parent first: the batched put below only applies at the
@@ -2820,7 +2803,7 @@ pub fn auth_chain_children_append(
 pub fn auth_chain_purge_room(py: Python<'_>, namespace: String, room_id: String) -> PyResult<()> {
     assert_writable()?;
     py.detach(|| {
-        let engine = db_for_shard_type(ShardType::Edges)?;
+        let engine = db_for_shard_type(ShardType::State)?;
         let collection = auth_chain_closure_room_id(&namespace, &room_id);
         engine.delete_collection(&collection).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb delete_collection error: {e}"))
@@ -2860,8 +2843,8 @@ pub fn batch_get(py: Python<'_>, keys: Vec<Vec<u8>>) -> PyResult<Vec<(Vec<u8>, V
             match shard_type_for_key(key) {
                 ShardType::State => state_ids.push(entry),
                 ShardType::EventDag => event_ids.push(entry),
-                ShardType::Edges | ShardType::ServerInfo => {
-                    unreachable!("flat KV never routes to edge/server-info pools")
+                ShardType::ServerInfo => {
+                    unreachable!("flat KV never routes to the server-info pool")
                 }
             }
         }
@@ -2915,8 +2898,8 @@ fn batch_put_impl(pairs: Vec<(Vec<u8>, Vec<u8>)>) -> PyResult<()> {
         match shard_type_for_key(&key) {
             ShardType::State => state_puts.push(entry),
             ShardType::EventDag => event_puts.push(entry),
-            ShardType::Edges | ShardType::ServerInfo => {
-                unreachable!("flat KV never routes to edge/server-info pools")
+            ShardType::ServerInfo => {
+                unreachable!("flat KV never routes to the server-info pool")
             }
         }
     }
@@ -4006,11 +3989,7 @@ pub fn sync(py: Python<'_>) -> PyResult<()> {
     py.detach(|| {
         // Sync mtxdb pools before publishing the room index. A durable
         // index entry must never point at a root that was not yet synced.
-        for (name, engine) in [
-            ("state", state_db()?),
-            ("event-dag", event_dag_db()?),
-            ("auth-chain", auth_chain_db()?),
-        ] {
+        for (name, engine) in [("state", state_db()?), ("event-dag", event_dag_db()?)] {
             sync_one(name, engine)?;
         }
         room_index::sync()?;
@@ -4021,7 +4000,7 @@ pub fn sync(py: Python<'_>) -> PyResult<()> {
 /// Sync only the `state` pool (plus the room index, which is published
 /// off state-group root writes -- see `room_index::sync`'s doc comment on
 /// why an index entry must never be synced ahead of the root it points
-/// at). Callers should prefer this (or `sync_event_dag`/`sync_auth_chain`)
+/// at). Callers should prefer this (or `sync_event_dag`)
 /// over the blanket `sync()`: a DURABLE write only needs its own pool
 /// durable, not every other pool's currently-dirty shards along with it.
 #[pyfunction]
@@ -4041,14 +4020,6 @@ pub fn sync_event_dag(py: Python<'_>) -> PyResult<()> {
     py.detach(|| sync_one("event-dag", event_dag_db()?))
 }
 
-/// Sync only the `auth_chain` pool (auth-chain links, manifests, short-id
-/// index).
-#[pyfunction]
-pub fn sync_auth_chain(py: Python<'_>) -> PyResult<()> {
-    assert_writable()?;
-    py.detach(|| sync_one("auth-chain", auth_chain_db()?))
-}
-
 /// Start the WAL group committer for the writable pools.
 ///
 /// The pools share a coordinator in WAL mode; starting it on each pool is
@@ -4063,11 +4034,7 @@ pub fn start_background_commit(py: Python<'_>, interval_ms: u64, max_pending: u6
             interval: Duration::from_millis(interval_ms),
             max_pending,
         };
-        for (name, engine) in [
-            ("state", state_db()?),
-            ("event-dag", event_dag_db()?),
-            ("auth-chain", auth_chain_db()?),
-        ] {
+        for (name, engine) in [("state", state_db()?), ("event-dag", event_dag_db()?)] {
             engine.start_background_commit(config).map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
                     "mtxdb start background commit error for {name}: {e}"
@@ -4083,11 +4050,7 @@ pub fn start_background_commit(py: Python<'_>, interval_ms: u64, max_pending: u6
 pub fn stop_background_commit(py: Python<'_>) -> PyResult<()> {
     assert_writable()?;
     py.detach(|| {
-        for (name, engine) in [
-            ("state", state_db()?),
-            ("event-dag", event_dag_db()?),
-            ("auth-chain", auth_chain_db()?),
-        ] {
+        for (name, engine) in [("state", state_db()?), ("event-dag", event_dag_db()?)] {
             engine.stop_background_commit().map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
                     "mtxdb stop background commit error for {name}: {e}"
@@ -4106,7 +4069,7 @@ pub fn stop_background_commit(py: Python<'_>) -> PyResult<()> {
 pub fn background_commit_error(py: Python<'_>) -> PyResult<Option<String>> {
     assert_writable()?;
     py.detach(|| {
-        for engine in [state_db()?, event_dag_db()?, auth_chain_db()?] {
+        for engine in [state_db()?, event_dag_db()?] {
             if let Some(journal) = engine.journal() {
                 if let Some(message) = journal.background_failure_message() {
                     return Ok(Some(message));
@@ -4119,15 +4082,15 @@ pub fn background_commit_error(py: Python<'_>) -> PyResult<Option<String>> {
 
 /// Request durability through the current published boundary of every pool.
 ///
-/// The fixed three-entry result keeps the pool mapping stable even when a
-/// legacy per-pool WAL layout is used. A zero entry means that pool has no
-/// journal and needs no wait.
+/// The fixed two-entry result keeps the state/event-DAG mapping stable even
+/// when a legacy per-pool WAL layout is used. A zero entry means that pool
+/// has no journal and needs no wait.
 #[pyfunction]
 pub fn request_durable(py: Python<'_>) -> PyResult<Vec<u64>> {
     assert_writable()?;
     py.detach(|| {
-        let mut targets = Vec::with_capacity(3);
-        for engine in [state_db()?, event_dag_db()?, auth_chain_db()?] {
+        let mut targets = Vec::with_capacity(2);
+        for engine in [state_db()?, event_dag_db()?] {
             let target = engine
                 .journal()
                 .map(|journal| {
@@ -4146,16 +4109,15 @@ pub fn request_durable(py: Python<'_>) -> PyResult<Vec<u64>> {
 #[pyfunction]
 pub fn wait_durable(py: Python<'_>, targets: Vec<u64>) -> PyResult<()> {
     assert_writable()?;
-    if targets.len() != 3 {
+    if targets.len() != 2 {
         return Err(pyo3::exceptions::PyValueError::new_err(
-            "mtxdb wait_durable expects three pool targets",
+            "mtxdb wait_durable expects two pool targets",
         ));
     }
     py.detach(|| {
         for (name, target, engine) in [
             ("state", targets[0], state_db()?),
             ("event-dag", targets[1], event_dag_db()?),
-            ("auth-chain", targets[2], auth_chain_db()?),
         ] {
             if target == 0 {
                 continue;
@@ -4461,22 +4423,20 @@ pub fn stats_snapshot(py: Python<'_>) -> PyResult<Py<PyDict>> {
 /// SQL-read-removal gate must show `true` on every read-only process role.
 #[pyfunction]
 pub fn publish_signal_active(py: Python<'_>) -> PyResult<Py<PyDict>> {
-    let (state, event_dag, auth_chain) = py.detach(|| -> PyResult<(bool, bool, bool)> {
+    let (state, event_dag) = py.detach(|| -> PyResult<(bool, bool)> {
         let pools = pools()?;
         Ok((
             pools.state.read_journal_publish_signal_active(),
             pools.event_dag.read_journal_publish_signal_active(),
-            pools.auth_chain.read_journal_publish_signal_active(),
         ))
     })?;
     let out = PyDict::new(py);
     out.set_item("state", state)?;
     out.set_item("event_dag", event_dag)?;
-    out.set_item("auth_chain", auth_chain)?;
     Ok(out.unbind())
 }
 
-/// Return runtime-stat dictionaries keyed by state, event_dag, auth_chain, and server_info.
+/// Return runtime-stat dictionaries keyed by state, event_dag, and server_info.
 ///
 /// When `take_diagnostics` is true, take and reset per-interval sync diagnostics;
 /// otherwise, leave them intact. Return a Python RuntimeError if mtxdb is not open,
@@ -4494,19 +4454,20 @@ fn stats_impl(py: Python<'_>, take_diagnostics: bool) -> PyResult<Py<PyDict>> {
         > {
             let pools = pools()?;
             let state_stats = pools.state.stats();
+            let state_diagnostics = if take_diagnostics {
+                pools.state.take_sync_diagnostics()
+            } else {
+                state_stats.sync_diagnostics.clone()
+            };
+            let state_publish_signal = pools.state.read_journal_publish_signal_active();
             let event_dag_stats = pools.event_dag.stats();
-            let auth_chain_stats = pools.auth_chain.stats();
             let server_info_stats = pools.server_info.stats();
             Ok(vec![
                 (
                     "state",
                     state_stats.clone(),
-                    if take_diagnostics {
-                        pools.state.take_sync_diagnostics()
-                    } else {
-                        state_stats.sync_diagnostics.clone()
-                    },
-                    pools.state.read_journal_publish_signal_active(),
+                    state_diagnostics,
+                    state_publish_signal,
                 ),
                 (
                     "event_dag",
@@ -4517,16 +4478,6 @@ fn stats_impl(py: Python<'_>, take_diagnostics: bool) -> PyResult<Py<PyDict>> {
                         event_dag_stats.sync_diagnostics.clone()
                     },
                     pools.event_dag.read_journal_publish_signal_active(),
-                ),
-                (
-                    "auth_chain",
-                    auth_chain_stats.clone(),
-                    if take_diagnostics {
-                        pools.auth_chain.take_sync_diagnostics()
-                    } else {
-                        auth_chain_stats.sync_diagnostics.clone()
-                    },
-                    pools.auth_chain.read_journal_publish_signal_active(),
                 ),
                 (
                     "server_info",
@@ -4558,7 +4509,6 @@ pub fn reset_stats(py: Python<'_>) -> PyResult<()> {
         let pools = pools()?;
         pools.state.reset_stats();
         pools.event_dag.reset_stats();
-        pools.auth_chain.reset_stats();
         pools.server_info.reset_stats();
         REFCOUNT_INITS.store(0, Ordering::Relaxed);
         REFCOUNT_EXISTING.store(0, Ordering::Relaxed);
@@ -4574,7 +4524,6 @@ pub fn set_stats_enabled(py: Python<'_>, enabled: bool) -> PyResult<()> {
         let pools = pools()?;
         pools.state.set_stats_enabled(enabled);
         pools.event_dag.set_stats_enabled(enabled);
-        pools.auth_chain.set_stats_enabled(enabled);
         pools.server_info.set_stats_enabled(enabled);
         Ok(())
     })
@@ -4597,7 +4546,7 @@ pub fn set_checkpoint_rewrite_budget(
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("invalid interval: {e}")))?;
     py.detach(|| {
         let pools = pools()?;
-        for store in [&pools.state, &pools.event_dag, &pools.auth_chain] {
+        for store in [&pools.state, &pools.event_dag] {
             store.set_checkpoint_rewrite_budget(interval, max_bytes);
         }
         Ok(())
@@ -4617,11 +4566,7 @@ pub fn repack(py: Python<'_>) -> PyResult<Py<PyDict>> {
         assert_writable()?;
 
         let mut out = Vec::new();
-        for (name, store) in [
-            ("state", &pools.state),
-            ("event_dag", &pools.event_dag),
-            ("auth_chain", &pools.auth_chain),
-        ] {
+        for (name, store) in [("state", &pools.state), ("event_dag", &pools.event_dag)] {
             let collection_ids = store.collection_ids();
             let results = store
                 .repack_collections_reachable(&collection_ids, |_hash, _data| Vec::new())
@@ -4689,7 +4634,6 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(sync, m)?)?;
     m.add_function(wrap_pyfunction!(sync_state, m)?)?;
     m.add_function(wrap_pyfunction!(sync_event_dag, m)?)?;
-    m.add_function(wrap_pyfunction!(sync_auth_chain, m)?)?;
     m.add_function(wrap_pyfunction!(begin_transaction, m)?)?;
     m.add_function(wrap_pyfunction!(recheck_collection_version, m)?)?;
     m.add_function(wrap_pyfunction!(txn_commit_phases, m)?)?;
@@ -4739,6 +4683,33 @@ pub(crate) mod auth_chain_closure_tests {
                     .expect("open_client should succeed");
             });
         });
+    }
+
+    #[test]
+    fn edge_collection_derivation_is_tag_separated_from_state() {
+        // Edges share the State pool now. The guarantee is domain separation
+        // by member tag, not a lucky digest: for one fixed room, each family
+        // must derive from exactly its own tag and differ from the others.
+        let room = "!edge-domain-separation:example.org";
+        let namespace = "namespace";
+        let group = group_full_logical_id(room.as_bytes());
+        let state = member_collection_id(*b"STAT", &group);
+        let auth = member_collection_id(*b"AUTH", &group);
+        let prev = member_collection_id(*b"PREV", &group);
+        let manifest = namespace_room_id(namespace);
+
+        assert_eq!(state, state_hamt_room_id(room));
+        assert_eq!(auth, auth_chain_closure_room_id(namespace, room));
+        assert_eq!(prev, prev_edges_room_id(namespace, room));
+
+        assert_ne!(auth, state, "AUTH must not reuse the STAT tag");
+        assert_ne!(prev, state, "PREV must not reuse the STAT tag");
+        assert_ne!(auth, prev, "AUTH must not reuse the PREV tag");
+        // The chain-links manifest collection is namespace-scoped, not
+        // room-scoped, but it shares the pool too.
+        assert_ne!(manifest, state);
+        assert_ne!(manifest, auth);
+        assert_ne!(manifest, prev);
     }
 
     fn test_root_value(room_id: &str, root_byte: u8, lattice_byte: u8) -> Vec<u8> {

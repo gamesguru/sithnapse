@@ -1043,12 +1043,13 @@ def _print_mtxdb_engine_stats(timings_dir: str) -> None:
     print(
         f"\n=== mtxdb runtime stats (summed over {processes} process(es)) ===", file=err
     )
-    for pool in ("state", "event_dag", "auth_chain", "server_info"):
+    for pool in ("state", "event_dag", "server_info"):
         pool_totals = totals.get(pool)
         if not pool_totals:
             continue
-        # The stats keys keep their older names; the report says `event`/`edges`.
-        label = {"event_dag": "event", "auth_chain": "edges"}.get(pool, pool)
+        # The stats keys keep their older names; the report says `event`.
+        # Auth-chain and previous-event edges share the state pool.
+        label = {"event_dag": "event"}.get(pool, pool)
         print(f"\n  [{label}]", file=err)
         print(
             f"    get: {pool_totals['get_calls']:,.0f} calls, {pool_totals['get_misses']:,.0f} misses"
