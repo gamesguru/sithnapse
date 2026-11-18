@@ -57,5 +57,6 @@ class MtxdbLatencyStatsTestCase(unittest.TestCase):
                     self.assertEqual(len(latency["buckets"]), 6)
                     self.assertEqual(sum(latency["buckets"]), latency["calls"])
 
-        # The edges pool was never touched.
-        self.assertEqual(stats["auth_chain"]["put_many_latency"]["calls"], 0)
+        # Edges share the state pool now; `auth_chain` is a compatibility
+        # alias for it, so both report the same counters.
+        self.assertEqual(stats["auth_chain"], stats["state"])

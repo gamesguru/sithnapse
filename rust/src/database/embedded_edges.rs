@@ -1,4 +1,8 @@
-//! Embedded Event Edges storage in the `edges` mtxdb packfile storage pool.
+//! Embedded Event Edges storage in the mtxdb state pool.
+//!
+//! mtxdb merged the former `Edges` shard type into `State`; auth-chain and
+//! previous-event records share that physical pool but use their own `AUTH`
+//! and `PREV` collection namespaces.
 //!
 //! Stores the DAG edges connecting Matrix events:
 //! - Backward edges: `event_id -> [(prev_event_id, is_state)]` (immutable, write-once).
@@ -93,7 +97,7 @@ impl EdgeWriteTarget for mtxdb::PackfileStorage {
     }
 }
 
-/// Stages into the edges pool instead of writing the live pool: every
+/// Stages into the state pool instead of writing the live pool: every
 /// `put_many` below becomes one `DatabaseTransaction::put` per record, and
 /// nothing is visible or durable until the caller commits.
 impl EdgeWriteTarget for DatabaseTransaction<'_> {
@@ -102,7 +106,7 @@ impl EdgeWriteTarget for DatabaseTransaction<'_> {
         collection: &[u8; 16],
         ids: &[NodeId],
     ) -> Result<Vec<Option<NodeData>>, mtxdb::storage::StorageError> {
-        self.get(ShardType::Edges, collection, ids)
+        self.get(ShardType::State, collection, ids)
     }
 
     fn edge_put_many(
@@ -111,14 +115,14 @@ impl EdgeWriteTarget for DatabaseTransaction<'_> {
         pairs: Vec<(NodeId, NodeData)>,
     ) -> Result<(), mtxdb::storage::StorageError> {
         for (node, data) in pairs {
-            self.put(ShardType::Edges, collection, node, &data)
+            self.put(ShardType::State, collection, node, &data)
                 .map_err(mtxdb::storage::StorageError::Io)?;
         }
         Ok(())
     }
 
     fn edge_get_record_versions(&self, collection: &[u8; 16], ids: &[NodeId]) -> VersionedEdgeRead {
-        self.get_with_record_versions(ShardType::Edges, collection, ids)
+        self.get_with_record_versions(ShardType::State, collection, ids)
             .map(|(found, versions)| (found, Some(versions)))
     }
 
@@ -130,7 +134,7 @@ impl EdgeWriteTarget for DatabaseTransaction<'_> {
     ) -> Result<(), mtxdb::storage::StorageError> {
         match version {
             Some(version) => self
-                .expect_record_version(ShardType::Edges, *collection, *node_id, version)
+                .expect_record_version(ShardType::State, *collection, *node_id, version)
                 .map_err(mtxdb::storage::StorageError::Io),
             None => Ok(()),
         }
@@ -535,7 +539,7 @@ fn run_edge_occ(
     ))
 }
 
-/// Batch put event edges into the room-aware PREV collection in the Edges pool:
+/// Batch put event edges into the room-aware PREV collection in the state pool:
 /// 1. Backward edges: `event_id -> [(prev_event_id, is_state)]`
 /// 2. Forward edges: `prev_event_id -> [child_event_id]` (appended and deduplicated)
 ///

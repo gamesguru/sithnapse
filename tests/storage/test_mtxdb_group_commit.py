@@ -63,7 +63,8 @@ class MtxdbGroupCommitTestCase(unittest.TestCase):
     def test_durable_wait_commits_and_is_counted(self) -> None:
         out = self._run_engine()
 
-        # One target per pool (state, event, edges); zero means no journal.
+        # One target per logical pool (state, event, edges alias); zero means
+        # no journal. Edges share the state pool since the layout merge.
         self.assertEqual(len(out["targets"]), 3)
         self.assertTrue(any(out["targets"]), out["targets"])
 

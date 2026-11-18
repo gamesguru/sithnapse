@@ -578,10 +578,11 @@ if _PG_TIMINGS_ENABLED:
 
 # Display names for the stats keys. The keys keep their older names
 # (`event_dag`, `auth_chain`); the report says `event` (event JSON) and `edges`
-# (previous-event and auth-chain edges, mtxdb's `ShardType::Edges`).
+# (previous-event and auth-chain edges). mtxdb merged its former `Edges` shard
+# into `State`, so `auth_chain` is now a compatibility alias of `state`.
 _POOL_LABELS: dict[str, str] = {
     "event_dag": "event",
-    "auth_chain": "edges",
+    "auth_chain": "edges (state alias)",
     "server_info": "server-info",
 }
 
@@ -633,8 +634,8 @@ def _print_mtxdb_stats() -> None:
         ps = s.get(pool_name, {})
         if not ps:
             continue
-        # The third pool is mtxdb's `Edges` (previous-event and auth-chain
-        # edges); the stats key kept the older `auth_chain` name.
+        # `auth_chain` keeps its older name for compatibility; since mtxdb
+        # merged `Edges` into `State`, it reports the state pool's counters.
         print(f"\n  [{_POOL_LABELS.get(pool_name, pool_name)}]", file=out)
         print(
             f"    collections: {ps.get('collection_count', 0)}  shards: {ps.get('shard_count', 0)}  index: {ps.get('index_bytes', 0):,}B",
