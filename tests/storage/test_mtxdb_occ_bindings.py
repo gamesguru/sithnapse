@@ -61,7 +61,7 @@ stale.put(1, collection, key, b"must-not-publish")
 try:
     stale.commit()
 except m.StaleReadError as error:
-    assert error.args[1:] == ("mtpl-event", collection, expected, expected + 1), error.args
+    assert error.args[1:] == ("mtpl-state", collection, expected, expected + 1), error.args
 else:
     raise AssertionError("stale transaction unexpectedly committed")
 
@@ -146,7 +146,7 @@ stale.put(1, collection, key, b"must-not-publish")
 try:
     stale.commit()
 except m.StaleReadError as error:
-    assert error.args[1] == "mtpl-event", error.args
+    assert error.args[1] == "mtpl-state", error.args
     assert error.args[2] == collection, error.args
     assert error.args[3] == observed, error.args
     assert error.args[4] > observed, error.args
