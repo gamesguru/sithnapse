@@ -1999,8 +1999,6 @@ class EventFederationWorkerStore(
         txn.execute(query, params)
         return [row[0] for row in txn]
 
-    @trace
-    @tag_args
     def _get_backfill_points_mtxdb(
         self,
         txn: LoggingTransaction,
@@ -2078,6 +2076,8 @@ class EventFederationWorkerStore(
         results.sort(key=lambda row: (row[1], row[0]), reverse=True)
         return results[:limit]
 
+    @trace
+    @tag_args
     async def get_backfill_points_in_room(
         self,
         room_id: str,

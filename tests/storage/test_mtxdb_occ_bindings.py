@@ -26,7 +26,7 @@ import sys
 from synapse.synapse_rust import mtxdb_engine as m
 
 m.open_client(sys.argv[1])
-# Pool tag 0 is the event DAG pool (tags are contiguous: 0=event, 1=state,
+# Pool tag 1 is the state pool (tags are contiguous: 0=event, 1=state,
 # 2=server info), so the typed stale-read error names that pool.
 collection = bytes([0xA1]) * 16
 key = bytes([0x01]) * 16
@@ -97,7 +97,7 @@ import sys
 from synapse.synapse_rust import mtxdb_engine as m
 
 m.open_client(sys.argv[1])
-# Pool tag 0 is the event DAG pool; see the note in _SCRIPT.
+# Pool tag 1 is the state pool; see the note in _SCRIPT.
 collection = bytes([0xB2]) * 16
 key = bytes([0x11]) * 16
 neighbour = bytes([0x12]) * 16

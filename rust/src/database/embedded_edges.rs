@@ -960,8 +960,8 @@ pub fn event_edges_get_forward(
         // -- exactly the same "embedded miss" signal this function already
         // returns when the forward node itself doesn't exist. There is no SQL
         // fallback in mtxdb mode; callers treat the miss as "no known
-        // successors". A manual verify/repair pass is the recovery path for
-        // these gaps.
+        // successors". The gap is only closed by rewriting the edge (a repair
+        // command for events that lost edges is not implemented yet).
         let mut live: HashMap<([u8; 16], String), Option<bool>> = HashMap::new();
         for (collection, children) in &mut child_lookup {
             children.sort_unstable();

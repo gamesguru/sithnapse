@@ -274,7 +274,7 @@ def main() -> None:
             # base build; the stash (or the destination branch) owns any real
             # local changes.
             subprocess.run(
-                ["git", "checkout", "--", *HEAD_RUST_PATHS],
+                ["git", "checkout", "HEAD", "--", *HEAD_RUST_PATHS],
                 cwd=REPO_ROOT,
                 check=True,
             )

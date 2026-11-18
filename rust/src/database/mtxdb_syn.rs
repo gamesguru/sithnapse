@@ -2053,10 +2053,10 @@ mod wal_env_tests {
     }
 }
 
-/// Matrix pool policies with Synapse's compression overrides.
+/// The mtxdb Matrix pool policies, unmodified.
 ///
-/// Edge records now share the State pool, whose default policy already keeps
-/// compression off for their small, dense payloads.
+/// Edge records share the State pool, whose default policy already keeps
+/// compression off for their small, dense payloads, so no override is needed.
 fn synapse_pool_policies() -> mtxdb::PoolPolicies {
     mtxdb::matrix_pool_policies()
 }

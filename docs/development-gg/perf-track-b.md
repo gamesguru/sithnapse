@@ -130,9 +130,11 @@ locks, device-list coordination, push queues, delayed events):
    The SQL `events` table stays.
 4. `event_edges`: cut over to exactly one authoritative backend per config (SQL
    or mtxdb), with a manual backend migration and a startup marker check. mtxdb
-   edge writes are staged with event JSON; there is no SQL outbox,
-   source-version clock, or runtime SQL fallback. The SQL table remains as dead
-   data in mtxdb mode until the index/purge-list cleanup is done.
+   edge writes are staged with event JSON in the persist transaction when a
+   shared WAL is available, and otherwise written directly before the SQL
+   COMMIT; there is no SQL outbox, source-version clock, or runtime SQL
+   fallback. The SQL table remains as dead data in mtxdb mode until the
+   index/purge-list cleanup is done.
 5. `state_groups`, `state_group_edges`, `state_group_id_seq`
    ([family-5 state map](perf-track-b-family5-state-map.md),
    [state-groups-out-of-sql.md](state-groups-out-of-sql.md)): broadest change,

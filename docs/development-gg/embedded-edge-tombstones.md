@@ -22,8 +22,8 @@ a lossy cache and validates each returned child against its backward edge:
 
 - a non-empty backward record means the child is live;
 - a present empty record is an explicit deletion tombstone and is filtered;
-- a missing backward record is an incomplete/legacy edge and is not silently
-  kept or dropped.
+- a missing backward record is an incomplete edge: the child is not returned,
+  and the whole forward read is reported as a miss.
 
 If the forward result is incomplete because a child’s backward record is
 missing, the read returns a miss. In mtxdb mode there is no SQL fallback, so
