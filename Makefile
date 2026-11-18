@@ -29,7 +29,7 @@ sync:	##H Sync deps (uv) then build the Rust extension (maturin develop)
 	# `matrix-synapse` install, so every subsequent `uv run` would uninstall
 	# and reinstall it. `--no-install-project` leaves the package to maturin;
 	# `--inexact` keeps it from being treated as extraneous and removed.
-	uv sync --no-install-project --inexact
+	uv sync --no-install-project --inexact --group core_dev
 	@rm -f target/maturin/libsynapse.so target/release/libsynapse.so
 	@RUSTC_WRAPPER= uv run --no-sync maturin develop --release
 	@test -s target/maturin/libsynapse.so || { \
