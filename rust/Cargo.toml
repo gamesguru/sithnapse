@@ -8,16 +8,17 @@ version = "0.1.0"
 
 edition = "2021"
 # Match CI's actual enforced floor (tests.yml/complement_tests.yml/
-# latest_deps.yml all pin RUST_VERSION: 1.88.0) -- this field had drifted to
-# 1.82.0, stale against reality: the icu_* pins below already silently
-# require 1.86+, and cpufeatures 0.3.1 (transitive via rand -> chacha20,
-# pulled in even though reqwest's "http3" feature that gates quinn is never
-# enabled -- Cargo.lock still needs to resolve/fetch it) requires
+# latest_deps.yml/twisted_trunk.yml all pin RUST_VERSION: 1.89.0). This field
+# had drifted to 1.82.0, stale against reality: the mtxdb and rezzy git
+# dependencies declare `rust-version = "1.89"`; the icu_* pins below already
+# silently require 1.86+; and cpufeatures 0.3.1 (transitive via rand ->
+# chacha20, pulled in even though reqwest's "http3" feature that gates quinn
+# is never enabled -- Cargo.lock still needs to resolve/fetch it) requires
 # edition2024, unstable before 1.85. A declared rust-version below what the
 # dependency graph actually needs just means `cargo +<declared-version>
 # build` fails while a plain `cargo build` (using whatever's installed)
 # silently succeeds and hides it.
-rust-version = "1.88.0"
+rust-version = "1.89.0"
 
 [lib]
 name = "synapse"

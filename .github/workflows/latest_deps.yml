@@ -22,7 +22,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  RUST_VERSION: 1.88.0
+  RUST_VERSION: 1.89.0
   UV_HTTP_RETRIES: 5
 
 jobs:
@@ -99,7 +99,11 @@ jobs:
             postgres:${{ matrix.postgres-version }}
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.x"
+          # Pin rather than use "3.x": 3.15 is newer than the latest Python
+          # pydantic-core's PyO3 supports (3.14), so a fresh install there
+          # fails to build the extension from source. Bump once pydantic-core
+          # (and the rest of the dependency graph) supports the next Python.
+          python-version: "3.14"
       - run: pip install .[all,test]
       - name: Await PostgreSQL
         if: ${{ matrix.postgres-version }}
