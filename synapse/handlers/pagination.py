@@ -25,7 +25,7 @@ import attr
 
 from twisted.python.failure import Failure
 
-from synapse.api.constants import Direction, EventTypes, Membership
+from synapse.api.constants import MAX_DEPTH, Direction, EventTypes, Membership
 from synapse.api.errors import SynapseError
 from synapse.api.filtering import Filter
 from synapse.events import EventBase
@@ -645,17 +645,29 @@ class PaginationHandler:
             # to a newer event in the same page.
             backfill_depth = curr_topo
 
+            # A cursor at or before the oldest point of the room cannot have
+            # older history behind it (the page window partly below our oldest
+            # event is the only case where a fetch could be useful). Backfilling
+            # from an extremity newer than such a cursor would only return
+            # events the client has already paged past.
+            min_topological = await self.store.get_min_topological_ordering(room_id)
+            cursor_is_before_room = (
+                min_topological is not None
+                and backfill_depth - pagin_config.limit <= min_topological
+            )
+
             if (
                 found_big_gap
                 or missing_too_many_events
                 or not_enough_events_to_fill_response
                 or pagin_config.limit == 1
-            ):
+            ) and not cursor_is_before_room:
                 did_backfill = await self.hs.get_federation_handler().maybe_backfill(
                     room_id,
                     backfill_depth,
                     limit=pagin_config.limit,
                     force=True,
+                    direction=Direction.BACKWARDS,
                 )
 
                 # If we did backfill something, refetch the events from the database to
@@ -674,16 +686,83 @@ class PaginationHandler:
                         event_filter=event_filter,
                     )
             else:
-                # Otherwise, we can backfill in the background for eventual
-                # consistency's sake but we don't need to block the client waiting
-                # for a costly federation call and processing.
-                self.hs.run_as_background_process(
-                    "maybe_backfill_in_the_background",
-                    self.hs.get_federation_handler().maybe_backfill,
-                    room_id,
-                    backfill_depth,
-                    limit=pagin_config.limit,
+                if not cursor_is_before_room:
+                    # Otherwise, we can backfill in the background for eventual
+                    # consistency's sake but we don't need to block the client
+                    # waiting for a costly federation call and processing.
+                    self.hs.run_as_background_process(
+                        "maybe_backfill_in_the_background",
+                        self.hs.get_federation_handler().maybe_backfill,
+                        room_id,
+                        backfill_depth,
+                        limit=pagin_config.limit,
+                        direction=Direction.BACKWARDS,
+                    )
+
+        if pagin_config.direction == Direction.FORWARDS:
+            # Events we accepted as a "forward gap" have prev_events we could
+            # not fetch when they arrived. Those gaps are ahead of a forward
+            # cursor and can only be filled by backfilling from the backward
+            # extremities they created. A filtered empty page is included so
+            # that a client can still drive the fill when no stored event is
+            # visible.
+            page_hits_a_gap = False
+            if not events:
+                # An empty page only means there is a gap to fill if there are
+                # events after the cursor at all. (The page may be empty simply
+                # because the cursor is at the end of the room, or because the
+                # filter removed everything.)
+                (
+                    probe,
+                    _,
+                    _,
+                ) = await self.store.paginate_room_events_by_topological_ordering(
+                    room_id=room_id,
+                    from_key=room_token,
+                    to_key=to_room_key,
+                    direction=Direction.FORWARDS,
+                    limit=1,
+                    event_filter=None,
                 )
+                page_hits_a_gap = bool(probe)
+            else:
+                for event in events:
+                    if await self.store.is_event_next_to_backward_gap(event):
+                        page_hits_a_gap = True
+                        break
+
+            if page_hits_a_gap:
+                # Any extremity ahead of the cursor is eligible: we are walking
+                # forwards, so there is no "already paged past" boundary.
+                did_backfill = await self.hs.get_federation_handler().maybe_backfill(
+                    room_id,
+                    MAX_DEPTH,
+                    limit=pagin_config.limit,
+                    force=True,
+                    direction=Direction.FORWARDS,
+                )
+                if did_backfill:
+                    (
+                        events,
+                        next_key,
+                        limited,
+                    ) = await self.store.paginate_room_events_by_topological_ordering(
+                        room_id=room_id,
+                        from_key=from_token.room_key,
+                        to_key=to_room_key,
+                        direction=pagin_config.direction,
+                        limit=pagin_config.limit,
+                        event_filter=event_filter,
+                    )
+
+                    if not events:
+                        # There are more gaps to try. Ask the client to come
+                        # back rather than pretending the page is the end of
+                        # the room.
+                        raise SynapseError(
+                            429,
+                            "History is still being fetched, please retry",
+                        )
 
         next_token = from_token.copy_and_replace(StreamKeyType.ROOM, next_key)
 

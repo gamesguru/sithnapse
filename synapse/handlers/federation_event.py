@@ -1116,25 +1116,57 @@ class FederationEventHandler:
         #
         # All that said: Let's try increasing the timeout to 60s and see what happens.
 
-        try:
-            missing_events = await self._federation_client.get_missing_events(
-                origin,
-                room_id,
-                earliest_events_ids=list(latest),
-                latest_events=[pdu],
-                limit=10,
-                min_depth=min_depth,
-                timeout=60000,
-            )
-        except (RequestSendFailed, HttpResponseException, NotRetryingDestination) as e:
-            # We failed to get the missing events, but since we need to handle
-            # the case of `get_missing_events` not returning the necessary
-            # events anyway, it is safe to simply log the error and continue.
-            logger.warning("Failed to get prev_events: %s", e)
-            return
+        frontier = set(prevs) - seen
+        fetched_ids: set[str] = set()
+        for _ in range(10):
+            if not frontier:
+                break
 
-        logger.info("Got %d prev_events", len(missing_events))
-        await self._process_pulled_events(origin, missing_events, backfilled=False)
+            try:
+                missing_events = await self._federation_client.get_missing_events(
+                    origin,
+                    room_id,
+                    earliest_events_ids=list(latest),
+                    latest_events=list(frontier),
+                    limit=10,
+                    min_depth=min_depth,
+                    timeout=60000,
+                )
+            except (
+                RequestSendFailed,
+                HttpResponseException,
+                NotRetryingDestination,
+            ) as e:
+                # We failed to get the missing events, but since we need to handle
+                # the case of `get_missing_events` not returning the necessary
+                # events anyway, it is safe to simply log the error and continue.
+                logger.warning("Failed to get prev_events: %s", e)
+                break
+
+            # The remote may include events it already sent us. Skip repeats so
+            # that a truncated answer can't loop forever.
+            missing_events = [
+                e for e in missing_events if e.event_id not in fetched_ids
+            ]
+            logger.info("Got %d prev_events", len(missing_events))
+            if not missing_events:
+                break
+
+            await self._process_pulled_events(origin, missing_events, backfilled=False)
+            fetched_ids.update(e.event_id for e in missing_events)
+
+            # The answer is capped, so the oldest events in this batch may still
+            # have predecessors we need. Keep asking with those as the latest
+            # events until we reach events we already have (or the remote stops
+            # making progress).
+            candidate_prevs: set[str] = set()
+            for event in missing_events:
+                candidate_prevs.update(
+                    p for p in event.prev_event_ids() if p not in latest
+                )
+            candidate_prevs -= fetched_ids
+            have = await self._store.have_events_in_timeline(candidate_prevs)
+            frontier = candidate_prevs - have
 
         # Some servers answer /get_missing_events with an empty or truncated
         # batch even though they can serve the missing events via /event. Fetch
@@ -1413,7 +1445,7 @@ class FederationEventHandler:
         try:
             try:
                 context = await self._compute_event_context_with_maybe_missing_prevs(
-                    origin, event
+                    origin, event, allow_current_state_fallback=backfilled
                 )
                 await self._process_received_pdu(
                     origin,
@@ -1425,7 +1457,7 @@ class FederationEventHandler:
                 # The room was un-partial stated while we were processing the event.
                 # Try once more, with full state this time.
                 context = await self._compute_event_context_with_maybe_missing_prevs(
-                    origin, event
+                    origin, event, allow_current_state_fallback=backfilled
                 )
 
                 # We ought to have full state now, barring some unlikely race where we left and
@@ -1466,7 +1498,12 @@ class FederationEventHandler:
 
     @trace
     async def _compute_event_context_with_maybe_missing_prevs(
-        self, dest: str, event: EventBase, *, ignore_pull_backoff: bool = False
+        self,
+        dest: str,
+        event: EventBase,
+        *,
+        ignore_pull_backoff: bool = False,
+        allow_current_state_fallback: bool = False,
     ) -> EventContext:
         """Build an EventContext structure for a non-outlier event whose prev_events may
         be missing.
@@ -1567,6 +1604,7 @@ class FederationEventHandler:
 
             # state_maps is a list of mappings from (type, state_key) to event_id
             state_maps: list[StateMap[str]] = []
+            state_fetch_failed = False
 
             # Ask the remote server for the states we don't
             # know about
@@ -1599,6 +1637,7 @@ class FederationEventHandler:
                         # non-state events: resolve against the prev events we
                         # do have. The gap stays a backward extremity and is
                         # filled by backfill later.
+                        state_fetch_failed = True
                         logger.warning(
                             "_compute_event_context_with_maybe_missing_prevs(event_id=%s): "
                             "failed to fetch state for missing prev_event %s from %s: %s. "
@@ -1633,6 +1672,30 @@ class FederationEventHandler:
                     self._store, self._state_deletion_store
                 ),
             )
+
+            if not state_map:
+                if allow_current_state_fallback and state_fetch_failed:
+                    # This is a backfilled event. The remote has lost the state
+                    # at its prev_events entirely (the lookup failed rather than
+                    # returning a definite state). We cannot drop the event:
+                    # old history which can't describe its state still belongs
+                    # in the timeline. Assume the state did not change between
+                    # the missing prev_events and now. This is only used for
+                    # pulled historical events, never for an event pushed to us
+                    # live, and never when the remote gave us a definite (if
+                    # empty) state.
+                    state_map = dict(
+                        await self._state_storage_controller.get_current_state_ids(
+                            room_id, await_full_state=False
+                        )
+                    )
+                    logger.warning(
+                        "_compute_event_context_with_maybe_missing_prevs(event_id=%s): "
+                        "could not fetch the state before the event; falling back to "
+                        "the room's current state (%d events)",
+                        event_id,
+                        len(state_map),
+                    )
 
             if not state_map:
                 # We could not establish any state before the event (for
@@ -1833,7 +1896,16 @@ class FederationEventHandler:
             redact_behaviour=EventRedactBehaviour.as_is,
         )
         if not remote_event:
-            raise Exception("Unable to get missing prev_event %s" % (event_id,))
+            # Some servers serve the state at an event (via /state_ids) without
+            # being willing to serve the event itself. That is enough to know the
+            # state before it; only the event's own inclusion in the state map is
+            # lost.
+            logger.warning(
+                "Unable to fetch missing prev_event %s from %s; using the state it "
+                "reported anyway",
+                event_id,
+                destination,
+            )
 
         # missing state at that event is a warning, not a blocker
         # XXX: this doesn't sound right? it means that we'll end up with incomplete
@@ -1866,7 +1938,11 @@ class FederationEventHandler:
                     "event at %s" % (sorted(failed_to_fetch), event_id)
                 )
 
-        if remote_event.is_state() and remote_event.rejected_reason is None:
+        if (
+            remote_event is not None
+            and remote_event.is_state()
+            and remote_event.rejected_reason is None
+        ):
             state_map[(remote_event.type, remote_event.state_key)] = (
                 remote_event.event_id
             )

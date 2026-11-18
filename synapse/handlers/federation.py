@@ -46,6 +46,7 @@ from twisted.internet.defer import CancelledError
 from synapse import event_auth
 from synapse.api.constants import (
     MAX_DEPTH,
+    Direction,
     EventContentFields,
     EventTypes,
     Membership,
@@ -269,6 +270,7 @@ class FederationHandler:
         limit: int,
         record_time: bool = True,
         force: bool = False,
+        direction: Direction | None = None,
     ) -> bool:
         """Checks the database to see if we should backfill before paginating,
         and if so do.
@@ -284,6 +286,10 @@ class FederationHandler:
             record_time: Whether to record the time it takes to backfill.
             force: Whether to force backfilling even if the depth heuristic would
                 otherwise skip it (e.g. when there are not enough local events).
+            direction: The direction the client is paginating in. A backward
+                request must not fall back to backfill points which are newer
+                than its cursor, as those would return events the client has
+                already paged past.
 
         Returns:
             True if we actually tried to backfill something, otherwise False.
@@ -320,6 +326,7 @@ class FederationHandler:
                     limit,
                     processing_start_time=processing_start_time,
                     force=force,
+                    allow_later_points=direction != Direction.BACKWARDS,
                 )
 
     @trace
@@ -332,6 +339,7 @@ class FederationHandler:
         *,
         processing_start_time: int | None,
         force: bool = False,
+        allow_later_points: bool = True,
     ) -> bool:
         """
         Checks whether the `current_depth` is at or approaching any backfill
@@ -415,6 +423,12 @@ class FederationHandler:
         # and it's within the `NUMBER_OF_EVENTS_TO_BACKFILL` events that are returned
         # from `/backfill`.
         if not sorted_backfill_points and current_depth != MAX_DEPTH:
+            if not allow_later_points:
+                # A backward request must not backfill from extremities which
+                # are newer than its cursor: the events they reveal are newer
+                # than the page the client is asking for.
+                return False
+
             # Check that we actually have later backfill points, if not just return.
             have_later_backfill_points = await self.store.get_backfill_points_in_room(
                 room_id=room_id,
@@ -437,6 +451,7 @@ class FederationHandler:
                 # force flag into it, or an unrelated newer extremity can
                 # make the request block on federation.
                 force=False,
+                allow_later_points=allow_later_points,
             )
 
         # Even after recursing with `MAX_DEPTH`, we didn't find any
@@ -651,6 +666,19 @@ class FederationHandler:
 
         success = await try_backfill(likely_domains)
         if success:
+            # Remember the extremities the remote could not provide. The store
+            # consults `event_failed_pull_attempts` before offering a backfill
+            # point again, so a permanently missing gap is not re-requested on
+            # every page and cannot starve the other gaps out of the batch.
+            have_extremities = await self.store.have_seen_events(
+                room_id, extremities_to_request
+            )
+            for event_id in set(extremities_to_request) - have_extremities:
+                await self.store.record_event_failed_pull_attempt(
+                    room_id,
+                    event_id,
+                    "Backfill did not return the event",
+                )
             return True
 
         # TODO: we could also try servers which were previously in the room, but

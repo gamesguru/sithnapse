@@ -1958,6 +1958,21 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
         )
         return row[0][0] if row else 0
 
+    async def get_min_topological_ordering(self, room_id: str) -> int | None:
+        """Get the smallest topological ordering of any event in the room.
+
+        This includes outliers, so it is the oldest point in the room's DAG
+        we know anything about. Returns None if we have no events for the room.
+        """
+        row = await self.db_pool.execute(
+            "get_min_topological_ordering",
+            "SELECT MIN(topological_ordering) FROM events WHERE room_id = ?",
+            room_id,
+        )
+        if not row or row[0][0] is None:
+            return None
+        return int(row[0][0])
+
     def _get_max_topological_txn(self, txn: LoggingTransaction, room_id: str) -> int:
         txn.execute(
             "SELECT MAX(topological_ordering) FROM events WHERE room_id = ?",
