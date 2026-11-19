@@ -365,7 +365,16 @@ class FederationHandler:
                 room_id=room_id,
                 # Per the docstring, it's best to pad the `current_depth` by the
                 # number of messages you plan to backfill from these points.
-                nearby_depth=current_depth + NUMBER_OF_EVENTS_TO_BACKFILL,
+                #
+                # A backward request must not use that padding: it would let an
+                # extremity newer than its cursor supply events the client has
+                # already paged past. Only points at or before the cursor are
+                # eligible in that direction.
+                nearby_depth=(
+                    current_depth + NUMBER_OF_EVENTS_TO_BACKFILL
+                    if allow_later_points
+                    else current_depth
+                ),
                 # We only need to end up with 5 extremities combined with the
                 # insertion event extremities to make the `/backfill` request
                 # but fetch an order of magnitude more to make sure there is

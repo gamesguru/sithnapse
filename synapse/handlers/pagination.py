@@ -658,23 +658,12 @@ class PaginationHandler:
             # to a newer event in the same page.
             backfill_depth = curr_topo
 
-            # A cursor at or before the oldest point of the room cannot have
-            # older history behind it (the page window partly below our oldest
-            # event is the only case where a fetch could be useful). Backfilling
-            # from an extremity newer than such a cursor would only return
-            # events the client has already paged past.
-            min_topological = await self.store.get_min_topological_ordering(room_id)
-            cursor_is_before_room = (
-                min_topological is not None
-                and backfill_depth - pagin_config.limit <= min_topological
-            )
-
             if (
                 found_big_gap
                 or missing_too_many_events
                 or not_enough_events_to_fill_response
                 or pagin_config.limit == 1
-            ) and not cursor_is_before_room:
+            ):
                 did_backfill = await self.hs.get_federation_handler().maybe_backfill(
                     room_id,
                     backfill_depth,
@@ -699,18 +688,17 @@ class PaginationHandler:
                         event_filter=event_filter,
                     )
             else:
-                if not cursor_is_before_room:
-                    # Otherwise, we can backfill in the background for eventual
-                    # consistency's sake but we don't need to block the client
-                    # waiting for a costly federation call and processing.
-                    self.hs.run_as_background_process(
-                        "maybe_backfill_in_the_background",
-                        self.hs.get_federation_handler().maybe_backfill,
-                        room_id,
-                        backfill_depth,
-                        limit=pagin_config.limit,
-                        direction=Direction.BACKWARDS,
-                    )
+                # Otherwise, we can backfill in the background for eventual
+                # consistency's sake but we don't need to block the client
+                # waiting for a costly federation call and processing.
+                self.hs.run_as_background_process(
+                    "maybe_backfill_in_the_background",
+                    self.hs.get_federation_handler().maybe_backfill,
+                    room_id,
+                    backfill_depth,
+                    limit=pagin_config.limit,
+                    direction=Direction.BACKWARDS,
+                )
 
         if pagin_config.direction == Direction.FORWARDS:
             # Events we accepted as a "forward gap" have prev_events we could

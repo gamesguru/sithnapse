@@ -1200,6 +1200,7 @@ class FederationEventHandler:
 
         frontier = set(prevs) - seen
         fetched_ids: set[str] = set()
+        limit = 10
         for _ in range(10):
             if not frontier:
                 break
@@ -1210,7 +1211,7 @@ class FederationEventHandler:
                     room_id,
                     earliest_events_ids=list(latest),
                     latest_events=list(frontier),
-                    limit=10,
+                    limit=limit,
                     min_depth=min_depth,
                     timeout=60000,
                 )
@@ -1224,6 +1225,13 @@ class FederationEventHandler:
                 # events anyway, it is safe to simply log the error and continue.
                 logger.warning("Failed to get prev_events: %s", e)
                 break
+
+            # A capped answer may have been cut short, so walking further back
+            # with its oldest predecessors is warranted. A shorter answer is the
+            # remote's complete response for this frontier; asking again would
+            # walk past where it intended to stop (and some servers treat the
+            # request as a distinct query whose exact arguments matter).
+            answer_was_capped = len(missing_events) == limit
 
             # The remote may include events it already sent us. Skip repeats so
             # that a truncated answer can't loop forever.
@@ -1255,6 +1263,9 @@ class FederationEventHandler:
                 )
                 break
 
+            if not answer_was_capped:
+                break
+
             # The answer is capped, so the oldest events in this batch may still
             # have predecessors we need. Keep asking with those as the latest
             # events until we reach events we already have (or the remote stops
@@ -1273,7 +1284,7 @@ class FederationEventHandler:
         # any prev_events that are still missing directly rather than rejecting
         # the pushed event. This mirrors what /backfill would do.
         seen = await self._store.have_events_in_timeline(prevs)
-        still_missing = prevs - seen
+        still_missing = prevs - seen - fetched_ids
         if still_missing:
             logger.info(
                 "Fetching %d prev_events directly from %s: %s",

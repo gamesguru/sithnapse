@@ -157,7 +157,7 @@
 {"Action":"pass","Test":"TestEventAuth/returns_auth_events_for_the_requested_event"}
 {"Action":"pass","Test":"TestEventAuth/returns_the_auth_chain_for_the_requested_event"}
 {"Action":"pass","Test":"TestFederatedClientSpaces"}
-{"Action":"pass","Test":"TestFederationBackfillAheadOfStaleCursor"}
+{"Action":"fail","Test":"TestFederationBackfillAheadOfStaleCursor"}
 {"Action":"pass","Test":"TestFederationBackfilledHistoryReachableFromPrevBatch"}
 {"Action":"pass","Test":"TestFederationForwardGapWithManyOpenGapsStaysBounded"}
 {"Action":"pass","Test":"TestFederationForwardMessagesDoesNotRepeatFailedGap"}
@@ -274,7 +274,7 @@
 {"Action":"fail","Test":"TestJumpToDateEndpoint"}
 {"Action":"fail","Test":"TestJumpToDateEndpoint/parallel"}
 {"Action":"fail","Test":"TestJumpToDateEndpoint/parallel/federation"}
-{"Action":"fail","Test":"TestJumpToDateEndpoint/parallel/federation/can_paginate_backwards_after_getting_remote_event_from_timestamp_to_event_endpoint_(end)"}
+{"Action":"pass","Test":"TestJumpToDateEndpoint/parallel/federation/can_paginate_backwards_after_getting_remote_event_from_timestamp_to_event_endpoint_(end)"}
 {"Action":"fail","Test":"TestJumpToDateEndpoint/parallel/federation/can_paginate_backwards_after_getting_remote_event_from_timestamp_to_event_endpoint_(start)"}
 {"Action":"pass","Test":"TestJumpToDateEndpoint/parallel/federation/looking_backwards,_should_be_able_to_find_event_that_was_sent_before_we_joined"}
 {"Action":"pass","Test":"TestJumpToDateEndpoint/parallel/federation/looking_forwards,_should_be_able_to_find_event_that_was_sent_before_we_joined"}
@@ -588,9 +588,9 @@
 {"Action":"pass","Test":"TestMembersLocal/Parallel/Existing_members_see_new_members'_presence_(in_initial_sync)"}
 {"Action":"pass","Test":"TestMembersLocal/Parallel/New_room_members_see_their_own_join_event"}
 {"Action":"pass","Test":"TestMembershipOnEvents"}
-{"Action":"fail","Test":"TestMessagesOverFederation"}
-{"Action":"fail","Test":"TestMessagesOverFederation/Visible_shared_history_after_joining_new_room_(backfill)"}
-{"Action":"fail","Test":"TestMessagesOverFederation/Visible_shared_history_after_joining_new_room_(backfill)/`messagesRequestLimit`_is_greater_than_the_number_of_messages_backfilled_(in_Synapse,_100)"}
+{"Action":"pass","Test":"TestMessagesOverFederation"}
+{"Action":"pass","Test":"TestMessagesOverFederation/Visible_shared_history_after_joining_new_room_(backfill)"}
+{"Action":"pass","Test":"TestMessagesOverFederation/Visible_shared_history_after_joining_new_room_(backfill)/`messagesRequestLimit`_is_greater_than_the_number_of_messages_backfilled_(in_Synapse,_100)"}
 {"Action":"pass","Test":"TestMessagesOverFederation/Visible_shared_history_after_joining_new_room_(backfill)/`messagesRequestLimit`_is_lower_than_the_number_of_messages_backfilled_(assumed)"}
 {"Action":"pass","Test":"TestMessagesOverFederation/Visible_shared_history_after_re-joining_room_(backfill)"}
 {"Action":"pass","Test":"TestMessagesOverFederation/Visible_shared_history_after_re-joining_room_(backfill)/`messagesRequestLimit`_is_lower_than_the_number_of_messages_backfilled_(assumed)"}
