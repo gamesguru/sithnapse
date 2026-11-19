@@ -111,8 +111,8 @@ class FakeEngine(ModuleType):
 
 
 class FakeTxn:
-    """Fakes just the `execute(...).fetchall()`/`.fetchone()` surface the
-    closure walk and child-edge repair need, backed by a hand-built
+    """Fakes just the `execute(...).fetchall()` surface the
+    closure cold-import query needs, backed by a hand-built
     `event_auth` graph.
     """
 
@@ -123,42 +123,55 @@ class FakeTxn:
         self._known_events = (
             known_events if known_events is not None else set(auth_edges)
         )
-        # Reverse index, derived from auth_edges -- what a real event_auth
-        # table's WHERE auth_id = ? query would return.
-        self._children_of: dict[str, list[str]] = {}
-        for child, parents in auth_edges.items():
-            for parent in parents:
-                self._children_of.setdefault(parent, []).append(child)
         self._last_rows: list[tuple[Any, ...]] = []
-        # Every statement executed, so tests can assert that the repair is
-        # batched rather than issued once per visited parent.
+        # Every statement executed, so tests can assert cold imports are
+        # batched rather than issued once per event.
         self.executed_sql: list[str] = []
 
     def execute(self, sql: str, parameters: tuple[Any, ...]) -> None:
         self.executed_sql.append(sql)
-        if sql.startswith("SELECT auth_id, event_id FROM event_auth"):
-            # Batched inbound (child) edge repair: rows are
-            # `(auth_id=parent, event_id=child)`.
-            _room_id, *parent_ids = parameters
-            self._last_rows = [
-                (parent_id, child_id)
-                for parent_id in parent_ids
-                for child_id in self._children_of.get(parent_id, [])
+        if sql.startswith("WITH RECURSIVE reachable(event_id) AS ("):
+            root_event_ids = parameters[1:-3]
+            reachable: set[str] = set()
+            expanded: set[str] = set()
+            pending = [
+                event_id
+                for event_id in root_event_ids
+                if event_id in self._known_events
             ]
-        elif sql.startswith("SELECT auth_id FROM event_auth"):
-            (event_id,) = parameters
-            self._last_rows = [(a,) for a in self._auth_edges.get(event_id, [])]
-        elif sql.startswith("SELECT 1 FROM events"):
-            (event_id,) = parameters
-            self._last_rows = [(1,)] if event_id in self._known_events else []
+            while pending:
+                event_id = pending.pop()
+                if event_id in expanded:
+                    continue
+                expanded.add(event_id)
+                reachable.add(event_id)
+                auth_event_ids = self._auth_edges.get(event_id, [])
+                reachable.update(auth_event_ids)
+                pending.extend(
+                    auth_event_id
+                    for auth_event_id in auth_event_ids
+                    if auth_event_id in self._known_events
+                )
+
+            rows: list[tuple[str, str | None, str | None]] = []
+            for event_id in reachable:
+                if event_id not in self._known_events:
+                    rows.append((event_id, None, None))
+                    continue
+                auth_event_ids = self._auth_edges.get(event_id, [])
+                if auth_event_ids:
+                    rows.extend(
+                        (event_id, event_id, auth_event_id)
+                        for auth_event_id in auth_event_ids
+                    )
+                else:
+                    rows.append((event_id, event_id, None))
+            self._last_rows = rows
         else:
             raise AssertionError(f"unexpected SQL: {sql}")
 
     def fetchall(self) -> list[tuple[Any, ...]]:
         return self._last_rows
-
-    def fetchone(self) -> tuple[Any, ...] | None:
-        return self._last_rows[0] if self._last_rows else None
 
 
 def _install_fake_engine(
@@ -326,6 +339,8 @@ class ClosureWalkTests(TestCase):
         )
         self.assertEqual(set(results[b_id]), {a_id, create_id})
         self.assertEqual(set(results[c_id]), {a_id, create_id})
+        self.assertEqual(len(txn.executed_sql), 1)
+        self.assertTrue(txn.executed_sql[0].startswith("WITH RECURSIVE"))
 
 
 class ForwardReachabilityTests(TestCase):

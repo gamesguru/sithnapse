@@ -58,14 +58,12 @@ class _AuthChainTxn(Protocol):
 
     Structural (PEP 544) on purpose, so tests can drive the walk with a
     tiny fake txn instead of a full `LoggingTransaction`, and the walk
-    itself stays decoupled from any concrete cursor type. The methods
-    match what `_fetch_auth_event_ids_from_sql` actually calls, nothing
-    more.
+    itself stays decoupled from any concrete cursor type. It matches the
+    cold-import query used by the closure walk.
     """
 
     def execute(self, sql: str, parameters: tuple[Any, ...]) -> None: ...
     def fetchall(self) -> list[tuple[Any, ...]]: ...
-    def fetchone(self) -> tuple[Any, ...] | None: ...
 
 
 logger = logging.getLogger(__name__)
@@ -74,6 +72,10 @@ logger = logging.getLogger(__name__)
 # valid short id, but no code here relies on that -- it's just documented
 # for anyone reading key encodings.
 _MAX_SHORT_ID = (1 << 32) - 1
+
+# Keep the recursive cold-import seed list below SQLite's historical
+# 999-variable limit, including the fixed room-id parameters.
+_COLD_IMPORT_ROOT_BATCH = 900
 
 
 class IncompleteAuthGraph(Exception):
@@ -344,18 +346,9 @@ class ClosureCache:
         `event_federation.py`'s narrow `_NoChainCoverIndex` fallback, not
         swallow it here.
         """
-        generation = _room_generation(namespace, room_id)
-        cached = self._get(namespace, room_id, generation, event_short_id)
-        if cached is not None:
-            return cached
-
-        closure, is_complete = self._walk(
-            txn, engine_name, namespace, room_id, event_short_id, generation, {}
-        )
-        if not is_complete:
-            raise IncompleteAuthGraph(event_short_id)
-        self._put(namespace, room_id, generation, event_short_id, closure)
-        return closure
+        return self.get_closures_batch(
+            txn, engine_name, namespace, room_id, [event_short_id]
+        )[event_short_id]
 
     def get_closures_batch(
         self,
@@ -370,6 +363,15 @@ class ClosureCache:
         once per call.
         """
         generation = _room_generation(namespace, room_id)
+        roots_to_load = [
+            short_id
+            for short_id in event_short_ids
+            if self._get(namespace, room_id, generation, short_id) is None
+        ]
+        direct_edges = self._load_direct_edges(
+            txn, engine_name, namespace, room_id, roots_to_load, generation
+        )
+
         memo: dict[int, tuple[BitMap, bool]] = {}
         out: dict[int, BitMap] = {}
         for short_id in event_short_ids:
@@ -378,7 +380,7 @@ class ClosureCache:
                 out[short_id] = cached
                 continue
             closure, is_complete = self._walk(
-                txn, engine_name, namespace, room_id, short_id, generation, memo
+                namespace, room_id, short_id, generation, memo, direct_edges
             )
             if not is_complete:
                 raise IncompleteAuthGraph(short_id)
@@ -386,20 +388,100 @@ class ClosureCache:
             out[short_id] = closure
         return out
 
-    def _walk(
+    def _load_direct_edges(
         self,
         txn: _AuthChainTxn,
         engine_name: str | None,
         namespace: str,
         room_id: str,
+        root_short_ids: list[int],
+        generation: int,
+    ) -> dict[int, list[int] | None]:
+        """Collect direct edges needed for the requested closures.
+
+        Warm mtxdb edges are followed in memory. When a cold node is reached,
+        one recursive SQL query imports that node and its complete ancestor
+        subgraph, avoiding a round trip per event on a cold linear chain.
+        """
+        direct_edges: dict[int, list[int] | None] = {}
+        pending = set(root_short_ids)
+        seen: set[int] = set()
+        # Short ids imported by the cold-import query in this pass. Its answer
+        # is authoritative for them -- including an empty list for a genuine
+        # leaf -- so they must not be re-checked against SQL in the next layer.
+        freshly_imported: set[int] = set()
+
+        while pending:
+            layer = pending - seen
+            pending.clear()
+            if not layer:
+                continue
+            seen.update(layer)
+
+            layer = {
+                short_id
+                for short_id in layer
+                if self._get(namespace, room_id, generation, short_id) is None
+            }
+            if not layer:
+                continue
+
+            embedded = get_embedded_auth_edges_batch(
+                engine_name, namespace, room_id, list(layer)
+            )
+            cold: list[int] = []
+            for short_id, auth_short_ids in embedded.items():
+                # Recheck empty edges too: an early write may have observed an
+                # event before its SQL auth rows committed. That does not apply
+                # to a node this pass just imported from SQL.
+                if auth_short_ids:
+                    direct_edges[short_id] = auth_short_ids
+                    pending.update(auth_short_ids)
+                elif short_id not in freshly_imported:
+                    cold.append(short_id)
+
+            if cold:
+                imported_edges = _cold_import_auth_edges(
+                    txn, engine_name, namespace, room_id, cold
+                )
+                # A node may already be embedded but absent from SQL (for
+                # example an earlier write that raced the events row, or a
+                # test/RAM-only graph). Trust those mtxdb edges, including an
+                # empty list, rather than reporting a gap.
+                unresolved = [
+                    short_id
+                    for short_id, auth_short_ids in imported_edges.items()
+                    if auth_short_ids is None
+                ]
+                if unresolved:
+                    already_embedded = get_embedded_auth_edges_batch(
+                        engine_name, namespace, room_id, unresolved
+                    )
+                    for short_id, auth_short_ids in already_embedded.items():
+                        if auth_short_ids is not None:
+                            imported_edges[short_id] = auth_short_ids
+
+                freshly_imported.update(imported_edges)
+                for short_id, auth_short_ids in imported_edges.items():
+                    direct_edges[short_id] = auth_short_ids
+                    if auth_short_ids:
+                        pending.update(auth_short_ids)
+
+        return direct_edges
+
+    def _walk(
+        self,
+        namespace: str,
+        room_id: str,
         event_short_id: int,
         generation: int,
         memo: dict[int, tuple[BitMap, bool]],
+        direct_edges: dict[int, list[int] | None],
     ) -> tuple[BitMap, bool]:
         """Depth-first walk over direct auth edges, unioning children's
         (cached or freshly-walked) ancestor closures. Returns
         `(closure, is_complete)`; an incomplete result (a genuinely
-        missing auth event, per `_fetch_direct_edges`) is never cached by
+        missing auth event, per the cold-import lookup) is never cached by
         the caller.
         """
         if event_short_id in memo:
@@ -410,14 +492,10 @@ class ClosureCache:
             memo[event_short_id] = (cached, True)
             return cached, True
 
-        auth_short_ids = self._fetch_direct_edges(
-            txn, engine_name, namespace, room_id, event_short_id
-        )
+        auth_short_ids = direct_edges.get(event_short_id)
         if auth_short_ids is None:
-            # A genuine gap: SQL has no event_auth rows for this event
-            # either (see _fetch_direct_edges). Distinct from "not
-            # embedded yet", which _fetch_direct_edges resolves via
-            # cold-import before ever returning None.
+            # A genuine gap: this event has no corresponding row in SQL,
+            # unlike an ordinary mtxdb miss, which was cold-imported above.
             logger.debug(
                 "auth-chain closure walk: genuine gap at short_id=%s "
                 "(room=%s namespace=%s) -- no SQL event_auth rows and no "
@@ -442,7 +520,12 @@ class ClosureCache:
         for auth_short_id in auth_short_ids:
             closure.add(auth_short_id)
             child_closure, child_complete = self._walk(
-                txn, engine_name, namespace, room_id, auth_short_id, generation, memo
+                namespace,
+                room_id,
+                auth_short_id,
+                generation,
+                memo,
+                direct_edges,
             )
             closure |= child_closure
             complete = complete and child_complete
@@ -450,99 +533,89 @@ class ClosureCache:
         memo[event_short_id] = (closure, complete)
         return closure, complete
 
-    def _fetch_direct_edges(
-        self,
-        txn: _AuthChainTxn,
-        engine_name: str | None,
-        namespace: str,
-        room_id: str,
-        event_short_id: int,
-    ) -> list[int] | None:
-        """Returns `event_short_id`'s direct auth-edge short ids, embedding
-        them from SQL first if they aren't in mtxdb yet (plan §3's
-        cold-import path). Returns `None` only if SQL itself has no
-        `event_auth` rows for this event AND it isn't a known short id at
-        all -- a genuine gap, not an ordinary cache/embed miss.
-        """
-        embedded = get_embedded_auth_edges_batch(
-            engine_name, namespace, room_id, [event_short_id]
-        )[event_short_id]
-        if embedded:
-            return embedded
 
-        if embedded == []:
-            # An empty edge list is normally a leaf, but it can also have
-            # been recorded during the short window between the events row
-            # becoming visible and its event_auth rows being committed.  In
-            # that case treating it as final permanently loses the event's
-            # auth chain.  Recheck SQL for empty records; non-empty records
-            # remain the cheap embedded fast path.
-            event_id = resolve_short_ids_to_event_ids(
-                engine_name, namespace, room_id, [event_short_id]
-            )[0]
-            if event_id is not None:
-                auth_event_ids = _fetch_auth_event_ids_from_sql(txn, event_id)
-                if auth_event_ids:
-                    auth_short_ids = get_or_create_short_ids(
-                        engine_name, namespace, room_id, auth_event_ids
-                    )
-                    embed_auth_edges_batch(
-                        engine_name,
-                        namespace,
-                        room_id,
-                        [(event_short_id, auth_short_ids)],
-                    )
-                    return auth_short_ids
-            return embedded
+def _cold_import_auth_edges(
+    txn: _AuthChainTxn,
+    engine_name: str | None,
+    namespace: str,
+    room_id: str,
+    root_short_ids: list[int],
+) -> dict[int, list[int] | None]:
+    """Import the complete ancestor graph for cold mtxdb roots.
 
-        event_id = resolve_short_ids_to_event_ids(
-            engine_name, namespace, room_id, [event_short_id]
-        )[0]
-        if event_id is None:
-            # Dangling short id (its event was individually purged, or the
-            # reverse mapping is missing for another reason) -- not
-            # resolvable to anything SQL can help with either.
-            return None
-
-        auth_event_ids = _fetch_auth_event_ids_from_sql(txn, event_id)
-        if auth_event_ids is None:
-            # No event_auth rows at all for this event id -- treat as a
-            # genuine leaf only if the event itself is known to SQL;
-            # otherwise it's a real gap.
-            return None
-
-        auth_short_ids = (
-            get_or_create_short_ids(
-                engine_name, namespace, room_id, list(auth_event_ids)
-            )
-            if auth_event_ids
-            else []
-        )
-        embed_auth_edges_batch(
-            engine_name, namespace, room_id, [(event_short_id, auth_short_ids)]
-        )
-        return auth_short_ids
-
-
-def _fetch_auth_event_ids_from_sql(
-    txn: _AuthChainTxn, event_id: str
-) -> list[str] | None:
-    """Direct one-hop `auth_events` for `event_id`, from the durable SQL
-    `event_auth` table (event_id, auth_id -- one row per direct edge,
-    written at persist time; see `events.py`). Returns `[]` for a genuine
-    leaf (e.g. the room create event), `None` if `event_id` is not known
-    to SQL at all (a real gap, distinct from "leaf").
+    A recursive CTE follows `event_auth` from the requested roots through
+    their ancestors. Its result is written to both mtxdb edge directions in
+    batches. `None` marks a short id whose event is absent from SQL.
     """
-    txn.execute("SELECT auth_id FROM event_auth WHERE event_id = ?", (event_id,))
-    rows = txn.fetchall()
-    if rows:
-        return [auth_id for (auth_id,) in rows]
+    root_event_ids = resolve_short_ids_to_event_ids(
+        engine_name, namespace, room_id, root_short_ids
+    )
+    resolved_roots = {
+        event_id: short_id
+        for short_id, event_id in zip(root_short_ids, root_event_ids)
+        if event_id is not None
+    }
+    result: dict[int, list[int] | None] = {
+        short_id: None
+        for short_id, event_id in zip(root_short_ids, root_event_ids)
+        if event_id is None
+    }
+    if not resolved_roots:
+        return result
 
-    txn.execute("SELECT 1 FROM events WHERE event_id = ?", (event_id,))
-    exists = txn.fetchone()
-    if exists is None:
-        return None
-    return []
+    root_ids = list(resolved_roots)
+    event_edges: dict[str, list[str] | None] = {}
+    for start in range(0, len(root_ids), _COLD_IMPORT_ROOT_BATCH):
+        batch = root_ids[start : start + _COLD_IMPORT_ROOT_BATCH]
+        placeholders = ",".join("?" for _ in batch)
+        txn.execute(
+            "WITH RECURSIVE reachable(event_id) AS ("
+            " SELECT event_id FROM events WHERE room_id = ? "
+            f"AND event_id IN ({placeholders}) "
+            " UNION "
+            " SELECT ea.auth_id FROM event_auth AS ea "
+            " JOIN reachable AS r ON ea.event_id = r.event_id "
+            " WHERE ea.room_id = ?"
+            ") "
+            "SELECT r.event_id, e.event_id, ea.auth_id "
+            "FROM reachable AS r "
+            "LEFT JOIN events AS e ON e.event_id = r.event_id AND e.room_id = ? "
+            "LEFT JOIN event_auth AS ea ON ea.event_id = r.event_id "
+            " AND ea.room_id = ? AND e.event_id IS NOT NULL",
+            (room_id, *batch, room_id, room_id, room_id),
+        )
+
+        for event_id, existing_event_id, auth_event_id in txn.fetchall():
+            if existing_event_id is None:
+                event_edges[event_id] = None
+            else:
+                edges = event_edges.setdefault(event_id, [])
+                if auth_event_id is not None and edges is not None:
+                    edges.append(auth_event_id)
+
+    for root_event_id in resolved_roots:
+        event_edges.setdefault(root_event_id, None)
+
+    all_event_ids = list(event_edges)
+    all_short_ids = get_or_create_short_ids(
+        engine_name, namespace, room_id, all_event_ids
+    )
+    short_id_by_event_id = dict(zip(all_event_ids, all_short_ids))
+
+    embedded_rows: list[tuple[int, list[int]]] = []
+    for event_id, auth_event_ids in event_edges.items():
+        short_id = short_id_by_event_id[event_id]
+        if auth_event_ids is None:
+            result[short_id] = None
+            continue
+        auth_short_ids = list(
+            dict.fromkeys(short_id_by_event_id[auth_id] for auth_id in auth_event_ids)
+        )
+        result[short_id] = auth_short_ids
+        embedded_rows.append((short_id, auth_short_ids))
+
+    embed_auth_edges_batch(engine_name, namespace, room_id, embedded_rows)
+    return result
 
 
 # -----------------------------------------------------------------------------
