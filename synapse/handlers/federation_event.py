@@ -1271,6 +1271,15 @@ class FederationEventHandler:
             if not answer_was_capped:
                 break
 
+            # A capped run of state events does not need to be walked further.
+            # We already resolved the state at the oldest event's missing
+            # parent, and that snapshot summarises every state event before it.
+            # Continuing would replay the room's whole state history through
+            # /get_missing_events (and /state for each batch) before the event
+            # which triggered this walk can be persisted.
+            if all(event.is_state() for event in missing_events):
+                break
+
             # The answer is capped, so the oldest events in this batch may still
             # have predecessors we need. Keep asking with those as the latest
             # events until we reach events we already have (or the remote stops
