@@ -19,6 +19,7 @@
 #
 #
 
+import asyncio
 import collections
 import itertools
 import logging
@@ -430,11 +431,10 @@ class FederationEventHandler:
         """Persist a simple contiguous run of inbound PDUs in one batch.
 
         The inbound federation staging queue normally hands us one PDU at a time.
-        That is necessary for state events, forks, and missing prev-events, but it
-        turns a burst of ordinary timeline events into one replication request per
-        event. A run of non-state events with one predecessor each has identical
-        state before and after every event, so its contexts can safely share the
-        first event's state group and be persisted together.
+        That is necessary for state events and arbitrary forks, but it turns a
+        burst of ordinary timeline events into one replication request per event.
+        A linear run of non-state events can share the first event's state group
+        when any additional predecessors are confirmed unavailable remotely.
 
         Return ``False`` when the run is not exactly that shape. The caller must
         then use ``on_receive_pdu`` for its normal conservative handling.
@@ -452,7 +452,7 @@ class FederationEventHandler:
             event.room_id != room_id
             or event.is_state()
             or event_origin != origin
-            or set(event.prev_event_ids()) != {previous.event_id}
+            or previous.event_id not in event.prev_event_ids()
             for (_, previous), (event_origin, event) in zip(pdus, pdus[1:])
         ):
             return False
@@ -479,14 +479,96 @@ class FederationEventHandler:
             except SynapseError:
                 return False
 
-        # The first event must have all of its real predecessors already present.
-        # Subsequent predecessors are the preceding events in this batch.
+        # The first event needs a known predecessor to anchor its state. Each
+        # later event must extend the previous event in this run.
         first_prevs = set(first_event.prev_event_ids())
-        if first_prevs - await self._store.have_events_in_timeline(first_prevs):
+        seen_first_prevs = await self._store.have_events_in_timeline(first_prevs)
+        first_missing_prevs = first_prevs - seen_first_prevs
+        if len(first_missing_prevs) > 1 or not seen_first_prevs:
             return False
 
+        # An unavailable parent per event is common when a remote forwards
+        # events with open gaps. Probe these independently before sharing state
+        # across the run; if any parent or its state can be recovered, use the
+        # normal per-event path instead.
+        gap_parents: list[tuple[EventBase, str]] = [
+            (first_event, prev) for prev in first_missing_prevs
+        ]
+        preceding_ids = {first_event.event_id}
+        for _, event in pdus[1:]:
+            unknown_prevs = set(event.prev_event_ids()) - preceding_ids
+            if len(unknown_prevs) > 1:
+                return False
+            gap_parents.extend((event, prev) for prev in unknown_prevs)
+            preceding_ids.add(event.event_id)
+
+        if gap_parents:
+            gap_parent_ids = {prev for _, prev in gap_parents}
+            if await self._store.have_events_in_timeline(gap_parent_ids):
+                return False
+
+            min_depth = await self._store.get_min_depth(room_id)
+            latest = set(await self._store.get_latest_event_ids_in_room(room_id))
+            latest.update(seen_first_prevs)
+
+            async def parent_is_unavailable(
+                event: EventBase, missing_prev: str
+            ) -> bool:
+                if min_depth is not None and event.depth > min_depth:
+                    try:
+                        recovered = await self._federation_client.get_missing_events(
+                            origin,
+                            room_id,
+                            earliest_events_ids=list(latest),
+                            latest_events=[event],
+                            limit=10,
+                            min_depth=min_depth,
+                            timeout=60000,
+                        )
+                    except Exception:
+                        recovered = []
+                    # The answer is a capped breadth-first walk, so it only
+                    # proves the parent is reachable if it contains that parent.
+                    if any(e.event_id == missing_prev for e in recovered):
+                        return False
+
+                try:
+                    if (
+                        await self._federation_client.get_pdu(
+                            [origin], missing_prev, event.room_version, timeout=10000
+                        )
+                        is not None
+                    ):
+                        return False
+                except Exception:
+                    pass
+
+                try:
+                    await self._federation_client.get_room_state_ids(
+                        origin, room_id, event_id=missing_prev
+                    )
+                except Exception:
+                    return True
+                return False
+
+            if not all(
+                await asyncio.gather(
+                    *(parent_is_unavailable(event, prev) for event, prev in gap_parents)
+                )
+            ):
+                return False
+
         async def build_contexts() -> list[EventPersistencePair]:
-            first_context = await self._state_handler.compute_event_context(first_event)
+            if first_missing_prevs:
+                first_context = (
+                    await self._compute_event_context_with_maybe_missing_prevs(
+                        origin, first_event, ignore_pull_backoff=True
+                    )
+                )
+            else:
+                first_context = await self._state_handler.compute_event_context(
+                    first_event
+                )
             if first_context.rejected or first_context.state_group is None:
                 # A rejected event has no meaningful state group to share.
                 raise ValueError("cannot batch a rejected or outlier event")
@@ -1155,6 +1237,24 @@ class FederationEventHandler:
             await self._process_pulled_events(origin, missing_events, backfilled=False)
             fetched_ids.update(e.event_id for e in missing_events)
 
+            # If any of this batch could not be persisted, the chain is broken at
+            # this point (for example the batch's oldest event still has a parent
+            # the remote cannot serve). Walking further back cannot fix that and
+            # only spends time on events which will be rejected for the same
+            # reason, so leave the rest to backfill.
+            persisted_events = await self._store.have_events_in_timeline(
+                [e.event_id for e in missing_events]
+            )
+            if len(persisted_events) < len(missing_events):
+                logger.info(
+                    "Stopping /get_missing_events walk for %s: only %d of %d "
+                    "events in the batch could be persisted",
+                    event_id,
+                    len(persisted_events),
+                    len(missing_events),
+                )
+                break
+
             # The answer is capped, so the oldest events in this batch may still
             # have predecessors we need. Keep asking with those as the latest
             # events until we reach events we already have (or the remote stops
@@ -1300,6 +1400,15 @@ class FederationEventHandler:
             # the next event we're going to process.
             sorted_events = sorted(new_events, key=lambda x: x.depth)
 
+            if (
+                not backfilled
+                and len(sorted_events) > 1
+                and await self._try_process_pulled_events_as_batch(
+                    origin, sorted_events
+                )
+            ):
+                return
+
             # Backfilled events are persisted without recalculating the current state,
             # which is right for the room DAG but not always for the state DAG. Backfill
             # can teach us about state events we have never seen, which then belong on
@@ -1385,6 +1494,111 @@ class FederationEventHandler:
         # persisted if we've never tried before.
         if len(fresh_events) > 0:
             await _process_new_pulled_events(fresh_events)
+
+    async def _try_process_pulled_events_as_batch(
+        self, origin: str, events: list[EventBase]
+    ) -> bool:
+        """Persist a linear run of pulled live events in one go.
+
+        A capped `/get_missing_events` answer is a contiguous run of ancestors.
+        Each event in the run usually has one predecessor inside the run and one
+        predecessor which is a gap the remote cannot serve. Processing them one
+        at a time asks the remote for that gap's state for every event, even
+        though the run is non-state and therefore has exactly one state before
+        and after all of it. Computing the first event's context once and
+        sharing it removes those repeated round trips.
+
+        Returns `False` (without persisting anything) unless the run is exactly
+        that shape, so the caller can fall back to the normal per-event path.
+        """
+        first = events[0]
+        room_id = first.room_id
+
+        if first.is_state():
+            return False
+
+        for previous, event in zip(events, events[1:]):
+            if (
+                event.room_id != room_id
+                or event.is_state()
+                or event.internal_metadata.is_outlier()
+                or previous.event_id not in event.prev_event_ids()
+                # One predecessor in the run, at most one gap parent.
+                or len(event.prev_event_ids()) > 2
+            ):
+                return False
+
+        # The only predecessors outside the run must be gaps, not events whose
+        # state would have to be resolved into the shared context.
+        extra_prevs = {
+            prev
+            for previous, event in zip(events, events[1:])
+            for prev in event.prev_event_ids()
+            if prev != previous.event_id
+        }
+        if extra_prevs & await self._store.have_events_in_timeline(extra_prevs):
+            return False
+
+        try:
+            first_context = await self._compute_event_context_with_maybe_missing_prevs(
+                origin, first, ignore_pull_backoff=True
+            )
+        except Exception:
+            return False
+
+        if first_context.rejected or first_context.state_group is None:
+            return False
+
+        # Non-state events do not change the room state, so the state after the
+        # first event is the state before every later event in the run.
+        event_and_contexts: list[EventPersistencePair] = [(first, first_context)]
+        event_and_contexts.extend(
+            (
+                event,
+                EventContext.with_state(
+                    storage=self._storage_controllers,
+                    state_group=first_context.state_group,
+                    state_group_before_event=first_context.state_group,
+                    state_delta_due_to_event={},
+                    partial_state=first_context.partial_state,
+                    state_group_deltas={},
+                ),
+            )
+            for event in events[1:]
+        )
+
+        try:
+            for event, context in event_and_contexts:
+                await self._check_event_auth(origin, event, context)
+                if context.rejected:
+                    return False
+                await self._check_for_soft_fail(event, context=context, origin=origin)
+        except Exception:
+            return False
+
+        min_depth = await self._store.get_min_depth(room_id)
+        push_action_events = [
+            (event, context)
+            for event, context in event_and_contexts
+            if not context.rejected and (min_depth is None or min_depth <= event.depth)
+        ]
+        if push_action_events:
+            await self._bulk_push_rule_evaluator.action_for_events_by_user(
+                push_action_events
+            )
+
+        await self.persist_events_and_notify(room_id, event_and_contexts)
+
+        for event, _ in event_and_contexts:
+            try:
+                await self._handle_encrypted_event(event)
+            except Exception:
+                logger.exception(
+                    "Failed to handle encrypted event %s after batch persistence",
+                    event.event_id,
+                )
+
+        return True
 
     @trace
     @tag_args

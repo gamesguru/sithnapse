@@ -1931,7 +1931,7 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
             """
             SELECT topological_ordering, stream_ordering FROM events
             WHERE room_id = ? AND stream_ordering <= ? AND NOT outlier
-            ORDER BY stream_ordering DESC LIMIT 1
+            ORDER BY stream_ordering DESC, topological_ordering DESC LIMIT 1
             """,
             room_id,
             stream_key,

@@ -907,6 +907,7 @@ class MessageAcceptTests(unittest.FederatingHomeserverTestCase):
             )
         )
         self.assertIsNotNone(row)
+        assert row is not None  # For mypy
         # The event has no auth_events we can check, so it is rejected rather
         # than trusted. It must not become part of the room's live timeline.
         self.assertEqual(row[1], "auth_error")
