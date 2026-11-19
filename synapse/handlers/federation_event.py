@@ -1198,9 +1198,13 @@ class FederationEventHandler:
         #
         # All that said: Let's try increasing the timeout to 60s and see what happens.
 
-        frontier = set(prevs) - seen
+        # The first request is about the pushed event itself; the remote walks
+        # back from it. If that answer was capped we continue from the oldest
+        # events it contained.
+        frontier = {pdu.event_id}
         fetched_ids: set[str] = set()
         limit = 10
+        first_request = True
         for _ in range(10):
             if not frontier:
                 break
@@ -1210,11 +1214,12 @@ class FederationEventHandler:
                     origin,
                     room_id,
                     earliest_events_ids=list(latest),
-                    latest_events=list(frontier),
+                    latest_events=([pdu.event_id] if first_request else list(frontier)),
                     limit=limit,
                     min_depth=min_depth,
                     timeout=60000,
                 )
+                first_request = False
             except (
                 RequestSendFailed,
                 HttpResponseException,

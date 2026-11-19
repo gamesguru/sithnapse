@@ -326,7 +326,12 @@ class FederationHandler:
                     limit,
                     processing_start_time=processing_start_time,
                     force=force,
-                    allow_later_points=direction != Direction.BACKWARDS,
+                    # A foreground backward page must not block on backfill
+                    # points newer than its cursor: the events they reveal are
+                    # outside the page the client asked for. Background
+                    # backfill may still fetch them for eventual consistency
+                    # (the pagination window keeps them out of the response).
+                    allow_later_points=(direction != Direction.BACKWARDS or not force),
                 )
 
     @trace
