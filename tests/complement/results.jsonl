@@ -462,7 +462,7 @@
 {"Action":"pass","Test":"TestMSC4291RoomIDAsHashOfCreateEvent_CannotSendCreateEvent"}
 {"Action":"pass","Test":"TestMSC4291RoomIDAsHashOfCreateEvent_RoomIDIsOnCreateEvent"}
 {"Action":"pass","Test":"TestMSC4291RoomIDAsHashOfCreateEvent_UpgradedRooms"}
-{"Action":"pass","Test":"TestMSC4297StateResolutionV2_1_includes_conflicted_subgraph"}
+{"Action":"fail","Test":"TestMSC4297StateResolutionV2_1_includes_conflicted_subgraph"}
 {"Action":"pass","Test":"TestMSC4297StateResolutionV2_1_starts_from_empty_set"}
 {"Action":"pass","Test":"TestMSC4308ThreadSubscriptionsSlidingSync"}
 {"Action":"pass","Test":"TestMSC4308ThreadSubscriptionsSlidingSync/Receives_thread_subscriptions_over_incremental_sliding_sync"}
@@ -511,7 +511,7 @@
 {"Action":"pass","Test":"TestMSC4499Key/System/\u00a76"}
 {"Action":"skip","Test":"TestMSC4499Key/System/\u00a76/AdminStartupGuardrails"}
 {"Action":"pass","Test":"TestMSC4499Key/System/\u00a79"}
-{"Action":"skip","Test":"TestMSC4499Key/System/\u00a79/CorroborationTierRetention"}
+{"Action":"pass","Test":"TestMSC4499Key/System/\u00a79/CorroborationTierRetention"}
 {"Action":"skip","Test":"TestMSC4499Key/System/\u00a79/StorageQuotaResilience"}
 {"Action":"pass","Test":"TestMSC4499Key/Temporal"}
 {"Action":"pass","Test":"TestMSC4499Key/Temporal/\u00a75"}
