@@ -1718,8 +1718,7 @@ properties:
         type: boolean
         description: >-
           Whether to use partial-state federation joins when possible. When
-          false, Synapse requests full room state during joins. Defaults to
-          true.
+          false, Synapse requests full room state during joins.
         default: true
       client_timeout:
         $ref: "#/$defs/duration"
