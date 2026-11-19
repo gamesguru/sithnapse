@@ -545,16 +545,87 @@ def _fetch_auth_event_ids_from_sql(
     return []
 
 
-def _fetch_child_event_ids_from_sql(txn: _AuthChainTxn, event_id: str) -> list[str]:
-    """The reverse of `_fetch_auth_event_ids_from_sql`: every event that
-    directly names `event_id` as one of its auth events, per SQL
-    `event_auth` (`auth_id = event_id`). Used only to verify/repair the
-    embedded inbound (child) edge list stays complete -- see
-    `_fetch_and_verify_children` -- never to build a persisted index of
-    its own.
+def _repair_embedded_children_from_sql(
+    txn: _AuthChainTxn,
+    engine_name: str | None,
+    namespace: str,
+    room_id: str,
+    parent_short_ids: set[int],
+    allowed_child_short_ids: set[int] | None,
+) -> None:
+    """Batch-repair inbound mtxdb edges for one forward-reachability walk.
+
+    SQL remains the durable source used to recover missing embedded writes,
+    but do that check once for the whole candidate graph instead of once per
+    visited parent. The BFS itself then reads only mtxdb.
     """
-    txn.execute("SELECT event_id FROM event_auth WHERE auth_id = ?", (event_id,))
-    return [child_id for (child_id,) in txn.fetchall()]
+    if not parent_short_ids:
+        return
+
+    parent_short_id_list = list(parent_short_ids)
+    parent_ids = resolve_short_ids_to_event_ids(
+        engine_name, namespace, room_id, parent_short_id_list
+    )
+    short_id_by_event_id = {
+        event_id: short_id
+        for short_id, event_id in zip(parent_short_id_list, parent_ids)
+        if event_id is not None
+    }
+    if not short_id_by_event_id:
+        return
+
+    parent_event_ids = list(short_id_by_event_id)
+    if allowed_child_short_ids is not None:
+        allowed_child_ids = resolve_short_ids_to_event_ids(
+            engine_name, namespace, room_id, list(allowed_child_short_ids)
+        )
+        allowed_child_event_ids = [
+            event_id for event_id in allowed_child_ids if event_id is not None
+        ]
+        if not allowed_child_event_ids:
+            return
+        txn.execute(
+            "SELECT auth_id, event_id FROM event_auth "
+            "WHERE room_id = ? AND auth_id = ANY(?) AND event_id = ANY(?)",
+            (room_id, parent_event_ids, allowed_child_event_ids),
+        )
+    else:
+        txn.execute(
+            "SELECT auth_id, event_id FROM event_auth "
+            "WHERE room_id = ? AND auth_id = ANY(?)",
+            (room_id, parent_event_ids),
+        )
+
+    rows = txn.fetchall()
+    if not rows:
+        return
+
+    child_event_ids = list(dict.fromkeys(child_id for _, child_id in rows))
+    child_short_ids = get_or_create_short_ids(
+        engine_name, namespace, room_id, child_event_ids
+    )
+    short_id_by_child_id = dict(zip(child_event_ids, child_short_ids))
+    children_by_parent: dict[int, list[int]] = {}
+    for parent_event_id, child_event_id in rows:
+        children_by_parent.setdefault(short_id_by_event_id[parent_event_id], []).append(
+            short_id_by_child_id[child_event_id]
+        )
+
+    embedded_children = get_embedded_auth_children_batch(
+        engine_name, namespace, room_id, list(children_by_parent)
+    )
+    missing_rows: list[tuple[int, list[int]]] = []
+    for parent_short_id, child_short_ids_for_parent in children_by_parent.items():
+        existing = set(embedded_children[parent_short_id])
+        missing = [
+            child for child in child_short_ids_for_parent if child not in existing
+        ]
+        if missing:
+            missing_rows.append((parent_short_id, missing))
+    if missing_rows:
+        _engine(engine_name).auth_chain_children_append(
+            namespace, room_id, missing_rows
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -573,49 +644,6 @@ def _fetch_child_event_ids_from_sql(txn: _AuthChainTxn, event_id: str) -> list[s
 # per request and discarded -- never cached, never persisted.
 
 
-def _fetch_and_verify_children(
-    txn: _AuthChainTxn,
-    engine_name: str | None,
-    namespace: str,
-    room_id: str,
-    parent_short_id: int,
-) -> list[int]:
-    """Returns `parent_short_id`'s known children, repairing the embedded
-    inbound list against SQL `event_auth` first if needed. Unlike outbound
-    edges (written once, atomically, alongside the event that owns them),
-    inbound edges accumulate incrementally as *other* events get embedded
-    -- so a child appended to SQL after this parent's own outbound-edge
-    walk last touched it can be missing here even for an otherwise "warm"
-    parent. This check is what keeps the forward BFS complete rather than
-    silently under-approximating the conflicted subgraph.
-    """
-    embedded = get_embedded_auth_children_batch(
-        engine_name, namespace, room_id, [parent_short_id]
-    )[parent_short_id]
-
-    parent_event_id = resolve_short_ids_to_event_ids(
-        engine_name, namespace, room_id, [parent_short_id]
-    )[0]
-    if parent_event_id is None:
-        # Dangling short id -- nothing in SQL to cross-check against either.
-        return embedded
-
-    sql_child_ids = _fetch_child_event_ids_from_sql(txn, parent_event_id)
-    if not sql_child_ids:
-        return embedded
-
-    sql_child_short_ids = get_or_create_short_ids(
-        engine_name, namespace, room_id, sql_child_ids
-    )
-    missing = [c for c in sql_child_short_ids if c not in embedded]
-    if missing:
-        _engine(engine_name).auth_chain_children_append(
-            namespace, room_id, [(parent_short_id, missing)]
-        )
-        embedded = embedded + missing
-    return embedded
-
-
 def get_forward_reachable_short_ids(
     txn: _AuthChainTxn,
     engine_name: str | None,
@@ -624,8 +652,7 @@ def get_forward_reachable_short_ids(
     start_short_ids: list[int],
     candidate_short_ids: set[int] | None = None,
 ) -> set[int]:
-    """Ephemeral BFS over embedded inbound (child) edges, verified/repaired
-    against SQL as it goes (see `_fetch_and_verify_children`).
+    """Ephemeral BFS over embedded inbound (child) edges.
 
     Returns the set of short ids forward-reachable from `start_short_ids`,
     **including the starting events themselves**; when `candidate_short_ids`
@@ -660,21 +687,50 @@ def get_forward_reachable_short_ids(
        always in the result regardless of candidate membership.
     """
     starting = set(start_short_ids)
+    if candidate_short_ids is not None:
+        parents_to_repair = set(starting).union(candidate_short_ids)
+        _repair_embedded_children_from_sql(
+            txn,
+            engine_name,
+            namespace,
+            room_id,
+            parents_to_repair,
+            candidate_short_ids,
+        )
+
     result: set[int] = set(starting)
     seen: set[int] = set()
     frontier = list(starting)
     while frontier:
-        current = frontier.pop()
-        if current in seen:
+        current_layer = set(frontier) - seen
+        frontier = []
+        if not current_layer:
             continue
-        seen.add(current)
-        for child in _fetch_and_verify_children(
-            txn, engine_name, namespace, room_id, current
-        ):
-            if child in seen:
-                continue
-            if candidate_short_ids is not None and child not in candidate_short_ids:
-                continue
-            result.add(child)
-            frontier.append(child)
+
+        # Without candidate pruning, discover the graph one BFS layer at a
+        # time and repair that layer in one SQL query. The v2.1 caller passes
+        # a candidate set, allowing the entire bounded subgraph to be
+        # repaired in one query above.
+        if candidate_short_ids is None:
+            _repair_embedded_children_from_sql(
+                txn,
+                engine_name,
+                namespace,
+                room_id,
+                current_layer,
+                None,
+            )
+
+        children_by_parent = get_embedded_auth_children_batch(
+            engine_name, namespace, room_id, list(current_layer)
+        )
+        seen.update(current_layer)
+        for children in children_by_parent.values():
+            for child in children:
+                if child in seen:
+                    continue
+                if candidate_short_ids is not None and child not in candidate_short_ids:
+                    continue
+                result.add(child)
+                frontier.append(child)
     return result
