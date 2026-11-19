@@ -371,14 +371,16 @@ class FederationHandler:
                 # Per the docstring, it's best to pad the `current_depth` by the
                 # number of messages you plan to backfill from these points.
                 #
-                # A backward request must not use that padding: it would let an
-                # extremity newer than its cursor supply events the client has
-                # already paged past. Only points at or before the cursor are
-                # eligible in that direction.
+                # A foreground backward request only pads by the page size: an
+                # extremity further ahead than that can only reveal events
+                # newer than the client's cursor, which the page cannot
+                # contain. Background requests still use the full padding so
+                # that branches merging ahead of a stale cursor are persisted
+                # for eventual consistency.
                 nearby_depth=(
                     current_depth + NUMBER_OF_EVENTS_TO_BACKFILL
                     if allow_later_points
-                    else current_depth
+                    else current_depth + limit
                 ),
                 # We only need to end up with 5 extremities combined with the
                 # insertion event extremities to make the `/backfill` request
