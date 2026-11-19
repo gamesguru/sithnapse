@@ -435,7 +435,6 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
                     "creator": room_creator_user_id,
                     "is_public": is_public,
                     "room_version": room_version.identifier,
-                    "has_auth_chain_index": True,
                 },
                 desc="store_room",
             )
@@ -451,23 +450,26 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
         Returns:
             A tuple containing the room information:
                 * True if the room is public
-                * True if the room has an auth chain index
+                * True if the room has an auth graph (SQL or mtxdb)
 
             or None if the room is unknown.
         """
         row = cast(
-            tuple[int | bool | None, int | bool | None] | None,
+            tuple[int | bool | None] | None,
             await self.db_pool.simple_select_one(
                 table="rooms",
                 keyvalues={"room_id": room_id},
-                retcols=("is_public", "has_auth_chain_index"),
+                retcols=("is_public",),
                 desc="get_room",
                 allow_none=True,
             ),
         )
         if row is None:
             return row
-        return bool(row[0]), bool(row[1])
+        # The old second value represented availability of the SQL chain-cover
+        # index. That index is retired; both supported backends traverse their
+        # direct auth graph, so preserve the tuple API with a constant True.
+        return bool(row[0]), True
 
     async def get_room_with_stats(self, room_id: str) -> RoomStats | None:
         """Retrieve room with statistics.
@@ -2510,37 +2512,6 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
                 desc="set_room_is_public_appservice_false",
             )
 
-    async def has_auth_chain_index(self, room_id: str) -> bool:
-        """Check if the room has (or can have) a chain cover index.
-
-        Defaults to True if we don't have an entry in `rooms` table nor any
-        events for the room.
-        """
-
-        has_auth_chain_index = await self.db_pool.simple_select_one_onecol(
-            table="rooms",
-            keyvalues={"room_id": room_id},
-            retcol="has_auth_chain_index",
-            desc="has_auth_chain_index",
-            allow_none=True,
-        )
-
-        if has_auth_chain_index:
-            return True
-
-        # It's possible that we already have events for the room in our DB
-        # without a corresponding room entry. If we do then we don't want to
-        # mark the room as having an auth chain cover index.
-        max_ordering = await self.db_pool.simple_select_one_onecol(
-            table="events",
-            keyvalues={"room_id": room_id},
-            retcol="MAX(stream_ordering)",
-            allow_none=True,
-            desc="has_auth_chain_index_fallback",
-        )
-
-        return max_ordering is None
-
     async def maybe_store_room_on_outlier_membership(
         self, room_id: str, room_version: RoomVersion
     ) -> None:
@@ -2548,11 +2519,6 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
         When we receive an invite or any other event over federation that may relate to a room
         we are not in, store the version of the room if we don't already know the room version.
         """
-        # It's possible that we already have events for the room in our DB
-        # without a corresponding room entry. If we do then we don't want to
-        # mark the room as having an auth chain cover index.
-        has_auth_chain_index = await self.has_auth_chain_index(room_id)
-
         await self.db_pool.simple_upsert(
             desc="maybe_store_room_on_outlier_membership",
             table="rooms",
@@ -2565,7 +2531,6 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
                 # we don't process any messages in a room while a user is
                 # invited (only after the join).
                 "creator": "",
-                "has_auth_chain_index": has_auth_chain_index,
             },
         )
 
@@ -3099,11 +3064,6 @@ class RoomStore(RoomBackgroundUpdateStore, RoomWorkerStore):
         Called when we join a room over federation, and overwrites any room version
         currently in the table.
         """
-        # It's possible that we already have events for the room in our DB
-        # without a corresponding room entry. If we do then we don't want to
-        # mark the room as having an auth chain cover index.
-        has_auth_chain_index = await self.has_auth_chain_index(room_id)
-
         create_event = None
         for e in state_events:
             if (e.type, e.state_key) == (EventTypes.Create, ""):
@@ -3134,7 +3094,6 @@ class RoomStore(RoomBackgroundUpdateStore, RoomWorkerStore):
             insertion_values={
                 "is_public": False,
                 "creator": room_creator,
-                "has_auth_chain_index": has_auth_chain_index,
             },
         )
 

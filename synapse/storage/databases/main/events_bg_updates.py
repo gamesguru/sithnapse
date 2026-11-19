@@ -43,7 +43,6 @@ from synapse.storage.database import (
     DatabasePool,
     LoggingDatabaseConnection,
     LoggingTransaction,
-    make_tuple_comparison_clause,
 )
 from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
 from synapse.storage.databases.main.embedded_event_json import (
@@ -67,7 +66,7 @@ from synapse.storage.databases.main.stream import StreamWorkerStore
 from synapse.storage.engines import PostgresEngine
 from synapse.storage.types import Cursor
 from synapse.synapse_rust.events import redact_event
-from synapse.types import JsonDict, RoomStreamToken, StateMap, StrCollection
+from synapse.types import JsonDict, RoomStreamToken, StateMap
 from synapse.types.handlers import SLIDING_SYNC_DEFAULT_BUMP_EVENT_TYPES
 from synapse.types.state import StateFilter
 from synapse.types.storage import _BackgroundUpdates
@@ -93,24 +92,6 @@ _REPLACE_STREAM_ORDERING_SQL_COMMANDS = (
     "ALTER INDEX events_room_stream2 RENAME TO events_room_stream",
     "ALTER INDEX events_ts2 RENAME TO events_ts",
 )
-
-
-@attr.s(slots=True, frozen=True, auto_attribs=True)
-class _CalculateChainCover:
-    """Return value for _calculate_chain_cover_txn."""
-
-    # The last room_id/depth/stream processed.
-    room_id: str
-    depth: int
-    stream: int
-
-    # Number of rows processed
-    processed_count: int
-
-    # Map from room_id to last depth/stream processed for each room that we have
-    # processed all events for (i.e. the rooms we can flip the
-    # `has_auth_chain_index` for)
-    finished_room_map: dict[str, tuple[int, int]]
 
 
 @attr.s(slots=True, frozen=True, auto_attribs=True)
@@ -221,15 +202,17 @@ class EventsBackgroundUpdatesStore(
             self._rejected_events_metadata,
         )
 
-        self.db_pool.updates.register_background_update_handler(
+        # These updates only maintained the SQL chain-cover index, which is no
+        # longer written or read. Retire any row left queued by an older
+        # version without doing the work.
+        for retired_update in (
             "chain_cover",
-            self._chain_cover_index,
-        )
-
-        self.db_pool.updates.register_background_update_handler(
             "purged_chain_cover",
-            self._purged_chain_cover_index,
-        )
+            "event_auth_chain_links_origin_index",
+        ):
+            self.db_pool.updates.register_background_update_handler(
+                retired_update, self._retire_chain_cover_update
+            )
 
         self.db_pool.updates.register_background_update_handler(
             "event_arbitrary_relations",
@@ -1283,316 +1266,18 @@ class EventsBackgroundUpdatesStore(
 
         return len(results)
 
-    async def _chain_cover_index(self, progress: dict, batch_size: int) -> int:
-        """A background updates that iterates over all rooms and generates the
-        chain cover index for them.
+    async def _retire_chain_cover_update(self, progress: dict, batch_size: int) -> int:
+        """Drain a queued chain-cover update without doing the work.
+
+        The SQL chain-cover index is no longer written or read; mtxdb's auth
+        edges and closures are authoritative.
         """
-
-        if self._embedded_db_engine is not None:
-            # With mtxdb authoritative, auth-chain queries walk the embedded
-            # graph; the SQL chain cover is no longer read. Building it would
-            # also need `event_auth`, which is no longer written.
-            await self.db_pool.updates._end_background_update("chain_cover")
-            return 0
-
-        current_room_id = progress.get("current_room_id", "")
-
-        # Where we've processed up to in the room, defaults to the start of the
-        # room.
-        last_depth = progress.get("last_depth", -1)
-        last_stream = progress.get("last_stream", -1)
-
-        result = await self.db_pool.runInteraction(
-            "_chain_cover_index",
-            self._calculate_chain_cover_txn,
-            current_room_id,
-            last_depth,
-            last_stream,
-            batch_size,
-            single_room=False,
-        )
-
-        finished = result.processed_count == 0
-
-        total_rows_processed = result.processed_count
-        current_room_id = result.room_id
-        last_depth = result.depth
-        last_stream = result.stream
-
-        for room_id, (depth, stream) in result.finished_room_map.items():
-            # If we've done all the events in the room we flip the
-            # `has_auth_chain_index` in the DB. Note that its possible for
-            # further events to be persisted between the above and setting the
-            # flag without having the chain cover calculated for them. This is
-            # fine as a) the code gracefully handles these cases and b) we'll
-            # calculate them below.
-
-            await self.db_pool.simple_update(
-                table="rooms",
-                keyvalues={"room_id": room_id},
-                updatevalues={"has_auth_chain_index": True},
-                desc="_chain_cover_index",
-            )
-
-            # Handle any events that might have raced with us flipping the
-            # bit above.
-            result = await self.db_pool.runInteraction(
-                "_chain_cover_index",
-                self._calculate_chain_cover_txn,
-                room_id,
-                depth,
-                stream,
-                batch_size=None,
-                single_room=True,
-            )
-
-            total_rows_processed += result.processed_count
-
-        if finished:
-            await self.db_pool.updates._end_background_update("chain_cover")
-            return total_rows_processed
-
-        await self.db_pool.updates._background_update_progress(
-            "chain_cover",
-            {
-                "current_room_id": current_room_id,
-                "last_depth": last_depth,
-                "last_stream": last_stream,
-            },
-        )
-
-        return total_rows_processed
-
-    def _calculate_chain_cover_txn(
-        self,
-        txn: LoggingTransaction,
-        last_room_id: str,
-        last_depth: int,
-        last_stream: int,
-        batch_size: int | None,
-        single_room: bool,
-    ) -> _CalculateChainCover:
-        """Calculate the chain cover for `batch_size` events, ordered by
-        `(room_id, depth, stream)`.
-
-        Args:
-            txn,
-            last_room_id, last_depth, last_stream: The `(room_id, depth, stream)`
-                tuple to fetch results after.
-            batch_size: The maximum number of events to process. If None then
-                no limit.
-            single_room: Whether to calculate the index for just the given
-                room.
-        """
-
-        # Get the next set of events in the room (that we haven't already
-        # computed chain cover for). We do this in topological order.
-
-        # We want to do a `(topological_ordering, stream_ordering) > (?,?)`
-        # comparison, but that is not supported on older SQLite versions
-        tuple_clause, tuple_args = make_tuple_comparison_clause(
-            [
-                ("events.room_id", last_room_id),
-                ("topological_ordering", last_depth),
-                ("stream_ordering", last_stream),
-            ],
-        )
-
-        extra_clause = ""
-        if single_room:
-            extra_clause = "AND events.room_id = ?"
-            tuple_args.append(last_room_id)
-
-        sql = """
-            SELECT
-                event_id, state_events.type, state_events.state_key,
-                topological_ordering, stream_ordering,
-                events.room_id
-            FROM events
-            INNER JOIN state_events USING (event_id)
-            LEFT JOIN event_auth_chains USING (event_id)
-            LEFT JOIN event_auth_chain_to_calculate USING (event_id)
-            WHERE event_auth_chains.event_id IS NULL
-                AND event_auth_chain_to_calculate.event_id IS NULL
-                AND %(tuple_cmp)s
-                %(extra)s
-            ORDER BY events.room_id, topological_ordering, stream_ordering
-            %(limit)s
-        """ % {
-            "tuple_cmp": tuple_clause,
-            "limit": "LIMIT ?" if batch_size is not None else "",
-            "extra": extra_clause,
-        }
-
-        if batch_size is not None:
-            tuple_args.append(batch_size)
-
-        txn.execute(sql, tuple_args)
-        rows = txn.fetchall()
-
-        # Put the results in the necessary format for
-        # `_add_chain_cover_index`
-        event_to_room_id = {row[0]: row[5] for row in rows}
-        event_to_types = {row[0]: (row[1], row[2]) for row in rows}
-
-        # Calculate the new last position we've processed up to.
-        new_last_depth: int = rows[-1][3] if rows else last_depth
-        new_last_stream: int = rows[-1][4] if rows else last_stream
-        new_last_room_id: str = rows[-1][5] if rows else ""
-
-        # Map from room_id to last depth/stream_ordering processed for the room,
-        # excluding the last room (which we're likely still processing). We also
-        # need to include the room passed in if it's not included in the result
-        # set (as we then know we've processed all events in said room).
-        #
-        # This is the set of rooms that we can now safely flip the
-        # `has_auth_chain_index` bit for.
-        finished_rooms = {
-            row[5]: (row[3], row[4]) for row in rows if row[5] != new_last_room_id
-        }
-        if last_room_id not in finished_rooms and last_room_id != new_last_room_id:
-            finished_rooms[last_room_id] = (last_depth, last_stream)
-
-        count = len(rows)
-
-        # We also need to fetch the auth events for them.
-        auth_events = cast(
-            list[tuple[str, str]],
-            self.db_pool.simple_select_many_txn(
-                txn,
-                table="event_auth",
-                column="event_id",
-                iterable=event_to_room_id,
-                keyvalues={},
-                retcols=("event_id", "auth_id"),
-            ),
-        )
-
-        event_to_auth_chain: dict[str, list[str]] = {}
-        for event_id, auth_id in auth_events:
-            event_to_auth_chain.setdefault(event_id, []).append(auth_id)
-
-        # Calculate and persist the chain cover index for this set of events.
-        #
-        # Annoyingly we need to gut wrench into the persit event store so that
-        # we can reuse the function to calculate the chain cover for rooms.
-        from synapse.storage.databases.main.embedded_event_auth_chain_links import (
-            resolve_namespace,
-        )
-
-        PersistEventsStore._add_chain_cover_index(
-            txn,
-            self.db_pool,
-            self.event_chain_id_gen,
-            event_to_room_id,
-            event_to_types,
-            cast(dict[str, StrCollection], event_to_auth_chain),
-            resolve_namespace(self),
-            self._embedded_db_engine,
-        )
-
-        return _CalculateChainCover(
-            room_id=new_last_room_id,
-            depth=new_last_depth,
-            stream=new_last_stream,
-            processed_count=count,
-            finished_room_map=finished_rooms,
-        )
-
-    async def _purged_chain_cover_index(self, progress: dict, batch_size: int) -> int:
-        """
-        A background updates that iterates over the chain cover and deletes the
-        chain cover for events that have been purged.
-
-        This may be due to fully purging a room or via setting a retention policy.
-        """
-        if self._embedded_db_engine is not None:
-            # The SQL chain cover is not written when mtxdb is authoritative.
-            await self.db_pool.updates._end_background_update("purged_chain_cover")
-            return 0
-
-        current_event_id = progress.get("current_event_id", "")
-
-        def purged_chain_cover_txn(txn: LoggingTransaction) -> int:
-            # The event ID from events will be null if the chain ID / sequence
-            # number points to a purged event.
-            sql = """
-                SELECT event_id, chain_id, sequence_number, e.event_id IS NOT NULL
-                FROM event_auth_chains
-                LEFT JOIN events AS e USING (event_id)
-                WHERE event_id > ? ORDER BY event_auth_chains.event_id ASC LIMIT ?
-            """
-            txn.execute(sql, (current_event_id, batch_size))
-
-            rows = txn.fetchall()
-            if not rows:
-                return 0
-
-            # The event IDs and chain IDs / sequence numbers where the event has
-            # been purged.
-            unreferenced_event_ids = []
-            unreferenced_chain_id_tuples = []
-            event_id = ""
-            for event_id, chain_id, sequence_number, has_event in rows:
-                if not has_event:
-                    unreferenced_event_ids.append((event_id,))
-                    unreferenced_chain_id_tuples.append((chain_id, sequence_number))
-
-            # Delete the unreferenced auth chains from event_auth_chain_links and
-            # event_auth_chains.
-            txn.executemany(
-                """
-                DELETE FROM event_auth_chains WHERE event_id = ?
-                """,
-                unreferenced_event_ids,
-            )
-            # We should also delete matching target_*, but there is no index on
-            # target_chain_id. Hopefully any purged events are due to a room
-            # being fully purged and they will be removed from the origin_*
-            # searches.
-            from synapse.storage.databases.main.embedded_event_auth_chain_links import (
-                delete_chain_links_batch,
-                resolve_namespace,
-            )
-
-            embedded_db_namespace = resolve_namespace(self)
-            if embedded_db_namespace is not None:
-                # Exclusive by configured engine, not a dual-write -- see
-                # embedded_event_auth_chain_links.py.
-                delete_chain_links_batch(
-                    self._embedded_db_engine,
-                    embedded_db_namespace,
-                    unreferenced_chain_id_tuples,
-                    sync=True,
-                )
-            else:
-                txn.executemany(
-                    """
-                    DELETE FROM event_auth_chain_links WHERE
-                    origin_chain_id = ? AND origin_sequence_number = ?
-                    """,
-                    unreferenced_chain_id_tuples,
-                )
-
-            progress = {
-                "current_event_id": event_id,
-            }
-
-            self.db_pool.updates._background_update_progress_txn(
-                txn, "purged_chain_cover", progress
-            )
-
-            return len(rows)
-
-        result = await self.db_pool.runInteraction(
-            "_purged_chain_cover_index",
-            purged_chain_cover_txn,
-        )
-
-        if not result:
-            await self.db_pool.updates._end_background_update("purged_chain_cover")
-
-        return result
+        # The handler API does not pass the update name, so look at the
+        # currently-running update instead.
+        update_name = self.db_pool.updates._current_background_update
+        if update_name is not None:
+            await self.db_pool.updates._end_background_update(update_name)
+        return 0
 
     async def _event_arbitrary_relations(
         self, progress: JsonDict, batch_size: int
@@ -2416,13 +2101,6 @@ class EventsBackgroundUpdatesStore(
                     table="rooms",
                     values={
                         "room_id": room_id,
-                        # Only out-of-band memberships are missing from the `rooms`
-                        # table so that is the only type of membership we're dealing
-                        # with here. Since we don't calculate the "chain cover" for
-                        # out-of-band memberships, we can just set this to `True` as if
-                        # the user ever joins the room, we will end up calculating the
-                        # "chain cover" anyway.
-                        "has_auth_chain_index": True,
                     },
                 )
 

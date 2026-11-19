@@ -22,12 +22,10 @@ import datetime
 import itertools
 import logging
 import time
-from collections import OrderedDict
 from queue import Empty, PriorityQueue
 from typing import (
     TYPE_CHECKING,
     Collection,
-    Generator,
     Iterable,
     Sequence,
     cast,
@@ -113,12 +111,6 @@ _LONGEST_BACKOFF_PERIOD_MILLISECONDS = (
 assert 0 < _LONGEST_BACKOFF_PERIOD_MILLISECONDS <= ((2**31) - 1)
 
 
-# We use 2^53-1 as a "very large number", it has no particular
-# importance other than knowing synapse can support it (given canonical json
-# requires it).
-MAX_CHAIN_LENGTH = (2**53) - 1
-
-
 # All the info we need while iterating the DAG while backfilling
 @attr.s(frozen=True, slots=True, auto_attribs=True)
 class BackfillQueueNavigationItem:
@@ -134,50 +126,6 @@ class StateDifference:
     auth_difference: set[str]
     # The event IDs in the conflicted state subgraph. Used in v2.1 only.
     conflicted_subgraph: set[str] | None
-
-
-class _NoChainCoverIndex(Exception):
-    def __init__(self, room_id: str):
-        super().__init__("Unexpectedly no chain cover for events in %s" % (room_id,))
-
-
-# Rooms for which the embedded auth-graph incomplete warning has already been
-# logged.  Populated lazily; lives at module level so every store instance
-# shares the dedup cache for the process lifetime.  Prevents unbounded memory
-# growth while rate-limiting repeated warnings for the same room (10m TTL, max 10k rooms).
-class _WarnedIncompleteAuthGraphCache:
-    def __init__(self, max_size: int = 10_000, ttl_seconds: float = 600.0) -> None:
-        self._max_size = max_size
-        self._ttl_seconds = ttl_seconds
-        self._entries: OrderedDict[str, float] = OrderedDict()
-
-    def should_warn(self, room_id: str) -> bool:
-        now = time.monotonic()
-        last_warned = self._entries.get(room_id)
-        if last_warned is not None and (now - last_warned) < self._ttl_seconds:
-            return False
-        self._entries[room_id] = now
-        self._entries.move_to_end(room_id)
-        while len(self._entries) > self._max_size:
-            self._entries.popitem(last=False)
-        return True
-
-    def __contains__(self, room_id: object) -> bool:
-        if not isinstance(room_id, str):
-            return False
-        last_warned = self._entries.get(room_id)
-        if last_warned is None:
-            return False
-        return (time.monotonic() - last_warned) < self._ttl_seconds
-
-    def add(self, room_id: str) -> None:
-        self._entries[room_id] = time.monotonic()
-        self._entries.move_to_end(room_id)
-        while len(self._entries) > self._max_size:
-            self._entries.popitem(last=False)
-
-
-_warned_incomplete_auth_graph = _WarnedIncompleteAuthGraphCache()
 
 
 def _auth_coverage(
@@ -221,10 +169,6 @@ class EventFederationWorkerStore(
             size_callback=len,
         )
 
-        # Flag used by unit tests to disable fallback when there is no chain cover
-        # index.
-        self.tests_allow_no_chain_cover_index = True
-
         # RAM-only ancestor-closure cache for the embedded (mtxdb) auth-chain
         # path -- see embedded_event_auth_chains.py. Lives here (not module
         # level) so each store/worker gets its own bounded LRU.
@@ -248,13 +192,6 @@ class EventFederationWorkerStore(
                 ),
                 unique_columns=("event_id", "room_id"),
             )
-
-        self.db_pool.updates.register_background_index_update(
-            update_name="event_auth_chain_links_origin_index",
-            index_name="event_auth_chain_links_origin_index",
-            table="event_auth_chain_links",
-            columns=("origin_chain_id", "origin_sequence_number"),
-        )
 
     async def get_auth_chain(
         self, room_id: str, event_ids: Collection[str], include_given: bool = False
@@ -293,98 +230,33 @@ class EventFederationWorkerStore(
             set of event_ids
         """
 
-        # Check if we have indexed the room so we can use the chain cover
-        # algorithm.
-        room = await self.get_room(room_id)  # type: ignore[attr-defined]
         from synapse.storage.databases.main.embedded_event_auth_chains import (
             IncompleteAuthGraph,
             resolve_namespace,
         )
 
         embedded_db_namespace = resolve_namespace(self)
-        is_embedded_writer = (
-            embedded_db_namespace is not None
-            and self.hs.get_instance_name() in self.hs.config.worker.writers.events
-        )
-        is_mtxdb_auth_backend = self._embedded_db_engine is not None
-        if is_embedded_writer or (is_mtxdb_auth_backend and embedded_db_namespace):
-            assert embedded_db_namespace is not None
+        if embedded_db_namespace is not None:
+            assert self._embedded_db_engine is not None
             _auth_coverage("get_auth_chain_ids", "embedded_attempt", len(event_ids))
             try:
-                result = await self.db_pool.runInteraction(
-                    "get_auth_chain_ids_embedded",
-                    self._get_auth_chain_ids_using_embedded_closures_txn,
+                result = self._get_auth_chain_ids_using_embedded_closures(
                     embedded_db_namespace,
                     room_id,
                     event_ids,
                     include_given,
                 )
-                _auth_coverage(
-                    "get_auth_chain_ids",
-                    "embedded_complete",
-                    len(event_ids),
-                    len(result),
-                )
-                return result
             except IncompleteAuthGraph:
-                if is_mtxdb_auth_backend:
-                    raise RuntimeError(
-                        "Auth-chain graph is incomplete after the mtxdb cutover"
-                    ) from None
-                # The embedded graph is missing genuine data. Fall through to
-                # the SQL paths below, which are still authoritative while the
-                # one-shot import is incomplete.
-                if _warned_incomplete_auth_graph.should_warn(room_id):
-                    logger.warning(
-                        "Embedded auth graph incomplete for room %s; "
-                        "falling back to SQL auth-chain traversal",
-                        room_id,
-                    )
-
-        # If the room has an auth chain index.
-        if room[1]:
-            try:
-                # Prefer the cover index when complete. Includes the
-                # non-writer case, which cannot repair the embedded graph.
-                result = await self.db_pool.runInteraction(
-                    "get_auth_chain_ids_chains",
-                    self._get_auth_chain_ids_using_cover_index_txn,
-                    room_id,
-                    event_ids,
-                    include_given,
-                )
-                _auth_coverage(
-                    "get_auth_chain_ids",
-                    "sql_chain_cover_complete",
-                    len(event_ids),
-                    len(result),
-                )
-                return result
-            except (IncompleteAuthGraph, _NoChainCoverIndex):
-                # For whatever reason we don't actually have a complete chain cover index
-                # for the events in question, so we fall back to the old method
-                # (except in tests)
-                if not self.tests_allow_no_chain_cover_index:
-                    raise
-                if _warned_incomplete_auth_graph.should_warn(room_id):
-                    logger.warning(
-                        "Cover index incomplete for room %s; "
-                        "falling back to legacy SQL auth-chain traversal",
-                        room_id,
-                    )
-                result = await self.db_pool.runInteraction(
-                    "get_auth_chain_ids_legacy_fallback",
-                    self._get_auth_chain_ids_txn,
-                    event_ids,
-                    include_given,
-                )
-                _auth_coverage(
-                    "get_auth_chain_ids",
-                    "embedded_incomplete_sql_fallback",
-                    len(event_ids),
-                    len(result),
-                )
-                return result
+                raise RuntimeError(
+                    "Auth-chain graph is incomplete after the mtxdb cutover"
+                ) from None
+            _auth_coverage(
+                "get_auth_chain_ids",
+                "embedded_complete",
+                len(event_ids),
+                len(result),
+            )
+            return result
 
         _auth_coverage("get_auth_chain_ids", "sql_only", len(event_ids))
         return await self.db_pool.runInteraction(
@@ -394,24 +266,23 @@ class EventFederationWorkerStore(
             include_given,
         )
 
-    def _get_auth_chain_ids_using_embedded_closures_txn(
+    def _get_auth_chain_ids_using_embedded_closures(
         self,
-        txn: LoggingTransaction,
         embedded_db_namespace: str,
         room_id: str,
         event_ids: Collection[str],
         include_given: bool,
     ) -> set[str]:
         """Embedded-store equivalent of
-        `_get_auth_chain_ids_using_cover_index_txn`: union the requested
-        events' ancestor closures (short-id bitmaps), resolve back to event
+        the SQL recursive traversal: union the requested events' ancestor
+        closures (short-id bitmaps), resolve back to event
         ids, and apply `include_given` the same way the legacy method does
         (its `chains[chain_id] = max(seq_no - 1, ...)` excludes each given
         event's own chain position, then unions `initial_events` back in
         only when `include_given` -- i.e. the closure is ancestors-only, and
         `include_given` alone controls whether the starting set is added
         back). Raises `IncompleteAuthGraph` on a genuine data gap; the
-        caller translates that to `_NoChainCoverIndex`.
+        caller translates that to `RuntimeError`.
         """
         from synapse.storage.databases.main.embedded_event_auth_chains import (
             IncompleteAuthGraph,
@@ -443,12 +314,10 @@ class EventFederationWorkerStore(
         ]
 
         closures = self._auth_chain_closure_cache.get_closures_batch(
-            txn,
             engine_name,
             embedded_db_namespace,
             room_id,
             short_ids,
-            allow_cold_import=False,
         )
 
         result_short_ids: set[int] = set()
@@ -469,315 +338,12 @@ class EventFederationWorkerStore(
         )
         return {event_id for event_id in resolved if event_id is not None}
 
-    def _get_auth_chain_ids_using_cover_index_txn(
-        self,
-        txn: LoggingTransaction,
-        room_id: str,
-        event_ids: Collection[str],
-        include_given: bool,
-    ) -> set[str]:
-        """Calculates the auth chain IDs using the chain index."""
-
-        logger.debug(
-            "get_auth_chain_ids: using LEGACY COVER-INDEX (chain_id/SQL) path "
-            "for room=%s event_ids=%s include_given=%s",
-            room_id,
-            list(event_ids),
-            include_given,
-        )
-
-        # First we look up the chain ID/sequence numbers for the given events.
-
-        initial_events = set(event_ids)
-
-        # All the events that we've found that are reachable from the events.
-        seen_events: set[str] = set()
-
-        # A map from chain ID to max sequence number of the given events.
-        event_chains: dict[int, int] = {}
-
-        sql = """
-            SELECT event_id, chain_id, sequence_number
-            FROM event_auth_chains
-            WHERE %s
-        """
-        for batch in batch_iter(initial_events, 1000):
-            clause, args = make_in_list_sql_clause(
-                txn.database_engine, "event_id", batch
-            )
-            txn.execute(sql % (clause,), args)
-
-            for event_id, chain_id, sequence_number in txn:
-                seen_events.add(event_id)
-                event_chains[chain_id] = max(
-                    sequence_number, event_chains.get(chain_id, 0)
-                )
-
-        # Check that we actually have a chain ID for all the events.
-        events_missing_chain_info = initial_events.difference(seen_events)
-        if events_missing_chain_info:
-            # This can happen due to e.g. downgrade/upgrade of the server. We
-            # raise an exception and fall back to the previous algorithm.
-            logger.error(
-                "Unexpectedly found that events don't have chain IDs in room %s: %s",
-                room_id,
-                events_missing_chain_info,
-            )
-            raise _NoChainCoverIndex(room_id)
-
-        # Now we look up all links for the chains we have, adding chains that
-        # are reachable from any event.
-
-        # A map from chain ID to max sequence number *reachable* from any event ID.
-        chains: dict[int, int] = {}
-        from synapse.storage.databases.main.embedded_event_auth_chain_links import (
-            resolve_namespace,
-        )
-
-        embedded_db_namespace = resolve_namespace(self)
-        for links in self._get_chain_links(
-            txn,
-            set(event_chains.keys()),
-            embedded_db_namespace,
-            self._embedded_db_engine,
-        ):
-            for chain_id in links:
-                if chain_id not in event_chains:
-                    continue
-
-                _materialize(chain_id, event_chains[chain_id], links, chains)
-
-        # Add the initial set of chains, excluding the sequence corresponding to
-        # initial event.
-        for chain_id, seq_no in event_chains.items():
-            # Check if the initial event is the first item in the chain. If so, then
-            # there is nothing new to add from this chain.
-            if seq_no == 1:
-                continue
-
-            chains[chain_id] = max(seq_no - 1, chains.get(chain_id, 0))
-
-        # Now for each chain we figure out the maximum sequence number reachable
-        # from *any* event ID. Events with a sequence less than that are in the
-        # auth chain.
-        if include_given:
-            results = initial_events
-        else:
-            results = set()
-
-        if isinstance(self.database_engine, PostgresEngine):
-            # We can use `execute_values` to efficiently fetch the gaps when
-            # using postgres.
-            sql = """
-                SELECT event_id
-                FROM event_auth_chains AS c, (VALUES ?) AS l(chain_id, max_seq)
-                WHERE
-                    c.chain_id = l.chain_id
-                    AND sequence_number <= max_seq
-            """
-
-            rows = txn.execute_values(sql, chains.items())
-            results.update(r for (r,) in rows)
-        else:
-            # For SQLite we just fall back to doing a noddy for loop.
-            sql = """
-                SELECT event_id FROM event_auth_chains
-                WHERE chain_id = ? AND sequence_number <= ?
-            """
-            for chain_id, max_no in chains.items():
-                txn.execute(sql, (chain_id, max_no))
-                results.update(r for (r,) in txn)
-
-        # Check that all direct auth events for the initial events are present in the
-        # computed auth chain. If any direct auth event is missing from the cover index,
-        # the chain cover is incomplete and we must fall back to legacy traversal.
-        # Note: when include_given is False, results does not contain initial_events,
-        # so direct auth events (and the room create event) that are already in
-        # initial_events must be accounted for via all_covered = results | initial_events.
-        clause, args = make_in_list_sql_clause(
-            txn.database_engine, "event_id", initial_events
-        )
-        txn.execute(
-            f"SELECT DISTINCT auth_id FROM event_auth WHERE {clause}",
-            args,
-        )
-        direct_auth_ids = {auth_id for (auth_id,) in txn}
-        all_covered = results | initial_events
-        missing_direct_auth = direct_auth_ids.difference(all_covered)
-        if missing_direct_auth:
-            from synapse.storage.databases.main.embedded_event_auth_chains import (
-                IncompleteAuthGraph,
-            )
-
-            logger.warning(
-                "Cover index auth chain incomplete for room %s: missing direct auth events %s",
-                room_id,
-                missing_direct_auth,
-            )
-            raise IncompleteAuthGraph(
-                f"Missing direct auth events in cover index: {missing_direct_auth}"
-            )
-
-        if direct_auth_ids:
-            txn.execute(
-                "SELECT event_id FROM events WHERE room_id = ? AND type = 'm.room.create' LIMIT 1",
-                (room_id,),
-            )
-            create_row = txn.fetchone()
-            if create_row and create_row[0] not in all_covered:
-                from synapse.storage.databases.main.embedded_event_auth_chains import (
-                    IncompleteAuthGraph,
-                )
-
-                logger.warning(
-                    "Cover index auth chain incomplete for room %s: room create event %s missing",
-                    room_id,
-                    create_row[0],
-                )
-                raise IncompleteAuthGraph(
-                    f"Room create event {create_row[0]} missing from cover index results"
-                )
-
-        return results
-
-    @classmethod
-    def _get_chain_links(
-        cls,
-        txn: LoggingTransaction,
-        chains_to_fetch: set[int],
-        embedded_db_namespace: str | None,
-        embedded_db_engine: str | None,
-    ) -> Generator[dict[int, list[tuple[int, int, int]]], None, None]:
-        """Fetch all auth chain links from the given set of chains, and all
-        links from those chains, recursively.
-
-        Note: This may return links that are not reachable from the given
-        chains.
-
-        Returns a generator that produces dicts from origin chain ID to 3-tuple
-        of origin sequence number, target chain ID and target sequence number.
-
-        `embedded_db_namespace`: the caller's resolved namespace when the
-        embedded engine is configured, `None` when it isn't -- a
-        `@classmethod` has no `self` of its own, so this can't be
-        recomputed here; see `embedded_event_auth_chain_links.py`.
-
-        `embedded_db_engine`: the engine name threaded alongside
-        `embedded_db_namespace` (same `@classmethod` constraint).
-        """
-        if embedded_db_namespace is not None:
-            # Exclusive by configured engine, not a dual-write. mtxdb has no
-            # recursive-query primitive, so the walk is done here in Python
-            # instead of SQL's `WITH RECURSIVE` below -- see
-            # embedded_event_auth_chain_links.py's module docstring.
-            from synapse.storage.databases.main.embedded_event_auth_chain_links import (
-                get_chain_links_batch,
-            )
-
-            # `get_chain_links_batch` is a flat batch-get, not a BFS -- it
-            # only returns edges *out of* the chain IDs it's given, not the
-            # transitive closure. So unlike the SQL `WITH RECURSIVE` below,
-            # the walk has to happen here: every `target_chain_id` we
-            # discover is a new chain that might have further edges out of
-            # it, so it goes back into the fetch set (unless already seen).
-            #
-            # Every caller of this generator relies on each yielded `links`
-            # dict being *self-contained*: `_materialize` does its own
-            # internal stack-based walk over a single `links` dict starting
-            # from one origin chain, so if the edges for a chain two hops
-            # away land in a *different* yielded dict than the edges for the
-            # chain one hop away, `_materialize` dead-ends after one hop and
-            # silently drops everything beyond it (this used to happen here
-            # and kept happening: each BFS layer was fetched separately, and
-            # the `yield` stayed inside the BFS loop, so the closure was
-            # still split). So the whole transitive closure for each outer
-            # (<=1000-chain) seed batch is accumulated below and yielded
-            # once, matching what the SQL recursive query below returns in a
-            # single row set per outer batch.
-            chains_to_fetch = set(chains_to_fetch)
-            while chains_to_fetch:
-                seeds = set(itertools.islice(chains_to_fetch, 1000))
-                chains_to_fetch.difference_update(seeds)
-
-                seen_chains = set(seeds)
-                to_walk = set(seeds)
-                accumulated: dict[int, list[tuple[int, int, int]]] = {}
-                while to_walk:
-                    batch = set(itertools.islice(to_walk, 1000))
-                    to_walk.difference_update(batch)
-                    embedded_links = get_chain_links_batch(
-                        embedded_db_engine, embedded_db_namespace, batch
-                    )
-                    for chain_id, edges in embedded_links.items():
-                        accumulated.setdefault(chain_id, []).extend(edges)
-                        for _origin_seq, target_chain_id, _target_seq in edges:
-                            if target_chain_id not in seen_chains:
-                                seen_chains.add(target_chain_id)
-                                to_walk.add(target_chain_id)
-                # Chains that turned out to have links were consumed by this
-                # batch's closure (the SQL path removes them from
-                # `chains_to_fetch` the same way), so skip them as seeds.
-                chains_to_fetch.difference_update(accumulated)
-                yield accumulated
-            return
-
-        # This query is structured to first get all chain IDs reachable, and
-        # then pull out all links from those chains. This does pull out more
-        # rows than is strictly necessary, however there isn't a way of
-        # structuring the recursive part of query to pull out the links without
-        # also returning large quantities of redundant data (which can make it a
-        # lot slower).
-        sql = """
-            WITH RECURSIVE links(chain_id) AS (
-                SELECT
-                    DISTINCT origin_chain_id
-                FROM event_auth_chain_links WHERE %s
-                UNION
-                SELECT
-                    target_chain_id
-                FROM event_auth_chain_links
-                INNER JOIN links ON (chain_id = origin_chain_id)
-            )
-            SELECT
-                origin_chain_id, origin_sequence_number,
-                target_chain_id, target_sequence_number
-            FROM links
-            INNER JOIN event_auth_chain_links ON (chain_id = origin_chain_id)
-        """
-
-        while chains_to_fetch:
-            batch2 = tuple(itertools.islice(chains_to_fetch, 1000))
-            chains_to_fetch.difference_update(batch2)
-            clause, args = make_in_list_sql_clause(
-                txn.database_engine, "origin_chain_id", batch2
-            )
-            txn.execute(sql % (clause,), args)
-
-            links: dict[int, list[tuple[int, int, int]]] = {}
-
-            for (
-                origin_chain_id,
-                origin_sequence_number,
-                target_chain_id,
-                target_sequence_number,
-            ) in txn:
-                links.setdefault(origin_chain_id, []).append(
-                    (origin_sequence_number, target_chain_id, target_sequence_number)
-                )
-
-            chains_to_fetch.difference_update(links)
-
-            yield links
-
     def _get_auth_chain_ids_txn(
         self, txn: LoggingTransaction, event_ids: Collection[str], include_given: bool
     ) -> set[str]:
-        """Calculates the auth chain IDs.
-
-        This is used when we don't have a cover index for the room.
-        """
+        """Calculates auth-chain reachability by traversing SQL `event_auth`."""
         logger.debug(
-            "get_auth_chain_ids: using OLDEST no-cover-index SQL fallback "
+            "get_auth_chain_ids: using SQL auth-graph traversal "
             "for event_ids=%s include_given=%s",
             list(event_ids),
             include_given,
@@ -872,100 +438,49 @@ class EventFederationWorkerStore(
             conflicted_set is not None
         """
 
-        # Check if we have indexed the room so we can use the chain cover
-        # algorithm.
-        room = await self.get_room(room_id)  # type: ignore[attr-defined]
         from synapse.storage.databases.main.embedded_event_auth_chains import (
             IncompleteAuthGraph,
             resolve_namespace,
         )
 
         embedded_db_namespace = resolve_namespace(self)
-        is_embedded_writer = (
-            embedded_db_namespace is not None
-            and self.hs.get_instance_name() in self.hs.config.worker.writers.events
-        )
-        is_mtxdb_auth_backend = self._embedded_db_engine is not None
-        if is_embedded_writer or (is_mtxdb_auth_backend and embedded_db_namespace):
-            assert embedded_db_namespace is not None
+        if embedded_db_namespace is not None:
+            assert self._embedded_db_engine is not None
             _auth_coverage(
                 "get_auth_chain_difference",
                 "embedded_attempt",
                 sum(len(state_set) for state_set in state_sets),
             )
             try:
-                result = await self.db_pool.runInteraction(
-                    "get_auth_chain_difference_embedded",
-                    self._get_auth_chain_difference_using_embedded_closures_txn,
+                result = self._get_auth_chain_difference_using_embedded_closures(
                     embedded_db_namespace,
                     room_id,
                     state_sets,
                     conflicted_set,
                     additional_backwards_reachable_conflicted_events,
                 )
-                _auth_coverage(
-                    "get_auth_chain_difference",
-                    "embedded_complete",
-                    sum(len(state_set) for state_set in state_sets),
-                    len(result.auth_difference),
-                )
-                return result
             except IncompleteAuthGraph:
-                if is_mtxdb_auth_backend:
-                    raise RuntimeError(
-                        "Auth-chain graph is incomplete after the mtxdb cutover"
-                    ) from None
-                # The embedded graph is missing genuine data. Fall through to
-                # the SQL paths below, which are still authoritative while the
-                # one-shot import is incomplete.
-                if _warned_incomplete_auth_graph.should_warn(room_id):
-                    logger.warning(
-                        "Embedded auth graph incomplete for room %s; "
-                        "falling back to SQL auth-chain traversal",
-                        room_id,
-                    )
+                raise RuntimeError(
+                    "Auth-chain graph is incomplete after the mtxdb cutover"
+                ) from None
+            _auth_coverage(
+                "get_auth_chain_difference",
+                "embedded_complete",
+                sum(len(state_set) for state_set in state_sets),
+                len(result.auth_difference),
+            )
+            return result
 
-        # If the room has an auth chain index.
-        if room[1]:
-            try:
-                # Prefer the cover index when complete. Includes the
-                # non-writer case, which cannot repair the embedded graph.
-                result = await self.db_pool.runInteraction(
-                    "get_auth_chain_difference_chains",
-                    self._get_auth_chain_difference_using_cover_index_txn,
-                    room_id,
-                    state_sets,
-                    conflicted_set,
-                    additional_backwards_reachable_conflicted_events,
-                )
-                _auth_coverage(
-                    "get_auth_chain_difference",
-                    "sql_chain_cover_complete",
-                    sum(len(state_set) for state_set in state_sets),
-                    len(result.auth_difference),
-                )
-                return result
-            except (IncompleteAuthGraph, _NoChainCoverIndex):
-                # For whatever reason we don't actually have a chain cover index
-                # for the events in question, so we fall back to the old method
-                # (except in tests)
-                if not self.tests_allow_no_chain_cover_index:
-                    raise
-                if conflicted_set is not None:
-                    raise _NoChainCoverIndex(room_id)
-                auth_diff = await self.db_pool.runInteraction(
-                    "get_auth_chain_difference_legacy_fallback",
-                    self._get_auth_chain_difference_txn,
-                    state_sets,
-                )
-                return StateDifference(
-                    auth_difference=auth_diff, conflicted_subgraph=None
-                )
-
-        # It's been 4 years since we added chain cover, so we expect all rooms to have it.
-        # If they don't, we will error out when trying to do state res v2.1
+        # The SQL backend has no chain cover index any more. State res v2.1
+        # computes the conflicted subgraph directly from `event_auth` instead.
         if conflicted_set is not None:
-            raise _NoChainCoverIndex(room_id)
+            return await self.db_pool.runInteraction(
+                "get_auth_chain_difference_sql_v21",
+                self._get_auth_chain_difference_sql_v21_txn,
+                state_sets,
+                conflicted_set,
+                additional_backwards_reachable_conflicted_events,
+            )
 
         _auth_coverage(
             "get_auth_chain_difference",
@@ -979,18 +494,16 @@ class EventFederationWorkerStore(
         )
         return StateDifference(auth_difference=auth_diff, conflicted_subgraph=None)
 
-    def _get_auth_chain_difference_using_embedded_closures_txn(
+    def _get_auth_chain_difference_using_embedded_closures(
         self,
-        txn: LoggingTransaction,
         embedded_db_namespace: str,
         room_id: str,
         state_sets: list[set[str]],
         conflicted_set: set[str] | None = None,
         additional_backwards_reachable_conflicted_events: set[str] | None = None,
     ) -> StateDifference:
-        """Embedded-store equivalent of
-        `_get_auth_chain_difference_using_cover_index_txn`: same `StateDifference`
-        result, computed from the ramp ancestor-closure bitmaps in
+        """Embedded-store auth difference, computed from the ancestor-closure
+        bitmaps in
         `embedded_event_auth_chains.py` instead of the chain-id/sequence-number
         cover-index reduction.
 
@@ -1003,17 +516,14 @@ class EventFederationWorkerStore(
         its members' ancestor closures plus the members themselves.
 
         `conflicted_subgraph` (v2.1 only) is `backwards ∩ forwards`, with both
-        sides *inclusive* of the conflicted events -- the exact contract the
-        chain-cover path's per-chain seq ranges encode (`forwards_seq_num ..
-        backwards_seq_num` inclusive of both, so each conflicted event's own
-        position ends up in the subgraph). Backwards is the union of the
+        sides *inclusive* of the conflicted events. Backwards is the union of the
         conflicted and additional events' inclusive ancestor closures; forwards
         is the seed-inclusive forward BFS (`get_forward_reachable_short_ids`)
         *pruned to the backwards set* -- a descendant outside the backwards
         universe provably can't be in the intersection, which is what bounds
         the walk (it may not touch data the conflicted-set computation doesn't
         need). Raises `IncompleteAuthGraph` on a genuine data gap; the caller
-        translates that to `_NoChainCoverIndex`.
+        translates that to `RuntimeError`.
         """
         from synapse.storage.databases.main.embedded_event_auth_chains import (
             IncompleteAuthGraph,
@@ -1068,12 +578,10 @@ class EventFederationWorkerStore(
         for state_set in state_sets:
             member_short_ids = [short_id_of[event_id] for event_id in state_set]
             closures = self._auth_chain_closure_cache.get_closures_batch(
-                txn,
                 engine_name,
                 embedded_db_namespace,
                 room_id,
                 member_short_ids,
-                allow_cold_import=False,
             )
             union: set[int] = set(member_short_ids)
             for closure in closures.values():
@@ -1096,12 +604,10 @@ class EventFederationWorkerStore(
             # backwards-reachable events and theirs.
             backwards_ids: set[int] = set(conflicted_short_ids)
             for closure in self._auth_chain_closure_cache.get_closures_batch(
-                txn,
                 engine_name,
                 embedded_db_namespace,
                 room_id,
                 conflicted_short_ids,
-                allow_cold_import=False,
             ).values():
                 backwards_ids.update(closure)
             if additional_backwards_reachable_conflicted_events:
@@ -1111,12 +617,10 @@ class EventFederationWorkerStore(
                 ]
                 backwards_ids.update(additional_short_ids)
                 for closure in self._auth_chain_closure_cache.get_closures_batch(
-                    txn,
                     engine_name,
                     embedded_db_namespace,
                     room_id,
                     additional_short_ids,
-                    allow_cold_import=False,
                 ).values():
                     backwards_ids.update(closure)
 
@@ -1152,494 +656,60 @@ class EventFederationWorkerStore(
             conflicted_subgraph=None,
         )
 
-    def _get_auth_chain_difference_using_cover_index_txn(
+    def _get_auth_chain_difference_sql_v21_txn(
         self,
         txn: LoggingTransaction,
-        room_id: str,
         state_sets: list[set[str]],
-        conflicted_set: set[str] | None = None,
-        additional_backwards_reachable_conflicted_events: set[str] | None = None,
+        conflicted_set: set[str],
+        additional_backwards_reachable_conflicted_events: set[str] | None,
     ) -> StateDifference:
-        """Calculates the auth chain difference using the chain index.
+        """SQL v2.1 auth difference without the retired chain cover.
 
-        See docs/auth_chain_difference_algorithm.md for details
+        Backwards is the inclusive ancestor closure of the conflicted and
+        additional events; forwards is an ephemeral BFS over `event_auth`
+        restricted to that closure. The conflicted subgraph is their
+        intersection, matching the mtxdb closure path.
         """
-        is_state_res_v21 = conflicted_set is not None
+        auth_difference = self._get_auth_chain_difference_txn(txn, state_sets)
 
-        # First we look up the chain ID/sequence numbers for all the events, and
-        # work out the chain/sequence numbers reachable from each state set.
-
-        initial_events = set(state_sets[0]).union(*state_sets[1:])
-
-        if is_state_res_v21:
-            # Sanity check v2.1 fields
-            assert conflicted_set is not None
-            assert conflicted_set.issubset(initial_events)
-            # It's possible for the conflicted_set to be empty if all the conflicts are in
-            # unpersisted events, so we don't assert that conflicted_set has len > 0
-            if additional_backwards_reachable_conflicted_events:
-                assert additional_backwards_reachable_conflicted_events.issubset(
-                    initial_events
-                )
-
-        # Map from event_id -> (chain ID, seq no)
-        chain_info: dict[str, tuple[int, int]] = {}
-
-        # Map from chain ID -> seq no -> event Id
-        chain_to_event: dict[int, dict[int, str]] = {}
-
-        # All the chains that we've found that are reachable from the state
-        # sets.
-        seen_chains: set[int] = set()
-
-        # Fetch the chain cover index for the initial set of events we're
-        # considering.
-        def fetch_chain_info(events_to_fetch: Collection[str]) -> None:
-            sql = """
-                SELECT event_id, chain_id, sequence_number
-                FROM event_auth_chains
-                WHERE %s
-            """
-            for batch in batch_iter(events_to_fetch, 1000):
-                clause, args = make_in_list_sql_clause(
-                    txn.database_engine, "event_id", batch
-                )
-                txn.execute(sql % (clause,), args)
-
-                for event_id, chain_id, sequence_number in txn:
-                    chain_info[event_id] = (chain_id, sequence_number)
-                    seen_chains.add(chain_id)
-                    chain_to_event.setdefault(chain_id, {})[sequence_number] = event_id
-
-        fetch_chain_info(initial_events)
-
-        # Check that we actually have a chain ID for all the events.
-        events_missing_chain_info = initial_events.difference(chain_info)
-
-        # The result set to return, i.e. the auth chain difference.
-        auth_difference_result: set[str] = set()
-
-        if events_missing_chain_info:
-            # For some reason we have events we haven't calculated the chain
-            # index for, so we need to handle those separately. This should only
-            # happen for older rooms where the server doesn't have all the auth
-            # events.
-            auth_difference_result = self._fixup_auth_chain_difference_sets(
-                txn,
-                room_id,
-                state_sets=state_sets,
-                events_missing_chain_info=events_missing_chain_info,
-                events_that_have_chain_index=chain_info,
-            )
-
-            # We now need to refetch any events that we have added to the state
-            # sets.
-            new_events_to_fetch = {
-                event_id
-                for state_set in state_sets
-                for event_id in state_set
-                if event_id not in initial_events
-            }
-
-            fetch_chain_info(new_events_to_fetch)
-
-        # State Res v2.1 needs extra data structures to calculate the conflicted subgraph which
-        # are outlined below.
-
-        # A subset of chain_info for conflicted events only, as we need to
-        # loop all conflicted chain positions. Map from event_id -> (chain ID, seq no)
-        conflicted_chain_positions: dict[str, tuple[int, int]] = {}
-        # For each chain, remember the positions where conflicted events are.
-        # We need this for calculating the forward reachable events.
-        conflicted_chain_to_seq: dict[int, set[int]] = {}  # chain_id => {seq_num}
-        #  A subset of chain_info for additional backwards reachable events only, as we need to
-        # loop all additional backwards reachable events for calculating backwards reachable events.
-        additional_backwards_reachable_positions: dict[
-            str, tuple[int, int]
-        ] = {}  # event_id => (chain_id, seq_num)
-        # These next two fields are critical as the intersection of them is the conflicted subgraph.
-        # We'll populate them when we walk the chain links.
-        # chain_id => max(seq_num) backwards reachable (e.g 4 means 1,2,3,4 are backwards reachable)
-        conflicted_backwards_reachable: dict[int, int] = {}
-        # chain_id => min(seq_num) forwards reachable (e.g 4 means 4,5,6..n are forwards reachable)
-        conflicted_forwards_reachable: dict[int, int] = {}
-
-        # populate the v2.1 data structures
-        if is_state_res_v21:
-            assert conflicted_set is not None
-            # provide chain positions for each conflicted event
-            for conflicted_event_id in conflicted_set:
-                (chain_id, seq_num) = chain_info[conflicted_event_id]
-                conflicted_chain_positions[conflicted_event_id] = (chain_id, seq_num)
-                conflicted_chain_to_seq.setdefault(chain_id, set()).add(seq_num)
-            if additional_backwards_reachable_conflicted_events:
-                for (
-                    additional_event_id
-                ) in additional_backwards_reachable_conflicted_events:
-                    (chain_id, seq_num) = chain_info[additional_event_id]
-                    additional_backwards_reachable_positions[additional_event_id] = (
-                        chain_id,
-                        seq_num,
-                    )
-
-        # Corresponds to `state_sets`, except as a map from chain ID to max
-        # sequence number reachable from the state set.
-        set_to_chain: list[dict[int, int]] = []
-        for state_set in state_sets:
-            chains: dict[int, int] = {}
-            set_to_chain.append(chains)
-
-            for state_id in state_set:
-                chain_id, seq_no = chain_info[state_id]
-
-                chains[chain_id] = max(seq_no, chains.get(chain_id, 0))
-
-        # Now we look up all links for the chains we have, adding chains that
-        # are reachable from any event.
-
-        # (We need to take a copy of `seen_chains` as the function mutates it)
-        from synapse.storage.databases.main.embedded_event_auth_chain_links import (
-            resolve_namespace,
+        backwards = self._get_auth_chain_ids_txn(
+            txn, conflicted_set, include_given=True
         )
-
-        embedded_db_namespace = resolve_namespace(self)
-        for links in self._get_chain_links(
-            txn, set(seen_chains), embedded_db_namespace, self._embedded_db_engine
-        ):
-            # `links` encodes the backwards reachable events _from a single chain_ all the way to
-            # the root of the graph.
-            for chains in set_to_chain:
-                for chain_id in links:
-                    if chain_id not in chains:
-                        continue
-
-                    _materialize(chain_id, chains[chain_id], links, chains)
-
-                seen_chains.update(chains)
-            if is_state_res_v21:
-                # Apply v2.1 conflicted event reachability checks.
-                #
-                #  A <-- B <-- C <-- D <-- E
-                #
-                # Backwards reachable from C = {A,B}
-                # Forwards reachable from C = {D,E}
-
-                # this handles calculating forwards reachable information and updates
-                # conflicted_forwards_reachable.
-                accumulate_forwards_reachable_events(
-                    conflicted_forwards_reachable,
-                    links,
-                    conflicted_chain_positions,
-                )
-
-                # handle backwards reachable information
-                for (
-                    conflicted_chain_id,
-                    conflicted_chain_seq,
-                ) in conflicted_chain_positions.values():
-                    if conflicted_chain_id not in links:
-                        # This conflicted event does not lie on the path to the root.
-                        continue
-
-                    # The conflicted chain position itself encodes reachability information
-                    # _within_ the chain. Set it now before walking to other links.
-                    conflicted_backwards_reachable[conflicted_chain_id] = max(
-                        conflicted_chain_seq,
-                        conflicted_backwards_reachable.get(conflicted_chain_id, 0),
-                    )
-
-                    # Build backwards reachability paths. This is the same as what the auth difference
-                    # code does. We find which chain the conflicted event
-                    # belongs to then walk it backwards to the root. We store reachability info
-                    # for all conflicted events in the same map 'conflicted_backwards_reachable'
-                    # as we don't care about the paths themselves.
-                    _materialize(
-                        conflicted_chain_id,
-                        conflicted_chain_seq,
-                        links,
-                        conflicted_backwards_reachable,
-                    )
-                # Mark some extra events as backwards reachable. This is used when we have some
-                # unpersisted events and want to know the subgraph across the persisted/unpersisted
-                # boundary:
-                #                  |
-                #  A <-- B <-- C <-|- D <-- E <-- F
-                #     persisted    |   unpersisted
-                #
-                # Assume {B,E} are conflicted, we want to return {B,C,D,E}
-                #
-                # The unpersisted code ensures it passes C as an additional backwards reachable
-                # event. C is NOT a conflicted event, but we do need to consider it as part of
-                # the backwards reachable set. When we then calculate the forwards reachable set
-                # from B, C will be in both the backwards and forwards reachable sets and hence
-                # will be included in the conflicted subgraph.
-                for (
-                    additional_chain_id,
-                    additional_chain_seq,
-                ) in additional_backwards_reachable_positions.values():
-                    if additional_chain_id not in links:
-                        # The additional backwards reachable event does not lie on the path to the root.
-                        continue
-
-                    # the additional event chain position itself encodes reachability information.
-                    # It means that position and all positions earlier in that chain are backwards reachable
-                    # by some unpersisted conflicted event.
-                    conflicted_backwards_reachable[additional_chain_id] = max(
-                        additional_chain_seq,
-                        conflicted_backwards_reachable.get(additional_chain_id, 0),
-                    )
-
-                    # Now walk the chains back, marking backwards reachable events.
-                    # This is the same thing we do for auth difference / conflicted events.
-                    _materialize(
-                        additional_chain_id,  # walk all links back, marking them as backwards reachable
-                        additional_chain_seq,
-                        links,
-                        conflicted_backwards_reachable,
-                    )
-
-        # Now for each chain we figure out the maximum sequence number reachable
-        # from *any* state set and the minimum sequence number reachable from
-        # *all* state sets. Events in that range are in the auth chain
-        # difference.
-
-        # Mapping from chain ID to the range of sequence numbers that should be
-        # pulled from the database.
-        auth_diff_chain_to_gap: dict[int, tuple[int, int]] = {}
-
-        for chain_id in seen_chains:
-            min_seq_no = min(chains.get(chain_id, 0) for chains in set_to_chain)
-            max_seq_no = max(chains.get(chain_id, 0) for chains in set_to_chain)
-
-            if min_seq_no < max_seq_no:
-                # We have a non empty gap, try and fill it from the events that
-                # we have, otherwise add them to the list of gaps to pull out
-                # from the DB.
-                for seq_no in range(min_seq_no + 1, max_seq_no + 1):
-                    event_id = chain_to_event.get(chain_id, {}).get(seq_no)
-                    if event_id:
-                        auth_difference_result.add(event_id)
-                    else:
-                        auth_diff_chain_to_gap[chain_id] = (min_seq_no, max_seq_no)
-                        break
-
-        conflicted_subgraph_result: set[str] = set()
-        # Mapping from chain ID to the range of sequence numbers that should be
-        # pulled from the database.
-        conflicted_subgraph_chain_to_gap: dict[int, tuple[int, int]] = {}
-        if is_state_res_v21:
-            # also include the conflicted subgraph using backward/forward reachability info from all
-            # the conflicted events. To calculate this, we want to extract the intersection between
-            # the backwards and forwards reachability sets, e.g:
-            #     A <- B <- C <- D <- E
-            #    Assume B and D are conflicted so we want {C} as the conflicted subgraph.
-            #    B_backwards={A}, B_forwards={C,D,E}
-            #    D_backwards={A,B,C} D_forwards={E}
-            #    ALL_backwards={A,B,C} ALL_forwards={C,D,E}
-            #    Intersection(ALL_backwards, ALL_forwards) = {C}
-            #
-            # It's worth noting that once we have the ALL_ sets, we no longer care about the paths.
-            # We're dealing with chains and not singular events, but we've already got the ALL_ sets.
-            # As such, we can inspect each chain in isolation and check for overlapping sequence
-            # numbers:
-            #             1,2,3,4,5 Seq Num
-            #    Chain N [A,B,C,D,E]
-            #
-            # if (N,4) is in the backwards set and (N,2) is in the forwards set, then the
-            # intersection is events between 2 < 4. We will include the conflicted events themselves
-            # in the subgraph, but they will already be, hence the full set of events is {B,C,D}.
-            for chain_id, backwards_seq_num in conflicted_backwards_reachable.items():
-                forwards_seq_num = conflicted_forwards_reachable.get(chain_id)
-                if forwards_seq_num is None:
-                    continue  # this chain isn't in both sets so can't intersect
-                if forwards_seq_num > backwards_seq_num:
-                    continue  # this chain is in both sets but they don't overap
-                for seq_no in range(
-                    forwards_seq_num, backwards_seq_num + 1
-                ):  # inclusive of both
-                    event_id = chain_to_event.get(chain_id, {}).get(seq_no)
-                    if event_id:
-                        conflicted_subgraph_result.add(event_id)
-                    else:
-                        conflicted_subgraph_chain_to_gap[chain_id] = (
-                            # _fetch_event_ids_from_chains_txn is exclusive of the min value
-                            forwards_seq_num - 1,
-                            backwards_seq_num,
-                        )
-                        break
-
-        if auth_diff_chain_to_gap:
-            auth_difference_result.update(
-                self._fetch_event_ids_from_chains_txn(txn, auth_diff_chain_to_gap)
+        if additional_backwards_reachable_conflicted_events:
+            backwards |= self._get_auth_chain_ids_txn(
+                txn,
+                additional_backwards_reachable_conflicted_events,
+                include_given=True,
             )
-        if conflicted_subgraph_chain_to_gap:
-            conflicted_subgraph_result.update(
-                self._fetch_event_ids_from_chains_txn(
-                    txn, conflicted_subgraph_chain_to_gap
+
+        forwards: set[str] = set(conflicted_set)
+        front = set(conflicted_set)
+        while front:
+            new_front: set[str] = set()
+            for chunk in batch_iter(front, 100):
+                clause, args = make_in_list_sql_clause(
+                    txn.database_engine, "auth_id", chunk
                 )
-            )
+                txn.execute(
+                    "SELECT event_id FROM event_auth WHERE " + clause,
+                    args,
+                )
+                new_front.update(
+                    event_id for (event_id,) in txn if event_id in backwards
+                )
+            new_front -= forwards
+            forwards.update(new_front)
+            front = new_front
 
         return StateDifference(
-            auth_difference=auth_difference_result,
-            conflicted_subgraph=conflicted_subgraph_result,
+            auth_difference=auth_difference,
+            conflicted_subgraph=backwards & forwards,
         )
-
-    def _fetch_event_ids_from_chains_txn(
-        self, txn: LoggingTransaction, chains: dict[int, tuple[int, int]]
-    ) -> set[str]:
-        result: set[str] = set()
-        if isinstance(self.database_engine, PostgresEngine):
-            # We can use `execute_values` to efficiently fetch the gaps when
-            # using postgres.
-            sql = """
-                SELECT event_id
-                FROM event_auth_chains AS c, (VALUES ?) AS l(chain_id, min_seq, max_seq)
-                WHERE
-                    c.chain_id = l.chain_id
-                    AND min_seq < sequence_number AND sequence_number <= max_seq
-            """
-
-            args = [
-                (chain_id, min_no, max_no)
-                for chain_id, (min_no, max_no) in chains.items()
-            ]
-
-            rows = txn.execute_values(sql, args)
-            result.update(r for (r,) in rows)
-        else:
-            # For SQLite we just fall back to doing a noddy for loop.
-            sql = """
-                SELECT event_id FROM event_auth_chains
-                WHERE chain_id = ? AND ? < sequence_number AND sequence_number <= ?
-            """
-            for chain_id, (min_no, max_no) in chains.items():
-                txn.execute(sql, (chain_id, min_no, max_no))
-                result.update(r for (r,) in txn)
-        return result
-
-    def _fixup_auth_chain_difference_sets(
-        self,
-        txn: LoggingTransaction,
-        room_id: str,
-        state_sets: list[set[str]],
-        events_missing_chain_info: set[str],
-        events_that_have_chain_index: Collection[str],
-    ) -> set[str]:
-        """Helper for `_get_auth_chain_difference_using_cover_index_txn` to
-        handle the case where we haven't calculated the chain cover index for
-        all events.
-
-        This modifies `state_sets` so that they only include events that have a
-        chain cover index, and returns a set of event IDs that are part of the
-        auth difference.
-        """
-
-        # This works similarly to the handling of unpersisted events in
-        # `synapse.state.v2_get_auth_chain_difference`. We uses the observation
-        # that if you can split the set of events into two classes X and Y,
-        # where no events in Y have events in X in their auth chain, then we can
-        # calculate the auth difference by considering X and Y separately.
-        #
-        # We do this in three steps:
-        #   1. Compute the set of events without chain cover index belonging to
-        #      the auth difference.
-        #   2. Replacing the un-indexed events in the state_sets with their auth
-        #      events, recursively, until the state_sets contain only indexed
-        #      events. We can then calculate the auth difference of those state
-        #      sets using the chain cover index.
-        #   3. Add the results of 1 and 2 together.
-
-        # By construction we know that all events that we haven't persisted the
-        # chain cover index for are contained in
-        # `event_auth_chain_to_calculate`, so we pull out the events from those
-        # rather than doing recursive queries to walk the auth chain.
-        #
-        # We pull out those events with their auth events, which gives us enough
-        # information to construct the auth chain of an event up to auth events
-        # that have the chain cover index.
-        sql = """
-            SELECT tc.event_id, ea.auth_id, eac.chain_id IS NOT NULL
-            FROM event_auth_chain_to_calculate AS tc
-            LEFT JOIN event_auth AS ea USING (event_id)
-            LEFT JOIN event_auth_chains AS eac ON (ea.auth_id = eac.event_id)
-            WHERE tc.room_id = ?
-        """
-        txn.execute(sql, (room_id,))
-        event_to_auth_ids: dict[str, set[str]] = {}
-        events_that_have_chain_index = set(events_that_have_chain_index)
-        for event_id, auth_id, auth_id_has_chain in txn:
-            s = event_to_auth_ids.setdefault(event_id, set())
-            if auth_id is not None:
-                s.add(auth_id)
-                if auth_id_has_chain:
-                    events_that_have_chain_index.add(auth_id)
-
-        if events_missing_chain_info - event_to_auth_ids.keys():
-            # Uh oh, we somehow haven't correctly done the chain cover index,
-            # bail and fall back to the old method.
-            logger.error(
-                "Unexpectedly found that events don't have chain IDs in room %s: %s",
-                room_id,
-                events_missing_chain_info - event_to_auth_ids.keys(),
-            )
-            raise _NoChainCoverIndex(room_id)
-
-        # Create a map from event IDs we care about to their partial auth chain.
-        event_id_to_partial_auth_chain: dict[str, set[str]] = {}
-        for event_id, auth_ids in event_to_auth_ids.items():
-            if not any(event_id in state_set for state_set in state_sets):
-                continue
-
-            processing = set(auth_ids)
-            to_add = set()
-            while processing:
-                auth_id = processing.pop()
-                to_add.add(auth_id)
-
-                sub_auth_ids = event_to_auth_ids.get(auth_id)
-                if sub_auth_ids is None:
-                    continue
-
-                processing.update(sub_auth_ids - to_add)
-
-            event_id_to_partial_auth_chain[event_id] = to_add
-
-        # Now we do two things:
-        #   1. Update the state sets to only include indexed events; and
-        #   2. Create a new list containing the auth chains of the un-indexed
-        #      events
-        unindexed_state_sets: list[set[str]] = []
-        for state_set in state_sets:
-            unindexed_state_set = set()
-            for event_id, auth_chain in event_id_to_partial_auth_chain.items():
-                if event_id not in state_set:
-                    continue
-
-                unindexed_state_set.add(event_id)
-
-                state_set.discard(event_id)
-                state_set.difference_update(auth_chain)
-                for auth_id in auth_chain:
-                    if auth_id in events_that_have_chain_index:
-                        state_set.add(auth_id)
-                    else:
-                        unindexed_state_set.add(auth_id)
-
-            unindexed_state_sets.append(unindexed_state_set)
-
-        # Calculate and return the auth difference of the un-indexed events.
-        union = unindexed_state_sets[0].union(*unindexed_state_sets[1:])
-        intersection = unindexed_state_sets[0].intersection(*unindexed_state_sets[1:])
-
-        return union - intersection
 
     def _get_auth_chain_difference_txn(
         self, txn: LoggingTransaction, state_sets: list[set[str]]
     ) -> set[str]:
-        """Calculates the auth chain difference using a breadth first search.
-
-        This is used when we don't have a cover index for the room.
-        """
+        """Calculates auth-chain difference using SQL graph traversals."""
 
         # Algorithm Description
         # ~~~~~~~~~~~~~~~~~~~~~
@@ -3458,6 +2528,14 @@ class EventFederationStore(EventFederationWorkerStore):
     async def _background_delete_non_state_event_auth(
         self, progress: JsonDict, batch_size: int
     ) -> int:
+        if self._embedded_db_engine is not None:
+            # The table is no longer part of the live graph after the mtxdb
+            # cutover. Retire any queued legacy cleanup without scanning SQL.
+            await self.db_pool.updates._end_background_update(
+                self.EVENT_AUTH_STATE_ONLY
+            )
+            return 0
+
         def delete_event_auth(txn: LoggingTransaction) -> bool:
             target_min_stream_id = progress.get("target_min_stream_id_inclusive")
             max_stream_id = progress.get("max_stream_id_exclusive")
@@ -3506,143 +2584,3 @@ class EventFederationStore(EventFederationWorkerStore):
             )
 
         return batch_size
-
-
-def _materialize(
-    origin_chain_id: int,
-    origin_sequence_number: int,
-    links: dict[int, list[tuple[int, int, int]]],
-    materialized: dict[int, int],
-    backwards: bool = True,
-) -> None:
-    """Helper function for fetching auth chain links. For a given origin chain
-    ID / sequence number and a dictionary of links, updates the materialized
-    dict with the reachable chains.
-
-    To get a dict of all chains reachable from a set of chains this function can
-    be called in a loop, once per origin chain with the same links and
-    materialized args. The materialized dict will the result.
-
-    Args:
-        origin_chain_id, origin_sequence_number
-        links: map of the links between chains as a dict from origin chain ID
-            to list of 3-tuples of origin sequence number, target chain ID and
-            target sequence number.
-        materialized: dict to update with new reachability information, as a
-            map from chain ID to max sequence number reachable.
-        backwards: If True, walks backwards down the chains. If False, walks forwards from the chains.
-    """
-
-    # Do a standard graph traversal.
-    stack = [(origin_chain_id, origin_sequence_number)]
-
-    while stack:
-        c, s = stack.pop()
-
-        chain_links = links.get(c, [])
-        for (
-            sequence_number,
-            target_chain_id,
-            target_sequence_number,
-        ) in chain_links:
-            if backwards:
-                # Ignore any links that are higher up the chain
-                if sequence_number > s:
-                    continue
-
-                # Check if we have already visited the target chain before, if so we
-                # can skip it.
-                if materialized.get(target_chain_id, 0) < target_sequence_number:
-                    stack.append((target_chain_id, target_sequence_number))
-                    materialized[target_chain_id] = target_sequence_number
-            else:
-                # Ignore any links that are lower down the chain.
-                if sequence_number < s:
-                    continue
-                # Check if we have already visited the target chain before, if so we
-                # can skip it.
-                if (
-                    materialized.get(target_chain_id, MAX_CHAIN_LENGTH)
-                    > target_sequence_number
-                ):
-                    stack.append((target_chain_id, target_sequence_number))
-                    materialized[target_chain_id] = target_sequence_number
-
-
-def _generate_forward_links(
-    links: dict[int, list[tuple[int, int, int]]],
-) -> dict[int, list[tuple[int, int, int]]]:
-    """Reverse the input links from the given backwards links"""
-    new_links: dict[int, list[tuple[int, int, int]]] = {}
-    for origin_chain_id, chain_links in links.items():
-        for origin_seq_num, target_chain_id, target_seq_num in chain_links:
-            new_links.setdefault(target_chain_id, []).append(
-                (target_seq_num, origin_chain_id, origin_seq_num)
-            )
-    return new_links
-
-
-def accumulate_forwards_reachable_events(
-    conflicted_forwards_reachable: dict[int, int],
-    back_links: dict[int, list[tuple[int, int, int]]],
-    conflicted_chain_positions: dict[str, tuple[int, int]],
-) -> None:
-    """Accumulate new forwards reachable events using the back_links provided.
-
-    Accumulating forwards reachable information is quite different from backwards reachable information
-    because _get_chain_links returns the entire linkage information for backwards reachable events,
-    but not _forwards_ reachable events. We are only interested in the forwards reachable information
-    that is encoded in the backwards reachable links, so we can just invert all the operations we do
-    for backwards reachable events to calculate a subset of forwards reachable information. The
-    caveat with this approach is that it is a _subset_. This means new back_links may encode new
-    forwards reachable information which we also need. Consider this scenario:
-
-    A <-- B <-- C <--- D <-- E <-- F         Chain 1
-                |
-                `----- G <-- H <-- I         Chain 2
-                             |
-                             `---- J <-- K   Chain 3
-
-    Now consider what happens when B is a conflicted event. _get_chain_links returns the conflicted
-    chain and ALL links heading towards the root of the graph. This means we will know the
-    Chain 1 to Chain 2 link via C (as all links for the chain are returned, not strictly ones with
-    a lower sequence number), but we will NOT know the Chain 2 to Chain 3 link via H. We can be
-    blissfully unaware of Chain 3 entirely, if and only if there isn't some other conflicted event
-    on that chain. Consider what happens when K is /also/ conflicted. _get_chain_links will generate
-    two iterations: one for B and one for K. It's important that we re-evaluate the forwards reachable
-    information for B to include Chain 3 when we process the K iteration, hence we are "accumulating"
-    forwards reachability information.
-
-    NB: We don't consider 'additional backwards reachable events' here because they have no effect
-    on forwards reachability calculations, only backwards.
-
-    Args:
-      conflicted_forwards_reachable: The materialised dict of forwards reachable information.
-      The output to this function are stored here.
-      back_links: One iteration of _get_chain_links which encodes backwards reachable information.
-      conflicted_chain_positions: The conflicted events.
-    """
-    # links go backwards but we want them to go forwards as well for v2.1
-    fwd_links = _generate_forward_links(back_links)
-
-    # for each conflicted event, accumulate forwards reachability information
-    for (
-        conflicted_chain_id,
-        conflicted_chain_seq,
-    ) in conflicted_chain_positions.values():
-        # the conflicted event itself encodes reachability information
-        # e.g if D was conflicted, it encodes E,F as forwards reachable.
-        conflicted_forwards_reachable[conflicted_chain_id] = min(
-            conflicted_chain_seq,
-            conflicted_forwards_reachable.get(conflicted_chain_id, MAX_CHAIN_LENGTH),
-        )
-        # Walk from the conflicted event forwards to explore the links.
-        # This function checks if we've visited the chain before and skips reprocessing, so this
-        # does not repeatedly traverse the graph.
-        _materialize(
-            conflicted_chain_id,
-            conflicted_chain_seq,
-            fwd_links,
-            conflicted_forwards_reachable,
-            backwards=False,
-        )

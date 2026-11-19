@@ -50,14 +50,11 @@ logger = logging.getLogger(__name__)
 
 
 purge_room_tables_with_event_id_index = (
-    "event_auth",
     "event_edges",
     "event_json",
     "event_push_actions_staging",
     "event_relations",
     "event_to_state_groups",
-    "event_auth_chains",
-    "event_auth_chain_to_calculate",
     "redactions",
     "rejections",
     "state_events",
@@ -698,17 +695,11 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
                     room_id,
                 )
 
-        # Get all the auth chains that are referenced by events that are to be
-        # deleted.
-        txn.execute(
-            """
-            SELECT chain_id, sequence_number FROM events
-            LEFT JOIN event_auth_chains USING (event_id)
-            WHERE room_id = ?
-            """,
-            (room_id,),
-        )
-        referenced_chain_id_tuples = list(txn)
+        # event_auth is still retained as an offline migration snapshot, so
+        # it may contain rows whose event rows are already absent (for
+        # example, after an earlier partial purge). Delete by its own room_id
+        # before removing events, rather than relying on an events subquery.
+        txn.execute("DELETE FROM event_auth WHERE room_id = ?", (room_id,))
 
         room_event_ids: list[str] = []
         room_redacted_event_ids: list[str] = []
@@ -724,37 +715,6 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             room_redacted_event_ids = [
                 redacts for (redacts,) in txn if redacts is not None
             ]
-
-        logger.info("[purge] removing from event_auth_chain_links")
-        if getattr(self, "_embedded_event_json_enabled", False):
-            # Exclusive by configured engine, not a dual-write -- see
-            # embedded_event_auth_chain_links.py. The `LEFT JOIN` above can
-            # yield `(None, None)` for events with no chain cover entry
-            # (e.g. non-state events); a raw SQL `WHERE origin_chain_id =
-            # NULL` matches nothing harmlessly, but building an mtxdb key
-            # from `None` would crash, so filter those out explicitly.
-            from synapse.storage.databases.main.embedded_event_auth_chain_links import (
-                delete_chain_links_batch,
-            )
-
-            delete_chain_links_batch(
-                self._embedded_db_engine,
-                self._embedded_db_namespace,
-                [
-                    (chain_id, sequence_number)
-                    for chain_id, sequence_number in referenced_chain_id_tuples
-                    if chain_id is not None
-                ],
-                sync=True,
-            )
-        else:
-            txn.executemany(
-                """
-                DELETE FROM event_auth_chain_links WHERE
-                origin_chain_id = ? AND origin_sequence_number = ?
-                """,
-                referenced_chain_id_tuples,
-            )
 
         # Now we delete tables which lack an index on `room_id` but have one on `event_id`
         for table in purge_room_tables_with_event_id_index:

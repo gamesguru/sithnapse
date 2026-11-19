@@ -95,12 +95,10 @@ from synapse.storage.databases.main.embedded_event_json import (
     open_embedded_event_json_engine,
 )
 from synapse.storage.databases.main.embedded_redactions import get_redactions_batch
-from synapse.storage.types import Cursor
 from synapse.storage.util.id_generators import (
     AbstractStreamIdGenerator,
     MultiWriterIdGenerator,
 )
-from synapse.storage.util.sequence import build_sequence_generator
 from synapse.types import JsonDict, get_domain_from_id
 from synapse.types.state import StateFilter
 from synapse.types.storage import _BackgroundUpdates
@@ -369,22 +367,6 @@ class EventsWorkerStore(SQLBaseStore):
         self._event_fetch_ongoing = 0
         event_fetch_ongoing_gauge.labels(**{SERVER_NAME_LABEL: self.server_name}).set(
             self._event_fetch_ongoing
-        )
-
-        # We define this sequence here so that it can be referenced from both
-        # the DataStore and PersistEventStore.
-        def get_chain_id_txn(txn: Cursor) -> int:
-            txn.execute("SELECT COALESCE(max(chain_id), 0) FROM event_auth_chains")
-            return cast(tuple[int], txn.fetchone())[0]
-
-        self.event_chain_id_gen = build_sequence_generator(
-            db_conn,
-            database.engine,
-            get_chain_id_txn,
-            "event_auth_chain_id",
-            table="event_auth_chains",
-            id_column="chain_id",
-            db_is_fresh=database.is_fresh,
         )
 
         self._un_partial_stated_events_stream_id_gen: AbstractStreamIdGenerator

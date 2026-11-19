@@ -1308,7 +1308,6 @@ class SlidingSyncTablesTestCase(SlidingSyncTablesTestCaseBase):
                 new_forward_extremities={message_tuple[0].event_id},
                 use_negative_stream_ordering=False,
                 inhibit_local_membership_updates=False,
-                new_event_links={},
             )
         )
 
@@ -2768,7 +2767,6 @@ class SlidingSyncTablesTestCase(SlidingSyncTablesTestCaseBase):
                 new_forward_extremities={message_tuple[0].event_id},
                 use_negative_stream_ordering=False,
                 inhibit_local_membership_updates=False,
-                new_event_links={},
             )
         )
 

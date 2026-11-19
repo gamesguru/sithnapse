@@ -127,7 +127,7 @@ BOOLEAN_COLUMNS = {
     "remote_media_cache": ["authenticated"],
     "room_memberships": ["participant"],
     "room_stats_state": ["is_federatable"],
-    "rooms": ["is_public", "has_auth_chain_index"],
+    "rooms": ["is_public"],
     "server_signature_keys": ["seen_active"],
     "sliding_sync_joined_rooms": ["is_encrypted"],
     "sliding_sync_membership_snapshots": [
@@ -915,7 +915,6 @@ class Porter:
                     ("presence_stream", "stream_id"),
                 ],
             )
-            await self._setup_auth_chain_sequence()
             await self._setup_sequence(
                 "application_services_txn_id_seq",
                 [
@@ -1407,30 +1406,6 @@ class Porter:
         return await self.postgres_store.db_pool.runInteraction(
             "_pg_get_serial_sequence", r
         )
-
-    async def _setup_auth_chain_sequence(self) -> None:
-        curr_chain_id: (
-            int | None
-        ) = await self.sqlite_store.db_pool.simple_select_one_onecol(
-            table="event_auth_chains",
-            keyvalues={},
-            retcol="MAX(chain_id)",
-            allow_none=True,
-        )
-
-        def r(txn: LoggingTransaction) -> None:
-            # Presumably there is at least one row in event_auth_chains.
-            assert curr_chain_id is not None
-            txn.execute(
-                "ALTER SEQUENCE event_auth_chain_id RESTART WITH %s",
-                (curr_chain_id + 1,),
-            )
-
-        if curr_chain_id is not None:
-            await self.postgres_store.db_pool.runInteraction(
-                "_setup_event_auth_chain_id",
-                r,
-            )
 
 
 ##############################################

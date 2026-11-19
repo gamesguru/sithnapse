@@ -113,7 +113,7 @@ def open_embedded_event_json_engine(hs: "HomeServer") -> bool:
 
     Keys are namespaced by `embedded_db_namespace` (see `_event_json_key`),
     same scheme `embedded_event_to_state_group.py`/
-    `embedded_event_auth_chain_links.py` already use, so multiple
+    other embedded collections already use, so multiple
     homeservers sharing one mtxdb file don't collide on event_id.
     """
     return bool(

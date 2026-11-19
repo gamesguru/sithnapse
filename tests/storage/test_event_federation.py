@@ -20,7 +20,6 @@
 
 import datetime
 import random
-import unittest
 from typing import (
     Collection,
     Iterable,
@@ -49,10 +48,6 @@ from synapse.rest import admin
 from synapse.rest.client import login, room
 from synapse.server import HomeServer
 from synapse.storage.database import LoggingTransaction
-from synapse.storage.databases.main.embedded_event_auth_chain_links import (
-    put_chain_links_batch,
-    resolve_namespace,
-)
 from synapse.storage.types import Cursor
 from synapse.synapse_rust.events import EventInternalMetadata
 from synapse.synapse_rust.room_versions import RoomVersions
@@ -328,10 +323,10 @@ class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
         r = self.get_success(self.store.get_rooms_with_many_extremities(5, 1, [room1]))
         self.assertTrue(r == [room2] or r == [room3])
 
-    def _setup_auth_chain(self, use_chain_cover_index: bool) -> str:
+    def _setup_auth_chain(self) -> str:
         room_id = "@ROOM:local"
 
-        # Mark the room as maybe having a cover index.
+        # Store the room metadata needed by the SQL auth-graph fixtures.
 
         def store_room(txn: LoggingTransaction) -> None:
             self.store.db_pool.simple_insert_txn(
@@ -342,7 +337,6 @@ class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
                     "creator": "room_creator_user_id",
                     "is_public": True,
                     "room_version": "6",
-                    "has_auth_chain_index": use_chain_cover_index,
                 },
             )
 
@@ -377,16 +371,7 @@ class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
                 cast(EventBase, FakeEvent(event_id, room_id, AUTH_GRAPH[event_id]))
                 for event_id in AUTH_GRAPH
             ]
-            new_event_links = (
-                self.persist_events.calculate_chain_cover_index_for_events_txn(
-                    txn, room_id, [e for e in events if e.is_state()]
-                )
-            )
-            self.persist_events._persist_event_auth_chain_txn(
-                txn,
-                events,
-                new_event_links,
-            )
+            self.persist_events._persist_event_auth_chain_txn(txn, events)
 
         self.get_success(
             self.store.db_pool.runInteraction(
@@ -397,9 +382,8 @@ class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
 
         return room_id
 
-    @parameterized.expand([(True,), (False,)])
-    def test_auth_chain_ids(self, use_chain_cover_index: bool) -> None:
-        room_id = self._setup_auth_chain(use_chain_cover_index)
+    def test_auth_chain_ids(self) -> None:
+        room_id = self._setup_auth_chain()
 
         # a and b have the same auth chain.
         auth_chain_ids = self.get_success(self.store.get_auth_chain_ids(room_id, ["a"]))
@@ -462,52 +446,10 @@ class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
         )
         self.assertCountEqual(auth_chain_ids, ["i", "j"])
 
-    @parameterized.expand([(True,), (False,)])
-    def test_auth_difference(self, use_chain_cover_index: bool) -> None:
-        room_id = self._setup_auth_chain(use_chain_cover_index)
+    def test_auth_difference(self) -> None:
+        room_id = self._setup_auth_chain()
 
         # Now actually test that various combinations give the right result:
-        self.assert_auth_diff_is_expected(room_id)
-
-    @parameterized.expand(
-        [
-            [graph_subset]
-            for graph_subset in get_all_topologically_consistent_subsets(
-                AUTH_GRAPH, AUTH_GRAPH
-            )
-        ]
-    )
-    def test_auth_difference_partial(self, graph_subset: Collection[str]) -> None:
-        """Test that if we only have a chain cover index on a partial subset of
-        the room we still get the correct auth chain difference.
-
-        We do this by removing the chain cover index for every valid subset of the
-        graph.
-        """
-        room_id = self._setup_auth_chain(True)
-
-        for event_id in graph_subset:
-            # Remove chain cover from that event.
-            self.get_success(
-                self.store.db_pool.simple_delete(
-                    table="event_auth_chains",
-                    keyvalues={"event_id": event_id},
-                    desc="test_auth_difference_partial_remove",
-                )
-            )
-            self.get_success(
-                self.store.db_pool.simple_insert(
-                    table="event_auth_chain_to_calculate",
-                    values={
-                        "event_id": event_id,
-                        "room_id": room_id,
-                        "type": "",
-                        "state_key": "",
-                    },
-                    desc="test_auth_difference_partial_remove",
-                )
-            )
-
         self.assert_auth_diff_is_expected(room_id)
 
     def assert_auth_diff_is_expected(self, room_id: str) -> None:
@@ -552,430 +494,24 @@ class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
         )
         self.assertSetEqual(difference, set())
 
-    def test_auth_difference_partial_cover(self) -> None:
-        """Test that we correctly handle rooms where not all events have a chain
-        cover calculated. This can happen in some obscure edge cases, including
-        during the background update that calculates the chain cover for old
-        rooms.
-        """
-
-        # We allow partial covers for this test
-        self.hs.get_datastores().main.tests_allow_no_chain_cover_index = True
-
-        room_id = "@ROOM:local"
-
-        # The silly auth graph we use to test the auth difference algorithm,
-        # where the top are the most recent events.
-        #
-        #   A   B
-        #    \ /
-        #  D  E
-        #  \  |
-        #   ` F   C
-        #     |  /|
-        #     G ´ |
-        #     | \ |
-        #     H   I
-        #     |   |
-        #     K   J
-
-        auth_graph: dict[str, list[str]] = {
-            "a": ["e"],
-            "b": ["e"],
-            "c": ["g", "i"],
-            "d": ["f"],
-            "e": ["f"],
-            "f": ["g"],
-            "g": ["h", "i"],
-            "h": ["k"],
-            "i": ["j"],
-            "k": [],
-            "j": [],
-        }
-
-        depth_map = {
-            "a": 7,
-            "b": 7,
-            "c": 4,
-            "d": 6,
-            "e": 6,
-            "f": 5,
-            "g": 3,
-            "h": 2,
-            "i": 2,
-            "k": 1,
-            "j": 1,
-        }
-
-        # We rudely fiddle with the appropriate tables directly, as that's much
-        # easier than constructing events properly.
-
-        def insert_event(txn: LoggingTransaction) -> None:
-            # First insert the room and mark it as having a chain cover.
-            self.store.db_pool.simple_insert_txn(
-                txn,
-                "rooms",
-                {
-                    "room_id": room_id,
-                    "creator": "room_creator_user_id",
-                    "is_public": True,
-                    "room_version": "6",
-                    "has_auth_chain_index": True,
-                },
-            )
-
-            stream_ordering = 0
-
-            for event_id in auth_graph:
-                stream_ordering += 1
-                depth = depth_map[event_id]
-
-                self.store.db_pool.simple_insert_txn(
-                    txn,
-                    table="events",
-                    values={
-                        "event_id": event_id,
-                        "room_id": room_id,
-                        "depth": depth,
-                        "topological_ordering": depth,
-                        "type": "m.test",
-                        "processed": True,
-                        "outlier": False,
-                        "stream_ordering": stream_ordering,
-                    },
-                )
-
-            # Insert all events apart from 'B'
-            events = [
-                cast(EventBase, FakeEvent(event_id, room_id, auth_graph[event_id]))
-                for event_id in auth_graph
-                if event_id != "b"
-            ]
-            new_event_links = (
-                self.persist_events.calculate_chain_cover_index_for_events_txn(
-                    txn, room_id, [e for e in events if e.is_state()]
-                )
-            )
-            self.persist_events._persist_event_auth_chain_txn(
-                txn,
-                events,
-                new_event_links,
-            )
-
-            # Now we insert the event 'B' without a chain cover, by temporarily
-            # pretending the room doesn't have a chain cover.
-
-            self.store.db_pool.simple_update_txn(
-                txn,
-                table="rooms",
-                keyvalues={"room_id": room_id},
-                updatevalues={"has_auth_chain_index": False},
-            )
-
-            events = [cast(EventBase, FakeEvent("b", room_id, auth_graph["b"]))]
-            new_event_links = (
-                self.persist_events.calculate_chain_cover_index_for_events_txn(
-                    txn, room_id, [e for e in events if e.is_state()]
-                )
-            )
-            self.persist_events._persist_event_auth_chain_txn(
-                txn, events, new_event_links
-            )
-
-            self.store.db_pool.simple_update_txn(
-                txn,
-                table="rooms",
-                keyvalues={"room_id": room_id},
-                updatevalues={"has_auth_chain_index": True},
-            )
-
-        self.get_success(
-            self.store.db_pool.runInteraction(
-                "insert",
-                insert_event,
-            )
-        )
-
-        # Now actually test that various combinations give the right result:
-
-        difference = self.get_success(
-            self.store.get_auth_chain_difference(room_id, [{"a"}, {"b"}])
-        )
-        self.assertSetEqual(difference, {"a", "b"})
-
-        difference = self.get_success(
-            self.store.get_auth_chain_difference(room_id, [{"a"}, {"b"}, {"c"}])
-        )
-        self.assertSetEqual(difference, {"a", "b", "c", "e", "f"})
-
-        difference = self.get_success(
-            self.store.get_auth_chain_difference(room_id, [{"a", "c"}, {"b"}])
-        )
-        self.assertSetEqual(difference, {"a", "b", "c"})
-
-        difference = self.get_success(
-            self.store.get_auth_chain_difference(room_id, [{"a", "c"}, {"b", "c"}])
-        )
-        self.assertSetEqual(difference, {"a", "b"})
-
-        difference = self.get_success(
-            self.store.get_auth_chain_difference(room_id, [{"a"}, {"b"}, {"d"}])
-        )
-        self.assertSetEqual(difference, {"a", "b", "d", "e"})
-
-        difference = self.get_success(
-            self.store.get_auth_chain_difference(room_id, [{"a"}, {"b"}, {"c"}, {"d"}])
-        )
-        self.assertSetEqual(difference, {"a", "b", "c", "d", "e", "f"})
-
-        difference = self.get_success(
-            self.store.get_auth_chain_difference(room_id, [{"a"}, {"b"}, {"e"}])
-        )
-        self.assertSetEqual(difference, {"a", "b"})
-
-        difference = self.get_success(
-            self.store.get_auth_chain_difference(room_id, [{"a"}])
-        )
-        self.assertSetEqual(difference, set())
-
-    def test_conflicted_subgraph(self) -> None:
-        """Test that the conflicted subgraph code in state res v2.1 can walk arbitrary length links
-        and chains.
-
-        We construct a chain cover index like this:
-
-        A1 <- A2 <- A3
-               ^--- B1 <- B2 <- B3
-                           ^--- C1 <- C2 <- C3     v--- G1 <- G2
-                                 ^--- D1 <- D2 <- D3
-                                             ^--- E1
-                                                   ^--- F1 <- F2
-
-        ..and then pick various events to be conflicted / additional backwards reachable to assert
-        that the code walks the chains correctly. We're particularly interested in ensuring that
-        the code walks multiple links between chains, hence why we have so many chains.
-        """
-
-        class TestNode(NamedTuple):
-            event_id: str
-            chain_id: int
-            seq_num: int
-
-        class TestLink(NamedTuple):
-            origin_chain_and_seq: tuple[int, int]
-            target_chain_and_seq: tuple[int, int]
-
-        # Map to chain IDs / seq nums
-        nodes: list[TestNode] = [
-            TestNode("A1", 1, 1),
-            TestNode("A2", 1, 2),
-            TestNode("A3", 1, 3),
-            TestNode("B1", 2, 1),
-            TestNode("B2", 2, 2),
-            TestNode("B3", 2, 3),
-            TestNode("C1", 3, 1),
-            TestNode("C2", 3, 2),
-            TestNode("C3", 3, 3),
-            TestNode("D1", 4, 1),
-            TestNode("D2", 4, 2),
-            TestNode("D3", 4, 3),
-            TestNode("E1", 5, 1),
-            TestNode("F1", 6, 1),
-            TestNode("F2", 6, 2),
-            TestNode("G1", 7, 1),
-            TestNode("G2", 7, 2),
-        ]
-        links: list[TestLink] = [
-            TestLink((2, 1), (1, 2)),  # B1 -> A2
-            TestLink((3, 1), (2, 2)),  # C1 -> B2
-            TestLink((4, 1), (3, 1)),  # D1 -> C1
-            TestLink((5, 1), (4, 2)),  # E1 -> D2
-            TestLink((6, 1), (5, 1)),  # F1 -> E1
-            TestLink((7, 1), (4, 3)),  # G1 -> D3
-        ]
-
-        # populate the chain cover index tables as that's all we need
-        for node in nodes:
-            self.get_success(
-                self.store.db_pool.simple_insert(
-                    "event_auth_chains",
-                    {
-                        "event_id": node.event_id,
-                        "chain_id": node.chain_id,
-                        "sequence_number": node.seq_num,
-                    },
-                    desc="insert",
-                )
-            )
-        # Links are exclusive to whichever engine is configured (SQL or the
-        # embedded mtxdb engine -- see `_persist_chain_cover_index`), so
-        # insert the fixture the same way the production write path does
-        # rather than always writing straight to the SQL table, otherwise
-        # this test would only ever check the SQL backend under the
-        # trial-mtxdb CI job's `embedded_db_engine` config.
-        embedded_db_namespace = resolve_namespace(self.store)
-        if embedded_db_namespace is not None:
-            put_chain_links_batch(
-                getattr(self.store, "_embedded_db_engine", None),
-                embedded_db_namespace,
-                [
-                    (
-                        link.origin_chain_and_seq[0],
-                        link.origin_chain_and_seq[1],
-                        link.target_chain_and_seq[0],
-                        link.target_chain_and_seq[1],
-                    )
-                    for link in links
-                ],
-            )
-        else:
-            for link in links:
-                self.get_success(
-                    self.store.db_pool.simple_insert(
-                        "event_auth_chain_links",
-                        {
-                            "origin_chain_id": link.origin_chain_and_seq[0],
-                            "origin_sequence_number": link.origin_chain_and_seq[1],
-                            "target_chain_id": link.target_chain_and_seq[0],
-                            "target_sequence_number": link.target_chain_and_seq[1],
-                        },
-                        desc="insert",
-                    )
-                )
-
-        # Define the test cases
-        class TestCase(NamedTuple):
-            name: str
-            conflicted: set[str]
-            additional_backwards_reachable: set[str]
-            want_conflicted_subgraph: set[str]
-
-        # Reminder:
-        # A1 <- A2 <- A3
-        #        ^--- B1 <- B2 <- B3
-        #                    ^--- C1 <- C2 <- C3     v--- G1 <- G2
-        #                          ^--- D1 <- D2 <- D3
-        #                                      ^--- E1
-        #                                            ^--- F1 <- F2
-        test_cases = [
-            TestCase(
-                name="basic_single_chain",
-                conflicted={"B1", "B3"},
-                additional_backwards_reachable=set(),
-                want_conflicted_subgraph={"B1", "B2", "B3"},
-            ),
-            TestCase(
-                name="basic_single_link",
-                conflicted={"A1", "B2"},
-                additional_backwards_reachable=set(),
-                want_conflicted_subgraph={"A1", "A2", "B1", "B2"},
-            ),
-            TestCase(
-                name="basic_multi_link",
-                conflicted={"B1", "F1"},
-                additional_backwards_reachable=set(),
-                want_conflicted_subgraph={"B1", "B2", "C1", "D1", "D2", "E1", "F1"},
-            ),
-            # Repeat these tests but put the later event as an additional backwards reachable event.
-            # The output should be the same.
-            TestCase(
-                name="basic_single_chain_as_additional",
-                conflicted={"B1"},
-                additional_backwards_reachable={"B3"},
-                want_conflicted_subgraph={"B1", "B2", "B3"},
-            ),
-            TestCase(
-                name="basic_single_link_as_additional",
-                conflicted={"A1"},
-                additional_backwards_reachable={"B2"},
-                want_conflicted_subgraph={"A1", "A2", "B1", "B2"},
-            ),
-            TestCase(
-                name="basic_multi_link_as_additional",
-                conflicted={"B1"},
-                additional_backwards_reachable={"F1"},
-                want_conflicted_subgraph={"B1", "B2", "C1", "D1", "D2", "E1", "F1"},
-            ),
-            TestCase(
-                name="mixed_multi_link",
-                conflicted={"D1", "F1"},
-                additional_backwards_reachable={"G1"},
-                want_conflicted_subgraph={"D1", "D2", "D3", "E1", "F1", "G1"},
-            ),
-            TestCase(
-                name="additional_backwards_doesnt_add_forwards_info",
-                conflicted={"C1", "C3"},
-                # This is on the path to the root but Chain C isn't forwards reachable so this doesn't
-                # change anything.
-                additional_backwards_reachable={"B1"},
-                want_conflicted_subgraph={"C1", "C2", "C3"},
-            ),
-            TestCase(
-                name="empty_subgraph",
-                conflicted={
-                    "B3",
-                    "C3",
-                },  # these can't reach each other going forwards, so the subgraph is empty
-                additional_backwards_reachable=set(),
-                want_conflicted_subgraph={"B3", "C3"},
-            ),
-            TestCase(
-                name="empty_subgraph_with_additional",
-                conflicted={"C1"},
-                # This is on the path to the root but Chain C isn't forwards reachable so this doesn't
-                # change anything.
-                additional_backwards_reachable={"B1"},
-                want_conflicted_subgraph={"C1"},
-            ),
-            TestCase(
-                name="empty_subgraph_single_conflict",
-                conflicted={"C1"},  # no subgraph can form as you need 2+
-                additional_backwards_reachable=set(),
-                want_conflicted_subgraph={"C1"},
-            ),
-        ]
-
-        def run_test(txn: LoggingTransaction, test_case: TestCase) -> None:
-            result = self.store._get_auth_chain_difference_using_cover_index_txn(
-                txn,
-                "!not_relevant",
-                [test_case.conflicted.union(test_case.additional_backwards_reachable)],
-                test_case.conflicted,
-                test_case.additional_backwards_reachable,
-            )
-            self.assertEqual(
-                result.conflicted_subgraph,
-                test_case.want_conflicted_subgraph,
-                f"{test_case.name} : conflicted subgraph mismatch",
-            )
-
-        for test_case in test_cases:
-            self.get_success(
-                self.store.db_pool.runInteraction(
-                    f"test_case_{test_case.name}", run_test, test_case
-                )
-            )
-
-    @unittest.skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
     def test_conflicted_subgraph_embedded_closures(self) -> None:
         """Embedded-closures counterpart to `test_conflicted_subgraph`.
 
-        The fixture above is a chain-cover **(chain id, seq num, link)**
-        description; the embedded closures path instead navigates a plain
-        auth DAG (short ids + direct auth edges), so this test expresses the
-        same ancestry as *direct edges* and asserts
-        `_get_auth_chain_difference_using_embedded_closures_txn` returns the
-        very same `want_conflicted_subgraph` sets the chain-cover code is held
-        to. Both implementations must agree; if one drifts, this is the guard.
+        The fixture above describes ancestry using chain links; the embedded
+        closures path navigates a plain auth DAG (short ids + direct auth
+        edges). This test expresses the same ancestry as direct edges and
+        asserts `_get_auth_chain_difference_using_embedded_closures` returns
+        the same expected conflicted subgraph.
 
         The edge set is derived from the links: an event that "links into" a
         chain at position `n` auths every position `<= n` of that chain, plus
-        its own chain's predecessors -- the chain-cover semantics that the
-        want sets above were computed under.
+        its own chain's predecessors, which is how the expected sets above
+        were computed.
         """
         from synapse.storage.databases.main.embedded_event_auth_chains import (
             embed_auth_edges_batch,
             get_or_create_short_ids,
+            resolve_namespace,
         )
 
         embedded_db_namespace = resolve_namespace(self.store)
@@ -1096,9 +632,8 @@ class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
             ),
         ]
 
-        def run_test(txn: LoggingTransaction, test_case: TestCase) -> None:
-            result = self.store._get_auth_chain_difference_using_embedded_closures_txn(
-                txn,
+        def run_test(test_case: TestCase) -> None:
+            result = self.store._get_auth_chain_difference_using_embedded_closures(
                 embedded_db_namespace,
                 room_id,
                 [test_case.conflicted.union(test_case.additional_backwards_reachable)],
@@ -1112,11 +647,7 @@ class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
             )
 
         for test_case in test_cases:
-            self.get_success(
-                self.store.db_pool.runInteraction(
-                    f"embedded_test_case_{test_case.name}", run_test, test_case
-                )
-            )
+            run_test(test_case)
 
     @parameterized.expand(
         [(room_version,) for room_version in KNOWN_ROOM_VERSIONS.values()]
@@ -2075,30 +1606,11 @@ class FakeEvent:
         return True
 
 
-class WarnedIncompleteAuthGraphCacheTestCase(unittest.TestCase):
-    def test_dedup_and_ttl_and_eviction(self) -> None:
-        from synapse.storage.databases.main.event_federation import (
-            _WarnedIncompleteAuthGraphCache,
-        )
-
-        cache = _WarnedIncompleteAuthGraphCache(max_size=2, ttl_seconds=10.0)
-        self.assertTrue(cache.should_warn("!r1:test"))
-        self.assertFalse(cache.should_warn("!r1:test"))
-        self.assertIn("!r1:test", cache)
-
-        self.assertTrue(cache.should_warn("!r2:test"))
-        self.assertTrue(
-            cache.should_warn("!r3:test")
-        )  # evicts !r1:test due to max_size=2
-
-        self.assertNotIn("!r1:test", cache)
-        self.assertTrue(cache.should_warn("!r1:test"))
-
-
 class AuthChainReaderWorkerTestCase(tests.unittest.HomeserverTestCase):
     def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
         self.store = hs.get_datastores().main
 
+    @tests.unittest.skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
     def test_non_writer_v21_fails_loud(self) -> None:
         """Non-writer instances must fail loud when the mtxdb auth graph is
         incomplete for a state res v2.1 request, rather than falling back to the
@@ -2114,7 +1626,6 @@ class AuthChainReaderWorkerTestCase(tests.unittest.HomeserverTestCase):
                     "creator": "@user:test",
                     "is_public": True,
                     "room_version": "org.matrix.msc4297",
-                    "has_auth_chain_index": True,
                 },
             )
 
@@ -2133,11 +1644,11 @@ class AuthChainReaderWorkerTestCase(tests.unittest.HomeserverTestCase):
             RuntimeError,
         )
 
+    @tests.unittest.skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
     def test_non_writer_incomplete_graph_does_not_fall_back_to_sql(self) -> None:
         """The mtxdb auth graph is authoritative. A reader worker that finds a
         missing short id must fail loud, not silently rebuild an answer from the
         legacy SQL event_auth rows."""
-        self.store.tests_allow_no_chain_cover_index = True
         room_id = "!incomplete_cover:test"
 
         def insert_test_events(txn: LoggingTransaction) -> None:
@@ -2149,7 +1660,6 @@ class AuthChainReaderWorkerTestCase(tests.unittest.HomeserverTestCase):
                     "creator": "@user:test",
                     "is_public": True,
                     "room_version": "6",
-                    "has_auth_chain_index": True,
                 },
             )
             # Insert create event ($create), power levels ($pl), and message/state ($s1)
@@ -2187,13 +1697,6 @@ class AuthChainReaderWorkerTestCase(tests.unittest.HomeserverTestCase):
                 txn,
                 "event_auth",
                 {"event_id": "$s1", "room_id": room_id, "auth_id": "$create"},
-            )
-            # Intentionally insert an event_auth_chains row for $s1 with a fictitious chain
-            # that has NO links in mtxdb/SQL, so cover index alone would return only {$s1}.
-            self.store.db_pool.simple_insert_txn(
-                txn,
-                "event_auth_chains",
-                {"event_id": "$s1", "chain_id": 99999, "sequence_number": 1},
             )
 
         self.get_success(

@@ -380,13 +380,6 @@ class EventsTestCase(HomeserverTestCase):
         # Nothing is left for the reactor thread.
         self.assertNotIn(("call_after_sync_now", ([Pool.STATE],)), calls)
         self.assertFalse([call for call in calls if call[0] == "call_after_sync_now"])
-        # In the transaction: the barrier is issued before the post-commit
-        # durability marks that the same block registers. (An earlier
-        # `mark_dirty(EVENT_DAG)` is the edge writes' own coalescing.)
-        self.assertLess(
-            calls.index(barriers[0]),
-            calls.index(("call_after_mark_dirty", (Pool.STATE,))),
-        )
 
     @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
     def test_auth_event_leaves_durability_to_the_coalescer_at_commit(self) -> None:
@@ -619,7 +612,6 @@ class EventsTestCase(HomeserverTestCase):
                 inhibit_local_membership_updates=False,
                 state_delta_for_room=None,
                 new_forward_extremities=None,
-                new_event_links={},
                 sliding_sync_table_changes=None,
             )
 

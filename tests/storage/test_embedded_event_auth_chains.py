@@ -13,14 +13,12 @@
 #
 
 """Unit tests for `embedded_event_auth_chains.py`'s closure-walk logic,
-against a fake in-memory mtxdb engine and a fake SQL transaction -- these
-exercise the module's own logic (walk correctness, is_complete gating,
-cold-import, cache-generation invalidation) independent of the real Rust
-engine or a running homeserver, per the plan's Verification section.
+against a fake in-memory mtxdb engine -- these exercise the module's own
+logic (walk correctness, gap handling, cache-generation invalidation)
+independent of the real Rust engine or a running homeserver.
 """
 
 from types import ModuleType
-from typing import Any
 from unittest import TestCase
 
 from synapse.storage.databases.main.embedded_event_auth_chains import (
@@ -28,7 +26,6 @@ from synapse.storage.databases.main.embedded_event_auth_chains import (
     IncompleteAuthGraph,
     bump_room_generation,
     embed_auth_edges_batch,
-    get_embedded_auth_edges_batch,
     get_forward_reachable_short_ids,
     get_or_create_short_ids,
 )
@@ -110,78 +107,6 @@ class FakeEngine(ModuleType):
         self._counters.pop(key, None)
 
 
-class FakeTxn:
-    """Fakes just the `execute(...).fetchall()` surface the
-    closure cold-import query needs, backed by a hand-built
-    `event_auth` graph.
-    """
-
-    def __init__(
-        self, auth_edges: dict[str, list[str]], known_events: set[str] | None = None
-    ) -> None:
-        self._auth_edges = auth_edges
-        self._known_events = (
-            known_events if known_events is not None else set(auth_edges)
-        )
-        self._last_rows: list[tuple[Any, ...]] = []
-        # Every statement executed, so tests can assert cold imports are
-        # batched rather than issued once per event.
-        self.executed_sql: list[str] = []
-
-    def execute(self, sql: str, parameters: tuple[Any, ...]) -> None:
-        self.executed_sql.append(sql)
-        if sql.startswith("WITH RECURSIVE reachable(event_id) AS ("):
-            root_event_ids = parameters[1:-3]
-            reachable: set[str] = set()
-            expanded: set[str] = set()
-            pending = [
-                event_id
-                for event_id in root_event_ids
-                if event_id in self._known_events
-            ]
-            while pending:
-                event_id = pending.pop()
-                if event_id in expanded:
-                    continue
-                expanded.add(event_id)
-                reachable.add(event_id)
-                auth_event_ids = self._auth_edges.get(event_id, [])
-                reachable.update(auth_event_ids)
-                pending.extend(
-                    auth_event_id
-                    for auth_event_id in auth_event_ids
-                    if auth_event_id in self._known_events
-                )
-
-            rows: list[tuple[str, str | None, str | None]] = []
-            for event_id in reachable:
-                if event_id not in self._known_events:
-                    rows.append((event_id, None, None))
-                    continue
-                auth_event_ids = self._auth_edges.get(event_id, [])
-                if auth_event_ids:
-                    rows.extend(
-                        (event_id, event_id, auth_event_id)
-                        for auth_event_id in auth_event_ids
-                    )
-                else:
-                    rows.append((event_id, event_id, None))
-            self._last_rows = rows
-        else:
-            raise AssertionError(f"unexpected SQL: {sql}")
-
-    def fetchall(self) -> list[tuple[Any, ...]]:
-        return self._last_rows
-
-
-def _install_fake_engine(
-    monkeypatch_target: dict[str, Any], engine: FakeEngine
-) -> None:
-    import synapse.storage.databases.embedded_engine as embedded_engine_module
-
-    embedded_engine_module.get_embedded_engine = lambda engine_name: engine
-
-
 class ClosureWalkTests(TestCase):
     def setUp(self) -> None:
         self.engine = FakeEngine()
@@ -196,102 +121,64 @@ class ClosureWalkTests(TestCase):
 
         embedded_engine_module.get_embedded_engine = self._real_get_embedded_engine
 
-    def _short_id(self, event_id: str) -> int:
-        return get_or_create_short_ids(None, NAMESPACE, ROOM_ID, [event_id])[0]
+    def _embed_graph(self, graph: dict[str, list[str]]) -> dict[str, int]:
+        event_ids = list(graph)
+        short_ids = get_or_create_short_ids(None, NAMESPACE, ROOM_ID, event_ids)
+        short_id_of = dict(zip(event_ids, short_ids))
+        embed_auth_edges_batch(
+            None,
+            NAMESPACE,
+            ROOM_ID,
+            [
+                (short_id_of[event_id], [short_id_of[parent] for parent in parents])
+                for event_id, parents in graph.items()
+            ],
+        )
+        return short_id_of
 
     def test_diamond_shaped_graph_and_leaf_with_zero_auth_events(self) -> None:
         # create -> (nothing)
         # a -> create
         # b -> create
         # c -> a, b   (diamond: c's closure should include create only once)
-        graph = {
-            "$create": [],
-            "$a": ["$create"],
-            "$b": ["$create"],
-            "$c": ["$a", "$b"],
-        }
-        txn = FakeTxn(graph)
+        ids = self._embed_graph(
+            {
+                "$create": [],
+                "$a": ["$create"],
+                "$b": ["$create"],
+                "$c": ["$a", "$b"],
+            }
+        )
+        create_id, a_id, b_id, c_id = (ids[k] for k in ("$create", "$a", "$b", "$c"))
 
-        create_id = self._short_id("$create")
-        a_id = self._short_id("$a")
-        b_id = self._short_id("$b")
-        c_id = self._short_id("$c")
-
-        closure = self.cache.get_closure(txn, None, NAMESPACE, ROOM_ID, c_id)
+        closure = self.cache.get_closure(None, NAMESPACE, ROOM_ID, c_id)
         self.assertEqual(set(closure), {a_id, b_id, create_id})
         # Ancestors only -- c itself is not included.
         self.assertNotIn(c_id, closure)
 
         # The leaf's own closure is empty (zero auth events), not an error.
-        leaf_closure = self.cache.get_closure(txn, None, NAMESPACE, ROOM_ID, create_id)
+        leaf_closure = self.cache.get_closure(None, NAMESPACE, ROOM_ID, create_id)
         self.assertEqual(len(leaf_closure), 0)
 
-    def test_cold_import_embeds_edges_from_sql_on_first_touch(self) -> None:
-        graph = {"$create": [], "$a": ["$create"]}
-        txn = FakeTxn(graph)
-        create_id = self._short_id("$create")
-        a_id = self._short_id("$a")
-
-        # Nothing embedded yet.
-        self.assertEqual(
-            get_embedded_auth_edges_batch(None, NAMESPACE, ROOM_ID, [a_id])[a_id],
-            None,
+    def test_missing_edge_raises_and_is_not_cached(self) -> None:
+        a_id, missing_id = get_or_create_short_ids(
+            None, NAMESPACE, ROOM_ID, ["$a", "$missing"]
         )
-
-        closure = self.cache.get_closure(txn, None, NAMESPACE, ROOM_ID, a_id)
-        self.assertEqual(set(closure), {create_id})
-
-        # Now embedded, idempotently re-embeddable.
-        embedded = get_embedded_auth_edges_batch(None, NAMESPACE, ROOM_ID, [a_id])[a_id]
-        self.assertEqual(embedded, [create_id])
-        embed_auth_edges_batch(None, NAMESPACE, ROOM_ID, [(a_id, [create_id])])
-        self.assertEqual(
-            get_embedded_auth_edges_batch(None, NAMESPACE, ROOM_ID, [a_id])[a_id],
-            [create_id],
-        )
-
-    def test_empty_embedded_edges_are_repaired_from_sql(self) -> None:
-        """An early empty write must not permanently turn an event into a leaf."""
-        graph = {"$create": [], "$a": ["$create"]}
-        txn = FakeTxn(graph)
-        create_id = self._short_id("$create")
-        a_id = self._short_id("$a")
-
-        # Model the race where the events row was visible before its SQL
-        # event_auth rows, causing the first writer to record an empty list.
-        embed_auth_edges_batch(None, NAMESPACE, ROOM_ID, [(a_id, [])])
-
-        closure = self.cache.get_closure(txn, None, NAMESPACE, ROOM_ID, a_id)
-        self.assertEqual(set(closure), {create_id})
-        self.assertEqual(
-            get_embedded_auth_edges_batch(None, NAMESPACE, ROOM_ID, [a_id])[a_id],
-            [create_id],
-        )
-
-    def test_incomplete_graph_raises_and_is_not_cached(self) -> None:
-        # "$a" claims "$missing" as an auth event, but SQL has no
-        # event_auth rows *and* no events row for "$missing" -- a genuine
-        # gap, not an ordinary miss.
-        graph = {"$a": ["$missing"]}
-        txn = FakeTxn(graph, known_events={"$a"})
-        a_id = self._short_id("$a")
+        embed_auth_edges_batch(None, NAMESPACE, ROOM_ID, [(a_id, [missing_id])])
 
         with self.assertRaises(IncompleteAuthGraph):
-            self.cache.get_closure(txn, None, NAMESPACE, ROOM_ID, a_id)
+            self.cache.get_closure(None, NAMESPACE, ROOM_ID, a_id)
 
-        # An incomplete walk must not be cached: retrying (even with the
-        # same broken graph) must raise again, not silently return a
-        # wrong/partial cached closure.
+        # An incomplete walk must not be cached: retrying must raise again,
+        # not silently return a partial closure.
         with self.assertRaises(IncompleteAuthGraph):
-            self.cache.get_closure(txn, None, NAMESPACE, ROOM_ID, a_id)
+            self.cache.get_closure(None, NAMESPACE, ROOM_ID, a_id)
 
     def test_cache_generation_invalidation_on_purge(self) -> None:
-        graph = {"$create": [], "$a": ["$create"]}
-        txn = FakeTxn(graph)
-        create_id = self._short_id("$create")
-        a_id = self._short_id("$a")
+        ids = self._embed_graph({"$create": [], "$a": ["$create"]})
+        create_id, a_id = ids["$create"], ids["$a"]
 
-        first = self.cache.get_closure(txn, None, NAMESPACE, ROOM_ID, a_id)
+        first = self.cache.get_closure(None, NAMESPACE, ROOM_ID, a_id)
         self.assertEqual(set(first), {create_id})
 
         # Purge the room: bump generation first (as purge_events.py must),
@@ -304,43 +191,31 @@ class ClosureWalkTests(TestCase):
         # `create2_id` is guaranteed *not* to numerically equal
         # `create_id` -- otherwise a stale-cache bug could coincidentally
         # produce the right-looking set after the counter resets.
-        self._short_id("$placeholder")
-        new_graph = {"$create2": [], "$a": ["$create2"]}
-        txn2 = FakeTxn(new_graph)
-        create2_id = self._short_id("$create2")
-        a2_id = self._short_id("$a")
+        get_or_create_short_ids(None, NAMESPACE, ROOM_ID, ["$placeholder"])
+        ids2 = self._embed_graph({"$create2": [], "$a": ["$create2"]})
+        create2_id, a2_id = ids2["$create2"], ids2["$a"]
         self.assertNotEqual(create2_id, create_id)
 
-        second = self.cache.get_closure(txn2, None, NAMESPACE, ROOM_ID, a2_id)
+        second = self.cache.get_closure(None, NAMESPACE, ROOM_ID, a2_id)
         # The post-purge lookup must recompute against the new graph, not
         # serve the pre-purge cached bitmap for (old_generation, a_id).
         self.assertEqual(set(second), {create2_id})
         self.assertNotEqual(set(second), set(first))
 
     def test_get_closures_batch_shares_memo_across_roots(self) -> None:
-        graph = {
-            "$create": [],
-            "$a": ["$create"],
-            "$b": ["$a"],
-            "$c": ["$a"],
-        }
-        txn = FakeTxn(graph)
-        create_id = self._short_id("$create")
-        a_id = self._short_id("$a")
-        b_id = self._short_id("$b")
-        c_id = self._short_id("$c")
-
-        results = self.cache.get_closures_batch(
-            txn,
-            None,
-            NAMESPACE,
-            ROOM_ID,
-            [b_id, c_id],
+        ids = self._embed_graph(
+            {
+                "$create": [],
+                "$a": ["$create"],
+                "$b": ["$a"],
+                "$c": ["$a"],
+            }
         )
+        create_id, a_id, b_id, c_id = (ids[k] for k in ("$create", "$a", "$b", "$c"))
+
+        results = self.cache.get_closures_batch(None, NAMESPACE, ROOM_ID, [b_id, c_id])
         self.assertEqual(set(results[b_id]), {a_id, create_id})
         self.assertEqual(set(results[c_id]), {a_id, create_id})
-        self.assertEqual(len(txn.executed_sql), 1)
-        self.assertTrue(txn.executed_sql[0].startswith("WITH RECURSIVE"))
 
 
 class ForwardReachabilityTests(TestCase):

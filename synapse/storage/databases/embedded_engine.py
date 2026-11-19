@@ -16,7 +16,7 @@
 
 Every consumer of the embedded engine (the state HAMT layer in
 `state/store.py`, `state/bg_updates.py`, and the mirrors in
-`embedded_event_auth_chain_links.py`, `embedded_event_json.py`,
+`embedded_event_json.py`,
 `embedded_event_to_state_group.py`) used to import the engine module
 directly by name. That scattered the engine name across a dozen files and
 made swapping engines a whole-repo refactor.
