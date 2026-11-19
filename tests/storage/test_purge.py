@@ -36,6 +36,12 @@ from synapse.storage.databases.main.embedded_common import (
     enable_ffi_counting,
     get_ffi_count,
 )
+from synapse.storage.databases.main.embedded_event_auth_chains import (
+    embed_auth_edges_batch,
+    get_embedded_auth_edges_batch,
+    get_or_create_short_ids,
+    resolve_short_ids_to_event_ids,
+)
 from synapse.storage.databases.main.embedded_redactions import (
     get_redactions_batch,
     put_redaction_batch,
@@ -233,6 +239,36 @@ class PurgeTests(HomeserverTestCase):
         self.get_success(self._storage_controllers.purge_events.purge_room(room_id))
 
         self._assert_mirrors(engine, namespace, target["event_id"], present=False)
+
+    def test_purge_room_clears_embedded_auth_chain(self) -> None:
+        engine, namespace = self._enable_embedded_engine()
+        if namespace is None:
+            self.skipTest("embedded auth-chain namespace not configured")
+
+        room_id = self.helper.create_room_as(self.user_id)
+        event_id = self.helper.send(room_id, body="auth chain event")["event_id"]
+
+        short_id = get_or_create_short_ids(engine, namespace, room_id, [event_id])[0]
+        embed_auth_edges_batch(engine, namespace, room_id, [(short_id, [])])
+        self.assertEqual(
+            get_embedded_auth_edges_batch(engine, namespace, room_id, [short_id]),
+            {short_id: []},
+        )
+        self.assertEqual(
+            resolve_short_ids_to_event_ids(engine, namespace, room_id, [short_id]),
+            [event_id],
+        )
+
+        self.get_success(self._storage_controllers.purge_events.purge_room(room_id))
+
+        self.assertEqual(
+            get_embedded_auth_edges_batch(engine, namespace, room_id, [short_id]),
+            {short_id: None},
+        )
+        self.assertEqual(
+            resolve_short_ids_to_event_ids(engine, namespace, room_id, [short_id]),
+            [None],
+        )
 
     def test_purge_history_clears_embedded_redaction_and_rejection_mirrors(
         self,

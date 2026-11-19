@@ -677,6 +677,27 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             # take a while!
             txn.execute("SET LOCAL statement_timeout = 0")
 
+        # The auth-chain collections are keyed by room and have no foreign key
+        # to the SQL rows, so purge them alongside the room. Bump the in-process
+        # generation first so cached closures are discarded; the durable delete
+        # itself runs after the SQL commit, like the other mtxdb purge work.
+        if getattr(self, "_embedded_db_engine", None) is not None:
+            from synapse.storage.databases.main.embedded_event_auth_chains import (
+                bump_room_generation,
+                purge_room as purge_auth_chain_room,
+                resolve_namespace,
+            )
+
+            namespace = resolve_namespace(self)
+            if namespace is not None:
+                bump_room_generation(namespace, room_id)
+                txn.call_after(
+                    purge_auth_chain_room,
+                    self._embedded_db_engine,
+                    namespace,
+                    room_id,
+                )
+
         # Get all the auth chains that are referenced by events that are to be
         # deleted.
         txn.execute(
