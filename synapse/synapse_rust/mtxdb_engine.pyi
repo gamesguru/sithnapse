@@ -32,6 +32,9 @@ def delete_auth_chain_links_batch(
 def get_or_create_short_ids(
     namespace: str, room_id: str, event_ids: list[str]
 ) -> list[int]: ...
+def resolve_event_ids_to_short_ids(
+    namespace: str, room_id: str, event_ids: list[str]
+) -> list[int | None]: ...
 def resolve_short_ids_to_event_ids(
     namespace: str, room_id: str, short_ids: list[int]
 ) -> list[str | None]: ...
@@ -134,6 +137,9 @@ class MtxdbTransaction:
     ) -> None: ...
     def event_edges_put(
         self, namespace: str, rows: list[tuple[str, str, str, bool]]
+    ) -> None: ...
+    def auth_chain_edges_put(
+        self, namespace: str, room_id: str, rows: list[tuple[int, list[int]]]
     ) -> None: ...
     def get_with_collection_version(
         self,

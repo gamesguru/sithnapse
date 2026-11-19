@@ -2100,12 +2100,9 @@ class AuthChainReaderWorkerTestCase(tests.unittest.HomeserverTestCase):
         self.store = hs.get_datastores().main
 
     def test_non_writer_v21_fails_loud(self) -> None:
-        """Non-writer instances must deliberately fail loud with _NoChainCoverIndex
-        on state res v2.1 requests (conflicted_set is not None), since non-writers
-        cannot safely mutate/repair short IDs or embedded closures and legacy BFS
-        cannot compute the conflicted subgraph."""
-        from synapse.storage.databases.main.event_federation import _NoChainCoverIndex
-
+        """Non-writer instances must fail loud when the mtxdb auth graph is
+        incomplete for a state res v2.1 request, rather than falling back to the
+        SQL legacy BFS (which cannot compute the conflicted subgraph)."""
         room_id = "!v21_fail_loud:test"
 
         def setup_room(txn: LoggingTransaction) -> None:
@@ -2133,13 +2130,13 @@ class AuthChainReaderWorkerTestCase(tests.unittest.HomeserverTestCase):
                 conflicted_set={"$e1", "$e2"},
                 additional_backwards_reachable_conflicted_events=set(),
             ),
-            _NoChainCoverIndex,
+            RuntimeError,
         )
 
-    def test_non_writer_auth_chain_fallback_on_incomplete_cover(self) -> None:
-        """When the cover index is incomplete (e.g. missing direct auth events
-        or create event in cover index), a non-writer reader worker must detect
-        the gap and fall back to the authoritative SQL event_auth traversal."""
+    def test_non_writer_incomplete_graph_does_not_fall_back_to_sql(self) -> None:
+        """The mtxdb auth graph is authoritative. A reader worker that finds a
+        missing short id must fail loud, not silently rebuild an answer from the
+        legacy SQL event_auth rows."""
         self.store.tests_allow_no_chain_cover_index = True
         room_id = "!incomplete_cover:test"
 
@@ -2206,11 +2203,12 @@ class AuthChainReaderWorkerTestCase(tests.unittest.HomeserverTestCase):
         # Simulate reader worker
         self.hs.get_instance_name = lambda: "federation_reader1"  # type: ignore[method-assign]
 
-        # Calling get_auth_chain_ids for $s1 must fall back to SQL and return the full auth chain
-        chain = self.get_success(
-            self.store.get_auth_chain_ids(room_id, ["$s1"], include_given=True)
+        # The SQL rows above are a decoy: with mtxdb authoritative the reader
+        # must not use them, and must fail loud on the missing graph instead.
+        self.get_failure(
+            self.store.get_auth_chain_ids(room_id, ["$s1"], include_given=True),
+            RuntimeError,
         )
-        self.assertEqual(chain, {"$s1", "$pl", "$create"})
 
 
 def walk_state_dag(

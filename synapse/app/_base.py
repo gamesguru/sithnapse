@@ -684,6 +684,16 @@ async def start(hs: "HomeServer", *, freeze: bool = True) -> None:
     except EventEdgesBackendMismatchError as e:
         quit_with_error(str(e))
 
+    from synapse.storage.databases.main.embedded_event_auth_chains import (
+        AuthChainBackendMismatchError,
+        check_backend as check_auth_chain_backend,
+    )
+
+    try:
+        await check_auth_chain_backend(hs)
+    except AuthChainBackendMismatchError as e:
+        quit_with_error(str(e))
+
     # We want to use a separate thread pool for the resolver so that large
     # numbers of DNS requests don't starve out other users of the threadpool.
     resolver_threadpool = ThreadPool(name="gai_resolver")

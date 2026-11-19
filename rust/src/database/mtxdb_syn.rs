@@ -1973,6 +1973,79 @@ fn decode_auth_edges(bytes: &[u8]) -> PyResult<Vec<u32>> {
     Ok(out)
 }
 
+/// Stage the outbound auth edges and their derived inbound child edges in an
+/// existing persistence transaction. The child records use a collection
+/// version expectation so concurrent event persists cannot lose each other's
+/// appends.
+fn stage_auth_chain_edges(
+    txn: &DatabaseTransaction<'_>,
+    namespace: &str,
+    room_id: &str,
+    rows: &[(u32, Vec<u32>)],
+) -> PyResult<()> {
+    let collection = auth_chain_closure_room_id(namespace, room_id);
+    let mut children_by_parent: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+
+    for (event_short_id, auth_short_ids) in rows {
+        txn.put(
+            ShardType::State,
+            collection,
+            auth_chain_edge_node_id(*event_short_id),
+            &NodeData::new(bytes::Bytes::from(encode_auth_edges(auth_short_ids))),
+        )
+        .map_err(|error| map_transaction_io_error("stage auth-chain edges", error))?;
+
+        for auth_short_id in auth_short_ids {
+            children_by_parent
+                .entry(*auth_short_id)
+                .or_default()
+                .push(*event_short_id);
+        }
+    }
+
+    if children_by_parent.is_empty() {
+        return Ok(());
+    }
+
+    let parent_ids: Vec<u32> = children_by_parent.keys().copied().collect();
+    let node_ids: Vec<NodeId> = parent_ids
+        .iter()
+        .map(|short_id| auth_chain_child_node_id(*short_id))
+        .collect();
+    let (existing_records, collection_version) = txn
+        .get_with_collection_version(ShardType::State, &collection, &node_ids)
+        .map_err(|error| map_transaction_error("read auth-chain children", error))?;
+    txn.expect_collection_version(ShardType::State, collection, collection_version)
+        .map_err(|error| map_transaction_io_error("guard auth-chain children", error))?;
+
+    for ((parent_id, mut new_children), (node_id, existing)) in children_by_parent
+        .into_iter()
+        .zip(node_ids.into_iter().zip(existing_records))
+    {
+        let mut children = match existing {
+            Some(data) => decode_auth_edges(&data.bytes)?,
+            None => Vec::new(),
+        };
+        let mut seen: HashSet<u32> = children.iter().copied().collect();
+        for child in new_children.drain(..) {
+            if seen.insert(child) {
+                children.push(child);
+            }
+        }
+        txn.put(
+            ShardType::State,
+            collection,
+            node_id,
+            &NodeData::new(bytes::Bytes::from(encode_auth_edges(&children))),
+        )
+        .map_err(|error| {
+            map_transaction_io_error(&format!("stage auth-chain children of {parent_id}"), error)
+        })?;
+    }
+
+    Ok(())
+}
+
 // -----------------------------------------------------------------------------
 // PyO3 Bindings
 // -----------------------------------------------------------------------------
@@ -2586,6 +2659,42 @@ pub fn get_or_create_short_ids(
 
             Ok(out)
         })
+    })
+}
+
+/// Read existing room-scoped `event_id -> short_id` mappings without
+/// allocating. This is the reader-worker path after the auth-chain backend
+/// cutover; missing mappings are reported as `None` and treated as an
+/// incomplete graph by the caller.
+#[pyfunction]
+pub fn resolve_event_ids_to_short_ids(
+    py: Python<'_>,
+    namespace: String,
+    room_id: String,
+    event_ids: Vec<String>,
+) -> PyResult<Vec<Option<u32>>> {
+    py.detach(|| {
+        let engine = db_for_shard_type(ShardType::State)?;
+        let collection = auth_chain_closure_room_id(&namespace, &room_id);
+        let node_ids: Vec<NodeId> = event_ids
+            .iter()
+            .map(|event_id| short_id_forward_node_id(event_id))
+            .collect();
+        let records = engine
+            .get_read_committed(&collection, &node_ids)
+            .map_err(map_read_storage_error)?;
+        records
+            .into_iter()
+            .map(|record| match record {
+                Some(data) if data.bytes.len() == 4 => Ok(Some(u32::from_be_bytes(
+                    data.bytes.as_ref().try_into().unwrap(),
+                ))),
+                Some(_) => Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "corrupt auth-chain short-id forward record",
+                )),
+                None => Ok(None),
+            })
+            .collect()
     })
 }
 
@@ -3462,6 +3571,18 @@ impl PyMtxdbTransaction {
         rows: Vec<(String, String, String, bool)>,
     ) -> PyResult<()> {
         py.detach(|| super::embedded_edges::stage_event_edges(&self.inner, &namespace, &rows))
+    }
+
+    /// Stage outbound auth edges and their inbound child index in the
+    /// persistence transaction that stages the event JSON and DAG edges.
+    fn auth_chain_edges_put(
+        &self,
+        py: Python<'_>,
+        namespace: String,
+        room_id: String,
+        rows: Vec<(u32, Vec<u32>)>,
+    ) -> PyResult<()> {
+        py.detach(|| stage_auth_chain_edges(&self.inner, &namespace, &room_id, &rows))
     }
 
     /// Publish every staged write as one group. After an error, the writes may
@@ -4616,6 +4737,7 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(put_auth_chain_links_batch, m)?)?;
     m.add_function(wrap_pyfunction!(delete_auth_chain_links_batch, m)?)?;
     m.add_function(wrap_pyfunction!(get_or_create_short_ids, m)?)?;
+    m.add_function(wrap_pyfunction!(resolve_event_ids_to_short_ids, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_short_ids_to_event_ids, m)?)?;
     m.add_function(wrap_pyfunction!(auth_chain_edges_get, m)?)?;
     m.add_function(wrap_pyfunction!(auth_chain_edges_put, m)?)?;

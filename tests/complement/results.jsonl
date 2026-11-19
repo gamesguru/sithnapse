@@ -512,7 +512,7 @@
 {"Action":"skip","Test":"TestMSC4499Key/System/\u00a76/AdminStartupGuardrails"}
 {"Action":"pass","Test":"TestMSC4499Key/System/\u00a79"}
 {"Action":"pass","Test":"TestMSC4499Key/System/\u00a79/CorroborationTierRetention"}
-{"Action":"skip","Test":"TestMSC4499Key/System/\u00a79/StorageQuotaResilience"}
+{"Action":"pass","Test":"TestMSC4499Key/System/\u00a79/StorageQuotaResilience"}
 {"Action":"pass","Test":"TestMSC4499Key/Temporal"}
 {"Action":"pass","Test":"TestMSC4499Key/Temporal/\u00a75"}
 {"Action":"pass","Test":"TestMSC4499Key/Temporal/\u00a75/KeyRotation"}

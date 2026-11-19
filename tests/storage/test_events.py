@@ -42,6 +42,11 @@ from synapse.storage.databases.main import (
     state as state_module,
 )
 from synapse.storage.databases.main.embedded_common import Pool, SyncTier
+from synapse.storage.databases.main.embedded_event_auth_chains import (
+    get_embedded_auth_edges_batch,
+    get_or_create_short_ids,
+    resolve_short_ids_to_event_ids,
+)
 from synapse.types import StateMap
 from synapse.util.clock import Clock
 
@@ -119,6 +124,60 @@ class EventsTestCase(HomeserverTestCase):
         event = self.get_success(self._store.get_event(event_id))
         self.assertEqual(event.event_id, event_id)
         self.assertEqual(event.content.get("body"), "hello embedded mtxdb")
+
+    @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
+    def test_persist_writes_auth_edges_to_mtxdb_only(self) -> None:
+        """Persisting state events writes auth edges to mtxdb, not SQL.
+
+        This is the ownership switch: the SQL `event_auth` table is no longer
+        written when the embedded engine is configured, so a missing mtxdb
+        row would mean a committed state event with no auth chain.
+        """
+        persist_store = self.hs.get_datastores().persist_events
+        assert persist_store is not None
+        self.assertTrue(persist_store._embedded_event_json_enabled)
+        engine = persist_store._embedded_db_engine
+        namespace = persist_store._embedded_db_namespace
+        if engine is None or namespace is None:
+            self.skipTest("embedded auth-chain namespace not configured")
+
+        user = self.register_user("auth_edges_user", "pass")
+        token = self.login("auth_edges_user", "pass")
+        room_id = self.helper.create_room_as(user, tok=token)
+
+        state_ids = self.get_success(
+            self.hs.get_storage_controllers().state.get_current_state_ids(room_id)
+        )
+        state_event_id = state_ids[(EventTypes.RoomHistoryVisibility, "")]
+        state_event = self.get_success(self._store.get_event(state_event_id))
+        expected_auth_ids = set(state_event.auth_event_ids())
+        self.assertTrue(expected_auth_ids)
+
+        # The SQL table must not receive the new rows any more.
+        sql_rows = self.get_success(
+            self._store.db_pool.simple_select_list(
+                table="event_auth",
+                keyvalues={"room_id": room_id},
+                retcols=("event_id", "auth_id"),
+                desc="test_persist_writes_auth_edges_to_mtxdb_only",
+            )
+        )
+        self.assertEqual(sql_rows, [])
+
+        # The mtxdb outbound edges carry the same direct auth events.
+        short_id = get_or_create_short_ids(
+            engine, namespace, room_id, [state_event_id]
+        )[0]
+        edges = get_embedded_auth_edges_batch(engine, namespace, room_id, [short_id])[
+            short_id
+        ]
+        self.assertIsNotNone(edges)
+        resolved = resolve_short_ids_to_event_ids(
+            engine, namespace, room_id, list(edges or [])
+        )
+        self.assertEqual(
+            {event_id for event_id in resolved if event_id}, expected_auth_ids
+        )
 
     def _check_de_outlier_state_barrier(self, *, publish_at_commit: bool) -> None:
         """De-outliering an already-persisted outlier must schedule an immediate

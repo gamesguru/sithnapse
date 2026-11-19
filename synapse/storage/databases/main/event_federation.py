@@ -296,70 +296,56 @@ class EventFederationWorkerStore(
         # Check if we have indexed the room so we can use the chain cover
         # algorithm.
         room = await self.get_room(room_id)  # type: ignore[attr-defined]
+        from synapse.storage.databases.main.embedded_event_auth_chains import (
+            IncompleteAuthGraph,
+            resolve_namespace,
+        )
+
+        embedded_db_namespace = resolve_namespace(self)
+        is_embedded_writer = (
+            embedded_db_namespace is not None
+            and self.hs.get_instance_name() in self.hs.config.worker.writers.events
+        )
+        is_mtxdb_auth_backend = self._embedded_db_engine is not None
+        if is_embedded_writer or (is_mtxdb_auth_backend and embedded_db_namespace):
+            assert embedded_db_namespace is not None
+            _auth_coverage("get_auth_chain_ids", "embedded_attempt", len(event_ids))
+            try:
+                result = await self.db_pool.runInteraction(
+                    "get_auth_chain_ids_embedded",
+                    self._get_auth_chain_ids_using_embedded_closures_txn,
+                    embedded_db_namespace,
+                    room_id,
+                    event_ids,
+                    include_given,
+                )
+                _auth_coverage(
+                    "get_auth_chain_ids",
+                    "embedded_complete",
+                    len(event_ids),
+                    len(result),
+                )
+                return result
+            except IncompleteAuthGraph:
+                if is_mtxdb_auth_backend:
+                    raise RuntimeError(
+                        "Auth-chain graph is incomplete after the mtxdb cutover"
+                    ) from None
+                # The embedded graph is missing genuine data. Fall through to
+                # the SQL paths below, which are still authoritative while the
+                # one-shot import is incomplete.
+                if _warned_incomplete_auth_graph.should_warn(room_id):
+                    logger.warning(
+                        "Embedded auth graph incomplete for room %s; "
+                        "falling back to SQL auth-chain traversal",
+                        room_id,
+                    )
+
         # If the room has an auth chain index.
         if room[1]:
-            from synapse.storage.databases.main.embedded_event_auth_chains import (
-                IncompleteAuthGraph,
-                resolve_namespace,
-            )
-
-            embedded_db_namespace = resolve_namespace(self)
-            is_embedded_writer = (
-                embedded_db_namespace is not None
-                and self.hs.get_instance_name() in self.hs.config.worker.writers.events
-            )
             try:
-                if is_embedded_writer:
-                    assert embedded_db_namespace is not None
-                    _auth_coverage(
-                        "get_auth_chain_ids", "embedded_attempt", len(event_ids)
-                    )
-                    try:
-                        result = await self.db_pool.runInteraction(
-                            "get_auth_chain_ids_embedded",
-                            self._get_auth_chain_ids_using_embedded_closures_txn,
-                            embedded_db_namespace,
-                            room_id,
-                            event_ids,
-                            include_given,
-                        )
-                        _auth_coverage(
-                            "get_auth_chain_ids",
-                            "embedded_complete",
-                            len(event_ids),
-                            len(result),
-                        )
-                        return result
-                    except IncompleteAuthGraph:
-                        # The embedded ramp is missing genuine data (e.g.
-                        # cold-import hasn't caught up yet).  Bypass the
-                        # chain-cover path entirely and fall through to the
-                        # legacy recursive BFS walk, which is authoritative
-                        # against raw event_auth rows.
-                        if _warned_incomplete_auth_graph.should_warn(room_id):
-                            logger.warning(
-                                "Embedded auth graph incomplete for room %s; "
-                                "falling back to legacy SQL auth-chain traversal",
-                                room_id,
-                            )
-                        result = await self.db_pool.runInteraction(
-                            "get_auth_chain_ids_legacy_fallback",
-                            self._get_auth_chain_ids_txn,
-                            event_ids,
-                            include_given,
-                        )
-                        _auth_coverage(
-                            "get_auth_chain_ids",
-                            "embedded_incomplete_sql_fallback",
-                            len(event_ids),
-                            len(result),
-                        )
-                        return result
-
-                # Non-writers (or instances without embedded DB): prefer the cover
-                # index when complete. Non-writers hold a read-only mtxdb handle and
-                # cannot safely repair missing links; if the cover index is incomplete or
-                # missing, fall back to the authoritative legacy SQL BFS walk.
+                # Prefer the cover index when complete. Includes the
+                # non-writer case, which cannot repair the embedded graph.
                 result = await self.db_pool.runInteraction(
                     "get_auth_chain_ids_chains",
                     self._get_auth_chain_ids_using_cover_index_txn,
@@ -428,7 +414,8 @@ class EventFederationWorkerStore(
         caller translates that to `_NoChainCoverIndex`.
         """
         from synapse.storage.databases.main.embedded_event_auth_chains import (
-            get_or_create_short_ids,
+            IncompleteAuthGraph,
+            resolve_event_ids_to_short_ids,
             resolve_short_ids_to_event_ids,
         )
 
@@ -446,12 +433,22 @@ class EventFederationWorkerStore(
         )
 
         engine_name = self._embedded_db_engine
-        short_ids = get_or_create_short_ids(
+        resolved_short_ids = resolve_event_ids_to_short_ids(
             engine_name, embedded_db_namespace, room_id, initial_events
         )
+        if any(short_id is None for short_id in resolved_short_ids):
+            raise IncompleteAuthGraph(initial_events[0])
+        short_ids = [
+            short_id for short_id in resolved_short_ids if short_id is not None
+        ]
 
         closures = self._auth_chain_closure_cache.get_closures_batch(
-            txn, engine_name, embedded_db_namespace, room_id, short_ids
+            txn,
+            engine_name,
+            embedded_db_namespace,
+            room_id,
+            short_ids,
+            allow_cold_import=False,
         )
 
         result_short_ids: set[int] = set()
@@ -878,76 +875,61 @@ class EventFederationWorkerStore(
         # Check if we have indexed the room so we can use the chain cover
         # algorithm.
         room = await self.get_room(room_id)  # type: ignore[attr-defined]
+        from synapse.storage.databases.main.embedded_event_auth_chains import (
+            IncompleteAuthGraph,
+            resolve_namespace,
+        )
+
+        embedded_db_namespace = resolve_namespace(self)
+        is_embedded_writer = (
+            embedded_db_namespace is not None
+            and self.hs.get_instance_name() in self.hs.config.worker.writers.events
+        )
+        is_mtxdb_auth_backend = self._embedded_db_engine is not None
+        if is_embedded_writer or (is_mtxdb_auth_backend and embedded_db_namespace):
+            assert embedded_db_namespace is not None
+            _auth_coverage(
+                "get_auth_chain_difference",
+                "embedded_attempt",
+                sum(len(state_set) for state_set in state_sets),
+            )
+            try:
+                result = await self.db_pool.runInteraction(
+                    "get_auth_chain_difference_embedded",
+                    self._get_auth_chain_difference_using_embedded_closures_txn,
+                    embedded_db_namespace,
+                    room_id,
+                    state_sets,
+                    conflicted_set,
+                    additional_backwards_reachable_conflicted_events,
+                )
+                _auth_coverage(
+                    "get_auth_chain_difference",
+                    "embedded_complete",
+                    sum(len(state_set) for state_set in state_sets),
+                    len(result.auth_difference),
+                )
+                return result
+            except IncompleteAuthGraph:
+                if is_mtxdb_auth_backend:
+                    raise RuntimeError(
+                        "Auth-chain graph is incomplete after the mtxdb cutover"
+                    ) from None
+                # The embedded graph is missing genuine data. Fall through to
+                # the SQL paths below, which are still authoritative while the
+                # one-shot import is incomplete.
+                if _warned_incomplete_auth_graph.should_warn(room_id):
+                    logger.warning(
+                        "Embedded auth graph incomplete for room %s; "
+                        "falling back to SQL auth-chain traversal",
+                        room_id,
+                    )
+
         # If the room has an auth chain index.
         if room[1]:
-            from synapse.storage.databases.main.embedded_event_auth_chains import (
-                IncompleteAuthGraph,
-                resolve_namespace,
-            )
-
             try:
-                embedded_db_namespace = resolve_namespace(self)
-                is_embedded_writer = (
-                    embedded_db_namespace is not None
-                    and self.hs.get_instance_name()
-                    in self.hs.config.worker.writers.events
-                )
-                if is_embedded_writer:
-                    assert embedded_db_namespace is not None
-                    _auth_coverage(
-                        "get_auth_chain_difference",
-                        "embedded_attempt",
-                        sum(len(state_set) for state_set in state_sets),
-                    )
-                    try:
-                        result = await self.db_pool.runInteraction(
-                            "get_auth_chain_difference_embedded",
-                            self._get_auth_chain_difference_using_embedded_closures_txn,
-                            embedded_db_namespace,
-                            room_id,
-                            state_sets,
-                            conflicted_set,
-                            additional_backwards_reachable_conflicted_events,
-                        )
-                        _auth_coverage(
-                            "get_auth_chain_difference",
-                            "embedded_complete",
-                            sum(len(state_set) for state_set in state_sets),
-                            len(result.auth_difference),
-                        )
-                        return result
-                    except IncompleteAuthGraph:
-                        # The embedded ramp is missing genuine data (e.g.
-                        # cold-import hasn't caught up yet).  The SQL
-                        # cover-index may have the same gap for imported
-                        # outliers, so go directly to the authoritative
-                        # legacy BFS walk against raw event_auth rows.
-                        if _warned_incomplete_auth_graph.should_warn(room_id):
-                            logger.warning(
-                                "Embedded auth graph incomplete for room %s; "
-                                "falling back to legacy SQL auth-chain traversal",
-                                room_id,
-                            )
-                        if conflicted_set is not None:
-                            # The legacy BFS cannot compute the v2.1
-                            # conflicted subgraph; surface the error.
-                            raise _NoChainCoverIndex(room_id)
-                        auth_diff = await self.db_pool.runInteraction(
-                            "get_auth_chain_difference_legacy_fallback",
-                            self._get_auth_chain_difference_txn,
-                            state_sets,
-                        )
-                        _auth_coverage(
-                            "get_auth_chain_difference",
-                            "embedded_incomplete_sql_fallback",
-                            sum(len(state_set) for state_set in state_sets),
-                            len(auth_diff),
-                        )
-                        return StateDifference(
-                            auth_difference=auth_diff, conflicted_subgraph=None
-                        )
-                # Non-writers cannot repair the embedded graph. If the embedded lookup is
-                # incomplete, fall back to the SQL chain-cover implementation.
+                # Prefer the cover index when complete. Includes the
+                # non-writer case, which cannot repair the embedded graph.
                 result = await self.db_pool.runInteraction(
                     "get_auth_chain_difference_chains",
                     self._get_auth_chain_difference_using_cover_index_txn,
@@ -1034,8 +1016,9 @@ class EventFederationWorkerStore(
         translates that to `_NoChainCoverIndex`.
         """
         from synapse.storage.databases.main.embedded_event_auth_chains import (
+            IncompleteAuthGraph,
             get_forward_reachable_short_ids,
-            get_or_create_short_ids,
+            resolve_event_ids_to_short_ids,
             resolve_short_ids_to_event_ids,
         )
 
@@ -1063,9 +1046,15 @@ class EventFederationWorkerStore(
             )
 
         event_ids = list(initial_events)
-        short_ids = get_or_create_short_ids(
+        resolved_short_ids = resolve_event_ids_to_short_ids(
             engine_name, embedded_db_namespace, room_id, event_ids
         )
+        if any(short_id is None for short_id in resolved_short_ids):
+            missing = event_ids[resolved_short_ids.index(None)]
+            raise IncompleteAuthGraph(missing)
+        short_ids = [
+            short_id for short_id in resolved_short_ids if short_id is not None
+        ]
         short_id_of = dict(zip(event_ids, short_ids))
 
         # State-set closures: union of each set's members' ancestor closures,
@@ -1084,6 +1073,7 @@ class EventFederationWorkerStore(
                 embedded_db_namespace,
                 room_id,
                 member_short_ids,
+                allow_cold_import=False,
             )
             union: set[int] = set(member_short_ids)
             for closure in closures.values():
@@ -1111,6 +1101,7 @@ class EventFederationWorkerStore(
                 embedded_db_namespace,
                 room_id,
                 conflicted_short_ids,
+                allow_cold_import=False,
             ).values():
                 backwards_ids.update(closure)
             if additional_backwards_reachable_conflicted_events:
@@ -1125,6 +1116,7 @@ class EventFederationWorkerStore(
                     embedded_db_namespace,
                     room_id,
                     additional_short_ids,
+                    allow_cold_import=False,
                 ).values():
                     backwards_ids.update(closure)
 

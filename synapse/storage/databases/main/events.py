@@ -962,6 +962,11 @@ class PersistEventsStore:
     async def calculate_chain_cover_index_for_events(
         self, room_id: str, events: Collection[EventBase]
     ) -> dict[str, NewEventChainLinks]:
+        if self._embedded_db_engine is not None:
+            # mtxdb is authoritative for auth edges; the SQL chain cover is
+            # neither written nor read, so do not spend time deriving it.
+            return {}
+
         # Filter to state events, and ensure there are no duplicates.
         state_events = []
         seen_events = set()
@@ -985,6 +990,9 @@ class PersistEventsStore:
     def calculate_chain_cover_index_for_events_txn(
         self, txn: LoggingTransaction, room_id: str, state_events: Collection[EventBase]
     ) -> dict[str, NewEventChainLinks]:
+        if self._embedded_db_engine is not None:
+            return {}
+
         # We now calculate chain ID/sequence numbers for any state events we're
         # persisting. We ignore out of band memberships as we're not in the room
         # and won't have their auth chain (we'll fix it up later if we join the
@@ -1649,7 +1657,10 @@ class PersistEventsStore:
         self._store_event_state_mappings_txn(txn, events_and_contexts)
 
         self._persist_event_auth_chain_txn(
-            txn, [e for e, _ in events_and_contexts], new_event_links
+            txn,
+            [e for e, _ in events_and_contexts],
+            new_event_links,
+            mtxdb_txn=mtxdb_txn,
         )
 
         # _store_rejected_events_txn filters out any events which were
@@ -1721,12 +1732,12 @@ class PersistEventsStore:
         # the response that depends on them is returned. Backfilled events are
         # skipped -- no live request waits on them.
         if self._embedded_db_engine:
+            # Every persisted state event owns an outbound auth-edge record in
+            # mtxdb, including leaves and backfilled events. Those edges have
+            # no SQL fallback, so make them durable before the response that
+            # depends on them is returned.
             needs_auth_chain_barrier = any(
-                ev.type in AUTH_CHAIN_EVENT_TYPES
-                and not ev.internal_metadata.is_outlier()
-                and ev.internal_metadata.stream_ordering is not None
-                and ev.internal_metadata.stream_ordering >= 0
-                for ev, _ in events_and_contexts
+                ev.is_state() for ev, _ in all_events_and_contexts
             )
             # Every live event with a state group can be read immediately by
             # another worker (for example, when it becomes a prev event for a
@@ -1832,6 +1843,7 @@ class PersistEventsStore:
         txn: LoggingTransaction,
         events: list[EventBase],
         new_event_links: dict[str, NewEventChainLinks],
+        mtxdb_txn: "MtxdbTransaction | None" = None,
     ) -> None:
         if new_event_links:
             from synapse.storage.databases.main.embedded_event_auth_chain_links import (
@@ -1848,7 +1860,57 @@ class PersistEventsStore:
             )
 
         # We only care about state events, so this if there are no state events.
-        if not any(e.is_state() for e in events):
+        state_events = [event for event in events if event.is_state()]
+        if not state_events:
+            return
+
+        # Exactly one auth-edge store is written: mtxdb when the embedded
+        # engine is configured, SQL otherwise. Never both.
+        from synapse.storage.databases.main.embedded_event_auth_chains import (
+            embed_auth_edges_batch,
+            get_or_create_short_ids,
+            resolve_namespace,
+        )
+
+        embedded_db_namespace = resolve_namespace(self)
+        if embedded_db_namespace is not None:
+            # Auth edges are durable, not a cache: write them before the SQL
+            # COMMIT rather than from a post-commit callback, which could be
+            # lost to a crash or fail without aborting the persist. A SQL
+            # rollback can leave orphan edges, the same trade-off event JSON
+            # and the event DAG already make; a committed event cannot lack
+            # them.
+            room_id = state_events[0].room_id
+            event_ids = [event.event_id for event in state_events]
+            auth_ids = list(
+                dict.fromkeys(
+                    auth_id
+                    for event in state_events
+                    for auth_id in event.auth_event_ids()
+                )
+            )
+            short_ids = get_or_create_short_ids(
+                self._embedded_db_engine,
+                embedded_db_namespace,
+                room_id,
+                event_ids + auth_ids,
+            )
+            short_id_of = dict(zip(event_ids + auth_ids, short_ids))
+            rows = [
+                (
+                    short_id_of[event.event_id],
+                    [short_id_of[auth_id] for auth_id in event.auth_event_ids()],
+                )
+                for event in state_events
+            ]
+            embed_auth_edges_batch(
+                self._embedded_db_engine,
+                embedded_db_namespace,
+                room_id,
+                rows,
+                transaction=mtxdb_txn,
+            )
+            txn.call_after(mark_dirty, Pool.STATE)
             return
 
         # We want to store event_auth mappings for rejected events, as they're
@@ -1863,9 +1925,8 @@ class PersistEventsStore:
             keys=("event_id", "room_id", "auth_id"),
             values=[
                 (event.event_id, event.room_id, auth_id)
-                for event in events
+                for event in state_events
                 for auth_id in event.auth_event_ids()
-                if event.is_state()
             ],
         )
 

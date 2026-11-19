@@ -48,9 +48,12 @@ from __future__ import annotations
 
 import logging
 from collections import OrderedDict
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from pyroaring import BitMap
+
+if TYPE_CHECKING:
+    from synapse.synapse_rust.mtxdb_engine import MtxdbTransaction
 
 
 class _AuthChainTxn(Protocol):
@@ -103,6 +106,263 @@ def resolve_namespace(store: object) -> str | None:
     )
 
 
+class AuthChainBackendMismatchError(Exception):
+    """The configured auth-edge backend does not hold the migrated graph."""
+
+
+def configured_backend(hs: object) -> str:
+    """mtxdb is authoritative whenever its engine is configured."""
+    return "mtxdb" if hs.config.database.embedded_db_engine else "sql"  # type: ignore[attr-defined]
+
+
+async def check_backend(hs: object) -> None:
+    """Refuse startup when the auth-edge data has not been migrated to the
+    configured authoritative backend.
+
+    An empty database can adopt either backend because it has no event graph
+    to migrate. Once events exist, switching is an explicit offline operation.
+    """
+    store = hs.get_datastores().main  # type: ignore[attr-defined]
+    configured = configured_backend(hs)
+
+    def _txn(txn: Any) -> str:
+        txn.execute("SELECT backend FROM auth_chain_backend WHERE lock = 'X'")
+        row = txn.fetchone()
+        stored = row[0] if row else "sql"
+        if stored != configured:
+            txn.execute("SELECT 1 FROM events LIMIT 1")
+            if txn.fetchone() is None:
+                txn.execute("DELETE FROM auth_chain_backend")
+                txn.execute(
+                    "INSERT INTO auth_chain_backend (lock, backend) VALUES ('X', ?)",
+                    (configured,),
+                )
+                return configured
+        return str(stored)
+
+    stored = await store.db_pool.runInteraction("check_auth_chain_backend", _txn)
+    if stored != configured:
+        raise AuthChainBackendMismatchError(
+            f"Auth edges are stored in {stored!r} but this server is configured "
+            f"for {configured!r}. Refusing to start: stop Synapse and run "
+            f"`synapse_auth_edges_migrate --to {configured}` with this config, "
+            "or restore the previous embedded_db configuration."
+        )
+
+
+async def migrate_auth_chain_edges(
+    hs: object, *, batch_size: int = 1000
+) -> dict[str, int]:
+    """Offline SQL -> mtxdb import. Stop every Synapse process first.
+
+    Each room is cleared and rebuilt so an interrupted run can be repeated
+    without retaining stale inbound children. The backend marker is changed
+    only after outbound and inbound records have been checked against SQL.
+    """
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    if not hs.config.database.embedded_db_engine:  # type: ignore[attr-defined]
+        raise ValueError("configure embedded_db.engine for the mtxdb destination")
+
+    store = hs.get_datastores().main  # type: ignore[attr-defined]
+    engine_name = hs.config.database.embedded_db_engine  # type: ignore[attr-defined]
+    namespace = (
+        hs.config.database.embedded_db_namespace  # type: ignore[attr-defined]
+        or hs.hostname  # type: ignore[attr-defined]
+    )
+
+    def _read_marker(txn: Any) -> str:
+        txn.execute("SELECT backend FROM auth_chain_backend WHERE lock = 'X'")
+        row = txn.fetchone()
+        return str(row[0]) if row else "sql"
+
+    current_backend = await store.db_pool.runInteraction(
+        "auth_chain_migrate_read_marker", _read_marker
+    )
+    if current_backend == "mtxdb":
+        return {"already_migrated": 1, "rooms": 0, "state_events": 0, "auth_edges": 0}
+    if current_backend != "sql":
+        raise RuntimeError(
+            f"Unrecognized auth-chain backend marker: {current_backend!r}"
+        )
+
+    def _read_rooms(txn: Any) -> list[str]:
+        txn.execute("SELECT room_id FROM rooms ORDER BY room_id")
+        return [room_id for (room_id,) in txn.fetchall()]
+
+    rooms = await store.db_pool.runInteraction("auth_chain_migrate_rooms", _read_rooms)
+    stats = {"rooms": 0, "state_events": 0, "auth_edges": 0}
+
+    from synapse.storage.database import make_in_list_sql_clause
+    from synapse.storage.databases.main.embedded_common import Pool, sync_now
+
+    for room_id in rooms:
+        bump_room_generation(namespace, room_id)
+        purge_room(engine_name, namespace, room_id)
+        sync_now(pools=[Pool.STATE])
+        last_event_id = ""
+
+        while True:
+
+            def _read_batch(txn: Any) -> tuple[list[str], dict[str, list[str]]]:
+                # Union both sources: `event_auth` covers every imported edge
+                # (including rejected state events, which may not be in
+                # `state_events`), while `state_events` adds the durable empty
+                # marker for state events whose auth_events list is empty
+                # (e.g. the room create event).
+                txn.execute(
+                    "SELECT event_id FROM ("
+                    "  SELECT event_id FROM state_events WHERE room_id = ?"
+                    "  UNION"
+                    "  SELECT event_id FROM event_auth WHERE room_id = ?"
+                    ") AS ids WHERE event_id > ? "
+                    "ORDER BY event_id LIMIT ?",
+                    (room_id, room_id, last_event_id, batch_size),
+                )
+                event_ids = [event_id for (event_id,) in txn.fetchall()]
+                if not event_ids:
+                    return [], {}
+
+                clause, args = make_in_list_sql_clause(
+                    txn.database_engine, "event_id", event_ids
+                )
+                txn.execute(
+                    "SELECT event_id, auth_id FROM event_auth WHERE room_id = ? AND "
+                    + clause,
+                    (room_id, *args),
+                )
+                auth_events: dict[str, list[str]] = {
+                    event_id: [] for event_id in event_ids
+                }
+                for event_id, auth_id in txn.fetchall():
+                    auth_events[event_id].append(auth_id)
+                return event_ids, auth_events
+
+            event_ids, auth_events = await store.db_pool.runInteraction(
+                "auth_chain_migrate_batch", _read_batch
+            )
+            if not event_ids:
+                break
+
+            all_ids = list(
+                dict.fromkeys(
+                    event_ids
+                    + [
+                        auth_id
+                        for event_id in event_ids
+                        for auth_id in auth_events[event_id]
+                    ]
+                )
+            )
+            short_ids = get_or_create_short_ids(
+                engine_name, namespace, room_id, all_ids
+            )
+            short_id_of = dict(zip(all_ids, short_ids))
+            rows = [
+                (short_id_of[event_id], [short_id_of[a] for a in auth_events[event_id]])
+                for event_id in event_ids
+            ]
+            embed_auth_edges_batch(engine_name, namespace, room_id, rows)
+            embedded = get_embedded_auth_edges_batch(
+                engine_name, namespace, room_id, [short_id for short_id, _ in rows]
+            )
+            for (event_id, auth_ids), (short_id, _) in zip(
+                ((event_id, auth_events[event_id]) for event_id in event_ids), rows
+            ):
+                expected = [short_id_of[auth_id] for auth_id in auth_ids]
+                if embedded[short_id] != expected:
+                    raise RuntimeError(
+                        f"Auth-edge verification failed for {event_id} in {room_id}"
+                    )
+
+            stats["state_events"] += len(event_ids)
+            stats["auth_edges"] += sum(
+                len(auth_events[event_id]) for event_id in event_ids
+            )
+            last_event_id = event_ids[-1]
+
+        sync_now(pools=[Pool.STATE])
+        stats["rooms"] += 1
+
+    # Check that every SQL inbound edge is represented in mtxdb, and that no
+    # stale child survived the room rebuild.
+    for room_id in rooms:
+        last_event_id = ""
+        while True:
+
+            def _read_parent_batch(txn: Any) -> tuple[list[str], dict[str, list[str]]]:
+                txn.execute(
+                    "SELECT event_id FROM ("
+                    "  SELECT event_id FROM state_events WHERE room_id = ?"
+                    "  UNION"
+                    "  SELECT auth_id AS event_id FROM event_auth WHERE room_id = ?"
+                    ") AS ids WHERE event_id > ? "
+                    "ORDER BY event_id LIMIT ?",
+                    (room_id, room_id, last_event_id, batch_size),
+                )
+                parent_ids = [event_id for (event_id,) in txn.fetchall()]
+                if not parent_ids:
+                    return [], {}
+                clause, args = make_in_list_sql_clause(
+                    txn.database_engine, "auth_id", parent_ids
+                )
+                txn.execute(
+                    "SELECT auth_id, event_id FROM event_auth WHERE room_id = ? AND "
+                    + clause,
+                    (room_id, *args),
+                )
+                children: dict[str, list[str]] = {
+                    event_id: [] for event_id in parent_ids
+                }
+                for parent_id, child_id in txn.fetchall():
+                    children[parent_id].append(child_id)
+                return parent_ids, children
+
+            parent_ids, children = await store.db_pool.runInteraction(
+                "auth_chain_migrate_verify_children", _read_parent_batch
+            )
+            if not parent_ids:
+                break
+            parent_short_ids = get_or_create_short_ids(
+                engine_name, namespace, room_id, parent_ids
+            )
+            all_child_ids = list(
+                dict.fromkeys(
+                    child for parent in parent_ids for child in children[parent]
+                )
+            )
+            child_short_ids = dict(
+                zip(
+                    all_child_ids,
+                    get_or_create_short_ids(
+                        engine_name, namespace, room_id, all_child_ids
+                    ),
+                )
+            )
+            actual = get_embedded_auth_children_batch(
+                engine_name, namespace, room_id, parent_short_ids
+            )
+            for parent_id, parent_short_id in zip(parent_ids, parent_short_ids):
+                expected = sorted(
+                    child_short_ids[child_id] for child_id in children[parent_id]
+                )
+                if sorted(actual[parent_short_id]) != expected:
+                    raise RuntimeError(
+                        f"Auth-child verification failed for {parent_id} in {room_id}"
+                    )
+            last_event_id = parent_ids[-1]
+
+    def _set_marker(txn: Any) -> None:
+        txn.execute("UPDATE auth_chain_backend SET backend = 'mtxdb' WHERE lock = 'X'")
+        if txn.rowcount == 0:
+            txn.execute(
+                "INSERT INTO auth_chain_backend (lock, backend) VALUES ('X', 'mtxdb')"
+            )
+
+    await store.db_pool.runInteraction("auth_chain_migrate_set_marker", _set_marker)
+    return stats
+
+
 def _engine(engine_name: str | None):  # type: ignore[no-untyped-def]
     from synapse.storage.databases.embedded_engine import get_embedded_engine
 
@@ -124,6 +384,17 @@ def get_or_create_short_ids(
     if not event_ids:
         return []
     return _engine(engine_name).get_or_create_short_ids(namespace, room_id, event_ids)
+
+
+def resolve_event_ids_to_short_ids(
+    engine_name: str | None, namespace: str, room_id: str, event_ids: list[str]
+) -> list[int | None]:
+    """Resolve existing short ids without allocating, for read-only workers."""
+    if not event_ids:
+        return []
+    return _engine(engine_name).resolve_event_ids_to_short_ids(
+        namespace, room_id, event_ids
+    )
 
 
 def resolve_short_ids_to_event_ids(
@@ -150,6 +421,8 @@ def embed_auth_edges_batch(
     namespace: str,
     room_id: str,
     rows: list[tuple[int, list[int]]],
+    *,
+    transaction: MtxdbTransaction | None = None,
 ) -> None:
     """`rows`: `(event_short_id, [auth_short_id, ...])`. Idempotent: safe to
     call again with the same data (e.g. a retried post-commit dual-write,
@@ -167,17 +440,16 @@ def embed_auth_edges_batch(
     can't answer the forward-reachability question the V2.1
     conflicted-subgraph algorithm needs.
 
-    Callers must only invoke this strictly after the corresponding SQL
-    `event_auth` insert has *committed* (plan §2's write-timing
-    requirement) -- never from within that same transaction, since a
-    rollback would otherwise leave ghost mtxdb records with no matching
-    SQL row. A failure here is expected to happen occasionally and must
-    not be treated as fatal: log/metric it and move on, since the
-    cold-import path below repairs the gap the next time this event is
-    visited by a closure walk.
+    A persistence caller may pass its staged mtxdb transaction so edges and
+    event JSON become visible at the same boundary. Standalone imports write
+    directly through the engine.
     """
     if not rows:
         return
+    if transaction is not None:
+        transaction.auth_chain_edges_put(namespace, room_id, rows)
+        return
+
     engine = _engine(engine_name)
     engine.auth_chain_edges_put(namespace, room_id, rows)
 
@@ -357,6 +629,8 @@ class ClosureCache:
         namespace: str,
         room_id: str,
         event_short_ids: list[int],
+        *,
+        allow_cold_import: bool = True,
     ) -> dict[int, BitMap]:
         """Batch form of `get_closure`, sharing one memo dict across all
         requested roots so overlapping ancestor subgraphs are only walked
@@ -369,7 +643,13 @@ class ClosureCache:
             if self._get(namespace, room_id, generation, short_id) is None
         ]
         direct_edges = self._load_direct_edges(
-            txn, engine_name, namespace, room_id, roots_to_load, generation
+            txn,
+            engine_name,
+            namespace,
+            room_id,
+            roots_to_load,
+            generation,
+            allow_cold_import,
         )
 
         memo: dict[int, tuple[BitMap, bool]] = {}
@@ -396,6 +676,7 @@ class ClosureCache:
         room_id: str,
         root_short_ids: list[int],
         generation: int,
+        allow_cold_import: bool,
     ) -> dict[int, list[int] | None]:
         """Collect direct edges needed for the requested closures.
 
@@ -437,12 +718,23 @@ class ClosureCache:
                 if auth_short_ids:
                     direct_edges[short_id] = auth_short_ids
                     pending.update(auth_short_ids)
-                elif short_id not in freshly_imported:
+                elif auth_short_ids is None:
+                    if allow_cold_import:
+                        cold.append(short_id)
+                    else:
+                        direct_edges[short_id] = None
+                elif allow_cold_import and short_id not in freshly_imported:
                     cold.append(short_id)
+                else:
+                    # With the mtxdb backend, an explicit empty list is the
+                    # durable leaf marker and does not need SQL confirmation.
+                    direct_edges[short_id] = []
 
             if cold:
-                imported_edges = _cold_import_auth_edges(
-                    txn, engine_name, namespace, room_id, cold
+                imported_edges = (
+                    _cold_import_auth_edges(txn, engine_name, namespace, room_id, cold)
+                    if allow_cold_import
+                    else dict.fromkeys(cold)
                 )
                 # A node may already be embedded but absent from SQL (for
                 # example an earlier write that raced the events row, or a

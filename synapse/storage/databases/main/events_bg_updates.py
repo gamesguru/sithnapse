@@ -1149,18 +1149,25 @@ class EventsBackgroundUpdatesStore(
             #
             # Note we can assume that events that don't have a corresponding
             # room version are V1 rooms.
-            sql = """
+            has_mtxdb_auth_edges = bool(self._embedded_db_engine)
+            auth_join = (
+                "" if has_mtxdb_auth_edges else "LEFT JOIN event_auth USING (event_id)"
+            )
+            has_event_auth = (
+                "TRUE" if has_mtxdb_auth_edges else "event_auth.event_id IS NOT NULL"
+            )
+            sql = f"""
                 SELECT DISTINCT
                     event_id,
                     COALESCE(room_version, '1'),
                     json,
                     state_events.event_id IS NOT NULL,
-                    event_auth.event_id IS NOT NULL
+                    {has_event_auth}
                 FROM rejections
                 LEFT JOIN event_json USING (event_id)
                 LEFT JOIN rooms USING (room_id)
                 LEFT JOIN state_events USING (event_id)
-                LEFT JOIN event_auth USING (event_id)
+                {auth_join}
                 WHERE event_id > ?
                 ORDER BY event_id
                 LIMIT ?
@@ -1257,7 +1264,7 @@ class EventsBackgroundUpdatesStore(
                 desc="_rejected_events_metadata_state_events",
             )
 
-        if auth_events:
+        if auth_events and not self._embedded_db_engine:
             await self.db_pool.simple_insert_many(
                 table="event_auth",
                 keys=("event_id", "room_id", "auth_id"),
@@ -1280,6 +1287,13 @@ class EventsBackgroundUpdatesStore(
         """A background updates that iterates over all rooms and generates the
         chain cover index for them.
         """
+
+        if self._embedded_db_engine is not None:
+            # With mtxdb authoritative, auth-chain queries walk the embedded
+            # graph; the SQL chain cover is no longer read. Building it would
+            # also need `event_auth`, which is no longer written.
+            await self.db_pool.updates._end_background_update("chain_cover")
+            return 0
 
         current_room_id = progress.get("current_room_id", "")
 
@@ -1492,6 +1506,11 @@ class EventsBackgroundUpdatesStore(
 
         This may be due to fully purging a room or via setting a retention policy.
         """
+        if self._embedded_db_engine is not None:
+            # The SQL chain cover is not written when mtxdb is authoritative.
+            await self.db_pool.updates._end_background_update("purged_chain_cover")
+            return 0
+
         current_event_id = progress.get("current_event_id", "")
 
         def purged_chain_cover_txn(txn: LoggingTransaction) -> int:
