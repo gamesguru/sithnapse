@@ -1131,7 +1131,6 @@ class EventFederationWorkerStore(
             # Inclusive forwards (seed-inclusive BFS), pruned to the backwards
             # universe so the walk cost is bounded by |backwards|, not |room|.
             forwards_ids = get_forward_reachable_short_ids(
-                txn,
                 engine_name,
                 embedded_db_namespace,
                 room_id,

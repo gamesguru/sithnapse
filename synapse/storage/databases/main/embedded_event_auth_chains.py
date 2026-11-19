@@ -59,8 +59,8 @@ class _AuthChainTxn(Protocol):
     Structural (PEP 544) on purpose, so tests can drive the walk with a
     tiny fake txn instead of a full `LoggingTransaction`, and the walk
     itself stays decoupled from any concrete cursor type. The methods
-    match what `_fetch_auth_event_ids_from_sql` /
-    `_fetch_child_event_ids_from_sql` actually call, nothing more.
+    match what `_fetch_auth_event_ids_from_sql` actually calls, nothing
+    more.
     """
 
     def execute(self, sql: str, parameters: tuple[Any, ...]) -> None: ...
@@ -545,89 +545,6 @@ def _fetch_auth_event_ids_from_sql(
     return []
 
 
-def _repair_embedded_children_from_sql(
-    txn: _AuthChainTxn,
-    engine_name: str | None,
-    namespace: str,
-    room_id: str,
-    parent_short_ids: set[int],
-    allowed_child_short_ids: set[int] | None,
-) -> None:
-    """Batch-repair inbound mtxdb edges for one forward-reachability walk.
-
-    SQL remains the durable source used to recover missing embedded writes,
-    but do that check once for the whole candidate graph instead of once per
-    visited parent. The BFS itself then reads only mtxdb.
-    """
-    if not parent_short_ids:
-        return
-
-    parent_short_id_list = list(parent_short_ids)
-    parent_ids = resolve_short_ids_to_event_ids(
-        engine_name, namespace, room_id, parent_short_id_list
-    )
-    short_id_by_event_id = {
-        event_id: short_id
-        for short_id, event_id in zip(parent_short_id_list, parent_ids)
-        if event_id is not None
-    }
-    if not short_id_by_event_id:
-        return
-
-    parent_event_ids = list(short_id_by_event_id)
-    if allowed_child_short_ids is not None:
-        allowed_child_ids = resolve_short_ids_to_event_ids(
-            engine_name, namespace, room_id, list(allowed_child_short_ids)
-        )
-        allowed_child_event_ids = [
-            event_id for event_id in allowed_child_ids if event_id is not None
-        ]
-        if not allowed_child_event_ids:
-            return
-        txn.execute(
-            "SELECT auth_id, event_id FROM event_auth "
-            "WHERE room_id = ? AND auth_id = ANY(?) AND event_id = ANY(?)",
-            (room_id, parent_event_ids, allowed_child_event_ids),
-        )
-    else:
-        txn.execute(
-            "SELECT auth_id, event_id FROM event_auth "
-            "WHERE room_id = ? AND auth_id = ANY(?)",
-            (room_id, parent_event_ids),
-        )
-
-    rows = txn.fetchall()
-    if not rows:
-        return
-
-    child_event_ids = list(dict.fromkeys(child_id for _, child_id in rows))
-    child_short_ids = get_or_create_short_ids(
-        engine_name, namespace, room_id, child_event_ids
-    )
-    short_id_by_child_id = dict(zip(child_event_ids, child_short_ids))
-    children_by_parent: dict[int, list[int]] = {}
-    for parent_event_id, child_event_id in rows:
-        children_by_parent.setdefault(short_id_by_event_id[parent_event_id], []).append(
-            short_id_by_child_id[child_event_id]
-        )
-
-    embedded_children = get_embedded_auth_children_batch(
-        engine_name, namespace, room_id, list(children_by_parent)
-    )
-    missing_rows: list[tuple[int, list[int]]] = []
-    for parent_short_id, child_short_ids_for_parent in children_by_parent.items():
-        existing = set(embedded_children[parent_short_id])
-        missing = [
-            child for child in child_short_ids_for_parent if child not in existing
-        ]
-        if missing:
-            missing_rows.append((parent_short_id, missing))
-    if missing_rows:
-        _engine(engine_name).auth_chain_children_append(
-            namespace, room_id, missing_rows
-        )
-
-
 # -----------------------------------------------------------------------------
 # §5 addendum: V2.1 conflicted-subgraph forward reachability
 # -----------------------------------------------------------------------------
@@ -645,14 +562,15 @@ def _repair_embedded_children_from_sql(
 
 
 def get_forward_reachable_short_ids(
-    txn: _AuthChainTxn,
     engine_name: str | None,
     namespace: str,
     room_id: str,
     start_short_ids: list[int],
     candidate_short_ids: set[int] | None = None,
 ) -> set[int]:
-    """Ephemeral BFS over embedded inbound (child) edges.
+    """Ephemeral BFS over mtxdb inbound (child) edges. This walk performs
+    no SQL reads; outbound auth edges are imported when the backwards closure
+    is built, and embedding each event appends its inbound child edges.
 
     Returns the set of short ids forward-reachable from `start_short_ids`,
     **including the starting events themselves**; when `candidate_short_ids`
@@ -687,17 +605,6 @@ def get_forward_reachable_short_ids(
        always in the result regardless of candidate membership.
     """
     starting = set(start_short_ids)
-    if candidate_short_ids is not None:
-        parents_to_repair = set(starting).union(candidate_short_ids)
-        _repair_embedded_children_from_sql(
-            txn,
-            engine_name,
-            namespace,
-            room_id,
-            parents_to_repair,
-            candidate_short_ids,
-        )
-
     result: set[int] = set(starting)
     seen: set[int] = set()
     frontier = list(starting)
@@ -706,20 +613,6 @@ def get_forward_reachable_short_ids(
         frontier = []
         if not current_layer:
             continue
-
-        # Without candidate pruning, discover the graph one BFS layer at a
-        # time and repair that layer in one SQL query. The v2.1 caller passes
-        # a candidate set, allowing the entire bounded subgraph to be
-        # repaired in one query above.
-        if candidate_short_ids is None:
-            _repair_embedded_children_from_sql(
-                txn,
-                engine_name,
-                namespace,
-                room_id,
-                current_layer,
-                None,
-            )
 
         children_by_parent = get_embedded_auth_children_batch(
             engine_name, namespace, room_id, list(current_layer)

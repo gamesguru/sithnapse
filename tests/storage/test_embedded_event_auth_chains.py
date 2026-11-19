@@ -111,8 +111,8 @@ class FakeEngine(ModuleType):
 
 
 class FakeTxn:
-    """Fakes just the `execute(...).fetchall()`/`.fetchone()` surface
-    `_fetch_auth_event_ids_from_sql` needs, backed by a hand-built
+    """Fakes just the `execute(...).fetchall()`/`.fetchone()` surface the
+    closure walk and child-edge repair need, backed by a hand-built
     `event_auth` graph.
     """
 
@@ -130,14 +130,24 @@ class FakeTxn:
             for parent in parents:
                 self._children_of.setdefault(parent, []).append(child)
         self._last_rows: list[tuple[Any, ...]] = []
+        # Every statement executed, so tests can assert that the repair is
+        # batched rather than issued once per visited parent.
+        self.executed_sql: list[str] = []
 
     def execute(self, sql: str, parameters: tuple[Any, ...]) -> None:
-        if sql.startswith("SELECT auth_id"):
+        self.executed_sql.append(sql)
+        if sql.startswith("SELECT auth_id, event_id FROM event_auth"):
+            # Batched inbound (child) edge repair: rows are
+            # `(auth_id=parent, event_id=child)`.
+            _room_id, *parent_ids = parameters
+            self._last_rows = [
+                (parent_id, child_id)
+                for parent_id in parent_ids
+                for child_id in self._children_of.get(parent_id, [])
+            ]
+        elif sql.startswith("SELECT auth_id FROM event_auth"):
             (event_id,) = parameters
             self._last_rows = [(a,) for a in self._auth_edges.get(event_id, [])]
-        elif sql.startswith("SELECT event_id FROM event_auth WHERE auth_id"):
-            (auth_id,) = parameters
-            self._last_rows = [(c,) for c in self._children_of.get(auth_id, [])]
         elif sql.startswith("SELECT 1 FROM events"):
             (event_id,) = parameters
             self._last_rows = [(1,)] if event_id in self._known_events else []
@@ -319,12 +329,7 @@ class ClosureWalkTests(TestCase):
 
 
 class ForwardReachabilityTests(TestCase):
-    """Tests for the V2.1 addendum's on-demand forward BFS. Unlike
-    `ClosureWalkTests`, these deliberately don't pre-warm the embedded
-    inbound edges via `ClosureCache` -- `get_forward_reachable_short_ids`
-    must be able to discover children straight from SQL's reverse
-    `event_auth` query and repair the embedded list as it goes.
-    """
+    """Tests for the V2.1 mtxdb-only forward BFS."""
 
     def setUp(self) -> None:
         self.engine = FakeEngine()
@@ -341,6 +346,21 @@ class ForwardReachabilityTests(TestCase):
     def _short_id(self, event_id: str) -> int:
         return get_or_create_short_ids(None, NAMESPACE, ROOM_ID, [event_id])[0]
 
+    def _embed_graph(self, graph: dict[str, list[str]]) -> dict[str, int]:
+        event_ids = list(graph)
+        short_ids = get_or_create_short_ids(None, NAMESPACE, ROOM_ID, event_ids)
+        short_id_of = dict(zip(event_ids, short_ids))
+        embed_auth_edges_batch(
+            None,
+            NAMESPACE,
+            ROOM_ID,
+            [
+                (short_id_of[event_id], [short_id_of[parent] for parent in parents])
+                for event_id, parents in graph.items()
+            ],
+        )
+        return short_id_of
+
     def test_linear_chain_forward_reachable(self) -> None:
         # create <- a <- b <- c  (each arrow: "auths")
         graph = {
@@ -349,14 +369,11 @@ class ForwardReachabilityTests(TestCase):
             "$b": ["$a"],
             "$c": ["$b"],
         }
-        txn = FakeTxn(graph)
-        create_id = self._short_id("$create")
-        a_id = self._short_id("$a")
-        b_id = self._short_id("$b")
-        c_id = self._short_id("$c")
+        ids = self._embed_graph(graph)
+        create_id, a_id, b_id, c_id = (ids[k] for k in graph)
 
         reachable = get_forward_reachable_short_ids(
-            txn, None, NAMESPACE, ROOM_ID, [create_id]
+            None, NAMESPACE, ROOM_ID, [create_id]
         )
         # Seed-inclusive (see the function docstring): the starting event
         # itself is part of the forward-reachable set, matching the v2.1
@@ -371,25 +388,19 @@ class ForwardReachabilityTests(TestCase):
             "$b": ["$create"],
             "$c": ["$a", "$b"],
         }
-        txn = FakeTxn(graph)
-        create_id = self._short_id("$create")
-        a_id = self._short_id("$a")
-        b_id = self._short_id("$b")
-        c_id = self._short_id("$c")
+        ids = self._embed_graph(graph)
+        create_id, a_id, b_id, c_id = (ids[k] for k in graph)
 
         reachable = get_forward_reachable_short_ids(
-            txn, None, NAMESPACE, ROOM_ID, [create_id]
+            None, NAMESPACE, ROOM_ID, [create_id]
         )
         self.assertEqual(reachable, {create_id, a_id, b_id, c_id})
 
     def test_leaf_has_no_forward_reachable_events(self) -> None:
         graph = {"$create": [], "$a": ["$create"]}
-        txn = FakeTxn(graph)
-        a_id = self._short_id("$a")
+        a_id = self._embed_graph(graph)["$a"]
 
-        reachable = get_forward_reachable_short_ids(
-            txn, None, NAMESPACE, ROOM_ID, [a_id]
-        )
+        reachable = get_forward_reachable_short_ids(None, NAMESPACE, ROOM_ID, [a_id])
         self.assertEqual(reachable, {a_id})
 
     def test_candidate_prune_bounds_walk_to_intersectable_universe(self) -> None:
@@ -406,15 +417,11 @@ class ForwardReachabilityTests(TestCase):
             "$x": ["$create"],
             "$y": ["$x"],
         }
-        txn = FakeTxn(graph)
-        create_id = self._short_id("$create")
-        a_id = self._short_id("$a")
-        x_id = self._short_id("$x")
-        y_id = self._short_id("$y")
+        ids = self._embed_graph(graph)
+        create_id, a_id, x_id, y_id = (ids[k] for k in graph)
 
         candidate = {create_id, a_id}
         reachable = get_forward_reachable_short_ids(
-            txn,
             None,
             NAMESPACE,
             ROOM_ID,
@@ -431,12 +438,10 @@ class ForwardReachabilityTests(TestCase):
         around must never vanish from the forwards side.
         """
         graph = {"$create": [], "$a": ["$create"]}
-        txn = FakeTxn(graph)
-        a_id = self._short_id("$a")
-        create_id = self._short_id("$create")
+        ids = self._embed_graph(graph)
+        a_id, create_id = ids["$a"], ids["$create"]
 
         reachable = get_forward_reachable_short_ids(
-            txn,
             None,
             NAMESPACE,
             ROOM_ID,
@@ -445,29 +450,42 @@ class ForwardReachabilityTests(TestCase):
         )
         self.assertEqual(reachable, {a_id})
 
-    def test_repairs_embedded_children_discovered_late(self) -> None:
+    def test_late_child_write_updates_embedded_children(self) -> None:
         """A child persisted (and short-id allocated) *after* the parent
-        was already touched must still show up in the forward walk -- the
-        embedded inbound list is verified/repaired against SQL each call,
-        not trusted blindly once populated.
+        was already touched must still show up in the forward walk. The
+        child's normal embed write appends its inbound edge in mtxdb.
         """
         graph = {"$create": [], "$a": ["$create"]}
-        txn = FakeTxn(graph)
-        create_id = self._short_id("$create")
-        a_id = self._short_id("$a")
+        ids = self._embed_graph(graph)
+        create_id, a_id = ids["$create"], ids["$a"]
 
         # First walk: only $a is a child of $create.
-        first = get_forward_reachable_short_ids(
-            txn, None, NAMESPACE, ROOM_ID, [create_id]
-        )
+        first = get_forward_reachable_short_ids(None, NAMESPACE, ROOM_ID, [create_id])
         self.assertEqual(first, {create_id, a_id})
 
         # A new event "$b" is persisted, also authed by $create.
-        graph2 = {"$create": [], "$a": ["$create"], "$b": ["$create"]}
-        txn2 = FakeTxn(graph2)
         b_id = self._short_id("$b")
+        embed_auth_edges_batch(None, NAMESPACE, ROOM_ID, [(b_id, [create_id])])
 
-        second = get_forward_reachable_short_ids(
-            txn2, None, NAMESPACE, ROOM_ID, [create_id]
-        )
+        second = get_forward_reachable_short_ids(None, NAMESPACE, ROOM_ID, [create_id])
         self.assertEqual(second, {create_id, a_id, b_id})
+
+    def test_candidate_walk_uses_only_mtxdb_edges(self) -> None:
+        graph = {
+            "$create": [],
+            "$a": ["$create"],
+            "$b": ["$a"],
+            "$c": ["$b"],
+            "$d": ["$c"],
+        }
+        ids = self._embed_graph(graph)
+        candidate = set(ids.values())
+
+        reachable = get_forward_reachable_short_ids(
+            None,
+            NAMESPACE,
+            ROOM_ID,
+            [ids["$create"]],
+            candidate_short_ids=candidate,
+        )
+        self.assertEqual(reachable, candidate)

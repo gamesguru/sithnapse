@@ -1138,6 +1138,12 @@ class FederationEventHandler:
         if not prevs - seen:
             return
 
+        # The prev_events of the pushed event that we already have. If there
+        # are none, the event is only connected to us through the remote's
+        # answer, so an empty/truncated answer must reject it rather than be
+        # worked around (see the direct-fetch fallback below).
+        known_prevs = prevs & seen
+
         latest_frozen = await self._store.get_latest_event_ids_in_room(room_id)
 
         # We add the prev events that we have seen to the latest
@@ -1293,13 +1299,20 @@ class FederationEventHandler:
             have = await self._store.have_events_in_timeline(candidate_prevs)
             frontier = candidate_prevs - have
 
-        # Some servers answer /get_missing_events with an empty or truncated
-        # batch even though they can serve the missing events via /event. Fetch
-        # any prev_events that are still missing directly rather than rejecting
-        # the pushed event. This mirrors what /backfill would do.
+        # Some servers answer /get_missing_events with a truncated batch even
+        # though they can serve the remaining prev_events via /event. When the
+        # pushed event is also anchored to a prev_event we already have, fetch
+        # those directly rather than rejecting the event. This mirrors what
+        # /backfill would do.
+        #
+        # An event whose only connections are remote-supplied gets no such
+        # benefit: if the remote answers with nothing, it is deliberately
+        # withholding the event's history, and chasing the individual event
+        # behind its back would accept a PDU it meant us to drop (and can
+        # stall on peers that do not implement /event at all).
         seen = await self._store.have_events_in_timeline(prevs)
         still_missing = prevs - seen - fetched_ids
-        if still_missing:
+        if still_missing and known_prevs:
             logger.info(
                 "Fetching %d prev_events directly from %s: %s",
                 len(still_missing),
@@ -1566,7 +1579,10 @@ class FederationEventHandler:
 
         try:
             first_context = await self._compute_event_context_with_maybe_missing_prevs(
-                origin, first, ignore_pull_backoff=True
+                origin,
+                first,
+                ignore_pull_backoff=True,
+                require_complete_state=False,
             )
         except Exception:
             return False
@@ -1684,7 +1700,10 @@ class FederationEventHandler:
         try:
             try:
                 context = await self._compute_event_context_with_maybe_missing_prevs(
-                    origin, event, allow_current_state_fallback=backfilled
+                    origin,
+                    event,
+                    allow_current_state_fallback=backfilled,
+                    require_complete_state=False,
                 )
                 await self._process_received_pdu(
                     origin,
@@ -1696,7 +1715,10 @@ class FederationEventHandler:
                 # The room was un-partial stated while we were processing the event.
                 # Try once more, with full state this time.
                 context = await self._compute_event_context_with_maybe_missing_prevs(
-                    origin, event, allow_current_state_fallback=backfilled
+                    origin,
+                    event,
+                    allow_current_state_fallback=backfilled,
+                    require_complete_state=False,
                 )
 
                 # We ought to have full state now, barring some unlikely race where we left and
@@ -1743,6 +1765,7 @@ class FederationEventHandler:
         *,
         ignore_pull_backoff: bool = False,
         allow_current_state_fallback: bool = False,
+        require_complete_state: bool = True,
     ) -> EventContext:
         """Build an EventContext structure for a non-outlier event whose prev_events may
         be missing.
@@ -1771,6 +1794,13 @@ class FederationEventHandler:
             dest: the remote server to ask for state at the missing prevs. Typically,
                 this will be the server we got `event` from.
             event: an event to check for missing prevs.
+            require_complete_state: If True, fail when the remote's state at a
+                missing prev_event cannot be fully fetched. This is the safe
+                default for a *pushed* event: accepting it against a state the
+                remote withheld could let it pass auth the real state would
+                reject. Pulled events (``/get_missing_events`` and backfill)
+                pass False, matching the historical behaviour of resolving
+                against the state we do have and treating the rest as a gap.
 
         Returns:
             The event context.
@@ -1865,7 +1895,9 @@ class FederationEventHandler:
                                 dest,
                                 room_id,
                                 missing_prev,
-                                require_complete_state=not partial_state,
+                                require_complete_state=(
+                                    require_complete_state and not partial_state
+                                ),
                             )
                         )
                     except IncompleteStateError:
