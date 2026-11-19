@@ -516,10 +516,16 @@ class PaginationHandler:
         if (
             pagin_config.direction == Direction.FORWARDS
             and from_token.room_key.topological is None
+            and not from_token.room_key.instance_map
         ):
             # A stream-only token (e.g. a sync `prev_batch`) cannot see
             # backfilled events, whose stream orderings are negative. Pin it to
             # a topological position so forward pages can include them.
+            #
+            # Vector clock tokens (with an instance map) already encode each
+            # writer's position and are filtered per instance, so leave them
+            # alone: discarding the map would let through events the client has
+            # already synced.
             pinned = await self.store.get_topological_token_for_stream_position(
                 room_id, from_token.room_key.stream
             )
