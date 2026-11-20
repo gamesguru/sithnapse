@@ -23,7 +23,12 @@ from unittest import mock
 from twisted.internet.testing import MemoryReactor
 
 from synapse.api.constants import EventTypes
-from synapse.api.errors import AuthError, StoreError
+from synapse.api.errors import (
+    AuthError,
+    HttpResponseException,
+    RequestSendFailed,
+    StoreError,
+)
 from synapse.api.room_versions import RoomVersion, RoomVersions
 from synapse.event_auth import (
     check_state_dependent_auth_rules,
@@ -230,6 +235,232 @@ class FederationEventHandlerTests(unittest.FederatingHomeserverTestCase):
             [mock.call(first_event), mock.call(second_event)]
         )
         self.assertEqual(encrypted_handlers_saw_persisted, [True, True])
+
+    def _run_pulled_batch_with_state_probe(
+        self,
+        state_probe: mock.AsyncMock,
+    ) -> tuple[bool, mock.AsyncMock]:
+        """Run a two-event pulled batch with one unaccounted gap parent."""
+        room_id = "!room:test"
+        first_event = mock.Mock(room_id=room_id, event_id="$first")
+        first_event.is_state.return_value = False
+        first_event.prev_event_ids.return_value = ("$first-prev",)
+        first_event.internal_metadata.is_outlier.return_value = False
+
+        second_event = mock.Mock(room_id=room_id, event_id="$second")
+        second_event.is_state.return_value = False
+        second_event.prev_event_ids.return_value = ("$first", "$gap")
+        second_event.internal_metadata.is_outlier.return_value = False
+
+        first_context = mock.Mock(rejected=False, state_group=1, partial_state=False)
+        second_context = mock.Mock(rejected=False)
+
+        handler = self.hs.get_federation_event_handler()
+        store = self.hs.get_datastores().main
+        persist_events_and_notify = mock.AsyncMock()
+
+        with (
+            mock.patch.object(handler, "_sanity_check_event"),
+            mock.patch.object(
+                store,
+                "have_events_in_timeline",
+                new=mock.AsyncMock(return_value=set()),
+            ),
+            mock.patch.object(
+                handler._federation_client,
+                "get_room_state_ids",
+                new=state_probe,
+            ),
+            mock.patch.object(
+                handler,
+                "_compute_event_context_with_maybe_missing_prevs",
+                new=mock.AsyncMock(return_value=first_context),
+            ),
+            mock.patch.object(EventContext, "with_state", return_value=second_context),
+            mock.patch.object(handler, "_check_event_auth", new=mock.AsyncMock()),
+            mock.patch.object(handler, "_check_for_soft_fail", new=mock.AsyncMock()),
+            mock.patch.object(
+                store, "get_min_depth", new=mock.AsyncMock(return_value=None)
+            ),
+            mock.patch.object(
+                handler._bulk_push_rule_evaluator,
+                "action_for_events_by_user",
+                new=mock.AsyncMock(),
+            ),
+            mock.patch.object(
+                handler, "persist_events_and_notify", new=persist_events_and_notify
+            ),
+            mock.patch.object(handler, "_handle_encrypted_event", new=mock.AsyncMock()),
+        ):
+            result = self.get_success(
+                handler._try_process_pulled_events_as_batch(
+                    "remote", [first_event, second_event]
+                )
+            )
+
+        return result, persist_events_and_notify
+
+    def test_pulled_batch_allows_confirmed_gap_parent(self) -> None:
+        """A 404 for an extra predecessor means it is a gap, not a state fork."""
+        state_probe = mock.AsyncMock(
+            side_effect=HttpResponseException(404, "Not Found", b"")
+        )
+        result, persist_events_and_notify = self._run_pulled_batch_with_state_probe(
+            state_probe
+        )
+
+        self.assertTrue(result)
+        persist_events_and_notify.assert_awaited_once()
+        state_probe.assert_awaited_once()
+
+    def test_pulled_batch_falls_back_when_gap_parent_has_state(self) -> None:
+        """If the remote can serve the extra predecessor's state, use serial."""
+        state_probe = mock.AsyncMock(return_value=([], []))
+        result, persist_events_and_notify = self._run_pulled_batch_with_state_probe(
+            state_probe
+        )
+
+        self.assertFalse(result)
+        persist_events_and_notify.assert_not_awaited()
+        state_probe.assert_awaited_once()
+
+    def test_pulled_batch_declines_5xx_gap_parent(self) -> None:
+        """A 5xx probe is transient, not a confirmed gap."""
+        state_probe = mock.AsyncMock(
+            side_effect=HttpResponseException(502, "Bad Gateway", b"")
+        )
+        result, persist_events_and_notify = self._run_pulled_batch_with_state_probe(
+            state_probe
+        )
+
+        self.assertFalse(result)
+        persist_events_and_notify.assert_not_awaited()
+        state_probe.assert_awaited_once()
+
+    def _run_inbound_batch_with_gap_probe(
+        self, state_probe: mock.AsyncMock
+    ) -> tuple[bool, mock.AsyncMock]:
+        """Run an inbound batch whose second event has one gap parent."""
+        room_id = "!room:test"
+        first_event = mock.Mock(room_id=room_id, event_id="$first", depth=1)
+        first_event.is_state.return_value = False
+        first_event.prev_event_ids.return_value = ("$known",)
+        first_event.internal_metadata.outlier = False
+
+        second_event = mock.Mock(room_id=room_id, event_id="$second", depth=2)
+        second_event.is_state.return_value = False
+        second_event.prev_event_ids.return_value = ("$first", "$gap")
+        second_event.internal_metadata.outlier = False
+
+        first_context = mock.Mock(rejected=False, state_group=1, partial_state=False)
+        second_context = mock.Mock(rejected=False)
+
+        async def have_events_in_timeline(event_ids: object) -> set[str]:
+            if "$known" in event_ids:  # type: ignore[operator]
+                return {"$known"}
+            return set()
+
+        handler = self.hs.get_federation_event_handler()
+        store = self.hs.get_datastores().main
+        persist_events_and_notify = mock.AsyncMock()
+
+        with (
+            mock.patch.object(
+                handler._event_auth_handler,
+                "is_host_in_room",
+                new=mock.AsyncMock(return_value=True),
+            ),
+            mock.patch.object(
+                store, "get_event", new=mock.AsyncMock(return_value=None)
+            ),
+            mock.patch.object(
+                store,
+                "have_events_in_timeline",
+                new=mock.AsyncMock(side_effect=have_events_in_timeline),
+            ),
+            mock.patch.object(
+                store,
+                "get_latest_event_ids_in_room",
+                new=mock.AsyncMock(return_value=[]),
+            ),
+            mock.patch.object(
+                store, "get_min_depth", new=mock.AsyncMock(return_value=None)
+            ),
+            mock.patch.object(
+                handler._federation_client,
+                "get_pdu",
+                new=mock.AsyncMock(return_value=None),
+            ),
+            mock.patch.object(
+                handler._federation_client,
+                "get_room_state_ids",
+                new=state_probe,
+            ),
+            mock.patch.object(handler, "_sanity_check_event"),
+            mock.patch.object(
+                handler._state_handler,
+                "compute_event_context",
+                new=mock.AsyncMock(return_value=first_context),
+            ),
+            mock.patch.object(EventContext, "with_state", return_value=second_context),
+            mock.patch.object(handler, "_check_event_auth", new=mock.AsyncMock()),
+            mock.patch.object(handler, "_check_for_soft_fail", new=mock.AsyncMock()),
+            mock.patch.object(
+                handler._bulk_push_rule_evaluator,
+                "action_for_events_by_user",
+                new=mock.AsyncMock(),
+            ),
+            mock.patch.object(
+                handler, "persist_events_and_notify", new=persist_events_and_notify
+            ),
+            mock.patch.object(handler, "_handle_encrypted_event", new=mock.AsyncMock()),
+        ):
+            result = self.get_success(
+                handler.try_on_receive_pdu_batch(
+                    [("remote", first_event), ("remote", second_event)]
+                )
+            )
+
+        return result, persist_events_and_notify
+
+    def test_inbound_batch_allows_404_gap_parent(self) -> None:
+        """A 404 when probing a gap parent means it is genuinely unavailable."""
+        state_probe = mock.AsyncMock(
+            side_effect=HttpResponseException(404, "Not Found", b"")
+        )
+        result, persist_events_and_notify = self._run_inbound_batch_with_gap_probe(
+            state_probe
+        )
+
+        self.assertTrue(result)
+        persist_events_and_notify.assert_awaited_once()
+        state_probe.assert_awaited_once()
+
+    def test_inbound_batch_declines_transient_gap_probe_error(self) -> None:
+        """A transient state lookup failure must not be treated as a gap."""
+        state_probe = mock.AsyncMock(
+            side_effect=RequestSendFailed(Exception("timeout"), can_retry=True)
+        )
+        result, persist_events_and_notify = self._run_inbound_batch_with_gap_probe(
+            state_probe
+        )
+
+        self.assertFalse(result)
+        persist_events_and_notify.assert_not_awaited()
+        state_probe.assert_awaited_once()
+
+    def test_inbound_batch_declines_5xx_gap_probe(self) -> None:
+        """A 5xx state lookup failure must not be treated as a gap."""
+        state_probe = mock.AsyncMock(
+            side_effect=HttpResponseException(500, "Internal Server Error", b"")
+        )
+        result, persist_events_and_notify = self._run_inbound_batch_with_gap_probe(
+            state_probe
+        )
+
+        self.assertFalse(result)
+        persist_events_and_notify.assert_not_awaited()
+        state_probe.assert_awaited_once()
 
     def _update_state_for_flipped_membership(
         self, cached_devices: dict[str, JsonDict], last_stream_id: str | None

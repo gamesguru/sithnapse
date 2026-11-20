@@ -550,8 +550,21 @@ class FederationEventHandler:
                     await self._federation_client.get_room_state_ids(
                         origin, room_id, event_id=missing_prev
                     )
-                except Exception:
+                except HttpResponseException as e:
+                    # The remote cannot serve state for this parent. A 4xx is a
+                    # genuine gap; 5xx is transient and could recover.
+                    return 400 <= e.code < 500
+                except FederationError:
+                    # The remote cannot serve state for this parent, so it is a
+                    # genuine gap.
                     return True
+                except (RequestSendFailed, NotRetryingDestination, TimeoutError):
+                    # The lookup failed transiently: we cannot prove the parent
+                    # is unavailable or that batching may share this state.
+                    # Decline the fast path so the per-event path retries it.
+                    return False
+                except Exception:
+                    return False
                 return False
 
             if not all(
@@ -1604,16 +1617,55 @@ class FederationEventHandler:
             ):
                 return False
 
-        # The only predecessors outside the run must be gaps, not events whose
-        # state would have to be resolved into the shared context.
+        # A later event may only reference other events whose state is already
+        # represented by the first event's context: earlier members of this run
+        # (all non-state) and the first event's own predecessors. Other known
+        # predecessors have state that would have to be resolved separately.
+        # An unresolved predecessor is allowed only when the remote confirms it
+        # cannot serve its state (i.e. it really is the gap this run bridges).
+        preceding_ids = {first.event_id}
+        preceding_ids.update(event.event_id for event in events[1:-1])
+        accounted_prevs = set(first.prev_event_ids()) | preceding_ids
         extra_prevs = {
             prev
             for previous, event in zip(events, events[1:])
             for prev in event.prev_event_ids()
             if prev != previous.event_id
         }
-        if extra_prevs & await self._store.have_events_in_timeline(extra_prevs):
-            return False
+        unaccounted_prevs = extra_prevs - accounted_prevs
+        if unaccounted_prevs:
+            if await self._store.have_events_in_timeline(unaccounted_prevs):
+                return False
+
+            async def gap_parent_is_unavailable(prev: str) -> bool:
+                try:
+                    await self._federation_client.get_room_state_ids(
+                        origin, room_id, event_id=prev
+                    )
+                except HttpResponseException as e:
+                    # A 4xx means the remote refuses to serve this parent, so
+                    # it really is the gap this run bridges. 5xx is transient.
+                    return 400 <= e.code < 500
+                except (RequestSendFailed, NotRetryingDestination, TimeoutError):
+                    # Transient failure: let the per-event path retry it.
+                    return False
+                except FederationError:
+                    # The remote cannot serve state for this parent, so it is a
+                    # gap rather than a state-bearing branch.
+                    return True
+                except Exception:
+                    return False
+                else:
+                    # The parent has state of its own, which is not part of the
+                    # first event's context.
+                    return False
+
+            if not all(
+                await yieldable_gather_results(
+                    gap_parent_is_unavailable, unaccounted_prevs
+                )
+            ):
+                return False
 
         try:
             first_context = await self._compute_event_context_with_maybe_missing_prevs(
@@ -2200,12 +2252,23 @@ class FederationEventHandler:
                     metadata.room_id,
                     room_id,
                 )
+                if require_complete_state:
+                    raise IncompleteStateError(
+                        f"Remote server {destination} advertised event "
+                        f"{state_event_id} from room {metadata.room_id} as state "
+                        f"in room {room_id}"
+                    )
                 continue
 
             if metadata.state_key is None:
                 logger.warning(
                     "Remote server gave us non-state event in state: %s", state_event_id
                 )
+                if require_complete_state:
+                    raise IncompleteStateError(
+                        f"Remote server {destination} advertised non-state event "
+                        f"{state_event_id} as state in room {room_id}"
+                    )
                 continue
 
             state_map[(metadata.event_type, metadata.state_key)] = state_event_id

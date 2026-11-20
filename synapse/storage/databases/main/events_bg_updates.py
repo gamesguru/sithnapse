@@ -1124,19 +1124,6 @@ class EventsBackgroundUpdatesStore(
 
         last_event_id = progress.get("last_event_id", "")
 
-        # Until `synapse_auth_edges_migrate` has flipped the marker, SQL
-        # `event_auth` is still the source snapshot it imports from, so this
-        # update must keep filling it even when an embedded engine is configured.
-        def read_auth_backend(txn: LoggingTransaction) -> str:
-            txn.execute("SELECT backend FROM auth_chain_backend WHERE lock = 'X'")
-            row = txn.fetchone()
-            return str(row[0]) if row else "sql"
-
-        auth_backend = await self.db_pool.runInteraction(
-            "rejected_events_metadata_auth_backend", read_auth_backend
-        )
-        auth_edges_in_mtxdb = bool(self._embedded_db_engine) and auth_backend == "mtxdb"
-
         def get_rejected_events(
             txn: Cursor,
         ) -> list[tuple[str, str, JsonDict, bool, bool]]:
@@ -1145,7 +1132,7 @@ class EventsBackgroundUpdatesStore(
             #
             # Note we can assume that events that don't have a corresponding
             # room version are V1 rooms.
-            has_mtxdb_auth_edges = auth_edges_in_mtxdb
+            has_mtxdb_auth_edges = bool(self._embedded_db_engine)
             auth_join = (
                 "" if has_mtxdb_auth_edges else "LEFT JOIN event_auth USING (event_id)"
             )
@@ -1260,7 +1247,7 @@ class EventsBackgroundUpdatesStore(
                 desc="_rejected_events_metadata_state_events",
             )
 
-        if auth_events and not auth_edges_in_mtxdb:
+        if auth_events and not self._embedded_db_engine:
             await self.db_pool.simple_insert_many(
                 table="event_auth",
                 keys=("event_id", "room_id", "auth_id"),

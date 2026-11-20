@@ -38,6 +38,7 @@ from synapse.streams.config import PaginationConfig
 from synapse.types import (
     JsonMapping,
     Requester,
+    RoomStreamToken,
     ScheduledTask,
     StreamKeyType,
     StreamToken,
@@ -513,26 +514,36 @@ class PaginationHandler:
             # `/messages` should still works with live tokens when manually provided.
             assert from_token.room_key.topological is not None
 
-        if (
-            pagin_config.direction == Direction.FORWARDS
-            and from_token.room_key.topological is None
-            and not from_token.room_key.instance_map
-        ):
-            # A stream-only token (e.g. a sync `prev_batch`) cannot see
-            # backfilled events, whose stream orderings are negative. Pin it to
-            # a topological position so forward pages can include them.
-            #
-            # Vector clock tokens (with an instance map) already encode each
-            # writer's position and are filtered per instance, so leave them
-            # alone: discarding the map would let through events the client has
-            # already synced.
-            pinned = await self.store.get_topological_token_for_stream_position(
-                room_id, from_token.room_key.stream
-            )
-            if pinned is not None:
-                from_token = from_token.copy_and_replace(StreamKeyType.ROOM, pinned)
+        pagination_from_token = from_token.room_key
+        live_from_token: RoomStreamToken | None = None
+        if pagin_config.direction == Direction.FORWARDS:
+            if (
+                from_token.room_key.topological is None
+                and not from_token.room_key.instance_map
+            ):
+                # A stream-only token (e.g. a sync `prev_batch`) cannot see
+                # backfilled events, whose stream orderings are negative. Pin a
+                # separate query token to a topological position so forward
+                # pages can include them, while the original token's stream
+                # position still bounds live events.
+                #
+                # Vector clock tokens (with an instance map) already encode each
+                # writer's position and are filtered per instance, so leave them
+                # alone: discarding the map would let through events the client
+                # has already synced.
+                pinned = await self.store.get_topological_token_for_stream_position(
+                    room_id, from_token.room_key.stream
+                )
+                if pinned is not None:
+                    pagination_from_token = pinned
+                    live_from_token = from_token.room_key
+            elif from_token.room_key.topological is not None:
+                # Forward historical pages also use the stream position in the
+                # token as the live bound. Backfilled events are selected by
+                # the topological part of the same token.
+                live_from_token = RoomStreamToken(stream=from_token.room_key.stream)
 
-        room_token = from_token.room_key
+        room_token = pagination_from_token
 
         (membership, member_event_id) = (None, None)
         if not use_admin_priviledge:
@@ -580,6 +591,11 @@ class PaginationHandler:
         if pagin_config.to_token:
             to_room_key = pagin_config.to_token.room_key
 
+        # The token the client sent (or the start of this pagination run) is
+        # what we echo back, even when the query uses a pinned topological
+        # anchor to find backfilled events.
+        response_start_token = from_token
+
         # Initially fetch the events from the database. With any luck, we can return
         # these without blocking on backfill (handled below).
         (
@@ -588,11 +604,12 @@ class PaginationHandler:
             limited,
         ) = await self.store.paginate_room_events_by_topological_ordering(
             room_id=room_id,
-            from_key=from_token.room_key,
+            from_key=pagination_from_token,
             to_key=to_room_key,
             direction=pagin_config.direction,
             limit=pagin_config.limit,
             event_filter=event_filter,
+            live_from_key=live_from_token,
         )
 
         if pagin_config.direction == Direction.BACKWARDS:
@@ -687,11 +704,12 @@ class PaginationHandler:
                         limited,
                     ) = await self.store.paginate_room_events_by_topological_ordering(
                         room_id=room_id,
-                        from_key=from_token.room_key,
+                        from_key=pagination_from_token,
                         to_key=to_room_key,
                         direction=pagin_config.direction,
                         limit=pagin_config.limit,
                         event_filter=event_filter,
+                        live_from_key=live_from_token,
                     )
             else:
                 # Otherwise, we can backfill in the background for eventual
@@ -715,10 +733,12 @@ class PaginationHandler:
             # visible.
             page_hits_a_gap = False
             if not events:
-                # An empty page (end of room, or the filter removed everything)
-                # is not itself evidence of a gap. Only retry if the first
-                # unfiltered event after the cursor is next to a backward gap,
-                # i.e. the requested range really has missing history.
+                # An empty page only means there is a gap to fill if there are
+                # events after the cursor at all. (The page may be empty simply
+                # because the cursor is at the end of the room, or because the
+                # filter removed everything.) The probe is deliberately
+                # unfiltered: with a filter that matches nothing it is the only
+                # way a client can drive the fill across many open gaps.
                 (
                     probe,
                     _,
@@ -730,11 +750,9 @@ class PaginationHandler:
                     direction=Direction.FORWARDS,
                     limit=1,
                     event_filter=None,
+                    live_from_key=live_from_token,
                 )
-                for probe_event in probe:
-                    if await self.store.is_event_next_to_backward_gap(probe_event):
-                        page_hits_a_gap = True
-                        break
+                page_hits_a_gap = bool(probe)
             else:
                 for event in events:
                     if await self.store.is_event_next_to_backward_gap(event):
@@ -758,11 +776,12 @@ class PaginationHandler:
                         limited,
                     ) = await self.store.paginate_room_events_by_topological_ordering(
                         room_id=room_id,
-                        from_key=from_token.room_key,
+                        from_key=pagination_from_token,
                         to_key=to_room_key,
                         direction=pagin_config.direction,
                         limit=pagin_config.limit,
                         event_filter=event_filter,
+                        live_from_key=live_from_token,
                     )
 
                     if not events:
@@ -786,7 +805,7 @@ class PaginationHandler:
                 messages_chunk=[],
                 bundled_aggregations={},
                 state=None,
-                start_token=from_token,
+                start_token=response_start_token,
                 end_token=None,
             )
 
@@ -810,7 +829,7 @@ class PaginationHandler:
                 messages_chunk=[],
                 bundled_aggregations={},
                 state=None,
-                start_token=from_token,
+                start_token=response_start_token,
                 end_token=next_token,
             )
 
@@ -839,7 +858,7 @@ class PaginationHandler:
             messages_chunk=filtered_events,
             bundled_aggregations=aggregations,
             state=state,
-            start_token=from_token,
+            start_token=response_start_token,
             end_token=next_token,
         )
 

@@ -90,6 +90,10 @@ logger = logging.getLogger(__name__)
 
 MAX_STREAM_SIZE = 1000
 
+# Upper bound on how many rows we will fetch to complete a topological depth
+# when a forward page ends on a backfilled event.
+_MAX_BACKFILL_BOUNDARY_FETCH = 10000
+
 
 _STREAM_TOKEN = "stream"
 _TOPOLOGICAL_TOKEN = "topological"
@@ -2259,6 +2263,7 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
         direction: Direction = Direction.BACKWARDS,
         limit: int = 0,
         event_filter: Filter | None = None,
+        live_from_key: RoomStreamToken | None = None,
     ) -> tuple[list[_EventDictReturn], RoomStreamToken, bool]:
         """Returns list of events before or after a given token.
 
@@ -2305,13 +2310,38 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
             direction, from_token, to_token
         )
 
-        bounds = generate_pagination_where_clause(
-            direction=direction,
-            column_names=("event.topological_ordering", "event.stream_ordering"),
-            from_token=from_bound,
-            to_token=to_bound,
-            engine=self.database_engine,
-        )
+        if direction == Direction.FORWARDS and live_from_key is not None:
+            # `from_token` is a topological anchor for backfilled events only;
+            # live events continue to use the caller's stream position.
+            _, live_from_bound, live_to_bound = generate_pagination_bounds(
+                direction, live_from_key, to_token
+            )
+            backfilled_bounds = generate_pagination_where_clause(
+                direction=direction,
+                column_names=("event.topological_ordering", "event.stream_ordering"),
+                from_token=from_bound,
+                to_token=to_bound,
+                engine=self.database_engine,
+            )
+            live_bounds = generate_pagination_where_clause(
+                direction=direction,
+                column_names=("event.topological_ordering", "event.stream_ordering"),
+                from_token=live_from_bound,
+                to_token=live_to_bound,
+                engine=self.database_engine,
+            )
+            bounds = (
+                f"((event.stream_ordering < 0 AND ({backfilled_bounds})) OR "
+                f"(event.stream_ordering >= 0 AND ({live_bounds})))"
+            )
+        else:
+            bounds = generate_pagination_where_clause(
+                direction=direction,
+                column_names=("event.topological_ordering", "event.stream_ordering"),
+                from_token=from_bound,
+                to_token=to_bound,
+                engine=self.database_engine,
+            )
 
         filter_clause, filter_args = filter_to_clause(event_filter)
 
@@ -2385,37 +2415,128 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
         }
         txn.execute(sql, args)
 
+        def _filter_fetched(
+            fetched_rows: list[tuple[Any, ...]],
+        ) -> list[_EventDictReturn]:
+            filtered_rows: list[_EventDictReturn] = []
+            for (
+                event_id,
+                instance_name,
+                topological_ordering,
+                stream_ordering,
+            ) in fetched_rows:
+                lower_token: RoomStreamToken | None
+                upper_token: RoomStreamToken | None
+                if direction == Direction.BACKWARDS:
+                    lower_token = to_token
+                    upper_token = from_token
+                elif live_from_key is not None and stream_ordering >= 0:
+                    lower_token = live_from_key
+                    upper_token = to_token
+                else:
+                    lower_token = from_token
+                    upper_token = to_token
+
+                if _filter_results(
+                    lower_token=lower_token,
+                    upper_token=upper_token,
+                    instance_name=instance_name,
+                    topological_ordering=topological_ordering,
+                    stream_ordering=stream_ordering,
+                ):
+                    filtered_rows.append(
+                        _EventDictReturn(
+                            event_id, topological_ordering, stream_ordering
+                        )
+                    )
+            return filtered_rows
+
         # Get all the rows and check if we hit the limit.
         fetched_rows = txn.fetchall()
+        filtered_rows = _filter_fetched(fetched_rows)
+
+        if (
+            direction == Direction.FORWARDS
+            and live_from_key is not None
+            and filtered_rows
+            and limit > 0
+        ):
+            boundary_index = min(int(limit), len(filtered_rows)) - 1
+            boundary = filtered_rows[boundary_index]
+            if boundary.stream_ordering < 0:
+                boundary_topo = boundary.topological_ordering
+
+                # The next token keeps the live stream position rather than the
+                # backfilled event's negative one, so a same-depth backfilled
+                # sibling would look already-seen. Fetch until every event at
+                # this topological depth is present, then include the whole
+                # depth in this page.
+                while (
+                    fetched_rows
+                    and len(fetched_rows) >= requested_limit
+                    and fetched_rows[-1][2] == boundary_topo
+                ):
+                    if requested_limit >= _MAX_BACKFILL_BOUNDARY_FETCH:
+                        logger.warning(
+                            "Pagination at room %s reached the %d-event fetch cap "
+                            "at topological depth %d; a same-depth sibling may be "
+                            "split across pages",
+                            room_id,
+                            _MAX_BACKFILL_BOUNDARY_FETCH,
+                            boundary_topo,
+                        )
+                        break
+
+                    requested_limit = min(
+                        requested_limit * 2, _MAX_BACKFILL_BOUNDARY_FETCH
+                    )
+                    txn.execute(sql, (*args[:-1], requested_limit))
+                    fetched_rows = txn.fetchall()
+                    filtered_rows = _filter_fetched(fetched_rows)
+                    boundary_index = min(boundary_index, len(filtered_rows) - 1)
+                    boundary = filtered_rows[boundary_index]
+                    if boundary.stream_ordering >= 0:
+                        break
+                    boundary_topo = boundary.topological_ordering
+
+                if boundary.stream_ordering < 0:
+                    end = boundary_index + 1
+                    while (
+                        end < len(filtered_rows)
+                        and filtered_rows[end].topological_ordering == boundary_topo
+                    ):
+                        end += 1
+                else:
+                    end = int(limit)
+            else:
+                end = int(limit)
+        else:
+            end = int(limit)
+
         limited = len(fetched_rows) >= requested_limit
-
-        # Filter the result set.
-        rows = [
-            _EventDictReturn(event_id, topological_ordering, stream_ordering)
-            for event_id, instance_name, topological_ordering, stream_ordering in fetched_rows
-            if _filter_results(
-                lower_token=(
-                    to_token if direction == Direction.BACKWARDS else from_token
-                ),
-                upper_token=(
-                    from_token if direction == Direction.BACKWARDS else to_token
-                ),
-                instance_name=instance_name,
-                topological_ordering=topological_ordering,
-                stream_ordering=stream_ordering,
-            )
-        ]
-
-        if len(rows) > limit:
+        if len(filtered_rows) > end:
             limited = True
 
-        rows = rows[:limit]
+        rows = filtered_rows[:end]
 
         if rows:
             assert rows[-1].topological_ordering is not None
-            next_token = generate_next_token(
-                direction, rows[-1].topological_ordering, rows[-1].stream_ordering
-            )
+            if (
+                direction == Direction.FORWARDS
+                and live_from_key is not None
+                and rows[-1].stream_ordering < 0
+            ):
+                # Advancing past a backfilled event must not advance the live
+                # stream bound: later live events still start from the caller's
+                # original position.
+                next_token = RoomStreamToken(
+                    topological=rows[-1].topological_ordering,
+                    stream=live_from_key.stream,
+                )
+            else:
+                next_token = generate_next_token(
+                    direction, rows[-1].topological_ordering, rows[-1].stream_ordering
+                )
         else:
             # TODO (erikj): We should work out what to do here instead.
             next_token = to_token if to_token else from_token
@@ -2433,6 +2554,7 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
         direction: Direction = Direction.BACKWARDS,
         limit: int = 0,
         event_filter: Filter | None = None,
+        live_from_key: RoomStreamToken | None = None,
     ) -> tuple[list[EventBase], RoomStreamToken, bool]:
         """
         Paginate events by `topological_ordering` (tie-break with `stream_ordering`) in
@@ -2448,6 +2570,10 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
                 from `from_key`.
             limit: Maximum number of events to return
             event_filter: If provided filters the events to those that match the filter.
+            live_from_key: For forwards pagination, the live stream position to
+                use for events with a non-negative stream ordering. `from_key`
+                then only anchors the topological position used for backfilled
+                events (which have negative stream orderings).
 
         Returns:
             - The results as a list of events;
@@ -2504,6 +2630,7 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
             direction,
             limit,
             event_filter,
+            live_from_key,
         )
 
         events = await self.get_events_as_list(
