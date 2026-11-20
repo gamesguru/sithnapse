@@ -184,8 +184,10 @@ is needed to avoid trusting wire depth. The initial-sync cursor fix and the
 stale-outlier pagination fix address separate bugs and are unaffected by this
 change.
 
-The implementation still needs verification on PostgreSQL and mtxdb, especially
-the three-column row comparison and the background-built expression index.
+The token and pagination suites pass on SQLite and PostgreSQL with mtxdb enabled.
+The three-column comparisons and background expression-index registration were
+exercised in those test homeservers. Production migration duration and
+query-plan selection have not been measured.
 
 The reason C was selected was:
 
@@ -214,8 +216,9 @@ The implementation includes:
 - the equal-depth ordering regression test, paged one event at a time in both
   directions.
 
-Still to verify: the three-column comparison and background expression index on
-PostgreSQL, and the index/order path on mtxdb.
+The three-column comparison and background expression index were exercised on
+PostgreSQL with mtxdb enabled. Query-plan selection on a production-sized
+database remains to be measured.
 
 No ordering can guarantee that displayed dates always increase while preserving
 causality when timestamps are sender-supplied. C removes the visible inversions
