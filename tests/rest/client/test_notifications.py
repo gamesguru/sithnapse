@@ -180,6 +180,16 @@ class HTTPPusherTests(HomeserverTestCase):
         )
         self.assertIsNone(next_token)
 
+        # The spec types `next_token` as a string and uses its absence, not a
+        # null value, to signal the end of the list.
+        channel = self.make_request(
+            "GET",
+            "/notifications?limit=24",
+            access_token=self.other_access_token,
+        )
+        self.assertEqual(channel.code, 200, channel.json_body)
+        self.assertNotIn("next_token", channel.json_body)
+
         # A full page might not be the last one, so it keeps its token.
         _, next_token = self._request_notifications(
             from_token=None, limit=2, expected_count=2
@@ -194,7 +204,7 @@ class HTTPPusherTests(HomeserverTestCase):
 
     def _request_notifications(
         self, from_token: str | None, limit: int, expected_count: int
-    ) -> tuple[list[str], str]:
+    ) -> tuple[list[str], str | None]:
         """
         Make a request to /notifications to get the latest events to be notified about.
 
@@ -226,7 +236,7 @@ class HTTPPusherTests(HomeserverTestCase):
         )
 
         # Extract the necessary data from the response.
-        next_token = channel.json_body["next_token"]
+        next_token = channel.json_body.get("next_token")
         event_ids = [
             event["event"]["event_id"] for event in channel.json_body["notifications"]
         ]

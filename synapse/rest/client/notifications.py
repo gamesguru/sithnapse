@@ -137,7 +137,13 @@ class NotificationsServlet(RestServlet):
         if len(push_actions) < limit:
             next_token = None
 
-        return 200, {"notifications": returned_push_actions, "next_token": next_token}
+        response: JsonDict = {"notifications": returned_push_actions}
+        # `next_token` is absent, rather than null, when there are no more
+        # results: the spec types it as a string and uses its absence to mean
+        # the end of the list.
+        if next_token is not None:
+            response["next_token"] = next_token
+        return 200, response
 
 
 def register_servlets(hs: "HomeServer", http_server: HttpServer) -> None:
