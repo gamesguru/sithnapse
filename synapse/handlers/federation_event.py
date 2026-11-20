@@ -19,7 +19,6 @@
 #
 #
 
-import asyncio
 import collections
 import itertools
 import logging
@@ -93,7 +92,11 @@ from synapse.types import (
     get_domain_from_id,
 )
 from synapse.types.state import StateFilter
-from synapse.util.async_helpers import Linearizer, concurrently_execute
+from synapse.util.async_helpers import (
+    Linearizer,
+    concurrently_execute,
+    yieldable_gather_results,
+)
 from synapse.util.duration import Duration
 from synapse.util.iterutils import batch_iter, partition, sorted_topologically
 from synapse.util.retryutils import NotRetryingDestination
@@ -552,8 +555,8 @@ class FederationEventHandler:
                 return False
 
             if not all(
-                await asyncio.gather(
-                    *(parent_is_unavailable(event, prev) for event, prev in gap_parents)
+                await yieldable_gather_results(
+                    lambda pair: parent_is_unavailable(*pair), gap_parents
                 )
             ):
                 return False
