@@ -3081,11 +3081,10 @@ pub fn batch_delete(py: Python<'_>, keys: Vec<Vec<u8>>) -> PyResult<()> {
 /// to 1/N of the server's event ids.
 const EVENT_LOCATOR_BUCKETS: u32 = 256;
 
-/// One `event_json_get` result row: `(event_id, internal_metadata, body)`.
-/// `body` is `format_version(4B) + json`; either half is `None` on a miss
-/// (including a partial mirror write, which counts as a miss rather than a
-/// mismatched pair -- see `event_json_get`'s doc comment).
-type EventJsonGetRow = (String, Option<Vec<u8>>, Option<Vec<u8>>);
+/// One `event_json_get` result row: `(event_id, record)`. `record` is the
+/// opaque per-event value the Python side packs (`format_version +
+/// metadata_len + internal_metadata + json`); `None` on a miss.
+type EventJsonGetRow = (String, Option<Vec<u8>>);
 
 /// 128-bit identity for an event inside the mirror, derived exactly the way
 /// every other `NodeId` in this adapter is (first 16 bytes of SHA-256 over a
@@ -3094,23 +3093,6 @@ type EventJsonGetRow = (String, Option<Vec<u8>>, Option<Vec<u8>>);
 pub(crate) fn event_node_id(namespace: &str, event_id: &str) -> NodeId {
     let mut hasher = Sha256::new();
     hasher.update(b"event_json:event:");
-    hasher.update(namespace.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(event_id.as_bytes());
-    let hash = hasher.finalize();
-    let mut id = [0u8; 16];
-    id.copy_from_slice(&hash[..16]);
-    id
-}
-
-/// Domain-separated sibling of `event_node_id`: same event, distinct node,
-/// holding `internal_metadata` as its own physically separate record instead
-/// of packed into the body blob. Lives in the same room EventDag collection
-/// as the body (same locator resolves both), so no extra locator lookup is
-/// needed to find it -- see `event_json_put`/`event_json_get`.
-fn event_meta_node_id(namespace: &str, event_id: &str) -> NodeId {
-    let mut hasher = Sha256::new();
-    hasher.update(b"event_json:meta:");
     hasher.update(namespace.as_bytes());
     hasher.update(b"\0");
     hasher.update(event_id.as_bytes());
@@ -3269,13 +3251,13 @@ pub(crate) fn state_hamt_metadata(room_id: &str) -> CollectionMetadata {
 /// groups in the order they must be written.
 type EventJsonPuts = Vec<([u8; 16], Vec<(NodeId, NodeData)>)>;
 
-/// Reject rows the mirror cannot store: empty metadata/body is the tombstone
+/// Reject rows the mirror cannot store: an empty record is the tombstone
 /// encoding.
-fn validate_event_json_rows(rows: &[(String, String, Vec<u8>, Vec<u8>)]) -> PyResult<()> {
-    for (_, _, metadata, body) in rows {
-        if metadata.is_empty() || body.is_empty() {
+fn validate_event_json_rows(rows: &[(String, String, Vec<u8>)]) -> PyResult<()> {
+    for (_, _, record) in rows {
+        if record.is_empty() {
             return Err(pyo3::exceptions::PyValueError::new_err(
-                "event_json_put does not accept empty metadata/body (used as tombstones)",
+                "event_json_put does not accept an empty record (used as a tombstone)",
             ));
         }
     }
@@ -3291,18 +3273,16 @@ fn validate_event_json_rows(rows: &[(String, String, Vec<u8>, Vec<u8>)]) -> PyRe
 /// about a record's key.
 fn event_json_puts(
     namespace: &str,
-    rows: Vec<(String, String, Vec<u8>, Vec<u8>)>,
+    rows: Vec<(String, String, Vec<u8>)>,
 ) -> (EventJsonPuts, EventJsonPuts) {
     let mut locator_puts: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
     let mut dag_puts: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
-    for (room_id, event_id, metadata, body) in rows {
+    for (room_id, event_id, record) in rows {
         let identity = event_node_id(namespace, &event_id);
-        let meta_identity = event_meta_node_id(namespace, &event_id);
         let room_collection = event_dag_room_id(namespace, &room_id);
         let locator_collection = event_locator_collection_id(namespace, &identity);
         let puts = dag_puts.entry(room_collection).or_default();
-        puts.push((identity, NodeData::new(bytes::Bytes::from(body))));
-        puts.push((meta_identity, NodeData::new(bytes::Bytes::from(metadata))));
+        puts.push((identity, NodeData::new(bytes::Bytes::from(record))));
         locator_puts.entry(locator_collection).or_default().push((
             identity,
             NodeData::new(bytes::Bytes::copy_from_slice(&room_collection)),
@@ -3314,22 +3294,15 @@ fn event_json_puts(
     )
 }
 
-/// Put split event_json records into the room-aware mirror: a locator entry
+/// Put event_json records into the room-aware mirror: a locator entry
 /// (`event_locator_collection_id` bucket -> room EventDag collection id) and
-/// two physically separate records in the room's own EventDag collection --
-/// the body (`event_node_id`) and `internal_metadata` (`event_meta_node_id`).
-/// Splitting these means a raw dump of one node (e.g. via `mtxdb get`) never
-/// mixes the two together, and mirrors SQL's own `event_json` table, which
-/// has always carried `internal_metadata` and `json` as separate columns
-/// (see `full_schemas/72/full.sql.sqlite`) -- this collapses back to that
-/// same separation instead of the single length-prefixed blob the mirror
-/// used before. Both share one locator: they live in the same collection, so
-/// resolving it once finds both.
+/// one record per event in the room's own EventDag collection
+/// (`event_node_id`).
 ///
-/// `rows` are `(room_id, event_id, internal_metadata_bytes, body_bytes)`.
-/// `body_bytes` is `format_version(4B, signed, -1 = NULL) + json`; encoded on
-/// the Python side (`_encode_event_json_body`) and preserved byte-for-byte.
-/// `internal_metadata_bytes` is the utf-8 metadata JSON, stored as-is.
+/// `rows` are `(room_id, event_id, record)`. `record` is the opaque per-event
+/// value packed on the Python side (`_encode_event_json_record`:
+/// `format_version(i32 BE, -1 = NULL) + metadata_len(u32 BE) +
+/// internal_metadata + json`) and preserved byte-for-byte.
 ///
 /// Writes are plain `put_many` (idempotent overwrite -- censoring, expiry, and
 /// re-signing replace the body in place through this same call). Room bodies
@@ -3346,7 +3319,7 @@ fn event_json_puts(
 pub fn event_json_put(
     py: Python<'_>,
     namespace: String,
-    rows: Vec<(String, String, Vec<u8>, Vec<u8>)>,
+    rows: Vec<(String, String, Vec<u8>)>,
 ) -> PyResult<()> {
     assert_writable()?;
     validate_event_json_rows(&rows)?;
@@ -3547,7 +3520,7 @@ impl PyMtxdbTransaction {
         &self,
         py: Python<'_>,
         namespace: String,
-        rows: Vec<(String, String, Vec<u8>, Vec<u8>)>,
+        rows: Vec<(String, String, Vec<u8>)>,
     ) -> PyResult<()> {
         validate_event_json_rows(&rows)?;
         py.detach(|| {
@@ -3676,17 +3649,19 @@ pub fn begin_transaction() -> PyResult<Option<PyMtxdbTransaction>> {
         }))
 }
 
-/// Read split event_json records by event id: resolve each id's locator to
-/// its room EventDag collection, then read the metadata and body records
+/// Read event_json records by event id: resolve each id's locator to
+/// its room EventDag collection, then read the event record
 /// from that room collection. Ids with no locator entry are simply a miss
-/// (the caller's SQL `event_json` fallback takes over) -- no legacy combined-
-/// blob format is supported; this mirror predates any released version, so
-/// there's nothing to stay compatible with. Empty-byte values are treated as
-/// absent everywhere.
+/// (the caller's SQL `event_json` fallback takes over). Records are opaque
+/// here: the Python side packs and unpacks the combined
+/// `format_version + metadata_len + internal_metadata + json` value. The old
+/// split body/metadata layout is not supported; this mirror predates any
+/// released version, so there was nothing to stay compatible with and the
+/// split layout was dropped rather than dual-read. Empty-byte values are
+/// treated as absent everywhere.
 ///
-/// Returns `(event_id, metadata, body)` in input order; ids the mirror has
-/// nowhere return `(None, None)` and the caller's SQL `event_json` fallback
-/// takes over, exactly as before.
+/// Returns `(event_id, record)` in input order; ids the mirror has nowhere
+/// return `None` and the caller's SQL `event_json` fallback takes over.
 #[pyfunction]
 pub fn event_json_get(
     py: Python<'_>,
@@ -3740,32 +3715,22 @@ pub fn event_json_get(
             }
         }
 
-        // Phase 2 -- read metadata + body from the resolved room collections,
-        // grouped the same way (both node ids per position, tagged so the
-        // results can be told apart after one combined get_many); ids
-        // without a locator are simply a miss.
-        #[derive(Clone, Copy)]
-        enum Kind {
-            Body,
-            Meta,
-        }
-        let mut dag_ids: HashMap<[u8; 16], Vec<(usize, Kind, NodeId)>> = HashMap::new();
+        // Phase 2 -- read the one record per event from the resolved room
+        // collections, grouped by collection; ids without a locator are
+        // simply a miss.
+        let mut dag_ids: HashMap<[u8; 16], Vec<(usize, NodeId)>> = HashMap::new();
         for (position, room_collection) in room_collections.iter().enumerate() {
             if let Some(room_collection) = room_collection {
-                let entries = dag_ids.entry(*room_collection).or_default();
-                entries.push((position, Kind::Body, node_ids[position]));
-                entries.push((
-                    position,
-                    Kind::Meta,
-                    event_meta_node_id(&namespace, &event_ids[position]),
-                ));
+                dag_ids
+                    .entry(*room_collection)
+                    .or_default()
+                    .push((position, node_ids[position]));
             }
         }
-        let mut bodies: Vec<Option<Vec<u8>>> = vec![None; event_ids.len()];
-        let mut metadatas: Vec<Option<Vec<u8>>> = vec![None; event_ids.len()];
+        let mut records: Vec<Option<Vec<u8>>> = vec![None; event_ids.len()];
         for (collection, ids) in dag_ids {
-            let node_ids_only: Vec<NodeId> = ids.iter().map(|(_, _, id)| *id).collect();
-            // Refresh on a miss so event bodies/metadata the writer appended
+            let node_ids_only: Vec<NodeId> = ids.iter().map(|(_, id)| *id).collect();
+            // Refresh on a miss so event records the writer appended
             // after this worker opened are visible to the read.
             let mut found = engine
                 .get_read_committed(&collection, &node_ids_only)
@@ -3781,29 +3746,21 @@ pub fn event_json_get(
                     .get_read_committed(&collection, &node_ids_only)
                     .map_err(map_read_storage_error)?;
             }
-            for ((position, kind, _), value) in ids.into_iter().zip(found) {
+            for ((position, _), value) in ids.into_iter().zip(found) {
                 if let Some(data) = value {
                     if !data.bytes.is_empty() {
-                        match kind {
-                            Kind::Body => bodies[position] = Some(data.bytes.to_vec()),
-                            Kind::Meta => metadatas[position] = Some(data.bytes.to_vec()),
-                        }
+                        records[position] = Some(data.bytes.to_vec());
                     }
                 }
             }
         }
 
-        Ok(event_ids
-            .into_iter()
-            .zip(metadatas)
-            .zip(bodies)
-            .map(|((id, metadata), body)| (id, metadata, body))
-            .collect())
+        Ok(event_ids.into_iter().zip(records).collect())
     })
 }
 
 /// Tombstone event_json mirror records: resolve each event's locator (if
-/// any), then tombstone the room-local body, metadata, and locator entry.
+/// any), then tombstone the room-local record and locator entry.
 /// Locator-driven: no room_id needed, so history purge, which only has event
 /// ids, can use it directly.
 #[pyfunction]
@@ -3845,7 +3802,7 @@ pub fn event_json_delete(
             }
         }
 
-        // Tombstone locators (always) and room-local bodies+metadata (when a
+        // Tombstone locators (always) and room-local records (when a
         // room was resolved). Empty values are the deletion marker -- same
         // encoding `batch_delete` already uses.
         let mut locator_tombs: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
@@ -3858,12 +3815,10 @@ pub fn event_json_delete(
                 .or_default()
                 .push((identity, NodeData::new(bytes::Bytes::new())));
             if let Some(room_collection) = room_collection {
-                let tombs = dag_tombs.entry(*room_collection).or_default();
-                tombs.push((identity, NodeData::new(bytes::Bytes::new())));
-                tombs.push((
-                    event_meta_node_id(&namespace, &event_ids[position]),
-                    NodeData::new(bytes::Bytes::new()),
-                ));
+                dag_tombs
+                    .entry(*room_collection)
+                    .or_default()
+                    .push((identity, NodeData::new(bytes::Bytes::new())));
             }
         }
         for (collection, pairs) in locator_tombs {
