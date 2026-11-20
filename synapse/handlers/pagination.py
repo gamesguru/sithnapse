@@ -715,10 +715,10 @@ class PaginationHandler:
             # visible.
             page_hits_a_gap = False
             if not events:
-                # An empty page only means there is a gap to fill if there are
-                # events after the cursor at all. (The page may be empty simply
-                # because the cursor is at the end of the room, or because the
-                # filter removed everything.)
+                # An empty page (end of room, or the filter removed everything)
+                # is not itself evidence of a gap. Only retry if the first
+                # unfiltered event after the cursor is next to a backward gap,
+                # i.e. the requested range really has missing history.
                 (
                     probe,
                     _,
@@ -731,7 +731,10 @@ class PaginationHandler:
                     limit=1,
                     event_filter=None,
                 )
-                page_hits_a_gap = bool(probe)
+                for probe_event in probe:
+                    if await self.store.is_event_next_to_backward_gap(probe_event):
+                        page_hits_a_gap = True
+                        break
             else:
                 for event in events:
                     if await self.store.is_event_next_to_backward_gap(event):

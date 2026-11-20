@@ -25,8 +25,12 @@ mtxdb holds:
 - the v2.1 forward-reachability BFS over inbound child edges.
 
 The persist path stages direct edges in the same mtxdb transaction as event JSON
-and event-DAG edges. A committed state event therefore always has its auth-edge
-record, accepted or rejected; a rolled-back persist leaves none.
+and event-DAG edges. If the persist aborts before the embedded transaction
+commits, the staged edges are discarded. Once the embedded transaction has
+committed, a later SQL commit failure does not remove the published edges, and
+the direct (non-staged) write path can likewise leave edges after a SQL
+rollback. Such leftover edges are harmless: they are idempotent and describe
+events that a retry persists again.
 
 There is no runtime SQL fallback, no lazy cold import, and no dual write. If the
 graph is missing an event, `IncompleteAuthGraph` is a data-corruption error and
@@ -36,8 +40,9 @@ The SQL chain-cover index (`event_auth_chains`, `event_auth_chain_links`,
 `event_auth_chain_to_calculate`) is retired. It is no longer written, read, or
 repaired. Auth-chain queries use the closure cache and forward BFS directly, so
 there is no chain-id/sequence-number derivation to maintain and no background
-chain-cover backfill to run. Schema delta 98 drops the obsolete tables and
-sequence after retiring any queued chain-cover background updates.
+chain-cover backfill to run. Schema delta 97 (`04_drop_sql_chain_cover`) drops
+the obsolete tables and sequence after retiring any queued chain-cover
+background updates.
 
 ## Ownership and migration marker
 
@@ -66,8 +71,12 @@ For each room the command:
    edges and explicit empty records for zero-auth state events and rejected
    state events;
 3. allocates short ids and writes outbound + inbound edges in batches;
-4. verifies every imported outbound edge and every SQL inbound edge;
-5. flips `auth_chain_backend` to `mtxdb` only after verification succeeds.
+4. verifies every imported outbound edge, and rejects any `event_auth.auth_id`
+   that has no outbound record;
+
+After every room has been imported, the command verifies every SQL inbound edge
+and only then flips `auth_chain_backend` to `mtxdb`, as a single migration-wide
+step.
 
 If the marker already says `mtxdb`, the command returns immediately. A failed or
 interrupted run leaves the marker at `sql`, so the server keeps refusing to boot

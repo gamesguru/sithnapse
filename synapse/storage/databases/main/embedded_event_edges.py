@@ -557,7 +557,9 @@ async def _migrate_sql_edges_to_mtxdb(
 
         last_event_id = events[-1][0]
 
-    sync_now(pools=[Pool.EVENT_DAG])
+    # The copy writes PREV records (State pool) as well as event-DAG locators;
+    # both must be durable before the caller flips the SQL marker.
+    sync_now(pools=[Pool.STATE, Pool.EVENT_DAG])
     return {"edges": total_edges, "changed_events": changed_events}
 
 
@@ -635,7 +637,74 @@ async def _migrate_mtxdb_edges_to_sql(
 
         last_event_id = events[-1][0]
 
+    await _verify_sql_edges_against_forward(store, namespace, batch_size)
     return {"edges": total_edges}
+
+
+async def _verify_sql_edges_against_forward(
+    store: Any, namespace: str, batch_size: int
+) -> None:
+    """Check the copied SQL edges against mtxdb's forward (child) lists.
+
+    The copy and the row-count check both derive from the backward records, so
+    they cannot notice an event whose backward record lost predecessors. The
+    forward lists are written independently, so every child they name that has
+    an event row must have the matching SQL edge.
+    """
+    last_event_id = ""
+    while True:
+
+        def _read(txn: Any) -> list[str]:
+            txn.execute(
+                "SELECT event_id FROM events WHERE event_id > ? "
+                "ORDER BY event_id LIMIT ?",
+                (last_event_id, batch_size),
+            )
+            return [row[0] for row in txn]
+
+        parent_ids = await store.db_pool.runInteraction(
+            "migrate_event_edges_verify_read", _read
+        )
+        if not parent_ids:
+            return
+
+        forward = get_event_edges_forward_batch(namespace, parent_ids)
+        pairs = {
+            (child_id, parent_id)
+            for parent_id, children in forward.items()
+            for child_id in (children or ())
+        }
+
+        def _check(txn: Any) -> list[tuple[str, str]]:
+            if not pairs:
+                return []
+            child_ids = list({child for child, _ in pairs})
+            clause, args = make_in_list_sql_clause(
+                store.database_engine, "event_id", child_ids
+            )
+            txn.execute(f"SELECT event_id FROM events WHERE {clause}", args)
+            existing = {row[0] for row in txn}
+            clause, args = make_in_list_sql_clause(
+                store.database_engine, "event_id", list(existing)
+            )
+            have: set[tuple[str, str]] = set()
+            if existing:
+                txn.execute(
+                    f"SELECT event_id, prev_event_id FROM event_edges WHERE {clause}",
+                    args,
+                )
+                have = {(row[0], row[1]) for row in txn}
+            return sorted(p for p in pairs if p[0] in existing and p not in have)
+
+        missing = await store.db_pool.runInteraction(
+            "migrate_event_edges_verify_check", _check
+        )
+        if missing:
+            raise RuntimeError(
+                "event-edges migration verification failed: forward edges name "
+                f"{len(missing)} child/parent pairs missing from SQL, e.g. {missing[:3]}"
+            )
+        last_event_id = parent_ids[-1]
 
 
 async def _count_sql_event_edges(store: Any) -> int:

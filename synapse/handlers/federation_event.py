@@ -1211,6 +1211,7 @@ class FederationEventHandler:
         # back from it. If that answer was capped we continue from the oldest
         # events it contained.
         frontier = {pdu.event_id}
+        walked_from: set[str] = set(frontier)
         fetched_ids: set[str] = set()
         limit = 10
         first_request = True
@@ -1300,7 +1301,19 @@ class FederationEventHandler:
                 )
             candidate_prevs -= fetched_ids
             have = await self._store.have_events_in_timeline(candidate_prevs)
-            frontier = candidate_prevs - have
+            unseen_prevs = candidate_prevs - have
+            # /get_missing_events never returns its `latest_events`, so asking
+            # with the unseen parents themselves could not return them. Seed the
+            # next request with the children that name them instead. The
+            # children are not added to `latest`, so the remote may re-send them
+            # but must walk on to the parents; skip ones we already walked from.
+            frontier = {
+                event.event_id
+                for event in missing_events
+                if event.event_id not in walked_from
+                and not unseen_prevs.isdisjoint(event.prev_event_ids())
+            }
+            walked_from.update(frontier)
 
         # Some servers answer /get_missing_events with a truncated batch even
         # though they can serve the remaining prev_events via /event. When the
@@ -1337,8 +1350,21 @@ class FederationEventHandler:
                         e,
                     )
                     continue
-                if pulled is not None:
-                    fetched_pdus.append(pulled.pdu)
+                if pulled is None:
+                    continue
+                if (
+                    pulled.pdu.event_id != prev_event_id
+                    or pulled.pdu.room_id != room_id
+                ):
+                    logger.warning(
+                        "Ignoring %s from %s: asked for %s in %s",
+                        pulled.pdu.event_id,
+                        origin,
+                        prev_event_id,
+                        room_id,
+                    )
+                    continue
+                fetched_pdus.append(pulled.pdu)
 
             if fetched_pdus:
                 await self._process_pulled_events(
@@ -1558,6 +1584,15 @@ class FederationEventHandler:
         if first.is_state():
             return False
 
+        # The serial path sanity-checks every pulled event; do the same for the
+        # whole run, including the first PDU, and let the serial path handle
+        # (and record) any failure.
+        for event in events:
+            try:
+                self._sanity_check_event(event)
+            except SynapseError:
+                return False
+
         for previous, event in zip(events, events[1:]):
             if (
                 event.room_id != room_id
@@ -1631,7 +1666,20 @@ class FederationEventHandler:
                 push_action_events
             )
 
-        await self.persist_events_and_notify(room_id, event_and_contexts)
+        try:
+            await self.persist_events_and_notify(room_id, event_and_contexts)
+        except Exception:
+            # Clear staged push actions for the events that were not committed.
+            # Events from chunks that did commit have already consumed theirs.
+            event_ids = [event.event_id for event, _ in event_and_contexts]
+            try:
+                committed = await self._store.have_events_in_timeline(event_ids)
+            except Exception:
+                committed = set()
+            for event_id in event_ids:
+                if event_id not in committed:
+                    await self._store.remove_push_actions_from_staging(event_id)
+            raise
 
         for event, _ in event_and_contexts:
             try:

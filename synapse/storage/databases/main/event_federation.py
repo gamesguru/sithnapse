@@ -25,9 +25,12 @@ import time
 from queue import Empty, PriorityQueue
 from typing import (
     TYPE_CHECKING,
+    Any,
+    Callable,
     Collection,
     Iterable,
     Sequence,
+    TypeVar,
     cast,
 )
 
@@ -85,6 +88,8 @@ pdus_pruned_from_federation_queue = Counter(
 )
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 # Parameters controlling exponential backoff between backfill failures.
 # After the first failure to backfill, we wait 2 hours before trying again. If the
@@ -240,7 +245,9 @@ class EventFederationWorkerStore(
             assert self._embedded_db_engine is not None
             _auth_coverage("get_auth_chain_ids", "embedded_attempt", len(event_ids))
             try:
-                result = self._get_auth_chain_ids_using_embedded_closures(
+                result = await self._run_embedded_off_reactor(
+                    "get_auth_chain_ids_embedded",
+                    self._get_auth_chain_ids_using_embedded_closures,
                     embedded_db_namespace,
                     room_id,
                     event_ids,
@@ -265,6 +272,19 @@ class EventFederationWorkerStore(
             event_ids,
             include_given,
         )
+
+    async def _run_embedded_off_reactor(
+        self, desc: str, func: Callable[..., _T], *args: Any
+    ) -> _T:
+        """Run a blocking mtxdb read on a database thread, not the reactor.
+
+        `ClosureCache` serializes its own access, so concurrent calls are safe.
+        """
+
+        def _run(_txn: LoggingTransaction) -> _T:
+            return func(*args)
+
+        return await self.db_pool.runInteraction(desc, _run)
 
     def _get_auth_chain_ids_using_embedded_closures(
         self,
@@ -452,7 +472,9 @@ class EventFederationWorkerStore(
                 sum(len(state_set) for state_set in state_sets),
             )
             try:
-                result = self._get_auth_chain_difference_using_embedded_closures(
+                result = await self._run_embedded_off_reactor(
+                    "get_auth_chain_difference_embedded",
+                    self._get_auth_chain_difference_using_embedded_closures,
                     embedded_db_namespace,
                     room_id,
                     state_sets,
@@ -1091,28 +1113,32 @@ class EventFederationWorkerStore(
         if not candidates:
             return []
 
-        child_clause, child_args = make_in_list_sql_clause(
-            self.database_engine, "event_id", list({c for c, _ in candidates})
-        )
-        txn.execute(
-            f"SELECT event_id, depth FROM events WHERE {child_clause} AND depth <= ?",
-            (*child_args, nearby_depth),
-        )
-        depth_by_id: dict[str, int] = dict(txn)
+        # Chunk the IN lists to stay under SQLite's bind-parameter limit.
+        child_ids = list({c for c, _ in candidates})
+        depth_by_id: dict[str, int] = {}
+        for start in range(0, len(child_ids), 500):
+            child_clause, child_args = make_in_list_sql_clause(
+                self.database_engine, "event_id", child_ids[start : start + 500]
+            )
+            txn.execute(
+                f"SELECT event_id, depth FROM events WHERE {child_clause} AND depth <= ?",
+                (*child_args, nearby_depth),
+            )
+            depth_by_id.update(dict(txn))
 
-        extremity_clause, extremity_args = make_in_list_sql_clause(
-            self.database_engine, "event_id", extremity_ids
-        )
-        txn.execute(
-            "SELECT event_id, num_attempts, last_attempt_ts "
-            "FROM event_failed_pull_attempts "
-            f"WHERE room_id = ? AND {extremity_clause}",
-            (room_id, *extremity_args),
-        )
-        failed_attempts = {
-            event_id: (num_attempts, last_attempt_ts)
-            for event_id, num_attempts, last_attempt_ts in txn
-        }
+        failed_attempts: dict[str, tuple[int, int]] = {}
+        for start in range(0, len(extremity_ids), 500):
+            extremity_clause, extremity_args = make_in_list_sql_clause(
+                self.database_engine, "event_id", extremity_ids[start : start + 500]
+            )
+            txn.execute(
+                "SELECT event_id, num_attempts, last_attempt_ts "
+                "FROM event_failed_pull_attempts "
+                f"WHERE room_id = ? AND {extremity_clause}",
+                (room_id, *extremity_args),
+            )
+            for event_id, num_attempts, last_attempt_ts in txn:
+                failed_attempts[event_id] = (num_attempts, last_attempt_ts)
 
         now = self.clock.time_msec()
         results: list[tuple[str, int]] = []
@@ -2134,6 +2160,18 @@ class EventFederationWorkerStore(
             )
             successors = forward_map.get(event_id)
             if successors is not None:
+                # The forward index is written before the SQL commit, so it can
+                # name children without a committed row.
+                if successors:
+                    committed = await self.db_pool.simple_select_many_batch(
+                        table="events",
+                        column="event_id",
+                        iterable=successors,
+                        retcols=["event_id"],
+                        desc="get_successor_events_committed",
+                    )
+                    committed_ids = {row[0] for row in committed}
+                    successors = [e for e in successors if e in committed_ids]
                 ffi_count("event_edges_successor_hits", 1)
                 record_event_edge_read(self.server_name, "successor", "hit")
                 ffi_timing("event_edges_successor_total", time.monotonic() - started)

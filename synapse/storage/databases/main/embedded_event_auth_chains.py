@@ -47,6 +47,7 @@ existing `include_given` semantics at that call site.
 from __future__ import annotations
 
 import logging
+import threading
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any
 
@@ -165,6 +166,22 @@ async def migrate_auth_chain_edges(
             f"Unrecognized auth-chain backend marker: {current_backend!r}"
         )
 
+    def _rejected_metadata_pending(txn: Any) -> bool:
+        txn.execute(
+            "SELECT 1 FROM background_updates "
+            "WHERE update_name = 'rejected_events_metadata'"
+        )
+        return txn.fetchone() is not None
+
+    if await store.db_pool.runInteraction(
+        "auth_chain_migrate_check_bg_updates", _rejected_metadata_pending
+    ):
+        raise RuntimeError(
+            "The rejected_events_metadata background update is still queued, so "
+            "SQL event_auth lacks some rejected state events' auth edges. Let it "
+            "finish (run Synapse with the SQL backend) before migrating."
+        )
+
     def _read_rooms(txn: Any) -> list[str]:
         txn.execute("SELECT room_id FROM rooms ORDER BY room_id")
         return [room_id for (room_id,) in txn.fetchall()]
@@ -259,6 +276,30 @@ async def migrate_auth_chain_edges(
                 len(auth_events[event_id]) for event_id in event_ids
             )
             last_event_id = event_ids[-1]
+
+        def _read_dangling(txn: Any) -> list[str]:
+            # Every auth target must itself have an outbound record, or the
+            # runtime would later report IncompleteAuthGraph for it.
+            txn.execute(
+                "SELECT DISTINCT ea.auth_id FROM event_auth AS ea "
+                "WHERE ea.room_id = ? "
+                "AND NOT EXISTS (SELECT 1 FROM state_events AS se "
+                "                WHERE se.event_id = ea.auth_id) "
+                "AND NOT EXISTS (SELECT 1 FROM event_auth AS e2 "
+                "                WHERE e2.event_id = ea.auth_id) "
+                "LIMIT 5",
+                (room_id,),
+            )
+            return [auth_id for (auth_id,) in txn.fetchall()]
+
+        dangling = await store.db_pool.runInteraction(
+            "auth_chain_migrate_dangling", _read_dangling
+        )
+        if dangling:
+            raise RuntimeError(
+                f"Room {room_id} has auth references with no outbound auth-event "
+                f"record, e.g. {dangling}; refusing to migrate"
+            )
 
         sync_now(pools=[Pool.STATE])
         stats["rooms"] += 1
@@ -548,6 +589,9 @@ class ClosureCache:
         # re-verifies anything. Namespace and room_id must be part of the
         # key for this cache to be safe with more than one room per process.
         self._cache: OrderedDict[tuple[str, str, int, int], BitMap] = OrderedDict()
+        # Reads run on database threads (see event_federation.py), so the
+        # check-then-evict sequences below must be serialized.
+        self._lock = threading.RLock()
 
     def _get(
         self, namespace: str, room_id: str, generation: int, short_id: int
@@ -576,7 +620,8 @@ class ClosureCache:
         """Test/debug helper -- production invalidation goes through
         `bump_room_generation`, not this.
         """
-        self._cache.clear()
+        with self._lock:
+            self._cache.clear()
 
     def get_closure(
         self,
@@ -607,25 +652,44 @@ class ClosureCache:
         requested roots so overlapping ancestor subgraphs are only walked
         once per call.
         """
+        with self._lock:
+            return self._get_closures_batch_locked(
+                engine_name, namespace, room_id, event_short_ids
+            )
+
+    def _get_closures_batch_locked(
+        self,
+        engine_name: str | None,
+        namespace: str,
+        room_id: str,
+        event_short_ids: list[int],
+    ) -> dict[int, BitMap]:
         generation = _room_generation(namespace, room_id)
-        roots_to_load = [
-            short_id
-            for short_id in event_short_ids
-            if self._get(namespace, room_id, generation, short_id) is None
-        ]
+        # Closures found in the LRU while preloading. `_put` below may evict
+        # them before the walk reaches them; the preload skipped loading their
+        # edges because they were cached, so the walk must keep using these
+        # request-local references rather than re-reading the LRU.
+        pinned: dict[int, BitMap] = {}
+        roots_to_load: list[int] = []
+        for short_id in event_short_ids:
+            cached = self._get(namespace, room_id, generation, short_id)
+            if cached is None:
+                roots_to_load.append(short_id)
+            else:
+                pinned[short_id] = cached
         direct_edges = self._load_direct_edges(
-            engine_name, namespace, room_id, roots_to_load, generation
+            engine_name, namespace, room_id, roots_to_load, generation, pinned
         )
 
         memo: dict[int, tuple[BitMap, bool]] = {}
         out: dict[int, BitMap] = {}
         for short_id in event_short_ids:
-            cached = self._get(namespace, room_id, generation, short_id)
+            cached = pinned.get(short_id)
             if cached is not None:
                 out[short_id] = cached
                 continue
             closure, is_complete = self._walk(
-                namespace, room_id, short_id, generation, memo, direct_edges
+                namespace, room_id, short_id, generation, memo, direct_edges, pinned
             )
             if not is_complete:
                 raise IncompleteAuthGraph(short_id)
@@ -640,6 +704,7 @@ class ClosureCache:
         room_id: str,
         root_short_ids: list[int],
         generation: int,
+        pinned: dict[int, BitMap],
     ) -> dict[int, list[int] | None]:
         """Collect direct auth edges from mtxdb for the requested closures.
 
@@ -658,11 +723,16 @@ class ClosureCache:
                 continue
             seen.update(layer)
 
-            layer = {
-                short_id
-                for short_id in layer
-                if self._get(namespace, room_id, generation, short_id) is None
-            }
+            uncached: set[int] = set()
+            for short_id in layer:
+                cached = pinned.get(short_id)
+                if cached is None:
+                    cached = self._get(namespace, room_id, generation, short_id)
+                if cached is None:
+                    uncached.add(short_id)
+                else:
+                    pinned[short_id] = cached
+            layer = uncached
             if not layer:
                 continue
 
@@ -686,6 +756,7 @@ class ClosureCache:
         generation: int,
         memo: dict[int, tuple[BitMap, bool]],
         direct_edges: dict[int, list[int] | None],
+        pinned: dict[int, BitMap],
     ) -> tuple[BitMap, bool]:
         """Depth-first walk over direct auth edges, unioning children's
         (cached or freshly-walked) ancestor closures. Returns
@@ -695,7 +766,9 @@ class ClosureCache:
         if event_short_id in memo:
             return memo[event_short_id]
 
-        cached = self._get(namespace, room_id, generation, event_short_id)
+        cached = pinned.get(event_short_id)
+        if cached is None:
+            cached = self._get(namespace, room_id, generation, event_short_id)
         if cached is not None:
             memo[event_short_id] = (cached, True)
             return cached, True
@@ -733,6 +806,7 @@ class ClosureCache:
                 generation,
                 memo,
                 direct_edges,
+                pinned,
             )
             closure |= child_closure
             complete = complete and child_complete

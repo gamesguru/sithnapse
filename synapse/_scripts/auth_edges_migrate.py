@@ -56,6 +56,12 @@ def main() -> None:
         help="Synapse config with embedded_db.engine and embedded_db.path set.",
     )
     parser.add_argument(
+        "--to",
+        choices=["mtxdb"],
+        default="mtxdb",
+        help="Destination backend. Only the SQL -> mtxdb import is implemented.",
+    )
+    parser.add_argument(
         "--batch-size", type=int, default=1000, help="State events per batch."
     )
     args = parser.parse_args()

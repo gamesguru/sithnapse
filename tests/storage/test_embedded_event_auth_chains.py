@@ -192,8 +192,12 @@ class ClosureWalkTests(TestCase):
         # `create_id` -- otherwise a stale-cache bug could coincidentally
         # produce the right-looking set after the counter resets.
         get_or_create_short_ids(None, NAMESPACE, ROOM_ID, ["$placeholder"])
-        ids2 = self._embed_graph({"$create2": [], "$a": ["$create2"]})
+        # Allocate `$a` first so it reuses its pre-purge short id; the stale
+        # cache entry for (old_generation, a_id) would be hit if the
+        # generation were not part of the key.
+        ids2 = self._embed_graph({"$a": ["$create2"], "$create2": []})
         create2_id, a2_id = ids2["$create2"], ids2["$a"]
+        self.assertEqual(a2_id, a_id)
         self.assertNotEqual(create2_id, create_id)
 
         second = self.cache.get_closure(None, NAMESPACE, ROOM_ID, a2_id)
@@ -201,6 +205,20 @@ class ClosureWalkTests(TestCase):
         # serve the pre-purge cached bitmap for (old_generation, a_id).
         self.assertEqual(set(second), {create2_id})
         self.assertNotEqual(set(second), set(first))
+
+    def test_eviction_during_batch_does_not_look_like_a_gap(self) -> None:
+        ids = self._embed_graph(
+            {"$create": [], "$a": ["$create"], "$b": ["$a"], "$c": ["$a"]}
+        )
+        create_id, a_id, b_id, c_id = (ids[k] for k in ("$create", "$a", "$b", "$c"))
+        # Cache only `$a`'s closure, then shrink the LRU so that computing `$b`
+        # evicts it before `$c` is walked.
+        self.cache.get_closure(None, NAMESPACE, ROOM_ID, a_id)
+        self.cache._max_size = 1
+
+        results = self.cache.get_closures_batch(None, NAMESPACE, ROOM_ID, [b_id, c_id])
+        self.assertEqual(set(results[b_id]), {a_id, create_id})
+        self.assertEqual(set(results[c_id]), {a_id, create_id})
 
     def test_get_closures_batch_shares_memo_across_roots(self) -> None:
         ids = self._embed_graph(

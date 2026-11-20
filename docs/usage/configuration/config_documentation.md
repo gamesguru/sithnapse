@@ -1641,9 +1641,9 @@ databases:
 
 *(object)* Configures the embedded `mtxdb` storage engine, which holds event JSON, state groups and event edges outside the SQL database. Both `engine` and `path` must be set together; setting only one is a configuration error.
 
-Worker deployments have extra requirements: the sole events writer must be `main`, only one events writer is allowed, and the `SYNAPSE_MTXDB_WAL=1` environment variable must be set.
+Worker deployments have extra requirements: the sole events writer must be `main`, only one events writer is allowed, `run_background_tasks_on` must be unset or select `main`, and the `SYNAPSE_MTXDB_WAL=1` environment variable must be set.
 
-Environment variables override these options: `SYNAPSE_EMBEDDED_DB_ENGINE`, `SYNAPSE_EMBEDDED_DB_PATH`, `SYNAPSE_MTXDB_SYNC`, `SYNAPSE_MTXDB_NO_SYNC` and `SYNAPSE_MTXDB_FLUSH_DELAY_SECS`. Setting `SYNAPSE_MTXDB=1` together with `SYNAPSE_MTXDB_PATH` (or `embedded_db.path`) is a shortcut that selects the `mtxdb` engine.
+Environment variables override these options: `SYNAPSE_EMBEDDED_DB_ENGINE`, `SYNAPSE_EMBEDDED_DB_PATH`, `SYNAPSE_MTXDB_SYNC`, `SYNAPSE_MTXDB_NO_SYNC` (a false value does not override `no_sync: true` in YAML; only a truthy value is applied) and `SYNAPSE_MTXDB_FLUSH_DELAY_SECS`. Setting `SYNAPSE_MTXDB=1` together with `SYNAPSE_MTXDB_PATH` (or `embedded_db.path`) is a shortcut that selects the `mtxdb` engine.
 
 This setting has the following sub-options:
 

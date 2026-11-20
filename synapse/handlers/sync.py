@@ -2348,8 +2348,16 @@ class SyncHandler:
         # query would not see the new stream row, and
         # `is_partial_state_room_batched` would then see the room as
         # fully-stated and include it, recreating the token mismatch.
+        #
+        # Lazy-loading syncs do not replay un-partial-stated rooms (see
+        # `forced_newly_joined_room_ids` below), so they have no duplicate to
+        # avoid; excluding the room there would instead drop its join for good,
+        # since the next sync starts after the join event.
         raced_un_partial_rooms: set[str] = set()
-        if mutable_joined_room_ids:
+        if (
+            mutable_joined_room_ids
+            and not sync_config.filter_collection.lazy_load_members()
+        ):
             raced_un_partial_rooms = mutable_joined_room_ids.intersection(
                 await self.store.get_rooms_un_partial_stated_after(
                     now_token.un_partial_stated_rooms_key
@@ -2921,6 +2929,19 @@ class SyncHandler:
                     user_id, since_token.account_data_key
                 )
             )
+            # Rooms replayed because their partial-state resync finished were
+            # omitted from earlier eager syncs, so the client has none of
+            # their account data yet: send the full snapshot for them, not just
+            # updates since `since_token`.
+            if sync_result_builder.forced_newly_joined_room_ids:
+                snapshot = await self.store.get_room_account_data_for_user(user_id)
+                merged: dict[str, Mapping[str, JsonMapping]] = dict(
+                    account_data_by_room
+                )
+                for room_id in sync_result_builder.forced_newly_joined_room_ids:
+                    if room_id in snapshot:
+                        merged[room_id] = snapshot[room_id]
+                account_data_by_room = merged
         else:
             account_data_by_room = await self.store.get_room_account_data_for_user(
                 user_id

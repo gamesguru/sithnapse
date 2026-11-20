@@ -215,8 +215,12 @@ room_depth      : (room_id, depth, stream_ordering) -> event_id     # optional
 event_ts        : (origin_server_ts, stream_ordering) -> event_id
 ```
 
-- `global_stream` replaces `events_stream_ordering`, serves replication and
-  global range scans, and makes min/max O(1) if the stream exposes ends.
+- `global_stream` replaces `events_stream_ordering` for global range scans and
+  makes min/max O(1) if the stream exposes ends. Replication must not use the
+  eligible-only variant: it needs an all-events index (or a separate complete
+  source) covering every row returned by `get_all_new_forward_event_rows` and
+  `get_all_new_backfill_event_rows`, otherwise replication tokens advance past
+  omitted rows. Keep eligible-only indexes for timeline consumers.
 - `room_stream` replaces `events_room_stream` and serves timeline pagination.
 - `room_topological` replaces `events_order_room`.
 - `room_type_stream` serves type-filtered "last event in room" reads. Start

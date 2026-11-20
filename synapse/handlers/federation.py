@@ -371,17 +371,13 @@ class FederationHandler:
                 # Per the docstring, it's best to pad the `current_depth` by the
                 # number of messages you plan to backfill from these points.
                 #
-                # A foreground backward request only pads by the page size: an
-                # extremity further ahead than that can only reveal events
-                # newer than the client's cursor, which the page cannot
-                # contain. Background requests still use the full padding so
-                # that branches merging ahead of a stale cursor are persisted
-                # for eventual consistency.
-                nearby_depth=(
-                    current_depth + NUMBER_OF_EVENTS_TO_BACKFILL
-                    if allow_later_points
-                    else current_depth + limit
-                ),
+                # A backfill from an extremity returns up to
+                # `NUMBER_OF_EVENTS_TO_BACKFILL` events, so an extremity whose
+                # child is that far ahead of the cursor can still reveal history
+                # inside the requested page. Foreground backward requests use
+                # the same padding; `allow_later_points` only controls the
+                # fallback probe for extremities beyond it.
+                nearby_depth=current_depth + NUMBER_OF_EVENTS_TO_BACKFILL,
                 # We only need to end up with 5 extremities combined with the
                 # insertion event extremities to make the `/backfill` request
                 # but fetch an order of magnitude more to make sure there is
@@ -601,6 +597,14 @@ class FederationHandler:
             # backfill request with 4xx codes before we give up.
             max_denied_count = 5
 
+            # Extremities no peer has resolved yet, and whether any peer
+            # answered successfully. A peer that returns nothing for an
+            # extremity must not stop us asking the remaining peers.
+            remaining = list(extremities_to_request)
+            any_success = False
+            successful_peers = 0
+            max_successful_peers = 3
+
             for dom in domains:
                 # We don't want to ask our own server for information we don't have
                 if self.is_mine_server_name(dom):
@@ -611,12 +615,15 @@ class FederationHandler:
                         dom,
                         room_id,
                         limit=NUMBER_OF_EVENTS_TO_BACKFILL,
-                        extremities=extremities_to_request,
+                        extremities=remaining,
                     )
-                    # If this succeeded then we probably already have the
-                    # appropriate stuff.
-                    # TODO: We can probably do something more intelligent here.
-                    return True
+                    any_success = True
+                    successful_peers += 1
+                    seen = await self.store.have_seen_events(room_id, remaining)
+                    remaining = [e for e in remaining if e not in seen]
+                    if not remaining or successful_peers >= max_successful_peers:
+                        return True
+                    continue
                 except NotRetryingDestination as e:
                     logger.info("_maybe_backfill_inner: %s", e)
                     continue
@@ -640,7 +647,7 @@ class FederationHandler:
                         )
                         denied_count += 1
                         if denied_count >= max_denied_count:
-                            return False
+                            return any_success
                         continue
 
                     logger.info("Failed to backfill from %s because %s", dom, e)
@@ -656,7 +663,7 @@ class FederationHandler:
                         )
                         denied_count += 1
                         if denied_count >= max_denied_count:
-                            return False
+                            return any_success
                         continue
 
                     logger.info("Failed to backfill from %s because %s", dom, e)
@@ -668,7 +675,7 @@ class FederationHandler:
                     logger.exception("Failed to backfill from %s because %s", dom, e)
                     continue
 
-            return False
+            return any_success
 
         # If we have the `processing_start_time`, then we can make an
         # observation. We wouldn't have the `processing_start_time` in the case

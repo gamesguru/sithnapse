@@ -108,6 +108,11 @@ class Off(str):
 DISABLED_RE = re.compile(r"^#( *)((?:[A-Za-z0-9_.\-]+:|-)(?:\s.*)?)$")
 
 
+# A plain sample marks options as `#key:` or `#  key:` (two or more spaces);
+# a single space after `#` is prose, so it is left alone.
+SAMPLE_DISABLED_RE = re.compile(r"^#( {2,}|)((?:[A-Za-z0-9_.\-]+:|-)(?:\s.*)?)$")
+
+
 def resolve(node: dict[str, Any], defs: dict[str, Any]) -> dict[str, Any]:
     """Inline a $ref (siblings win) so the node carries its own type/default."""
     ref = node.get("$ref", "")
@@ -181,11 +186,13 @@ def render_schema(schema: dict[str, Any]) -> list[str]:
     return out
 
 
-def enable_disabled(lines: Iterable[str]) -> list[str]:
+def enable_disabled(
+    lines: Iterable[str], pattern: re.Pattern[str] = DISABLED_RE
+) -> list[str]:
     """Turn `#key: v` template lines into in-memory YAML lines tagged as Off."""
     res = []
     for ln in lines:
-        m = DISABLED_RE.match(ln.rstrip("\n"))
+        m = pattern.match(ln.rstrip("\n"))
         res.append(Off(m.group(1) + m.group(2) + "\n") if m else ln)
     return res
 
@@ -300,7 +307,7 @@ def main() -> None:
         if a.sample.endswith((".schema.yaml", ".schema.yml")):
             lines = enable_disabled(render_schema(yaml.safe_load(f)))
         else:
-            lines = f.readlines()
+            lines = enable_disabled(f.readlines(), SAMPLE_DISABLED_RE)
     out, used = merge(lines, user)
     out = ["#" + ln if isinstance(ln, Off) else ln for ln in out]
     missing = [

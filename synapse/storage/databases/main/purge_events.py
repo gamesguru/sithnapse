@@ -288,11 +288,30 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             forward = get_event_edges_forward_batch(
                 self._embedded_db_namespace, list(purge_ids)
             )
+            # The forward index can name children whose SQL rows are not
+            # committed (or were deleted); only a child that is outside the
+            # purge set and still has an events row keeps its parent.
+            candidate_children = {
+                child_id
+                for event_id in purge_ids
+                for child_id in (forward.get(event_id) or ())
+                if child_id not in purge_ids
+            }
+            existing_children: set[str] = set()
+            candidate_list = list(candidate_children)
+            for start in range(0, len(candidate_list), 500):
+                clause, args = make_in_list_sql_clause(
+                    self.database_engine,
+                    "event_id",
+                    candidate_list[start : start + 500],
+                )
+                txn.execute(f"SELECT event_id FROM events WHERE {clause}", args)
+                existing_children.update(event_id for (event_id,) in txn)
             new_backwards_extrems = [
                 (event_id,)
                 for event_id in purge_ids
                 if any(
-                    child_id not in purge_ids
+                    child_id in existing_children
                     for child_id in (forward.get(event_id) or ())
                 )
             ]
@@ -700,6 +719,14 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
         # example, after an earlier partial purge). Delete by its own room_id
         # before removing events, rather than relying on an events subquery.
         txn.execute("DELETE FROM event_auth WHERE room_id = ?", (room_id,))
+
+        # Keyed by (old_room_id, new_room_id, user_id) rather than a single
+        # room_id column, so it is not covered by the generic room_id sweep.
+        txn.execute(
+            "DELETE FROM room_upgrade_user_transfers "
+            "WHERE old_room_id = ? OR new_room_id = ?",
+            (room_id, room_id),
+        )
 
         room_event_ids: list[str] = []
         room_redacted_event_ids: list[str] = []

@@ -2679,12 +2679,19 @@ class EventsWorkerStore(SQLBaseStore):
                 record_event_edge_read(self.server_name, "gap", "hit")
                 if not children:
                     return True
+                # The forward index can name children that have no committed
+                # row in `events`; only a committed, non-rejected child
+                # suppresses the gap.
                 clause, args = make_in_list_sql_clause(
-                    self.database_engine, "event_id", children
+                    self.database_engine, "e.event_id", children
                 )
-                txn.execute(f"SELECT event_id FROM rejections WHERE {clause}", args)
-                rejected_children = {r[0] for r in txn}
-                if any(c not in rejected_children for c in children):
+                txn.execute(
+                    "SELECT 1 FROM events AS e "
+                    "LEFT JOIN rejections AS r ON r.event_id = e.event_id "
+                    f"WHERE r.event_id IS NULL AND {clause} LIMIT 1",
+                    args,
+                )
+                if txn.fetchone():
                     return False
                 return True
 
@@ -2880,22 +2887,42 @@ class EventsWorkerStore(SQLBaseStore):
             )
 
             ready: list[str] = []
-            offset = 0
-            while len(ready) < 100:
-                txn.execute(
-                    """
-                    SELECT event_id FROM partial_state_events AS pse
-                        JOIN events USING (event_id)
-                    WHERE pse.room_id = ?
-                    ORDER BY events.stream_ordering
-                    LIMIT 1000 OFFSET ?
-                    """,
-                    (room_id, offset),
-                )
-                candidates = [row[0] for row in txn]
-                if not candidates:
+            # Keyset cursor (stream_ordering, event_id): rows removed
+            # concurrently cannot shift unseen candidates past the cursor.
+            cursor_stream: int | None = None
+            cursor_event_id = ""
+            while True:
+                if cursor_stream is None:
+                    txn.execute(
+                        """
+                        SELECT pse.event_id, events.stream_ordering
+                        FROM partial_state_events AS pse
+                            JOIN events USING (event_id)
+                        WHERE pse.room_id = ?
+                        ORDER BY events.stream_ordering, pse.event_id
+                        LIMIT 1000
+                        """,
+                        (room_id,),
+                    )
+                else:
+                    txn.execute(
+                        """
+                        SELECT pse.event_id, events.stream_ordering
+                        FROM partial_state_events AS pse
+                            JOIN events USING (event_id)
+                        WHERE pse.room_id = ?
+                            AND (events.stream_ordering > ?
+                                 OR (events.stream_ordering = ? AND pse.event_id > ?))
+                        ORDER BY events.stream_ordering, pse.event_id
+                        LIMIT 1000
+                        """,
+                        (room_id, cursor_stream, cursor_stream, cursor_event_id),
+                    )
+                page = [(row[0], row[1]) for row in txn]
+                if not page:
                     break
-                offset += len(candidates)
+                candidates = [event_id for event_id, _ in page]
+                cursor_event_id, cursor_stream = page[-1]
 
                 backward = get_event_edges_backward_batch(
                     self._embedded_db_namespace, candidates
@@ -2930,6 +2957,10 @@ class EventsWorkerStore(SQLBaseStore):
                     ready.append(event_id)
                     if len(ready) >= 100:
                         break
+                # Return as soon as this page yielded anything; only keep
+                # scanning when nothing here was ready.
+                if ready:
+                    break
             return ready
 
         txn.execute(
