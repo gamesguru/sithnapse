@@ -140,14 +140,17 @@ locks, device-list coordination, push queues, delayed events):
    [state-groups-out-of-sql.md](state-groups-out-of-sql.md)): broadest change,
    last.
 
-The SQL `events` table is not a candidate yet. Event bodies are already in mtxdb
-for new events; `events` is the relational index (event/room IDs, stream and
-topological order, type, sender, depth, timestamps, state key, flags) behind
-pagination, federation, relations, membership, purging and stream queries (about
-197 SQL references in the main storage code). mtxdb offers point and batch
-lookups, not range scans or joins, so dropping it would mean building those
-indexes and query paths in Python/Rust. Revisit only after mapping its query
-patterns to mtxdb indexes and measuring the replacement cost.
+The SQL `events` table is now the largest measured SQL area and the next major
+target, but it is an index cutover, not a key-value one. Event bodies are
+already in mtxdb for new events; `events` is the relational index (event/room
+IDs, stream and topological order, type, sender, depth, timestamps, state key,
+flags) behind pagination, federation, relations, membership, purging and stream
+queries (about 150 direct references in main storage, including ~58 ordered
+scans). The pinned mtxdb includes a persistent ordered `TimelineIndex`, but
+Synapse's Rust adapter does not yet expose it. The replacement must integrate
+that index and prove its cursor/scope semantics against Synapse's per-room and
+global ordering contracts. See [`events-cutover.md`](events-cutover.md) for the
+query/mutation inventory and proposed records and indexes.
 
 SQL cost per family (`res/logs/2026-10-21-trial-tests-530s.log`, 5,767 tests,
 `-j4`, sync off, pin `0efca0a`; summed over 25 processes, total 494.9 s). This
