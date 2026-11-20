@@ -792,6 +792,7 @@
         // 1. Optional authenticated server DB stats endpoint. It is disabled by
         // default and requires both an admin token and stats.server_stats_endpoint_enabled.
         let dbStatsLoaded = false;
+        let publicRoomsLoaded = false;
         try {
           const publicStatsRes = await fetch("/_synapse/client/public_stats");
           if (publicStatsRes.ok) {
@@ -801,6 +802,23 @@
               if (soulsEl) soulsEl.textContent = stats.total_users.toLocaleString();
               const soulsSubEl = document.getElementById("stat-souls-sub");
               if (soulsSubEl) soulsSubEl.textContent = "REGISTERED DB SOULS";
+            }
+            if (typeof stats.total_destinations === "number") {
+              const galacticEl = document.getElementById("stat-galactic");
+              if (galacticEl)
+                galacticEl.textContent =
+                  stats.total_destinations.toLocaleString();
+              const galacticSubEl = document.getElementById("stat-galactic-sub");
+              if (galacticSubEl) galacticSubEl.textContent = "FEDERATED PEERS";
+            }
+            if (typeof stats.total_rooms === "number") {
+              const sanctumsEl = document.getElementById("stat-sanctums");
+              if (sanctumsEl)
+                sanctumsEl.textContent = stats.total_rooms.toLocaleString();
+              const sanctumsSubEl = document.getElementById("stat-sanctums-sub");
+              if (sanctumsSubEl)
+                sanctumsSubEl.textContent = "ACTIVE DATABASE SANCTUMS";
+              publicRoomsLoaded = true;
             }
           }
         } catch (e) {}
@@ -907,7 +925,11 @@
                 typeof roomsData.total_room_count_estimate === "number"
                   ? roomsData.total_room_count_estimate
                   : 0;
-              if (sanctumsEl && sanctumsEl.textContent === "...") {
+              if (
+                sanctumsEl &&
+                !publicRoomsLoaded &&
+                sanctumsEl.textContent === "..."
+              ) {
                 sanctumsEl.textContent = count.toLocaleString();
               }
             }

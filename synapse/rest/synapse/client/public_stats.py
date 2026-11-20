@@ -12,8 +12,10 @@ import logging
 from http import HTTPStatus
 from typing import TYPE_CHECKING
 
+from synapse.api.constants import Direction
 from synapse.http.server import DirectServeJsonResource
 from synapse.http.site import SynapseRequest
+from synapse.storage.databases.main.transactions import DestinationSortOrder
 from synapse.types import JsonDict
 
 logger = logging.getLogger(__name__)
@@ -22,8 +24,13 @@ if TYPE_CHECKING:
     from synapse.server import HomeServer
 
 
-class PublicUserCountResource(DirectServeJsonResource):
-    """Opt-in public endpoint exposing only the total registered user count."""
+class PublicStatsResource(DirectServeJsonResource):
+    """Opt-in public endpoint exposing only aggregate counts.
+
+    Returns the total registered users, known rooms and federation peers. No
+    identifiers or per-user/room details are exposed. Any count that fails to
+    load is returned as `null`.
+    """
 
     def __init__(self, hs: "HomeServer"):
         super().__init__(clock=hs.get_clock())
@@ -36,4 +43,26 @@ class PublicUserCountResource(DirectServeJsonResource):
             logger.exception("Failed to count users for public server statistics")
             total_users = None
 
-        return HTTPStatus.OK, {"total_users": total_users}
+        try:
+            total_rooms = await self.store.get_room_count()
+        except Exception:
+            logger.exception("Failed to count rooms for public server statistics")
+            total_rooms = None
+
+        try:
+            _, total_destinations = await self.store.get_destinations_paginate(
+                start=0,
+                limit=1,
+                destination=None,
+                order_by=DestinationSortOrder.DESTINATION.value,
+                direction=Direction.FORWARDS,
+            )
+        except Exception:
+            logger.exception("Failed to count peers for public server statistics")
+            total_destinations = None
+
+        return HTTPStatus.OK, {
+            "total_users": total_users,
+            "total_rooms": total_rooms,
+            "total_destinations": total_destinations,
+        }
