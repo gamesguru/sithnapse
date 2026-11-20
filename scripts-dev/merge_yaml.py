@@ -315,7 +315,7 @@ def main():
         print(
             "Not in sample: " + ", ".join(".".join(p) for p in missing), file=sys.stderr
         )
-    # The merged config holds secrets: write it to a private temporary file in
+    # The merged config holds secrets: write it to a group-readable (0640) temporary file in
     # the output directory, then replace the output atomically, so a failure
     # leaves any existing output untouched and no partial file behind.
     # Resolve a symlinked output so the link's target is updated, not the link.
@@ -326,7 +326,7 @@ def main():
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.writelines(out)
         try:
-            os.chmod(tmp_path, 0o600)
+            os.chmod(tmp_path, 0o640)
         except OSError:
             pass  # best effort on platforms without POSIX permissions
         os.replace(tmp_path, dest)
