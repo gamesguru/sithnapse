@@ -14,7 +14,7 @@
 
 import importlib.util
 from pathlib import Path
-from unittest import TestCase
+from unittest import TestCase, skipUnless
 
 SCRIPT = Path(__file__).parent.parent / "scripts-dev" / "merge_yaml.py"
 
@@ -27,6 +27,9 @@ def _load():  # type: ignore[no-untyped-def]
     return module
 
 
+# The Debian package build runs the tests from a tree that has `tests/` but not
+# `scripts-dev/`, so there is nothing to load there.
+@skipUnless(SCRIPT.exists(), "scripts-dev/merge_yaml.py is not part of this tree")
 class MergePlainSampleTests(TestCase):
     def test_commented_and_active_options_are_enabled(self) -> None:
         mod = _load()
