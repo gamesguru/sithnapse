@@ -698,7 +698,7 @@ properties:
       ssh_pub_key_path:
         type: ["string", "null"]
         description: >-
-          The public SSH key corresponsing to `ssh_priv_key_path`. If left
+          The public SSH key corresponding to `ssh_priv_key_path`. If left
           unset, a hardcoded key is used.
     examples:
       - username: manhole
@@ -1282,7 +1282,7 @@ properties:
       DB.
 
 
-      Synapse will check whether the rentention period has concluded for
+      Synapse will check whether the retention period has concluded for
       redacted events every 5 minutes. Thus, even if this option is set to `0`,
       Synapse may still take up to 5 minutes to purge redacted events from the
       database. Set to `null` to disable.

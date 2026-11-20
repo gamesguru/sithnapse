@@ -636,7 +636,7 @@ This setting has the following sub-options:
 
 * `ssh_priv_key_path` (string|null): The private SSH key used to encrypt the manhole traffic. If left unset, then hardcoded and non-secret keys are used, which could allow traffic to be intercepted if sent over a public network.
 
-* `ssh_pub_key_path` (string|null): The public SSH key corresponsing to `ssh_priv_key_path`. If left unset, a hardcoded key is used.
+* `ssh_pub_key_path` (string|null): The public SSH key corresponding to `ssh_priv_key_path`. If left unset, a hardcoded key is used.
 
 Example configuration:
 ```yaml
@@ -1067,7 +1067,7 @@ allowed_avatar_mimetypes:
 
 How long to keep redacted events in unredacted form in the database. After this period redacted events get replaced with their redacted form in the DB.
 
-Synapse will check whether the rentention period has concluded for redacted events every 5 minutes. Thus, even if this option is set to `0`, Synapse may still take up to 5 minutes to purge redacted events from the database. Set to `null` to disable.
+Synapse will check whether the retention period has concluded for redacted events every 5 minutes. Thus, even if this option is set to `0`, Synapse may still take up to 5 minutes to purge redacted events from the database. Set to `null` to disable.
 
 Defaults to `"7d"`.
 
