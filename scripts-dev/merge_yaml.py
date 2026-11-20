@@ -26,13 +26,15 @@ import re
 import sys
 import tempfile
 import textwrap
+from collections.abc import Iterable, Iterator, Sequence
+from typing import Any
 
 import yaml
 
 KEY_RE = re.compile(r"^(\s*)([A-Za-z0-9_.\-]+):(?:\s+(.*?))?\s*$")
 
 
-def scalar(v):
+def scalar(v: Any) -> str:
     """Format a scalar as a JSON literal, which is valid YAML."""
     if v is None:
         return "null"
@@ -42,12 +44,12 @@ def scalar(v):
         return json.dumps(str(v), ensure_ascii=False)
 
 
-def is_scalar(v):
+def is_scalar(v: Any) -> bool:
     """Return whether v is neither a dict nor a list."""
     return not isinstance(v, (dict, list))
 
 
-def trailing_comment(text):
+def trailing_comment(text: str) -> str:
     """Return a YAML comment suffix outside any quoted scalar, if present."""
     quote = None
     escaped = False
@@ -69,7 +71,7 @@ def trailing_comment(text):
     return ""
 
 
-def dump_block(v, indent):
+def dump_block(v: Any, indent: int) -> str:
     """Dump v as indented block-style YAML lines."""
     text = yaml.safe_dump(
         v, default_flow_style=False, sort_keys=False, allow_unicode=True
@@ -78,7 +80,7 @@ def dump_block(v, indent):
     return "".join(pad + ln + "\n" for ln in text.splitlines())
 
 
-def lookup(cfg, path):
+def lookup(cfg: Any, path: Sequence[str]) -> tuple[bool, Any]:
     """Return (found, value) for a key path in a nested dict."""
     cur = cfg
     for p in path:
@@ -88,7 +90,7 @@ def lookup(cfg, path):
     return True, cur
 
 
-def leaves(v, path=()):
+def leaves(v: Any, path: tuple[str, ...] = ()) -> Iterator[tuple[tuple[str, ...], Any]]:
     """Leaf paths of v; lists and empty dicts count as leaves."""
     if isinstance(v, dict) and v:
         for k, sub in v.items():
@@ -106,7 +108,7 @@ class Off(str):
 DISABLED_RE = re.compile(r"^#( *)((?:[A-Za-z0-9_.\-]+:|-)(?:\s.*)?)$")
 
 
-def resolve(node, defs):
+def resolve(node: dict[str, Any], defs: dict[str, Any]) -> dict[str, Any]:
     """Inline a $ref (siblings win) so the node carries its own type/default."""
     ref = node.get("$ref", "")
     if ref.startswith("#/$defs/"):
@@ -114,7 +116,7 @@ def resolve(node, defs):
     return node
 
 
-def render_schema(schema):
+def render_schema(schema: dict[str, Any]) -> list[str]:
     """Render a JSON schema as a documented template with options commented out."""
     defs = schema.get("$defs", {})
     out = [
@@ -124,7 +126,7 @@ def render_schema(schema):
         "\n",
     ]
 
-    def doc(node, indent):
+    def doc(node: dict[str, Any], indent: int) -> None:
         text = (node.get("description") or "").strip()
         lines = []
         for ln in text.splitlines():
@@ -143,7 +145,7 @@ def render_schema(schema):
         pad = "##" + " " * (indent + 1)
         out.extend((pad + ln).rstrip() + "\n" for ln in lines)
 
-    def emit(props, indent):
+    def emit(props: dict[str, Any], indent: int) -> None:
         for key, raw in props.items():
             node = resolve(raw, defs)
             doc(node, indent)
@@ -174,7 +176,7 @@ def render_schema(schema):
     return out
 
 
-def enable_disabled(lines):
+def enable_disabled(lines: Iterable[str]) -> list[str]:
     """Turn `#key: v` template lines into in-memory YAML lines tagged as Off."""
     res = []
     for ln in lines:
@@ -183,12 +185,16 @@ def enable_disabled(lines):
     return res
 
 
-def merge(sample_lines, user):  # pylint: disable=too-many-locals
+def merge(  # pylint: disable=too-many-locals
+    sample_lines: Sequence[str], user: Any
+) -> tuple[list[str], set[tuple[str, ...]]]:
     """Overlay user values onto the sample lines; return (lines, used paths)."""
-    out, stack, used = [], [], set()
+    out: list[str] = []
+    stack: list[tuple[int, str]] = []
+    used: set[tuple[str, ...]] = set()
     i, n = 0, len(sample_lines)
 
-    def block_end(start, key_indent):
+    def block_end(start: int, key_indent: int) -> int:
         """Index after the indented block (comments included) under a key line."""
         j = start
         while j < n:
@@ -274,7 +280,7 @@ def merge(sample_lines, user):  # pylint: disable=too-many-locals
     return out, used
 
 
-def main():
+def main() -> None:
     """Parse arguments, merge the config into the sample and write the result."""
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -298,7 +304,7 @@ def main():
         if p and p not in used and not any(p[:k] in used for k in range(1, len(p)))
     ]
     if missing:
-        rest = {}
+        rest: dict[str, Any] = {}
         for p, v in leaves(user):
             if p in missing:  # p is never empty: empty overrides are skipped above
                 cur = rest
