@@ -147,6 +147,16 @@ install/gen-config: ##H Generate homeserver config as $(INSTALL_USER)
 		--report-stats="$(REPORT_STATS)"
 
 
+# Output of `make install/merge-config`. It holds your secrets, so keep it out
+# of version control (`/homeserver*.yaml` is already gitignored).
+MERGED_PATH ?= homeserver.merged.yaml
+
+.PHONY: install/merge-config
+install/merge-config: ##H Merge CONFIG_PATH onto the full documented template -> MERGED_PATH
+	@echo "Merging $(CONFIG_PATH) into $(MERGED_PATH)"
+	uv run --no-sync python scripts-dev/merge_yaml.py -c "$(CONFIG_PATH)" -o "$(MERGED_PATH)"
+
+
 .PHONY: _publish
 _publish: build ##H Upload the package to PyPI using twine
 	uv run --with twine twine upload dist/*

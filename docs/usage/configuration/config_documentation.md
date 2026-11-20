@@ -1637,6 +1637,45 @@ databases:
       cp_max: 10
 ```
 ---
+### `embedded_db`
+
+*(object)* Configures the embedded `mtxdb` storage engine, which holds event JSON, state groups and event edges outside the SQL database. Both `engine` and `path` must be set together; setting only one is a configuration error.
+
+Worker deployments have extra requirements: the sole events writer must be `main`, only one events writer is allowed, and the `SYNAPSE_MTXDB_WAL=1` environment variable must be set.
+
+Environment variables override these options: `SYNAPSE_EMBEDDED_DB_ENGINE`, `SYNAPSE_EMBEDDED_DB_PATH`, `SYNAPSE_MTXDB_SYNC`, `SYNAPSE_MTXDB_NO_SYNC` and `SYNAPSE_MTXDB_FLUSH_DELAY_SECS`. Setting `SYNAPSE_MTXDB=1` together with `SYNAPSE_MTXDB_PATH` (or `embedded_db.path`) is a shortcut that selects the `mtxdb` engine.
+
+This setting has the following sub-options:
+
+* `engine` (string|null): The embedded engine to use. `mtxdb` is the only supported value. Defaults to `null`.
+
+* `path` (string|null): Path of the mtxdb data file or directory. Required whenever `engine` is set. Persistent state is never placed in a temporary directory, so there is no default. Defaults to `null`.
+
+* `namespace` (string|null): Namespace for HAMT keys in the embedded engine. Defaults to the server name when unset. Only useful for isolating several homeservers that share one embedded-engine file; not a normal deployment concern. Defaults to `null`.
+
+* `sync_mode` (string): How persists make embedded writes visible and durable.
+
+  `interval` publishes writes to other workers at the commit boundary and lets a flush coalescer group the fsyncs. A crash can lose the writes of the last flush window (about 0.5s, or 2s on a rotational disk), and a committed SQL row can then be left without its mtxdb record.
+
+  `always` fsyncs before a persist returns. It is the strictest mode and is slow on a spinning disk.
+
+  `off` never fsyncs and is for tests and diagnostics only; worker deployments reject it.
+
+  Defaults to `"interval"`.
+
+* `no_sync` (boolean): Older spelling of `sync_mode: off`. Suppresses all durable fsyncs and reintroduces a silent data-loss window. Not for production use. Defaults to `false`.
+
+* `flush_delay_secs` (number|null): Flush coalescer window, in seconds. When unset, it is chosen from the disk that holds `path`: 2.0 for a rotational disk, 0.5 otherwise. Defaults to `null`.
+---
+### `setup_timings_path`
+
+*(string|null)* If set, the time spent in each database setup step is written as JSON to this path once the homeserver has finished setting up. It is intended for profiling start-up. The `SYNAPSE_DB_SETUP_TIMINGS_PATH` environment variable sets it too. Defaults to `null`.
+
+Example configuration:
+```yaml
+setup_timings_path: /tmp/synapse-setup-timings.json
+```
+---
 ## Logging
 
 Config options related to logging.
