@@ -250,6 +250,11 @@ pool membership alone proves those guarantees.
 
 ## Phase 3: event and room-state fan-out
 
+The ordered-index design and evaluation gate for the `events` cutover is in
+[`mtxdb-range-index-phase3.md`](mtxdb-range-index-phase3.md). The pinned mtxdb
+version already has a `TimelineIndex`; first validate and integrate that API
+against Synapse's query semantics before proposing another range-index engine.
+
 The largest client-facing opportunity is not the polling request itself. It is
 serving the same active-room data repeatedly to many clients.
 
