@@ -2066,6 +2066,46 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
             _get_un_partial_stated_rooms_between_txn,
         )
 
+    async def get_rooms_un_partial_stated_after(self, stream_id: int) -> set[str]:
+        """Get the rooms that became fully-stated after `stream_id`.
+
+        Unlike `get_un_partial_stated_rooms_between`, the upper bound is the
+        database, not a (possibly lagging) stream token: this is used to find
+        rooms whose partial-state resync completed after the sync response's
+        token was captured.
+
+        The caller intersects the result with the rooms it cares about. Doing
+        that in Python rather than with an `IN` clause keeps this safe for a
+        user who is joined to thousands of rooms (SQLite has a bound-variable
+        limit). The `stream_id` predicate is a primary-key range scan whose
+        tail is normally empty.
+
+        Args:
+            stream_id: The un-partial-stated-rooms stream position to compare
+                against (exclusive).
+
+        Returns:
+            Every room with an un-partial-stated stream row after `stream_id`.
+        """
+
+        def _get_rooms_un_partial_stated_after_txn(
+            txn: LoggingTransaction,
+        ) -> set[str]:
+            txn.execute(
+                """
+                SELECT DISTINCT room_id FROM un_partial_stated_room_stream
+                WHERE stream_id > ?
+                """,
+                (stream_id,),
+            )
+
+            return {r[0] for r in txn}
+
+        return await self.db_pool.runInteraction(
+            "get_rooms_un_partial_stated_after",
+            _get_rooms_un_partial_stated_after_txn,
+        )
+
     async def get_un_partial_stated_rooms_from_stream(
         self, instance_name: str, last_id: int, current_id: int, limit: int
     ) -> tuple[list[tuple[int, tuple[str]]], int, bool]:

@@ -1447,6 +1447,88 @@ class SyncTestCase(tests.unittest.HomeserverTestCase):
         # We should return without waiting for the presence stream to advance.
         self.get_success(sync_d)
 
+    def test_partial_state_room_finished_after_token_is_not_replayed(
+        self,
+    ) -> None:
+        """A room that finishes its partial-state resync just after `now_token`
+        was captured must not be delivered with that token.
+
+        Otherwise the next sync sees the un-partial-stated transition in its
+        window, treats the room as newly joined again, and re-sends its full
+        state. That re-delivery also re-adds the user who joined in the
+        previous sync to `device_lists.changed`.
+        """
+        user = self.register_user("alice", "password")
+        tok = self.login("alice", "password")
+
+        event_sources = self.hs.get_event_sources()
+        sync_config = generate_sync_config(user, use_state_after=self.use_state_after)
+
+        # The room is joined after this token, so the first sync sees it as
+        # newly joined.
+        since_token = event_sources.get_current_token()
+
+        room_id = self.helper.create_room_as(user, tok=tok)
+        self.get_success(
+            self.store.store_partial_state_room(
+                room_id,
+                {"hs2"},
+                since_token.device_list_key.stream,
+                "hs2",
+            )
+        )
+
+        # The sync captures this token, and the room finishes its resync just
+        # after. That is the race: the room is non-partial by the time the
+        # partial-state check runs, but the token does not cover the
+        # transition yet.
+        stale_token = event_sources.get_current_token()
+        un_partial_stream_id = self.get_success(
+            self.store.clear_partial_state_room(room_id)
+        )
+        self.assertIsNotNone(un_partial_stream_id)
+        assert un_partial_stream_id is not None
+        self.assertGreater(
+            un_partial_stream_id, stale_token.un_partial_stated_rooms_key
+        )
+
+        # First sync: with the stale token the room must be held back. If it
+        # were delivered now, the next sync would deliver it again as
+        # newly-joined and re-add alice to `device_lists.changed`.
+        with patch.object(event_sources, "get_current_token", return_value=stale_token):
+            first = self.get_success(
+                self.sync_handler.generate_sync_result(
+                    sync_config, since_token=since_token
+                )
+            )
+
+        self.assertNotIn(room_id, {room.room_id for room in first.joined})
+        self.assertNotIn(user, first.device_lists.changed)
+
+        # Second sync: the token now covers the transition, so the room is
+        # delivered exactly once as a newly-joined room.
+        fresh_token = stale_token.copy_and_advance(
+            StreamKeyType.UN_PARTIAL_STATED_ROOMS, un_partial_stream_id
+        )
+        with patch.object(event_sources, "get_current_token", return_value=fresh_token):
+            second = self.get_success(
+                self.sync_handler.generate_sync_result(
+                    sync_config, since_token=first.next_batch
+                )
+            )
+
+        self.assertIn(room_id, {room.room_id for room in second.joined})
+        self.assertIn(user, second.device_lists.changed)
+
+        # Third sync: nothing is re-delivered and alice is not reported again.
+        third = self.get_success(
+            self.sync_handler.generate_sync_result(
+                sync_config, since_token=second.next_batch
+            )
+        )
+        self.assertNotIn(room_id, {room.room_id for room in third.joined})
+        self.assertNotIn(user, third.device_lists.changed)
+
 
 def generate_sync_config(
     user_id: str,
