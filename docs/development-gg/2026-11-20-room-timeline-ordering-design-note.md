@@ -93,9 +93,9 @@ Two limits of option C:
 
 ### Cross-depth example
 
-The first limit is not theoretical. In `!4zKUu8M4fstFjTFZ9E:nutra.tk` the
-stored edges (read from mtxdb, since this deployment keeps edges outside SQL)
-give this shape:
+The first limit is not theoretical. In `!4zKUu8M4fstFjTFZ9E:nutra.tk` the stored
+edges (read from mtxdb, since this deployment keeps edges outside SQL) give this
+shape:
 
 ```text
                   $yspw4Ug…  depth 459, 13 Nov 23:40Z
@@ -109,34 +109,34 @@ give this shape:
        (goldencasey joined)
 ```
 
-| Event | Depth | Timestamp (UTC) | `prev_events` |
-| --- | --- | --- | --- |
-| `$yspw4Ug7285DHzv_QXd0fm62B-2eaeGHQxZ6OUTlLu0` | 459 | 13 Nov 23:40:22 | `$nGLgjWfk…` (458) |
-| `$fJT7NvSSuaoIj26XHACD8E_I6if_MIbwVXMDKk6b90M` | 460 | 15 Nov 02:06:04 | `$yspw4Ug…` |
-| `$3L-wW0HFg-PEOhj74wf1p9luw59iH3oGi0jO4WHOKQc` | 460 | 15 Nov 21:17:51 | `$yspw4Ug…` |
-| `$wb1OgO1XAo13Gd2yZUllkweNTi0IxfCn45tIKzsOU8I` | 461 | 15 Nov 03:34:01 | `$fJT7NvSS…` |
+| Event                                          | Depth | Timestamp (UTC) | `prev_events`      |
+| ---------------------------------------------- | ----- | --------------- | ------------------ |
+| `$yspw4Ug7285DHzv_QXd0fm62B-2eaeGHQxZ6OUTlLu0` | 459   | 13 Nov 23:40:22 | `$nGLgjWfk…` (458) |
+| `$fJT7NvSSuaoIj26XHACD8E_I6if_MIbwVXMDKk6b90M` | 460   | 15 Nov 02:06:04 | `$yspw4Ug…`        |
+| `$3L-wW0HFg-PEOhj74wf1p9luw59iH3oGi0jO4WHOKQc` | 460   | 15 Nov 21:17:51 | `$yspw4Ug…`        |
+| `$wb1OgO1XAo13Gd2yZUllkweNTi0IxfCn45tIKzsOU8I` | 461   | 15 Nov 03:34:01 | `$fJT7NvSS…`       |
 
 - The two depth-460 events are siblings: both list `$yspw4Ug…` as their only
   parent, so they are concurrent.
-- The depth-461 event is a child of the depth-460 join, so it is causally
-  after that join but concurrent with the depth-460 leave.
+- The depth-461 event is a child of the depth-460 join, so it is causally after
+  that join but concurrent with the depth-460 leave.
 
 Chronological order is join (02:06) → goldencasey (03:34) → leave (21:17). The
 graph permits it, so this is not a causal timestamp reversal.
 
-| Ordering | Displayed (oldest first) |
-| --- | --- |
-| A — `(depth, stream_ordering)` | leave, join, goldencasey |
+| Ordering                                         | Displayed (oldest first) |
+| ------------------------------------------------ | ------------------------ |
+| A — `(depth, stream_ordering)`                   | leave, join, goldencasey |
 | C — `(depth, origin_server_ts, stream_ordering)` | join, leave, goldencasey |
 
 C fixes the sibling half (join before leave) but still displays the depth-461
 join after the depth-460 leave, because depth outranks timestamp. Removing the
 remaining inversion needs a timestamp-prioritised topological traversal that
-emits the earliest-timestamp ready head: after the join is emitted,
-goldencasey becomes ready and sorts before the leave. That cannot be expressed
-as a single `ORDER BY`; the cursor would have to encode the traversal frontier,
-and it would be unstable if backfill later discovers older edges. C
-deliberately does not attempt it.
+emits the earliest-timestamp ready head: after the join is emitted, goldencasey
+becomes ready and sorts before the leave. That cannot be expressed as a single
+`ORDER BY`; the cursor would have to encode the traversal frontier, and it would
+be unstable if backfill later discovers older edges. C deliberately does not
+attempt it.
 
 ## Pagination and forward-skip hazards
 
@@ -184,10 +184,10 @@ is needed to avoid trusting wire depth. The initial-sync cursor fix and the
 stale-outlier pagination fix address separate bugs and are unaffected by this
 change.
 
-The token and pagination suites pass on SQLite and PostgreSQL with mtxdb enabled.
-The three-column comparisons and background expression-index registration were
-exercised in those test homeservers. Production migration duration and
-query-plan selection have not been measured.
+The token and pagination suites pass on SQLite and PostgreSQL with mtxdb
+enabled. The three-column comparisons and background expression-index
+registration were exercised in those test homeservers. Production migration
+duration and query-plan selection have not been measured.
 
 The reason C was selected was:
 
@@ -205,9 +205,8 @@ cost and must be designed first, not treated as a detail.
 The implementation includes:
 
 - the timestamp in the continuation token, plus a matching
-  `(room_id, topological_ordering, COALESCE(origin_server_ts, 0),
-  stream_ordering)` index and migration, so the index expression matches the
-  query ordering;
+  `(room_id, topological_ordering, COALESCE(origin_server_ts, 0), stream_ordering)`
+  index and migration, so the index expression matches the query ordering;
 - the same comparator in every ordering site: `/messages` in both directions,
   `/context`, newly joined/initial `/sync` windows, and gap refills. Incremental
   `/sync` remains stream-ordered and uses stream tokens;

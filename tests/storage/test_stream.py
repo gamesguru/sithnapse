@@ -360,6 +360,19 @@ class PaginationTestCase(HomeserverTestCase):
         self.assertLess(forwards.index(ids["early"]), forwards.index(ids["late"]))
         self.assertIn(self.event_id_none, forwards)
 
+        around = self.get_success(
+            store.get_events_around(
+                self.room_id,
+                ids["early"],
+                before_limit=10,
+                after_limit=10,
+            )
+        )
+        self.assertIn(
+            ids["negative"], [event.event_id for event in around.events_before]
+        )
+        self.assertIn(ids["late"], [event.event_id for event in around.events_after])
+
     def test_forward_pagination_from_history_start_advances_at_limit_1(self) -> None:
         """Paging forwards one event at a time from a "start of history" token
         must advance rather than re-return the same backfilled event.
@@ -451,6 +464,7 @@ class PaginationTestCase(HomeserverTestCase):
                 type=EventTypes.Message,
                 content={"msgtype": "m.text", "body": "late live event"},
                 prev_event_ids=[self.event_id_1],
+                origin_server_ts=1,
             )
         )
         self.get_success(persistence.persist_event(event, context))

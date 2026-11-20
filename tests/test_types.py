@@ -199,6 +199,14 @@ class MultiWriterTokenTestCase(unittest.HomeserverTestCase):
         self.assertEqual(encoded, "t42.-123.-7")
         self.assertEqual(self.get_success(RoomStreamToken.parse(store, encoded)), token)
 
+    def test_room_historical_token_rejects_old_format(self) -> None:
+        if self.token_type is not RoomStreamToken:
+            self.skipTest("Only RoomStreamToken has historical positions")
+
+        store = self.hs.get_datastores().main
+        failure = self.get_failure(RoomStreamToken.parse(store, "t42-7"), SynapseError)
+        self.assertEqual(failure.value.code, 400)
+
     @skipUnless(USE_POSTGRES_FOR_TESTS, "Requires Postgres")
     def test_instance_map(self) -> None:
         """Test for stream token with instance map"""

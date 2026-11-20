@@ -138,6 +138,17 @@ class EventsBackgroundUpdatesStore(
             columns=["room_id", "topological_ordering", "stream_ordering"],
             where_clause="contains_url = true AND outlier = false",
         )
+        self.db_pool.updates.register_background_index_update(
+            "events_order_room_ts_idx",
+            index_name="events_order_room_ts_idx",
+            table="events",
+            columns=[
+                "room_id",
+                "topological_ordering",
+                "COALESCE(origin_server_ts, 0)",
+                "stream_ordering",
+            ],
+        )
 
         # an event_id index on event_search is useful for the purge_history
         # api. Plus it means we get to enforce some integrity with a UNIQUE
