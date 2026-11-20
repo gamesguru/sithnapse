@@ -1,0 +1,1 @@
+Prevent a room's create event from remaining in `event_backward_extremities` after it is persisted on its own, and prevent `/messages` from crossing unresolved history gaps. Return a retry response if backfill cannot make progress.

@@ -729,6 +729,62 @@ class EventsTestCase(HomeserverTestCase):
         self.assert_dict(event_ids_to_senders, response)
 
 
+class BackwardExtremityTestCase(HomeserverTestCase):
+    servlets = [
+        admin.register_servlets,
+        room.register_servlets,
+        login.register_servlets,
+    ]
+
+    def prepare(
+        self, reactor: MemoryReactor, clock: Clock, homeserver: HomeServer
+    ) -> None:
+        self._store = self.hs.get_datastores().main
+        persist_events_store = self.hs.get_datastores().persist_events
+        assert persist_events_store is not None
+        self._persist_events_store = persist_events_store
+
+    def test_persisting_event_without_prevs_clears_its_backward_extremity(
+        self,
+    ) -> None:
+        """An event with no `prev_events` (a room's create event) that is
+        persisted on its own must be removed from `event_backward_extremities`.
+
+        A child can be persisted before the create event arrives, which records
+        the create event as a gap. Persisting the create event alone yields no
+        new potential extremities, and used to return before the cleanup ran.
+        """
+        user_id = self.register_user("creator", "pass")
+        token = self.login("creator", "pass")
+        room_id = self.helper.create_room_as(user_id, tok=token)
+        create_event = self.get_success(self._store.get_create_event_for_room(room_id))
+        self.assertEqual(create_event.prev_event_ids(), [])
+
+        self.get_success(
+            self._store.db_pool.simple_insert(
+                "event_backward_extremities",
+                {"room_id": room_id, "event_id": create_event.event_id},
+            )
+        )
+
+        self.get_success(
+            self._store.db_pool.runInteraction(
+                "update_backward_extremities",
+                self._persist_events_store._update_backward_extremeties,
+                [create_event],
+            )
+        )
+
+        remaining = self.get_success(
+            self._store.db_pool.simple_select_onecol(
+                "event_backward_extremities",
+                {"room_id": room_id},
+                "event_id",
+            )
+        )
+        self.assertNotIn(create_event.event_id, remaining)
+
+
 class ExtremPruneTestCase(HomeserverTestCase):
     servlets = [
         admin.register_servlets,

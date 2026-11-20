@@ -4361,6 +4361,42 @@ class PersistEventsStore:
 
         room_id = events[0].room_id
 
+        # Do this before anything can return early: a batch whose events have no
+        # prev_events (e.g. a room's create event persisted on its own) yields no
+        # potential extremities, but each such event must still be removed from
+        # the table if an earlier persist recorded it as a gap.
+        # Delete all these events that we've already fetched and now know that their
+        # prev events are the new backwards extremeties.
+        query = (
+            "DELETE FROM event_backward_extremities WHERE event_id = ? AND room_id = ?"
+        )
+        backward_extremity_tuples_to_remove = [
+            (ev.event_id, ev.room_id)
+            for ev in events
+            if not ev.internal_metadata.is_outlier()
+            # If we encountered an event with no prev_events, then we might
+            # as well remove it now because it won't ever have anything else
+            # to backfill from.
+            or len(ev.prev_event_ids()) == 0
+        ]
+        txn.execute_batch(
+            query,
+            backward_extremity_tuples_to_remove,
+        )
+
+        # Clear out the failed backfill attempts after we successfully pulled
+        # the event. Since we no longer need these events as backward
+        # extremities, it also means that they won't be backfilled from again so
+        # we no longer need to store the backfill attempts around it.
+        query = """
+            DELETE FROM event_failed_pull_attempts
+            WHERE event_id = ? and room_id = ?
+        """
+        txn.execute_batch(
+            query,
+            backward_extremity_tuples_to_remove,
+        )
+
         potential_backwards_extremities = {
             e_id
             for ev in events
@@ -4410,35 +4446,3 @@ class PersistEventsStore:
                 keys=("room_id", "instance_name", "stream_ordering"),
                 values=gap_events,
             )
-
-        # Delete all these events that we've already fetched and now know that their
-        # prev events are the new backwards extremeties.
-        query = (
-            "DELETE FROM event_backward_extremities WHERE event_id = ? AND room_id = ?"
-        )
-        backward_extremity_tuples_to_remove = [
-            (ev.event_id, ev.room_id)
-            for ev in events
-            if not ev.internal_metadata.is_outlier()
-            # If we encountered an event with no prev_events, then we might
-            # as well remove it now because it won't ever have anything else
-            # to backfill from.
-            or len(ev.prev_event_ids()) == 0
-        ]
-        txn.execute_batch(
-            query,
-            backward_extremity_tuples_to_remove,
-        )
-
-        # Clear out the failed backfill attempts after we successfully pulled
-        # the event. Since we no longer need these events as backward
-        # extremities, it also means that they won't be backfilled from again so
-        # we no longer need to store the backfill attempts around it.
-        query = """
-            DELETE FROM event_failed_pull_attempts
-            WHERE event_id = ? and room_id = ?
-        """
-        txn.execute_batch(
-            query,
-            backward_extremity_tuples_to_remove,
-        )
