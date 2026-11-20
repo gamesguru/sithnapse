@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Migration 68fff8aea6 -> 3ce782b9dc (mtxdb 30c659da pinned at both): event_json
+# mirror, two records per event -> one combined record per event.
 """Dump the old split event_json mirror into a rewrite JSONL file.
 
 Run with the old Synapse package and a stopped server. This uses the generic

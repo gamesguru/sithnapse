@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Migration 68fff8aea6 -> 3ce782b9dc (mtxdb 30c659da pinned at both): event_json
+# mirror, two records per event -> one combined record per event.
 """Rewrite a split-layout event_json dump into the current combined layout.
 
 Run only after the dump is complete, with the service stopped and a backup of
@@ -133,7 +135,10 @@ def main() -> int:
         "--config", required=True, help="Synapse config used by the service"
     )
     parser.add_argument(
-        "--input", required=True, type=Path, help="Dump JSONL from dump_event_json.py"
+        "--input",
+        required=True,
+        type=Path,
+        help="Dump JSONL from dump_event_json-001-68fff8aea6-3ce782b9dc.py",
     )
     parser.add_argument(
         "--backup-dir",
