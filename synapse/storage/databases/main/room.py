@@ -2066,6 +2066,51 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
             _get_un_partial_stated_rooms_between_txn,
         )
 
+    async def get_rooms_un_partial_stated_after(
+        self, room_ids: Collection[str], stream_id: int
+    ) -> set[str]:
+        """Get the subset of `room_ids` that became fully-stated after `stream_id`.
+
+        Unlike `get_un_partial_stated_rooms_between`, the upper bound is the
+        database, not a (possibly lagging) stream token: this is used to find
+        rooms whose partial-state resync completed after the sync response's
+        token was captured.
+
+        Args:
+            room_ids: The rooms to check.
+            stream_id: The un-partial-stated-rooms stream position to compare
+                against (exclusive).
+
+        Returns:
+            The rooms in `room_ids` with an un-partial-stated stream row after
+            `stream_id`.
+        """
+
+        if not room_ids:
+            return set()
+
+        def _get_rooms_un_partial_stated_after_txn(
+            txn: LoggingTransaction,
+        ) -> set[str]:
+            clause, args = make_in_list_sql_clause(
+                self.database_engine, "room_id", room_ids
+            )
+
+            txn.execute(
+                f"""
+                SELECT DISTINCT room_id FROM un_partial_stated_room_stream
+                WHERE stream_id > ? AND {clause}
+                """,
+                [stream_id, *args],
+            )
+
+            return {r[0] for r in txn}
+
+        return await self.db_pool.runInteraction(
+            "get_rooms_un_partial_stated_after",
+            _get_rooms_un_partial_stated_after_txn,
+        )
+
     async def get_un_partial_stated_rooms_from_stream(
         self, instance_name: str, last_id: int, current_id: int, limit: int
     ) -> tuple[list[tuple[int, tuple[str]]], int, bool]:
