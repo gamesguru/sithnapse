@@ -2506,6 +2506,47 @@ class RoomMessageListTestCase(RoomBase):
         )
 
 
+class DepartedUserMessagesTestCase(unittest.HomeserverTestCase):
+    """/messages for a user who has left the room, with real authentication."""
+
+    servlets = [
+        admin.register_servlets,
+        login.register_servlets,
+        room.register_servlets,
+    ]
+
+    def test_departed_user_cannot_page_past_their_leave(self) -> None:
+        """A user who has left must not see events from after they left, even when
+        asking for the latest messages without a `from` token (sytest
+        "Can get rooms/{roomId}/messages for a departed room").
+        """
+        owner = self.register_user("owner", "pass")
+        owner_tok = self.login("owner", "pass")
+        other = self.register_user("other", "pass")
+        other_tok = self.login("other", "pass")
+
+        room_id = self.helper.create_room_as(owner, tok=owner_tok)
+        self.helper.join(room_id, other, tok=other_tok)
+        self.helper.send(room_id, "before leaving", tok=other_tok)
+        self.helper.leave(room_id, other, tok=other_tok)
+        # Sent by the remaining member after `other` has left.
+        self.helper.send(room_id, "after leaving", tok=owner_tok)
+
+        channel = self.make_request(
+            "GET",
+            f"/_matrix/client/v3/rooms/{room_id}/messages?dir=b&limit=2",
+            access_token=other_tok,
+        )
+        self.assertEqual(HTTPStatus.OK, channel.code, channel.result)
+        bodies = [
+            event["content"].get("body")
+            for event in channel.json_body["chunk"]
+            if event["type"] == "m.room.message"
+        ]
+        self.assertNotIn("after leaving", bodies)
+        self.assertEqual(bodies[:1], ["before leaving"])
+
+
 class RoomMessageFilterTestCase(RoomBase):
     """Tests /rooms/$room_id/messages REST events."""
 

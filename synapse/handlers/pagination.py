@@ -586,6 +586,10 @@ class PaginationHandler:
                 from_token = from_token.copy_and_replace(
                     StreamKeyType.ROOM, leave_token
                 )
+                # The database query uses `pagination_from_token`, which was
+                # captured from the original token above. Clamp it too, or a
+                # departed user can still page past their leave event.
+                pagination_from_token = leave_token
 
         to_room_key = None
         if pagin_config.to_token:
