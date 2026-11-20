@@ -104,3 +104,4 @@ target/
 
 # Local-only dependency path overrides (absolute paths; never commit)
 rust/.cargo/config.toml
+synapse/_build_version.txt

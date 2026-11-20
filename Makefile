@@ -133,6 +133,17 @@ install/build: ##H Build, pip-install $(INSTALL_SRC) to $(INSTALL_DIR)
 	# if [ -f .env ]; then set -a; . ./.env; set +a; fi
 	@echo "Installing $(INSTALL_SRC)$(INSTALL_EXTRAS) into $(INSTALL_DIR)"
 	sudo "$(INSTALL_DIR)/bin/pip" install "$(INSTALL_SRC)$(INSTALL_EXTRAS)"
+	@# A pip-installed copy has no git checkout, so record the branch and commit
+	@# it was built from; synapse/util/__init__.py reads this for the version.
+	@set -euo pipefail; \
+	ver="$$($(INSTALL_DIR)/bin/python -c 'import importlib.metadata as m; print(m.version("matrix-synapse"))')"; \
+	branch="$$(git -C "$(INSTALL_SRC)" rev-parse --abbrev-ref HEAD)"; \
+	rev="$$(git -C "$(INSTALL_SRC)" rev-parse --short HEAD)"; \
+	dirty=""; \
+	if [ -n "$$(git -C "$(INSTALL_SRC)" status --porcelain --untracked-files=no)" ]; then dirty=",dirty"; fi; \
+	pkg="$$($(INSTALL_DIR)/bin/python -c 'import importlib.util as u; print(u.find_spec("synapse").submodule_search_locations[0])')"; \
+	echo "Recording version $$ver (b=$$branch,$$rev$$dirty) in $$pkg"; \
+	echo "$$ver (b=$$branch,$$rev$$dirty)" | sudo tee "$$pkg/_build_version.txt" >/dev/null
 
 .PHONY: install/gen-config
 install/gen-config: ##H Generate homeserver config as $(INSTALL_USER)
