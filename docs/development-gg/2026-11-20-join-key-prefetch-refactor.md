@@ -1,8 +1,16 @@
 # Join-time signing-key acquisition: prefetch refactor
 
-Status: design proposal (not implemented, not benchmarked). Scope: Sithnapse
-`synapse/crypto/keyring.py`, `synapse/federation/federation_client.py`
-(`send_join`), plus the equivalent changes for Congruent and Dendrite.
+Status: design proposal (not implemented, not benchmarked). Revised after
+review. Scope: Sithnapse `synapse/crypto/keyring.py`,
+`synapse/federation/federation_client.py` (`send_join`), plus the equivalent
+changes for Congruent and Dendrite.
+
+The design has two tracks that must not be mixed:
+
+- **Track A, a faster join with unchanged trust semantics.** Every event the
+  join installs is still signature-verified. Safe; this is the main proposal.
+- **Track B, deferred verification.** Accepting less-verified state. A protocol
+  and storage change that needs its own design. Listed only as future work.
 
 ## Problem
 
@@ -14,164 +22,181 @@ origins without letting dead servers hold up the join.
 
 ## Current behaviour (as read from code, 2026-11)
 
-|               | Key-acquisition path in a join                                                                                                                                                                                                       | Gaps                                                                                                                                                                                            |
-| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Sithnapse** | `send_join` runs `concurrently_execute(_execute, state+auth_chain, 10000)`. Each event calls `keyring.verify_event_for_server`, which feeds a `BatchingQueue`. Fetchers run in order: store, perspectives (notaries), direct origin. | No explicit prefetch; batching depends on what reaches the queue together. Every notary gets the full set. `ServerKeyFetcher` fan-out has no concurrency cap.                                   |
-| **Congruent** | `acquire_events_pubkeys` collects keys from the whole response, then notary batches, then `FuturesUnordered` origin fan-out, then validates.                                                                                         | `acquire_locals` checks cache one key at a time. Every notary gets the entire missing set. Origin fan-out is unbounded with no phase deadline. Per-event fallback (`get_event_keys`) is serial. |
-| **Dendrite**  | `VerifyEventSignatures` calls `KeyRing.FetchKeys` with a `map[request]ts`. Local, then DB/cache, then fetchers sequentially (direct first by default).                                                                               | No response-wide prefetch. Fetchers run one after another with a 30s context each. Direct-before-perspective ordering is the wrong default for bulk.                                            |
+|               | Key-acquisition path in a join                                                                                                                                                                                                       | Gaps                                                                                                                                                                                                                                                        |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Sithnapse** | `send_join` runs `concurrently_execute(_execute, state+auth_chain, 10000)`. Each event calls `keyring.verify_event_for_server`, which feeds a `BatchingQueue`. Fetchers run in order: store, perspectives (notaries), direct origin. | No explicit prefetch; batching depends on what reaches the queue together. Notaries are all queried with the full set concurrently. `ServerKeyFetcher` fan-out has no concurrency cap.                                                                      |
+| **Congruent** | `acquire_events_pubkeys` collects keys from the whole response, then notary batches, then `FuturesUnordered` origin fan-out, then validates.                                                                                         | Local availability appears to be checked per key (`acquire_locals`). Each notary gets the entire missing set. Origin fan-out has no cap or phase deadline. Per-event fallback (`get_event_keys`) is serial. Whether a mtxdb multi-get exists is unverified. |
+| **Dendrite**  | `VerifyEventSignatures` calls `KeyRing.FetchKeys` with a `map[request]ts`: local keys, then DB/cache, then each fetcher in turn.                                                                                                     | Fetcher order is perspectives first, direct last by default (`PreferDirectFetch` true makes direct first). No evidence yet that a whole join response is submitted as one request set. Parallelism _within_ a fetcher is unverified.                        |
 
-Verdict: Congruent has the best shape (explicit whole-response prefetch), but
-none is optimal.
+Verdict: Congruent has the clearest structure for this workload (explicit
+whole-response prefetch), but none is optimal and none is measured.
 
-## Target design: the 8 steps
+## Track A: safe fast path
 
-### 1. Prefetch before verifying
+### 1. Collect and dedupe the requests
 
 Walk the entire send_join response once and build a deduped set of
-`(origin, key_id, min_valid_ts)`:
+`(origin, key_id, minimum_valid_until_ts)`:
 
-- `min_valid_ts` is the maximum `origin_server_ts` over the events that need
-  that key (room version 5+), or 0 for v1-4.
+- `minimum_valid_until_ts` is the maximum `origin_server_ts` over the events
+  that need that key (room version 5+), or 0 for v1-4.
 - Include sender domain, event-ID domain for v1/v2, and restricted-join
   authorising server.
-- Verification must not start until this phase completes or hits its deadline.
+- Verification does not start until this phase finishes.
 
-### 2. One bulk cache read
+### 2. Read local/cache results in bulk, where the API supports it
 
-- Single multi-get against the key store (mtxdb in this tree), not one lookup
-  per key.
+- Use a multi-get against the key store only if the storage layer provides one.
+  Otherwise, add it as a prerequisite and measure whether the per-key reads are
+  actually significant before doing so.
 - Classify each request as **fresh**, **stale** (cached but `valid_until_ts` too
   early for the events that need it) or **missing**.
-- Drop origins currently in negative-cache backoff (MSC4499
-  `KeyFetchBackoffCache`) from the fetch set immediately; their events go to
-  step 7's degraded path.
+- Skip origins currently in negative-cache backoff (MSC4499
+  `KeyFetchBackoffCache`) when fetching. The events they signed fall under the
+  same failure/retry semantics as step 5, not a new one.
 - Local server keys short-circuit as today.
 
-### 3. Partition across notaries, don't broadcast
+### 3. Query notaries with bounded batching and fallback
 
-- Split the stale+missing set across the configured notaries (stable hash on
-  origin). Cap batch size per `/_matrix/key/v2/query` call.
-- Only origins a notary failed to satisfy (or omitted) go to the next notary.
-- Hedge: if a notary has not answered by a short threshold, send its slice to
-  another notary without cancelling the first.
-- Validate notary signatures and MSC4499 duplicate-key rules per response entry,
-  as now. A bad entry skips only that origin.
+- Cap batch size per `/_matrix/key/v2/query` call.
+- Order notaries by **measured** coverage and latency, tracked per notary, and
+  choose a primary. Do not statically partition origins by hash: a notary that
+  cannot answer its slice adds a full round trip.
+- Send the primary the whole set; send only its misses to the next notary.
+  Bounded hedging, firing a second notary after a latency threshold without
+  cancelling the first, is an option to benchmark, not a default.
+- Keep per-entry validation (notary signature, MSC4499 duplicate keys). A bad
+  entry skips only that origin.
+- Today every notary is queried concurrently with the same set. That costs
+  duplicate work but wins on latency; benchmark before replacing it.
 
-### 4. Bounded origin fallback
+### 4. Fetch remaining origins concurrently, bounded
 
 - Remaining misses go direct to `/_matrix/key/v2/server`.
-- Semaphore of roughly 64-128 concurrent requests; per-origin timeout 3-5s (not
-  the 10s x multiple retries of the generic path).
-- Overall phase deadline (e.g. 10-15s). Anything unresolved at the deadline is
-  left for step 7. Failures update the backoff cache.
-- Order the queue so origins that signed auth-critical events go first (see step
-  7).
+- Configurable concurrency cap and an overall phase deadline. Start values for
+  the benchmark (not defaults): cap 64-128, per-origin timeout 3-10s, phase
+  deadline 10-30s. Right values depend on DNS/TLS setup, geography, retries and
+  destination rate limits.
+- Failures update the backoff cache.
 
-### 5. One batched write
-
-- Persist everything fetched in a single batched write (one transaction / one
-  mtxdb batch) after steps 3 and 4, not per response.
-- Keep the existing "favour largest `valid_until_ts`" merge rules.
-
-### 6. Verify against an immutable snapshot, in parallel
+### 5. Verify as usual
 
 - Build an immutable `origin -> key_id -> (key, valid_until, expired)` snapshot
-  from steps 2-5. Per-event checks only read this snapshot: no I/O, no locks.
-- Run signature and hash checks on a CPU pool (in Sithnapse the Rust side; in
-  Congruent `spawn_blocking`/rayon). Use batch Ed25519 verification where
-  available.
-- Events with no usable key in the snapshot are not fetched again here; they go
-  to step 7.
+  and have per-event checks read only that (no I/O, no locks). Run signature and
+  hash checks on a CPU pool, and use batch Ed25519 verification where available.
+- If required keys are still unavailable after step 4, **keep the join's
+  existing failure, retry, or incomplete-state semantics.** The events are not
+  installed as verified state. Concretely:
+  - Sithnapse: `_check_sigs_and_hash_and_fetch_one` failures drop the event from
+    the signed set, as now.
+  - Congruent: unvalidatable state events are dropped from joined state, as now.
+  - Dendrite: `VerifyEventSignatures` errors fail the verification, as now.
+- A cheap, safe improvement here is to distinguish "key unavailable" from
+  "signature invalid" in logs, metrics and error types. It changes reporting
+  only, not trust decisions.
 
-### 7. Degrade, don't fail
+### 6. Partial-state joins are a separate lever
 
-- Do not reject an event just because a key could not be fetched in time.
-  Persist it as unverified/outlier and queue a background retry; re-verify and
-  promote or reject when the key arrives. (This matches the existing comment in
-  `process_remote_join` that failing to validate signatures now does not mean
-  never.)
-- Verify auth-critical events first: `m.room.create`, power levels, join rules,
-  and the memberships those depend on. The join can complete once those verify,
-  so stragglers never block it.
-- A key that is fetched and proves the signature invalid is a real rejection; a
-  key that is merely unavailable is not.
+- Partial-state joins (MSC3706) reduce how many events, and so origins, must be
+  verified at join time. But they are an intentional join mode with their own
+  semantics, not a transparent speed switch. Optimize and benchmark them
+  separately.
+- Resync can reuse steps 1-5 in bounded chunks.
 
-### 8. Avoid the work where possible
-
-- Prefer partial-state joins (MSC3706): most member events, which carry most of
-  the distinct origins, aren't verified at join time and are resolved during
-  resync.
-- During resync, run the same steps 1-7 in bounded chunks instead of one huge
-  batch.
-
-## Per-project changes
+## Per-project changes (Track A)
 
 ### Sithnapse
 
-1. Add `KeyRing.prefetch(requests, deadline)` implementing steps 1-5, and call
-   it in `federation_client.send_join` immediately before the
-   `concurrently_execute` calls.
-2. `PerspectivesKeyFetcher._fetch_keys`: replace "query every notary with
-   everything" with partition + waterfall + hedge (step 3).
-3. `ServerKeyFetcher._fetch_keys`: replace unbounded `yieldable_gather_results`
-   with a bounded gather and the shorter timeout (step 4).
-4. Make `StoreKeyFetcher` expose a multi-get used by prefetch (step 2).
-5. Reuse `process_request`'s checks against the snapshot after prefetch, so
-   `verify_event_for_server` becomes a cache hit.
-6. Step 7: let `_check_sigs_and_hash_and_fetch_one` distinguish "key
-   unavailable" from "signature invalid" and route the former to the
-   outlier/retry path.
+1. Add `KeyRing.prefetch(requests, deadline)` implementing steps 1-4 and call it
+   in `federation_client.send_join` immediately before the
+   `concurrently_execute` calls, so `verify_event_for_server` becomes a cache
+   hit.
+2. `ServerKeyFetcher._fetch_keys`: bound the concurrency and add the phase
+   deadline (step 4).
+3. `PerspectivesKeyFetcher._fetch_keys`: add per-notary coverage/latency
+   tracking and the primary + fallback ordering (step 3), after benchmarking
+   against the current concurrent broadcast.
+4. Inspect `StoreKeyFetcher` for a real multi-get before claiming one (step 2).
+5. Split "key unavailable" from "signature invalid" in error reporting (step 5).
 
 ### Congruent
 
-1. Replace serial `acquire_locals` with one mtxdb multi-get (reuse the approach
-   in `event_key_metadata_for_events`).
-2. `acquire_notary`: partition the missing set across `trusted_servers()` and
-   waterfall instead of sending all of it to each notary.
-3. `acquire_origins`: add a semaphore and a phase deadline around
+1. Measure whether the per-key `acquire_locals` cost matters; if so, add a mtxdb
+   multi-get (the `event_key_metadata_for_events` approach may be reusable; not
+   yet checked).
+2. `acquire_notary`: primary + fallback instead of sending the full missing set
+   to every notary, after benchmarking.
+3. `acquire_origins`: add a concurrency cap and a phase deadline around
    `FuturesUnordered`.
 4. Make `get_event_keys` use the prefetched snapshot rather than per-origin
    sequential lookups.
-5. Treat unavailable keys as retryable in `concurrent_validate_and_add_events`
-   (currently an unvalidatable state event is dropped from joined state).
 
 ### Dendrite
 
-1. Add a prefetch step before `PerformJoin`/`VerifyEventSignatures` that calls
-   `KeyRing.FetchKeys` once with the whole request set.
-2. Default perspective-first for bulk requests (`PreferDirectFetch: false`).
-3. Run fetchers concurrently with first-hit-wins instead of sequentially, and
-   shorten the 30s per-fetcher context.
-4. Check how much concurrency `DirectKeyFetcher` in gomatrixserverlib allows;
-   cap it explicitly if it is unbounded.
-5. Same available-vs-invalid distinction as step 7.
+1. First verify where a join response triggers key requests. The `FetchKeys` map
+   API alone does not show a whole join is submitted as one set. Only then add a
+   prefetch before `PerformJoin` verification.
+2. Default order is already perspectives first; `PreferDirectFetch` is the
+   opt-in direct-first. Leave it perspective-first for bulk workloads.
+3. Check whether fetchers could run concurrently with first-hit-wins, and
+   whether the 30s per-fetcher context should shrink.
+4. Check how much concurrency `DirectKeyFetcher` in gomatrixserverlib allows and
+   cap it if unbounded.
+
+## Track B: deferred verification (future work, not part of this proposal)
+
+Letting a join finish before all keys are fetched would speed it up, but it
+cannot be done by "persist as unverified and retry later" alone. An event whose
+signing key is unavailable is not trusted room state. A design would need, at
+minimum:
+
+- A strict quarantine: unverified events must not affect state resolution, auth
+  checks, membership, joined hosts, or anything client-visible until verified.
+- A defined result when verification later fails (rewrite state? re-resolve?
+  notify clients?).
+- A decision on which events may be deferred at all; the create, power-levels,
+  join-rules and the memberships they depend on must be verified before the join
+  is accepted.
+- Storage for pending events and a background re-verifier.
+
+This is a substantial protocol and storage change. It needs its own design and
+review; it is not a cheap optimization.
 
 ## Expected impact (hypotheses to test)
 
-- Biggest: step 3 (no broadcast, no redundant notary work) and step 7 (join not
-  blocked by stragglers/dead servers). Both are cheap.
-- Medium: steps 1-2 (deterministic batching, bulk read) and step 4 (bounded
-  concurrency avoids socket/CPU storms).
-- Step 8 changes the problem size rather than the speed of the same work.
+- Likely largest: explicit prefetch with a bounded, deadline-limited origin
+  phase (steps 1 and 4), because it makes batching deterministic and stops
+  stragglers fanning out without limit.
+- Notary ordering by measured coverage (step 3) saves duplicate work but may
+  cost latency; undecided until measured.
+- Partial-state (step 6) changes the problem size rather than the speed of the
+  same work.
 
 ## Benchmark plan
 
 Fixture: synthetic send_join response with 700 distinct origins, one key each.
 Variables: notary coverage (100% / 50% / 0%), fraction of dead origins (0 / 5 /
 20%), notary RTT, origin RTT, cold vs warm cache. Metrics: time to join
-complete, time to all events verified, outbound requests, peak concurrent
-sockets, notary bytes, events left unverified at the deadline. Compare: current
-Sithnapse, prefetch only (1-2), +partitioned notaries (3), +bounded origins and
-deadline (4), +degraded path (7).
+acceptance, time until all response events are verified, outbound requests by
+destination, peak in-flight requests, cache hit rate, events that could not be
+verified.
+
+Compare at least: current behaviour; explicit prefetch; prefetch plus bounded,
+deadline-limited fetching; prefetch plus coverage-aware notary ordering. This
+also answers whether Congruent's deterministic batch actually beats Sithnapse's
+concurrent queue on a realistic 700-origin response.
 
 ## Open questions
 
-- Hedge threshold and phase deadline defaults; should they be per-room-size?
-- Where unverified-pending state lives (an event status in mtxdb metadata vs a
-  separate queue).
-- Whether notary partitioning by hash should weight notaries by observed
-  latency.
-- Dendrite's actual `DirectKeyFetcher` concurrency (unverified).
+- Do the Sithnapse store fetcher and the Congruent mtxdb adapter offer a real
+  multi-get, and is per-key reading a measurable cost?
+- Best primary-notary selection: static config, observed coverage, observed
+  latency?
+- Hedge threshold, concurrency cap and phase deadline values, and whether they
+  should scale with response size.
+- Where in Dendrite's join path keys are requested, and its `DirectKeyFetcher`
+  concurrency.
+- Whether Track B is worth designing at all.
 
 ## Caveats
 
