@@ -41,7 +41,7 @@ sequence after retiring any queued chain-cover background updates.
 
 ## Ownership and migration marker
 
-`auth_chain_backend` (schema delta 98) records `sql` or `mtxdb` in one row.
+`auth_chain_backend` (schema delta 97) records `sql` or `mtxdb` in one row.
 
 - A fresh database adopts the configured backend at boot.
 - An existing database with a mismatched marker refuses to start with
