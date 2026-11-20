@@ -77,10 +77,12 @@ For non-unique sort values, include a stable unique suffix so pagination has a
 total order and a resumable cursor. Prefer event identity as the index target,
 not a content hash for the stored body. Event IDs are stable across redaction
 for room versions whose IDs are derived from the redacted event; older room
-versions need their existing event-ID semantics preserved. This makes the
-logical event index independent of replacement body frames. It does not settle
-whether bodies are deduplicated underneath: if multiple events can share one
-body object, purge needs reference tracking or another safe ownership rule.
+versions need their existing event-ID semantics preserved. The mtxdb record
+identity must therefore derive from the event ID, not from the current body
+bytes. This makes the logical event index independent of replacement body
+frames. It does not settle whether bodies are deduplicated underneath: if
+multiple events can share one body object, purge needs reference tracking or
+another safe ownership rule.
 
 Specify how updates that change a sort value remove the old association. If
 index entries are derived from record fields, version the extractor/index
@@ -106,6 +108,27 @@ A range scan can separate logical selection from physical reads:
 4. Sort only the selected locators by pack and offset, then coalesce reads under
    explicit maximum gap and window sizes.
 5. Decode and validate records, then restore logical result order.
+
+Packs should be shared across small rooms, with a slot directory ordered by
+`(room_id, topological_ordering, stream_ordering)`. A large room may span many
+packs, and later backfill can make their per-room ranges overlap; the query then
+merges the relevant pack directories. Locator resolution is still needed only
+for changed/overridden entries if slot directories carry direct record
+locations. Outliers can be excluded from sealed timeline packs because they do
+not appear in `/messages`, but de-outliering must re-place the event through an
+override or repack path.
+
+The slot directory may carry compact flags and type tags so timeline filters can
+skip bodies before reading them. `lazy_load_members` affects membership events
+in the response's `state` section; it does not filter `m.room.member` events out
+of the timeline `chunk`. Timeline filters such as `types` and `not_types` do
+affect the chunk and are the relevant case for slot-level type tags.
+
+For an overridden slot, the directory's `RecordId` can resolve whether the event
+was purged or moved to a redacted frame. A bitset alone cannot identify the
+replacement location. Measure cold primary-directory page faults as well as
+logical locator probes; when that directory exceeds RAM, `P_loc` includes real
+storage reads.
 
 This can reduce random blob reads when selected records are physically close,
 while retaining early `LIMIT K` termination. It is not guaranteed to help every
@@ -175,12 +198,14 @@ Before choosing an implementation:
    Run the measurement for both `/messages` and stream-order reads. This tests
    whether pack layout, rather than a different index, is the dominant cost.
 5. Record wall time, index blocks read, locator probes, pack reads, bytes read
-   versus bytes returned, memory, write amplification, and compaction cost.
+   versus bytes returned, primary-index page faults, memory, write
+   amplification, and compaction cost. Report `P_loc` separately from body
+   reads.
 6. Measure append and import latency at 10k, 100k, and 1M events per room,
    including root/manifest publication cost.
 7. Compare against the current SQL indexes on the same data and query shapes.
 8. Exercise concurrent writes, refresh/reopen, interrupted publication,
-   redaction, and purge while readers hold cursors.
+   redaction, de-outliering, and purge while readers hold cursors.
 
 Claims such as a fixed number of block reads per level, a particular HDD seek
 latency, a speedup factor, or a fixed memory cost are hypotheses until these
