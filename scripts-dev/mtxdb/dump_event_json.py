@@ -14,7 +14,6 @@ import argparse
 import base64
 import json
 import os
-import re
 import struct
 import subprocess
 import sys
@@ -29,7 +28,6 @@ from _common import (
     sql_connection,
 )
 
-COLLECTION_ROW = re.compile(r"^\s*(0x[0-9a-fA-F]{32})\s+(.+?)\s+(\d+)\s+\S+%\s+")
 EXPORT_FORMAT = "sithnapse-event-json-rewrite/v1"
 
 
@@ -42,31 +40,6 @@ def cli_command(cli: str, db_path: Path, *args: str) -> list[str]:
         "events",
         *args,
     ]
-
-
-def room_collections(cli: str, db_path: Path) -> list[tuple[str, str]]:
-    completed = subprocess.run(
-        cli_command(cli, db_path, "collections", "--canonical", "--limit", "0"),
-        check=True,
-        stdout=subprocess.PIPE,
-        text=True,
-    )
-    found: list[tuple[str, str]] = []
-    for line in completed.stdout.splitlines():
-        match = COLLECTION_ROW.match(line)
-        if not match:
-            continue
-        collection_id, canonical = match.group(1), match.group(2).strip()
-        # Room EventDag collections use the room ID as their canonical ID.
-        # System locator buckets have sys:* canonical IDs and are skipped.
-        if canonical.startswith("!"):
-            found.append((collection_id, canonical.split(maxsplit=1)[0]))
-    if not found:
-        raise RuntimeError(
-            "mtxdb listed no room EventDag collections; check --config, the "
-            "database path, and --mtxdb-cli"
-        )
-    return found
 
 
 def envelope_records(
@@ -169,10 +142,6 @@ def main() -> int:
     sql_total = sum(len(ids) for ids in events_by_room.values())
     print(f"SQL events: {sql_total} in {len(events_by_room)} rooms", file=sys.stderr)
 
-    collection_by_room = {
-        room: cid for cid, room in room_collections(args.mtxdb_cli, db_path)
-    }
-
     args.output.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary_output = tempfile.mkstemp(
         prefix=f".{args.output.name}.", dir=args.output.parent
@@ -183,21 +152,23 @@ def main() -> int:
         with os.fdopen(fd, "w", encoding="utf-8") as output:
             output.write("\n")  # header placeholder, rewritten below
             for room_id, event_ids in events_by_room.items():
-                collection_id = collection_by_room.get(room_id)
-                if collection_id is None:
-                    problems.extend(
-                        f"{e}: no mtxdb collection for {room_id}" for e in event_ids
-                    )
-                    continue
                 wanted: dict[bytes, tuple[str, str]] = {}
                 for event_id in event_ids:
                     wanted[event_node_id(namespace, event_id)] = ("body", event_id)
                     wanted[event_meta_node_id(namespace, event_id)] = ("meta", event_id)
                 bodies: dict[str, tuple[int | None, str]] = {}
                 metas: dict[str, str] = {}
-                for node_id, payload in envelope_records(
-                    args.mtxdb_cli, db_path, collection_id
-                ):
+                # The CLI resolves a `!room:server` selector to the room's
+                # collection itself; the canonical-id listing cannot be used
+                # because Sithnapse's collections show as "[unregistered]".
+                try:
+                    records = list(envelope_records(args.mtxdb_cli, db_path, room_id))
+                except subprocess.CalledProcessError:
+                    problems.extend(
+                        f"{e}: mtxdb export failed for {room_id}" for e in event_ids
+                    )
+                    continue
+                for node_id, payload in records:
                     hit = wanted.get(node_id)
                     if hit is None:
                         continue
