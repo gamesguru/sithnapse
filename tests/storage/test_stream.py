@@ -289,6 +289,68 @@ class PaginationTestCase(HomeserverTestCase):
             {backfilled.event_id, live.event_id},
         )
 
+    def test_forward_pagination_from_history_start_advances_at_limit_1(self) -> None:
+        """Paging forwards one event at a time from a "start of history" token
+        must advance rather than re-return the same backfilled event.
+
+        The token a client gets from paginating backwards to the start has a
+        negative stream part. Reusing that as the next token's stream part (the
+        live bound) put the cursor *below* the event just returned, so it was
+        returned again forever.
+        """
+        persistence = self.hs.get_storage_controllers().persistence
+        assert persistence is not None
+        store = self.hs.get_datastores().main
+
+        history_type = "org.example.history"
+        backfilled_ids = []
+        prev = self.event_id_none
+        for i in range(4):
+            event, context = self.get_success(
+                create_event(
+                    self.hs,
+                    room_id=self.room_id,
+                    sender=self.user_id,
+                    type=history_type,
+                    content={"n": i},
+                    prev_event_ids=[prev],
+                )
+            )
+            self.get_success(persistence.persist_event(event, context, backfilled=True))
+            backfilled_ids.append(event.event_id)
+            prev = event.event_id
+
+        oldest = self.get_success(
+            store.get_topological_token_for_event(backfilled_ids[0])
+        )
+        assert oldest.topological is not None
+        # What a backward /messages returns as its `end` at the start of history.
+        start = RoomStreamToken(
+            topological=oldest.topological, stream=oldest.stream - 1
+        )
+        # Only the history events, as in a room whose live events all sort later.
+        event_filter = Filter(self.hs, {"types": [history_type]})
+
+        seen: list[str] = []
+        key = start
+        for _ in range(12):
+            events, key, _ = self.get_success(
+                store.paginate_room_events_by_topological_ordering(
+                    room_id=self.room_id,
+                    from_key=key,
+                    to_key=None,
+                    direction=Direction.FORWARDS,
+                    limit=1,
+                    event_filter=event_filter,
+                    live_from_key=RoomStreamToken(stream=key.stream),
+                )
+            )
+            if not events:
+                break
+            seen.extend(event.event_id for event in events)
+
+        self.assertEqual(seen, backfilled_ids, "each event exactly once, in order")
+
     def test_forward_pagination_keeps_late_live_event_below_anchor(self) -> None:
         """Live events after the stream bound are returned even at a lower depth."""
         persistence = self.hs.get_storage_controllers().persistence

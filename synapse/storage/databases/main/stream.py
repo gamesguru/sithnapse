@@ -2455,9 +2455,16 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
         fetched_rows = txn.fetchall()
         filtered_rows = _filter_fetched(fetched_rows)
 
+        # The tie-break handling below is only needed when the live bound is a
+        # real (non-negative) stream position, which cannot also be used to
+        # order backfilled events. A negative live bound lives in the same
+        # domain as backfilled stream orderings, so the ordinary
+        # `(topological, stream)` next token already breaks ties correctly.
+        carries_live_bound = live_from_key is not None and live_from_key.stream >= 0
+
         if (
             direction == Direction.FORWARDS
-            and live_from_key is not None
+            and carries_live_bound
             and filtered_rows
             and limit > 0
         ):
@@ -2524,6 +2531,7 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
             if (
                 direction == Direction.FORWARDS
                 and live_from_key is not None
+                and carries_live_bound
                 and rows[-1].stream_ordering < 0
             ):
                 # Advancing past a backfilled event must not advance the live
