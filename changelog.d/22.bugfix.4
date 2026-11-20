@@ -1,1 +1,0 @@
-Fix `prev_batch` of a limited initial or newly joined `/sync` timeline so paging back with `/messages` neither repeats events from the window nor skips older ones in rooms whose history was backfilled. The token now carries the oldest event's topological position instead of only its stream position.
