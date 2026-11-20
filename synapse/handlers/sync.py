@@ -1089,6 +1089,7 @@ class SyncHandler:
                     )
                     room_key = RoomStreamToken(
                         topological=oldest_token.topological,
+                        timestamp=oldest_token.timestamp,
                         stream=oldest_stream_ordering - 1,
                     )
                 else:

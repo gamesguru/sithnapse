@@ -289,6 +289,77 @@ class PaginationTestCase(HomeserverTestCase):
             {backfilled.event_id, live.event_id},
         )
 
+    def test_same_depth_siblings_are_ordered_by_timestamp(self) -> None:
+        """Concurrent events at one depth read chronologically.
+
+        Two backfilled siblings share a parent and therefore a depth. The one
+        with the earlier timestamp is backfilled first, so it gets the *higher*
+        (less negative) stream ordering: ordering by `(depth, stream)` alone
+        puts it second. Paging one event at a time in both directions must put
+        it first, without skipping or repeating anything at the page boundary.
+        """
+        persistence = self.hs.get_storage_controllers().persistence
+        assert persistence is not None
+        store = self.hs.get_datastores().main
+
+        ids = {}
+        for name, ts in (("negative", -100), ("early", 1_000), ("late", 2_000)):
+            event, context = self.get_success(
+                create_event(
+                    self.hs,
+                    room_id=self.room_id,
+                    sender=self.user_id,
+                    type=EventTypes.Message,
+                    content={"msgtype": "m.text", "body": name},
+                    prev_event_ids=[self.event_id_none],
+                    origin_server_ts=ts,
+                )
+            )
+            self.get_success(persistence.persist_event(event, context, backfilled=True))
+            ids[name] = event.event_id
+
+        # Backfilled arrival order is the reverse of timestamp order here.
+        early_stream, late_stream = (
+            self.get_success(
+                store.db_pool.simple_select_one_onecol(
+                    "events", {"event_id": ids[name]}, "stream_ordering"
+                )
+            )
+            for name in ("early", "late")
+        )
+        self.assertGreater(early_stream, late_stream)
+
+        async def page_all(direction: Direction, key: RoomStreamToken) -> list[str]:
+            seen: list[str] = []
+            while True:
+                (
+                    events,
+                    key,
+                    _,
+                ) = await store.paginate_room_events_by_topological_ordering(
+                    room_id=self.room_id,
+                    from_key=key,
+                    to_key=None,
+                    direction=direction,
+                    limit=1,
+                )
+                if not events:
+                    return seen
+                seen.extend(event.event_id for event in events)
+
+        newest = self.get_success(
+            store.get_current_room_stream_token_for_room_id(self.room_id)
+        )
+        backwards = self.get_success(page_all(Direction.BACKWARDS, newest))
+        oldest = RoomStreamToken(topological=0, timestamp=-(2**63), stream=-(2**62))
+        forwards = self.get_success(page_all(Direction.FORWARDS, oldest))
+
+        self.assertEqual(len(backwards), len(set(backwards)))
+        self.assertEqual(forwards, list(reversed(backwards)))
+        self.assertLess(forwards.index(ids["negative"]), forwards.index(ids["early"]))
+        self.assertLess(forwards.index(ids["early"]), forwards.index(ids["late"]))
+        self.assertIn(self.event_id_none, forwards)
+
     def test_forward_pagination_from_history_start_advances_at_limit_1(self) -> None:
         """Paging forwards one event at a time from a "start of history" token
         must advance rather than re-return the same backfilled event.
@@ -326,7 +397,9 @@ class PaginationTestCase(HomeserverTestCase):
         assert oldest.topological is not None
         # What a backward /messages returns as its `end` at the start of history.
         start = RoomStreamToken(
-            topological=oldest.topological, stream=oldest.stream - 1
+            topological=oldest.topological,
+            timestamp=oldest.timestamp,
+            stream=oldest.stream - 1,
         )
         # Only the history events, as in a room whose live events all sort later.
         event_filter = Filter(self.hs, {"types": [history_type]})

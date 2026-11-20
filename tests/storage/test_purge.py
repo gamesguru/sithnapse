@@ -199,7 +199,7 @@ class PurgeTests(HomeserverTestCase):
             self.store.get_topological_token_for_event(last["event_id"])
         )
         assert token.topological is not None
-        event = f"t{token.topological + 1}-{token.stream + 1}"
+        event = f"t{token.topological + 1}.{token.timestamp}.{token.stream + 1}"
 
         # Purge everything before this topological token
         f = self.get_failure(

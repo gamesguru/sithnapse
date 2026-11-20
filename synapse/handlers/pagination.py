@@ -666,6 +666,7 @@ class PaginationHandler:
                 # backfilled event must keep the latter at its original bound.
                 return RoomStreamToken(
                     topological=event.depth,
+                    timestamp=event.origin_server_ts,
                     stream=live_from_token.stream,
                 )
             stream_ordering = event.internal_metadata.stream_ordering
@@ -675,7 +676,10 @@ class PaginationHandler:
             # past the last event returned, or that event is returned again by
             # the next request.
             return generate_next_token(
-                pagin_config.direction, event.depth, stream_ordering
+                pagin_config.direction,
+                event.depth,
+                event.origin_server_ts,
+                stream_ordering,
             )
 
         async def has_retryable_gap(nearby_depth: int) -> bool:
