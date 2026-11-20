@@ -1088,6 +1088,7 @@ class EventFederationWorkerStore(
         room_id: str,
         nearby_depth: int,
         limit: int,
+        include_failed: bool = False,
     ) -> list[tuple[str, int]]:
         """mtxdb-backed equivalent of ``get_backfill_points_in_room_txn``."""
         from synapse.storage.databases.main.embedded_event_edges import (
@@ -1147,7 +1148,7 @@ class EventFederationWorkerStore(
             if depth is None:
                 continue
             failed = failed_attempts.get(extremity_id)
-            if failed is not None:
+            if failed is not None and not include_failed:
                 num_attempts, last_attempt_ts = failed
                 backoff = (
                     1
@@ -1170,6 +1171,7 @@ class EventFederationWorkerStore(
         room_id: str,
         nearby_depth: int,
         limit: int,
+        include_failed: bool = False,
     ) -> list[tuple[str, int]]:
         """
         Get the backward extremities to backfill from in the room along with the
@@ -1230,6 +1232,9 @@ class EventFederationWorkerStore(
                 position + the number of events you plan to backfill from these backfill
                 points.
             limit: The max number of backfill points to return
+            include_failed: Include extremities currently in backoff. This is for
+                detecting an unresolved gap, not for deciding whether to retry a
+                federation request.
 
         Returns:
             List of (event_id, depth) tuples. Sorted by depth, highest to lowest
@@ -1242,7 +1247,7 @@ class EventFederationWorkerStore(
         ) -> list[tuple[str, int]]:
             if getattr(self, "_embedded_event_edges_enabled", False):
                 return self._get_backfill_points_mtxdb(
-                    txn, room_id, nearby_depth, limit
+                    txn, room_id, nearby_depth, limit, include_failed
                 )
 
             # Assemble a tuple lookup of event_id -> depth for the oldest events
@@ -1311,6 +1316,8 @@ class EventFederationWorkerStore(
                      * Otherwise, we would use `power(2, n)` or the power operator, `2^n`.
                      */
                     AND (
+                        ? /* include_failed */
+                        OR
                         failed_backfill_attempt_info.event_id IS NULL
                         OR ? /* current_time */ >= failed_backfill_attempt_info.last_attempt_ts + (
                             (1 << {least_function}(failed_backfill_attempt_info.num_attempts, ? /* max doubling steps */))
@@ -1332,6 +1339,7 @@ class EventFederationWorkerStore(
                 (
                     room_id,
                     nearby_depth,
+                    include_failed,
                     self.clock.time_msec(),
                     BACKFILL_EVENT_EXPONENTIAL_BACKOFF_MAXIMUM_DOUBLING_STEPS,
                     BACKFILL_EVENT_EXPONENTIAL_BACKOFF_STEP_MILLISECONDS,

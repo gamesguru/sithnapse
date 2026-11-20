@@ -1041,6 +1041,22 @@ class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
         # Only the backfill points that we didn't record earlier exist here.
         self.assertEqual(backfill_event_ids, ["b6", "2", "b1"])
 
+        # Pagination still needs to know that these gaps remain open so it can
+        # return a retry response instead of claiming to have reached the start
+        # of the room. This diagnostic query deliberately bypasses backoff.
+        backfill_points = self.get_success(
+            self.store.get_backfill_points_in_room(
+                room_id,
+                depth_map["B"],
+                limit=100,
+                include_failed=True,
+            )
+        )
+        self.assertEqual(
+            [backfill_point[0] for backfill_point in backfill_points],
+            ["b6", "b5", "b4", "2", "b3", "b2", "b1"],
+        )
+
     def test_get_backfill_points_in_room_attempted_event_retry_after_backoff_duration(
         self,
     ) -> None:
