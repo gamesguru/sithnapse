@@ -449,6 +449,102 @@ class KeyringTestCase(unittest.HomeserverTestCase):
         mock_fetcher1.get_keys.assert_called_once()
         mock_fetcher2.get_keys.assert_called_once()
 
+    def test_prefetch_keys_dedupes_and_bounds_requests(self) -> None:
+        """prefetch_keys de-duplicates requests, takes the maximum validity per
+        key, and skips our own server."""
+        calls: list[tuple[str, list[str], int]] = []
+
+        async def get_keys(
+            server_name: str, key_ids: list[str], minimum_valid_until_ts: int
+        ) -> dict[str, FetchKeyResult]:
+            calls.append((server_name, sorted(key_ids), minimum_valid_until_ts))
+            return {}
+
+        mock_fetcher = Mock()
+        mock_fetcher.get_keys = Mock(side_effect=get_keys)
+        kr = keyring.Keyring(self.hs, test_only_key_fetchers=[mock_fetcher])
+
+        self.get_success(
+            kr.prefetch_keys(
+                [
+                    ("server1", ["ed25519:a"], 100),
+                    ("server1", ["ed25519:b", "ed25519:a"], 300),
+                    ("server2", ["ed25519:c"], 50),
+                    (self.hs.hostname, ["ed25519:own"], 10),
+                ]
+            )
+        )
+
+        self.assertCountEqual(
+            calls,
+            [
+                # one lookup per (server, key id), each with the max validity
+                ("server1", ["ed25519:a"], 300),
+                ("server1", ["ed25519:b"], 300),
+                ("server2", ["ed25519:c"], 50),
+            ],
+        )
+
+    def test_prefetch_keys_swallows_fetch_errors(self) -> None:
+        """A failing lookup must not make prefetch_keys raise, nor stop other
+        origins from being looked up."""
+        seen: list[str] = []
+
+        async def get_keys(
+            server_name: str, key_ids: list[str], minimum_valid_until_ts: int
+        ) -> dict[str, FetchKeyResult]:
+            seen.append(server_name)
+            if server_name == "bad":
+                raise RuntimeError("boom")
+            return {}
+
+        mock_fetcher = Mock()
+        mock_fetcher.get_keys = Mock(side_effect=get_keys)
+        kr = keyring.Keyring(self.hs, test_only_key_fetchers=[mock_fetcher])
+
+        self.get_success(
+            kr.prefetch_keys([("bad", ["ed25519:x"], 0), ("good", ["ed25519:y"], 0)])
+        )
+        self.assertCountEqual(seen, ["bad", "good"])
+
+    def test_prefetch_keys_respects_concurrency_limit(self) -> None:
+        """No more than PREFETCH_CONCURRENCY origins are looked up at once."""
+        in_flight = 0
+        peak = 0
+        gates: list[Deferred] = []
+
+        async def get_keys(
+            server_name: str, key_ids: list[str], minimum_valid_until_ts: int
+        ) -> dict[str, FetchKeyResult]:
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            d: Deferred = Deferred()
+            gates.append(d)
+            await make_deferred_yieldable(d)
+            in_flight -= 1
+            return {}
+
+        mock_fetcher = Mock()
+        mock_fetcher.get_keys = Mock(side_effect=get_keys)
+        kr = keyring.Keyring(self.hs, test_only_key_fetchers=[mock_fetcher])
+
+        total = keyring.PREFETCH_CONCURRENCY * 3
+        d_all = defer.ensureDeferred(
+            kr.prefetch_keys([(f"s{i}", ["ed25519:k"], 0) for i in range(total)])
+        )
+        # Release lookups until everything has completed.
+        for _ in range(total * 2):
+            self.pump()
+            while gates:
+                gates.pop().callback(None)
+            self.pump()
+            if d_all.called:
+                break
+        self.get_success(d_all)
+        self.assertLessEqual(peak, keyring.PREFETCH_CONCURRENCY)
+        self.assertGreater(peak, 1)
+
     def test_retired_key_eviction_keeps_previously_active_keys(self) -> None:
         """Keys seen active before retirement are evicted after never-active ones."""
         store = self.hs.get_datastores().main

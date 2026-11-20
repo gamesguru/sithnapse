@@ -186,6 +186,35 @@ deadline-limited fetching; prefetch plus coverage-aware notary ordering. This
 also answers whether Congruent's deterministic batch actually beats Sithnapse's
 concurrent queue on a realistic 700-origin response.
 
+## Sithnapse code-reading corrections and status (implemented)
+
+Re-read `synapse/crypto/keyring.py` and `batching_queue.py` directly:
+
+- `Keyring._fetch_keys_queue` is sharded by `server_name`, so that queue only
+  coalesces requests for the _same_ origin. Cross-origin batching happens in the
+  per-fetcher queues (`StoreKeyFetcher`, `PerspectivesKeyFetcher`, which use the
+  shared key), one reactor tick at a time, so it is real but non-deterministic.
+  `ServerKeyFetcher.get_keys` shards per origin, so direct fetches never batch.
+- `StoreKeyFetcher` already does a bulk read (`get_server_keys_json` is a
+  `list_name` cached method), so step 2 needs no new storage API in Sithnapse.
+- The negative cache (`KeyFetchBackoffCache`) short-circuits a second attempt
+  for a failed origin, so a failed prefetch is not double-counted by the later
+  verification.
+
+Implemented (steps 1, 2 and the bounded part of 4; steps 3 and 5 not yet):
+
+- `Keyring.prefetch_keys(requests)`: de-duplicates `(origin, key_id, min ts)`,
+  skips our own server, looks each origin up through the normal fetcher chain
+  with `PREFETCH_CONCURRENCY` (100) in flight, and stops waiting after
+  `PREFETCH_TIMEOUT_SECONDS` (30) without cancelling. Errors are swallowed; it
+  only fills the store, so verification and trust decisions are unchanged.
+- `signature_requests_for_pdus` in `federation_base.py` mirrors the three checks
+  in `_check_sigs_on_pdu`; `send_join` calls prefetch before verifying
+  state/auth_chain (and the MSC4242 state DAG).
+- Both constants are untuned starting points. Not yet benchmarked, no per-join
+  origin cap (a hostile response is no worse than before, since verification
+  already looks up every origin, but prefetch is the natural place to add one).
+
 ## Open questions
 
 - Do the Sithnapse store fetcher and the Congruent mtxdb adapter offer a real

@@ -66,6 +66,7 @@ from synapse.federation.federation_base import (
     InvalidEventSignatureError,
     event_from_pdu_json,
     parse_events_from_pdu_json,
+    signature_requests_for_pdus,
 )
 from synapse.federation.transport.client import SendJoinResponse
 from synapse.http.client import is_unknown_endpoint
@@ -1227,6 +1228,9 @@ class FederationClient(FederationBase):
                     raise InvalidResponseError(
                         "State DAG rooms must not set servers_in_room, state or auth_chain fields"
                     )
+                await self.keyring.prefetch_keys(
+                    signature_requests_for_pdus(room_version, state_dag)
+                )
                 await concurrently_execute(_execute, itertools.chain(state_dag), 10000)
                 # NB: We *need* to copy to ensure that we don't have multiple
                 # references being passed on, as that causes... issues.
@@ -1259,6 +1263,11 @@ class FederationClient(FederationBase):
                     raise InvalidResponseError(
                         "Room does not support state DAGs but set state_dag field"
                     )
+                await self.keyring.prefetch_keys(
+                    signature_requests_for_pdus(
+                        room_version, itertools.chain(state, auth_chain)
+                    )
+                )
                 await concurrently_execute(
                     _execute, itertools.chain(state, auth_chain), 10000
                 )

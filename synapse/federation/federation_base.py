@@ -20,7 +20,7 @@
 #
 #
 import logging
-from typing import TYPE_CHECKING, Awaitable, Callable, Sequence
+from typing import TYPE_CHECKING, Awaitable, Callable, Iterable, Iterator, Sequence
 
 from synapse.api.constants import MAX_DEPTH, EventContentFields, EventTypes, Membership
 from synapse.api.errors import Codes, SynapseError
@@ -296,6 +296,37 @@ async def _check_sigs_on_pdu(
                 f"unable to verify signature for authorising serve {authorising_server}: {e}",
                 pdu.event_id,
             ) from None
+
+
+def signature_requests_for_pdus(
+    room_version: RoomVersion, pdus: Iterable[EventBase]
+) -> Iterator[tuple[str, list[str], int]]:
+    """The (server_name, key_ids, minimum_valid_until_ts) lookups that
+    `_check_sigs_on_pdu` will make for these events, for `Keyring.prefetch_keys`.
+
+    This must mirror the three checks in `_check_sigs_on_pdu`: the sender's
+    domain (except 3pid invites), the event-ID domain for v1/v2 rooms, and the
+    authorising server of a restricted-room join.
+    """
+    for pdu in pdus:
+        validity_ts = pdu.origin_server_ts if room_version.enforce_key_validity else 0
+        domains: list[str] = []
+        if not _is_invite_via_3pid(pdu):
+            domains.append(get_domain_from_id(pdu.sender))
+        if room_version.event_format == EventFormatVersions.ROOM_V1_V2:
+            domains.append(get_domain_from_id(pdu.event_id))
+        if (
+            room_version.restricted_join_rule
+            and pdu.type == EventTypes.Member
+            and pdu.membership == Membership.JOIN
+            and EventContentFields.AUTHORISING_USER in pdu.content
+        ):
+            domains.append(
+                get_domain_from_id(pdu.content[EventContentFields.AUTHORISING_USER])
+            )
+        for domain in domains:
+            if domain in pdu.signatures:
+                yield domain, list(pdu.signatures[domain]), validity_ts
 
 
 def _is_invite_via_3pid(event: EventBase) -> bool:
