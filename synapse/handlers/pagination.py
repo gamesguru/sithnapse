@@ -293,8 +293,8 @@ class PaginationHandler:
                 )
                 continue
 
-            (stream, topo, _event_id) = r
-            token = "t%d-%d" % (topo, stream)
+            (stream, topo, _event_id, origin_ts) = r
+            token = "t%d.%d.%d" % (topo, origin_ts, stream)
 
             logger.info("Starting purging events in room %s", room_id)
 

@@ -215,8 +215,8 @@ class PurgeHistoryRestServlet(RestServlet):
                     "there is no event to be purged",
                     errcode=Codes.NOT_FOUND,
                 )
-            (stream, topo, _event_id) = r
-            token = "t%d-%d" % (topo, stream)
+            (stream, topo, _event_id, origin_ts) = r
+            token = "t%d.%d.%d" % (topo, origin_ts, stream)
             logger.info(
                 "[purge] purging up to token %s (received_ts %i => stream_ordering %i)",
                 token,

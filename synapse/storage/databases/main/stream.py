@@ -37,8 +37,8 @@ weak ordering of events based on the pdu graph.
 This means that we have to have two different types of tokens, depending on
 what sort order was used:
     - stream tokens are of the form: "s%d", which maps directly to the column
-    - topological tokems: "t%d-%d", where the integers map to the topological
-      and stream ordering columns respectively.
+    - topological tokens: "t%d.%d.%d", where the integers map to the topological,
+      origin_server_ts and stream ordering columns respectively.
 """
 
 import logging
@@ -1505,7 +1505,7 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
 
     async def get_room_event_before_stream_ordering(
         self, room_id: str, stream_ordering: int
-    ) -> tuple[int, int, str] | None:
+    ) -> tuple[int, int, str, int] | None:
         """Gets details of the first event in a room at or before a stream ordering
 
         Args:
@@ -1513,12 +1513,14 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
             stream_ordering:
 
         Returns:
-            A tuple of (stream ordering, topological ordering, event_id)
+            A tuple of (stream ordering, topological ordering, event_id,
+            origin_server_ts)
         """
 
-        def _f(txn: LoggingTransaction) -> tuple[int, int, str] | None:
+        def _f(txn: LoggingTransaction) -> tuple[int, int, str, int] | None:
             sql = """
-                SELECT stream_ordering, topological_ordering, event_id
+                SELECT stream_ordering, topological_ordering, event_id,
+                    COALESCE(origin_server_ts, 0)
                 FROM events
                 LEFT JOIN rejections USING (event_id)
                 WHERE room_id = ?
@@ -1529,7 +1531,7 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
                 LIMIT 1
             """
             txn.execute(sql, (room_id, stream_ordering))
-            return cast(tuple[int, int, str] | None, txn.fetchone())
+            return cast(tuple[int, int, str, int] | None, txn.fetchone())
 
         return await self.db_pool.runInteraction(
             "get_room_event_before_stream_ordering", _f
