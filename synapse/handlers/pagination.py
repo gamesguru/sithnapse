@@ -468,6 +468,28 @@ class PaginationHandler:
         logger.info("purge complete for room_id %s", room_id)
 
     @trace
+    async def _reload_stale_outliers(self, events: list[EventBase]) -> list[EventBase]:
+        """Replace cached copies of events that are no longer outliers.
+
+        The timeline queries only select rows with `outlier = FALSE`, so an event
+        that still reports `is_outlier()` here is a stale in-memory copy: another
+        worker de-outliered it (typically a backfill running during this very
+        request) and the cache invalidation has not replicated to this worker
+        yet. Reload those from the database so the page, and the gap detection
+        that follows, see the current state instead of tripping over it.
+        """
+        stale = [e.event_id for e in events if e.internal_metadata.is_outlier()]
+        if not stale:
+            return events
+
+        for event_id in stale:
+            self.store._invalidate_local_get_event_cache(event_id)
+        fresh = {
+            e.event_id: e
+            for e in await self.store.get_events_as_list(stale, get_prev_content=True)
+        }
+        return [fresh.get(e.event_id, e) for e in events]
+
     async def get_messages(
         self,
         requester: Requester,
@@ -616,10 +638,16 @@ class PaginationHandler:
             event_filter=event_filter,
             live_from_key=live_from_token,
         )
+        events = await self._reload_stale_outliers(events)
 
         async def find_gap_index() -> int | None:
             """Return the first event in this page which is next to an open gap."""
             for i, event in enumerate(events):
+                if event.internal_metadata.is_outlier():
+                    # Outliers have no backward extremity bookkeeping. The page
+                    # only holds non-outliers, so this can only be a copy that
+                    # went stale after the reload above.
+                    continue
                 if await self.store.is_event_next_to_backward_gap(event):
                     return i
             return None
@@ -809,6 +837,7 @@ class PaginationHandler:
                         event_filter=event_filter,
                         live_from_key=live_from_token,
                     )
+                    events = await self._reload_stale_outliers(events)
                 backward_backfill_progress = did_backfill
                 # The cursor sits on a gap and the fill is moving but nothing
                 # new is visible yet: return no events and keep the cursor so the
@@ -888,6 +917,8 @@ class PaginationHandler:
                 page_hits_a_gap = bool(probe)
             else:
                 for event in events:
+                    if event.internal_metadata.is_outlier():
+                        continue
                     if await self.store.is_event_next_to_backward_gap(event):
                         page_hits_a_gap = True
                         break
@@ -917,6 +948,7 @@ class PaginationHandler:
                         event_filter=event_filter,
                         live_from_key=live_from_token,
                     )
+                    events = await self._reload_stale_outliers(events)
 
                     if not events:
                         # There are more gaps to try. Ask the client to come

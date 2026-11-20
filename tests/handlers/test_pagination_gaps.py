@@ -315,3 +315,62 @@ class PaginationGapTestCase(unittest.HomeserverTestCase):
                 self.reactor.advance(0.1)
             else:
                 self.fail(f"pagination never terminated; first pages: {pages[:6]}")
+
+
+class StaleOutlierCacheTestCase(unittest.HomeserverTestCase):
+    """`/messages` must survive a worker still holding an event as an outlier.
+
+    When a backfill running on one worker de-outliers an event, the new
+    `outlier = FALSE` row is visible immediately but the event cache
+    invalidation reaches the other workers a moment later. A `/messages`
+    request that backfills in the foreground can then page over events whose
+    cached copy still says `outlier`, which used to trip the assertion in
+    `is_event_next_to_backward_gap` and answer 500.
+    """
+
+    servlets = [
+        admin.register_servlets,
+        login.register_servlets,
+        room.register_servlets,
+        sync.register_servlets,
+    ]
+
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
+        self.store = hs.get_datastores().main
+        self.user_id = self.register_user("alice", "pass")
+        self.token = self.login("alice", "pass")
+        self.room_id = self.helper.create_room_as(self.user_id, tok=self.token)
+        self.event_ids = [
+            self.helper.send(self.room_id, f"message {i}", tok=self.token)["event_id"]
+            for i in range(6)
+        ]
+
+    def _page_back(self) -> tuple[int, list[str]]:
+        channel = self.make_request("GET", "/sync", access_token=self.token)
+        token = channel.json_body["next_batch"]
+        channel = self.make_request(
+            "GET",
+            f"/rooms/{self.room_id}/messages?dir=b&from={token}&limit=20",
+            access_token=self.token,
+        )
+        chunk = channel.json_body.get("chunk", [])
+        return channel.code, [e["event_id"] for e in chunk]
+
+    def test_backward_page_with_stale_outlier_flag(self) -> None:
+        # Warm the cache, then make the cached copies claim to be outliers while
+        # the database row (what the page query reads) is not, which is what a
+        # worker that has not yet processed the de-outlier invalidation holds.
+        for event_id in self.event_ids[1:4]:
+            event = self.get_success(self.store.get_event(event_id))
+            event.internal_metadata.outlier = True
+
+        code, seen = self._page_back()
+
+        self.assertEqual(code, HTTPStatus.OK)
+        for event_id in self.event_ids:
+            self.assertIn(event_id, seen)
+        self.assertEqual(len(seen), len(set(seen)))
+        # The page must hand back current copies, not the stale cached ones.
+        for event_id in self.event_ids[1:4]:
+            event = self.get_success(self.store.get_event(event_id))
+            self.assertFalse(event.internal_metadata.is_outlier())
