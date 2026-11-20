@@ -242,41 +242,37 @@ class PaginationGapTestCase(unittest.HomeserverTestCase):
             "forward pagination must continue triggering backfill across batches",
         )
 
-    def test_backward_pagination_never_claims_start_of_room_while_gap_is_open(
-        self,
-    ) -> None:
-        """If backfill cannot close the hole (remote unreachable), `/messages`
-        must not tell the client there is nothing more to fetch.
+    def test_backward_pagination_attempts_the_gap_before_ending(self) -> None:
+        """`/messages` must not end the timeline over a gap it has not tried to
+        fill.
 
-        The newest hidden event is still a backward extremity, so the room is
-        known to be incomplete. Returning no `end` token makes clients render
-        "beginning of conversation" over a hole, which is what a freshly joined
-        room looked like.
+        The newest hidden event is a backward extremity, so the room is known to
+        be incomplete. Ending without ever asking backfill makes clients render
+        "beginning of conversation" over a hole. Once backfill has been
+        attempted and added nothing, ending means "the end of what this server
+        can fetch right now": a walk over a gap nothing can fill must
+        terminate, not hand back the same cursor forever.
         """
         handler = self.hs.get_federation_handler()
-        received_retry = False
         with patch.object(handler, "maybe_backfill", self._unreachable_backfill):
             token = self._live_token()
             for _ in range(60):
                 result = self._messages("b", token)
-                if result["code"] == HTTPStatus.TOO_MANY_REQUESTS:
-                    self.assertEqual(result["retry_after"], "1")
-                    received_retry = True
-                    break
                 self.assertEqual(result["code"], HTTPStatus.OK, result["body"])
                 token = result["body"].get("end")
                 if token is None:
-                    self.fail(
-                        "backward pagination ended (no `end` token) while a "
-                        "backward extremity still marks missing history"
+                    self.assertGreater(
+                        self.backfill_calls,
+                        0,
+                        "pagination ended over an open gap without trying to "
+                        "backfill it",
                     )
+                    break
                 self.reactor.advance(0.1)
             else:
-                self.fail("pagination never reported the unresolved gap")
+                self.fail("pagination never terminated over an unfillable gap")
 
         self.assertTrue(self._hidden_event_ids(), "the gap should still be open")
-        self.assertTrue(received_retry)
-        self.assertGreater(self.backfill_calls, 0)
 
     def test_backward_pagination_ends_when_nobody_can_fill_the_gap(self) -> None:
         """A gap with no remote server to ask is the end of what exists.
