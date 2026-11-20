@@ -1,1 +1,1 @@
-Prevent a room's create event from remaining in `event_backward_extremities` after it is persisted on its own, and prevent `/messages` from crossing unresolved history gaps. Return a retry response if backfill cannot make progress.
+Prevent a room's create event from remaining in `event_backward_extremities` after it is persisted on its own, and keep `/messages` from reporting the end of a room's history over a gap it has not tried to fill. A continuation token is only returned while backfill is making progress, so a gap that cannot be filled no longer loops a client forever.
