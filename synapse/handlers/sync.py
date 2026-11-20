@@ -1074,11 +1074,25 @@ class SyncHandler:
             if len(filtered_recents) > timeline_limit:
                 limited = True
                 filtered_recents = filtered_recents[-timeline_limit:]
-                assert filtered_recents[0].event.internal_metadata.stream_ordering
-                room_key = RoomStreamToken(
-                    stream=filtered_recents[0].event.internal_metadata.stream_ordering
-                    - 1
-                )
+                oldest_stream_ordering = filtered_recents[
+                    0
+                ].event.internal_metadata.stream_ordering
+                assert oldest_stream_ordering
+                if since_key is None:
+                    # This window was chosen by `topological_ordering`, so the
+                    # token must resume by it too. A stream-only token makes
+                    # `/messages` compare `stream_ordering` alone, which in a
+                    # backfilled room repeats events already in this window and
+                    # skips older events with a newer stream position.
+                    oldest_token = await self.store.get_topological_token_for_event(
+                        filtered_recents[0].event.event_id
+                    )
+                    room_key = RoomStreamToken(
+                        topological=oldest_token.topological,
+                        stream=oldest_stream_ordering - 1,
+                    )
+                else:
+                    room_key = RoomStreamToken(stream=oldest_stream_ordering - 1)
 
             prev_batch_token = upto_token.copy_and_replace(StreamKeyType.ROOM, room_key)
 
