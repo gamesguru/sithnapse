@@ -2744,7 +2744,9 @@ turn_allow_guests: false
 
 *(object)* Options related to MatrixRTC.
 
-With `experimental_features.msc4143_enabled`, these transports are served to authenticated clients at `/_matrix/client/unstable/org.matrix.msc4143/rtc/transports`. They are **not** added to `/.well-known/matrix/client`. Clients and tools that still discover the SFU from the well-known (for example `testmatrix`, which skips its MatrixRTC and delayed-events checks otherwise) need the `org.matrix.msc4143.rtc_foci` key set under [`extra_well_known_client_content`](#extra_well_known_client_content). Defaults to `{}`.
+With `experimental_features.msc4143_enabled`, these transports are served to authenticated clients at `/_matrix/client/unstable/org.matrix.msc4143/rtc/transports`. They are **not** added to `/.well-known/matrix/client`. Clients and tools that still discover the SFU from the well-known (for example `testmatrix`, which skips its MatrixRTC and delayed-events checks otherwise) need the `org.matrix.msc4143.rtc_foci` key set under [`extra_well_known_client_content`](#extra_well_known_client_content).
+
+Defaults to `{}`.
 
 This setting has the following sub-options:
 
@@ -2769,6 +2771,25 @@ matrix_rtc:
   - type: livekit
     url: wss://livekit.example.com
     livekit_service_url: https://matrix-rtc.example.com/livekit/jwt
+```
+---
+### `experimental_features`
+
+*(object)* Experimental features. These may change or be removed without notice; only the options needed for MatrixRTC (Element Call) are listed here. Defaults to `{}`.
+
+This setting has the following sub-options:
+
+* `msc4143_enabled` (boolean): Enable [MSC4143](https://github.com/matrix-org/matrix-spec-proposals/pull/4143) to advertise the MatrixRTC transports configured under [`matrix_rtc`](#matrix_rtc). Required for Element Call. Defaults to `false`.
+
+* `msc4075_enabled` (boolean): Enable [MSC4075](https://github.com/matrix-org/matrix-spec-proposals/pull/4075) MatrixRTC call invites and notifications. Defaults to `false`.
+
+* `msc4140_max_delayed_events_per_user` (integer): The maximum number of delayed events a user may have pending at once (MSC4140). Delayed events must also be enabled with [`max_event_delay_duration`](#max_event_delay_duration). Defaults to `100`.
+
+Example configuration:
+```yaml
+experimental_features:
+  msc4143_enabled: true
+  msc4075_enabled: true
 ```
 ---
 ## Registration
