@@ -22,11 +22,11 @@ origins without letting dead servers hold up the join.
 
 ## Current behaviour (as read from code, 2026-11)
 
-|               | Key-acquisition path in a join                                                                                                                                                                                                       | Gaps                                                                                                                                                                                                                                                        |
-| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Sithnapse** | `send_join` runs `concurrently_execute(_execute, state+auth_chain, 10000)`. Each event calls `keyring.verify_event_for_server`, which feeds a `BatchingQueue`. Fetchers run in order: store, perspectives (notaries), direct origin. | No explicit prefetch; batching depends on what reaches the queue together. Notaries are all queried with the full set concurrently. `ServerKeyFetcher` fan-out has no concurrency cap.                                                                      |
-| **Congruent** | `acquire_events_pubkeys` collects keys from the whole response, then notary batches, then `FuturesUnordered` origin fan-out, then validates.                                                                                         | Local availability appears to be checked per key (`acquire_locals`). Each notary gets the entire missing set. Origin fan-out has no cap or phase deadline. Per-event fallback (`get_event_keys`) is serial. Whether a mtxdb multi-get exists is unverified. |
-| **Dendrite**  | `VerifyEventSignatures` calls `KeyRing.FetchKeys` with a `map[request]ts`: local keys, then DB/cache, then each fetcher in turn.                                                                                                     | Fetcher order is perspectives first, direct last by default (`PreferDirectFetch` true makes direct first). No evidence yet that a whole join response is submitted as one request set. Parallelism _within_ a fetcher is unverified.                        |
+|               | Key-acquisition path in a join                                                                                                                                                               | Gaps                                                                                                                                                                                                                                                        |
+| ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Sithnapse** | `send_join` calls `Keyring.prefetch_keys` over the full state/auth response before concurrent signature verification. It fetches through the normal store, notary, then direct-origin chain. | Prefetch has a per-phase concurrency bound, but no total per-join origin/request budget. Its timeout stops waiting, not background work, so prefetch and verification can overlap. Notaries are still queried concurrently with the same batch.             |
+| **Congruent** | `acquire_events_pubkeys` collects keys from the whole response, then notary batches, then `FuturesUnordered` origin fan-out, then validates.                                                 | Local availability appears to be checked per key (`acquire_locals`). Each notary gets the entire missing set. Origin fan-out has no cap or phase deadline. Per-event fallback (`get_event_keys`) is serial. Whether a mtxdb multi-get exists is unverified. |
+| **Dendrite**  | `VerifyEventSignatures` calls `KeyRing.FetchKeys` with a `map[request]ts`: local keys, then DB/cache, then each fetcher in turn.                                                             | Fetcher order is perspectives first, direct last by default (`PreferDirectFetch` true makes direct first). No evidence yet that a whole join response is submitted as one request set. Parallelism _within_ a fetcher is unverified.                        |
 
 Verdict: Congruent has the clearest structure for this workload (explicit
 whole-response prefetch), but none is optimal and none is measured.
@@ -211,9 +211,14 @@ Implemented (steps 1, 2 and the bounded part of 4; steps 3 and 5 not yet):
 - `signature_requests_for_pdus` in `federation_base.py` mirrors the three checks
   in `_check_sigs_on_pdu`; `send_join` calls prefetch before verifying
   state/auth_chain (and the MSC4242 state DAG).
-- Both constants are untuned starting points. Not yet benchmarked, no per-join
-  origin cap (a hostile response is no worse than before, since verification
-  already looks up every origin, but prefetch is the natural place to add one).
+- Both constants are untuned starting points. Not yet benchmarked. The
+  100-origin concurrency bound applies to prefetch work; it is not a cap on
+  total distinct origins or total key requests in a join. The old verification
+  path also looked up origins named by the response, so the hostile-origin
+  exposure is not new. However, prefetch makes that fan-out deliberate, and
+  after the 30-second wait expires its background work can overlap verification.
+  A separate per-join origin/request budget should bound aggregate work; define
+  its behavior for oversized responses before implementing it.
 
 ## Open questions
 
