@@ -73,13 +73,23 @@ chronological. They are design options, not current behavior.
 | A — keep current ordering             | `(wire depth, stream_ordering)`                                                                      | Existing behavior. Tokens and indexes unchanged. Equal-depth order follows local stream/backfill arrival order.                                                                                                                                                                                                                       |
 | B — backfill-only timestamp tie-break | `(wire depth, origin_server_ts, stream_ordering)` for backfilled events (`stream_ordering < 0`) only | Can make backfilled siblings look chronological. Still trusts received depth and timestamp; gives backfilled and live events different tie-break rules; needs a token/key change; does not fix rows already stored unless they are rewritten.                                                                                         |
 | C — timestamp tie-break everywhere    | `(wire depth, origin_server_ts, stream_ordering)` for all events                                     | Consistent among equal-depth events, but still trusts both sender-supplied fields and changes established ordering for every room.                                                                                                                                                                                                    |
-| D — local DAG rank, then timestamp    | `(locally computed rank from stored prev_events, origin_server_ts, stable tie-break)`                | The only option that does not trust wire depth for the primary order. Requires a defined rank algorithm that stays valid as backfill adds edges, recomputation, a new column and index, and matching pagination cursors. Largest and most structurally sound if chronological ordering among concurrent events becomes a requirement. |
+| D — local DAG rank, then timestamp    | `(locally computed rank from stored prev_events, origin_server_ts, stable tie-break)`                | The only option that does not trust wire depth for the primary order. Its hard part is cursor stability: a local rank can change when backfill discovers older edges, so cursors issued under the old rank can skip or repeat unless the rank is append-only or versioned. Also needs a defined rank algorithm, recomputation, a new column and index, and matching pagination cursors. |
 
 `origin_server_ts` is sender-supplied too. Options B and C only use it inside an
 equal-depth group, which preserves causal order only if received depth is
 honest. Option D avoids that assumption, but its rank must handle incomplete
 histories, newly discovered edges, and non-ordinary DAG shapes before it can be
 treated as stable.
+
+Two limits of option C:
+
+- It only reorders events at equal depth. A sibling branch one level deeper
+  with an earlier timestamp still sorts after, so C removes the obvious
+  inversions, not every one.
+- "Concurrent" is only guaranteed for honest senders. A forged equal depth
+  between an ancestor and its descendant would let the timestamp reorder a
+  causal pair. That is the depth-trust gap D would close, and it has not
+  affected this room.
 
 ## Pagination and forward-skip hazards
 
@@ -116,11 +126,37 @@ Tests for any such change should cover:
 
 ## Current decision
 
-Keep option A. The Wombat Central inversion is a valid ordering of sibling
-events, and there is no demonstrated product requirement to order concurrent
-events by timestamp. The initial-sync cursor fix and the stale-outlier
-pagination fix address separate bugs and are unaffected by this note.
+The implemented behavior remains option A. The Wombat Central inversion is a
+valid ordering of sibling events, and there is no demonstrated product
+requirement to order concurrent events by timestamp. The initial-sync cursor fix
+and the stale-outlier pagination fix address separate bugs and are unaffected by
+this note.
 
-If chronological ordering among concurrent events becomes a product requirement,
-scope option D rather than adding `origin_server_ts` to one `ORDER BY`. Do not
-assume honest received depth anywhere in the new design.
+If chronological ordering among concurrent events becomes a requirement, do
+**C first**:
+
+- Depth, timestamp and stream are all fixed when an event is stored, so the
+  cursor key is immutable and previously issued cursors keep their meaning.
+- C treats live and backfilled events the same; B does not.
+- C preserves causal order while depth is honest, because the timestamp only
+  acts inside an equal-depth group. It needs no rewrite of existing rows.
+- The visible result for the Wombat Central pair is the same as D.
+
+Scope D only if untrusted depth becomes a real requirement. D is not a better
+temporal fix; it is a depth-trust fix. Its rank-stability problem is the main
+cost and must be designed first, not treated as a detail.
+
+An implementation of C needs:
+
+- the timestamp in the continuation token, plus a matching
+  `(room_id, topological_ordering, origin_server_ts, stream_ordering)` index and
+  migration;
+- the same comparator in every ordering site: `/messages` in both directions,
+  `/context`, initial and incremental `/sync` windows, and gap refills;
+- explicit handling for the forward-skip case where a late event with an
+  earlier timestamp sorts before an already-issued cursor;
+- the boundary tests listed above.
+
+No ordering can guarantee that displayed dates always increase while preserving
+causality when timestamps are sender-supplied. C removes the visible inversions
+among concurrent events; it does not make clock skew disappear.
