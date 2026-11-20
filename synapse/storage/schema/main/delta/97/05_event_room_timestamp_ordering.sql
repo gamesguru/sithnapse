@@ -14,4 +14,4 @@
 -- Build the timeline ordering index in the background. This matches the
 -- COALESCE expression used by topological pagination for legacy NULL timestamps.
 INSERT INTO background_updates (ordering, update_name, progress_json) VALUES
-    (9801, 'events_order_room_ts_idx', '{}');
+    (9705, 'events_order_room_ts_idx', '{}');
