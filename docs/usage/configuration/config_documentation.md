@@ -250,6 +250,8 @@ serve_server_wellknown: true
 
 If this option is provided, it parses the given yaml to json and serves it on `/.well-known/matrix/client` endpoint alongside the standard properties.
 
+For example, to advertise a LiveKit SFU to clients that discover MatrixRTC from the well-known, set `org.matrix.msc4143.rtc_foci` to the same `livekit_service_url` configured under [`matrix_rtc`](#matrix_rtc).
+
 *Added in Synapse 1.62.0.*
 
 Example configuration:
@@ -257,6 +259,9 @@ Example configuration:
 extra_well_known_client_content:
   option1: value1
   option2: value2
+  org.matrix.msc4143.rtc_foci:
+  - type: livekit
+    livekit_service_url: https://matrix-rtc.example.com/livekit/jwt
 ```
 ---
 ### `soft_file_limit`
@@ -2737,7 +2742,9 @@ turn_allow_guests: false
 ---
 ### `matrix_rtc`
 
-*(object)* Options related to MatrixRTC. Defaults to `{}`.
+*(object)* Options related to MatrixRTC.
+
+With `experimental_features.msc4143_enabled`, these transports are served to authenticated clients at `/_matrix/client/unstable/org.matrix.msc4143/rtc/transports`. They are **not** added to `/.well-known/matrix/client`. Clients and tools that still discover the SFU from the well-known (for example `testmatrix`, which skips its MatrixRTC and delayed-events checks otherwise) need the `org.matrix.msc4143.rtc_foci` key set under [`extra_well_known_client_content`](#extra_well_known_client_content). Defaults to `{}`.
 
 This setting has the following sub-options:
 
