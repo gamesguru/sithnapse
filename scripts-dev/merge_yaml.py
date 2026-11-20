@@ -150,7 +150,12 @@ def render_schema(schema: dict[str, Any]) -> list[str]:
             node = resolve(raw, defs)
             doc(node, indent)
             pad = "#" + " " * indent
-            if isinstance(node.get("properties"), dict) and "default" not in node:
+            # Objects whose default is empty are expanded too, so their options
+            # are documented rather than hidden behind `#key: {}`.
+            if (
+                isinstance(node.get("properties"), dict)
+                and node.get("default", {}) == {}
+            ):
                 out.append(f"{pad}{key}:\n")
                 emit(node["properties"], indent + 2)
             elif "default" not in node:

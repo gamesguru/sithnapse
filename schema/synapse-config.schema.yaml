@@ -3195,6 +3195,38 @@ properties:
           - type: livekit
             url: wss://livekit.example.com
             livekit_service_url: https://matrix-rtc.example.com/livekit/jwt
+  experimental_features:
+    type: object
+    description: >-
+      Experimental features. These may change or be removed without notice;
+      only the options needed for MatrixRTC (Element Call) are listed here.
+    properties:
+      msc4143_enabled:
+        type: boolean
+        description: >-
+          Enable
+          [MSC4143](https://github.com/matrix-org/matrix-spec-proposals/pull/4143)
+          to advertise the MatrixRTC transports configured under
+          [`matrix_rtc`](#matrix_rtc). Required for Element Call.
+        default: false
+      msc4075_enabled:
+        type: boolean
+        description: >-
+          Enable
+          [MSC4075](https://github.com/matrix-org/matrix-spec-proposals/pull/4075)
+          MatrixRTC call invites and notifications.
+        default: false
+      msc4140_max_delayed_events_per_user:
+        type: integer
+        description: >-
+          The maximum number of delayed events a user may have pending at once
+          (MSC4140). Delayed events must also be enabled with
+          [`max_event_delay_duration`](#max_event_delay_duration).
+        default: 100
+    default: {}
+    examples:
+      - msc4143_enabled: true
+        msc4075_enabled: true
   enable_registration:
     type: boolean
     description: >-
