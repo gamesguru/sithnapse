@@ -4309,12 +4309,29 @@ fn durability_to_dict<'py>(
     Ok(d)
 }
 
+fn pool_disk_bytes(store: &PackfileStorage) -> u64 {
+    store
+        .shard_summaries()
+        .iter()
+        .map(|summary| summary.file_bytes)
+        .sum()
+}
+
+type PoolStatsSnapshot = (
+    &'static str,
+    mtxdb::packfile::storage::RuntimeStats,
+    mtxdb::packfile::storage::SyncDiagnosticsSnapshot,
+    bool,
+    u64,
+);
+
 fn stats_to_dict(
     py: Python<'_>,
     name: &str,
     s: &mtxdb::packfile::storage::RuntimeStats,
     sync_diagnostics: &mtxdb::packfile::storage::SyncDiagnosticsSnapshot,
     read_journal_publish_signal_active: bool,
+    disk_bytes: u64,
 ) -> PyResult<Py<PyDict>> {
     let d = PyDict::new(py);
     d.set_item("pool", name)?;
@@ -4322,6 +4339,7 @@ fn stats_to_dict(
         "read_journal_publish_signal_active",
         read_journal_publish_signal_active,
     )?;
+    d.set_item("disk_bytes", disk_bytes)?;
     d.set_item("open_count", s.open_count)?;
     d.set_item("get_calls", s.get_calls)?;
     d.set_item("get_misses", s.get_misses)?;
@@ -4561,61 +4579,64 @@ pub fn publish_signal_active(py: Python<'_>) -> PyResult<Py<PyDict>> {
 /// otherwise, leave them intact. Return a Python RuntimeError if mtxdb is not open,
 /// and propagate errors from constructing the Python dictionaries.
 fn stats_impl(py: Python<'_>, take_diagnostics: bool) -> PyResult<Py<PyDict>> {
-    let snapshots = py.detach(
-        || -> Result<
-            Vec<(
-                &str,
-                mtxdb::packfile::storage::RuntimeStats,
-                mtxdb::packfile::storage::SyncDiagnosticsSnapshot,
-                bool,
-            )>,
-            pyo3::PyErr,
-        > {
-            let pools = pools()?;
-            let state_stats = pools.state.stats();
-            let state_diagnostics = if take_diagnostics {
-                pools.state.take_sync_diagnostics()
-            } else {
-                state_stats.sync_diagnostics.clone()
-            };
-            let state_publish_signal = pools.state.read_journal_publish_signal_active();
-            let event_dag_stats = pools.event_dag.stats();
-            let server_info_stats = pools.server_info.stats();
-            Ok(vec![
-                (
-                    "state",
-                    state_stats.clone(),
-                    state_diagnostics,
-                    state_publish_signal,
-                ),
-                (
-                    "event_dag",
-                    event_dag_stats.clone(),
-                    if take_diagnostics {
-                        pools.event_dag.take_sync_diagnostics()
-                    } else {
-                        event_dag_stats.sync_diagnostics.clone()
-                    },
-                    pools.event_dag.read_journal_publish_signal_active(),
-                ),
-                (
-                    "server_info",
-                    server_info_stats.clone(),
-                    if take_diagnostics {
-                        pools.server_info.take_sync_diagnostics()
-                    } else {
-                        server_info_stats.sync_diagnostics.clone()
-                    },
-                    pools.server_info.read_journal_publish_signal_active(),
-                ),
-            ])
-        },
-    )?;
+    let snapshots = py.detach(|| -> Result<Vec<PoolStatsSnapshot>, pyo3::PyErr> {
+        let pools = pools()?;
+        let state_stats = pools.state.stats();
+        let state_diagnostics = if take_diagnostics {
+            pools.state.take_sync_diagnostics()
+        } else {
+            state_stats.sync_diagnostics.clone()
+        };
+        let state_publish_signal = pools.state.read_journal_publish_signal_active();
+        let state_disk_bytes = pool_disk_bytes(&pools.state);
+        let event_dag_stats = pools.event_dag.stats();
+        let event_dag_disk_bytes = pool_disk_bytes(&pools.event_dag);
+        let server_info_stats = pools.server_info.stats();
+        let server_info_disk_bytes = pool_disk_bytes(&pools.server_info);
+        Ok(vec![
+            (
+                "state",
+                state_stats.clone(),
+                state_diagnostics,
+                state_publish_signal,
+                state_disk_bytes,
+            ),
+            (
+                "event_dag",
+                event_dag_stats.clone(),
+                if take_diagnostics {
+                    pools.event_dag.take_sync_diagnostics()
+                } else {
+                    event_dag_stats.sync_diagnostics.clone()
+                },
+                pools.event_dag.read_journal_publish_signal_active(),
+                event_dag_disk_bytes,
+            ),
+            (
+                "server_info",
+                server_info_stats.clone(),
+                if take_diagnostics {
+                    pools.server_info.take_sync_diagnostics()
+                } else {
+                    server_info_stats.sync_diagnostics.clone()
+                },
+                pools.server_info.read_journal_publish_signal_active(),
+                server_info_disk_bytes,
+            ),
+        ])
+    })?;
     let out = PyDict::new(py);
-    for (name, s, diagnostics, publish_signal_active) in &snapshots {
+    for (name, s, diagnostics, publish_signal_active, disk_bytes) in &snapshots {
         out.set_item(
             *name,
-            stats_to_dict(py, name, s, diagnostics, *publish_signal_active)?,
+            stats_to_dict(
+                py,
+                name,
+                s,
+                diagnostics,
+                *publish_signal_active,
+                *disk_bytes,
+            )?,
         )?;
     }
     Ok(out.unbind())

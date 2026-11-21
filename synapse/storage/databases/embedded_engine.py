@@ -34,12 +34,26 @@ from types import ModuleType
 def get_embedded_db_disk_bytes(path: str | None) -> int | None:
     """Return the on-disk size of an embedded DB path, in bytes.
 
-    The embedded engine may store its packfiles either as a single file or as
-    a directory of files, so both shapes are handled. Returns `None` if the
-    path is unset or cannot be read.
+    Prefer the open embedded driver's own shard sizes, which avoids walking the
+    database directory. Falls back to the filesystem for an older extension or
+    when the engine is not open. Returns `None` if the path is unset.
     """
     if not path:
         return None
+
+    try:
+        from synapse.synapse_rust import mtxdb_engine
+
+        stats = mtxdb_engine.stats()
+        sizes = [
+            int(pool["disk_bytes"])
+            for pool in stats.values()
+            if isinstance(pool, dict) and isinstance(pool.get("disk_bytes"), int)
+        ]
+        if sizes:
+            return sum(sizes)
+    except Exception:
+        pass
 
     try:
         if os.path.isfile(path):
