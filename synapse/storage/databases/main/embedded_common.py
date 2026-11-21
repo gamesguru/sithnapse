@@ -1304,6 +1304,29 @@ def stop_background_commit() -> None:
     get_embedded_engine("mtxdb").stop_background_commit()
 
 
+def checkpoint_pools() -> None:
+    """Force a durable index checkpoint in every embedded pool.
+
+    For a clean stop, after the group committer has stopped and the final sync
+    has run. It moves each pool's durable baseline up to its current packs, so
+    the next open does not depend on a delta log that a stop can leave behind
+    the pack tail. A no-op when durability is disabled or the loaded extension
+    predates `checkpoint_all`.
+    """
+    if not _engine_configured or _sync_disabled:
+        return
+
+    from synapse.storage.databases.embedded_engine import get_embedded_engine
+
+    checkpoint_all = getattr(get_embedded_engine("mtxdb"), "checkpoint_all", None)
+    if checkpoint_all is None:
+        logger.warning(
+            "The mtxdb extension has no checkpoint_all; skipping the shutdown checkpoint"
+        )
+        return
+    checkpoint_all()
+
+
 def background_commit_error() -> str | None:
     """Return a terminal group-committer error without blocking or consuming it."""
     if not _engine_configured or _sync_disabled or not publishes_at_commit():
@@ -1588,6 +1611,15 @@ class _FlushCoalescer:
                     "writes remain pending: %s",
                     self._dirty,
                 )
+        # Leave a durable checkpoint at the current packs. Best effort: a
+        # failure must not turn a clean stop into an error, and the engine
+        # still recovers from its journal and delta logs without it.
+        try:
+            checkpoint_pools()
+        except Exception:
+            logger.warning(
+                "Unable to checkpoint embedded pools during shutdown", exc_info=True
+            )
 
 
 _coalescer: _FlushCoalescer | None = None

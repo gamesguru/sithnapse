@@ -4109,6 +4109,36 @@ pub fn sync_event_dag(py: Python<'_>) -> PyResult<()> {
     py.detach(|| sync_one("event-dag", event_dag_db()?))
 }
 
+/// Force a durable index checkpoint in every pool and wait for it.
+///
+/// A clean stop must leave each pool's checkpoint at its current packs. Without
+/// it, a pool whose delta log trails the pack tail is rescanned on the next
+/// open, and an mtxdb that deletes the delta log on that path can destroy the
+/// only durable version baseline for WAL groups it already reclaimed. Call this
+/// after the group committer has stopped and the final sync has run.
+#[pyfunction]
+pub fn checkpoint_all(py: Python<'_>) -> PyResult<()> {
+    assert_writable()?;
+    py.detach(|| {
+        let pools = [
+            ("state", state_db()?),
+            ("event-dag", event_dag_db()?),
+            ("server-info", server_info_db()?),
+        ];
+        for (name, engine) in &pools {
+            engine.force_index_checkpoint().map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "mtxdb checkpoint error for {name}: {e}"
+                ))
+            })?;
+        }
+        for (_, engine) in &pools {
+            engine.wait_for_checkpoint();
+        }
+        Ok(())
+    })
+}
+
 /// Start the WAL group committer for the writable pools.
 ///
 /// The pools share a coordinator in WAL mode; starting it on each pool is
@@ -4730,6 +4760,7 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMtxdbTransaction>()?;
     m.add_function(wrap_pyfunction!(start_background_commit, m)?)?;
     m.add_function(wrap_pyfunction!(stop_background_commit, m)?)?;
+    m.add_function(wrap_pyfunction!(checkpoint_all, m)?)?;
     m.add_function(wrap_pyfunction!(background_commit_error, m)?)?;
     m.add_function(wrap_pyfunction!(request_durable, m)?)?;
     m.add_function(wrap_pyfunction!(wait_durable, m)?)?;
