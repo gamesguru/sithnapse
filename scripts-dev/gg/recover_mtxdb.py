@@ -49,6 +49,9 @@ from pathlib import Path
 
 MAGIC = b"MTXVERS2"
 POOLS = (("state", "mtpl-state"), ("events", "mtpl-event"))
+# Pack frame flags byte: a removal marker removes its logical key. `packs
+# dump` does not render frame flags, so read this byte from the frame itself.
+_FLAG_REMOVED = 0x08
 
 
 def collection_ids(mtxdb: str, root: Path, pool: str) -> set[bytes]:
@@ -74,7 +77,8 @@ def wal_header(mtxdb: str, root: Path) -> tuple[int, dict[str, int]]:
     order state, events, srvinfo. `base_lsn` is cross-checked against
     `mtxdb meta wal`; any mismatch aborts rather than guessing.
     """
-    header = (root / "wal.bin").read_bytes()[:0x40]
+    with (root / "wal.bin").open("rb") as handle:
+        header = handle.read(0x40)
     if header[:8] != b"MTXWAL01":
         sys.exit(f"{root}/wal.bin: not an mtxdb shared WAL")
     base_lsn = struct.unpack("<Q", header[0x14:0x1C])[0]
@@ -160,9 +164,10 @@ def record_latest(
     Deleted collections are removed: their frames remain physical until a
     repack, but they are not logical records. The digest covers the payload and
     metadata, so a rewritten value differs from the original even though the key
-    is the same.
+    is the same. Frame removal markers are read from the frame flags; `packs
+    dump` does not include that state, and a removed key is not a logical record.
     """
-    latest: dict[tuple[str, str], str] = {}
+    latest: dict[tuple[str, str], tuple[str, bool]] = {}
     packs = sorted(
         (root / directory).glob("pack_*.pack"),
         key=_pack_order_key,
@@ -185,33 +190,46 @@ def record_latest(
             text=True,
             check=True,
         ).stdout
-        for line in out.splitlines():
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            digest = hashlib.sha256(
-                (
-                    rec.get("payload_base64", "")
-                    # `{}` and `null` both mean "no metadata" (a repack rewrites one
-                    # as the other); anything else is part of the value.
-                    + json.dumps(rec.get("metadata") or {}, sort_keys=True)
-                ).encode()
-            ).hexdigest()
-            latest[(rec["collection_id"], rec["node_id"])] = digest
+        with open(pack, "rb") as pack_file:
+            for line in out.splitlines():
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                offset = int(rec["offset"])
+                # Frame layout: u32 length, then the flags byte.
+                pack_file.seek(offset + 4)
+                flags = pack_file.read(1)
+                if not flags:
+                    sys.exit(f"{pack}: truncated frame at offset {offset}")
+                digest = hashlib.sha256(
+                    (
+                        rec.get("payload_base64", "")
+                        # `{}` and `null` both mean "no metadata" (a repack rewrites
+                        # one as the other); anything else is part of the value.
+                        + json.dumps(rec.get("metadata") or {}, sort_keys=True)
+                    ).encode()
+                ).hexdigest()
+                latest[(rec["collection_id"], rec["node_id"])] = (
+                    digest,
+                    bool(flags[0] & _FLAG_REMOVED),
+                )
+    live_latest = {
+        key: digest for key, (digest, removed) in latest.items() if not removed
+    }
     deleted = deleted_collections(root, directory)
     if deleted:
-        latest = {
+        live_latest = {
             key: digest
-            for key, digest in latest.items()
+            for key, digest in live_latest.items()
             if key[0].lower() not in deleted
         }
-    if packs and not latest and not deleted:
+    if packs and not live_latest and not deleted:
         sys.exit(
             f"{root}/{directory}: has pack files but the frame scan found no "
             "records; refusing to build a baseline from nothing"
         )
-    return latest
+    return live_latest
 
 
 def read_versions(path: Path) -> set[bytes]:
