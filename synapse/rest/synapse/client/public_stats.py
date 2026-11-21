@@ -15,12 +15,13 @@ from typing import TYPE_CHECKING
 from synapse.api.constants import Direction
 from synapse.http.server import DirectServeJsonResource
 from synapse.http.site import SynapseRequest
+from synapse.storage.databases.embedded_engine import get_embedded_db_disk_bytes
 from synapse.storage.databases.main.transactions import DestinationSortOrder
 from synapse.types import JsonDict
 
 logger = logging.getLogger(__name__)
 
-# The endpoint is anonymous and runs three counts, so serve a recent result
+# The endpoint is anonymous and runs several counts, so serve a recent result
 # instead of querying on every request.
 _CACHE_LIFETIME_MS = 60 * 1000
 
@@ -31,15 +32,17 @@ if TYPE_CHECKING:
 class PublicStatsResource(DirectServeJsonResource):
     """Opt-in public endpoint exposing only aggregate counts.
 
-    Returns the total registered users, known rooms and federation peers. No
-    identifiers or per-user/room details are exposed. Any count that fails to
-    load is returned as `null`.
+    Returns the total registered users, known rooms, federation peers, the
+    number of distinct servers present in room state, event/state-event counts
+    and the embedded engine's on-disk size. No identifiers or per-user/room
+    details are exposed. Any count that fails to load is returned as `null`.
     """
 
     def __init__(self, hs: "HomeServer"):
         super().__init__(clock=hs.get_clock())
         self.store = hs.get_datastores().main
         self._clock = hs.get_clock()
+        self._embedded_db_path = hs.config.database.embedded_db_path
         self._cached: JsonDict | None = None
         self._cached_at_ms = 0
 
@@ -75,14 +78,37 @@ class PublicStatsResource(DirectServeJsonResource):
             logger.exception("Failed to count peers for public server statistics")
             total_destinations = None
 
+        try:
+            total_known_servers = await self.store.get_known_servers_count()
+        except Exception:
+            logger.exception(
+                "Failed to count known servers for public server statistics"
+            )
+            total_known_servers = None
+
+        try:
+            total_events, total_state_events = await self.store.get_event_counts()
+        except Exception:
+            logger.exception("Failed to count events for public server statistics")
+            total_events = None
+            total_state_events = None
+
+        database: JsonDict = {
+            "events": total_events,
+            "state_events": total_state_events,
+            "mtxdb_bytes": get_embedded_db_disk_bytes(self._embedded_db_path),
+        }
+
         result: JsonDict = {
             "total_users": total_users,
             "total_rooms": total_rooms,
             "total_destinations": total_destinations,
+            "total_known_servers": total_known_servers,
+            "database": database,
         }
         # Only cache complete results so a transient failure isn't served for
         # the whole lifetime.
-        if None not in result.values():
+        if None not in result.values() and None not in database.values():
             self._cached = result
             self._cached_at_ms = now_ms
         return HTTPStatus.OK, result

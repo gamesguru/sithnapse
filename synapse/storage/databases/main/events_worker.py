@@ -2109,6 +2109,28 @@ class EventsWorkerStore(SQLBaseStore):
             room_id,
         )
 
+    async def get_event_counts(self) -> tuple[int, int]:
+        """Get the total number of events and current-state events stored.
+
+        Returns:
+            A tuple of (events, current_state_events).
+        """
+
+        def _get_event_counts_txn(txn: LoggingTransaction) -> tuple[int, int]:
+            txn.execute("SELECT COUNT(*) FROM events")
+            row = txn.fetchone()
+            events = int(row[0]) if row else 0
+
+            txn.execute("SELECT COUNT(*) FROM current_state_events")
+            row = txn.fetchone()
+            state_events = int(row[0]) if row else 0
+
+            return events, state_events
+
+        return await self.db_pool.runInteraction(
+            "get_event_counts", _get_event_counts_txn
+        )
+
     async def get_room_complexity(self, room_id: str) -> dict[str, float]:
         """
         Get a rough approximation of the complexity of the room. This is used by

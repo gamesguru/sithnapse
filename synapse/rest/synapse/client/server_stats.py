@@ -18,6 +18,7 @@ from synapse.api.constants import Direction
 from synapse.api.errors import AuthError
 from synapse.http.server import DirectServeJsonResource
 from synapse.http.site import SynapseRequest
+from synapse.storage.databases.embedded_engine import get_embedded_db_disk_bytes
 from synapse.storage.databases.main.transactions import DestinationSortOrder
 from synapse.types import JsonDict
 
@@ -73,10 +74,33 @@ class ServerStatsResource(DirectServeJsonResource):
             logger.exception("Failed to count destinations for server statistics")
             total_destinations = None
 
+        try:
+            total_known_servers = await self.store.get_known_servers_count()
+        except Exception:
+            logger.exception("Failed to count known servers for server statistics")
+            total_known_servers = None
+
+        try:
+            total_events, total_state_events = await self.store.get_event_counts()
+        except Exception:
+            logger.exception("Failed to count events for server statistics")
+            total_events = None
+            total_state_events = None
+
+        mtxdb_bytes = get_embedded_db_disk_bytes(
+            self.hs.config.database.embedded_db_path
+        )
+
         return HTTPStatus.OK, {
             "total_users": total_users,
             "total_rooms": total_rooms,
             "public_rooms": public_rooms,
             "total_destinations": total_destinations,
+            "total_known_servers": total_known_servers,
+            "database": {
+                "events": total_events,
+                "state_events": total_state_events,
+                "mtxdb_bytes": mtxdb_bytes,
+            },
             "server_version": self.hs.version_string,
         }

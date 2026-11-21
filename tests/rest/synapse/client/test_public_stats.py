@@ -50,8 +50,21 @@ class PublicStatsTests(unittest.HomeserverTestCase):
 
         self.assertEqual(channel.code, 200, channel.result)
         self.assertEqual(
-            set(channel.json_body), {"total_users", "total_rooms", "total_destinations"}
+            set(channel.json_body),
+            {
+                "total_users",
+                "total_rooms",
+                "total_destinations",
+                "total_known_servers",
+                "database",
+            },
         )
         self.assertEqual(channel.json_body["total_users"], 1)
         self.assertEqual(channel.json_body["total_rooms"], 1)
         self.assertIsInstance(channel.json_body["total_destinations"], int)
+        self.assertIsInstance(channel.json_body["total_known_servers"], int)
+
+        database = channel.json_body["database"]
+        self.assertEqual(set(database), {"events", "state_events", "mtxdb_bytes"})
+        self.assertIsInstance(database["events"], int)
+        self.assertIsInstance(database["state_events"], int)

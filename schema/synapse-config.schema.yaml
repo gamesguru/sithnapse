@@ -5370,9 +5370,12 @@ properties:
         description: >-
           Enable the unauthenticated `/_synapse/client/public_stats` endpoint,
           which exposes only aggregate counts: total registered users, known
-          rooms and federation peers (`total_users`, `total_rooms` and
-          `total_destinations`). No identifiers are exposed. This is disabled
-          by default.
+          rooms, transacted federation peers, servers present in room state and
+          a `database` object with event/state-event counts and the embedded
+          engine's on-disk size (`total_users`, `total_rooms`,
+          `total_destinations`, `total_known_servers`, and `database.events`,
+          `database.state_events`, `database.mtxdb_bytes`). No identifiers are
+          exposed. This is disabled by default.
         default: false
     examples:
       - enabled: false

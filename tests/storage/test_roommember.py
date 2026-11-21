@@ -126,6 +126,21 @@ class RoomMemberStoreTestCase(unittest.HomeserverTestCase):
         servers = self.get_success(self.store._count_known_servers())
         self.assertEqual(servers, 2)
 
+    def test_get_known_servers_count(self) -> None:
+        """
+        get_known_servers_count returns the distinct servers in current room
+        state, ignoring members that have left.
+        """
+        self.room = self.helper.create_room_as(self.u_alice, tok=self.t_alice)
+        self.inject_room_member(self.room, self.u_bob, Membership.JOIN)
+        self.inject_room_member(self.room, self.u_charlie.to_string(), Membership.JOIN)
+
+        self.assertEqual(self.get_success(self.store.get_known_servers_count()), 2)
+
+        self.inject_room_member(self.room, self.u_charlie.to_string(), Membership.LEAVE)
+
+        self.assertEqual(self.get_success(self.store.get_known_servers_count()), 1)
+
     def test_count_known_servers_stat_counter_disabled(self) -> None:
         """
         If enabled, the metrics for how many servers are known will be counted.

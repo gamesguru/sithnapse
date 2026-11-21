@@ -27,7 +27,36 @@ error. Consumers resolve the module here and never import it directly, so
 switching engines (or renaming the module) is a one-file change.
 """
 
+import os
 from types import ModuleType
+
+
+def get_embedded_db_disk_bytes(path: str | None) -> int | None:
+    """Return the on-disk size of an embedded DB path, in bytes.
+
+    The embedded engine may store its packfiles either as a single file or as
+    a directory of files, so both shapes are handled. Returns `None` if the
+    path is unset or cannot be read.
+    """
+    if not path:
+        return None
+
+    try:
+        if os.path.isfile(path):
+            return os.path.getsize(path)
+        if not os.path.isdir(path):
+            return None
+
+        total = 0
+        for root, _dirs, files in os.walk(path):
+            for name in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, name))
+                except OSError:
+                    pass
+        return total
+    except OSError:
+        return None
 
 
 def get_embedded_engine(engine_name: str | None) -> ModuleType:
