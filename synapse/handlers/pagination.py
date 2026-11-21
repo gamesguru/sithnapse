@@ -704,11 +704,10 @@ class PaginationHandler:
             """
             chunk_limit = max(pagin_config.limit, 1)
             cursor = room_token
-            # The first chunk keeps the caller's original live lower bound so
-            # late live events below the topological anchor still appear. Later
-            # chunks advance it to the full (depth, timestamp, stream) cursor;
-            # keeping the fixed bound would return the same live prefix forever.
-            chunk_live_from_key = live_from_token
+            # Keep the original live lower bound fixed. After the first chunk,
+            # also apply the moving cursor to live events so previously scanned
+            # rows are excluded while later topological events remain visible.
+            chunk_live_cursor_key: RoomStreamToken | None = None
             relevant_ids = {event.event_id for event in events}
             before_gap: list[EventBase] = []
             while True:
@@ -723,7 +722,8 @@ class PaginationHandler:
                     direction=Direction.FORWARDS,
                     limit=chunk_limit,
                     event_filter=None,
-                    live_from_key=chunk_live_from_key,
+                    live_from_key=live_from_token,
+                    live_cursor_key=chunk_live_cursor_key,
                 )
                 chunk = await self._reload_stale_outliers(chunk)
 
@@ -767,9 +767,7 @@ class PaginationHandler:
                 if not chunk:
                     return [], next_key, chunk_limited
                 cursor = next_key
-                # Advance the live predicate with the chunk cursor as well; it
-                # must not keep re-reading the first chunk's live prefix.
-                chunk_live_from_key = cursor
+                chunk_live_cursor_key = cursor
 
         async def has_retryable_gap(nearby_depth: int) -> bool:
             """Whether a gap is still eligible to be retried right now.

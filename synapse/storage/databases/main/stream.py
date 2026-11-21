@@ -2324,6 +2324,7 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
         limit: int = 0,
         event_filter: Filter | None = None,
         live_from_key: RoomStreamToken | None = None,
+        live_cursor_key: RoomStreamToken | None = None,
     ) -> tuple[list[_EventDictReturn], RoomStreamToken, bool]:
         """Returns list of events before or after a given token.
 
@@ -2398,6 +2399,22 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
                 to_token=live_to_bound,
                 engine=self.database_engine,
             )
+            if live_cursor_key is not None:
+                _, live_cursor_from_bound, live_cursor_to_bound = (
+                    generate_pagination_bounds(direction, live_cursor_key, to_token)
+                )
+                live_cursor_bounds = generate_pagination_where_clause(
+                    direction=direction,
+                    column_names=(
+                        "event.topological_ordering",
+                        "COALESCE(event.origin_server_ts, 0)",
+                        "event.stream_ordering",
+                    ),
+                    from_token=live_cursor_from_bound,
+                    to_token=live_cursor_to_bound,
+                    engine=self.database_engine,
+                )
+                live_bounds = f"({live_bounds}) AND ({live_cursor_bounds})"
             bounds = (
                 f"((event.stream_ordering < 0 AND ({backfilled_bounds})) OR "
                 f"(event.stream_ordering >= 0 AND ({live_bounds})))"
@@ -2512,14 +2529,29 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
                     lower_token = from_token
                     upper_token = to_token
 
-                if _filter_results(
+                in_bounds = _filter_results(
                     lower_token=lower_token,
                     upper_token=upper_token,
                     instance_name=instance_name,
                     topological_ordering=topological_ordering,
                     stream_ordering=stream_ordering,
                     origin_server_ts=origin_server_ts,
+                )
+                if (
+                    in_bounds
+                    and direction == Direction.FORWARDS
+                    and live_cursor_key is not None
+                    and stream_ordering >= 0
                 ):
+                    in_bounds = _filter_results(
+                        lower_token=live_cursor_key,
+                        upper_token=to_token,
+                        instance_name=instance_name,
+                        topological_ordering=topological_ordering,
+                        stream_ordering=stream_ordering,
+                        origin_server_ts=origin_server_ts,
+                    )
+                if in_bounds:
                     filtered_rows.append(
                         _EventDictReturn(
                             event_id,
@@ -2651,6 +2683,7 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
         limit: int = 0,
         event_filter: Filter | None = None,
         live_from_key: RoomStreamToken | None = None,
+        live_cursor_key: RoomStreamToken | None = None,
     ) -> tuple[list[EventBase], RoomStreamToken, bool]:
         """
         Paginate events by `topological_ordering` (tie-break with `stream_ordering`) in
@@ -2670,6 +2703,9 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
                 use for events with a non-negative stream ordering. `from_key`
                 then only anchors the topological position used for backfilled
                 events (which have negative stream orderings).
+            live_cursor_key: Optional additional forward cursor for live events.
+                When set, live events must be after both this cursor and
+                `live_from_key`; backfilled events continue to use `from_key`.
 
         Returns:
             - The results as a list of events;
@@ -2727,6 +2763,7 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
             limit,
             event_filter,
             live_from_key,
+            live_cursor_key,
         )
 
         events = await self.get_events_as_list(

@@ -487,6 +487,75 @@ class PaginationTestCase(HomeserverTestCase):
             f"event token={token} live={live_from_key} pinned={pinned}",
         )
 
+    def test_forward_live_cursor_keeps_original_stream_lower_bound(self) -> None:
+        """A later topo event survives even when its stream ID precedes the cursor."""
+        persistence = self.hs.get_storage_controllers().persistence
+        assert persistence is not None
+        store = self.hs.get_datastores().main
+        live_from_key = RoomStreamToken(
+            stream=self.get_success(
+                self.hs.get_event_sources().get_current_token_for_pagination(
+                    self.room_id
+                )
+            ).room_key.stream
+        )
+
+        first, first_context = self.get_success(
+            create_event(
+                self.hs,
+                room_id=self.room_id,
+                sender=self.user_id,
+                type=EventTypes.Message,
+                content={"msgtype": "m.text", "body": "first branch"},
+                prev_event_ids=[self.event_id_none],
+            )
+        )
+        self.get_success(persistence.persist_event(first, first_context))
+        later_topo, later_topo_context = self.get_success(
+            create_event(
+                self.hs,
+                room_id=self.room_id,
+                sender=self.user_id,
+                type=EventTypes.Message,
+                content={"msgtype": "m.text", "body": "deeper branch"},
+                prev_event_ids=[first.event_id],
+            )
+        )
+        self.get_success(persistence.persist_event(later_topo, later_topo_context))
+        cursor_event, cursor_context = self.get_success(
+            create_event(
+                self.hs,
+                room_id=self.room_id,
+                sender=self.user_id,
+                type=EventTypes.Message,
+                content={"msgtype": "m.text", "body": "later sibling"},
+                prev_event_ids=[self.event_id_none],
+            )
+        )
+        self.get_success(persistence.persist_event(cursor_event, cursor_context))
+
+        cursor = self.get_success(
+            store.get_topological_token_for_event(cursor_event.event_id)
+        )
+        self.assertGreater(later_topo.depth, cursor_event.depth)
+        later_stream = later_topo.internal_metadata.stream_ordering
+        cursor_stream = cursor_event.internal_metadata.stream_ordering
+        assert later_stream is not None and cursor_stream is not None
+        self.assertLess(later_stream, cursor_stream)
+        events, _, _ = self.get_success(
+            store.paginate_room_events_by_topological_ordering(
+                room_id=self.room_id,
+                from_key=cursor,
+                to_key=None,
+                direction=Direction.FORWARDS,
+                limit=10,
+                live_from_key=live_from_key,
+                live_cursor_key=cursor,
+            )
+        )
+        self.assertIn(later_topo.event_id, [event.event_id for event in events])
+        self.assertNotIn(cursor_event.event_id, [event.event_id for event in events])
+
     def test_filter_relation_senders(self) -> None:
         # Messages which second user reacted to.
         filter = {"related_by_senders": [self.second_user_id]}
