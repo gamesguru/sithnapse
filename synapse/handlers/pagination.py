@@ -695,30 +695,73 @@ class PaginationHandler:
         async def get_forward_unfiltered_events(
             endpoint_event_id: str | None,
         ) -> tuple[list[EventBase], RoomStreamToken, bool]:
-            """Fetch through the filtered page endpoint before scanning for gaps."""
-            unfiltered_limit = max(pagin_config.limit, 1)
+            """Scan the unfiltered range up to the filtered page's endpoint.
+
+            Reads bounded chunks, resuming each from the previous chunk's
+            cursor so no event is loaded twice. It stops at the first gap or at
+            the endpoint, and retains only the filtered events seen before a
+            gap (plus the chunk containing it), not the whole scanned prefix.
+            """
+            chunk_limit = max(pagin_config.limit, 1)
+            cursor = room_token
+            relevant_ids = {event.event_id for event in events}
+            before_gap: list[EventBase] = []
             while True:
                 (
-                    unfiltered_events,
-                    unfiltered_next_key,
-                    unfiltered_limited,
+                    chunk,
+                    next_key,
+                    chunk_limited,
                 ) = await self.store.paginate_room_events_by_topological_ordering(
                     room_id=room_id,
-                    from_key=room_token,
+                    from_key=cursor,
                     to_key=to_room_key,
                     direction=Direction.FORWARDS,
-                    limit=unfiltered_limit,
+                    limit=chunk_limit,
                     event_filter=None,
                     live_from_key=live_from_token,
                 )
-                unfiltered_events = await self._reload_stale_outliers(unfiltered_events)
-                if (
-                    endpoint_event_id is None
-                    or any(e.event_id == endpoint_event_id for e in unfiltered_events)
-                    or not unfiltered_limited
-                ):
-                    return unfiltered_events, unfiltered_next_key, unfiltered_limited
-                unfiltered_limit *= 2
+                chunk = await self._reload_stale_outliers(chunk)
+
+                # A gap beyond the filtered page's endpoint belongs to a later
+                # page, so do not scan past that endpoint.
+                endpoint_index = None
+                if endpoint_event_id is not None:
+                    endpoint_index = next(
+                        (
+                            index
+                            for index, event in enumerate(chunk)
+                            if event.event_id == endpoint_event_id
+                        ),
+                        None,
+                    )
+                scanned = (
+                    chunk if endpoint_index is None else chunk[: endpoint_index + 1]
+                )
+
+                gap_index = await find_gap_index(scanned)
+                if gap_index is not None:
+                    return (
+                        before_gap + scanned[: gap_index + 1],
+                        next_key,
+                        chunk_limited,
+                    )
+
+                # Only filtered events can appear in the eventual cut. Keeping
+                # just those bounds this prefix by the page size, not by how far
+                # the unfiltered scan has travelled.
+                before_gap.extend(
+                    event for event in scanned if event.event_id in relevant_ids
+                )
+
+                if endpoint_index is not None or not chunk_limited:
+                    return (
+                        before_gap if before_gap else scanned,
+                        next_key,
+                        chunk_limited,
+                    )
+                if not chunk:
+                    return [], next_key, chunk_limited
+                cursor = next_key
 
         async def has_retryable_gap(nearby_depth: int) -> bool:
             """Whether a gap is still eligible to be retried right now.

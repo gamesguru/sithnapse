@@ -290,6 +290,32 @@ def main() -> int:
         if (args.broken / directory).is_dir()
     }
 
+    active_root = args.active
+
+    def compare_against_active(recovered: Path) -> int:
+        """Count logical records where `recovered` differs from the active root."""
+        assert active_root is not None
+        problems = 0
+        for pool, directory in POOLS:
+            if not (
+                (recovered / directory).is_dir() or (active_root / directory).is_dir()
+            ):
+                continue
+            ours = record_latest(args.mtxdb, recovered, pool, directory)
+            theirs = record_latest(args.mtxdb, active_root, pool, directory)
+            new = len(theirs.keys() - ours.keys())
+            gone = len(ours.keys() - theirs.keys())
+            changed = sum(
+                1 for k in ours.keys() & theirs.keys() if ours[k] != theirs[k]
+            )
+            print(
+                f"{pool}: active vs recovered -> new {new}, missing {gone}, "
+                f"changed value {changed}"
+            )
+            problems += new + gone + changed
+        return problems
+
+    broken_wal_groups = 0
     if args.active:
         groups = wal_group_count(args.mtxdb, args.active)
         if groups:
@@ -297,28 +323,19 @@ def main() -> int:
                 f"the active root's WAL still holds {groups} group(s) that a pack "
                 "scan cannot see; this script does not merge them. Refusing."
             )
-        problems = 0
-        for pool, directory in POOLS:
-            if not (
-                (args.broken / directory).is_dir() or (args.active / directory).is_dir()
-            ):
-                continue
-            ours = frames.get(pool, {})
-            theirs = record_latest(args.mtxdb, args.active, pool, directory)
-            new = len(theirs.keys() - ours.keys())
-            gone = len(ours.keys() - theirs.keys())
-            changed = sum(
-                1 for k in ours.keys() & theirs.keys() if ours[k] != theirs[k]
-            )
+        broken_wal_groups = wal_group_count(args.mtxdb, args.broken)
+        if not broken_wal_groups:
+            # No retained WAL mutations to replay, so the physical packs are the
+            # post-replay contents.
+            if compare_against_active(args.broken):
+                sys.exit(
+                    "the active root differs from the broken one; this script does "
+                    "not merge. Refusing."
+                )
+        else:
             print(
-                f"{pool}: active vs broken -> new {new}, missing {gone}, "
-                f"changed value {changed}"
-            )
-            problems += new + gone + changed
-        if problems:
-            sys.exit(
-                "the active root differs from the broken one; this script does not "
-                "merge. Refusing."
+                f"broken root retains {broken_wal_groups} WAL group(s); comparing "
+                "after replaying the recovered copy"
             )
 
     shutil.copytree(args.broken, args.out, symlinks=False)
@@ -339,6 +356,27 @@ def main() -> int:
             ids |= collection_ids(args.mtxdb, other, pool)
         write_versions(path, ids, lsns[pool])
         print(f"{pool}: {len(ids)} collections, baseline LSN {lsns[pool]}")
+
+    if args.active and broken_wal_groups:
+        # The baseline now lets the recovered copy open and replay its retained
+        # WAL. Materialize that replay into the copy so the comparison sees the
+        # same post-replay contents the server will.
+        result = subprocess.run(
+            [args.mtxdb, "-d", str(args.out), "reclaim-wal"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            sys.exit(
+                f"failed to replay/checkpoint the recovered copy: "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+        if compare_against_active(args.out):
+            sys.exit(
+                "the active root differs from the replayed recovery; this script "
+                "does not merge. Refusing."
+            )
+
     print(f"wrote {args.out}")
     return 0
 
