@@ -200,7 +200,17 @@ def main() -> int:
         if not pool_dir.is_dir():
             continue
         path = pool_dir / "index.versions"
+        # Enumerate from the physical pack frames, not only from `mtxdb
+        # collections`, which reads a persisted directory that can omit
+        # collections written since: a collection missing from the baseline
+        # would restart at version 0.
         ids = read_versions(path) | collection_ids(args.mtxdb, args.out, pool)
+        ids |= {
+            bytes.fromhex(collection[2:])
+            for collection, _node in record_pairs(
+                args.mtxdb, args.broken, pool, directory
+            )
+        }
         for other in args.also_ids:
             ids |= collection_ids(args.mtxdb, other, pool)
         write_versions(path, ids, lsns[pool])
