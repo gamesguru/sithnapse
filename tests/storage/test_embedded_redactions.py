@@ -12,7 +12,7 @@
 # <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
 
-"""Pure unit tests for the embedded redactions/rejections FFI layer.
+"""Pure unit tests for the embedded redactions FFI layer.
 
 Like test_embedded_event_edges.py, mtxdb_engine.open_client() is backed by a
 Rust OnceCell: the engine is opened exactly once per process and the data
@@ -30,11 +30,6 @@ from synapse.storage.databases.main.embedded_redactions import (
     put_redaction_batch,
     set_have_censored_batch,
 )
-from synapse.storage.databases.main.embedded_rejections import (
-    delete_rejections_batch,
-    get_rejections_batch,
-    put_rejection_batch,
-)
 from synapse.synapse_rust import mtxdb_engine
 
 from tests import unittest
@@ -50,7 +45,7 @@ mtxdb_engine.open_client(_TEST_ENGINE_TMPDIR)
 _ENGINE = "mtxdb"
 
 
-class EmbeddedRedactionsRejectionsTestCase(unittest.TestCase):
+class EmbeddedRedactionsTestCase(unittest.TestCase):
     def test_redaction_put_get_round_trip(self) -> None:
         ns = "test-redactions-round-trip"
         put_redaction_batch(
@@ -124,47 +119,3 @@ class EmbeddedRedactionsRejectionsTestCase(unittest.TestCase):
         put_redaction_batch(_ENGINE, ns, [("$target", "$redaction", False)])
         delete_redactions_batch(_ENGINE, ns, ["$target"])
         self.assertEqual(get_redactions_batch(_ENGINE, ns, ["$target"]), {})
-
-    def test_rejection_put_get_round_trip(self) -> None:
-        ns = "test-rejections-round-trip"
-        put_rejection_batch(
-            _ENGINE,
-            ns,
-            [
-                ("$e1", "bad signature", "1700000000000"),
-                ("$e2", "not allowed", "1700000000001"),
-            ],
-        )
-
-        found = get_rejections_batch(_ENGINE, ns, ["$e1", "$e2", "$missing"])
-        self.assertEqual(found["$e1"], ("bad signature", "1700000000000"))
-        self.assertEqual(found["$e2"], ("not allowed", "1700000000001"))
-        self.assertNotIn("$missing", found)
-
-    def test_rejection_last_check_rewrite(self) -> None:
-        ns = "test-rejections-rewrite"
-        put_rejection_batch(_ENGINE, ns, [("$e1", "reason", "1700000000000")])
-        put_rejection_batch(_ENGINE, ns, [("$e1", "reason", "1700000009999")])
-        self.assertEqual(
-            get_rejections_batch(_ENGINE, ns, ["$e1"])["$e1"],
-            ("reason", "1700000009999"),
-        )
-
-    def test_rejection_namespace_isolation(self) -> None:
-        put_rejection_batch(_ENGINE, "rns-a", [("$shared", "reason-a", "1")])
-        put_rejection_batch(_ENGINE, "rns-b", [("$shared", "reason-b", "2")])
-
-        self.assertEqual(
-            get_rejections_batch(_ENGINE, "rns-a", ["$shared"])["$shared"],
-            ("reason-a", "1"),
-        )
-        self.assertEqual(
-            get_rejections_batch(_ENGINE, "rns-b", ["$shared"])["$shared"],
-            ("reason-b", "2"),
-        )
-
-    def test_rejection_delete(self) -> None:
-        ns = "test-rejections-delete"
-        put_rejection_batch(_ENGINE, ns, [("$e1", "reason", "1")])
-        delete_rejections_batch(_ENGINE, ns, ["$e1"])
-        self.assertEqual(get_rejections_batch(_ENGINE, ns, ["$e1"]), {})

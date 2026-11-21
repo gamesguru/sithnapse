@@ -234,7 +234,6 @@ _RESET_SEQUENCES_SQL = """
 -- These four sequences have a fresh-schema initial value of 1 with is_called
 -- false, so the first allocated ID is 1.
 SELECT setval('application_services_txn_id_seq', 1, false);
-SELECT setval('event_auth_chain_id', 1, false);
 SELECT setval('instance_map_instance_id_seq', 1, false);
 SELECT setval('user_id_seq', 1, false);
 SELECT setval('thread_subscriptions_sequence', 2, true);

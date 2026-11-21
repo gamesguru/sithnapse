@@ -19,7 +19,6 @@
 # [This file includes modifications made by New Vector Limited]
 #
 #
-import collections
 import itertools
 import logging
 import time
@@ -29,7 +28,6 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Collection,
-    Generator,
     Iterable,
     Sequence,
     TypedDict,
@@ -79,8 +77,9 @@ from synapse.storage.databases.main.embedded_common import (
     record_commit_phases,
 )
 from synapse.storage.databases.main.embedded_event_edges import (
-    bump_room_edge_source_version,
     embedded_event_edges_is_writable,
+    get_event_edges_backward_batch,
+    get_event_edges_forward_batch,
     open_embedded_event_edges_engine,
     put_event_edges_batch,
 )
@@ -98,20 +97,16 @@ from synapse.storage.databases.main.embedded_redactions import (
     put_redaction_batch,
     set_have_censored_batch,
 )
-from synapse.storage.databases.main.embedded_rejections import put_rejection_batch
-from synapse.storage.databases.main.event_federation import EventFederationStore
 from synapse.storage.databases.main.events_worker import EventCacheEntry
 from synapse.storage.databases.main.search import SearchEntry
 from synapse.storage.engines import PostgresEngine
 from synapse.storage.util.id_generators import AbstractStreamIdGenerator
-from synapse.storage.util.sequence import SequenceGenerator
 from synapse.synapse_rust.events import redact_event
 from synapse.synapse_rust.room_versions import EventFormatVersions, RoomVersion
 from synapse.types import (
     JsonDict,
     MutableStateMap,
     StateMap,
-    StrCollection,
     UserID,
     get_domain_from_id,
     unwrap,
@@ -119,7 +114,7 @@ from synapse.types import (
 from synapse.types.handlers import SLIDING_SYNC_DEFAULT_BUMP_EVENT_TYPES
 from synapse.types.state import StateFilter
 from synapse.util.events import get_plain_text_topic_from_event_content
-from synapse.util.iterutils import batch_iter, sorted_topologically
+from synapse.util.iterutils import batch_iter
 from synapse.util.json import json_encoder
 from synapse.util.stringutils import non_null_str_or_none
 
@@ -284,23 +279,6 @@ class SlidingSyncTableChanges:
     to_delete_membership_snapshots: list[str]
 
 
-@attr.s(slots=True, auto_attribs=True)
-class NewEventChainLinks:
-    """Information about new auth chain links that need to be added to the DB.
-
-    Attributes:
-        chain_id, sequence_number: the IDs corresponding to the event being
-            inserted, and the starting point of the links
-        links: Lists the links that need to be added, 2-tuple of the chain
-            ID/sequence number of the end point of the link.
-    """
-
-    chain_id: int
-    sequence_number: int
-
-    links: list[tuple[int, int]] = attr.Factory(list)
-
-
 def _event_dict_for_embedded_json(event: EventBase) -> JsonDict:
     d = event.get_dict_for_persistence()
     d.pop("redacted", None)
@@ -379,7 +357,6 @@ class PersistEventsStore:
         *,
         state_delta_for_room: DeltaState | None,
         new_forward_extremities: set[str] | None,
-        new_event_links: dict[str, NewEventChainLinks],
         use_negative_stream_ordering: bool = False,
         inhibit_local_membership_updates: bool = False,
         new_state_dag_forward_extremities: set[str] | None = None,
@@ -489,7 +466,6 @@ class PersistEventsStore:
                 inhibit_local_membership_updates=inhibit_local_membership_updates,
                 state_delta_for_room=state_delta_for_room,
                 new_forward_extremities=new_forward_extremities,
-                new_event_links=new_event_links,
                 sliding_sync_table_changes=sliding_sync_table_changes,
                 new_state_dag_forward_extremities=new_state_dag_forward_extremities,
                 sticky_events_to_un_soft_fail=sticky_events_to_un_soft_fail,
@@ -959,96 +935,24 @@ class PersistEventsStore:
             to_delete_membership_snapshots=user_ids_to_delete_membership_snapshots,
         )
 
-    async def calculate_chain_cover_index_for_events(
-        self, room_id: str, events: Collection[EventBase]
-    ) -> dict[str, NewEventChainLinks]:
-        # Filter to state events, and ensure there are no duplicates.
-        state_events = []
-        seen_events = set()
-        for event in events:
-            if not event.is_state() or event.event_id in seen_events:
-                continue
-
-            state_events.append(event)
-            seen_events.add(event.event_id)
-
-        if not state_events:
+    def _get_embedded_event_metadata(
+        self, txn: LoggingTransaction, missing_meta_ids: list[str]
+    ) -> dict[str, Any]:
+        """Fill in metadata missing from SQL from the embedded event JSON store."""
+        if not missing_meta_ids or not getattr(
+            self, "_embedded_event_json_enabled", False
+        ):
             return {}
-
-        return await self.db_pool.runInteraction(
-            "_calculate_chain_cover_index_for_events",
-            self.calculate_chain_cover_index_for_events_txn,
-            room_id,
-            state_events,
-        )
-
-    def calculate_chain_cover_index_for_events_txn(
-        self, txn: LoggingTransaction, room_id: str, state_events: Collection[EventBase]
-    ) -> dict[str, NewEventChainLinks]:
-        # We now calculate chain ID/sequence numbers for any state events we're
-        # persisting. We ignore out of band memberships as we're not in the room
-        # and won't have their auth chain (we'll fix it up later if we join the
-        # room).
-        #
-        # See: docs/auth_chain_difference_algorithm.md
-
-        # We ignore legacy rooms that we aren't filling the chain cover index
-        # for.
-        row = self.db_pool.simple_select_one_txn(
-            txn,
-            table="rooms",
-            keyvalues={"room_id": room_id},
-            retcols=("room_id", "has_auth_chain_index"),
-            allow_none=True,
-        )
-        if row is None or row[1] is False:
-            return {}
-
-        # Filter out events that we've already calculated.
-        rows = self.db_pool.simple_select_many_txn(
-            txn,
-            table="event_auth_chains",
-            column="event_id",
-            iterable=[e.event_id for e in state_events],
-            keyvalues={},
-            retcols=("event_id",),
-        )
-        already_persisted_events = {event_id for (event_id,) in rows}
-        state_events = [
-            event
-            for event in state_events
-            if event.event_id not in already_persisted_events
-        ]
-
-        if not state_events:
-            return {}
-
-        # We need to know the type/state_key and auth events of the events we're
-        # calculating chain IDs for. We don't rely on having the full Event
-        # instances as we'll potentially be pulling more events from the DB and
-        # we don't need the overhead of fetching/parsing the full event JSON.
-        event_to_types = {e.event_id: (e.type, e.state_key) for e in state_events}
-        event_to_auth_chain: dict[str, StrCollection] = {
-            e.event_id: e.auth_event_ids() for e in state_events
-        }
-        event_to_room_id = {e.event_id: e.room_id for e in state_events}
-
-        from synapse.storage.databases.main.embedded_event_auth_chain_links import (
-            resolve_namespace,
-        )
-
-        return self._calculate_chain_cover_index(
-            txn,
-            self.db_pool,
-            self.store.event_chain_id_gen,
-            event_to_room_id,
-            event_to_types,
-            event_to_auth_chain,
-            resolve_namespace(self),
+        found = get_event_json_batch(
             self._embedded_db_engine,
+            self._embedded_db_namespace,
+            missing_meta_ids,
         )
+        return {eid: m for eid, (m, _, _) in found.items()}
 
-    async def _get_events_which_are_prevs(self, event_ids: Iterable[str]) -> list[str]:
+    async def _get_events_which_are_prevs(
+        self, event_ids: Iterable[str], room_id: str | None = None
+    ) -> list[str]:
         """Filter the supplied list of event_ids to get those which are prev_events of
         existing events that are not outliers, rejected, or soft-failed.
 
@@ -1057,6 +961,8 @@ class PersistEventsStore:
 
         Args:
             event_ids: event ids to filter
+            room_id: room the candidates belong to, used for the embedded
+                forward-index lookup
 
         Returns:
             Matching event IDs, possibly repeated and in no guaranteed order.
@@ -1071,6 +977,55 @@ class PersistEventsStore:
             Exclude outlier, rejected, and soft-failed children. Missing metadata
             is treated as not soft-failed after an optional embedded lookup.
             """
+            if self._embedded_event_edges_enabled:
+                _t = time.monotonic()
+                forward = get_event_edges_forward_batch(
+                    self._embedded_db_namespace, list(batch)
+                )
+                ffi_timing("persist_prevs_mtxdb_forward", time.monotonic() - _t)
+                parents_by_child: dict[str, list[str]] = {}
+                for parent_id, children in forward.items():
+                    if not children:
+                        continue
+                    for child_id in children:
+                        parents_by_child.setdefault(child_id, []).append(parent_id)
+                if not parents_by_child:
+                    ffi_count("persist_prevs_mtxdb_empty", len(batch))
+                    return
+
+                clause, args = make_in_list_sql_clause(
+                    self.database_engine, "event_id", list(parents_by_child)
+                )
+                _t = time.monotonic()
+                txn.execute(
+                    f"""
+                    SELECT events.event_id, event_json.internal_metadata
+                    FROM events
+                        LEFT JOIN rejections USING (event_id)
+                        LEFT JOIN event_json USING (event_id)
+                    WHERE
+                        NOT events.outlier
+                        AND rejections.event_id IS NULL
+                        AND {clause}
+                    """,
+                    args,
+                )
+                rows = txn.fetchall()
+                ffi_timing("persist_prevs_sql_exec", time.monotonic() - _t)
+                ffi_count("persist_prevs_sql_rows", len(rows))
+                if not rows:
+                    return
+
+                missing_meta_ids = [event_id for event_id, meta in rows if meta is None]
+                meta_by_id = self._get_embedded_event_metadata(txn, missing_meta_ids)
+
+                for event_id, meta in rows:
+                    if meta is None:
+                        meta = meta_by_id.get(event_id)
+                    if not meta or not db_to_json(meta).get("soft_failed"):
+                        results.extend(parents_by_child.get(event_id, ()))
+                return
+
             sql = """
             SELECT prev_event_id, internal_metadata, event_id
             FROM event_edges
@@ -1096,17 +1051,7 @@ class PersistEventsStore:
                 return
 
             missing_meta_ids = [event_id for _, meta, event_id in rows if meta is None]
-            meta_by_id = {}
-            if missing_meta_ids and getattr(
-                self, "_embedded_event_json_enabled", False
-            ):
-                found = get_event_json_batch(
-                    self._embedded_db_engine,
-                    self._embedded_db_namespace,
-                    missing_meta_ids,
-                )
-                for eid, (m, _, _) in found.items():
-                    meta_by_id[eid] = m
+            meta_by_id = self._get_embedded_event_metadata(txn, missing_meta_ids)
 
             for prev_event_id, meta, event_id in rows:
                 if meta is None:
@@ -1161,9 +1106,73 @@ class PersistEventsStore:
             Start from ``batch`` and update existing_prevs, traversing only
             non-outlier events with stored edges.
             """
-            to_recursively_check = batch
+            to_recursively_check = list(batch)
 
             while to_recursively_check:
+                if self._embedded_event_edges_enabled:
+                    _t = time.monotonic()
+                    backward = get_event_edges_backward_batch(
+                        self._embedded_db_namespace, to_recursively_check
+                    )
+                    ffi_timing("persist_rejected_mtxdb_backward", time.monotonic() - _t)
+                    present = [
+                        event_id
+                        for event_id in to_recursively_check
+                        if backward.get(event_id) is not None
+                    ]
+                    if not present:
+                        break
+
+                    clause, args = make_in_list_sql_clause(
+                        self.database_engine, "event_id", present
+                    )
+                    _t = time.monotonic()
+                    txn.execute(
+                        f"""
+                        SELECT
+                            events.event_id, event_json.internal_metadata,
+                            rejections.event_id IS NOT NULL
+                        FROM events
+                            LEFT JOIN rejections USING (event_id)
+                            LEFT JOIN event_json USING (event_id)
+                        WHERE
+                            NOT events.outlier
+                            AND {clause}
+                        """,
+                        args,
+                    )
+                    rows = txn.fetchall()
+                    ffi_timing("persist_rejected_sql_exec", time.monotonic() - _t)
+                    ffi_count("persist_rejected_sql_rows", len(rows))
+                    to_recursively_check = []
+
+                    missing_meta_ids = [
+                        event_id for event_id, meta, _ in rows if meta is None
+                    ]
+                    meta_by_id = self._get_embedded_event_metadata(
+                        txn, missing_meta_ids
+                    )
+
+                    for event_id, metadata, rejected in rows:
+                        edges = backward.get(event_id)
+                        if not edges:
+                            continue
+                        if metadata is None:
+                            metadata = meta_by_id.get(event_id)
+
+                        soft_failed = (
+                            db_to_json(metadata).get("soft_failed")
+                            if metadata
+                            else False
+                        )
+                        if (include_soft_failed and soft_failed) or rejected:
+                            for prev_event_id, _is_state in edges:
+                                if prev_event_id in existing_prevs:
+                                    continue
+                                to_recursively_check.append(prev_event_id)
+                                existing_prevs.add(prev_event_id)
+                    continue
+
                 sql = """
                 SELECT
                     event_id, prev_event_id, internal_metadata,
@@ -1191,17 +1200,7 @@ class PersistEventsStore:
                 missing_meta_ids = [
                     event_id for event_id, _, meta, _ in rows if meta is None
                 ]
-                meta_by_id = {}
-                if missing_meta_ids and getattr(
-                    self, "_embedded_event_json_enabled", False
-                ):
-                    found = get_event_json_batch(
-                        self._embedded_db_engine,
-                        self._embedded_db_namespace,
-                        missing_meta_ids,
-                    )
-                    for eid, (m, _, _) in found.items():
-                        meta_by_id[eid] = m
+                meta_by_id = self._get_embedded_event_metadata(txn, missing_meta_ids)
 
                 for event_id, prev_event_id, metadata, rejected in rows:
                     if prev_event_id in existing_prevs:
@@ -1235,14 +1234,13 @@ class PersistEventsStore:
         inhibit_local_membership_updates: bool,
         state_delta_for_room: DeltaState | None,
         new_forward_extremities: set[str] | None,
-        new_event_links: dict[str, NewEventChainLinks],
         sliding_sync_table_changes: SlidingSyncTableChanges | None,
         new_state_dag_forward_extremities: set[str] | None = None,
         sticky_events_to_un_soft_fail: Set[str] = frozenset(),
         newly_joined_servers: Set[str] = frozenset(),
     ) -> None:
-        """Persist events, staging the embedded event-JSON writes in one mtxdb
-        transaction that commits with this SQL transaction.
+        """Persist events, staging embedded event-JSON and (with the shared
+        WAL) edge writes in one mtxdb transaction that commits before SQL.
 
         The staged writes are invisible to every reader until `commit()`. They
         are committed here, at the end of the body and before the SQL COMMIT,
@@ -1272,7 +1270,6 @@ class PersistEventsStore:
                 inhibit_local_membership_updates=inhibit_local_membership_updates,
                 state_delta_for_room=state_delta_for_room,
                 new_forward_extremities=new_forward_extremities,
-                new_event_links=new_event_links,
                 sliding_sync_table_changes=sliding_sync_table_changes,
                 new_state_dag_forward_extremities=new_state_dag_forward_extremities,
                 sticky_events_to_un_soft_fail=sticky_events_to_un_soft_fail,
@@ -1291,7 +1288,6 @@ class PersistEventsStore:
                 inhibit_local_membership_updates=inhibit_local_membership_updates,
                 state_delta_for_room=state_delta_for_room,
                 new_forward_extremities=new_forward_extremities,
-                new_event_links=new_event_links,
                 sliding_sync_table_changes=sliding_sync_table_changes,
                 new_state_dag_forward_extremities=new_state_dag_forward_extremities,
                 sticky_events_to_un_soft_fail=sticky_events_to_un_soft_fail,
@@ -1300,7 +1296,10 @@ class PersistEventsStore:
             )
             commit_started = True
             _ct = time.monotonic()
-            engine_seconds = mtxdb_txn.commit()
+            # A stale OCC expectation means a concurrent event-DAG write
+            # invalidated this staged transaction. Surface it as retryable so
+            # the SQL interaction rolls back and retries the whole persist.
+            engine_seconds = mtxdb_txn.commit_retryable()
             total_seconds = time.monotonic() - _ct
             ffi_timing("ffi_txn_commit", total_seconds)
             ffi_timing("ffi_txn_commit_engine", engine_seconds)
@@ -1332,7 +1331,6 @@ class PersistEventsStore:
         inhibit_local_membership_updates: bool,
         state_delta_for_room: DeltaState | None,
         new_forward_extremities: set[str] | None,
-        new_event_links: dict[str, NewEventChainLinks],
         sliding_sync_table_changes: SlidingSyncTableChanges | None,
         new_state_dag_forward_extremities: set[str] | None,
         sticky_events_to_un_soft_fail: Set[str] = frozenset(),
@@ -1512,6 +1510,7 @@ class PersistEventsStore:
                 txn,
                 events=[ev for ev, _ in de_outliered_events],
                 update_backward_extremities=False,
+                mtxdb_txn=mtxdb_txn,
             )
 
         if new_forward_extremities:
@@ -1533,7 +1532,9 @@ class PersistEventsStore:
         self._store_event_state_mappings_txn(txn, events_and_contexts)
 
         self._persist_event_auth_chain_txn(
-            txn, [e for e, _ in events_and_contexts], new_event_links
+            txn,
+            [e for e, _ in events_and_contexts],
+            mtxdb_txn=mtxdb_txn,
         )
 
         # _store_rejected_events_txn filters out any events which were
@@ -1550,6 +1551,7 @@ class PersistEventsStore:
             events_and_contexts=events_and_contexts,
             all_events_and_contexts=all_events_and_contexts,
             inhibit_local_membership_updates=inhibit_local_membership_updates,
+            mtxdb_txn=mtxdb_txn,
         )
 
         # We call this last as it assumes we've inserted the events into
@@ -1604,12 +1606,12 @@ class PersistEventsStore:
         # the response that depends on them is returned. Backfilled events are
         # skipped -- no live request waits on them.
         if self._embedded_db_engine:
+            # Every persisted state event owns an outbound auth-edge record in
+            # mtxdb, including leaves and backfilled events. Those edges have
+            # no SQL fallback, so make them durable before the response that
+            # depends on them is returned.
             needs_auth_chain_barrier = any(
-                ev.type in AUTH_CHAIN_EVENT_TYPES
-                and not ev.internal_metadata.is_outlier()
-                and ev.internal_metadata.stream_ordering is not None
-                and ev.internal_metadata.stream_ordering >= 0
-                for ev, _ in events_and_contexts
+                ev.is_state() for ev, _ in all_events_and_contexts
             )
             # Every live event with a state group can be read immediately by
             # another worker (for example, when it becomes a prev event for a
@@ -1667,7 +1669,7 @@ class PersistEventsStore:
                 if barrier_in_txn:
                     maybe_sync(
                         SyncTier.DURABLE,
-                        pools=[Pool.STATE, Pool.AUTH_CHAIN, Pool.EVENT_DAG],
+                        pools=[Pool.STATE, Pool.EVENT_DAG],
                     )
                 else:
                     # `interval`/`off`: the reason for this barrier is that
@@ -1677,7 +1679,6 @@ class PersistEventsStore:
                     # through the coalescer, as the mode says. (A `sync_now`
                     # from `call_after` would fsync on the reactor thread.)
                     txn.call_after(mark_dirty, Pool.STATE)
-                    txn.call_after(mark_dirty, Pool.AUTH_CHAIN)
                     txn.call_after(mark_dirty, Pool.EVENT_DAG)
             elif self._embedded_event_json_enabled and needs_state_barrier:
                 if barrier_in_txn:
@@ -1696,12 +1697,6 @@ class PersistEventsStore:
                     # coalescer (`mark_dirty`) and, for acknowledged auth
                     # writes, the barrier above. Visibility is not durability.
                     txn.call_after(mark_dirty, Pool.STATE)
-                # A live state event can also have written chain-cover links
-                # (see `calculate_chain_cover_index_for_events`) even when its
-                # type is not in `AUTH_CHAIN_EVENT_TYPES`. Those links have no
-                # SQL fallback, so keep them on the coalescer rather than
-                # dropping the AUTH_CHAIN dirty mark entirely.
-                txn.call_after(mark_dirty, Pool.AUTH_CHAIN)
             else:
                 if barrier_in_txn and wrote_event_json:
                     # Outliers and the like have no state barrier, but their
@@ -1709,30 +1704,65 @@ class PersistEventsStore:
                     # the row it belongs to commits.
                     maybe_sync(SyncTier.DURABLE, pools=[Pool.EVENT_DAG])
                 txn.call_after(mark_dirty, Pool.STATE)
-                txn.call_after(mark_dirty, Pool.AUTH_CHAIN)
 
     def _persist_event_auth_chain_txn(
         self,
         txn: LoggingTransaction,
         events: list[EventBase],
-        new_event_links: dict[str, NewEventChainLinks],
+        mtxdb_txn: "MtxdbTransaction | None" = None,
     ) -> None:
-        if new_event_links:
-            from synapse.storage.databases.main.embedded_event_auth_chain_links import (
-                resolve_namespace,
-            )
-
-            self._persist_chain_cover_index(
-                txn,
-                self.db_pool,
-                new_event_links,
-                resolve_namespace(self),
-                self._embedded_db_engine,
-                sync=False,
-            )
-
         # We only care about state events, so this if there are no state events.
-        if not any(e.is_state() for e in events):
+        state_events = [event for event in events if event.is_state()]
+        if not state_events:
+            return
+
+        # Exactly one auth-edge store is written: mtxdb when the embedded
+        # engine is configured, SQL otherwise. Never both.
+        from synapse.storage.databases.main.embedded_event_auth_chains import (
+            embed_auth_edges_batch,
+            get_or_create_short_ids,
+            resolve_namespace,
+        )
+
+        embedded_db_namespace = resolve_namespace(self)
+        if embedded_db_namespace is not None:
+            # Auth edges are durable, not a cache: write them before the SQL
+            # COMMIT rather than from a post-commit callback, which could be
+            # lost to a crash or fail without aborting the persist. A SQL
+            # rollback can leave orphan edges, the same trade-off event JSON
+            # and the event DAG already make; a committed event cannot lack
+            # them.
+            room_id = state_events[0].room_id
+            event_ids = [event.event_id for event in state_events]
+            auth_ids = list(
+                dict.fromkeys(
+                    auth_id
+                    for event in state_events
+                    for auth_id in event.auth_event_ids()
+                )
+            )
+            short_ids = get_or_create_short_ids(
+                self._embedded_db_engine,
+                embedded_db_namespace,
+                room_id,
+                event_ids + auth_ids,
+            )
+            short_id_of = dict(zip(event_ids + auth_ids, short_ids))
+            rows = [
+                (
+                    short_id_of[event.event_id],
+                    [short_id_of[auth_id] for auth_id in event.auth_event_ids()],
+                )
+                for event in state_events
+            ]
+            embed_auth_edges_batch(
+                self._embedded_db_engine,
+                embedded_db_namespace,
+                room_id,
+                rows,
+                transaction=mtxdb_txn,
+            )
+            txn.call_after(mark_dirty, Pool.STATE)
             return
 
         # We want to store event_auth mappings for rejected events, as they're
@@ -1747,502 +1777,10 @@ class PersistEventsStore:
             keys=("event_id", "room_id", "auth_id"),
             values=[
                 (event.event_id, event.room_id, auth_id)
-                for event in events
+                for event in state_events
                 for auth_id in event.auth_event_ids()
-                if event.is_state()
             ],
         )
-
-    @classmethod
-    def _add_chain_cover_index(
-        cls,
-        txn: LoggingTransaction,
-        db_pool: DatabasePool,
-        event_chain_id_gen: SequenceGenerator,
-        event_to_room_id: dict[str, str],
-        event_to_types: dict[str, tuple[str, str]],
-        event_to_auth_chain: dict[str, StrCollection],
-        embedded_db_namespace: str | None,
-        embedded_db_engine: str | None,
-    ) -> None:
-        """Calculate and persist the chain cover index for the given events.
-
-        Args:
-            event_to_room_id: Event ID to the room ID of the event
-            event_to_types: Event ID to type and state_key of the event
-            event_to_auth_chain: Event ID to list of auth event IDs of the
-                event (events with no auth events can be excluded).
-            embedded_db_namespace: the caller's resolved namespace when the
-                embedded engine is configured, `None` when it isn't -- a
-                `@classmethod` has no `self` of its own, so this can't be
-                recomputed here; see `embedded_event_auth_chain_links.py`.
-            embedded_db_engine: the engine name threaded alongside
-                `embedded_db_namespace` (same `@classmethod` constraint).
-        """
-
-        new_event_links = cls._calculate_chain_cover_index(
-            txn,
-            db_pool,
-            event_chain_id_gen,
-            event_to_room_id,
-            event_to_types,
-            event_to_auth_chain,
-            embedded_db_namespace,
-            embedded_db_engine,
-        )
-        cls._persist_chain_cover_index(
-            txn, db_pool, new_event_links, embedded_db_namespace, embedded_db_engine
-        )
-
-    @classmethod
-    def _calculate_chain_cover_index(
-        cls,
-        txn: LoggingTransaction,
-        db_pool: DatabasePool,
-        event_chain_id_gen: SequenceGenerator,
-        event_to_room_id: dict[str, str],
-        event_to_types: dict[str, tuple[str, str]],
-        event_to_auth_chain: dict[str, StrCollection],
-        embedded_db_namespace: str | None,
-        embedded_db_engine: str | None,
-    ) -> dict[str, NewEventChainLinks]:
-        """Calculate the chain cover index for the given events.
-
-        Args:
-            event_to_room_id: Event ID to the room ID of the event
-            event_to_types: Event ID to type and state_key of the event
-            event_to_auth_chain: Event ID to list of auth event IDs of the
-                event (events with no auth events can be excluded).
-
-        Returns:
-            A mapping with any new auth chain links we need to add, keyed by
-            event ID.
-        """
-
-        # Map from event ID to chain ID/sequence number.
-        chain_map: dict[str, tuple[int, int]] = {}
-
-        # Set of event IDs to calculate chain ID/seq numbers for.
-        events_to_calc_chain_id_for = set(event_to_room_id)
-
-        # We check if there are any events that need to be handled in the rooms
-        # we're looking at. These should just be out of band memberships, where
-        # we didn't have the auth chain when we first persisted.
-        auth_chain_to_calc_rows = cast(
-            list[tuple[str, str, str]],
-            db_pool.simple_select_many_txn(
-                txn,
-                table="event_auth_chain_to_calculate",
-                keyvalues={},
-                column="room_id",
-                iterable=set(event_to_room_id.values()),
-                retcols=("event_id", "type", "state_key"),
-            ),
-        )
-        for event_id, event_type, state_key in auth_chain_to_calc_rows:
-            # (We could pull out the auth events for all rows at once using
-            # simple_select_many, but this case happens rarely and almost always
-            # with a single row.)
-            auth_events = db_pool.simple_select_onecol_txn(
-                txn,
-                "event_auth",
-                keyvalues={"event_id": event_id},
-                retcol="auth_id",
-            )
-
-            events_to_calc_chain_id_for.add(event_id)
-            event_to_types[event_id] = (event_type, state_key)
-            event_to_auth_chain[event_id] = auth_events
-
-        # First we get the chain ID and sequence numbers for the events'
-        # auth events (that aren't also currently being persisted).
-        #
-        # Note that there there is an edge case here where we might not have
-        # calculated chains and sequence numbers for events that were "out
-        # of band". We handle this case by fetching the necessary info and
-        # adding it to the set of events to calculate chain IDs for.
-
-        missing_auth_chains = {
-            a_id
-            for auth_events in event_to_auth_chain.values()
-            for a_id in auth_events
-            if a_id not in events_to_calc_chain_id_for
-        }
-
-        # We loop here in case we find an out of band membership and need to
-        # fetch their auth event info.
-        while missing_auth_chains:
-            sql = """
-                SELECT event_id, events.type, se.state_key, chain_id, sequence_number
-                FROM events
-                INNER JOIN state_events AS se USING (event_id)
-                LEFT JOIN event_auth_chains USING (event_id)
-                WHERE
-            """
-            clause, args = make_in_list_sql_clause(
-                txn.database_engine,
-                "event_id",
-                missing_auth_chains,
-            )
-            txn.execute(sql + clause, args)
-
-            missing_auth_chains.clear()
-
-            for (
-                auth_id,
-                event_type,
-                state_key,
-                chain_id,
-                sequence_number,
-            ) in txn.fetchall():
-                event_to_types[auth_id] = (event_type, state_key)
-
-                if chain_id is None:
-                    # No chain ID, so the event was persisted out of band.
-                    # We add to list of events to calculate auth chains for.
-
-                    events_to_calc_chain_id_for.add(auth_id)
-
-                    event_to_auth_chain[auth_id] = db_pool.simple_select_onecol_txn(
-                        txn,
-                        "event_auth",
-                        keyvalues={"event_id": auth_id},
-                        retcol="auth_id",
-                    )
-
-                    missing_auth_chains.update(
-                        e
-                        for e in event_to_auth_chain[auth_id]
-                        if e not in event_to_types
-                    )
-                else:
-                    chain_map[auth_id] = (chain_id, sequence_number)
-
-        # Now we check if we have any events where we don't have auth chain,
-        # this should only be out of band memberships.
-        for event_id in sorted_topologically(event_to_auth_chain, event_to_auth_chain):
-            for auth_id in event_to_auth_chain[event_id]:
-                if (
-                    auth_id not in chain_map
-                    and auth_id not in events_to_calc_chain_id_for
-                ):
-                    events_to_calc_chain_id_for.discard(event_id)
-
-                    # If this is an event we're trying to persist we add it to
-                    # the list of events to calculate chain IDs for next time
-                    # around. (Otherwise we will have already added it to the
-                    # table).
-                    room_id = event_to_room_id.get(event_id)
-                    if room_id:
-                        e_type, state_key = event_to_types[event_id]
-                        db_pool.simple_upsert_txn(
-                            txn,
-                            table="event_auth_chain_to_calculate",
-                            keyvalues={"event_id": event_id},
-                            values={
-                                "room_id": room_id,
-                                "type": e_type,
-                                "state_key": state_key,
-                            },
-                        )
-
-                    # We stop checking the event's auth events since we've
-                    # discarded it.
-                    break
-
-        if not events_to_calc_chain_id_for:
-            return {}
-
-        # Allocate chain ID/sequence numbers to each new event.
-        new_chain_tuples = cls._allocate_chain_ids(
-            txn,
-            db_pool,
-            event_chain_id_gen,
-            event_to_room_id,
-            event_to_types,
-            event_to_auth_chain,
-            events_to_calc_chain_id_for,
-            chain_map,
-        )
-        chain_map.update(new_chain_tuples)
-
-        to_return = {
-            event_id: NewEventChainLinks(chain_id, sequence_number)
-            for event_id, (chain_id, sequence_number) in new_chain_tuples.items()
-        }
-
-        # Now we need to calculate any new links between chains caused by
-        # the new events.
-        #
-        # Links are pairs of chain ID/sequence numbers such that for any
-        # event A (CA, SA) and any event B (CB, SB), B is in A's auth chain
-        # if and only if there is at least one link (CA, S1) -> (CB, S2)
-        # where SA >= S1 and S2 >= SB.
-        #
-        # We try and avoid adding redundant links to the table, e.g. if we
-        # have two links between two chains which both start/end at the
-        # sequence number event (or cross) then one can be safely dropped.
-        #
-        # To calculate new links we look at every new event and:
-        #   1. Fetch the chain ID/sequence numbers of its auth events,
-        #      discarding any that are reachable by other auth events, or
-        #      that have the same chain ID as the event.
-        #   2. For each retained auth event we:
-        #       a. Add a link from the event's to the auth event's chain
-        #          ID/sequence number
-
-        # Step 1, fetch all existing links from all the chains we've seen
-        # referenced.
-        chain_links = _LinkMap()
-
-        for links in EventFederationStore._get_chain_links(
-            txn,
-            {chain_id for chain_id, _ in chain_map.values()},
-            embedded_db_namespace,
-            embedded_db_engine,
-        ):
-            for origin_chain_id, inner_links in links.items():
-                for (
-                    origin_sequence_number,
-                    target_chain_id,
-                    target_sequence_number,
-                ) in inner_links:
-                    chain_links.add_link(
-                        (origin_chain_id, origin_sequence_number),
-                        (target_chain_id, target_sequence_number),
-                        new=False,
-                    )
-
-        # We do this in toplogical order to avoid adding redundant links.
-        for event_id in sorted_topologically(
-            events_to_calc_chain_id_for, event_to_auth_chain
-        ):
-            chain_id, sequence_number = chain_map[event_id]
-
-            # Filter out auth events that are reachable by other auth
-            # events. We do this by looking at every permutation of pairs of
-            # auth events (A, B) to check if B is reachable from A.
-            reduction = {
-                a_id
-                for a_id in event_to_auth_chain.get(event_id, [])
-                if chain_map[a_id][0] != chain_id
-            }
-            for start_auth_id, end_auth_id in itertools.permutations(
-                event_to_auth_chain.get(event_id, []),
-                r=2,
-            ):
-                if chain_links.exists_path_from(
-                    chain_map[start_auth_id], chain_map[end_auth_id]
-                ):
-                    reduction.discard(end_auth_id)
-
-            # Step 2, figure out what the new links are from the reduced
-            # list of auth events.
-            for auth_id in reduction:
-                auth_chain_id, auth_sequence_number = chain_map[auth_id]
-
-                # Step 2a, add link between the event and auth event
-                to_return[event_id].links.append((auth_chain_id, auth_sequence_number))
-                chain_links.add_link(
-                    (chain_id, sequence_number), (auth_chain_id, auth_sequence_number)
-                )
-
-        return to_return
-
-    @classmethod
-    def _persist_chain_cover_index(
-        cls,
-        txn: LoggingTransaction,
-        db_pool: DatabasePool,
-        new_event_links: dict[str, NewEventChainLinks],
-        embedded_db_namespace: str | None,
-        embedded_db_engine: str | None,
-        sync: bool = True,
-    ) -> None:
-        db_pool.simple_insert_many_txn(
-            txn,
-            table="event_auth_chains",
-            keys=("event_id", "chain_id", "sequence_number"),
-            values=[
-                (event_id, new_links.chain_id, new_links.sequence_number)
-                for event_id, new_links in new_event_links.items()
-            ],
-        )
-
-        db_pool.simple_delete_many_txn(
-            txn,
-            table="event_auth_chain_to_calculate",
-            keyvalues={},
-            column="event_id",
-            values=new_event_links,
-        )
-
-        chain_links = [
-            (
-                new_links.chain_id,
-                new_links.sequence_number,
-                target_chain_id,
-                target_sequence_number,
-            )
-            for new_links in new_event_links.values()
-            for (target_chain_id, target_sequence_number) in new_links.links
-        ]
-
-        if embedded_db_namespace is not None:
-            # Exclusive by configured engine, not a dual-write -- see
-            # embedded_event_auth_chain_links.py.
-            from synapse.storage.databases.main.embedded_event_auth_chain_links import (
-                put_chain_links_batch,
-            )
-
-            put_chain_links_batch(
-                embedded_db_engine, embedded_db_namespace, chain_links, sync=sync
-            )
-            return
-
-        db_pool.simple_insert_many_txn(
-            txn,
-            table="event_auth_chain_links",
-            keys=(
-                "origin_chain_id",
-                "origin_sequence_number",
-                "target_chain_id",
-                "target_sequence_number",
-            ),
-            values=chain_links,
-        )
-
-    @staticmethod
-    def _allocate_chain_ids(
-        txn: LoggingTransaction,
-        db_pool: DatabasePool,
-        event_chain_id_gen: SequenceGenerator,
-        event_to_room_id: dict[str, str],
-        event_to_types: dict[str, tuple[str, str]],
-        event_to_auth_chain: dict[str, StrCollection],
-        events_to_calc_chain_id_for: set[str],
-        chain_map: dict[str, tuple[int, int]],
-    ) -> dict[str, tuple[int, int]]:
-        """Allocates, but does not persist, chain ID/sequence numbers for the
-        events in `events_to_calc_chain_id_for`. (c.f. _add_chain_cover_index
-        for info on args)
-        """
-
-        # We now calculate the chain IDs/sequence numbers for the events. We do
-        # this by looking at the chain ID and sequence number of any auth event
-        # with the same type/state_key and incrementing the sequence number by
-        # one. If there was no match or the chain ID/sequence number is already
-        # taken we generate a new chain.
-        #
-        # We try to reduce the number of times that we hit the database by
-        # batching up calls, to make this more efficient when persisting large
-        # numbers of state events (e.g. during joins).
-        #
-        # We do this by:
-        #   1. Calculating for each event which auth event will be used to
-        #      inherit the chain ID, i.e. converting the auth chain graph to a
-        #      tree that we can allocate chains on. We also keep track of which
-        #      existing chain IDs have been referenced.
-        #   2. Fetching the max allocated sequence number for each referenced
-        #      existing chain ID, generating a map from chain ID to the max
-        #      allocated sequence number.
-        #   3. Iterating over the tree and allocating a chain ID/seq no. to the
-        #      new event, by incrementing the sequence number from the
-        #      referenced event's chain ID/seq no. and checking that the
-        #      incremented sequence number hasn't already been allocated (by
-        #      looking in the map generated in the previous step). We generate a
-        #      new chain if the sequence number has already been allocated.
-        #
-
-        existing_chains: set[int] = set()
-        tree: list[tuple[str, str | None]] = []
-
-        # We need to do this in a topologically sorted order as we want to
-        # generate chain IDs/sequence numbers of an event's auth events before
-        # the event itself.
-        for event_id in sorted_topologically(
-            events_to_calc_chain_id_for, event_to_auth_chain
-        ):
-            for auth_id in event_to_auth_chain.get(event_id, []):
-                if event_to_types.get(event_id) == event_to_types.get(auth_id):
-                    existing_chain_id = chain_map.get(auth_id)
-                    if existing_chain_id:
-                        existing_chains.add(existing_chain_id[0])
-
-                    tree.append((event_id, auth_id))
-                    break
-            else:
-                tree.append((event_id, None))
-
-        # Fetch the current max sequence number for each existing referenced chain.
-        sql = """
-            SELECT chain_id, MAX(sequence_number) FROM event_auth_chains
-            WHERE %s
-            GROUP BY chain_id
-        """
-        clause, args = make_in_list_sql_clause(
-            db_pool.engine, "chain_id", existing_chains
-        )
-        txn.execute(sql % (clause,), args)
-
-        chain_to_max_seq_no: dict[Any, int] = {row[0]: row[1] for row in txn}
-
-        # Allocate the new events chain ID/sequence numbers.
-        #
-        # To reduce the number of calls to the database we don't allocate a
-        # chain ID number in the loop, instead we use a temporary `object()` for
-        # each new chain ID. Once we've done the loop we generate the necessary
-        # number of new chain IDs in one call, replacing all temporary
-        # objects with real allocated chain IDs.
-
-        unallocated_chain_ids: set[object] = set()
-        new_chain_tuples: dict[str, tuple[Any, int]] = {}
-        for event_id, auth_event_id in tree:
-            # If we reference an auth_event_id we fetch the allocated chain ID,
-            # either from the existing `chain_map` or the newly generated
-            # `new_chain_tuples` map.
-            existing_chain_id = None
-            if auth_event_id:
-                existing_chain_id = new_chain_tuples.get(auth_event_id)
-                if not existing_chain_id:
-                    existing_chain_id = chain_map[auth_event_id]
-
-            new_chain_tuple: tuple[Any, int] | None = None
-            if existing_chain_id:
-                # We found a chain ID/sequence number candidate, check its
-                # not already taken.
-                proposed_new_id = existing_chain_id[0]
-                proposed_new_seq = existing_chain_id[1] + 1
-
-                if chain_to_max_seq_no[proposed_new_id] < proposed_new_seq:
-                    new_chain_tuple = (
-                        proposed_new_id,
-                        proposed_new_seq,
-                    )
-
-            # If we need to start a new chain we allocate a temporary chain ID.
-            if not new_chain_tuple:
-                new_chain_tuple = (object(), 1)
-                unallocated_chain_ids.add(new_chain_tuple[0])
-
-            new_chain_tuples[event_id] = new_chain_tuple
-            chain_to_max_seq_no[new_chain_tuple[0]] = new_chain_tuple[1]
-
-        # Generate new chain IDs for all unallocated chain IDs.
-        newly_allocated_chain_ids = event_chain_id_gen.get_next_mult_txn(
-            txn, len(unallocated_chain_ids)
-        )
-
-        # Map from potentially temporary chain ID to real chain ID
-        chain_id_to_allocated_map: dict[Any, int] = dict(
-            zip(unallocated_chain_ids, newly_allocated_chain_ids)
-        )
-        chain_id_to_allocated_map.update((c, c) for c in existing_chains)
-
-        return {
-            event_id: (chain_id_to_allocated_map[chain_id], seq)
-            for event_id, (chain_id, seq) in new_chain_tuples.items()
-        }
 
     def _persist_transaction_ids_txn(
         self,
@@ -3885,6 +3423,7 @@ class PersistEventsStore:
         events_and_contexts: list[EventPersistencePair],
         all_events_and_contexts: list[EventPersistencePair],
         inhibit_local_membership_updates: bool = False,
+        mtxdb_txn: "MtxdbTransaction | None" = None,
     ) -> None:
         """Update all the miscellaneous tables for new events
 
@@ -3898,6 +3437,9 @@ class PersistEventsStore:
                 from being updated by these events. This should be set to True
                 for backfilled events because backfilled events in the past do
                 not affect the current local state.
+            mtxdb_txn: The persist's embedded transaction, if one is open.
+                Event edges are staged in it so they commit with the event
+                JSON, before the SQL COMMIT.
         """
 
         # Insert all the push actions into the event_push_actions table.
@@ -3925,7 +3467,9 @@ class PersistEventsStore:
         # Update the event_forward_extremities, event_backward_extremities and
         # event_edges tables.
         self._handle_mult_prev_events(
-            txn, events=[event for event, _ in events_and_contexts]
+            txn,
+            events=[event for event, _ in events_and_contexts],
+            mtxdb_txn=mtxdb_txn,
         )
 
         for event, _ in events_and_contexts:
@@ -4585,15 +4129,6 @@ class PersistEventsStore:
             },
         )
 
-        # Mirror into the embedded engine if configured -- flat point lookup,
-        # see embedded_rejections.py.
-        if getattr(self, "_embedded_event_json_enabled", False):
-            put_rejection_batch(
-                self._embedded_db_engine,
-                self._embedded_db_namespace,
-                [(event_id, reason, last_check)],
-            )
-
     def _store_event_state_mappings_txn(
         self,
         txn: LoggingTransaction,
@@ -4755,6 +4290,7 @@ class PersistEventsStore:
         txn: LoggingTransaction,
         events: list[EventBase],
         update_backward_extremities: bool = True,
+        mtxdb_txn: "MtxdbTransaction | None" = None,
     ) -> None:
         """
         For the given event, update the event edges table and forward and
@@ -4765,7 +4301,9 @@ class PersistEventsStore:
                 (ev.event_id, e_id) for ev in events for e_id in ev.prev_event_ids()
             )
         )
-        if edge_values:
+        # Exactly one edge store is written: mtxdb when the embedded engine is
+        # enabled, SQL otherwise. Never both.
+        if edge_values and not self._embedded_event_edges_enabled:
             if isinstance(self.database_engine, PostgresEngine):
                 sql = (
                     "INSERT INTO event_edges (event_id, prev_event_id) "
@@ -4779,42 +4317,6 @@ class PersistEventsStore:
                 )
                 txn.executemany(sql, edge_values)
 
-        # Keep the authoritative SQL edge write, its per-room source version,
-        # and the embedded-index publication mutations in one transaction.
-        # The outbox is deliberately populated even when the embedded engine
-        # is disabled: it makes enabling the publisher later a resumable,
-        # database-backed operation rather than a best-effort mirror.
-        edges_by_room: dict[str, list[tuple[str, str]]] = collections.defaultdict(list)
-        for event in events:
-            edges_by_room[event.room_id].extend(
-                (event.event_id, prev_event_id)
-                for prev_event_id in event.prev_event_ids()
-            )
-
-        for room_id, room_edges in edges_by_room.items():
-            if not room_edges:
-                continue
-
-            # Keep the outbox key idempotent if an input batch repeats an
-            # identical prev-event edge.
-            room_edges = list(dict.fromkeys(room_edges))
-            source_version = bump_room_edge_source_version(txn, room_id)
-            self.db_pool.simple_insert_many_txn(
-                txn,
-                table="edge_index_outbox",
-                keys=(
-                    "room_id",
-                    "source_version",
-                    "event_id",
-                    "prev_event_id",
-                    "operation",
-                ),
-                values=[
-                    (room_id, source_version, event_id, prev_event_id, "insert")
-                    for event_id, prev_event_id in room_edges
-                ],
-            )
-
         if self._embedded_event_edges_writable:
             edge_rows = [
                 (ev.room_id, ev.event_id, e_id, False)
@@ -4822,22 +4324,23 @@ class PersistEventsStore:
                 for e_id in ev.prev_event_ids()
             ]
             if edge_rows:
-                # MTXDB is authoritative when embedded event edges are
-                # enabled: the event is visible once this transaction commits,
-                # so its edges must be committed to MTXDB too.  Write the batch
-                # directly instead of enqueueing it on the coalescer --
-                # `put_event_edges_batch(sync=True)` drains the EVENT_DAG pool,
-                # which calls back into the edge queue's flush path, so routing
-                # this through `flush_edge_writes()` would try to re-take the
-                # non-reentrant per-namespace flush lock and self-deadlock.
-                txn.call_after(
-                    put_event_edges_batch,
+                # Write edges before the SQL COMMIT, never from a post-commit
+                # callback: a callback could be lost to a crash or fail without
+                # aborting the persist, leaving a committed event with no
+                # edges and no recovery path. With the shared WAL, stage them
+                # beside the event JSON so both are all-or-nothing. Without
+                # one, write directly: the persist's in-transaction EVENT_DAG
+                # barrier then makes them durable before SQL commits. A SQL
+                # rollback can leave orphan edges, the same trade-off event
+                # JSON already makes, but a committed event cannot lack them.
+                #
+                # Do not route this through `flush_edge_writes()`: its
+                # sync=True path drains the coalescer and would try to re-take
+                # the non-reentrant per-namespace flush lock from here.
+                put_event_edges_batch(
                     self._embedded_db_namespace,
                     edge_rows,
-                    # The post-commit write is visible immediately; durability
-                    # is handled by the EVENT_DAG coalescer according to the
-                    # configured sync mode.
-                    sync=False,
+                    transaction=mtxdb_txn,
                 )
                 txn.call_after(mark_dirty, Pool.EVENT_DAG)
 
@@ -4857,6 +4360,42 @@ class PersistEventsStore:
         """
 
         room_id = events[0].room_id
+
+        # Do this before anything can return early: a batch whose events have no
+        # prev_events (e.g. a room's create event persisted on its own) yields no
+        # potential extremities, but each such event must still be removed from
+        # the table if an earlier persist recorded it as a gap.
+        # Delete all these events that we've already fetched and now know that their
+        # prev events are the new backwards extremeties.
+        query = (
+            "DELETE FROM event_backward_extremities WHERE event_id = ? AND room_id = ?"
+        )
+        backward_extremity_tuples_to_remove = [
+            (ev.event_id, ev.room_id)
+            for ev in events
+            if not ev.internal_metadata.is_outlier()
+            # If we encountered an event with no prev_events, then we might
+            # as well remove it now because it won't ever have anything else
+            # to backfill from.
+            or len(ev.prev_event_ids()) == 0
+        ]
+        txn.execute_batch(
+            query,
+            backward_extremity_tuples_to_remove,
+        )
+
+        # Clear out the failed backfill attempts after we successfully pulled
+        # the event. Since we no longer need these events as backward
+        # extremities, it also means that they won't be backfilled from again so
+        # we no longer need to store the backfill attempts around it.
+        query = """
+            DELETE FROM event_failed_pull_attempts
+            WHERE event_id = ? and room_id = ?
+        """
+        txn.execute_batch(
+            query,
+            backward_extremity_tuples_to_remove,
+        )
 
         potential_backwards_extremities = {
             e_id
@@ -4907,154 +4446,3 @@ class PersistEventsStore:
                 keys=("room_id", "instance_name", "stream_ordering"),
                 values=gap_events,
             )
-
-        # Delete all these events that we've already fetched and now know that their
-        # prev events are the new backwards extremeties.
-        query = (
-            "DELETE FROM event_backward_extremities WHERE event_id = ? AND room_id = ?"
-        )
-        backward_extremity_tuples_to_remove = [
-            (ev.event_id, ev.room_id)
-            for ev in events
-            if not ev.internal_metadata.is_outlier()
-            # If we encountered an event with no prev_events, then we might
-            # as well remove it now because it won't ever have anything else
-            # to backfill from.
-            or len(ev.prev_event_ids()) == 0
-        ]
-        txn.execute_batch(
-            query,
-            backward_extremity_tuples_to_remove,
-        )
-
-        # Clear out the failed backfill attempts after we successfully pulled
-        # the event. Since we no longer need these events as backward
-        # extremities, it also means that they won't be backfilled from again so
-        # we no longer need to store the backfill attempts around it.
-        query = """
-            DELETE FROM event_failed_pull_attempts
-            WHERE event_id = ? and room_id = ?
-        """
-        txn.execute_batch(
-            query,
-            backward_extremity_tuples_to_remove,
-        )
-
-
-@attr.s(slots=True, auto_attribs=True)
-class _LinkMap:
-    """A helper type for tracking links between chains."""
-
-    # Stores the set of links as nested maps: source chain ID -> target chain ID
-    # -> source sequence number -> target sequence number.
-    maps: dict[int, dict[int, dict[int, int]]] = attr.Factory(dict)
-
-    # Stores the links that have been added (with new set to true), as tuples of
-    # `(source chain ID, source sequence no, target chain ID, target sequence no.)`
-    additions: set[tuple[int, int, int, int]] = attr.Factory(set)
-
-    def add_link(
-        self,
-        src_tuple: tuple[int, int],
-        target_tuple: tuple[int, int],
-        new: bool = True,
-    ) -> bool:
-        """Add a new link between two chains, ensuring no redundant links are added.
-
-        New links should be added in topological order.
-
-        Args:
-            src_tuple: The chain ID/sequence number of the source of the link.
-            target_tuple: The chain ID/sequence number of the target of the link.
-            new: Whether this is a "new" link, i.e. should it be returned
-                by `get_additions`.
-
-        Returns:
-            True if a link was added, false if the given link was dropped as redundant
-        """
-        src_chain, src_seq = src_tuple
-        target_chain, target_seq = target_tuple
-
-        current_links = self.maps.setdefault(src_chain, {}).setdefault(target_chain, {})
-
-        assert src_chain != target_chain
-
-        if new:
-            # Check if the new link is redundant
-            for current_seq_src, current_seq_target in current_links.items():
-                # If a link "crosses" another link then its redundant. For example
-                # in the following link 1 (L1) is redundant, as any event reachable
-                # via L1 is *also* reachable via L2.
-                #
-                #   Chain A     Chain B
-                #      |          |
-                #   L1 |------    |
-                #      |     |    |
-                #   L2 |---- | -->|
-                #      |     |    |
-                #      |     |--->|
-                #      |          |
-                #      |          |
-                #
-                # So we only need to keep links which *do not* cross, i.e. links
-                # that both start and end above or below an existing link.
-                #
-                # Note, since we add links in topological ordering we should never
-                # see `src_seq` less than `current_seq_src`.
-
-                if current_seq_src <= src_seq and target_seq <= current_seq_target:
-                    # This new link is redundant, nothing to do.
-                    return False
-
-            self.additions.add((src_chain, src_seq, target_chain, target_seq))
-
-        current_links[src_seq] = target_seq
-        return True
-
-    def get_additions(self) -> Generator[tuple[int, int, int, int], None, None]:
-        """Gets any newly added links.
-
-        Yields:
-            The source chain ID/sequence number and target chain ID/sequence number
-        """
-
-        for src_chain, src_seq, target_chain, _ in self.additions:
-            target_seq = self.maps.get(src_chain, {}).get(target_chain, {}).get(src_seq)
-            if target_seq is not None:
-                yield (src_chain, src_seq, target_chain, target_seq)
-
-    def exists_path_from(
-        self,
-        src_tuple: tuple[int, int],
-        target_tuple: tuple[int, int],
-    ) -> bool:
-        """Checks if there is a path between the source chain ID/sequence and
-        target chain ID/sequence.
-        """
-        src_chain, src_seq = src_tuple
-        target_chain, target_seq = target_tuple
-
-        if src_chain == target_chain:
-            return target_seq <= src_seq
-
-        # We have to graph traverse the links to check for indirect paths.
-        visited_chains: dict[int, int] = collections.Counter()
-        search = [(src_chain, src_seq)]
-        while search:
-            chain, seq = search.pop()
-            visited_chains[chain] = max(seq, visited_chains[chain])
-            for tc, links in self.maps.get(chain, {}).items():
-                for ss, ts in links.items():
-                    # Don't revisit chains we've already seen, unless the target
-                    # sequence number is higher than last time.
-                    if ts <= visited_chains.get(tc, 0):
-                        continue
-
-                    if ss <= seq:
-                        if tc == target_chain:
-                            if target_seq <= ts:
-                                return True
-                        else:
-                            search.append((tc, ts))
-
-        return False

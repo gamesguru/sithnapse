@@ -24,7 +24,8 @@ use pythonize::depythonize;
 use rezzy::basespec::event_types::MAX_POWER_LEVEL_JSON;
 use rezzy::{
     auth::roaring::AuthGraph, basespec::event_types::EventType, is_valid_mxid,
-    resolve_semilattice_fold, EventContent, LeanEvent, RoomId, SharedState, StateResVersion,
+    is_valid_principal_identifier, resolve_semilattice_fold, EventContent, LeanEvent, RoomId,
+    SharedState, StateResVersion,
 };
 use serde_json::Value;
 
@@ -277,12 +278,19 @@ impl EventContent for ResolverContent {
             .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some(sender)))
     }
 
-    fn additional_creators_are_valid(&self) -> bool {
+    fn additional_creators_are_valid(&self, principals: bool) -> bool {
         match self.get(rezzy::basespec::event_types::FIELD_ADDITIONAL_CREATORS) {
             None => true,
             Some(v) => v.as_array().is_some_and(|arr| {
-                arr.iter()
-                    .all(|entry| entry.as_str().is_some_and(is_valid_mxid))
+                arr.iter().all(|entry| {
+                    entry.as_str().is_some_and(|id| {
+                        if principals {
+                            is_valid_principal_identifier(id)
+                        } else {
+                            is_valid_mxid(id)
+                        }
+                    })
+                })
             }),
         }
     }
@@ -749,7 +757,7 @@ mod tests {
             assert_eq!(content.get_event_power_level("m.room.name"), Some(50));
             assert_eq!(content.get_creator(), Some("@a:test"));
             assert!(content.has_additional_creator("@b:test"));
-            assert!(content.additional_creators_are_valid());
+            assert!(content.additional_creators_are_valid(false));
         }
     }
 
@@ -795,7 +803,21 @@ mod tests {
             .expect("valid event content");
         let valid = ResolverContent::SharedValue(Arc::new(valid));
         let invalid = ResolverContent::SharedValue(Arc::new(invalid));
-        assert!(valid.additional_creators_are_valid());
-        assert!(!invalid.additional_creators_are_valid());
+        assert!(valid.additional_creators_are_valid(false));
+        assert!(!invalid.additional_creators_are_valid(false));
+    }
+
+    #[test]
+    fn resolver_content_checks_principal_identifiers_for_cygnus() {
+        let principal: Value = serde_json::from_str(r#"{"additional_creators":["@abc_DEF-123"]}"#)
+            .expect("valid event content");
+        let mxid: Value = serde_json::from_str(r#"{"additional_creators":["@a:test"]}"#)
+            .expect("valid event content");
+        let principal = ResolverContent::SharedValue(Arc::new(principal));
+        let mxid = ResolverContent::SharedValue(Arc::new(mxid));
+
+        assert!(principal.additional_creators_are_valid(true));
+        assert!(!mxid.additional_creators_are_valid(true));
+        assert!(mxid.additional_creators_are_valid(false));
     }
 }

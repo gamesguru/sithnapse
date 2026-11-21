@@ -47,25 +47,14 @@ existing `include_given` semantics at that call site.
 from __future__ import annotations
 
 import logging
+import threading
 from collections import OrderedDict
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, cast
 
 from pyroaring import BitMap
 
-
-class _AuthChainTxn(Protocol):
-    """The minimal SQL-transaction surface the closure walk depends on.
-
-    Structural (PEP 544) on purpose, so tests can drive the walk with a
-    tiny fake txn instead of a full `LoggingTransaction`, and the walk
-    itself stays decoupled from any concrete cursor type. The methods
-    match what `_fetch_auth_event_ids_from_sql` /
-    `_fetch_child_event_ids_from_sql` actually call, nothing more.
-    """
-
-    def execute(self, sql: str, parameters: tuple[Any, ...]) -> None: ...
-    def fetchall(self) -> list[tuple[Any, ...]]: ...
-    def fetchone(self) -> tuple[Any, ...] | None: ...
+if TYPE_CHECKING:
+    from synapse.synapse_rust.mtxdb_engine import MtxdbTransaction
 
 
 logger = logging.getLogger(__name__)
@@ -77,28 +66,323 @@ _MAX_SHORT_ID = (1 << 32) - 1
 
 
 class IncompleteAuthGraph(Exception):
-    """Raised internally when a closure walk hits a genuinely missing auth
-    edge (not an ordinary cache miss) -- the narrow, explicit signal that
-    should trigger falling back to the legacy SQL algorithm at the
-    `event_federation.py` call sites. Never caught by a bare `except`
-    anywhere in this module; a storage/(de)serialization bug must
+    """Raised internally when a closure walk finds an incomplete auth graph.
+
+    This includes a missing auth-edge record (not an ordinary cache miss) or
+    a cycle, which cannot occur in a valid event auth graph. In mtxdb mode
+    this indicates corrupted or incompletely migrated data and must surface
+    as an error; it must never trigger a SQL fallback. Never caught by a bare
+    `except` anywhere in this module; a storage/(de)serialization bug must
     propagate instead of being mistaken for this.
     """
 
 
 def resolve_namespace(store: object) -> str | None:
     """The namespace to use for this feature's mtxdb calls for `store`, or
-    `None` if it should use SQL instead. Same shape as
-    `embedded_event_auth_chain_links.resolve_namespace` -- kept as a
-    separate function (not reused directly) because this feature has its
-    own opt-in gate in principle, even though today it shares the same
-    `embedded_db_engine`/`embedded_db_namespace` config surface.
+    `None` if the legacy SQL backend is configured (no embedded engine).
     """
     return (
         store._embedded_db_namespace  # type: ignore[attr-defined]
         if getattr(store, "_embedded_db_engine", None)
         else None
     )
+
+
+class AuthChainBackendMismatchError(Exception):
+    """The configured auth-edge backend does not hold the migrated graph."""
+
+
+def configured_backend(hs: object) -> str:
+    """mtxdb is authoritative whenever its engine is configured."""
+    return "mtxdb" if hs.config.database.embedded_db_engine else "sql"  # type: ignore[attr-defined]
+
+
+async def check_backend(hs: object) -> None:
+    """Refuse startup when the auth-edge data has not been migrated to the
+    configured authoritative backend.
+
+    An empty database can adopt either backend because it has no event graph
+    to migrate. Once events exist, switching is an explicit offline operation.
+    """
+    store = hs.get_datastores().main  # type: ignore[attr-defined]
+    configured = configured_backend(hs)
+
+    def _txn(txn: Any) -> str:
+        txn.execute("SELECT backend FROM auth_chain_backend WHERE lock = 'X'")
+        row = txn.fetchone()
+        stored = row[0] if row else "sql"
+        if stored != configured:
+            txn.execute("SELECT 1 FROM events LIMIT 1")
+            if txn.fetchone() is None:
+                txn.execute("DELETE FROM auth_chain_backend")
+                txn.execute(
+                    "INSERT INTO auth_chain_backend (lock, backend) VALUES ('X', ?)",
+                    (configured,),
+                )
+                return configured
+        return str(stored)
+
+    stored = await store.db_pool.runInteraction("check_auth_chain_backend", _txn)
+    if stored != configured:
+        raise AuthChainBackendMismatchError(
+            f"Auth edges are stored in {stored!r} but this server is configured "
+            f"for {configured!r}. Refusing to start: stop Synapse and run "
+            f"`synapse_auth_edges_migrate --to {configured}` with this config, "
+            "or restore the previous embedded_db configuration."
+        )
+
+
+async def migrate_auth_chain_edges(
+    hs: object, *, batch_size: int = 1000
+) -> dict[str, int]:
+    """Offline SQL -> mtxdb import. Stop every Synapse process first.
+
+    Each room is cleared and rebuilt so an interrupted run can be repeated
+    without retaining stale inbound children. The backend marker is changed
+    only after outbound and inbound records have been checked against SQL.
+    """
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    if not hs.config.database.embedded_db_engine:  # type: ignore[attr-defined]
+        raise ValueError("configure embedded_db.engine for the mtxdb destination")
+
+    store = hs.get_datastores().main  # type: ignore[attr-defined]
+    engine_name = hs.config.database.embedded_db_engine  # type: ignore[attr-defined]
+    namespace = (
+        hs.config.database.embedded_db_namespace  # type: ignore[attr-defined]
+        or hs.hostname  # type: ignore[attr-defined]
+    )
+
+    def _read_marker(txn: Any) -> str:
+        txn.execute("SELECT backend FROM auth_chain_backend WHERE lock = 'X'")
+        row = txn.fetchone()
+        return str(row[0]) if row else "sql"
+
+    current_backend = await store.db_pool.runInteraction(
+        "auth_chain_migrate_read_marker", _read_marker
+    )
+    if current_backend == "mtxdb":
+        return {"already_migrated": 1, "rooms": 0, "state_events": 0, "auth_edges": 0}
+    if current_backend != "sql":
+        raise RuntimeError(
+            f"Unrecognized auth-chain backend marker: {current_backend!r}"
+        )
+
+    def _rejected_metadata_pending(txn: Any) -> bool:
+        txn.execute(
+            "SELECT 1 FROM background_updates "
+            "WHERE update_name = 'rejected_events_metadata'"
+        )
+        return txn.fetchone() is not None
+
+    if await store.db_pool.runInteraction(
+        "auth_chain_migrate_check_bg_updates", _rejected_metadata_pending
+    ):
+        raise RuntimeError(
+            "The rejected_events_metadata background update is still queued, so "
+            "SQL event_auth lacks some rejected state events' auth edges. Let it "
+            "finish (run Synapse with the SQL backend) before migrating."
+        )
+
+    def _read_rooms(txn: Any) -> list[str]:
+        txn.execute("SELECT room_id FROM rooms ORDER BY room_id")
+        return [room_id for (room_id,) in txn.fetchall()]
+
+    rooms = await store.db_pool.runInteraction("auth_chain_migrate_rooms", _read_rooms)
+    stats = {"rooms": 0, "state_events": 0, "auth_edges": 0}
+
+    from synapse.storage.database import make_in_list_sql_clause
+    from synapse.storage.databases.main.embedded_common import Pool, sync_now
+
+    for room_id in rooms:
+        bump_room_generation(namespace, room_id)
+        purge_room(engine_name, namespace, room_id)
+        sync_now(pools=[Pool.STATE])
+        last_event_id = ""
+
+        while True:
+
+            def _read_batch(txn: Any) -> tuple[list[str], dict[str, list[str]]]:
+                # Union both sources: `event_auth` covers every imported edge
+                # (including rejected state events, which may not be in
+                # `state_events`), while `state_events` adds the durable empty
+                # marker for state events whose auth_events list is empty
+                # (e.g. the room create event).
+                txn.execute(
+                    "SELECT event_id FROM ("
+                    "  SELECT event_id FROM state_events WHERE room_id = ?"
+                    "  UNION"
+                    "  SELECT event_id FROM event_auth WHERE room_id = ?"
+                    ") AS ids WHERE event_id > ? "
+                    "ORDER BY event_id LIMIT ?",
+                    (room_id, room_id, last_event_id, batch_size),
+                )
+                event_ids = [event_id for (event_id,) in txn.fetchall()]
+                if not event_ids:
+                    return [], {}
+
+                clause, args = make_in_list_sql_clause(
+                    txn.database_engine, "event_id", event_ids
+                )
+                txn.execute(
+                    "SELECT event_id, auth_id FROM event_auth WHERE room_id = ? AND "
+                    + clause,
+                    (room_id, *args),
+                )
+                auth_events: dict[str, list[str]] = {
+                    event_id: [] for event_id in event_ids
+                }
+                for event_id, auth_id in txn.fetchall():
+                    auth_events[event_id].append(auth_id)
+                return event_ids, auth_events
+
+            event_ids, auth_events = await store.db_pool.runInteraction(
+                "auth_chain_migrate_batch", _read_batch
+            )
+            if not event_ids:
+                break
+
+            all_ids = list(
+                dict.fromkeys(
+                    event_ids
+                    + [
+                        auth_id
+                        for event_id in event_ids
+                        for auth_id in auth_events[event_id]
+                    ]
+                )
+            )
+            short_ids = get_or_create_short_ids(
+                engine_name, namespace, room_id, all_ids
+            )
+            short_id_of = dict(zip(all_ids, short_ids))
+            rows = [
+                (short_id_of[event_id], [short_id_of[a] for a in auth_events[event_id]])
+                for event_id in event_ids
+            ]
+            embed_auth_edges_batch(engine_name, namespace, room_id, rows)
+            embedded = get_embedded_auth_edges_batch(
+                engine_name, namespace, room_id, [short_id for short_id, _ in rows]
+            )
+            for (event_id, auth_ids), (short_id, _) in zip(
+                ((event_id, auth_events[event_id]) for event_id in event_ids), rows
+            ):
+                expected = [short_id_of[auth_id] for auth_id in auth_ids]
+                if embedded[short_id] != expected:
+                    raise RuntimeError(
+                        f"Auth-edge verification failed for {event_id} in {room_id}"
+                    )
+
+            stats["state_events"] += len(event_ids)
+            stats["auth_edges"] += sum(
+                len(auth_events[event_id]) for event_id in event_ids
+            )
+            last_event_id = event_ids[-1]
+
+        def _read_dangling(txn: Any) -> list[str]:
+            # Every auth target must itself have an outbound record, or the
+            # runtime would later report IncompleteAuthGraph for it.
+            txn.execute(
+                "SELECT DISTINCT ea.auth_id FROM event_auth AS ea "
+                "WHERE ea.room_id = ? "
+                "AND NOT EXISTS (SELECT 1 FROM state_events AS se "
+                "                WHERE se.event_id = ea.auth_id) "
+                "AND NOT EXISTS (SELECT 1 FROM event_auth AS e2 "
+                "                WHERE e2.event_id = ea.auth_id) "
+                "LIMIT 5",
+                (room_id,),
+            )
+            return [auth_id for (auth_id,) in txn.fetchall()]
+
+        dangling = await store.db_pool.runInteraction(
+            "auth_chain_migrate_dangling", _read_dangling
+        )
+        if dangling:
+            raise RuntimeError(
+                f"Room {room_id} has auth references with no outbound auth-event "
+                f"record, e.g. {dangling}; refusing to migrate"
+            )
+
+        sync_now(pools=[Pool.STATE])
+        stats["rooms"] += 1
+
+    # Check that every SQL inbound edge is represented in mtxdb, and that no
+    # stale child survived the room rebuild.
+    for room_id in rooms:
+        last_event_id = ""
+        while True:
+
+            def _read_parent_batch(txn: Any) -> tuple[list[str], dict[str, list[str]]]:
+                txn.execute(
+                    "SELECT event_id FROM ("
+                    "  SELECT event_id FROM state_events WHERE room_id = ?"
+                    "  UNION"
+                    "  SELECT auth_id AS event_id FROM event_auth WHERE room_id = ?"
+                    ") AS ids WHERE event_id > ? "
+                    "ORDER BY event_id LIMIT ?",
+                    (room_id, room_id, last_event_id, batch_size),
+                )
+                parent_ids = [event_id for (event_id,) in txn.fetchall()]
+                if not parent_ids:
+                    return [], {}
+                clause, args = make_in_list_sql_clause(
+                    txn.database_engine, "auth_id", parent_ids
+                )
+                txn.execute(
+                    "SELECT auth_id, event_id FROM event_auth WHERE room_id = ? AND "
+                    + clause,
+                    (room_id, *args),
+                )
+                children: dict[str, list[str]] = {
+                    event_id: [] for event_id in parent_ids
+                }
+                for parent_id, child_id in txn.fetchall():
+                    children[parent_id].append(child_id)
+                return parent_ids, children
+
+            parent_ids, children = await store.db_pool.runInteraction(
+                "auth_chain_migrate_verify_children", _read_parent_batch
+            )
+            if not parent_ids:
+                break
+            parent_short_ids = get_or_create_short_ids(
+                engine_name, namespace, room_id, parent_ids
+            )
+            all_child_ids = list(
+                dict.fromkeys(
+                    child for parent in parent_ids for child in children[parent]
+                )
+            )
+            child_short_ids = dict(
+                zip(
+                    all_child_ids,
+                    get_or_create_short_ids(
+                        engine_name, namespace, room_id, all_child_ids
+                    ),
+                )
+            )
+            actual = get_embedded_auth_children_batch(
+                engine_name, namespace, room_id, parent_short_ids
+            )
+            for parent_id, parent_short_id in zip(parent_ids, parent_short_ids):
+                expected = sorted(
+                    child_short_ids[child_id] for child_id in children[parent_id]
+                )
+                if sorted(actual[parent_short_id]) != expected:
+                    raise RuntimeError(
+                        f"Auth-child verification failed for {parent_id} in {room_id}"
+                    )
+            last_event_id = parent_ids[-1]
+
+    def _set_marker(txn: Any) -> None:
+        txn.execute("UPDATE auth_chain_backend SET backend = 'mtxdb' WHERE lock = 'X'")
+        if txn.rowcount == 0:
+            txn.execute(
+                "INSERT INTO auth_chain_backend (lock, backend) VALUES ('X', 'mtxdb')"
+            )
+
+    await store.db_pool.runInteraction("auth_chain_migrate_set_marker", _set_marker)
+    return stats
 
 
 def _engine(engine_name: str | None):  # type: ignore[no-untyped-def]
@@ -122,6 +406,17 @@ def get_or_create_short_ids(
     if not event_ids:
         return []
     return _engine(engine_name).get_or_create_short_ids(namespace, room_id, event_ids)
+
+
+def resolve_event_ids_to_short_ids(
+    engine_name: str | None, namespace: str, room_id: str, event_ids: list[str]
+) -> list[int | None]:
+    """Resolve existing short ids without allocating, for read-only workers."""
+    if not event_ids:
+        return []
+    return _engine(engine_name).resolve_event_ids_to_short_ids(
+        namespace, room_id, event_ids
+    )
 
 
 def resolve_short_ids_to_event_ids(
@@ -148,10 +443,12 @@ def embed_auth_edges_batch(
     namespace: str,
     room_id: str,
     rows: list[tuple[int, list[int]]],
+    *,
+    transaction: MtxdbTransaction | None = None,
 ) -> None:
     """`rows`: `(event_short_id, [auth_short_id, ...])`. Idempotent: safe to
-    call again with the same data (e.g. a retried post-commit dual-write,
-    or the cold-import path in §3 re-embedding an already-embedded event).
+    call again with the same data (a retried persist, or a repeated offline
+    import re-embedding an already-embedded event).
 
     Writes *both* directions of the graph: the outbound `event_short_id ->
     [auth_short_id, ...]` list this row describes, and -- for each
@@ -165,17 +462,16 @@ def embed_auth_edges_batch(
     can't answer the forward-reachability question the V2.1
     conflicted-subgraph algorithm needs.
 
-    Callers must only invoke this strictly after the corresponding SQL
-    `event_auth` insert has *committed* (plan §2's write-timing
-    requirement) -- never from within that same transaction, since a
-    rollback would otherwise leave ghost mtxdb records with no matching
-    SQL row. A failure here is expected to happen occasionally and must
-    not be treated as fatal: log/metric it and move on, since the
-    cold-import path below repairs the gap the next time this event is
-    visited by a closure walk.
+    A persistence caller may pass its staged mtxdb transaction so edges and
+    event JSON become visible at the same boundary. Standalone imports write
+    directly through the engine.
     """
     if not rows:
         return
+    if transaction is not None:
+        transaction.auth_chain_edges_put(namespace, room_id, rows)
+        return
+
     engine = _engine(engine_name)
     engine.auth_chain_edges_put(namespace, room_id, rows)
 
@@ -190,9 +486,8 @@ def embed_auth_edges_batch(
 def get_embedded_auth_edges_batch(
     engine_name: str | None, namespace: str, room_id: str, short_ids: list[int]
 ) -> dict[int, list[int] | None]:
-    """`None` for a short id with no embedded edges yet (the cold-import
-    signal); an empty list is a genuine leaf (zero auth events) and is
-    final, not a signal to fetch SQL.
+    """`None` for a short id with no embedded edge record (corruption after
+    the cutover); an empty list is a genuine leaf (zero auth events).
     """
     if not short_ids:
         return {}
@@ -207,7 +502,7 @@ def get_embedded_auth_children_batch(
     to directly name it as an auth event so far. Missing/`None` and
     `Some([])` are the same information here (see
     `auth_chain_children_get`'s docstring in `mtxdb.rs`) -- both normalize
-    to `[]`, never a cold-import signal the way outbound edges' `None` is.
+    to `[]`. Outbound edges distinguish the two: `None` is a gap.
     """
     if not short_ids:
         return {}
@@ -264,7 +559,7 @@ def purge_room(engine_name: str | None, namespace: str, room_id: str) -> None:
 
 class ClosureCache:
     """A bounded in-process LRU of `(room_generation, event_short_id) ->
-    BitMap`, plus the cold-import-aware BFS that populates it.
+    BitMap`, plus the direct-edge BFS that populates it.
 
     Not thread-safe beyond the GIL's own serialization of individual
     dict/OrderedDict operations -- matches the rest of the embedded-engine
@@ -296,6 +591,9 @@ class ClosureCache:
         # re-verifies anything. Namespace and room_id must be part of the
         # key for this cache to be safe with more than one room per process.
         self._cache: OrderedDict[tuple[str, str, int, int], BitMap] = OrderedDict()
+        # Reads run on database threads (see event_federation.py), so the
+        # check-then-evict sequences below must be serialized.
+        self._lock = threading.RLock()
 
     def _get(
         self, namespace: str, room_id: str, generation: int, short_id: int
@@ -324,11 +622,11 @@ class ClosureCache:
         """Test/debug helper -- production invalidation goes through
         `bump_room_generation`, not this.
         """
-        self._cache.clear()
+        with self._lock:
+            self._cache.clear()
 
     def get_closure(
         self,
-        txn: _AuthChainTxn,
         engine_name: str | None,
         namespace: str,
         room_id: str,
@@ -337,29 +635,16 @@ class ClosureCache:
         """Returns event_short_id's ancestor closure (not including
         event_short_id itself), computing and caching it if necessary.
 
-        Raises `IncompleteAuthGraph` if the walk hits a genuinely missing
-        auth edge for some event reachable from `event_short_id` that
-        SQL's `event_auth` also has no row for (a real data gap, not an
-        ordinary cache miss) -- callers must let this propagate up to
-        `event_federation.py`'s narrow `_NoChainCoverIndex` fallback, not
-        swallow it here.
+        Raises `IncompleteAuthGraph` if the walk hits an event with no
+        embedded auth-edge record; after the cutover that is a data gap, not
+        an ordinary cache miss.
         """
-        generation = _room_generation(namespace, room_id)
-        cached = self._get(namespace, room_id, generation, event_short_id)
-        if cached is not None:
-            return cached
-
-        closure, is_complete = self._walk(
-            txn, engine_name, namespace, room_id, event_short_id, generation, {}
-        )
-        if not is_complete:
-            raise IncompleteAuthGraph(event_short_id)
-        self._put(namespace, room_id, generation, event_short_id, closure)
-        return closure
+        return self.get_closures_batch(
+            engine_name, namespace, room_id, [event_short_id]
+        )[event_short_id]
 
     def get_closures_batch(
         self,
-        txn: _AuthChainTxn,
         engine_name: str | None,
         namespace: str,
         room_id: str,
@@ -369,16 +654,44 @@ class ClosureCache:
         requested roots so overlapping ancestor subgraphs are only walked
         once per call.
         """
+        with self._lock:
+            return self._get_closures_batch_locked(
+                engine_name, namespace, room_id, event_short_ids
+            )
+
+    def _get_closures_batch_locked(
+        self,
+        engine_name: str | None,
+        namespace: str,
+        room_id: str,
+        event_short_ids: list[int],
+    ) -> dict[int, BitMap]:
         generation = _room_generation(namespace, room_id)
+        # Closures found in the LRU while preloading. `_put` below may evict
+        # them before the walk reaches them; the preload skipped loading their
+        # edges because they were cached, so the walk must keep using these
+        # request-local references rather than re-reading the LRU.
+        pinned: dict[int, BitMap] = {}
+        roots_to_load: list[int] = []
+        for short_id in event_short_ids:
+            cached = self._get(namespace, room_id, generation, short_id)
+            if cached is None:
+                roots_to_load.append(short_id)
+            else:
+                pinned[short_id] = cached
+        direct_edges = self._load_direct_edges(
+            engine_name, namespace, room_id, roots_to_load, generation, pinned
+        )
+
         memo: dict[int, tuple[BitMap, bool]] = {}
         out: dict[int, BitMap] = {}
         for short_id in event_short_ids:
-            cached = self._get(namespace, room_id, generation, short_id)
+            cached = pinned.get(short_id)
             if cached is not None:
                 out[short_id] = cached
                 continue
             closure, is_complete = self._walk(
-                txn, engine_name, namespace, room_id, short_id, generation, memo
+                namespace, room_id, short_id, generation, memo, direct_edges, pinned
             )
             if not is_complete:
                 raise IncompleteAuthGraph(short_id)
@@ -386,42 +699,93 @@ class ClosureCache:
             out[short_id] = closure
         return out
 
+    def _load_direct_edges(
+        self,
+        engine_name: str | None,
+        namespace: str,
+        room_id: str,
+        root_short_ids: list[int],
+        generation: int,
+        pinned: dict[int, BitMap],
+    ) -> dict[int, list[int] | None]:
+        """Collect direct auth edges from mtxdb for the requested closures.
+
+        An explicit empty list is the durable leaf marker. `None` means the
+        event has no record at all, which the caller reports as an incomplete
+        graph.
+        """
+        direct_edges: dict[int, list[int] | None] = {}
+        pending = set(root_short_ids)
+        seen: set[int] = set()
+
+        while pending:
+            layer = pending - seen
+            pending.clear()
+            if not layer:
+                continue
+            seen.update(layer)
+
+            uncached: set[int] = set()
+            for short_id in layer:
+                cached = pinned.get(short_id)
+                if cached is None:
+                    cached = self._get(namespace, room_id, generation, short_id)
+                if cached is None:
+                    uncached.add(short_id)
+                else:
+                    pinned[short_id] = cached
+            layer = uncached
+            if not layer:
+                continue
+
+            embedded = get_embedded_auth_edges_batch(
+                engine_name, namespace, room_id, list(layer)
+            )
+            for short_id, auth_short_ids in embedded.items():
+                if auth_short_ids is None:
+                    direct_edges[short_id] = None
+                else:
+                    direct_edges[short_id] = auth_short_ids
+                    pending.update(auth_short_ids)
+
+        return direct_edges
+
     def _walk(
         self,
-        txn: _AuthChainTxn,
-        engine_name: str | None,
         namespace: str,
         room_id: str,
         event_short_id: int,
         generation: int,
         memo: dict[int, tuple[BitMap, bool]],
+        direct_edges: dict[int, list[int] | None],
+        pinned: dict[int, BitMap],
     ) -> tuple[BitMap, bool]:
-        """Depth-first walk over direct auth edges, unioning children's
-        (cached or freshly-walked) ancestor closures. Returns
-        `(closure, is_complete)`; an incomplete result (a genuinely
-        missing auth event, per `_fetch_direct_edges`) is never cached by
-        the caller.
+        """Iteratively walk direct auth edges and union child closures.
+
+        Returns `(closure, is_complete)`; incomplete results are never cached
+        by the caller. An iterative depth-first traversal avoids Python's
+        recursion limit for long, valid auth chains.
         """
         if event_short_id in memo:
             return memo[event_short_id]
 
-        cached = self._get(namespace, room_id, generation, event_short_id)
-        if cached is not None:
-            memo[event_short_id] = (cached, True)
-            return cached, True
+        def cached_closure(short_id: int) -> BitMap | None:
+            cached = pinned.get(short_id)
+            if cached is None:
+                cached = self._get(namespace, room_id, generation, short_id)
+            return cached
 
-        auth_short_ids = self._fetch_direct_edges(
-            txn, engine_name, namespace, room_id, event_short_id
-        )
-        if auth_short_ids is None:
-            # A genuine gap: SQL has no event_auth rows for this event
-            # either (see _fetch_direct_edges). Distinct from "not
-            # embedded yet", which _fetch_direct_edges resolves via
-            # cold-import before ever returning None.
+        root_cached = cached_closure(event_short_id)
+        if root_cached is not None:
+            memo[event_short_id] = (root_cached, True)
+            return root_cached, True
+
+        root_edges = direct_edges.get(event_short_id)
+        if root_edges is None:
             logger.debug(
                 "auth-chain closure walk: genuine gap at short_id=%s "
-                "(room=%s namespace=%s) -- no SQL event_auth rows and no "
-                "embedded edges; treating as incomplete",
+                "(room=%s namespace=%s) -- no embedded edges; treating as "
+                "incomplete",
                 event_short_id,
                 room_id,
                 namespace,
@@ -430,131 +794,79 @@ class ClosureCache:
             memo[event_short_id] = result
             return result
 
-        logger.debug(
-            "auth-chain closure walk: short_id=%s has %d direct auth edge(s): %s",
-            event_short_id,
-            len(auth_short_ids),
-            auth_short_ids,
-        )
+        # Frames hold [event id, next child index, accumulated closure,
+        # completeness]. `active` tracks only the current DFS path, so a cycle
+        # is treated as an incomplete auth graph rather than recursing forever.
+        stack: list[list[object]] = [[event_short_id, 0, BitMap(), True]]
+        active = {event_short_id}
+        while stack:
+            frame = stack[-1]
+            short_id = cast(int, frame[0])
+            auth_short_ids = direct_edges.get(short_id)
+            assert auth_short_ids is not None
+            child_index = cast(int, frame[1])
 
-        closure = BitMap()
-        complete = True
-        for auth_short_id in auth_short_ids:
-            closure.add(auth_short_id)
-            child_closure, child_complete = self._walk(
-                txn, engine_name, namespace, room_id, auth_short_id, generation, memo
-            )
-            closure |= child_closure
-            complete = complete and child_complete
+            if child_index < len(auth_short_ids):
+                child_id = auth_short_ids[child_index]
+                frame[1] = child_index + 1
+                closure = cast(BitMap, frame[2])
+                closure.add(child_id)
 
-        memo[event_short_id] = (closure, complete)
-        return closure, complete
+                child_result = memo.get(child_id)
+                if child_result is not None:
+                    closure |= child_result[0]
+                    frame[3] = cast(bool, frame[3]) and child_result[1]
+                    continue
 
-    def _fetch_direct_edges(
-        self,
-        txn: _AuthChainTxn,
-        engine_name: str | None,
-        namespace: str,
-        room_id: str,
-        event_short_id: int,
-    ) -> list[int] | None:
-        """Returns `event_short_id`'s direct auth-edge short ids, embedding
-        them from SQL first if they aren't in mtxdb yet (plan §3's
-        cold-import path). Returns `None` only if SQL itself has no
-        `event_auth` rows for this event AND it isn't a known short id at
-        all -- a genuine gap, not an ordinary cache/embed miss.
-        """
-        embedded = get_embedded_auth_edges_batch(
-            engine_name, namespace, room_id, [event_short_id]
-        )[event_short_id]
-        if embedded:
-            return embedded
+                child_cached = cached_closure(child_id)
+                if child_cached is not None:
+                    memo[child_id] = (child_cached, True)
+                    closure |= child_cached
+                    continue
 
-        if embedded == []:
-            # An empty edge list is normally a leaf, but it can also have
-            # been recorded during the short window between the events row
-            # becoming visible and its event_auth rows being committed.  In
-            # that case treating it as final permanently loses the event's
-            # auth chain.  Recheck SQL for empty records; non-empty records
-            # remain the cheap embedded fast path.
-            event_id = resolve_short_ids_to_event_ids(
-                engine_name, namespace, room_id, [event_short_id]
-            )[0]
-            if event_id is not None:
-                auth_event_ids = _fetch_auth_event_ids_from_sql(txn, event_id)
-                if auth_event_ids:
-                    auth_short_ids = get_or_create_short_ids(
-                        engine_name, namespace, room_id, auth_event_ids
-                    )
-                    embed_auth_edges_batch(
-                        engine_name,
-                        namespace,
+                if child_id in active:
+                    # Cycles cannot be produced by valid event auth edges. Use
+                    # the established incomplete-graph path for corrupt data.
+                    frame[3] = False
+                    continue
+
+                child_edges = direct_edges.get(child_id)
+                if child_edges is None:
+                    logger.debug(
+                        "auth-chain closure walk: genuine gap at short_id=%s "
+                        "(room=%s namespace=%s) -- no embedded edges; treating "
+                        "as incomplete",
+                        child_id,
                         room_id,
-                        [(event_short_id, auth_short_ids)],
+                        namespace,
                     )
-                    return auth_short_ids
-            return embedded
+                    memo[child_id] = (BitMap(), False)
+                    frame[3] = False
+                    continue
 
-        event_id = resolve_short_ids_to_event_ids(
-            engine_name, namespace, room_id, [event_short_id]
-        )[0]
-        if event_id is None:
-            # Dangling short id (its event was individually purged, or the
-            # reverse mapping is missing for another reason) -- not
-            # resolvable to anything SQL can help with either.
-            return None
+                logger.debug(
+                    "auth-chain closure walk: short_id=%s has %d direct auth "
+                    "edge(s): %s",
+                    child_id,
+                    len(child_edges),
+                    child_edges,
+                )
+                active.add(child_id)
+                stack.append([child_id, 0, BitMap(), True])
+                continue
 
-        auth_event_ids = _fetch_auth_event_ids_from_sql(txn, event_id)
-        if auth_event_ids is None:
-            # No event_auth rows at all for this event id -- treat as a
-            # genuine leaf only if the event itself is known to SQL;
-            # otherwise it's a real gap.
-            return None
+            closure = cast(BitMap, frame[2])
+            complete = cast(bool, frame[3])
+            memo[short_id] = (closure, complete)
+            active.remove(short_id)
+            stack.pop()
+            if stack:
+                parent = stack[-1]
+                parent_closure = cast(BitMap, parent[2])
+                parent_closure |= closure
+                parent[3] = cast(bool, parent[3]) and complete
 
-        auth_short_ids = (
-            get_or_create_short_ids(
-                engine_name, namespace, room_id, list(auth_event_ids)
-            )
-            if auth_event_ids
-            else []
-        )
-        embed_auth_edges_batch(
-            engine_name, namespace, room_id, [(event_short_id, auth_short_ids)]
-        )
-        return auth_short_ids
-
-
-def _fetch_auth_event_ids_from_sql(
-    txn: _AuthChainTxn, event_id: str
-) -> list[str] | None:
-    """Direct one-hop `auth_events` for `event_id`, from the durable SQL
-    `event_auth` table (event_id, auth_id -- one row per direct edge,
-    written at persist time; see `events.py`). Returns `[]` for a genuine
-    leaf (e.g. the room create event), `None` if `event_id` is not known
-    to SQL at all (a real gap, distinct from "leaf").
-    """
-    txn.execute("SELECT auth_id FROM event_auth WHERE event_id = ?", (event_id,))
-    rows = txn.fetchall()
-    if rows:
-        return [auth_id for (auth_id,) in rows]
-
-    txn.execute("SELECT 1 FROM events WHERE event_id = ?", (event_id,))
-    exists = txn.fetchone()
-    if exists is None:
-        return None
-    return []
-
-
-def _fetch_child_event_ids_from_sql(txn: _AuthChainTxn, event_id: str) -> list[str]:
-    """The reverse of `_fetch_auth_event_ids_from_sql`: every event that
-    directly names `event_id` as one of its auth events, per SQL
-    `event_auth` (`auth_id = event_id`). Used only to verify/repair the
-    embedded inbound (child) edge list stays complete -- see
-    `_fetch_and_verify_children` -- never to build a persisted index of
-    its own.
-    """
-    txn.execute("SELECT event_id FROM event_auth WHERE auth_id = ?", (event_id,))
-    return [child_id for (child_id,) in txn.fetchall()]
+        return memo[event_short_id]
 
 
 # -----------------------------------------------------------------------------
@@ -573,59 +885,16 @@ def _fetch_child_event_ids_from_sql(txn: _AuthChainTxn, event_id: str) -> list[s
 # per request and discarded -- never cached, never persisted.
 
 
-def _fetch_and_verify_children(
-    txn: _AuthChainTxn,
-    engine_name: str | None,
-    namespace: str,
-    room_id: str,
-    parent_short_id: int,
-) -> list[int]:
-    """Returns `parent_short_id`'s known children, repairing the embedded
-    inbound list against SQL `event_auth` first if needed. Unlike outbound
-    edges (written once, atomically, alongside the event that owns them),
-    inbound edges accumulate incrementally as *other* events get embedded
-    -- so a child appended to SQL after this parent's own outbound-edge
-    walk last touched it can be missing here even for an otherwise "warm"
-    parent. This check is what keeps the forward BFS complete rather than
-    silently under-approximating the conflicted subgraph.
-    """
-    embedded = get_embedded_auth_children_batch(
-        engine_name, namespace, room_id, [parent_short_id]
-    )[parent_short_id]
-
-    parent_event_id = resolve_short_ids_to_event_ids(
-        engine_name, namespace, room_id, [parent_short_id]
-    )[0]
-    if parent_event_id is None:
-        # Dangling short id -- nothing in SQL to cross-check against either.
-        return embedded
-
-    sql_child_ids = _fetch_child_event_ids_from_sql(txn, parent_event_id)
-    if not sql_child_ids:
-        return embedded
-
-    sql_child_short_ids = get_or_create_short_ids(
-        engine_name, namespace, room_id, sql_child_ids
-    )
-    missing = [c for c in sql_child_short_ids if c not in embedded]
-    if missing:
-        _engine(engine_name).auth_chain_children_append(
-            namespace, room_id, [(parent_short_id, missing)]
-        )
-        embedded = embedded + missing
-    return embedded
-
-
 def get_forward_reachable_short_ids(
-    txn: _AuthChainTxn,
     engine_name: str | None,
     namespace: str,
     room_id: str,
     start_short_ids: list[int],
     candidate_short_ids: set[int] | None = None,
 ) -> set[int]:
-    """Ephemeral BFS over embedded inbound (child) edges, verified/repaired
-    against SQL as it goes (see `_fetch_and_verify_children`).
+    """Ephemeral BFS over mtxdb inbound (child) edges. This walk performs
+    no SQL reads; outbound auth edges are imported when the backwards closure
+    is built, and embedding each event appends its inbound child edges.
 
     Returns the set of short ids forward-reachable from `start_short_ids`,
     **including the starting events themselves**; when `candidate_short_ids`
@@ -664,17 +933,21 @@ def get_forward_reachable_short_ids(
     seen: set[int] = set()
     frontier = list(starting)
     while frontier:
-        current = frontier.pop()
-        if current in seen:
+        current_layer = set(frontier) - seen
+        frontier = []
+        if not current_layer:
             continue
-        seen.add(current)
-        for child in _fetch_and_verify_children(
-            txn, engine_name, namespace, room_id, current
-        ):
-            if child in seen:
-                continue
-            if candidate_short_ids is not None and child not in candidate_short_ids:
-                continue
-            result.add(child)
-            frontier.append(child)
+
+        children_by_parent = get_embedded_auth_children_batch(
+            engine_name, namespace, room_id, list(current_layer)
+        )
+        seen.update(current_layer)
+        for children in children_by_parent.values():
+            for child in children:
+                if child in seen:
+                    continue
+                if candidate_short_ids is not None and child not in candidate_short_ids:
+                    continue
+                result.add(child)
+                frontier.append(child)
     return result

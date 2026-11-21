@@ -66,6 +66,7 @@ from synapse.federation.federation_base import (
     InvalidEventSignatureError,
     event_from_pdu_json,
     parse_events_from_pdu_json,
+    signature_requests_for_pdus,
 )
 from synapse.federation.transport.client import SendJoinResponse
 from synapse.http.client import is_unknown_endpoint
@@ -1227,6 +1228,9 @@ class FederationClient(FederationBase):
                     raise InvalidResponseError(
                         "State DAG rooms must not set servers_in_room, state or auth_chain fields"
                     )
+                await self.keyring.prefetch_keys(
+                    signature_requests_for_pdus(room_version, state_dag)
+                )
                 await concurrently_execute(_execute, itertools.chain(state_dag), 10000)
                 # NB: We *need* to copy to ensure that we don't have multiple
                 # references being passed on, as that causes... issues.
@@ -1259,6 +1263,11 @@ class FederationClient(FederationBase):
                     raise InvalidResponseError(
                         "Room does not support state DAGs but set state_dag field"
                     )
+                await self.keyring.prefetch_keys(
+                    signature_requests_for_pdus(
+                        room_version, itertools.chain(state, auth_chain)
+                    )
+                )
                 await concurrently_execute(
                     _execute, itertools.chain(state, auth_chain), 10000
                 )
@@ -1689,7 +1698,7 @@ class FederationClient(FederationBase):
         destination: str,
         room_id: str,
         earliest_events_ids: Iterable[str],
-        latest_events: Iterable[EventBase],
+        latest_events: Iterable[EventBase | str],
         limit: int,
         min_depth: int,
         timeout: int,
@@ -1704,14 +1713,16 @@ class FederationClient(FederationBase):
             earliest_events_ids: List of event ids. Effectively the
                 events we expected to receive, but haven't. `get_missing_events`
                 should only return events that didn't happen before these.
-            latest_events: List of events we have received that we don't
-                have all previous events for.
+            latest_events: List of events (or event IDs) we have received that we
+                don't have all previous events for.
             limit: Maximum number of events to return.
             min_depth: Minimum depth of events to return.
             timeout: Max time to wait in ms
             state_dag: True to walk the state DAG (MSC4242 rooms)
         """
-        latest_event_ids = [e.event_id for e in latest_events]
+        latest_event_ids = [
+            e if isinstance(e, str) else e.event_id for e in latest_events
+        ]
         try:
             try:
                 content = await self.transport_layer.get_missing_events(

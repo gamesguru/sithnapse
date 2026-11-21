@@ -91,7 +91,6 @@ class SyncDisabledPublicationTestCase(TestCase):
             engine.sync.assert_not_called()
             engine.sync_state.assert_not_called()
             engine.sync_event_dag.assert_not_called()
-            engine.sync_auth_chain.assert_not_called()
             self.assertEqual(engine.mock_calls, [])
 
     def test_sync_now_with_durability_off_is_a_noop(self) -> None:
@@ -305,3 +304,144 @@ class FfiCountingScopeTestCase(TestCase):
 
             self.assertEqual(embedded_common._FFI_COUNTERS["before"], 4)
             self.assertEqual(embedded_common._FFI_COUNTERS["inside"], 2)
+
+
+class ShutdownCheckpointTestCase(TestCase):
+    """A clean stop leaves a durable checkpoint beside the final sync."""
+
+    def _patched_engine(self, engine: mock.Mock, *, sync_disabled: bool = False):  # type: ignore[no-untyped-def]
+        return (
+            mock.patch.object(embedded_common, "_engine_configured", True),
+            mock.patch.object(embedded_common, "_sync_disabled", sync_disabled),
+            mock.patch(
+                "synapse.storage.databases.embedded_engine.get_embedded_engine",
+                return_value=engine,
+            ),
+        )
+
+    def test_checkpoint_pools_forwards_to_the_engine(self) -> None:
+        engine = mock.Mock()
+        a, b, c = self._patched_engine(engine)
+        with a, b, c:
+            embedded_common.checkpoint_pools()
+        engine.checkpoint_all.assert_called_once_with()
+
+    def test_checkpoint_pools_is_a_noop_when_unconfigured_or_sync_disabled(
+        self,
+    ) -> None:
+        engine = mock.Mock()
+        with (
+            mock.patch.object(embedded_common, "_engine_configured", False),
+            mock.patch(
+                "synapse.storage.databases.embedded_engine.get_embedded_engine",
+                return_value=engine,
+            ),
+        ):
+            embedded_common.checkpoint_pools()
+        engine.checkpoint_all.assert_not_called()
+
+        a, b, c = self._patched_engine(engine, sync_disabled=True)
+        with a, b, c:
+            embedded_common.checkpoint_pools()
+        engine.checkpoint_all.assert_not_called()
+
+    def test_checkpoint_pools_tolerates_an_older_extension(self) -> None:
+        """An extension built before `checkpoint_all` must not break shutdown."""
+        engine = mock.Mock(spec=[])  # no attributes at all
+        a, b, c = self._patched_engine(engine)
+        with a, b, c:
+            embedded_common.checkpoint_pools()  # must not raise
+
+    def test_close_checkpoints_after_the_final_sync(self) -> None:
+        """The checkpoint runs after the dirty pools are synced, never before."""
+        from synapse.storage.databases.main.embedded_common import _FlushCoalescer
+        from synapse.util.clock import Clock
+
+        from tests.server import ThreadedMemoryReactorClock
+
+        order: list[str] = []
+        clock = Clock(ThreadedMemoryReactorClock(), server_name="test_server")  # type: ignore[multiple-internal-clocks]
+        coalescer = _FlushCoalescer(clock)
+        coalescer._dirty.add(Pool.STATE)
+        with (
+            mock.patch.object(
+                embedded_common, "_drain_edge_writes", return_value=False
+            ),
+            mock.patch.object(
+                embedded_common,
+                "_do_sync_pools",
+                side_effect=lambda pools: order.append("sync"),
+            ),
+            mock.patch.object(
+                embedded_common,
+                "checkpoint_pools",
+                side_effect=lambda: order.append("checkpoint"),
+            ),
+        ):
+            coalescer.close()
+        self.assertEqual(order, ["sync", "checkpoint"])
+
+    def test_close_still_checkpoints_when_nothing_is_dirty(self) -> None:
+        """A stop with no dirty pool still moves the baseline forward."""
+        from synapse.storage.databases.main.embedded_common import _FlushCoalescer
+        from synapse.util.clock import Clock
+
+        from tests.server import ThreadedMemoryReactorClock
+
+        clock = Clock(ThreadedMemoryReactorClock(), server_name="test_server")  # type: ignore[multiple-internal-clocks]
+        coalescer = _FlushCoalescer(clock)
+        with (
+            mock.patch.object(
+                embedded_common, "_drain_edge_writes", return_value=False
+            ),
+            mock.patch.object(embedded_common, "_do_sync_pools") as sync,
+            mock.patch.object(embedded_common, "checkpoint_pools") as checkpoint,
+        ):
+            coalescer.close()
+        sync.assert_not_called()
+        checkpoint.assert_called_once_with()
+
+    def test_close_skips_checkpoint_when_final_sync_fails(self) -> None:
+        """A failed final sync must not publish a baseline for dirty writes."""
+        from synapse.storage.databases.main.embedded_common import _FlushCoalescer
+        from synapse.util.clock import Clock
+
+        from tests.server import ThreadedMemoryReactorClock
+
+        clock = Clock(ThreadedMemoryReactorClock(), server_name="test_server")  # type: ignore[multiple-internal-clocks]
+        coalescer = _FlushCoalescer(clock)
+        coalescer._dirty.add(Pool.STATE)
+        with (
+            mock.patch.object(
+                embedded_common, "_drain_edge_writes", return_value=False
+            ),
+            mock.patch.object(
+                embedded_common,
+                "_do_sync_pools",
+                side_effect=RuntimeError("sync failed"),
+            ),
+            mock.patch.object(embedded_common, "checkpoint_pools") as checkpoint,
+        ):
+            coalescer.close()
+        checkpoint.assert_not_called()
+
+    def test_close_survives_a_checkpoint_failure(self) -> None:
+        """A failed shutdown checkpoint is logged, not raised."""
+        from synapse.storage.databases.main.embedded_common import _FlushCoalescer
+        from synapse.util.clock import Clock
+
+        from tests.server import ThreadedMemoryReactorClock
+
+        clock = Clock(ThreadedMemoryReactorClock(), server_name="test_server")  # type: ignore[multiple-internal-clocks]
+        coalescer = _FlushCoalescer(clock)
+        with (
+            mock.patch.object(
+                embedded_common, "_drain_edge_writes", return_value=False
+            ),
+            mock.patch.object(
+                embedded_common,
+                "checkpoint_pools",
+                side_effect=RuntimeError("checkpoint failed"),
+            ),
+        ):
+            coalescer.close()  # must not raise

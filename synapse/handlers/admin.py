@@ -209,7 +209,8 @@ class AdminHandler:
             else:
                 stream_ordering = room.event_pos.stream
 
-            from_key = RoomStreamToken(topological=0, stream=0)
+            # The smallest possible timestamp, so the token sorts before every event.
+            from_key = RoomStreamToken(topological=0, timestamp=-(2**63), stream=0)
             to_key = RoomStreamToken(stream=stream_ordering)
 
             # Events that we've processed in this room
@@ -251,6 +252,7 @@ class AdminHandler:
                 from_key = RoomStreamToken(
                     stream=last_event.internal_metadata.stream_ordering,
                     topological=last_event.depth,
+                    timestamp=last_event.origin_server_ts,
                 )
 
                 filtered_events = await filter_and_transform_events_for_client(

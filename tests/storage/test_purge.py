@@ -36,13 +36,15 @@ from synapse.storage.databases.main.embedded_common import (
     enable_ffi_counting,
     get_ffi_count,
 )
+from synapse.storage.databases.main.embedded_event_auth_chains import (
+    embed_auth_edges_batch,
+    get_embedded_auth_edges_batch,
+    get_or_create_short_ids,
+    resolve_short_ids_to_event_ids,
+)
 from synapse.storage.databases.main.embedded_redactions import (
     get_redactions_batch,
     put_redaction_batch,
-)
-from synapse.storage.databases.main.embedded_rejections import (
-    get_rejections_batch,
-    put_rejection_batch,
 )
 from synapse.types.state import StateFilter
 from synapse.types.storage import _BackgroundUpdates
@@ -50,6 +52,23 @@ from synapse.util.clock import Clock
 
 from tests.test_utils.event_builders import make_test_pdu_event
 from tests.unittest import HomeserverTestCase
+from tests.utils import EMBEDDED_DB_ENGINE, EMBEDDED_DB_PATH
+
+if EMBEDDED_DB_ENGINE and EMBEDDED_DB_PATH:
+    # Reuse the test harness's worker store; opening a private one here would
+    # win the engine's process-global OnceCell.
+    _EMBEDDED_ENGINE_TMPDIR = EMBEDDED_DB_PATH
+else:
+    import atexit
+    import shutil
+    import tempfile
+
+    _EMBEDDED_ENGINE_TMPDIR = tempfile.mkdtemp(prefix="test-purge-embedded-")
+    atexit.register(shutil.rmtree, _EMBEDDED_ENGINE_TMPDIR, ignore_errors=True)
+
+from synapse.synapse_rust import mtxdb_engine
+
+mtxdb_engine.open_client(_EMBEDDED_ENGINE_TMPDIR)
 
 
 class PurgeTests(HomeserverTestCase):
@@ -70,23 +89,23 @@ class PurgeTests(HomeserverTestCase):
     def _enable_embedded_engine(self) -> tuple[str, str]:
         """Force-enable the embedded mtxdb path for a single test.
 
-        Opens a per-test client and enables both the main and persister
-        stores *before* the room under test is created: the room's create
-        event must be persisted through the mirror, or events_worker.py's
-        unconditional `_embedded_event_json_enabled` read check
-        (events_worker.py:1666) routes its auth-chain lookup through a mirror
-        that never saw it, 403ing with "No create event in auth events".
+        Enables both the main and persister stores *before* the room under
+        test is created: the room's create event must be persisted through
+        the mirror, or events_worker.py's unconditional
+        `_embedded_event_json_enabled` read check (events_worker.py:1666)
+        routes its auth-chain lookup through a mirror that never saw it,
+        403ing with "No create event in auth events".
+
+        The engine itself is process-global (`mtxdb_engine.open_client` is
+        backed by a Rust `OnceCell`), so the module-level store opened at
+        import time is reused; a per-test directory would be unlinked while
+        the engine still pointed at it.
 
         Returns the configured (engine, namespace).
         """
-        import shutil
-        import tempfile
-
         from synapse.synapse_rust import mtxdb_engine
 
-        tmpdir = tempfile.mkdtemp(prefix="test-purge-embedded-")
-        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
-        mtxdb_engine.open_client(tmpdir)
+        mtxdb_engine.open_client(_EMBEDDED_ENGINE_TMPDIR)
 
         persist_store = self.hs.get_datastores().persist_events
         assert persist_store is not None
@@ -125,19 +144,15 @@ class PurgeTests(HomeserverTestCase):
             )
         )
         put_redaction_batch(engine, namespace, [(target_id, redaction_id, True)])
-        put_rejection_batch(engine, namespace, [(target_id, "test rejection", "1")])
 
     def _assert_mirrors(
         self, engine: str, namespace: str, target_id: str, present: bool
     ) -> None:
         redactions = get_redactions_batch(engine, namespace, [target_id])
-        rejections = get_rejections_batch(engine, namespace, [target_id])
         if present:
             self.assertIn(target_id, redactions)
-            self.assertIn(target_id, rejections)
         else:
             self.assertNotIn(target_id, redactions)
-            self.assertNotIn(target_id, rejections)
 
     def test_purge_history(self) -> None:
         """
@@ -184,7 +199,7 @@ class PurgeTests(HomeserverTestCase):
             self.store.get_topological_token_for_event(last["event_id"])
         )
         assert token.topological is not None
-        event = f"t{token.topological + 1}-{token.stream + 1}"
+        event = f"t{token.topological + 1}.{token.timestamp}.{token.stream + 1}"
 
         # Purge everything before this topological token
         f = self.get_failure(
@@ -241,6 +256,59 @@ class PurgeTests(HomeserverTestCase):
         self.get_success(self._storage_controllers.purge_events.purge_room(room_id))
 
         self._assert_mirrors(engine, namespace, target["event_id"], present=False)
+
+    def test_purge_room_clears_embedded_auth_chain(self) -> None:
+        engine, namespace = self._enable_embedded_engine()
+        if namespace is None:
+            self.skipTest("embedded auth-chain namespace not configured")
+
+        room_id = self.helper.create_room_as(self.user_id)
+        event_id = self.helper.send(room_id, body="auth chain event")["event_id"]
+
+        # Model a pre-cutover SQL snapshot. Runtime mtxdb writes no longer
+        # populate event_auth, but the table can still hold rows from before
+        # migration and purge must erase those rows for privacy.
+        self.get_success(
+            self.store.db_pool.simple_insert(
+                table="event_auth",
+                values={
+                    "event_id": event_id,
+                    "room_id": room_id,
+                    "auth_id": "$old-auth-event",
+                },
+            )
+        )
+
+        short_id = get_or_create_short_ids(engine, namespace, room_id, [event_id])[0]
+        embed_auth_edges_batch(engine, namespace, room_id, [(short_id, [])])
+        self.assertEqual(
+            get_embedded_auth_edges_batch(engine, namespace, room_id, [short_id]),
+            {short_id: []},
+        )
+        self.assertEqual(
+            resolve_short_ids_to_event_ids(engine, namespace, room_id, [short_id]),
+            [event_id],
+        )
+
+        self.get_success(self._storage_controllers.purge_events.purge_room(room_id))
+
+        sql_auth_rows = self.get_success(
+            self.store.db_pool.simple_select_list(
+                table="event_auth",
+                keyvalues={"event_id": event_id},
+                retcols=("auth_id",),
+            )
+        )
+        self.assertEqual(sql_auth_rows, [])
+
+        self.assertEqual(
+            get_embedded_auth_edges_batch(engine, namespace, room_id, [short_id]),
+            {short_id: None},
+        )
+        self.assertEqual(
+            resolve_short_ids_to_event_ids(engine, namespace, room_id, [short_id]),
+            [None],
+        )
 
     def test_purge_history_clears_embedded_redaction_and_rejection_mirrors(
         self,

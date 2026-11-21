@@ -103,6 +103,11 @@ case "$DEB_BUILD_OPTIONS" in
 
         cp -r tests "$tmpdir"
 
+        # tests/test_merge_yaml.py loads scripts-dev/merge_yaml.py relative to
+        # the test tree, so keep that sibling layout in the temporary directory.
+        mkdir -p "$tmpdir/scripts-dev"
+        cp scripts-dev/merge_yaml.py "$tmpdir/scripts-dev/"
+
         # To avoid pulling in the unbuilt Synapse in the local directory
         pushd /
 

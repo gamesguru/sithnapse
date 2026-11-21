@@ -317,114 +317,6 @@ class StateStoreTestCase(HomeserverTestCase):
         )
 
     @unittest.skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
-    def test_embedded_db_migration_copies_existing_sql_data(self) -> None:
-        """A state group written before `embedded_db_engine` was turned on
-        stays SQL-only until `_background_migrate_state_hamt_to_embedded`
-        runs; after it completes, the group is readable via mtxdb with SQL
-        deleted out from under it -- proving the data actually moved, not
-        just that the SQL fallback happened to still work.
-        """
-        import shutil
-        import tempfile
-
-        from synapse.synapse_rust import mtxdb_engine
-
-        # Persist with no embedded engine configured -- goes to SQL only.
-        self._force_sql_only_hamt()
-        event = self.inject_state_event(
-            self.room, self.u_alice, EventTypes.Create, "", {}
-        )
-        state_group = self.get_success(
-            self.store._get_state_group_for_event(event.event_id)
-        )
-        assert state_group is not None
-
-        sql_root_before = self.get_success(
-            self.store.db_pool.simple_select_one_onecol(
-                table="state_hamt_roots",
-                keyvalues={"state_group": state_group},
-                retcol="state_group",
-                desc="test_embedded_db_migration.check_sql_before",
-            )
-        )
-        self.assertEqual(sql_root_before, state_group)
-
-        # Now turn on the embedded engine and run the migration. In real
-        # deployments `embedded_db_engine` is set before the store is
-        # constructed, so __init__ registers the handler for
-        # do_next_background_update to dispatch to; this test flips the
-        # config after construction (same pattern the other embedded-engine
-        # tests here use), so no handler was ever registered for this store
-        # instance. Exercise _enqueue_embedded_db_migration_if_needed
-        # (real production code, still worth covering), but do not start its
-        # poller: it would race this test's direct handler invocation and
-        # repeatedly fail to dispatch the unregistered handler. Drive the
-        # handler directly instead.
-        tmpdir = tempfile.mkdtemp(prefix="test-hamt-migration-mtxdb-")
-        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
-        mtxdb_engine.open_client(tmpdir)
-        self.state_datastore._embedded_db_engine = "mtxdb"
-        self.state_datastore._embedded_db_path = tmpdir
-        # `mtxdb_engine.open_client` is a no-op after the first call in
-        # this process (`DBS` is a process-global `OnceCell` -- see
-        # rust/src/database/mtxdb_syn.rs), so every `test_embedded_*` test
-        # in this file that opens its own "fresh" tmpdir is actually still
-        # sharing one mtxdb store for the whole trial worker process.
-        # `_embedded_db_namespace` defaults to `server_name`, which every
-        # test here shares too ("test"), so without overriding it, two
-        # tests using the same `self.room` and the same small state_group
-        # ids (both start counting from 1) collide on the same mtxdb keys.
-        # tmpdir is unique per test (tempfile.mkdtemp), so reuse it as the
-        # namespace to keep tests isolated despite the shared store.
-        self.state_datastore._embedded_db_namespace = tmpdir
-
-        with patch.object(
-            self.store.db_pool.updates, "start_doing_background_updates"
-        ) as start_background_updates:
-            self.get_success(
-                self.state_datastore._enqueue_embedded_db_migration_if_needed()
-            )
-        start_background_updates.assert_called_once_with()
-
-        # `_background_migrate_state_hamt_to_embedded` ends the update after
-        # its final batch, which normally follows the poller selecting it.
-        # Model that selection explicitly rather than relying on a concurrently
-        # running poller to set this private dispatcher state.
-        self.store.db_pool.updates._current_background_update = (
-            self.state_datastore.EMBEDDED_DB_MIGRATION_UPDATE_NAME
-        )
-        progress: dict = {}
-        while True:
-            moved = self.get_success(
-                self.state_datastore._background_migrate_state_hamt_to_embedded(
-                    progress, batch_size=500
-                )
-            )
-            if moved == 0:
-                break
-            progress = {"last_state_group": state_group}
-
-        # Delete the SQL rows entirely -- if the read below still works,
-        # the data really moved into mtxdb rather than the read just still
-        # falling back to SQL.
-        self.get_success(
-            self.store.db_pool.simple_delete(
-                table="state_hamt_roots",
-                keyvalues={"state_group": state_group},
-                desc="test_embedded_db_migration.delete_sql_root",
-            )
-        )
-
-        full_state = self.get_success(
-            self.state_datastore._get_state_groups_from_groups(
-                [state_group], StateFilter.all()
-            )
-        )
-        self.assertDictEqual(
-            full_state[state_group], {(EventTypes.Create, ""): event.event_id}
-        )
-
-    @unittest.skipUnless(EMBEDDED_DB_ENGINE, "requires embedded DB engine")
     def test_embedded_engine_root_lookup_does_not_need_sql(self) -> None:
         """`_store_state_hamt_root_embedded_txn` mirrors the HAMT root
         record into the embedded engine itself (under the `hamt:root:...`
@@ -2451,9 +2343,18 @@ class HAMTStructuralKeyRegressionTest(HomeserverTestCase):
         # This catches regressions where the macaroon secret or another
         # ambient key leaks into the structural hash -- a mere length check
         # would pass regardless of what fed the hash, so pin the exact bytes.
+        #
+        # The structural hash was re-pinned for rezzy 8ee8ea3, which routes
+        # HAMT keys by their encoded bytes instead of the Rust `Hash` stream
+        # (rezzy keeps the old routing behind `legacy_key_path_hash`). That
+        # changes the tree shape, and therefore the root structural hash, but
+        # not the content: the lattice-derived `state_group_id` below is
+        # byte-identical to the pre-change value. If the two ever move
+        # together, suspect content encoding or ambient key material rather
+        # than tree layout.
         self.assertEqual(
             hash_a.hex(),
-            "46a91b55f48cdb7e5e628395c65c3699a3af8bc81954886b59f972345fecc139",
+            "f9c4f2ecc0b8a7bb280b958969434f708a9148823ad62c7fc63be243c7ed8fe8",
         )
         self.assertEqual(
             sg_a.hex(),

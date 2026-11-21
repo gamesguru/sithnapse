@@ -29,7 +29,7 @@ sync:	##H Sync deps (uv) then build the Rust extension (maturin develop)
 	# `matrix-synapse` install, so every subsequent `uv run` would uninstall
 	# and reinstall it. `--no-install-project` leaves the package to maturin;
 	# `--inexact` keeps it from being treated as extraneous and removed.
-	uv sync --no-install-project --inexact
+	uv sync --no-install-project --inexact --group core_dev
 	@rm -f target/maturin/libsynapse.so target/release/libsynapse.so
 	@RUSTC_WRAPPER= uv run --no-sync maturin develop --release
 	@test -s target/maturin/libsynapse.so || { \
@@ -133,6 +133,20 @@ install/build: ##H Build, pip-install $(INSTALL_SRC) to $(INSTALL_DIR)
 	# if [ -f .env ]; then set -a; . ./.env; set +a; fi
 	@echo "Installing $(INSTALL_SRC)$(INSTALL_EXTRAS) into $(INSTALL_DIR)"
 	sudo "$(INSTALL_DIR)/bin/pip" install "$(INSTALL_SRC)$(INSTALL_EXTRAS)"
+	@# A pip-installed copy has no git checkout, so record the branch and commit
+	@# it was built from; synapse/util/__init__.py reads this for the version.
+	@# Use the installed interpreter in isolated mode so the checkout's
+	@# synapse/ package, egg-info and PYTHONPATH cannot shadow it on sys.path.
+	@set -euo pipefail; \
+	install_python="$$(cd "$(INSTALL_DIR)" && pwd)/bin/python"; \
+	ver="$$("$$install_python" -I -c 'import importlib.metadata as m; print(m.version("matrix-synapse"))')"; \
+	branch="$$(git -C "$(INSTALL_SRC)" rev-parse --abbrev-ref HEAD)"; \
+	rev="$$(git -C "$(INSTALL_SRC)" rev-parse --short HEAD)"; \
+	dirty=""; \
+	if [ -n "$$(git -C "$(INSTALL_SRC)" status --porcelain --untracked-files=no)" ]; then dirty=",dirty"; fi; \
+	pkg="$$("$$install_python" -I -c 'import importlib.util as u; print(u.find_spec("synapse").submodule_search_locations[0])')"; \
+	echo "Recording version $$ver (b=$$branch,$$rev$$dirty) in $$pkg"; \
+	echo "$$ver (b=$$branch,$$rev$$dirty)" | sudo tee "$$pkg/_build_version.txt" >/dev/null
 
 .PHONY: install/gen-config
 install/gen-config: ##H Generate homeserver config as $(INSTALL_USER)
@@ -145,6 +159,28 @@ install/gen-config: ##H Generate homeserver config as $(INSTALL_USER)
 		--config-path "$(CONFIG_PATH)" \
 		--generate-config \
 		--report-stats="$(REPORT_STATS)"
+
+
+# Output of `make install/merge-config`. It holds your secrets, so keep it out
+# of version control (`/homeserver*.yaml` is already gitignored).
+MERGED_PATH ?= homeserver.merged.yaml
+
+# Defaults for the offline `make merge-config` target, which works on a config
+# copied into the checkout (e.g. `scp server:/etc/sithnapse/homeserver.yaml .`).
+LOCAL_CONFIG ?= homeserver.yaml
+LOCAL_MERGED_PATH ?= homeserver.merged.yaml
+
+.PHONY: merge-config
+merge-config: ##H Merge local homeserver.yaml onto the schema (offline) -> homeserver.merged.yaml
+	python3 scripts-dev/merge_yaml.py \
+		-c "$(LOCAL_CONFIG)" \
+		-s schema/synapse-config.schema.yaml \
+		-o "$(LOCAL_MERGED_PATH)"
+
+.PHONY: install/merge-config
+install/merge-config: ##H Merge CONFIG_PATH onto the full documented template -> MERGED_PATH
+	@echo "Merging $(CONFIG_PATH) into $(MERGED_PATH)"
+	uv run --no-sync python scripts-dev/merge_yaml.py -c "$(CONFIG_PATH)" -o "$(MERGED_PATH)"
 
 
 .PHONY: _publish

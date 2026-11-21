@@ -48,12 +48,21 @@ from synapse.api.errors import (
 from synapse.config.key import TrustedKeyServer
 from synapse.events import EventBase
 from synapse.http.matrixfederationclient import StrictJsonParser
-from synapse.logging.context import make_deferred_yieldable, run_in_background
+from synapse.logging.context import (
+    PreserveLoggingContext,
+    make_deferred_yieldable,
+    run_in_background,
+)
 from synapse.storage.keys import FetchKeyResult
 from synapse.synapse_rust.events import redact_event
 from synapse.types import JsonDict
 from synapse.util import unwrapFirstError
-from synapse.util.async_helpers import yieldable_gather_results
+from synapse.util.async_helpers import (
+    concurrently_execute,
+    stop_cancellation,
+    timeout_deferred,
+    yieldable_gather_results,
+)
 from synapse.util.batching_queue import BatchingQueue
 from synapse.util.clock import Clock
 from synapse.util.retryutils import NotRetryingDestination
@@ -67,6 +76,14 @@ logger = logging.getLogger(__name__)
 # malformed rather than truncated.
 MAX_ACTIVE_VERIFY_KEYS_PER_RESPONSE = 50
 MAX_OLD_VERIFY_KEYS_PER_RESPONSE = 3000
+
+# `Keyring.prefetch_keys` tuning. These are starting points to be tuned by
+# benchmarking (see docs/development-gg/2026-11-20-join-key-prefetch-refactor.md):
+# at most this many origins are looked up at once (which also caps how many
+# origins end up in one notary query / are probed directly at the same time),
+# and we stop waiting for the prefetch after this long.
+PREFETCH_CONCURRENCY = 100
+PREFETCH_TIMEOUT_SECONDS = 30.0
 
 # How far in the future an `old_verify_keys` entry's `expired_ts` may be before it
 # is treated as malformed, to allow for clock skew.
@@ -282,6 +299,7 @@ class Keyring:
         # Clean-up to avoid partial initialization leaving behind references.
         with ExitStack() as exit:
             self.server_name = hs.hostname
+            self._clock = hs.get_clock()
 
             self._key_fetchers: list[KeyFetcher] = []
             if test_only_key_fetchers is None:
@@ -415,6 +433,83 @@ class Keyring:
                 validity_time,
             )
         )
+
+    async def prefetch_keys(
+        self, requests: Iterable[tuple[str, Iterable[str], int]]
+    ) -> None:
+        """Best-effort warm-up of the key cache for a known batch of verifications.
+
+        Callers that are about to verify many signed objects (e.g. the state and
+        auth chain of a `/send_join` response) can pass the whole set of needed
+        keys up front. We de-duplicate them, look each origin up through the
+        normal fetcher chain (store, then notaries, then the origin itself) with
+        bounded concurrency, and let the fetchers persist what they find. The
+        verifications that follow then hit the store instead of the network.
+
+        This never changes what is trusted: it only fills the store, and
+        verification still goes through `process_request`. Failures and
+        timeouts are swallowed (the later verification will report them), and a
+        failed direct fetch is recorded once by the existing negative cache, so
+        the later verification fails fast rather than counting it again.
+
+        Args:
+            requests: (server_name, key_ids, minimum_valid_until_ts) triples, as
+                would be used for `VerifyJsonRequest`.
+        """
+        # The maximum validity requirement is tracked per (server, key id), so one
+        # key's stricter requirement doesn't raise another key's.
+        wanted: dict[str, dict[str, int]] = {}
+        for server_name, key_ids, minimum_valid_until_ts in requests:
+            if self._is_mine_server_name(server_name):
+                continue
+            by_key = wanted.setdefault(server_name, {})
+            for key_id in key_ids:
+                by_key[key_id] = max(by_key.get(key_id, 0), minimum_valid_until_ts)
+
+        items = [(name, by_key) for name, by_key in wanted.items() if by_key]
+        if not items:
+            return
+
+        async def _prefetch_one(item: tuple[str, dict[str, int]]) -> None:
+            server_name, by_key = item
+            # One request per distinct validity requirement for this origin.
+            by_ts: dict[int, list[str]] = {}
+            for key_id, ts in by_key.items():
+                by_ts.setdefault(ts, []).append(key_id)
+
+            async def _queue(ts: int) -> None:
+                try:
+                    await self._fetch_keys_queue.add_to_queue(
+                        _FetchKeyRequest(
+                            server_name=server_name,
+                            minimum_valid_until_ts=ts,
+                            key_ids=sorted(by_ts[ts]),
+                        ),
+                        key=server_name,
+                    )
+                except Exception as e:
+                    logger.debug("Key prefetch for %s failed: %s", server_name, e)
+
+            await yieldable_gather_results(_queue, list(by_ts))
+
+        logger.info("Prefetching signing keys for %d servers", len(items))
+        done = run_in_background(
+            concurrently_execute, _prefetch_one, items, PREFETCH_CONCURRENCY
+        )
+        try:
+            with PreserveLoggingContext():
+                await timeout_deferred(
+                    deferred=stop_cancellation(done),
+                    timeout=PREFETCH_TIMEOUT_SECONDS,
+                    clock=self._clock,
+                )
+        except defer.TimeoutError:
+            # Don't cancel: the lookups keep warming the cache in the background.
+            logger.info(
+                "Key prefetch for %d servers still running after %.0fs; continuing",
+                len(items),
+                PREFETCH_TIMEOUT_SECONDS,
+            )
 
     async def process_request(self, verify_request: VerifyJsonRequest) -> None:
         """Processes the `VerifyJsonRequest`. Raises if the object is not signed

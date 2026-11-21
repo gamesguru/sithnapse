@@ -1,6 +1,7 @@
 matrix-synapse-py3 (1.163.0+unreleased1) UNRELEASED; urgency=medium
 
   * Stop preinstalling the unused Python lxml package.
+  * Include scripts-dev/merge_yaml.py in the packaged test tree.
 
  -- Synapse Packaging team <packages@matrix.org>  Wed, 14 Oct 2026 11:30:04 +0100
 

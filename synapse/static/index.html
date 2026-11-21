@@ -792,6 +792,67 @@
         // 1. Optional authenticated server DB stats endpoint. It is disabled by
         // default and requires both an admin token and stats.server_stats_endpoint_enabled.
         let dbStatsLoaded = false;
+        let publicRoomsLoaded = false;
+        // A detached public response may finish after an authenticated one.
+        // Track which counts an authenticated request supplied so the public
+        // result cannot overwrite them (or their labels) later.
+        const authenticatedCounts = {
+          souls: false,
+          galactic: false,
+          sanctums: false,
+        };
+        // Optional and independent: it must not delay the authenticated stats or
+        // the core versions request below, so it is not awaited and is bounded.
+        (async () => {
+          try {
+            const publicStatsRes = await fetch(
+              "/_synapse/client/public_stats",
+              {
+                signal: AbortSignal.timeout(5000),
+              },
+            );
+            if (publicStatsRes.ok) {
+              const stats = await publicStatsRes.json();
+              if (
+                typeof stats.total_users === "number" &&
+                !authenticatedCounts.souls
+              ) {
+                const soulsEl = document.getElementById("stat-souls");
+                if (soulsEl)
+                  soulsEl.textContent = stats.total_users.toLocaleString();
+                const soulsSubEl = document.getElementById("stat-souls-sub");
+                if (soulsSubEl) soulsSubEl.textContent = "REGISTERED DB SOULS";
+              }
+              if (
+                typeof stats.total_destinations === "number" &&
+                !authenticatedCounts.galactic
+              ) {
+                const galacticEl = document.getElementById("stat-galactic");
+                if (galacticEl)
+                  galacticEl.textContent =
+                    stats.total_destinations.toLocaleString();
+                const galacticSubEl =
+                  document.getElementById("stat-galactic-sub");
+                if (galacticSubEl)
+                  galacticSubEl.textContent = "FEDERATED PEERS";
+              }
+              if (
+                typeof stats.total_rooms === "number" &&
+                !authenticatedCounts.sanctums
+              ) {
+                const sanctumsEl = document.getElementById("stat-sanctums");
+                if (sanctumsEl)
+                  sanctumsEl.textContent = stats.total_rooms.toLocaleString();
+                const sanctumsSubEl =
+                  document.getElementById("stat-sanctums-sub");
+                if (sanctumsSubEl)
+                  sanctumsSubEl.textContent = "ACTIVE DATABASE SANCTUMS";
+                publicRoomsLoaded = true;
+              }
+            }
+          } catch (e) {}
+        })();
+
         try {
           const statsRes = token
             ? await fetch("/_synapse/client/server_stats", {
@@ -806,6 +867,7 @@
             const soulsSubEl = document.getElementById("stat-souls-sub");
             if (soulsEl && typeof stats.total_users === "number") {
               soulsEl.textContent = stats.total_users.toLocaleString();
+              authenticatedCounts.souls = true;
               if (soulsSubEl) soulsSubEl.textContent = "REGISTERED DB SOULS";
             }
 
@@ -814,6 +876,7 @@
             if (galacticEl && typeof stats.total_destinations === "number") {
               galacticEl.textContent =
                 stats.total_destinations.toLocaleString();
+              authenticatedCounts.galactic = true;
               if (galacticSubEl) galacticSubEl.textContent = "FEDERATED PEERS";
             }
 
@@ -821,6 +884,7 @@
             const sanctumsSubEl = document.getElementById("stat-sanctums-sub");
             if (sanctumsEl && typeof stats.total_rooms === "number") {
               sanctumsEl.textContent = stats.total_rooms.toLocaleString();
+              authenticatedCounts.sanctums = true;
               if (sanctumsSubEl)
                 sanctumsSubEl.textContent = "ACTIVE DATABASE SANCTUMS";
             }
@@ -894,7 +958,11 @@
                 typeof roomsData.total_room_count_estimate === "number"
                   ? roomsData.total_room_count_estimate
                   : 0;
-              if (sanctumsEl && sanctumsEl.textContent === "...") {
+              if (
+                sanctumsEl &&
+                !publicRoomsLoaded &&
+                sanctumsEl.textContent === "..."
+              ) {
                 sanctumsEl.textContent = count.toLocaleString();
               }
             }
@@ -916,6 +984,7 @@
                 const soulsSubEl = document.getElementById("stat-souls-sub");
                 if (soulsEl)
                   soulsEl.textContent = usersData.total.toLocaleString();
+                authenticatedCounts.souls = true;
                 if (soulsSubEl)
                   soulsSubEl.textContent = "EXACT DB REGISTERED USERS";
               }
@@ -938,6 +1007,7 @@
                 if (sanctumsEl)
                   sanctumsEl.textContent =
                     allRoomsData.total_rooms.toLocaleString();
+                authenticatedCounts.sanctums = true;
                 if (sanctumsSubEl)
                   sanctumsSubEl.textContent = "TOTAL DB ROOMS (ALL)";
               }
@@ -957,6 +1027,7 @@
                   document.getElementById("stat-galactic-sub");
                 if (galacticEl)
                   galacticEl.textContent = destData.total.toLocaleString();
+                authenticatedCounts.galactic = true;
                 if (galacticSubEl)
                   galacticSubEl.textContent = "EXACT FEDERATED PEERS";
               }
@@ -970,9 +1041,8 @@
           const sanctumsEl = document.getElementById("stat-sanctums");
 
           if (soulsEl && soulsEl.textContent === "...") {
-            soulsEl.textContent = "LOCKED";
-            if (soulsSubEl)
-              soulsSubEl.textContent = "AUTH REQUIRED FOR DB COUNT";
+            soulsEl.textContent = "UNAVAILABLE";
+            if (soulsSubEl) soulsSubEl.textContent = "PUBLIC COUNT NOT ENABLED";
           }
           if (galacticEl && galacticEl.textContent === "...") {
             galacticEl.textContent = "0";

@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use pyo3::prelude::*;
 use synapse::database::embedded_edges::{event_edges_get_forward, event_edges_put};
-use synapse::database::mtxdb_syn::{open_client, open_client_read_only, sync_auth_chain};
+use synapse::database::mtxdb_syn::{open_client, open_client_read_only, sync_state};
 
 const DIR_ENV: &str = "SYNAPSE_TEST_EDGES_VISIBILITY_DIR";
 const PHASE_ENV: &str = "SYNAPSE_TEST_EDGES_VISIBILITY_PHASE";
@@ -102,7 +102,7 @@ fn writer_phase(py: Python<'_>, dir: &str) {
         vec![(ROOM.to_owned(), CHILD.to_owned(), PARENT.to_owned(), false)],
     )
     .expect("writer put");
-    sync_auth_chain(py).expect("sync edges pool");
+    sync_state(py).expect("sync state pool");
 
     fs::write(marker_path(dir, "writer_done"), b"").expect("write writer_done marker");
 }
@@ -198,7 +198,7 @@ fn repeated_writer_phase(py: Python<'_>, dir: &str) {
         )],
     )
     .expect("writer put 1");
-    sync_auth_chain(py).expect("sync edges pool after put 1");
+    sync_state(py).expect("sync state pool after put 1");
     fs::write(marker_path(dir, "writer_done_1"), b"").expect("write writer_done_1 marker");
 
     // Wait for the reader to actually observe the first write before doing
@@ -218,7 +218,7 @@ fn repeated_writer_phase(py: Python<'_>, dir: &str) {
         )],
     )
     .expect("writer put 2");
-    sync_auth_chain(py).expect("sync edges pool after put 2");
+    sync_state(py).expect("sync state pool after put 2");
     fs::write(marker_path(dir, "writer_done_2"), b"").expect("write writer_done_2 marker");
 }
 

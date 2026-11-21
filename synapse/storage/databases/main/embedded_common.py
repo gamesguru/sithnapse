@@ -207,7 +207,7 @@ def ffi_batch_size(tag: str, size: int) -> None:
 #
 # Every timer above brackets the duration of a call this module knows
 # about. None of them can see time spent *before* a call starts -- e.g. a
-# txn.call_after callback (queue_edge_write, a coalescer flush, sync_now)
+# txn.call_after callback (an event-JSON sync, a coalescer flush, sync_now)
 # blocking the Twisted reactor thread delays every other pending reactor
 # callback in the process, including unrelated tests' code that never
 # touches mtxdb. That delay is invisible to ffi_timing/mirror_timing and
@@ -577,17 +577,17 @@ if _PG_TIMINGS_ENABLED:
 
 
 # Display names for the stats keys. The keys keep their older names
-# (`event_dag`, `auth_chain`); the report says `event` (event JSON) and `edges`
-# (previous-event and auth-chain edges, mtxdb's `ShardType::Edges`).
+# (`event_dag`); the report says `event` (event JSON). Previous-event and
+# auth-chain edges share the state pool since mtxdb merged its former `Edges`
+# shard into `State`.
 _POOL_LABELS: dict[str, str] = {
     "event_dag": "event",
-    "auth_chain": "edges",
     "server_info": "server-info",
 }
 
 
 def _print_mtxdb_stats() -> None:
-    """Report runtime stats for all four pools: state, event_dag, auth_chain, server_info.
+    """Report runtime stats for all three pools: state, event_dag, server_info.
 
     Do nothing unless SYNAPSE_MTXDB_STATS is set and stats are available.
     With SYNAPSE_TIMINGS_RUN_DIR set, replace this process's JSON snapshot
@@ -629,12 +629,10 @@ def _print_mtxdb_stats() -> None:
         return f"{us / 1_000_000:.2f}s"
 
     print("\n=== mtxdb runtime stats ===", file=out)
-    for pool_name in ("state", "event_dag", "auth_chain", "server_info"):
+    for pool_name in ("state", "event_dag", "server_info"):
         ps = s.get(pool_name, {})
         if not ps:
             continue
-        # The third pool is mtxdb's `Edges` (previous-event and auth-chain
-        # edges); the stats key kept the older `auth_chain` name.
         print(f"\n  [{_POOL_LABELS.get(pool_name, pool_name)}]", file=out)
         print(
             f"    collections: {ps.get('collection_count', 0)}  shards: {ps.get('shard_count', 0)}  index: {ps.get('index_bytes', 0):,}B",
@@ -935,7 +933,7 @@ def _mtxdb_snapshot_once() -> None:
         return 0.0 if last is None else value - last
 
     segments: list[str] = []
-    for pool in ("state", "event_dag", "auth_chain", "server_info"):
+    for pool in ("state", "event_dag", "server_info"):
         ps = s.get(pool, {})
         if not ps:
             continue
@@ -1121,22 +1119,23 @@ class SyncTier(Enum):
 
 
 class Pool(Enum):
-    """Which of mtxdb's three storage pools a DURABLE write touched.
+    """Which of mtxdb's two writable storage pools a DURABLE write touched.
 
-    `sync()` on the Rust side used to always fsync `state`, `event_dag`,
-    and `auth_chain` together, regardless of which one a given caller
-    actually wrote to -- e.g. an `event_json_put` (event_dag, sharded
-    across 256 locator-bucket collections) forced a flush of every
-    dirty event_dag shard on the next unrelated `state.py` DURABLE sync,
-    and vice versa. Passing the pool(s) a call site actually dirtied to
-    `maybe_sync` lets it call the matching Rust-side `sync_state` /
-    `sync_event_dag` / `sync_auth_chain` instead of the blanket `sync`,
+    `sync()` on the Rust side used to always fsync `state` and `event_dag`
+    together, regardless of which one a given caller actually wrote to --
+    e.g. an `event_json_put` (event_dag, sharded across 256 locator-bucket
+    collections) forced a flush of every dirty event_dag shard on the next
+    unrelated `state.py` DURABLE sync, and vice versa. Passing the pool(s) a
+    call site actually dirtied to `maybe_sync` lets it call the matching
+    Rust-side `sync_state` / `sync_event_dag` instead of the blanket `sync`,
     so unrelated modules stop forcing each other's flushes.
+
+    Auth-chain and previous-event edges live in the state pool, so callers
+    that write them use `STATE`.
     """
 
     STATE = auto()
     EVENT_DAG = auto()
-    AUTH_CHAIN = auto()
 
 
 def maybe_sync(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
@@ -1152,7 +1151,7 @@ def maybe_sync(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
     `pools`: which pool(s) this call site's batch actually wrote to (see
     `Pool`'s doc comment). Omit only for a generic backstop that isn't
     tied to a specific write (e.g. a periodic timer flush) -- that syncs
-    all three pools, same as before this parameter existed. A call site
+    every writable pool, same as before this parameter existed. A call site
     that knows what it wrote should always pass `pools` explicitly, so a
     write to one pool doesn't force a flush of another pool's unrelated
     dirty shards.
@@ -1198,10 +1197,6 @@ def maybe_sync(tier: SyncTier, pools: Iterable[Pool] | None = None) -> None:
             elapsed = time.monotonic() - _st
             ffi_timing("ffi_sync_event_dag", elapsed)
             ffi_timing("event_dag_sync_duration", elapsed)
-    if Pool.AUTH_CHAIN in pool_set:
-        _st = time.monotonic()
-        engine.sync_auth_chain()
-        ffi_timing("ffi_sync_auth_chain", time.monotonic() - _st)
 
 
 _LAST_COMMIT_PHASES: dict[str, tuple[float, int]] = {}
@@ -1307,6 +1302,29 @@ def stop_background_commit() -> None:
     from synapse.storage.databases.embedded_engine import get_embedded_engine
 
     get_embedded_engine("mtxdb").stop_background_commit()
+
+
+def checkpoint_pools() -> None:
+    """Force a durable index checkpoint in every embedded pool.
+
+    For a clean stop, after the group committer has stopped and the final sync
+    has run. It moves each pool's durable baseline up to its current packs, so
+    the next open does not depend on a delta log that a stop can leave behind
+    the pack tail. A no-op when durability is disabled or the loaded extension
+    predates `checkpoint_all`.
+    """
+    if not _engine_configured or _sync_disabled:
+        return
+
+    from synapse.storage.databases.embedded_engine import get_embedded_engine
+
+    checkpoint_all = getattr(get_embedded_engine("mtxdb"), "checkpoint_all", None)
+    if checkpoint_all is None:
+        logger.warning(
+            "The mtxdb extension has no checkpoint_all; skipping the shutdown checkpoint"
+        )
+        return
+    checkpoint_all()
 
 
 def background_commit_error() -> str | None:
@@ -1592,6 +1610,16 @@ class _FlushCoalescer:
                     "Unable to durably flush embedded pools during shutdown; "
                     "writes remain pending: %s",
                     self._dirty,
+                )
+        # Leave a durable checkpoint at the current packs. Best effort: a
+        # failure must not turn a clean stop into an error, and the engine
+        # still recovers from its journal and delta logs without it.
+        if not self._dirty:
+            try:
+                checkpoint_pools()
+            except Exception:
+                logger.warning(
+                    "Unable to checkpoint embedded pools during shutdown", exc_info=True
                 )
 
 

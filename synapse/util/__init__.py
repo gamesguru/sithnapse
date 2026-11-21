@@ -79,13 +79,34 @@ def log_failure(
     return None
 
 
-SYNAPSE_VERSION = os.getenv(
-    "SYNAPSE_VERSION_STRING"
-) or get_distribution_version_string("matrix-synapse", __file__)
+def _build_version_string() -> str | None:
+    """The version string written next to the package by `make install/build`.
+
+    A pip-installed copy has no git checkout to inspect, so the install step
+    records the branch and commit it was built from. The file is absent in a
+    source checkout, where the git lookup below works as usual.
+    """
+    path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "_build_version.txt",
+    )
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+SYNAPSE_VERSION = (
+    os.getenv("SYNAPSE_VERSION_STRING")
+    or _build_version_string()
+    or get_distribution_version_string("matrix-synapse", __file__)
+)
 """
 Version string with git info.
 
-This can be overridden via the `SYNAPSE_VERSION_STRING` environment variable or is
+This can be overridden via the `SYNAPSE_VERSION_STRING` environment variable, read
+from `synapse/_build_version.txt` (written by `make install/build`), or is
 computed here once so that we don't invoke git multiple times.
 """
 

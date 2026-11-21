@@ -3,12 +3,19 @@
 ## Purpose
 
 This document describes the plan for reducing worker and client-sync latency in
-Sithnapse while using mtxdb for the read-heavy data which currently creates
-PostgreSQL and disk pressure.
+Sithnapse while moving suitable storage and query work into mtxdb.
 
-The goal is not to move every table into mtxdb. The goal is to keep ordering,
-filtering, per-user queues, and distributed coordination correct while moving
-shared immutable or mostly-read data onto a fast, refreshable store.
+The broader objective is to move as much suitable work as possible from Synapse,
+Conduwuit, and other Matrix servers into mtxdb, while improving mtxdb's data
+structures for those workloads. Choose migrations by query family and expected
+algorithmic or physical-I/O improvement; preserve each server's ordering,
+filtering, ownership, and recovery semantics, and remove the old path after
+cutover.
+
+The cross-engine structure map and migration gates live in the mtxdb repository
+at `docs/docs/2026-11-19-ordered-workloads-roadmap.md`. The Synapse-specific
+query map is in [`synapse-mtxdb-cutover-map.md`](synapse-mtxdb-cutover-map.md).
+This plan tracks the Synapse work and its measurements.
 
 ## Current evidence
 
@@ -94,6 +101,14 @@ it is not required for the initial design.
 5. Measure wall time and I/O pressure in addition to aggregate SQL/FFI time.
 6. Preserve Matrix protocol behavior first; speedups which weaken consistency
    are not acceptable.
+
+## Event-index cutover prerequisite
+
+The ordered-index design and evaluation gate for the `events` cutover is in
+[`synapse-event-range-index.md`](synapse-event-range-index.md). This is a
+prerequisite for the cutover, not client-facing fan-out work. The pinned mtxdb
+version already has a `TimelineIndex`; first validate and integrate that API
+against Synapse's query semantics before proposing another range-index engine.
 
 ## Phase 0: protect the baseline
 

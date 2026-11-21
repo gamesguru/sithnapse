@@ -221,7 +221,11 @@ class RelationsWorkerStore(SQLBaseStore):
 
         pagination_clause = generate_pagination_where_clause(
             direction=direction,
-            column_names=("topological_ordering", "stream_ordering"),
+            column_names=(
+                "topological_ordering",
+                "COALESCE(origin_server_ts, 0)",
+                "stream_ordering",
+            ),
             from_token=from_bound,
             to_token=to_bound,
             engine=self.database_engine,
@@ -245,38 +249,48 @@ class RelationsWorkerStore(SQLBaseStore):
             sql = """
                 WITH RECURSIVE related_events AS (
                     SELECT er.event_id, er.relation_type, ev.room_id, ev.sender,
-                        ev.topological_ordering, ev.stream_ordering, ev.type, 0 AS depth
+                        ev.topological_ordering,
+                        COALESCE(ev.origin_server_ts, 0) AS origin_server_ts,
+                        ev.stream_ordering,
+                        ev.type, 0 AS depth
                     FROM event_relations er
                     INNER JOIN events ev ON ev.event_id = er.event_id
                     WHERE er.relates_to_id = ?
                     UNION ALL
                     SELECT er.event_id, er.relation_type, ev.room_id, ev.sender,
-                        ev.topological_ordering, ev.stream_ordering, ev.type, r.depth + 1
+                        ev.topological_ordering,
+                        COALESCE(ev.origin_server_ts, 0) AS origin_server_ts,
+                        ev.stream_ordering,
+                        ev.type, r.depth + 1
                     FROM related_events r
                     INNER JOIN event_relations er ON er.relates_to_id = r.event_id
                     INNER JOIN events ev ON ev.event_id = er.event_id
                     WHERE r.depth <= 3
                 )
-                SELECT event_id, relation_type, sender, topological_ordering, stream_ordering
+                SELECT event_id, relation_type, sender, topological_ordering,
+                    COALESCE(origin_server_ts, 0), stream_ordering
                 FROM related_events
                 WHERE %s
-                ORDER BY topological_ordering %s, stream_ordering %s
+                ORDER BY topological_ordering %s, origin_server_ts %s, stream_ordering %s
                 LIMIT ?;
             """ % (
                 " AND ".join(where_clause),
                 order,
                 order,
+                order,
             )
         else:
             sql = """
-                SELECT event_id, relation_type, sender, topological_ordering, stream_ordering
+                SELECT event_id, relation_type, sender, topological_ordering,
+                    COALESCE(origin_server_ts, 0), stream_ordering
                 FROM event_relations
                 INNER JOIN events USING (event_id)
                 WHERE relates_to_id = ? AND %s
-                ORDER BY topological_ordering %s, stream_ordering %s
+                ORDER BY topological_ordering %s, COALESCE(origin_server_ts, 0) %s, stream_ordering %s
                 LIMIT ?
             """ % (
                 " AND ".join(where_clause),
+                order,
                 order,
                 order,
             )
@@ -288,15 +302,22 @@ class RelationsWorkerStore(SQLBaseStore):
 
             events = []
             topo_orderings: list[int] = []
+            timestamps: list[int] = []
             stream_orderings: list[int] = []
-            for event_id, relation_type, sender, topo_ordering, stream_ordering in cast(
-                list[tuple[str, str, str, int, int]], txn
-            ):
+            for (
+                event_id,
+                relation_type,
+                sender,
+                topo_ordering,
+                origin_server_ts,
+                stream_ordering,
+            ) in cast(list[tuple[str, str, str, int, int, int]], txn):
                 # Do not include edits for redacted events as they leak event
                 # content.
                 if not is_redacted or relation_type != RelationTypes.REPLACE:
                     events.append(_RelatedEvent(event_id, sender))
                     topo_orderings.append(topo_ordering)
+                    timestamps.append(origin_server_ts)
                     stream_orderings.append(stream_ordering)
 
             # If there are more events, generate the next pagination key from the
@@ -307,10 +328,11 @@ class RelationsWorkerStore(SQLBaseStore):
                 # data), use the last row to be returned.
                 events = events[:limit]
                 topo_orderings = topo_orderings[:limit]
+                timestamps = timestamps[:limit]
                 stream_orderings = stream_orderings[:limit]
 
                 next_key = generate_next_token(
-                    direction, topo_orderings[-1], stream_orderings[-1]
+                    direction, topo_orderings[-1], timestamps[-1], stream_orderings[-1]
                 )
 
                 if from_token:

@@ -26,6 +26,8 @@ import sys
 from synapse.synapse_rust import mtxdb_engine as m
 
 m.open_client(sys.argv[1])
+# Pool tag 1 is the state pool (tags are contiguous: 0=event, 1=state,
+# 2=server info), so the typed stale-read error names that pool.
 collection = bytes([0xA1]) * 16
 key = bytes([0x01]) * 16
 other_key = bytes([0x02]) * 16
@@ -38,24 +40,24 @@ def txn():
 
 # Seed a collection through the generic transaction put.
 seed = txn()
-seed.put(0, collection, key, payload)
+seed.put(1, collection, key, payload)
 seed.commit()
 
 # The versioned point read returns data and the token from one boundary.
 stale = txn()
-records, expected = stale.get_with_collection_version(0, collection, [key])
+records, expected = stale.get_with_collection_version(1, collection, [key])
 assert records == [payload], records
 
 # A concurrent transaction changes the collection version.
 writer = txn()
-writer.put(0, collection, other_key, b"concurrent")
+writer.put(1, collection, other_key, b"concurrent")
 writer.commit()
-assert not m.recheck_collection_version(0, collection, expected)
+assert not m.recheck_collection_version(1, collection, expected)
 
 # The stale expectation is surfaced as the registered typed exception, with
 # the structured conflict fields retained in args.
-stale.expect_collection_version(0, collection, expected)
-stale.put(0, collection, key, b"must-not-publish")
+stale.expect_collection_version(1, collection, expected)
+stale.put(1, collection, key, b"must-not-publish")
 try:
     stale.commit()
 except m.StaleReadError as error:
@@ -65,12 +67,28 @@ else:
 
 # A fresh read/expectation succeeds, and its token passes the lazy-scan recheck.
 retry = txn()
-records, current = retry.get_with_collection_version(0, collection, [key, other_key])
+records, current = retry.get_with_collection_version(1, collection, [key, other_key])
 assert records == [payload, b"concurrent"], records
-retry.expect_collection_version(0, collection, current)
-retry.put(0, collection, key, b"retried")
+retry.expect_collection_version(1, collection, current)
+retry.put(1, collection, key, b"retried")
 retry.commit()
-assert m.recheck_collection_version(0, collection, current + 1)
+assert m.recheck_collection_version(1, collection, current + 1)
+
+# Event persistence needs a stale staged commit to enter the SQL transaction's
+# retry path, while the generic commit above retains its typed StaleReadError.
+retryable = txn()
+records, expected = retryable.get_with_collection_version(1, collection, [key])
+writer = txn()
+writer.put(1, collection, other_key, b"newer")
+writer.commit()
+retryable.expect_collection_version(1, collection, expected)
+retryable.put(1, collection, key, b"must-not-publish")
+try:
+    retryable.commit_retryable()
+except BlockingIOError:
+    pass
+else:
+    raise AssertionError("stale retryable transaction unexpectedly committed")
 """
 
 
@@ -79,6 +97,7 @@ import sys
 from synapse.synapse_rust import mtxdb_engine as m
 
 m.open_client(sys.argv[1])
+# Pool tag 1 is the state pool; see the note in _SCRIPT.
 collection = bytes([0xB2]) * 16
 key = bytes([0x11]) * 16
 neighbour = bytes([0x12]) * 16
@@ -89,12 +108,12 @@ def txn():
     return result
 
 seed = txn()
-seed.put(0, collection, key, b"first")
-seed.put(0, collection, neighbour, b"neighbour")
+seed.put(1, collection, key, b"first")
+seed.put(1, collection, neighbour, b"neighbour")
 seed.commit()
 
 reader = txn()
-records, versions = reader.get_with_record_versions(0, collection, [key, neighbour])
+records, versions = reader.get_with_record_versions(1, collection, [key, neighbour])
 assert records == [b"first", b"neighbour"], records
 assert len(versions) == 2 and versions[0] > 0 and versions[1] > 0, versions
 key_version = versions[0]
@@ -102,28 +121,28 @@ key_version = versions[0]
 # A write to a different record bumps the collection version but must leave the
 # key's record version untouched, so a per-record expectation survives it.
 unrelated = txn()
-unrelated.put(0, collection, neighbour, b"neighbour-2")
+unrelated.put(1, collection, neighbour, b"neighbour-2")
 unrelated.commit()
 
 optimistic = txn()
-records, versions = optimistic.get_with_record_versions(0, collection, [key])
+records, versions = optimistic.get_with_record_versions(1, collection, [key])
 assert records == [b"first"], records
 assert versions[0] == key_version, (versions, key_version)
-optimistic.expect_record_version(0, collection, key, versions[0])
-optimistic.put(0, collection, key, b"second")
+optimistic.expect_record_version(1, collection, key, versions[0])
+optimistic.put(1, collection, key, b"second")
 optimistic.commit()
 
 # A concurrent write to the observed record invalidates the expectation, and the
 # stale version is surfaced as the registered typed exception.
 stale = txn()
-records, versions = stale.get_with_record_versions(0, collection, [key])
+records, versions = stale.get_with_record_versions(1, collection, [key])
 assert records == [b"second"], records
 observed = versions[0]
 writer = txn()
-writer.put(0, collection, key, b"third")
+writer.put(1, collection, key, b"third")
 writer.commit()
-stale.expect_record_version(0, collection, key, observed)
-stale.put(0, collection, key, b"must-not-publish")
+stale.expect_record_version(1, collection, key, observed)
+stale.put(1, collection, key, b"must-not-publish")
 try:
     stale.commit()
 except m.StaleReadError as error:

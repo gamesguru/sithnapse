@@ -25,7 +25,7 @@ use pyo3::prelude::*;
 use synapse::database::embedded_edges::{
     event_edges_delete, event_edges_get_backward, event_edges_get_forward, event_edges_put,
 };
-use synapse::database::mtxdb_syn::{open_client, sync_auth_chain};
+use synapse::database::mtxdb_syn::{open_client, sync_state};
 
 const DIR_ENV: &str = "SYNAPSE_TEST_EDGES_RESTART_DIR";
 const PHASE_ENV: &str = "SYNAPSE_TEST_EDGES_RESTART_PHASE";
@@ -56,7 +56,7 @@ fn write_phase(py: Python<'_>, dir: &str) {
     // Tombstone one child. The parent's forward list is deliberately left
     // holding both child ids; only the backward record marks DEAD deleted.
     event_edges_delete(py, NAMESPACE.to_owned(), vec![DEAD.to_owned()]).expect("tombstone child");
-    sync_auth_chain(py).expect("sync edges pool");
+    sync_state(py).expect("sync state pool");
 }
 
 fn read_phase(py: Python<'_>, dir: &str) {

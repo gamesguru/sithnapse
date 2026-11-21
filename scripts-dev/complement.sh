@@ -408,6 +408,10 @@ main() {
   complement_runtime_homeserver="${COMPLEMENT_RUNTIME_HOMESERVER:-sithnapse}"
   if [ -n "${COMPLEMENT_NO_BLACKLIST:-}" ]; then
     complement_runtime_homeserver=""
+  else
+    # Complement's runtime identity and runtime.SkipIf exclusions are
+    # initialised by this homeserver-specific build tag.
+    test_tags="${complement_runtime_homeserver}_blacklist"
   fi
 
   # It takes longer than 10m to run the whole suite.

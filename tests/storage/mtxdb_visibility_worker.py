@@ -66,7 +66,7 @@ def _fsyncs() -> int:
     stats = mtxdb_engine.stats()
     return sum(
         int((stats.get(pool) or {}).get("sync_totals", {}).get("calls", 0))
-        for pool in ("state", "event_dag", "auth_chain")
+        for pool in ("state", "event_dag", "server_info")
     )
 
 
@@ -139,27 +139,17 @@ def main() -> None:
                 assert transaction is not None
                 transaction.abort()
                 reply = "ok"
-            elif command == "edges_publish":
-                # edges_publish <room_id> <generation> <published_version>
-                #                <event_id> <prev_event_id>
-                room_id, generation, published, event_id, prev_event_id = args
-                mtxdb_engine.event_edges_apply_forward_outbox(
-                    namespace,
-                    room_id,
-                    int(generation),
-                    int(published),
-                    [(event_id, prev_event_id, "insert")],
+            elif command == "edges_put":
+                # edges_put <room_id> <event_id> <prev_event_id>
+                room_id, event_id, prev_event_id = args
+                mtxdb_engine.event_edges_put(
+                    namespace, [(room_id, event_id, prev_event_id, False)]
                 )
                 reply = "ok"
             elif command == "edges_get":
-                # edges_get <room_id> <expected_version> <prev_event_id>
-                room_id, expected, prev_event_id = args
-                forward = get_event_edges_forward_batch(
-                    namespace,
-                    room_id,
-                    int(expected),
-                    [prev_event_id],
-                )
+                # edges_get <prev_event_id>
+                (prev_event_id,) = args
+                forward = get_event_edges_forward_batch(namespace, [prev_event_id])
                 reply = json.dumps(forward)
             elif command == "fsyncs":
                 reply = str(_fsyncs())

@@ -77,6 +77,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Serializes transferring user state between an upgraded room pair.
+ROOM_UPGRADE_TRANSFER_LOCK_NAME = "room_upgrade_user_transfer"
+
 
 class NoKnownServersError(SynapseError):
     """No server already resident to the room was provided to the join/knock operation."""
@@ -609,7 +612,12 @@ class RoomMemberHandler(metaclass=abc.ABCMeta):
         room_tags = await self.store.get_tags_for_room(user_id, old_room_id)
 
         # Copy each room tag to the new room
+        # A retry after a partial failure must not overwrite tags already written
+        # (or since edited) at the destination.
+        existing_tags = await self.store.get_tags_for_room(user_id, new_room_id)
         for tag, tag_content in room_tags.items():
+            if tag in existing_tags:
+                continue
             await self.account_data_handler.add_tag_to_room(
                 user_id, new_room_id, tag, tag_content
             )
@@ -1454,9 +1462,24 @@ class RoomMemberHandler(metaclass=abc.ABCMeta):
         """
         logger.info("Transferring room state from %s to %s", old_room_id, room_id)
 
-        # Find all local users that were in the old room and copy over each user's state
-        local_users = await self.store.get_local_users_in_room(old_room_id)
-        await self.copy_user_state_on_room_upgrade(old_room_id, room_id, local_users)
+        # Serialize transfers for this room pair so a concurrent call cannot read
+        # stale progress and copy the same users twice. The lock name is distinct
+        # from NEW_EVENT_DURING_PURGE_LOCK_NAME, which the tombstone send holds.
+        async with self._worker_lock_handler.acquire_read_write_lock(
+            ROOM_UPGRADE_TRANSFER_LOCK_NAME, f"{old_room_id}|{room_id}", write=True
+        ):
+            local_users = await self.store.get_local_users_in_room(old_room_id)
+            transfer_progress = (
+                await self.store.get_room_upgrade_user_transfer_progress(
+                    old_room_id, room_id
+                )
+            )
+            await self.copy_user_state_on_room_upgrade(
+                old_room_id,
+                room_id,
+                local_users,
+                transfer_progress,
+            )
 
         # Add new room to the room directory if the old room was there
         # Remove old room from the room directory
@@ -1470,7 +1493,11 @@ class RoomMemberHandler(metaclass=abc.ABCMeta):
         await self.store.update_aliases_for_room(old_room_id, room_id)
 
     async def copy_user_state_on_room_upgrade(
-        self, old_room_id: str, new_room_id: str, user_ids: Iterable[str]
+        self,
+        old_room_id: str,
+        new_room_id: str,
+        user_ids: Iterable[str],
+        transfer_progress: dict[str, tuple[bool, bool]],
     ) -> None:
         """Copy user-specific information when they join a new room when that new room is the
         result of a room upgrade
@@ -1489,22 +1516,36 @@ class RoomMemberHandler(metaclass=abc.ABCMeta):
         )
 
         for user_id in user_ids:
+            tags_transferred, push_rules_transferred = transfer_progress.get(
+                user_id, (False, False)
+            )
             try:
-                # It is an upgraded room. Copy over old tags
-                await self.copy_room_tags_and_direct_to_room(
-                    old_room_id, new_room_id, user_id
-                )
-                # Copy over push rules
-                if self._is_push_writer:
-                    await self.store.copy_push_rules_from_room_to_room_for_user(
+                if not tags_transferred:
+                    # It is an upgraded room. Copy over old tags and direct state.
+                    await self.copy_room_tags_and_direct_to_room(
                         old_room_id, new_room_id, user_id
                     )
-                else:
-                    await self._copy_push_client(
-                        instance_name=self._push_writer,
-                        user_id=user_id,
-                        old_room_id=old_room_id,
-                        new_room_id=new_room_id,
+                    await self.store.mark_room_upgrade_user_transfer_progress(
+                        old_room_id, new_room_id, user_id, tags_transferred=True
+                    )
+                if not push_rules_transferred:
+                    # Copy over push rules.
+                    if self._is_push_writer:
+                        await self.store.copy_push_rules_from_room_to_room_for_user(
+                            old_room_id, new_room_id, user_id
+                        )
+                    else:
+                        await self._copy_push_client(
+                            instance_name=self._push_writer,
+                            user_id=user_id,
+                            old_room_id=old_room_id,
+                            new_room_id=new_room_id,
+                        )
+                    await self.store.mark_room_upgrade_user_transfer_progress(
+                        old_room_id,
+                        new_room_id,
+                        user_id,
+                        push_rules_transferred=True,
                     )
             except Exception:
                 logger.exception(
