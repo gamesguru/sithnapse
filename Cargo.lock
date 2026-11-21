@@ -133,9 +133,9 @@ checksum = "776dfebd015e2d8732c684a2c71003674ccb49457b539b9e82151ba38e96dd7c"
 
 [[package]]
 name = "cc"
-version = "1.11.2"
+version = "1.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33ef9e3e8154a45c7a95cff4c1299702106ad94062d7bb85fdc5d3a5afd91d45"
+checksum = "02f0e023adb368345ce0ca6cdfc0f24a06554468d0e8503e14a0841de79bfa69"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -357,9 +357,9 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "form_urlencoded"
-version = "1.2.2"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
+checksum = "afa489199eaffb1211795df1c6236ce1ad0d41a6fa45250add73e3b02420f06e"
 dependencies = [
  "percent-encoding",
 ]
@@ -1025,7 +1025,7 @@ dependencies = [
 [[package]]
 name = "mtxdb"
 version = "0.1.0-beta.3"
-source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=dev#30c659dae84152f1bbf89444a197779261a20134"
+source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=dev#a3a87ecd736ae5d2036d74a456dba96e26b445b8"
 dependencies = [
  "arc-swap",
  "base64 0.23.1",
@@ -1123,9 +1123,9 @@ dependencies = [
 
 [[package]]
 name = "pin-project-lite"
-version = "0.2.17"
+version = "0.2.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+checksum = "c938015719552d665fd0553b90d96cd7ff58e83e4c061ca99e6bb78865a72752"
 
 [[package]]
 name = "pkg-config"
@@ -1455,7 +1455,7 @@ dependencies = [
 [[package]]
 name = "rezzy"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#8ee8ea309c745d7b41e8eb95ba8a2b2bf7e55694"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#d3ceff0e84c358097d002ccce023cd11f01d654d"
 dependencies = [
  "base64 0.23.1",
  "blake3",
@@ -1469,7 +1469,7 @@ dependencies = [
 [[package]]
 name = "rezzy-json"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#8ee8ea309c745d7b41e8eb95ba8a2b2bf7e55694"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#d3ceff0e84c358097d002ccce023cd11f01d654d"
 dependencies = [
  "ryu",
 ]
@@ -1477,7 +1477,7 @@ dependencies = [
 [[package]]
 name = "rezzy-log"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#8ee8ea309c745d7b41e8eb95ba8a2b2bf7e55694"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#d3ceff0e84c358097d002ccce023cd11f01d654d"
 dependencies = [
  "tracing",
 ]
@@ -1485,7 +1485,7 @@ dependencies = [
 [[package]]
 name = "rezzy-recon"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#8ee8ea309c745d7b41e8eb95ba8a2b2bf7e55694"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#d3ceff0e84c358097d002ccce023cd11f01d654d"
 dependencies = [
  "base64 0.23.1",
  "blake3",
@@ -2100,9 +2100,9 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "url"
-version = "2.5.8"
+version = "2.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed"
+checksum = "f00cd2407bb42c0ef17be88d4cf020f5cceffd121665bac9b8b9493a369b3b1a"
 dependencies = [
  "form_urlencoded",
  "idna",
