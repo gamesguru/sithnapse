@@ -138,11 +138,18 @@ def _discover_room_txn(
         ]
         missing_prev_event_edges = 0
         if prev_event_ids:
-            clause, args = make_in_list_sql_clause(
-                store.database_engine, "event_id", list(set(prev_event_ids))
-            )
-            txn.execute(f"SELECT event_id FROM events WHERE {clause}", args)
-            existing = {row[0] for row in txn}
+            distinct_prev_event_ids = list(set(prev_event_ids))
+            existing: set[str] = set()
+            # Chunk the lookup: SQLite binds one placeholder per ID and a large
+            # room can exceed its bind-variable limit.
+            for start in range(0, len(distinct_prev_event_ids), 500):
+                clause, args = make_in_list_sql_clause(
+                    store.database_engine,
+                    "event_id",
+                    distinct_prev_event_ids[start : start + 500],
+                )
+                txn.execute(f"SELECT event_id FROM events WHERE {clause}", args)
+                existing.update(row[0] for row in txn)
             missing_prev_event_edges = sum(
                 1 for prev_event_id in prev_event_ids if prev_event_id not in existing
             )

@@ -21,8 +21,10 @@ of ordinary events (`outlier = TRUE`) behind a backward extremity and letting a
 stand-in for `maybe_backfill` reveal them a batch at a time.
 """
 
+import json
 from http import HTTPStatus
 from unittest.mock import AsyncMock, patch
+from urllib.parse import quote
 
 from twisted.internet.testing import MemoryReactor
 
@@ -151,11 +153,18 @@ class PaginationGapTestCase(unittest.HomeserverTestCase):
         self.backfill_calls += 1
         return False
 
-    def _messages(self, direction: str, from_token: str, limit: int = 5) -> dict:
+    def _messages(
+        self,
+        direction: str,
+        from_token: str,
+        limit: int = 5,
+        event_filter: str | None = None,
+    ) -> dict:
+        filter_param = f"&filter={quote(event_filter)}" if event_filter else ""
         channel = self.make_request(
             "GET",
             f"/rooms/{self.room_id}/messages?dir={direction}&from={from_token}"
-            f"&limit={limit}",
+            f"&limit={limit}{filter_param}",
             access_token=self.token,
         )
         retry_after = channel.headers.getRawHeaders("Retry-After")
@@ -242,6 +251,32 @@ class PaginationGapTestCase(unittest.HomeserverTestCase):
             "forward pagination must continue triggering backfill across batches",
         )
 
+    def test_forward_filtered_empty_pages_still_find_and_fill_gaps(self) -> None:
+        """An event filter must not hide gaps from forward pagination."""
+        handler = self.hs.get_federation_handler()
+        first = self.get_success(
+            self.store.get_topological_token_for_event(self.event_ids[0])
+        )
+        event_filter = json.dumps({"types": ["m.room.member"]})
+        with patch.object(handler, "maybe_backfill", self._fake_backfill):
+            token = self.get_success(first.to_string(self.store))
+            for _ in range(60):
+                result = self._messages("f", token, limit=2, event_filter=event_filter)
+                if result["code"] == HTTPStatus.TOO_MANY_REQUESTS:
+                    self.reactor.advance(0.1)
+                    continue
+                self.assertEqual(result["code"], HTTPStatus.OK, result["body"])
+                self.assertEqual(result["body"]["chunk"], [])
+                token = result["body"].get("end")
+                if token is None:
+                    break
+                self.reactor.advance(0.1)
+            else:
+                self.fail("filtered pagination did not terminate")
+
+        self.assertGreater(self.backfill_calls, 0)
+        self.assertEqual(self._hidden_event_ids(), [])
+
     def test_forward_pagination_skips_gap_when_backfill_cannot_resolve_it(
         self,
     ) -> None:
@@ -298,6 +333,67 @@ class PaginationGapTestCase(unittest.HomeserverTestCase):
             "events on both sides of an un-fillable gap must be reachable, "
             "without inventing the missing history",
         )
+
+    def test_forward_empty_filtered_page_does_not_retry_after_no_progress(self) -> None:
+        """A no-op foreground backfill must not produce a retry response."""
+        handler = self.hs.get_federation_handler()
+        first = self.get_success(
+            self.store.get_topological_token_for_event(self.event_ids[0])
+        )
+        event_filter = json.dumps({"types": ["m.room.member"]})
+        token = self.get_success(first.to_string(self.store))
+
+        with patch.object(handler, "maybe_backfill", self._unreachable_backfill):
+            for _ in range(30):
+                result = self._messages("f", token, limit=2, event_filter=event_filter)
+                self.assertEqual(result["code"], HTTPStatus.OK, result["body"])
+                next_token = result["body"].get("end")
+                if next_token is None:
+                    break
+                self.assertNotEqual(next_token, token)
+                token = next_token
+                self.reactor.advance(0.1)
+            else:
+                self.fail("filtered forward pagination did not terminate")
+
+        self.assertGreater(self.backfill_calls, 0)
+
+    def test_forward_filtered_page_resumes_immediately_before_gap(self) -> None:
+        """An empty filtered page before a gap must not skip later matches."""
+        handler = self.hs.get_federation_handler()
+        matching_event_ids = [
+            self.helper.send(
+                self.room_id,
+                f"notice {i}",
+                tok=self.token,
+                type="m.room.notice",
+            )["event_id"]
+            for i in range(2)
+        ]
+        first = self.get_success(
+            self.store.get_topological_token_for_event(self.event_ids[0])
+        )
+        token = self.get_success(first.to_string(self.store))
+        event_filter = json.dumps({"types": ["m.room.notice"]})
+
+        with patch.object(handler, "maybe_backfill", self._unreachable_backfill):
+            first_page = self._messages(
+                "f", token, limit=TOTAL_MESSAGES + 2, event_filter=event_filter
+            )
+            self.assertEqual(first_page["code"], HTTPStatus.OK, first_page["body"])
+            self.assertEqual(first_page["body"]["chunk"], [])
+            next_token = first_page["body"].get("end")
+            self.assertIsNotNone(next_token)
+            self.assertNotEqual(next_token, token)
+
+            second_page = self._messages(
+                "f", next_token, limit=TOTAL_MESSAGES + 2, event_filter=event_filter
+            )
+            self.assertEqual(second_page["code"], HTTPStatus.OK, second_page["body"])
+            self.assertEqual(
+                [event["event_id"] for event in second_page["body"]["chunk"]],
+                matching_event_ids,
+            )
 
     def test_backward_pagination_attempts_the_gap_before_ending(self) -> None:
         """`/messages` must not end the timeline over a gap it has not tried to

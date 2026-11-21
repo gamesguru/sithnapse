@@ -174,6 +174,26 @@ class ClosureWalkTests(TestCase):
         with self.assertRaises(IncompleteAuthGraph):
             self.cache.get_closure(None, NAMESPACE, ROOM_ID, a_id)
 
+    def test_deep_uncached_chain_does_not_recurse(self) -> None:
+        chain_length = 1_500
+        graph = {
+            f"$event{i}": ([f"$event{i - 1}"] if i else []) for i in range(chain_length)
+        }
+        ids = self._embed_graph(graph)
+
+        closure = self.cache.get_closure(
+            None, NAMESPACE, ROOM_ID, ids[f"$event{chain_length - 1}"]
+        )
+
+        self.assertEqual(len(closure), chain_length - 1)
+        self.assertNotIn(ids[f"$event{chain_length - 1}"], closure)
+
+    def test_cycle_uses_incomplete_auth_graph_failure_path(self) -> None:
+        ids = self._embed_graph({"$a": ["$b"], "$b": ["$a"]})
+
+        with self.assertRaises(IncompleteAuthGraph):
+            self.cache.get_closure(None, NAMESPACE, ROOM_ID, ids["$a"])
+
     def test_cache_generation_invalidation_on_purge(self) -> None:
         ids = self._embed_graph({"$create": [], "$a": ["$create"]})
         create_id, a_id = ids["$create"], ids["$a"]

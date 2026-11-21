@@ -32,7 +32,10 @@ from twisted.internet import defer, reactor as reactor_
 from synapse.config.homeserver import HomeServerConfig
 from synapse.server import HomeServer
 from synapse.storage import DataStore
-from synapse.storage.databases.main.embedded_event_edges import migrate_event_edges
+from synapse.storage.databases.main.embedded_event_edges import (
+    configured_event_edges_backend,
+    migrate_event_edges,
+)
 from synapse.types import ISynapseReactor
 
 reactor = cast(ISynapseReactor, reactor_)
@@ -82,7 +85,10 @@ def main() -> None:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Allow an empty source to overwrite a non-empty target.",
+        help=(
+            "Allow an empty source to overwrite a non-empty target, or adopt an "
+            "empty target when the database already has events."
+        ),
     )
     parser.add_argument(
         "--batch-size",
@@ -110,6 +116,14 @@ def main() -> None:
 
     hs = MigrateHomeserver(config)
     hs.setup()
+    configured = configured_event_edges_backend(hs)
+    if args.to != configured:
+        # Flipping the marker to a backend the config does not select would
+        # leave Synapse refusing to start with this config.
+        parser.error(
+            f"--to {args.to} does not match the configured event-edges backend "
+            f"({configured}); update the config first."
+        )
     hs.get_storage_controllers()
 
     exit_code = 0

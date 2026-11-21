@@ -286,7 +286,7 @@ class RelationsWorkerStore(SQLBaseStore):
                 FROM event_relations
                 INNER JOIN events USING (event_id)
                 WHERE relates_to_id = ? AND %s
-                ORDER BY topological_ordering %s, origin_server_ts %s, stream_ordering %s
+                ORDER BY topological_ordering %s, COALESCE(origin_server_ts, 0) %s, stream_ordering %s
                 LIMIT ?
             """ % (
                 " AND ".join(where_clause),

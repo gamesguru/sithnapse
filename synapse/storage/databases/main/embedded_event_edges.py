@@ -60,6 +60,7 @@ from synapse.storage.databases.main.embedded_common import (
     sync_event_dag_now,
     sync_now,
 )
+from synapse.storage.engines import PostgresEngine
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
@@ -575,6 +576,17 @@ async def _migrate_mtxdb_edges_to_sql(
 
     def _clear(txn: Any) -> None:
         txn.execute("DELETE FROM event_edges")
+        if isinstance(store.database_engine, PostgresEngine):
+            # `IF NOT EXISTS` below would keep an invalid index (e.g. left by a
+            # failed concurrent build), which neither enforces uniqueness nor
+            # can be used to infer `ON CONFLICT`. Drop it so it is rebuilt.
+            txn.execute(
+                "SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+                "WHERE c.relname = 'event_edges_event_id_prev_event_id_idx' "
+                "AND NOT i.indisvalid"
+            )
+            if txn.fetchone():
+                txn.execute("DROP INDEX event_edges_event_id_prev_event_id_idx")
         # The SQL-only background index update may have been skipped while
         # mtxdb was authoritative. Recreate the composite key needed by the
         # idempotent upserts below when migrating back to SQL.

@@ -77,6 +77,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Serializes transferring user state between an upgraded room pair.
+ROOM_UPGRADE_TRANSFER_LOCK_NAME = "room_upgrade_user_transfer"
+
 
 class NoKnownServersError(SynapseError):
     """No server already resident to the room was provided to the join/knock operation."""
@@ -609,7 +612,12 @@ class RoomMemberHandler(metaclass=abc.ABCMeta):
         room_tags = await self.store.get_tags_for_room(user_id, old_room_id)
 
         # Copy each room tag to the new room
+        # A retry after a partial failure must not overwrite tags already written
+        # (or since edited) at the destination.
+        existing_tags = await self.store.get_tags_for_room(user_id, new_room_id)
         for tag, tag_content in room_tags.items():
+            if tag in existing_tags:
+                continue
             await self.account_data_handler.add_tag_to_room(
                 user_id, new_room_id, tag, tag_content
             )
@@ -1454,16 +1462,24 @@ class RoomMemberHandler(metaclass=abc.ABCMeta):
         """
         logger.info("Transferring room state from %s to %s", old_room_id, room_id)
 
-        local_users = await self.store.get_local_users_in_room(old_room_id)
-        transfer_progress = await self.store.get_room_upgrade_user_transfer_progress(
-            old_room_id, room_id
-        )
-        await self.copy_user_state_on_room_upgrade(
-            old_room_id,
-            room_id,
-            local_users,
-            transfer_progress,
-        )
+        # Serialize transfers for this room pair so a concurrent call cannot read
+        # stale progress and copy the same users twice. The lock name is distinct
+        # from NEW_EVENT_DURING_PURGE_LOCK_NAME, which the tombstone send holds.
+        async with self._worker_lock_handler.acquire_read_write_lock(
+            ROOM_UPGRADE_TRANSFER_LOCK_NAME, f"{old_room_id}|{room_id}", write=True
+        ):
+            local_users = await self.store.get_local_users_in_room(old_room_id)
+            transfer_progress = (
+                await self.store.get_room_upgrade_user_transfer_progress(
+                    old_room_id, room_id
+                )
+            )
+            await self.copy_user_state_on_room_upgrade(
+                old_room_id,
+                room_id,
+                local_users,
+                transfer_progress,
+            )
 
         # Add new room to the room directory if the old room was there
         # Remove old room from the room directory

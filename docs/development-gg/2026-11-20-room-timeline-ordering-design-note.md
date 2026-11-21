@@ -1,6 +1,8 @@
 # Room timeline ordering and untrusted event depth
 
-Status: design note only. Nothing here is implemented.
+Status: option C is implemented (`e49e5bd1fb`); options A, B and D are not. The
+"What pagination actually orders by" section below describes the behavior
+_before_ that change.
 
 ## Observed case
 
@@ -24,11 +26,13 @@ order is an artifact of backfill arrival. It is not a pagination bug, and it is
 unrelated to the initial-sync `prev_batch` cursor fix. The room has all 98
 events; the single inversion is not missing history.
 
-## What pagination actually orders by
+## What pagination actually orders by (pre-change)
 
-- Pagination order is `ORDER BY topological_ordering, stream_ordering`
-  (`synapse/storage/databases/main/stream.py:2401-2409`). Continuation tokens
-  encode `t<topological>-<stream>`.
+- Before option C, pagination order was
+  `ORDER BY topological_ordering, stream_ordering` with two-part continuation
+  tokens `t<topological>-<stream>`. That format is retired: the current order
+  and tokens add `origin_server_ts` (`t<topological>.<timestamp>.<stream>`), and
+  the two-part form is rejected.
 - On persist, both `events.depth` and `events.topological_ordering` are set to
   the received `event.depth` verbatim
   (`synapse/storage/databases/main/events.py:3334-3335`). It is not recomputed

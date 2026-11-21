@@ -321,9 +321,14 @@ def signature_requests_for_pdus(
             and pdu.membership == Membership.JOIN
             and EventContentFields.AUTHORISING_USER in pdu.content
         ):
-            domains.append(
-                get_domain_from_id(pdu.content[EventContentFields.AUTHORISING_USER])
-            )
+            try:
+                domains.append(
+                    get_domain_from_id(pdu.content[EventContentFields.AUTHORISING_USER])
+                )
+            except (SynapseError, TypeError, AttributeError):
+                # A malformed value must not abort prefetching for the batch;
+                # `_check_sigs_on_pdu` rejects that event on its own.
+                pass
         for domain in domains:
             if domain in pdu.signatures:
                 yield domain, list(pdu.signatures[domain]), validity_ts

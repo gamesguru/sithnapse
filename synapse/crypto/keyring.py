@@ -456,34 +456,41 @@ class Keyring:
             requests: (server_name, key_ids, minimum_valid_until_ts) triples, as
                 would be used for `VerifyJsonRequest`.
         """
-        wanted: dict[str, tuple[set[str], int]] = {}
+        # The maximum validity requirement is tracked per (server, key id), so one
+        # key's stricter requirement doesn't raise another key's.
+        wanted: dict[str, dict[str, int]] = {}
         for server_name, key_ids, minimum_valid_until_ts in requests:
             if self._is_mine_server_name(server_name):
                 continue
-            key_set, existing_ts = wanted.setdefault(server_name, (set(), 0))
-            key_set.update(key_ids)
-            wanted[server_name] = (
-                key_set,
-                max(existing_ts, minimum_valid_until_ts),
-            )
+            by_key = wanted.setdefault(server_name, {})
+            for key_id in key_ids:
+                by_key[key_id] = max(by_key.get(key_id, 0), minimum_valid_until_ts)
 
-        items = [(name, ids, ts) for name, (ids, ts) in wanted.items() if ids]
+        items = [(name, by_key) for name, by_key in wanted.items() if by_key]
         if not items:
             return
 
-        async def _prefetch_one(item: tuple[str, set[str], int]) -> None:
-            server_name, key_ids, minimum_valid_until_ts = item
-            try:
-                await self._fetch_keys_queue.add_to_queue(
-                    _FetchKeyRequest(
-                        server_name=server_name,
-                        minimum_valid_until_ts=minimum_valid_until_ts,
-                        key_ids=sorted(key_ids),
-                    ),
-                    key=server_name,
-                )
-            except Exception as e:
-                logger.debug("Key prefetch for %s failed: %s", server_name, e)
+        async def _prefetch_one(item: tuple[str, dict[str, int]]) -> None:
+            server_name, by_key = item
+            # One request per distinct validity requirement for this origin.
+            by_ts: dict[int, list[str]] = {}
+            for key_id, ts in by_key.items():
+                by_ts.setdefault(ts, []).append(key_id)
+
+            async def _queue(ts: int) -> None:
+                try:
+                    await self._fetch_keys_queue.add_to_queue(
+                        _FetchKeyRequest(
+                            server_name=server_name,
+                            minimum_valid_until_ts=ts,
+                            key_ids=sorted(by_ts[ts]),
+                        ),
+                        key=server_name,
+                    )
+                except Exception as e:
+                    logger.debug("Key prefetch for %s failed: %s", server_name, e)
+
+            await yieldable_gather_results(_queue, list(by_ts))
 
         logger.info("Prefetching signing keys for %d servers", len(items))
         done = run_in_background(

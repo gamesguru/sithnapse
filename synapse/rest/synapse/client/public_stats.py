@@ -20,6 +20,10 @@ from synapse.types import JsonDict
 
 logger = logging.getLogger(__name__)
 
+# The endpoint is anonymous and runs three counts, so serve a recent result
+# instead of querying on every request.
+_CACHE_LIFETIME_MS = 60 * 1000
+
 if TYPE_CHECKING:
     from synapse.server import HomeServer
 
@@ -35,8 +39,18 @@ class PublicStatsResource(DirectServeJsonResource):
     def __init__(self, hs: "HomeServer"):
         super().__init__(clock=hs.get_clock())
         self.store = hs.get_datastores().main
+        self._clock = hs.get_clock()
+        self._cached: JsonDict | None = None
+        self._cached_at_ms = 0
 
     async def _async_render_GET(self, request: SynapseRequest) -> tuple[int, JsonDict]:
+        now_ms = self._clock.time_msec()
+        if (
+            self._cached is not None
+            and 0 <= now_ms - self._cached_at_ms < _CACHE_LIFETIME_MS
+        ):
+            return HTTPStatus.OK, self._cached
+
         try:
             total_users = await self.store.count_all_users()
         except Exception:
@@ -61,8 +75,14 @@ class PublicStatsResource(DirectServeJsonResource):
             logger.exception("Failed to count peers for public server statistics")
             total_destinations = None
 
-        return HTTPStatus.OK, {
+        result: JsonDict = {
             "total_users": total_users,
             "total_rooms": total_rooms,
             "total_destinations": total_destinations,
         }
+        # Only cache complete results so a transient failure isn't served for
+        # the whole lifetime.
+        if None not in result.values():
+            self._cached = result
+            self._cached_at_ms = now_ms
+        return HTTPStatus.OK, result

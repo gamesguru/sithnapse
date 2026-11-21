@@ -62,6 +62,10 @@ logger = logging.getLogger(__name__)
 # free to tune it in the future.
 BACKFILL_BECAUSE_TOO_MANY_GAPS_THRESHOLD = 3
 
+# `Retry-After` (seconds) sent with the 429 that tells a forward-paginating client
+# the history it needs is still being fetched.
+FORWARD_BACKFILL_RETRY_AFTER_SECONDS = 2
+
 
 # This is used to avoid purging a room several time at the same moment,
 # and also paginating during a purge. Pagination can trigger backfill,
@@ -613,6 +617,10 @@ class PaginationHandler:
                 # captured from the original token above. Clamp it too, or a
                 # departed user can still page past their leave event.
                 pagination_from_token = leave_token
+                # Gap detection and backfill must use the clamped cursor too, or
+                # gaps above the leave event (which this user can never see) would
+                # keep triggering backfill and retry tokens.
+                curr_topo = leave_token.topological
 
         to_room_key = None
         if pagin_config.to_token:
@@ -640,9 +648,11 @@ class PaginationHandler:
         )
         events = await self._reload_stale_outliers(events)
 
-        async def find_gap_index() -> int | None:
+        async def find_gap_index(
+            page_events: list[EventBase] | None = None,
+        ) -> int | None:
             """Return the first event in this page which is next to an open gap."""
-            for i, event in enumerate(events):
+            for i, event in enumerate(events if page_events is None else page_events):
                 if event.internal_metadata.is_outlier():
                     # Outliers have no backward extremity bookkeeping. The page
                     # only holds non-outliers, so this can only be a copy that
@@ -897,38 +907,29 @@ class PaginationHandler:
             # that a client can still drive the fill when no stored event is
             # visible.
             page_hits_a_gap = False
-            forward_backfill_progress = False
-            if not events:
-                # An empty page only means there is a gap to fill if there are
-                # events after the cursor at all. (The page may be empty simply
-                # because the cursor is at the end of the room, or because the
-                # filter removed everything.) The probe is deliberately
-                # unfiltered: with a filter that matches nothing it is the only
-                # way a client can drive the fill across many open gaps.
-                (
-                    probe,
-                    _,
-                    _,
-                ) = await self.store.paginate_room_events_by_topological_ordering(
-                    room_id=room_id,
-                    from_key=room_token,
-                    to_key=to_room_key,
-                    direction=Direction.FORWARDS,
-                    limit=1,
-                    event_filter=None,
-                    live_from_key=live_from_token,
-                )
-                page_hits_a_gap = bool(probe)
-            else:
-                for event in events:
-                    if event.internal_metadata.is_outlier():
-                        continue
-                    if await self.store.is_event_next_to_backward_gap(event):
-                        page_hits_a_gap = True
-                        break
+            # Inspect the actual requested range before applying the client's
+            # filter. A filter can hide the event adjacent to a gap while still
+            # returning later events, which would otherwise let pagination skip
+            # the missing history entirely.
+            (
+                forward_unfiltered_events,
+                forward_unfiltered_next_key,
+                forward_unfiltered_limited,
+            ) = await self.store.paginate_room_events_by_topological_ordering(
+                room_id=room_id,
+                from_key=room_token,
+                to_key=to_room_key,
+                direction=Direction.FORWARDS,
+                limit=pagin_config.limit,
+                event_filter=None,
+                live_from_key=live_from_token,
+            )
+            page_hits_a_gap = (
+                await find_gap_index(forward_unfiltered_events) is not None
+            )
+            backfill_progress = False
 
             if page_hits_a_gap:
-                event_ids_before_backfill = [e.event_id for e in events]
                 # Any extremity ahead of the cursor is eligible: we are walking
                 # forwards, so there is no "already paged past" boundary.
                 did_backfill = await self.hs.get_federation_handler().maybe_backfill(
@@ -938,7 +939,7 @@ class PaginationHandler:
                     force=True,
                     direction=Direction.FORWARDS,
                 )
-                forward_backfill_progress = did_backfill
+                backfill_progress = did_backfill
                 if did_backfill:
                     # `did_backfill` only says a request was made. Re-asking for
                     # the same cursor is only worthwhile if that request changed
@@ -958,36 +959,70 @@ class PaginationHandler:
                         live_from_key=live_from_token,
                     )
                     events = await self._reload_stale_outliers(events)
-                    forward_backfill_progress = [
-                        e.event_id for e in events
-                    ] != event_ids_before_backfill
+                    (
+                        forward_unfiltered_events,
+                        forward_unfiltered_next_key,
+                        forward_unfiltered_limited,
+                    ) = await self.store.paginate_room_events_by_topological_ordering(
+                        room_id=room_id,
+                        from_key=room_token,
+                        to_key=to_room_key,
+                        direction=Direction.FORWARDS,
+                        limit=pagin_config.limit,
+                        event_filter=None,
+                        live_from_key=live_from_token,
+                    )
 
             # A forward page is oldest first. Do not advance the cursor past the
             # event at a gap boundary: its missing predecessor may still be
             # backfilled, and events revealed behind the cursor would otherwise
             # never be returned by this run.
-            forward_gap_index = await find_gap_index()
+            forward_gap_index = await find_gap_index(forward_unfiltered_events)
+            forward_cut_at_gap = False
             if (
                 forward_gap_index is not None
                 and await gap_can_be_filled()
-                and await has_retryable_gap(events[forward_gap_index].depth)
+                and await has_retryable_gap(
+                    forward_unfiltered_events[forward_gap_index].depth
+                )
                 # Cutting at the very first event hands back an empty page, which
-                # only makes sense while the fill is moving; otherwise return the
-                # page as it is so the walk can continue.
-                and (forward_gap_index > 0 or forward_backfill_progress)
+                # only makes sense while the fill is moving. Otherwise return the
+                # page as it is: cutting it and advancing the cursor would skip
+                # the events at the gap boundary.
+                and (forward_gap_index > 0 or backfill_progress)
             ):
-                events = events[:forward_gap_index]
+                events_before_gap = {
+                    event.event_id
+                    for event in forward_unfiltered_events[:forward_gap_index]
+                }
+                events = [
+                    event for event in events if event.event_id in events_before_gap
+                ]
                 if events:
                     next_key = await gap_boundary_token(events[-1])
-                else:
-                    # The gap is the first event in the page. Returning the
-                    # unchanged cursor as an empty 200 page makes clients spin;
-                    # tell them this page is deferred instead.
+                    limited = True
+                    forward_cut_at_gap = True
+                elif backfill_progress:
+                    # The gap is the first event in the page and a fill is
+                    # moving. Returning the unchanged cursor as an empty 200
+                    # page makes clients spin; tell them this page is deferred.
                     raise SynapseError(
                         429,
                         "History is still being fetched, please retry",
+                        headers={
+                            "Retry-After": str(FORWARD_BACKFILL_RETRY_AFTER_SECONDS)
+                        },
                     )
-                limited = True
+                elif forward_gap_index > 0:
+                    # The filter hid every event before this gap, but may match
+                    # events after it. Resume after the last unfiltered event
+                    # before the gap so the next request can return those later
+                    # matches without skipping across the gap.
+                    next_key = await gap_boundary_token(
+                        forward_unfiltered_events[forward_gap_index - 1]
+                    )
+                    limited = True
+                    forward_cut_at_gap = True
 
             if page_hits_a_gap and not events:
                 # A failed or backed-off fill must not return an empty page with
@@ -995,12 +1030,31 @@ class PaginationHandler:
                 # eligible; once all points are in backoff, let pagination end
                 # until that backoff expires (or another request discovers new
                 # history).
-                if await gap_can_be_filled() and await has_retryable_gap(MAX_DEPTH):
+                if (
+                    backfill_progress
+                    and await gap_can_be_filled()
+                    and await has_retryable_gap(MAX_DEPTH)
+                ):
                     raise SynapseError(
                         429,
                         "History is still being fetched, please retry",
+                        headers={
+                            "Retry-After": str(FORWARD_BACKFILL_RETRY_AFTER_SECONDS)
+                        },
                     )
-                limited = False
+                if not forward_cut_at_gap:
+                    limited = False
+                    if not backfill_progress:
+                        # With the gap at the start of the range, an empty
+                        # filtered page contains no matching events to skip.
+                        next_key = forward_unfiltered_next_key
+                        limited = forward_unfiltered_limited
+            elif not events and forward_unfiltered_events:
+                # A filter may remove the whole page. Keep pagination moving
+                # using the unfiltered range's cursor so later matching events
+                # (and gaps) remain reachable.
+                next_key = forward_unfiltered_next_key
+                limited = forward_unfiltered_limited
 
         # An empty backward page at the room's oldest known event is not the
         # beginning of the room if a missing predecessor is still recorded.

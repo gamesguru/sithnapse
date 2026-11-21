@@ -49,7 +49,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections import OrderedDict
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from pyroaring import BitMap
 
@@ -66,12 +66,14 @@ _MAX_SHORT_ID = (1 << 32) - 1
 
 
 class IncompleteAuthGraph(Exception):
-    """Raised internally when a closure walk hits a genuinely missing auth
-    edge (not an ordinary cache miss). In mtxdb mode this indicates corrupted
-    or incompletely migrated data and must surface as an error; it must never
-    trigger a SQL fallback. Never caught by a bare `except` anywhere in this
-    module; a storage/(de)serialization bug must propagate instead of being
-    mistaken for this.
+    """Raised internally when a closure walk finds an incomplete auth graph.
+
+    This includes a missing auth-edge record (not an ordinary cache miss) or
+    a cycle, which cannot occur in a valid event auth graph. In mtxdb mode
+    this indicates corrupted or incompletely migrated data and must surface
+    as an error; it must never trigger a SQL fallback. Never caught by a bare
+    `except` anywhere in this module; a storage/(de)serialization bug must
+    propagate instead of being mistaken for this.
     """
 
 
@@ -758,24 +760,28 @@ class ClosureCache:
         direct_edges: dict[int, list[int] | None],
         pinned: dict[int, BitMap],
     ) -> tuple[BitMap, bool]:
-        """Depth-first walk over direct auth edges, unioning children's
-        (cached or freshly-walked) ancestor closures. Returns
-        `(closure, is_complete)`; an incomplete result (a genuinely
-        missing auth edge record) is never cached by the caller.
+        """Iteratively walk direct auth edges and union child closures.
+
+        Returns `(closure, is_complete)`; incomplete results are never cached
+        by the caller. An iterative depth-first traversal avoids Python's
+        recursion limit for long, valid auth chains.
         """
         if event_short_id in memo:
             return memo[event_short_id]
 
-        cached = pinned.get(event_short_id)
-        if cached is None:
-            cached = self._get(namespace, room_id, generation, event_short_id)
-        if cached is not None:
-            memo[event_short_id] = (cached, True)
-            return cached, True
+        def cached_closure(short_id: int) -> BitMap | None:
+            cached = pinned.get(short_id)
+            if cached is None:
+                cached = self._get(namespace, room_id, generation, short_id)
+            return cached
 
-        auth_short_ids = direct_edges.get(event_short_id)
-        if auth_short_ids is None:
-            # A genuine gap: this event has no edge record in mtxdb.
+        root_cached = cached_closure(event_short_id)
+        if root_cached is not None:
+            memo[event_short_id] = (root_cached, True)
+            return root_cached, True
+
+        root_edges = direct_edges.get(event_short_id)
+        if root_edges is None:
             logger.debug(
                 "auth-chain closure walk: genuine gap at short_id=%s "
                 "(room=%s namespace=%s) -- no embedded edges; treating as "
@@ -788,31 +794,79 @@ class ClosureCache:
             memo[event_short_id] = result
             return result
 
-        logger.debug(
-            "auth-chain closure walk: short_id=%s has %d direct auth edge(s): %s",
-            event_short_id,
-            len(auth_short_ids),
-            auth_short_ids,
-        )
+        # Frames hold [event id, next child index, accumulated closure,
+        # completeness]. `active` tracks only the current DFS path, so a cycle
+        # is treated as an incomplete auth graph rather than recursing forever.
+        stack: list[list[object]] = [[event_short_id, 0, BitMap(), True]]
+        active = {event_short_id}
+        while stack:
+            frame = stack[-1]
+            short_id = cast(int, frame[0])
+            auth_short_ids = direct_edges.get(short_id)
+            assert auth_short_ids is not None
+            child_index = cast(int, frame[1])
 
-        closure = BitMap()
-        complete = True
-        for auth_short_id in auth_short_ids:
-            closure.add(auth_short_id)
-            child_closure, child_complete = self._walk(
-                namespace,
-                room_id,
-                auth_short_id,
-                generation,
-                memo,
-                direct_edges,
-                pinned,
-            )
-            closure |= child_closure
-            complete = complete and child_complete
+            if child_index < len(auth_short_ids):
+                child_id = auth_short_ids[child_index]
+                frame[1] = child_index + 1
+                closure = cast(BitMap, frame[2])
+                closure.add(child_id)
 
-        memo[event_short_id] = (closure, complete)
-        return closure, complete
+                child_result = memo.get(child_id)
+                if child_result is not None:
+                    closure |= child_result[0]
+                    frame[3] = cast(bool, frame[3]) and child_result[1]
+                    continue
+
+                child_cached = cached_closure(child_id)
+                if child_cached is not None:
+                    memo[child_id] = (child_cached, True)
+                    closure |= child_cached
+                    continue
+
+                if child_id in active:
+                    # Cycles cannot be produced by valid event auth edges. Use
+                    # the established incomplete-graph path for corrupt data.
+                    frame[3] = False
+                    continue
+
+                child_edges = direct_edges.get(child_id)
+                if child_edges is None:
+                    logger.debug(
+                        "auth-chain closure walk: genuine gap at short_id=%s "
+                        "(room=%s namespace=%s) -- no embedded edges; treating "
+                        "as incomplete",
+                        child_id,
+                        room_id,
+                        namespace,
+                    )
+                    memo[child_id] = (BitMap(), False)
+                    frame[3] = False
+                    continue
+
+                logger.debug(
+                    "auth-chain closure walk: short_id=%s has %d direct auth "
+                    "edge(s): %s",
+                    child_id,
+                    len(child_edges),
+                    child_edges,
+                )
+                active.add(child_id)
+                stack.append([child_id, 0, BitMap(), True])
+                continue
+
+            closure = cast(BitMap, frame[2])
+            complete = cast(bool, frame[3])
+            memo[short_id] = (closure, complete)
+            active.remove(short_id)
+            stack.pop()
+            if stack:
+                parent = stack[-1]
+                parent_closure = cast(BitMap, parent[2])
+                parent_closure |= closure
+                parent[3] = cast(bool, parent[3]) and complete
+
+        return memo[event_short_id]
 
 
 # -----------------------------------------------------------------------------
