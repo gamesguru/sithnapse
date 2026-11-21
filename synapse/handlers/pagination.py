@@ -564,11 +564,11 @@ class PaginationHandler:
                 if pinned is not None:
                     pagination_from_token = pinned
                     live_from_token = from_token.room_key
-            elif from_token.room_key.topological is not None:
-                # Forward historical pages also use the stream position in the
-                # token as the live bound. Backfilled events are selected by
-                # the topological part of the same token.
-                live_from_token = RoomStreamToken(stream=from_token.room_key.stream)
+            # A token with a topological part is already a full
+            # (depth, timestamp, stream) cursor in the same order the query
+            # sorts by. Bounding live events by its stream position would skip
+            # events on forks, where a later-depth event has a lower stream
+            # ordering than an earlier-depth one.
 
         room_token = pagination_from_token
 
@@ -691,6 +691,34 @@ class PaginationHandler:
                 event.origin_server_ts,
                 stream_ordering,
             )
+
+        async def get_forward_unfiltered_events(
+            endpoint_event_id: str | None,
+        ) -> tuple[list[EventBase], RoomStreamToken, bool]:
+            """Fetch through the filtered page endpoint before scanning for gaps."""
+            unfiltered_limit = max(pagin_config.limit, 1)
+            while True:
+                (
+                    unfiltered_events,
+                    unfiltered_next_key,
+                    unfiltered_limited,
+                ) = await self.store.paginate_room_events_by_topological_ordering(
+                    room_id=room_id,
+                    from_key=room_token,
+                    to_key=to_room_key,
+                    direction=Direction.FORWARDS,
+                    limit=unfiltered_limit,
+                    event_filter=None,
+                    live_from_key=live_from_token,
+                )
+                unfiltered_events = await self._reload_stale_outliers(unfiltered_events)
+                if (
+                    endpoint_event_id is None
+                    or any(e.event_id == endpoint_event_id for e in unfiltered_events)
+                    or not unfiltered_limited
+                ):
+                    return unfiltered_events, unfiltered_next_key, unfiltered_limited
+                unfiltered_limit *= 2
 
         async def has_retryable_gap(nearby_depth: int) -> bool:
             """Whether a gap is still eligible to be retried right now.
@@ -915,14 +943,8 @@ class PaginationHandler:
                 forward_unfiltered_events,
                 forward_unfiltered_next_key,
                 forward_unfiltered_limited,
-            ) = await self.store.paginate_room_events_by_topological_ordering(
-                room_id=room_id,
-                from_key=room_token,
-                to_key=to_room_key,
-                direction=Direction.FORWARDS,
-                limit=pagin_config.limit,
-                event_filter=None,
-                live_from_key=live_from_token,
+            ) = await get_forward_unfiltered_events(
+                events[-1].event_id if events else None
             )
             page_hits_a_gap = (
                 await find_gap_index(forward_unfiltered_events) is not None
@@ -963,14 +985,8 @@ class PaginationHandler:
                         forward_unfiltered_events,
                         forward_unfiltered_next_key,
                         forward_unfiltered_limited,
-                    ) = await self.store.paginate_room_events_by_topological_ordering(
-                        room_id=room_id,
-                        from_key=room_token,
-                        to_key=to_room_key,
-                        direction=Direction.FORWARDS,
-                        limit=pagin_config.limit,
-                        event_filter=None,
-                        live_from_key=live_from_token,
+                    ) = await get_forward_unfiltered_events(
+                        events[-1].event_id if events else None
                     )
 
             # A forward page is oldest first. Do not advance the cursor past the

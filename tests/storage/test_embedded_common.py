@@ -401,6 +401,30 @@ class ShutdownCheckpointTestCase(TestCase):
         sync.assert_not_called()
         checkpoint.assert_called_once_with()
 
+    def test_close_skips_checkpoint_when_final_sync_fails(self) -> None:
+        """A failed final sync must not publish a baseline for dirty writes."""
+        from synapse.storage.databases.main.embedded_common import _FlushCoalescer
+        from synapse.util.clock import Clock
+
+        from tests.server import ThreadedMemoryReactorClock
+
+        clock = Clock(ThreadedMemoryReactorClock(), server_name="test_server")  # type: ignore[multiple-internal-clocks]
+        coalescer = _FlushCoalescer(clock)
+        coalescer._dirty.add(Pool.STATE)
+        with (
+            mock.patch.object(
+                embedded_common, "_drain_edge_writes", return_value=False
+            ),
+            mock.patch.object(
+                embedded_common,
+                "_do_sync_pools",
+                side_effect=RuntimeError("sync failed"),
+            ),
+            mock.patch.object(embedded_common, "checkpoint_pools") as checkpoint,
+        ):
+            coalescer.close()
+        checkpoint.assert_not_called()
+
     def test_close_survives_a_checkpoint_failure(self) -> None:
         """A failed shutdown checkpoint is logged, not raised."""
         from synapse.storage.databases.main.embedded_common import _FlushCoalescer

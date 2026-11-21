@@ -33,6 +33,43 @@ import yaml
 
 KEY_RE = re.compile(r"^(\s*)([A-Za-z0-9_.\-]+):(?:\s+(.*?))?\s*$")
 
+# Options renamed between schema versions. Values under the old path are moved
+# to the current one, so upgrading a config does not silently drop them.
+RENAMED_PATHS: dict[tuple[str, ...], tuple[str, ...]] = {
+    ("stats", "public_user_count_enabled"): ("stats", "public_stats_enabled"),
+}
+
+
+def apply_renames(user: Any) -> Any:
+    """Move values at renamed option paths to their current names."""
+    if not isinstance(user, dict):
+        return user
+    for old, new in RENAMED_PATHS.items():
+        old_parent: Any = user
+        for part in old[:-1]:
+            old_parent = old_parent.get(part) if isinstance(old_parent, dict) else None
+        if not isinstance(old_parent, dict) or old[-1] not in old_parent:
+            continue
+
+        new_parent = user
+        for part in new[:-1]:
+            child = new_parent.get(part)
+            if not isinstance(child, dict):
+                child = {}
+                new_parent[part] = child
+            new_parent = child
+
+        if new[-1] in new_parent:
+            del old_parent[old[-1]]
+            print(
+                f"Dropped {'.'.join(old)}: superseded by {'.'.join(new)}",
+                file=sys.stderr,
+            )
+        else:
+            new_parent[new[-1]] = old_parent.pop(old[-1])
+            print(f"Renamed {'.'.join(old)} -> {'.'.join(new)}", file=sys.stderr)
+    return user
+
 
 def scalar(v: Any) -> str:
     """Format a scalar as a JSON literal, which is valid YAML."""
@@ -302,7 +339,7 @@ def main() -> None:
     ap.add_argument("-o", "--output", default="homeserver.merged.yaml")
     a = ap.parse_args()
     with open(a.config, encoding="utf-8") as f:
-        user = yaml.safe_load(f) or {}
+        user = apply_renames(yaml.safe_load(f) or {})
     with open(a.sample, encoding="utf-8") as f:
         if a.sample.endswith((".schema.yaml", ".schema.yml")):
             lines = enable_disabled(render_schema(yaml.safe_load(f)))

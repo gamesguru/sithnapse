@@ -16,6 +16,7 @@ import argparse
 import base64
 import json
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -226,14 +227,25 @@ def main() -> int:
             "source_path": str(db_path),
             "record_count": written,
         }
-        with open(temporary_output, encoding="utf-8") as body:
-            body.readline()
-            rest = body.read()
-        with open(temporary_output, "w", encoding="utf-8") as final:
-            final.write(json.dumps(header, ensure_ascii=False) + "\n" + rest)
-            final.flush()
-            os.fsync(final.fileno())
-        os.replace(temporary_output, args.output)
+        header_line = (json.dumps(header, ensure_ascii=False) + "\n").encode()
+        fd, headed_output = tempfile.mkstemp(
+            prefix=args.output.name + ".", suffix=".tmp", dir=args.output.parent
+        )
+        try:
+            with os.fdopen(fd, "wb") as final, open(temporary_output, "rb") as body:
+                body.readline()
+                final.write(header_line)
+                shutil.copyfileobj(body, final, length=1024 * 1024)
+                final.flush()
+                os.fsync(final.fileno())
+            os.replace(headed_output, args.output)
+        except BaseException:
+            try:
+                os.unlink(headed_output)
+            except FileNotFoundError:
+                pass
+            raise
+        os.unlink(temporary_output)
     except BaseException:
         try:
             os.unlink(temporary_output)

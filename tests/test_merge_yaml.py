@@ -46,3 +46,25 @@ class MergePlainSampleTests(TestCase):
         self.assertNotIn("#commented: 10", text)
         self.assertIn("active: 20\n", text)
         self.assertEqual(used, {("commented",), ("active",)})
+
+    def test_renamed_option_is_moved_to_current_name(self) -> None:
+        mod = _load()
+        user = mod.apply_renames(
+            {"stats": {"public_user_count_enabled": True, "enabled": True}}
+        )
+        self.assertEqual(
+            user,
+            {"stats": {"enabled": True, "public_stats_enabled": True}},
+        )
+
+    def test_current_name_wins_over_renamed_option(self) -> None:
+        mod = _load()
+        user = mod.apply_renames(
+            {
+                "stats": {
+                    "public_user_count_enabled": True,
+                    "public_stats_enabled": False,
+                }
+            }
+        )
+        self.assertEqual(user, {"stats": {"public_stats_enabled": False}})

@@ -135,15 +135,16 @@ install/build: ##H Build, pip-install $(INSTALL_SRC) to $(INSTALL_DIR)
 	sudo "$(INSTALL_DIR)/bin/pip" install "$(INSTALL_SRC)$(INSTALL_EXTRAS)"
 	@# A pip-installed copy has no git checkout, so record the branch and commit
 	@# it was built from; synapse/util/__init__.py reads this for the version.
-	@# Resolve the installed copy from / so the checkout's synapse/ package and
-	@# egg-info cannot shadow it on sys.path.
+	@# Use the installed interpreter in isolated mode so the checkout's
+	@# synapse/ package, egg-info and PYTHONPATH cannot shadow it on sys.path.
 	@set -euo pipefail; \
-	ver="$$(cd / && $(INSTALL_DIR)/bin/python -c 'import importlib.metadata as m; print(m.version("matrix-synapse"))')"; \
+	install_python="$$(cd "$(INSTALL_DIR)" && pwd)/bin/python"; \
+	ver="$$("$$install_python" -I -c 'import importlib.metadata as m; print(m.version("matrix-synapse"))')"; \
 	branch="$$(git -C "$(INSTALL_SRC)" rev-parse --abbrev-ref HEAD)"; \
 	rev="$$(git -C "$(INSTALL_SRC)" rev-parse --short HEAD)"; \
 	dirty=""; \
 	if [ -n "$$(git -C "$(INSTALL_SRC)" status --porcelain --untracked-files=no)" ]; then dirty=",dirty"; fi; \
-	pkg="$$(cd / && $(INSTALL_DIR)/bin/python -c 'import importlib.util as u; print(u.find_spec("synapse").submodule_search_locations[0])')"; \
+	pkg="$$("$$install_python" -I -c 'import importlib.util as u; print(u.find_spec("synapse").submodule_search_locations[0])')"; \
 	echo "Recording version $$ver (b=$$branch,$$rev$$dirty) in $$pkg"; \
 	echo "$$ver (b=$$branch,$$rev$$dirty)" | sudo tee "$$pkg/_build_version.txt" >/dev/null
 
@@ -163,6 +164,18 @@ install/gen-config: ##H Generate homeserver config as $(INSTALL_USER)
 # Output of `make install/merge-config`. It holds your secrets, so keep it out
 # of version control (`/homeserver*.yaml` is already gitignored).
 MERGED_PATH ?= homeserver.merged.yaml
+
+# Defaults for the offline `make merge-config` target, which works on a config
+# copied into the checkout (e.g. `scp server:/etc/sithnapse/homeserver.yaml .`).
+LOCAL_CONFIG ?= homeserver.yaml
+LOCAL_MERGED_PATH ?= homeserver.merged.yaml
+
+.PHONY: merge-config
+merge-config: ##H Merge local homeserver.yaml onto the schema (offline) -> homeserver.merged.yaml
+	python3 scripts-dev/merge_yaml.py \
+		-c "$(LOCAL_CONFIG)" \
+		-s schema/synapse-config.schema.yaml \
+		-o "$(LOCAL_MERGED_PATH)"
 
 .PHONY: install/merge-config
 install/merge-config: ##H Merge CONFIG_PATH onto the full documented template -> MERGED_PATH

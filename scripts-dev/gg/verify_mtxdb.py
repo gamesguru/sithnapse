@@ -36,7 +36,7 @@ def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="mtxdb-verify-", dir=args.root.parent))
     copy = tmp / "root"
     try:
-        shutil.copytree(args.root, copy, symlinks=True)
+        shutil.copytree(args.root, copy, symlinks=False)
         from synapse.storage.databases.embedded_engine import get_embedded_engine
 
         get_embedded_engine("mtxdb").open_client(str(copy))
@@ -44,12 +44,24 @@ def main() -> int:
 
         from synapse.synapse_rust.mtxdb_engine import event_json_get
 
-        found = event_json_get(args.namespace, ids)
-        missing = [eid for eid, rec in found if rec is None]
-        print(f"event bodies found: {len(ids) - len(missing)} / {len(ids)}")
-        for eid in missing[: args.show_missing]:
+        found_count = 0
+        missing_count = 0
+        missing_samples: list[str] = []
+        batch_size = 1000
+        for offset in range(0, len(ids), batch_size):
+            batch = ids[offset : offset + batch_size]
+            found = event_json_get(args.namespace, batch)
+            for eid, record in found:
+                if record is None:
+                    missing_count += 1
+                    if len(missing_samples) < args.show_missing:
+                        missing_samples.append(eid)
+                else:
+                    found_count += 1
+        print(f"event bodies found: {found_count} / {len(ids)}")
+        for eid in missing_samples:
             print("  missing:", eid)
-        return 0 if not missing else 2
+        return 0 if not missing_count else 2
     except Exception as exc:  # noqa: BLE001
         print("writable open FAILED:", str(exc)[:500])
         return 1

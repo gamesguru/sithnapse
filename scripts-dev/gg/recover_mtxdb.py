@@ -62,7 +62,7 @@ def collection_ids(mtxdb: str, root: Path, pool: str) -> set[bytes]:
     return {
         bytes.fromhex(line.split()[0][2:])
         for line in out.splitlines()
-        if line.startswith("0x")
+        if line.lstrip().startswith("0x")
     }
 
 
@@ -97,14 +97,56 @@ def wal_header(mtxdb: str, root: Path) -> tuple[int, dict[str, int]]:
 
 
 def wal_group_count(mtxdb: str, root: Path) -> int:
-    """How many groups the root's shared WAL still holds (`mtxdb meta wal`)."""
+    """How many groups the root's *shared* WAL holds (`mtxdb meta wal`).
+
+    The report also lists per-pool WALs, which are ignored when a shared
+    `wal.bin` exists. Select the root-level line specifically so an ignored
+    per-pool count cannot hide pending shared-WAL data.
+    """
     report = subprocess.run(
         [mtxdb, "-d", str(root), "meta", "wal"], capture_output=True, text=True
     ).stdout
-    match = re.search(r"(\d+) group\(s\)", report)
-    if not match:
-        sys.exit(f"{root}: cannot read the WAL group count; refusing to guess")
-    return int(match.group(1))
+    shared_wal = (root / "wal.bin").resolve()
+    for line in report.splitlines():
+        match = re.match(r"wal (.+): (\d+) group\(s\)", line)
+        if not match:
+            continue
+        try:
+            path = Path(match.group(1)).resolve()
+        except OSError:
+            continue
+        if path == shared_wal:
+            return int(match.group(2))
+    sys.exit(f"{root}: cannot read the shared WAL group count; refusing to guess")
+
+
+def _pack_order_key(pack: Path) -> tuple[int, bytes]:
+    """The pool's persisted `(creation_seq, pack address)` ordering key.
+
+    mtime and the (possibly shortened) filename are not stable ordering inputs;
+    the immutable header is what the engine uses to decide which duplicate
+    record wins.
+    """
+    with open(pack, "rb") as handle:
+        header = handle.read(37)
+    if len(header) < 37 or header[:4] != b"MTDB":
+        sys.exit(f"{pack}: not a valid mtxdb pack header")
+    creation_seq = struct.unpack("<I", header[33:37])[0]
+    pack_id = header[9:25]
+    if creation_seq == 0:
+        sys.exit(f"{pack}: pack header carries creation_seq 0")
+    return creation_seq, pack_id
+
+
+def deleted_collections(root: Path, directory: str) -> set[str]:
+    """Collection ids tombstoned in a pool's `deleted.collections` file."""
+    path = root / directory / "deleted.collections"
+    if not path.exists():
+        return set()
+    data = path.read_bytes()
+    if len(data) % 16:
+        sys.exit(f"{path}: malformed deleted.collections (not 16-byte ids)")
+    return {"0x" + data[start : start + 16].hex() for start in range(0, len(data), 16)}
 
 
 def record_latest(
@@ -112,15 +154,18 @@ def record_latest(
 ) -> dict[tuple[str, str], str]:
     """`(collection, node) -> digest of its latest frame`, from the pack frames.
 
-    Reads the packs themselves, not the index. Packs are ordered by mtime then
-    name and frames by offset, so a later frame for the same key wins, as it
-    does when the pool is opened. The digest covers the payload and metadata, so
-    a rewritten value differs from the original even though the key is the same.
+    Reads the packs themselves, not the index. Packs are ordered by their
+    persisted `(creation_seq, pack address)` header fields and frames by offset,
+    so a later frame for the same key wins, as it does when the pool is opened.
+    Deleted collections are removed: their frames remain physical until a
+    repack, but they are not logical records. The digest covers the payload and
+    metadata, so a rewritten value differs from the original even though the key
+    is the same.
     """
     latest: dict[tuple[str, str], str] = {}
     packs = sorted(
         (root / directory).glob("pack_*.pack"),
-        key=lambda path: (path.stat().st_mtime, path.name),
+        key=_pack_order_key,
     )
     for pack in packs:
         pack_id = pack.stem.removeprefix("pack_")
@@ -154,7 +199,14 @@ def record_latest(
                 ).encode()
             ).hexdigest()
             latest[(rec["collection_id"], rec["node_id"])] = digest
-    if packs and not latest:
+    deleted = deleted_collections(root, directory)
+    if deleted:
+        latest = {
+            key: digest
+            for key, digest in latest.items()
+            if key[0].lower() not in deleted
+        }
+    if packs and not latest and not deleted:
         sys.exit(
             f"{root}/{directory}: has pack files but the frame scan found no "
             "records; refusing to build a baseline from nothing"
@@ -170,6 +222,11 @@ def read_versions(path: Path) -> set[bytes]:
     if len(data) < 24 or data[:8] != MAGIC:
         return set()
     count = struct.unpack("<I", data[16:20])[0]
+    expected_length = 20 + 24 * count + 4
+    if len(data) != expected_length:
+        return set()
+    if zlib.crc32(data[:-4]) & 0xFFFFFFFF != struct.unpack("<I", data[-4:])[0]:
+        return set()
     return {data[20 + 24 * i : 36 + 24 * i] for i in range(count)}
 
 
@@ -206,6 +263,10 @@ def main() -> int:
     )
     args = ap.parse_args()
 
+    broken_root = args.broken.resolve()
+    output_path = args.out.resolve()
+    if output_path == broken_root or broken_root in output_path.parents:
+        sys.exit(f"refusing output destination inside broken root: {args.out}")
     if args.out.exists():
         sys.exit(f"refusing to overwrite {args.out}")
 
@@ -260,7 +321,7 @@ def main() -> int:
                 "merge. Refusing."
             )
 
-    shutil.copytree(args.broken, args.out, symlinks=True)
+    shutil.copytree(args.broken, args.out, symlinks=False)
 
     for pool, directory in POOLS:
         pool_dir = args.out / directory

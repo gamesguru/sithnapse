@@ -1614,12 +1614,13 @@ class _FlushCoalescer:
         # Leave a durable checkpoint at the current packs. Best effort: a
         # failure must not turn a clean stop into an error, and the engine
         # still recovers from its journal and delta logs without it.
-        try:
-            checkpoint_pools()
-        except Exception:
-            logger.warning(
-                "Unable to checkpoint embedded pools during shutdown", exc_info=True
-            )
+        if not self._dirty:
+            try:
+                checkpoint_pools()
+            except Exception:
+                logger.warning(
+                    "Unable to checkpoint embedded pools during shutdown", exc_info=True
+                )
 
 
 _coalescer: _FlushCoalescer | None = None
