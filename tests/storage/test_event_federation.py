@@ -1004,6 +1004,31 @@ class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
         # know the approximate depth of 5 from our event "3".
         self.assertListEqual(backfill_event_ids, ["b3", "b2", "b1"])
 
+    def test_get_backward_extremities_among(self) -> None:
+        """Only ids that are still recorded as backward extremities are returned."""
+        setup_info = self._setup_room_for_backfill_tests()
+        room_id = setup_info.room_id
+
+        self.assertEqual(
+            self.get_success(
+                self.store.get_backward_extremities_among(
+                    room_id, ["b1", "b3", "not-an-extremity"]
+                )
+            ),
+            {"b1", "b3"},
+        )
+        self.assertEqual(
+            self.get_success(self.store.get_backward_extremities_among(room_id, [])),
+            set(),
+        )
+        # Scoped to the room.
+        self.assertEqual(
+            self.get_success(
+                self.store.get_backward_extremities_among("!other:test", ["b1"])
+            ),
+            set(),
+        )
+
     def test_get_backfill_points_in_room_excludes_events_we_have_attempted(
         self,
     ) -> None:

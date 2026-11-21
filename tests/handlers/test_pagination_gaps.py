@@ -242,6 +242,63 @@ class PaginationGapTestCase(unittest.HomeserverTestCase):
             "forward pagination must continue triggering backfill across batches",
         )
 
+    def test_forward_pagination_skips_gap_when_backfill_cannot_resolve_it(
+        self,
+    ) -> None:
+        """A peer answering a backfill request must not wedge forward pagination.
+
+        A remote can answer `/backfill` successfully (so `maybe_backfill`
+        returns true) while the extremity stays an outlier -- for example
+        because the pulled event was rejected or its own prev_event can never
+        be verified. Pagination must remember that the gap cannot be filled and
+        continue past it instead of returning the same empty page forever.
+        """
+        handler = self.hs.get_federation_handler()
+        first = self.get_success(
+            self.store.get_topological_token_for_event(self.event_ids[0])
+        )
+        seen: list[str] = []
+        with (
+            patch.object(
+                self.store,
+                "get_current_hosts_in_room_ordered",
+                AsyncMock(return_value=("remote.example.com",)),
+            ),
+            # A peer that always accepts the request but never resolves the
+            # extremity (no events are de-outliered).
+            patch.object(
+                handler._federation_event_handler,
+                "backfill",
+                AsyncMock(return_value=None),
+            ),
+        ):
+            token = self.get_success(first.to_string(self.store))
+            for _ in range(20):
+                result = self._messages("f", token)
+                if result["code"] == HTTPStatus.TOO_MANY_REQUESTS:
+                    self.reactor.advance(0.1)
+                    continue
+                self.assertEqual(result["code"], HTTPStatus.OK, result["body"])
+                seen.extend(e["event_id"] for e in result["body"]["chunk"])
+                token = result["body"].get("end")
+                if token is None:
+                    break
+                self.reactor.advance(0.1)
+            else:
+                self.fail(
+                    "forward pagination returned the same cursor forever over a "
+                    "gap backfill could not resolve"
+                )
+
+        self.assertTrue(self._hidden_event_ids(), "the gap should still be open")
+        sent_in_room = [self.event_ids.index(e) for e in seen if e in self.event_ids]
+        self.assertEqual(
+            sent_in_room,
+            list(range(1, HIDDEN[0])) + list(range(HIDDEN[-1] + 1, TOTAL_MESSAGES)),
+            "events on both sides of an un-fillable gap must be reachable, "
+            "without inventing the missing history",
+        )
+
     def test_backward_pagination_attempts_the_gap_before_ending(self) -> None:
         """`/messages` must not end the timeline over a gap it has not tried to
         fill.

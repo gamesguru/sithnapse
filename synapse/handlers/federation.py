@@ -623,8 +623,13 @@ class FederationHandler:
                     )
                     any_success = True
                     successful_peers += 1
-                    seen = await self.store.have_seen_events(room_id, remaining)
-                    remaining = [e for e in remaining if e not in seen]
+                    # An extremity we hold only as an outlier is still a gap: it
+                    # stays a backward extremity until persisted as a non-outlier.
+                    remaining = list(
+                        await self.store.get_backward_extremities_among(
+                            room_id, remaining
+                        )
+                    )
                     if not remaining or successful_peers >= max_successful_peers:
                         return True
                     continue
@@ -697,14 +702,20 @@ class FederationHandler:
             # consults `event_failed_pull_attempts` before offering a backfill
             # point again, so a permanently missing gap is not re-requested on
             # every page and cannot starve the other gaps out of the batch.
-            have_extremities = await self.store.have_seen_events(
+            #
+            # "Resolved" means no longer a backward extremity, not merely "seen":
+            # an extremity held as an outlier that was rejected, or whose own
+            # prev_event cannot be fetched (e.g. its signature never verifies),
+            # is seen yet is never de-outliered. Without a recorded attempt it is
+            # re-offered on every request and the same batch is re-downloaded.
+            unresolved = await self.store.get_backward_extremities_among(
                 room_id, extremities_to_request
             )
-            for event_id in set(extremities_to_request) - have_extremities:
+            for event_id in unresolved:
                 await self.store.record_event_failed_pull_attempt(
                     room_id,
                     event_id,
-                    "Backfill did not return the event",
+                    "Backfill did not resolve the extremity",
                 )
             return True
 

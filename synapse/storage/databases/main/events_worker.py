@@ -2547,6 +2547,35 @@ class EventsWorkerStore(SQLBaseStore):
             _cleanup_old_transaction_ids_txn,
         )
 
+    async def get_backward_extremities_among(
+        self, room_id: str, event_ids: Collection[str]
+    ) -> set[str]:
+        """Return which of `event_ids` are still backward extremities of the room.
+
+        Unlike `have_seen_events`, an extremity that we hold only as an outlier
+        (for example one persisted from a join's state, or a rejected event that
+        can never be de-outliered) is still reported: it stays in
+        `event_backward_extremities` until it is persisted as a non-outlier, so
+        it is the right test for whether a backfill actually resolved a gap.
+        """
+        if not event_ids:
+            return set()
+
+        def get_backward_extremities_among_txn(txn: LoggingTransaction) -> set[str]:
+            clause, args = make_in_list_sql_clause(
+                self.database_engine, "event_id", list(event_ids)
+            )
+            txn.execute(
+                "SELECT event_id FROM event_backward_extremities"
+                f" WHERE room_id = ? AND {clause}",
+                [room_id] + args,
+            )
+            return {event_id for (event_id,) in txn}
+
+        return await self.db_pool.runInteraction(
+            "get_backward_extremities_among", get_backward_extremities_among_txn
+        )
+
     async def is_event_next_to_backward_gap(self, event: EventBase) -> bool:
         """Check if the given event is next to a backward gap of missing events.
         <latest messages> A(False)--->B(False)--->C(True)--->  <gap, unknown events> <oldest messages>

@@ -928,6 +928,7 @@ class PaginationHandler:
                         break
 
             if page_hits_a_gap:
+                event_ids_before_backfill = [e.event_id for e in events]
                 # Any extremity ahead of the cursor is eligible: we are walking
                 # forwards, so there is no "already paged past" boundary.
                 did_backfill = await self.hs.get_federation_handler().maybe_backfill(
@@ -939,6 +940,10 @@ class PaginationHandler:
                 )
                 forward_backfill_progress = did_backfill
                 if did_backfill:
+                    # `did_backfill` only says a request was made. Re-asking for
+                    # the same cursor is only worthwhile if that request changed
+                    # what this page contains; otherwise a gap the remote cannot
+                    # fill would return the same cursor forever.
                     (
                         events,
                         next_key,
@@ -953,16 +958,9 @@ class PaginationHandler:
                         live_from_key=live_from_token,
                     )
                     events = await self._reload_stale_outliers(events)
-
-                    if not events:
-                        # There are more gaps to try. Ask the client to come
-                        # back rather than pretending the page is the end of
-                        # the room. Each retry makes progress, so this is
-                        # bounded: it stops as soon as an attempt adds nothing.
-                        raise SynapseError(
-                            429,
-                            "History is still being fetched, please retry",
-                        )
+                    forward_backfill_progress = [
+                        e.event_id for e in events
+                    ] != event_ids_before_backfill
 
             # A forward page is oldest first. Do not advance the cursor past the
             # event at a gap boundary: its missing predecessor may still be
@@ -982,9 +980,27 @@ class PaginationHandler:
                 if events:
                     next_key = await gap_boundary_token(events[-1])
                 else:
-                    # Nothing before the gap: retry this cursor, do not skip it.
-                    next_key = from_token.room_key
+                    # The gap is the first event in the page. Returning the
+                    # unchanged cursor as an empty 200 page makes clients spin;
+                    # tell them this page is deferred instead.
+                    raise SynapseError(
+                        429,
+                        "History is still being fetched, please retry",
+                    )
                 limited = True
+
+            if page_hits_a_gap and not events:
+                # A failed or backed-off fill must not return an empty page with
+                # the same cursor. Retry only while a backfill point is currently
+                # eligible; once all points are in backoff, let pagination end
+                # until that backoff expires (or another request discovers new
+                # history).
+                if await gap_can_be_filled() and await has_retryable_gap(MAX_DEPTH):
+                    raise SynapseError(
+                        429,
+                        "History is still being fetched, please retry",
+                    )
+                limited = False
 
         # An empty backward page at the room's oldest known event is not the
         # beginning of the room if a missing predecessor is still recorded.
