@@ -79,10 +79,20 @@ class EventValidatorTestCase(HomeserverTestCase):
                 if room_version.event_format == EventFormatVersions.ROOM_V1_V2:
                     event_dict["event_id"] = "$event:test"
 
-                event = make_event_from_dict(
-                    event_dict,
-                    room_version=room_version,
-                )
+                try:
+                    event = make_event_from_dict(
+                        event_dict,
+                        room_version=room_version,
+                    )
+                except SynapseError as e:
+                    # Some experimental strict-canonical-JSON room versions
+                    # reject the oversized integer while parsing the event,
+                    # before validation gets a chance to. The rejection is the
+                    # same one this test asserts for strict room versions.
+                    if not room_version.strict_canonicaljson:
+                        raise
+                    self.assertEqual(e.errcode, Codes.BAD_JSON)
+                    continue
 
                 # Check if this room version enforces strict canonical json.
                 if room_version.strict_canonicaljson:
