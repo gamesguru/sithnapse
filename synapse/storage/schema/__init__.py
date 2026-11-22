@@ -19,7 +19,7 @@
 #
 #
 
-SCHEMA_VERSION = 98  # remember to update the list below when updating
+SCHEMA_VERSION = 97  # remember to update the list below when updating
 """Represents the expectations made by the codebase about the database schema
 
 This should be incremented whenever the codebase changes its requirements on the
@@ -208,8 +208,6 @@ Changes in SCHEMA_VERSION = 97
       now traverse the direct event-auth graph.
     - Add a background-built event-room ordering index with origin_server_ts
       between topological_ordering and stream_ordering.
-
-Changes in SCHEMA_VERSION = 98
     - Add `server_key_response_blobs` and `server_keys_json.response_id` so a
       signed server-key response is stored once instead of once per key.
 """
@@ -222,7 +220,7 @@ SCHEMA_COMPAT_VERSION = (
     # present, SQL chain-cover tables have been dropped, and signed
     # server-key responses are stored once in `server_key_response_blobs`
     # rather than inline in every per-key row.
-    98
+    97
 )
 """Limit on how far the synapse codebase can be rolled back without breaking db compat
 
