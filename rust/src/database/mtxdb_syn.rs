@@ -192,6 +192,12 @@ fn check_pid_guard() -> PyResult<bool> {
 /// negligible.
 pub(crate) static RMW_LOCK: Mutex<()> = Mutex::new(());
 
+#[cfg(test)]
+type RepointTestHook = (String, Arc<std::sync::Barrier>, Arc<std::sync::Barrier>);
+
+#[cfg(test)]
+static REPOINT_TEST_HOOK: Mutex<Option<RepointTestHook>> = Mutex::new(None);
+
 /// Semantic counters for state-group refcount RMWs. These deliberately live
 /// beside the Synapse wrapper rather than in generic mtxdb runtime stats:
 /// only this layer knows that a missing counter means initialization.
@@ -4037,6 +4043,24 @@ pub fn repoint_event_state_group(
                     .map_err(|e| map_transaction_error("increment state_group_refcount", e))?;
             }
 
+            #[cfg(test)]
+            if attempt == 0 {
+                let hook = REPOINT_TEST_HOOK.lock().ok().and_then(|mut hook| {
+                    if hook
+                        .as_ref()
+                        .is_some_and(|(test_namespace, _, _)| test_namespace == &namespace)
+                    {
+                        hook.take()
+                    } else {
+                        None
+                    }
+                });
+                if let Some((_, staged, resume)) = hook {
+                    staged.wait();
+                    resume.wait();
+                }
+            }
+
             match txn.commit() {
                 Ok(()) => return Ok(old),
                 Err(StorageError::StaleRead { .. }) if attempt + 1 < MAX_ATTEMPTS => {
@@ -5427,73 +5451,60 @@ pub(crate) mod auth_chain_closure_tests {
         );
     }
 
-    /// A writer that bypasses `RMW_LOCK` (another process on the shared WAL,
-    /// or a direct transaction) races the repoint helper on the same counters.
-    /// Stale commits must retry inside the helper and lose no update.
+    /// Force a counter write between the repoint's versioned read and commit.
+    /// The first commit must be stale, and the helper must retry the whole operation.
     #[test]
     fn repoint_event_state_group_retries_stale_counter_commits() {
         ensure_open();
         let namespace = "ns-repoint-race";
         let (old_group, new_group): (i64, i64) = (81, 82);
-        let events: Vec<String> = (0..16).map(|i| format!("$repoint-race-{i}")).collect();
-        let bumps = 200;
+        let event_id = "$repoint-race-one";
         let collection = kv_room_id();
-
-        let mut seed = vec![(
-            state_group_refcount_key(namespace, old_group),
-            (events.len() as i64).to_be_bytes().to_vec(),
-        )];
-        for event_id in &events {
-            seed.push((
+        batch_put_impl(vec![
+            (
                 event_to_state_group_key(namespace, event_id),
                 old_group.to_be_bytes().to_vec(),
-            ));
-        }
-        batch_put_impl(seed).expect("seed");
+            ),
+            (
+                state_group_refcount_key(namespace, old_group),
+                1i64.to_be_bytes().to_vec(),
+            ),
+        ])
+        .expect("seed mapping and old refcount");
 
-        let new_node = kv_node_id(&state_group_refcount_key(namespace, new_group));
-        let outsider = std::thread::spawn(move || {
-            let database = pools()
-                .expect("pools")
-                .shared_database
-                .as_ref()
-                .expect("shared database");
-            let mut done = 0;
-            while done < bumps {
-                let txn = database.begin_transaction();
-                txn.increment_counters(ShardType::State, collection, &[(new_node, 1)])
-                    .expect("increment");
-                match txn.commit() {
-                    Ok(()) => {
-                        done += 1;
-                        std::thread::sleep(std::time::Duration::from_micros(300));
-                    }
-                    Err(e)
-                        if is_retryable_contention(&e)
-                            || matches!(e, StorageError::StaleRead { .. }) => {}
-                    Err(e) => panic!("outsider commit: {e}"),
-                }
-            }
-        });
-        let workers: Vec<_> = events
-            .iter()
-            .cloned()
-            .map(|event_id| {
-                std::thread::spawn(move || {
-                    pyo3::Python::attach(|py| {
-                        repoint_event_state_group(py, namespace.to_owned(), event_id, new_group)
-                    })
-                })
+        let staged = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        *REPOINT_TEST_HOOK.lock().expect("test hook lock") = Some((
+            namespace.to_owned(),
+            Arc::clone(&staged),
+            Arc::clone(&resume),
+        ));
+        let event_id_owned = event_id.to_owned();
+        let worker = std::thread::spawn(move || {
+            pyo3::Python::attach(|py| {
+                repoint_event_state_group(py, namespace.to_owned(), event_id_owned, new_group)
             })
-            .collect();
-        for worker in workers {
-            assert_eq!(
-                worker.join().expect("join").expect("repoint"),
-                Some(old_group)
-            );
-        }
-        outsider.join().expect("outsider");
+        });
 
+        // The repoint has read and staged both counters, but cannot publish yet.
+        staged.wait();
+        let database = pools()
+            .expect("pools")
+            .shared_database
+            .as_ref()
+            .expect("shared database");
+        let target_node = kv_node_id(&state_group_refcount_key(namespace, new_group));
+        let writer = database.begin_transaction();
+        writer
+            .increment_counters(ShardType::State, collection, &[(target_node, 1)])
+            .expect("concurrent counter increment");
+        writer.commit().expect("concurrent writer commits first");
+        resume.wait();
+
+        assert_eq!(
+            worker.join().expect("join").expect("repoint"),
+            Some(old_group)
+        );
         let read = |key: Vec<u8>| -> i64 {
             let record = state_db()
                 .expect("state db")
@@ -5503,16 +5514,11 @@ pub(crate) mod auth_chain_closure_tests {
                 .expect("present");
             i64::from_be_bytes(record.bytes.as_ref().try_into().unwrap())
         };
-        assert_eq!(read(state_group_refcount_key(namespace, old_group)), 0);
         assert_eq!(
-            read(state_group_refcount_key(namespace, new_group)),
-            events.len() as i64 + bumps
+            read(event_to_state_group_key(namespace, event_id)),
+            new_group
         );
-        for event_id in &events {
-            assert_eq!(
-                read(event_to_state_group_key(namespace, event_id)),
-                new_group
-            );
-        }
+        assert_eq!(read(state_group_refcount_key(namespace, old_group)), 0);
+        assert_eq!(read(state_group_refcount_key(namespace, new_group)), 2);
     }
 }
