@@ -170,9 +170,7 @@ class KeyStore(CacheInvalidationWorkerStore):
                 if stored_key_bytes == fetch_result.verify_key.encode():
                     # Same key body (refresh) -- preserve original from_server.
                     stored_ts = stored_ts if stored_ts is not None else 0
-                    if stored_ts < fetch_result.valid_until_ts or (
-                        seen_active and not stored_seen_active
-                    ):
+                    if stored_ts < fetch_result.valid_until_ts:
                         txn.execute(
                             """
                             UPDATE server_signature_keys
@@ -187,15 +185,28 @@ class KeyStore(CacheInvalidationWorkerStore):
                                 key_id,
                             ),
                         )
-                    elif stored_ts > fetch_result.valid_until_ts:
-                        # The previously observed validity window is longer than
-                        # this response claims (e.g. a stale notary view). Return
-                        # the longer window so it cannot be shortened for this
-                        # caller; the stored row already holds it.
-                        final_keys[key_id] = FetchKeyResult(
-                            verify_key=fetch_result.verify_key,
-                            valid_until_ts=stored_ts,
-                        )
+                    else:
+                        # The candidate does not extend the stored window. It
+                        # must never shorten it, even when this response also
+                        # upgrades a legacy `seen_active` flag.
+                        if seen_active and not stored_seen_active:
+                            txn.execute(
+                                """
+                                UPDATE server_signature_keys
+                                SET seen_active = ?
+                                WHERE server_name = ? AND key_id = ?
+                                """,
+                                (seen_active, server_name, key_id),
+                            )
+                        if stored_ts > fetch_result.valid_until_ts:
+                            # A stale or short notary view. Return the longer
+                            # stored window, and do not overwrite the cached
+                            # response blob for this key with the shorter one.
+                            final_keys[key_id] = FetchKeyResult(
+                                verify_key=fetch_result.verify_key,
+                                valid_until_ts=stored_ts,
+                            )
+                            keys_to_persist.pop(key_id, None)
                 elif stored_from_server != server_name and from_server == server_name:
                     # Two-Tier override: direct fetch overrides provisional
                     # notary binding (different key body).
@@ -246,8 +257,32 @@ class KeyStore(CacheInvalidationWorkerStore):
 
             per_key_seconds = time.perf_counter() - per_key_started
             post_key_started = time.perf_counter()
+            phase_started = post_key_started
+            phases: dict[str, float] = {}
+
+            def mark(name: str) -> None:
+                nonlocal phase_started
+                now = time.perf_counter()
+                phases[name] = now - phase_started
+                phase_started = now
 
             if keys_to_persist:
+                # The signed response covers every key in this payload, so
+                # storing it once per key would write the same blob thousands
+                # of times for a rotation that publishes many old keys.
+                # Content-address it instead: the blob table holds one copy,
+                # and each per-key row points at it.
+                response_id = hashlib.sha256(key_json_bytes).hexdigest()
+                txn.execute(
+                    """
+                    INSERT INTO server_key_response_blobs (response_id, key_json)
+                    VALUES (?, ?)
+                    ON CONFLICT (response_id) DO NOTHING
+                    """,
+                    (response_id, db_binary_type(key_json_bytes)),
+                )
+
+                mark("blob_insert")
                 self.db_pool.simple_upsert_many_txn(
                     txn,
                     table="server_keys_json",
@@ -259,17 +294,20 @@ class KeyStore(CacheInvalidationWorkerStore):
                         "ts_added_ms",
                         "ts_valid_until_ms",
                         "key_json",
+                        "response_id",
                     ),
                     value_values=[
                         (
                             ts_added_ms,
                             fetch_result.valid_until_ts,
-                            db_binary_type(key_json_bytes),
+                            db_binary_type(b""),
+                            response_id,
                         )
                         for fetch_result in keys_to_persist.values()
                     ],
                 )
 
+                mark("keys_json_upsert")
                 for key_id in keys_to_persist:
                     txn.call_after(
                         self._get_server_keys_json.invalidate,
@@ -288,6 +326,7 @@ class KeyStore(CacheInvalidationWorkerStore):
                     self.get_server_key_json_for_remote,
                     [(server_name, key_id) for key_id in keys_to_persist],
                 )
+                mark("persist_invalidation")
 
             # MSC4499: bound the number of retired keys retained for a server.
             # Keys we saw active before retirement may have signed events we
@@ -303,10 +342,24 @@ class KeyStore(CacheInvalidationWorkerStore):
                 (server_name, ts_added_ms),
             )
             retired_key_ids = [row[0] for row in txn]
+            mark("retired_select")
             excess = len(retired_key_ids) - MAX_RETIRED_SERVER_KEYS
             if excess > 0:
                 evicted_key_ids = retired_key_ids[:excess]
                 placeholders = ", ".join("?" for _ in evicted_key_ids)
+
+                # Remember which response blobs the evicted rows referenced, so
+                # we can drop any that no other key still uses.
+                txn.execute(
+                    f"""
+                    SELECT DISTINCT response_id FROM server_keys_json
+                    WHERE server_name = ? AND key_id IN ({placeholders})
+                        AND response_id IS NOT NULL
+                    """,
+                    (server_name, *evicted_key_ids),
+                )
+                evicted_response_ids = [row[0] for row in txn]
+
                 txn.execute(
                     f"DELETE FROM server_signature_keys WHERE server_name = ? "
                     f"AND key_id IN ({placeholders})",
@@ -317,6 +370,18 @@ class KeyStore(CacheInvalidationWorkerStore):
                     f"AND key_id IN ({placeholders})",
                     (server_name, *evicted_key_ids),
                 )
+                for response_id in evicted_response_ids:
+                    txn.execute(
+                        """
+                        DELETE FROM server_key_response_blobs
+                        WHERE response_id = ?
+                            AND NOT EXISTS (
+                                SELECT 1 FROM server_keys_json
+                                WHERE response_id = ?
+                            )
+                        """,
+                        (response_id, response_id),
+                    )
                 for key_id in evicted_key_ids:
                     txn.call_after(
                         self._get_server_keys_json.invalidate,
@@ -337,6 +402,7 @@ class KeyStore(CacheInvalidationWorkerStore):
                     [(server_name, key_id) for key_id in evicted_key_ids],
                 )
 
+            mark("eviction")
             post_key_seconds = time.perf_counter() - post_key_started
             txn_seconds = time.perf_counter() - txn_started
             if txn_seconds >= 0.5:
@@ -344,7 +410,7 @@ class KeyStore(CacheInvalidationWorkerStore):
                     "Slow server-key response transaction for %s from %s: "
                     "input_keys=%d persisted_keys=%d retired_keys=%d "
                     "evicted_keys=%d per_key_sql=%.3fs post_key_sql=%.3fs "
-                    "txn=%.3fs",
+                    "txn=%.3fs phases=%s",
                     server_name,
                     from_server,
                     len(verify_keys),
@@ -354,6 +420,7 @@ class KeyStore(CacheInvalidationWorkerStore):
                     per_key_seconds,
                     post_key_seconds,
                     txn_seconds,
+                    {k: round(v, 3) for k, v in phases.items()},
                 )
 
             return final_keys
@@ -400,16 +467,24 @@ class KeyStore(CacheInvalidationWorkerStore):
             """Processes a batch of keys to fetch, and adds the result to `keys`."""
 
             # batch_iter always returns tuples so it's safe to do len(batch)
-            where_clause = " OR (server_name=? AND key_id=?)" * len(batch)
+            where_clause = " OR (r.server_name=? AND r.key_id=?)" * len(batch)
 
             # `server_keys_json` can have multiple entries per server (one per
             # remote server we fetched from, if using perspectives). Order by
             # `ts_added_ms` so the most recently fetched one always wins.
+            #
+            # Newer rows point at a shared, content-addressed response blob;
+            # older rows still carry the full response inline, so fall back to
+            # that when there is no blob reference.
             sql = f"""
-                SELECT server_name, key_id, key_json, ts_valid_until_ms
-                FROM server_keys_json WHERE 1=0
+                SELECT r.server_name, r.key_id,
+                    COALESCE(b.key_json, r.key_json), r.ts_valid_until_ms
+                FROM server_keys_json r
+                LEFT JOIN server_key_response_blobs b
+                    ON b.response_id = r.response_id
+                WHERE 1=0
                 {where_clause}
-                ORDER BY ts_added_ms
+                ORDER BY r.ts_added_ms
             """
 
             txn.execute(sql, tuple(itertools.chain.from_iterable(batch)))
@@ -426,6 +501,9 @@ class KeyStore(CacheInvalidationWorkerStore):
                 # fetch out the bits needed. The key may live under either
                 # `verify_keys` (current) or `old_verify_keys` (expired, per
                 # MSC4499 historical event verification) -- check both.
+                if not key_json_bytes:
+                    # Missing response blob (e.g. mid-upgrade); nothing to use.
+                    continue
                 key_json = json.loads(bytes(key_json_bytes))
                 key_entry = key_json["verify_keys"].get(key_id)
                 if key_entry is None:
@@ -459,6 +537,69 @@ class KeyStore(CacheInvalidationWorkerStore):
     ) -> FetchKeyResultForRemote | None:
         raise NotImplementedError()
 
+    def _select_server_keys_json_for_remote_txn(
+        self,
+        txn: LoggingTransaction,
+        server_name: str,
+        key_ids: Iterable[str] | None,
+    ) -> list[tuple[str, str, int, int, bytes]]:
+        """Read remote-facing key rows, resolving the shared response blob.
+
+        `key_ids=None` means "all keys for this server". Rows written before
+        the blob table existed have no `response_id`, so the inline `key_json`
+        is used as a fallback.
+        """
+        # Newer rows point at a shared, content-addressed response blob.
+        select = """
+            SELECT r.key_id, r.from_server, r.ts_added_ms,
+                r.ts_valid_until_ms, COALESCE(b.key_json, r.key_json)
+            FROM server_keys_json r
+            LEFT JOIN server_key_response_blobs b
+                ON b.response_id = r.response_id
+        """
+
+        rows: list[tuple[str, str, int, int, bytes]] = []
+        if key_ids is None:
+            txn.execute(f"{select} WHERE r.server_name = ?", (server_name,))
+            result_rows = txn.fetchall()
+            rows.extend(
+                (
+                    key_id,
+                    from_server,
+                    ts_added_ms,
+                    ts_valid_until_ms,
+                    # Cast to bytes since postgresql returns a memoryview.
+                    bytes(key_json),
+                )
+                for key_id, from_server, ts_added_ms, ts_valid_until_ms, key_json in result_rows
+            )
+            return rows
+
+        for batch in batch_iter(key_ids, 50):
+            placeholders = ", ".join("?" for _ in batch)
+            txn.execute(
+                f"{select} WHERE r.server_name = ? AND r.key_id IN ({placeholders})",
+                (server_name, *batch),
+            )
+            for (
+                key_id,
+                from_server,
+                ts_added_ms,
+                ts_valid_until_ms,
+                key_json,
+            ) in txn.fetchall():
+                rows.append(
+                    (
+                        key_id,
+                        from_server,
+                        ts_added_ms,
+                        ts_valid_until_ms,
+                        bytes(key_json),
+                    )
+                )
+
+        return rows
+
     @cachedList(
         cached_method_name="get_server_key_json_for_remote", list_name="key_ids"
     )
@@ -469,22 +610,11 @@ class KeyStore(CacheInvalidationWorkerStore):
 
         If we have multiple entries for a given key ID, returns the most recent.
         """
-        rows = cast(
-            list[tuple[str, str, int, int, bytes | memoryview]],
-            await self.db_pool.simple_select_many_batch(
-                table="server_keys_json",
-                column="key_id",
-                iterable=key_ids,
-                keyvalues={"server_name": server_name},
-                retcols=(
-                    "key_id",
-                    "from_server",
-                    "ts_added_ms",
-                    "ts_valid_until_ms",
-                    "key_json",
-                ),
-                desc="get_server_keys_json_for_remote",
-            ),
+        rows = await self.db_pool.runInteraction(
+            "get_server_keys_json_for_remote",
+            self._select_server_keys_json_for_remote_txn,
+            server_name,
+            key_ids,
         )
 
         if not rows:
@@ -496,8 +626,7 @@ class KeyStore(CacheInvalidationWorkerStore):
 
         return {
             key_id: FetchKeyResultForRemote(
-                # Cast to bytes since postgresql returns a memoryview.
-                key_json=bytes(key_json),
+                key_json=key_json,
                 valid_until_ts=ts_valid_until_ms,
                 added_ts=ts_added_ms,
             )
@@ -512,20 +641,11 @@ class KeyStore(CacheInvalidationWorkerStore):
 
         If we have multiple entries for a given key ID, returns the most recent.
         """
-        rows = cast(
-            list[tuple[str, str, int, int, bytes | memoryview]],
-            await self.db_pool.simple_select_list(
-                table="server_keys_json",
-                keyvalues={"server_name": server_name},
-                retcols=(
-                    "key_id",
-                    "from_server",
-                    "ts_added_ms",
-                    "ts_valid_until_ms",
-                    "key_json",
-                ),
-                desc="get_server_keys_json_for_remote",
-            ),
+        rows = await self.db_pool.runInteraction(
+            "get_all_server_keys_json_for_remote",
+            self._select_server_keys_json_for_remote_txn,
+            server_name,
+            None,
         )
 
         if not rows:
@@ -537,8 +657,7 @@ class KeyStore(CacheInvalidationWorkerStore):
 
         return {
             key_id: FetchKeyResultForRemote(
-                # Cast to bytes since postgresql returns a memoryview.
-                key_json=bytes(key_json),
+                key_json=key_json,
                 valid_until_ts=ts_valid_until_ms,
                 added_ts=ts_added_ms,
             )
