@@ -283,6 +283,21 @@ class KeyStore(CacheInvalidationWorkerStore):
                 )
 
                 mark("blob_insert")
+
+                # The upsert below repoints these rows at the new blob, which
+                # can leave the blobs they used to reference unreferenced.
+                persist_key_ids = list(keys_to_persist)
+                key_placeholders = ", ".join("?" for _ in persist_key_ids)
+                txn.execute(
+                    f"""
+                    SELECT DISTINCT response_id FROM server_keys_json
+                    WHERE server_name = ? AND key_id IN ({key_placeholders})
+                        AND response_id IS NOT NULL
+                    """,
+                    (server_name, *persist_key_ids),
+                )
+                replaced_response_ids = {row[0] for row in txn} - {response_id}
+
                 self.db_pool.simple_upsert_many_txn(
                     txn,
                     table="server_keys_json",
@@ -308,6 +323,18 @@ class KeyStore(CacheInvalidationWorkerStore):
                 )
 
                 mark("keys_json_upsert")
+                for old_response_id in replaced_response_ids:
+                    txn.execute(
+                        """
+                        DELETE FROM server_key_response_blobs
+                        WHERE response_id = ?
+                            AND NOT EXISTS (
+                                SELECT 1 FROM server_keys_json
+                                WHERE response_id = ?
+                            )
+                        """,
+                        (old_response_id, old_response_id),
+                    )
                 for key_id in keys_to_persist:
                     txn.call_after(
                         self._get_server_keys_json.invalidate,

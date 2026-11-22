@@ -210,6 +210,7 @@ Changes in SCHEMA_VERSION = 97
       between topological_ordering and stream_ordering.
     - Add `server_key_response_blobs` and `server_keys_json.response_id` so a
       signed server-key response is stored once instead of once per key.
+    - Index `server_keys_json.response_id` for blob reference checks.
 """
 
 

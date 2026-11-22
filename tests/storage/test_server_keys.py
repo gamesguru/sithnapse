@@ -222,3 +222,20 @@ class ServerKeyResponseStorageTestCase(HomeserverTestCase):
             self.assertIsNotNone(remote_result)
             assert remote_result is not None
             self.assertEqual(remote_result.key_json, expected_json)
+
+    def test_refresh_does_not_leak_replaced_blob(self) -> None:
+        """A refresh with a new signed response drops the blob it replaces."""
+        now = self.clock.time_msec()
+        server_name = "remote.example"
+        signing_key = generate_signing_key("a")
+
+        for i in range(3):
+            key_id, _ = self._store_response(
+                server_name,
+                "notary.example",
+                signing_key,
+                valid_until_ts=now + 3600_000 + i,
+                ts_added_ms=now + i,
+            )
+            blobs, rows, refs = self._count_rows()
+            self.assertEqual((blobs, rows, refs), (1, 1, 1))
