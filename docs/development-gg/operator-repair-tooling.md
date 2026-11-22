@@ -19,19 +19,25 @@ The following are available today:
   room DAG.
 - The `synapse_state_repair` entry point provides read-only `check-room`,
   `list-rejected`, and `list-outliers` commands.
+- It also provides the narrow `repair-member` command, which imports one
+  signature-checked `m.room.member` event through the normal federation path and
+  repoints that state key without a leave/rejoin. It is dry-run by default and
+  only writes with `--publish --homeserver-is-stopped`.
 - The Synapse manhole provides an SSH/TCP Python shell for low-level
   introspection. It is not a Unix-socket admin command console and should not be
   treated as a repeatable repair interface.
 
-The state-repair tool currently reports discovery information only. Its
-`--publish` option is reserved and intentionally not implemented.
+`repair-member` does not replay the room DAG or force an arbitrary remote state
+snapshot; it applies one known event to one state key. The general
+`state-force-set` and DAG-replay commands remain unimplemented.
 
 ## Not currently exposed
 
 Sithnapse does not currently provide supported commands for:
 
 - comparing a room's state with one or more remote servers;
-- resetting or force-setting room state from local or remote input;
+- force-setting arbitrary room state from local or remote input (the narrow
+  `repair-member` command covers only one member event);
 - rebuilding room state by replaying the persisted DAG;
 - reordering or reindexing a room timeline topologically;
 - bulk backfill/export of a room DAG;

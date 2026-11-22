@@ -169,3 +169,32 @@ Build the read-only `synapse_state_repair check-room` command that:
 The first write-capable milestone should only publish repaired HAMTs/state
 groups for one room while the homeserver is offline. Online organic repair
 should wait until room-scoped persistence fencing is explicit.
+
+## Narrow repair: `repair-member`
+
+For the case where a single member event was dropped at join time (for example a
+notary key-window problem made a `send_join` state event fail verification),
+`synapse_state_repair repair-member` repoints one `m.room.member` key without a
+full DAG replay:
+
+```
+synapse_state_repair --config homeserver.yaml repair-member \
+    --room '!room:id' --event-id '$leave' --via unredacted.org            # dry run
+synapse_state_repair --config homeserver.yaml --publish --homeserver-is-stopped \
+    repair-member --room '!room:id' --event-id '$leave' --via unredacted.org
+```
+
+It fetches the event through the normal federation client (signatures and hashes
+checked against the keyring), persists it as an outlier through the normal
+auth/rejection path, then for each distinct state group among the forward
+extremities stores a new group (`prev_group` plus a one-key delta), repoints the
+extremities at it, and recalculates current state with the normal persistence
+code. Patching `current_state_events` alone would not stick, because the next
+event inherits its state group from its prev events. Old state groups are left
+in place.
+
+It refuses when the room is partial-state or an MSC4242 state-DAG room, when the
+event is rejected or not a member event of that room, or when the current value
+for the key is not one of the replacement event's `auth_events` (i.e. the
+replacement does not supersede it). `--publish` requires
+`--homeserver-is-stopped`.
