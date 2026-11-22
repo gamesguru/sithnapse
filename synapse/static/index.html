@@ -440,7 +440,7 @@
       <header>
         <div class="node-title" id="server-title">
           <span id="server-title-text"
-            >Sithnapse (Synapse Dark... but runs like it's lite)</span
+            >Sithnapse (Synapse Dark, but runs lite)</span
           >
         </div>
         <div class="node-status">
@@ -818,13 +818,16 @@
           if (fedRes.ok) {
             const fedData = await fedRes.json();
             if (fedData.server && fedData.server.version) {
-              const vStr = fedData.server.version.startsWith("v")
-                ? fedData.server.version
-                : `v${fedData.server.version}`;
+              // Show only the release version, not the build metadata
+              // (`1.163.0 (b=branch,commit)`).
+              const version = fedData.server.version.split(" ")[0];
+              const vStr = version.startsWith("v")
+                ? version
+                : `v${version}`;
               const titleEl = document.getElementById("server-title-text");
               const engineEl = document.getElementById("stat-engine-sub");
               if (titleEl)
-                titleEl.textContent = `Sithnapse ${vStr} (Synapse Dark... but runs like it's lite)`;
+                titleEl.textContent = `Sithnapse ${vStr} (Synapse Dark, but runs lite)`;
               if (engineEl) engineEl.textContent = `Sithnapse ${vStr}`;
             }
           }
