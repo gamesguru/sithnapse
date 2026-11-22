@@ -791,6 +791,7 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
         # to the SQL rows, so purge them alongside the room. Bump the in-process
         # generation first so cached closures are discarded; the durable delete
         # itself runs after the SQL commit, like the other mtxdb purge work.
+        room_cleanups: list[tuple[str, Callable[[], None]]] = []
         if getattr(self, "_embedded_db_engine", None) is not None:
             from synapse.storage.databases.main.embedded_event_auth_chains import (
                 bump_room_generation,
@@ -816,11 +817,15 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
                         # fails partway.
                         bump_room_generation(ns, purged_room_id)
 
-                txn.call_after(
-                    purge_then_bump,
-                    self._embedded_db_engine,
-                    namespace,
-                    room_id,
+                # Isolated like the other mirrors: a failed auth-chain delete
+                # must not stop the event/edge/state-group cleanups below.
+                room_cleanups.append(
+                    (
+                        "auth-chain index",
+                        lambda: purge_then_bump(
+                            self._embedded_db_engine, namespace, room_id
+                        ),
+                    )
                 )
 
         # event_auth is still retained as an offline migration snapshot, so
@@ -874,7 +879,6 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
 
         # As in _purge_history_txn, the mirrors are deleted only after the SQL
         # purge commits. The callbacks retry transient mtxdb contention.
-        room_cleanups: list[tuple[str, Callable[[], None]]] = []
         if room_event_ids and getattr(self, "_embedded_event_json_enabled", False):
             room_cleanups.append(
                 (
