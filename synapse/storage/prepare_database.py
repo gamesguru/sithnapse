@@ -158,7 +158,7 @@ def prepare_database(
                 databases,
             )
             if config is not None:
-                _apply_module_schemas(cur, database_engine, config)
+                _apply_module_schemas(cur, database_engine, config, read_only=read_only)
         else:
             logger.info("%r: Checking existing schema version", databases)
             version_info = _get_or_create_schema_state(cur, database_engine)
@@ -205,7 +205,7 @@ def prepare_database(
 
             # check if any of our configured dynamic modules want a database
             if config is not None:
-                _apply_module_schemas(cur, database_engine, config)
+                _apply_module_schemas(cur, database_engine, config, read_only=read_only)
 
         cur.close()
         db_conn.commit()
@@ -427,6 +427,15 @@ def _upgrade_existing_database(
 
     # some of the deltas assume that server_name is set correctly, so now
     # is a good time to run the sanity check.
+    if not is_empty:
+        # Each physical database (main, and a separate state database) has its
+        # own queue and its own delta that discards retired entries.
+        from synapse.storage.databases.main import (
+            check_retired_migrations_before_upgrade,
+        )
+
+        check_retired_migrations_before_upgrade(cur, database_engine)
+
     if not is_empty and "main" in databases:
         from synapse.storage.databases.main import check_database_before_upgrade
 
@@ -602,7 +611,10 @@ def _upgrade_existing_database(
 
 
 def _apply_module_schemas(
-    txn: Cursor, database_engine: BaseDatabaseEngine, config: HomeServerConfig
+    txn: Cursor,
+    database_engine: BaseDatabaseEngine,
+    config: HomeServerConfig,
+    read_only: bool = False,
 ) -> None:
     """Apply the module schemas for the dynamic modules, if any
 
@@ -610,6 +622,7 @@ def _apply_module_schemas(
         cur: database cursor
         database_engine:
         config: application config
+        read_only: if True, raise rather than apply any unapplied module schema
     """
     # This is the old way for password_auth_provider modules to make changes
     # to the database. This should instead be done using the module API
@@ -618,7 +631,11 @@ def _apply_module_schemas(
             continue
         modname = ".".join((mod.__module__, mod.__name__))
         _apply_module_schema_files(
-            txn, database_engine, modname, mod.get_db_schema_files()
+            txn,
+            database_engine,
+            modname,
+            mod.get_db_schema_files(),
+            read_only=read_only,
         )
 
 
@@ -627,6 +644,7 @@ def _apply_module_schema_files(
     database_engine: BaseDatabaseEngine,
     modname: str,
     names_and_streams: Iterable[tuple[str, TextIO]],
+    read_only: bool = False,
 ) -> None:
     """Apply the module schemas for a single module
 
@@ -635,6 +653,7 @@ def _apply_module_schema_files(
         database_engine: synapse database engine class
         modname: fully qualified name of the module
         names_and_streams: the names and streams of schemas to be applied
+        read_only: if True, raise before executing any unapplied schema file
     """
     cur.execute(
         "SELECT file FROM applied_module_schemas WHERE module_name = ?",
@@ -644,6 +663,12 @@ def _apply_module_schema_files(
     for name, stream in names_and_streams:
         if name in applied_deltas:
             continue
+
+        if read_only:
+            raise PrepareDatabaseException(
+                "Module schema %s for %s has not been applied, and this process "
+                "is read-only so will not apply it." % (name, modname)
+            )
 
         root_name, ext = os.path.splitext(name)
         if ext != ".sql":

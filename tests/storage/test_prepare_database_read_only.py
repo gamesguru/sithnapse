@@ -1,11 +1,21 @@
 #
 # This file is licensed under the Affero General Public License (AGPL) version 3.
 #
+import io
+import sqlite3
+from unittest import SkipTest
+
 from twisted.internet.testing import MemoryReactor
 
 from synapse.server import HomeServer
 from synapse.storage.database import LoggingDatabaseConnection
-from synapse.storage.prepare_database import PrepareDatabaseException, prepare_database
+from synapse.storage.databases.main import check_retired_migrations_before_upgrade
+from synapse.storage.engines import PostgresEngine
+from synapse.storage.prepare_database import (
+    PrepareDatabaseException,
+    _apply_module_schema_files,
+    prepare_database,
+)
 from synapse.util.clock import Clock
 
 from tests.unittest import HomeserverTestCase
@@ -68,3 +78,70 @@ class ReadOnlyPrepareDatabaseTests(HomeserverTestCase):
 
         # It was neither applied nor recorded as applied.
         self.assertFalse(self._delta_applied())
+
+    def test_pending_retired_migration_is_refused_for_the_state_database(self) -> None:
+        """The state database has its own queue, so the guard must also run when
+        this physical database holds only the state schema."""
+        cur = self.db_conn.cursor()
+        cur.execute(
+            "INSERT INTO background_updates (update_name, progress_json) VALUES (?, ?)",
+            ("state_hamt_embedded_migration", "{}"),
+        )
+        self.db_conn.commit()
+
+        with self.assertRaisesRegex(
+            RuntimeError, "embedded state migration is incomplete"
+        ):
+            prepare_database(
+                self.db_conn,
+                self.db_pool.engine,
+                self.hs.config,
+                databases=["state"],
+                read_only=True,
+            )
+
+    def test_read_only_refuses_unapplied_module_schema(self) -> None:
+        cur = self.db_conn.cursor()
+        with self.assertRaises(PrepareDatabaseException):
+            _apply_module_schema_files(
+                cur,
+                self.db_pool.engine,
+                "tests.module",
+                [("new_schema.sql", io.StringIO("CREATE TABLE should_not_exist(x);"))],
+                read_only=True,
+            )
+
+        # Refused before executing anything.
+        cur.execute(
+            "SELECT 1 FROM applied_module_schemas WHERE module_name = ?",
+            ("tests.module",),
+        )
+        self.assertIsNone(cur.fetchone())
+        self.db_conn.commit()
+
+    def test_read_only_allows_already_applied_module_schema(self) -> None:
+        cur = self.db_conn.cursor()
+        cur.execute(
+            "INSERT INTO applied_module_schemas (module_name, file) VALUES (?, ?)",
+            ("tests.module", "old_schema.sql"),
+        )
+        _apply_module_schema_files(
+            cur,
+            self.db_pool.engine,
+            "tests.module",
+            [("old_schema.sql", io.StringIO("CREATE TABLE should_not_exist(x);"))],
+            read_only=True,
+        )
+        self.db_conn.commit()
+
+    def test_retired_migration_check_tolerates_a_missing_queue_table(self) -> None:
+        """A database that predates `background_updates` cannot have a pending
+        retired migration, so the guard must not fail on the missing table."""
+        if isinstance(self.db_pool.engine, PostgresEngine):
+            raise SkipTest("uses a bare sqlite database")
+
+        conn = sqlite3.connect(":memory:")
+        try:
+            check_retired_migrations_before_upgrade(conn.cursor(), self.db_pool.engine)
+        finally:
+            conn.close()

@@ -38,7 +38,7 @@ from synapse.storage.databases.main.sticky_events import StickyEventsWorkerStore
 from synapse.storage.databases.main.thread_subscriptions import (
     ThreadSubscriptionsWorkerStore,
 )
-from synapse.storage.engines import BaseDatabaseEngine
+from synapse.storage.engines import BaseDatabaseEngine, PostgresEngine
 from synapse.storage.types import Cursor
 from synapse.types import get_domain_from_id
 
@@ -392,14 +392,15 @@ class DataStore(
         return await self.db_pool.runInteraction("search_users", search_users)
 
 
-def check_database_before_upgrade(
-    cur: Cursor, database_engine: BaseDatabaseEngine, config: HomeServerConfig
+def check_retired_migrations_before_upgrade(
+    cur: Cursor, database_engine: BaseDatabaseEngine
 ) -> None:
-    """Called before upgrading an existing database to check that it is broadly sane
-    compared with the configuration.
-    """
-    logger.info("Checking database for consistency with configuration...")
+    """Refuse to upgrade a database that still queues a retired SQL-to-mtxdb copy.
 
+    Runs against every physical database being upgraded (the main and, when
+    separate, the state database each have their own `background_updates`
+    table and their own delta that discards these entries).
+    """
     # The handlers for these SQL-to-mtxdb copies have been retired. If a queue
     # entry is still pending, the data has not been copied yet and the embedded
     # store would treat the missing records as a real miss. Refuse to upgrade
@@ -412,6 +413,21 @@ def check_database_before_upgrade(
         "event_auth_chain_links_embedded_migration",
         "state_hamt_embedded_migration",
     )
+    # A database old enough to predate `background_updates` cannot have a queued
+    # retired migration. Test for the table rather than swallowing every error,
+    # so a real failure still surfaces (and, on Postgres, a failed statement
+    # would abort the transaction anyway).
+    if isinstance(database_engine, PostgresEngine):
+        cur.execute("SELECT to_regclass('background_updates') IS NOT NULL")
+    else:
+        cur.execute(
+            "SELECT 1 FROM sqlite_master"
+            " WHERE type = 'table' AND name = 'background_updates'"
+        )
+    row = cur.fetchone()
+    if row is None or not row[0]:
+        return
+
     clause = ", ".join("?" for _ in retired_migrations)
     cur.execute(
         f"SELECT update_name FROM background_updates WHERE update_name IN ({clause})",
@@ -426,6 +442,15 @@ def check_database_before_upgrade(
             "finish before upgrading; the mtxdb store has no SQL fallback "
             "for the records they have not copied." % ", ".join(pending)
         )
+
+
+def check_database_before_upgrade(
+    cur: Cursor, database_engine: BaseDatabaseEngine, config: HomeServerConfig
+) -> None:
+    """Called before upgrading an existing database to check that it is broadly sane
+    compared with the configuration.
+    """
+    logger.info("Checking database for consistency with configuration...")
 
     # if there are any users in the database, check that the username matches our
     # configured server name.
