@@ -12,7 +12,7 @@ import traceback
 from collections import defaultdict, deque
 from contextlib import contextmanager
 from enum import Enum, auto
-from typing import IO, TYPE_CHECKING, Any, Callable, Iterable, Iterator
+from typing import IO, TYPE_CHECKING, Any, Callable, Iterable, Iterator, TypeVar
 
 from synapse.util.timings_flush import register_periodic_flush
 
@@ -127,6 +127,33 @@ def ffi_count(tag: str, count: int) -> None:
             _FFI_COUNTERS[tag] += count
     else:
         _FFI_COUNTERS[tag] += count
+
+
+_T = TypeVar("_T")
+
+# Same attempt count as `database.py`'s own retry loop
+# (`MAX_NUMBER_OF_ATTEMPTS = 5`), no backoff between attempts, matching that
+# convention for the same underlying mtxdb contention class.
+_MAX_READ_CONTENTION_ATTEMPTS = 5
+
+
+def retry_on_contention(call: Callable[[], _T], *, label: str) -> _T:
+    """Retry `call` on transient mtxdb contention, re-raising the last error.
+
+    Reads may raise `BlockingIOError` for journal/checkpoint contention.
+    Writes may also raise it after their native collection-OCC retry budget is
+    exhausted. `label` prefixes the diagnostic counters so the retrying call
+    site stays identifiable.
+    """
+    for attempt in range(1, _MAX_READ_CONTENTION_ATTEMPTS + 1):
+        try:
+            return call()
+        except BlockingIOError:
+            ffi_count(f"{label}_contention_retries", 1)
+            if attempt == _MAX_READ_CONTENTION_ATTEMPTS:
+                ffi_count(f"{label}_contention_exhausted", 1)
+                raise
+    raise AssertionError("unreachable: loop always returns or raises")
 
 
 def _count_sync_origin(kind: str, pools: Iterable[Pool] | None = None) -> None:

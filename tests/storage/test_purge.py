@@ -36,6 +36,7 @@ from synapse.events import EventBase
 from synapse.rest.client import room
 from synapse.server import HomeServer
 from synapse.storage.database import LoggingTransaction
+from synapse.storage.databases.main import purge_events as purge_events_module
 from synapse.storage.databases.main.embedded_common import (
     enable_ffi_counting,
     get_ffi_count,
@@ -187,6 +188,89 @@ class PurgeTests(HomeserverTestCase):
         self.get_failure(self.store.get_event(second["event_id"]), NotFoundError)
         self.get_failure(self.store.get_event(third["event_id"]), NotFoundError)
         self.get_success(self.store.get_event(last["event_id"]))
+
+    def test_embedded_purge_mirror_deletion_retries_contention(self) -> None:
+        redaction_calls = 0
+        event_json_calls = 0
+
+        def delete_redactions(
+            engine_name: str | None, namespace: str, event_ids: list[str]
+        ) -> None:
+            nonlocal redaction_calls
+            redaction_calls += 1
+            if redaction_calls == 1:
+                raise BlockingIOError("temporary mtxdb contention")
+
+        def delete_event_json(
+            engine_name: str | None, namespace: str, event_ids: list[str]
+        ) -> None:
+            nonlocal event_json_calls
+            event_json_calls += 1
+
+        with (
+            patch.object(
+                purge_events_module, "delete_redactions_batch", delete_redactions
+            ),
+            patch.object(
+                purge_events_module, "delete_event_json_batch", delete_event_json
+            ),
+        ):
+            purge_events_module._delete_purge_event_mirrors(
+                "mtxdb", "test", ["$redacted"], ["$event"]
+            )
+
+        self.assertEqual(redaction_calls, 2)
+        self.assertEqual(event_json_calls, 1)
+
+    def test_embedded_purge_mirrors_are_kept_when_the_purge_rolls_back(self) -> None:
+        """The mtxdb mirror deletes wait for the SQL commit.
+
+        They are not rolled back with the transaction, so running them inline
+        would lose the mirror for events whose SQL rows survive a failed purge.
+        """
+        engine, namespace = self._enable_embedded_engine()
+
+        room_id = self.helper.create_room_as(self.user_id)
+        target = self.helper.send(room_id, body="target")
+        redaction = self.helper.send(room_id, body="redaction event")
+        last = self.helper.send(room_id, body="last")
+        self._seed_redaction_and_rejection_mirror(
+            engine, namespace, target["event_id"], redaction["event_id"]
+        )
+        token = self.get_success(
+            self.store.get_topological_token_for_event(last["event_id"])
+        )
+        token_str = self.get_success(token.to_string(self.store))
+
+        original_execute = LoggingTransaction.execute
+
+        def failing_execute(
+            txn: LoggingTransaction, sql: str, *args: Any, **kwargs: Any
+        ) -> Any:
+            # The mirror deletes are registered well before this statement, and
+            # it runs before the temp-table drop that would commit on SQLite.
+            if sql.startswith("UPDATE room_depth"):
+                raise RuntimeError("purge failed late")
+            return original_execute(txn, sql, *args, **kwargs)
+
+        with patch.object(LoggingTransaction, "execute", failing_execute):
+            self.get_failure(
+                self._storage_controllers.purge_events.purge_history(
+                    room_id, token_str, True
+                ),
+                RuntimeError,
+            )
+
+        # The purge rolled back, so the mirror must still be there.
+        self._assert_mirrors(engine, namespace, target["event_id"], present=True)
+
+        # A purge that commits removes it.
+        self.get_success(
+            self._storage_controllers.purge_events.purge_history(
+                room_id, token_str, True
+            )
+        )
+        self._assert_mirrors(engine, namespace, target["event_id"], present=False)
 
     def test_purge_history_writes_rotation_watermark_before_summary_adjustment(
         self,

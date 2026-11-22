@@ -57,6 +57,7 @@ from synapse.storage.databases.main.embedded_common import (
     lock_wait_timing,
     mark_dirty,
     mirror_timing,
+    retry_on_contention,
     sync_event_dag_now,
     sync_now,
 )
@@ -1069,31 +1070,15 @@ def delete_event_edges_batch(
 # `runInteraction` (e.g. `is_event_next_to_forward_gap`) is retried for free
 # by that loop; a caller outside one (e.g. `get_successor_events`, a bare
 # mtxdb read with no enclosing transaction) is not, so it must retry the FFI
-# call itself or the exception is simply unhandled. Retrying here, once, in
-# the module that owns the FFI boundary, covers every caller instead of
-# duplicating a retry loop at each call site.
+# call itself or the exception is simply unhandled. Retrying at the FFI
+# boundary covers every caller instead of duplicating a retry loop at each call
+# site.
 #
-# Same attempt count as `database.py`'s own retry loop
-# (`MAX_NUMBER_OF_ATTEMPTS = 5`), no backoff between attempts, matching that
-# convention for the same underlying contention class.
-_MAX_READ_CONTENTION_ATTEMPTS = 5
-
-
+# The retry loop itself is the shared `retry_on_contention` in
+# `embedded_common` (same attempt count as `database.py`'s own loop); this thin
+# wrapper keeps this module's long-standing `event_edges` counter label.
 def _retry_on_contention(call: "Callable[[], _T]") -> "_T":
-    """Retry `call` on transient mtxdb contention, re-raising the last error.
-
-    Reads may raise this for journal/checkpoint contention. Edge writes may
-    also raise it after their native collection-OCC retry budget is exhausted.
-    """
-    for attempt in range(1, _MAX_READ_CONTENTION_ATTEMPTS + 1):
-        try:
-            return call()
-        except BlockingIOError:
-            ffi_count("event_edges_contention_retries", 1)
-            if attempt == _MAX_READ_CONTENTION_ATTEMPTS:
-                ffi_count("event_edges_contention_exhausted", 1)
-                raise
-    raise AssertionError("unreachable: loop always returns or raises")
+    return retry_on_contention(call, label="event_edges")
 
 
 def get_event_edges_backward_batch(

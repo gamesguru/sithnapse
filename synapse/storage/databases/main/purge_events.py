@@ -29,7 +29,11 @@ from synapse.storage.database import (
     user_is_local_like_pattern,
 )
 from synapse.storage.databases.main import CacheInvalidationWorkerStore
-from synapse.storage.databases.main.embedded_common import Pool, sync_now
+from synapse.storage.databases.main.embedded_common import (
+    Pool,
+    retry_on_contention,
+    sync_now,
+)
 from synapse.storage.databases.main.embedded_event_edges import (
     delete_event_edges_batch,
     get_event_edges_forward_batch,
@@ -47,6 +51,25 @@ from synapse.storage.engines._base import IsolationLevel
 from synapse.types import RoomStreamToken
 
 logger = logging.getLogger(__name__)
+
+
+def _delete_purge_event_mirrors(
+    engine_name: str | None,
+    namespace: str,
+    redacted_event_ids: list[str],
+    deleted_event_ids: list[str],
+) -> None:
+    """Delete purge mirrors after SQL commit, retrying transient mtxdb contention.
+
+    Both deletes are idempotent, so retrying the pair is safe if the first
+    mirror was deleted before contention interrupted the second one.
+    """
+
+    def delete() -> None:
+        delete_redactions_batch(engine_name, namespace, redacted_event_ids)
+        delete_event_json_batch(engine_name, namespace, deleted_event_ids)
+
+    retry_on_contention(delete, label="purge_mirrors")
 
 
 purge_room_tables_with_event_id_index = (
@@ -476,23 +499,22 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
                 ")" % (table,)
             )
 
-        # Remove the corresponding flat-KV entries after the SQL rows have
-        # been deleted, keyed by the redaction's target (`redacts`).
-        if getattr(self, "_embedded_event_json_enabled", False):
-            delete_redactions_batch(
-                self._embedded_db_engine,
-                self._embedded_db_namespace,
-                redacted_event_ids,
-            )
-
+        # Remove the corresponding flat-KV entries, keyed by the redaction's
+        # target (`redacts`). Like the edge mirror below, this runs only after
+        # the SQL transaction commits: it is not rolled back with the
+        # transaction, so doing it here could lose the mirror for events whose
+        # SQL rows survive a failed or retried purge.
         # The `event_json` DELETE above only removed the SQL rows; the
         # embedded mirror (if any) has its own copy under `event_json:<id>`
         # keys that must be removed too, or purged events keep serving their
         # pre-purge content forever from mtxdb -- see embedded_event_json.py.
+        # Deferred until after commit for the same reason as above.
         if getattr(self, "_embedded_event_json_enabled", False):
-            delete_event_json_batch(
+            txn.call_after(
+                _delete_purge_event_mirrors,
                 self._embedded_db_engine,
                 self._embedded_db_namespace,
+                redacted_event_ids,
                 [event_id for event_id, should_delete in event_rows if should_delete],
             )
         if getattr(self, "_embedded_event_edges_writable", False):
@@ -615,16 +637,22 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
                 for children in forward.values()
                 for child_id in (children or ())
             }
-            if child_ids:
+            # Batch the IN list like the extremity lookup above. `MIN` is NULL
+            # for a batch with no matching rows; those are ignored, and the
+            # depth is 0 only if no batch matched anything.
+            child_list = list(child_ids)
+            batch_depths: list[int] = []
+            for start in range(0, len(child_list), 500):
                 clause, args = make_in_list_sql_clause(
-                    self.database_engine, "event_id", list(child_ids)
+                    self.database_engine,
+                    "event_id",
+                    child_list[start : start + 500],
                 )
-                txn.execute(
-                    f"SELECT COALESCE(MIN(depth), 0) FROM events WHERE {clause}", args
-                )
-                (min_depth,) = cast(tuple[int], txn.fetchone())
-            else:
-                min_depth = 0
+                txn.execute(f"SELECT MIN(depth) FROM events WHERE {clause}", args)
+                (batch_min,) = cast(tuple[int | None], txn.fetchone())
+                if batch_min is not None:
+                    batch_depths.append(batch_min)
+            min_depth = min(batch_depths) if batch_depths else 0
         else:
             txn.execute(
                 """
@@ -739,8 +767,23 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             namespace = resolve_namespace(self)
             if namespace is not None:
                 bump_room_generation(namespace, room_id)
+
+                def purge_then_bump(
+                    engine_name: str | None, ns: str, purged_room_id: str
+                ) -> None:
+                    try:
+                        purge_auth_chain_room(engine_name, ns, purged_room_id)
+                    finally:
+                        # A closure computed between the bump above and this
+                        # durable delete was built from data that no longer
+                        # exists (the SQL purge has committed), and was cached
+                        # under the current generation. Advance it again so
+                        # such entries cannot be served, even when the delete
+                        # fails partway.
+                        bump_room_generation(ns, purged_room_id)
+
                 txn.call_after(
-                    purge_auth_chain_room,
+                    purge_then_bump,
                     self._embedded_db_engine,
                     namespace,
                     room_id,
@@ -795,21 +838,17 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             logger.info("[purge] removing from %s", table)
             txn.execute("DELETE FROM %s WHERE room_id=?" % (table,), (room_id,))
 
-        if room_event_ids:
-            delete_redactions_batch(
+        # As in _purge_history_txn, the mirrors are deleted only after the SQL
+        # purge commits. The callbacks retry transient mtxdb contention.
+        if room_event_ids and getattr(self, "_embedded_event_json_enabled", False):
+            txn.call_after(
+                _delete_purge_event_mirrors,
                 self._embedded_db_engine,
                 self._embedded_db_namespace,
                 room_redacted_event_ids,
-            )
-
-        # As in _purge_history_txn: the event_json DELETE above only cleared
-        # SQL, the embedded mirror needs its own delete pass.
-        if room_event_ids:
-            delete_event_json_batch(
-                self._embedded_db_engine,
-                self._embedded_db_namespace,
                 room_event_ids,
             )
+        if room_event_ids:
             if getattr(self, "_embedded_event_edges_writable", False):
                 txn.call_after(
                     delete_event_edges_batch,

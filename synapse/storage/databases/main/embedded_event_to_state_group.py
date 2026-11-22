@@ -64,8 +64,8 @@ from synapse.storage.databases.main.embedded_common import (
     ffi_timing,
     mirror_timing,
     namespace_hash,
+    retry_on_contention,
 )
-from synapse.storage.databases.main.embedded_event_edges import _retry_on_contention
 
 logger = logging.getLogger(__name__)
 
@@ -171,7 +171,9 @@ def get_state_group_for_events_batch(
         ]
         key_to_event_id = dict(zip(keys, event_ids))
         _et = time.monotonic()
-        found = _retry_on_contention(lambda: batch_get(keys))
+        found = retry_on_contention(
+            lambda: batch_get(keys), label="event_to_state_group"
+        )
         ffi_count("event_to_state_group_keys_sent", len(keys))
         ffi_timing("ffi_batch_get", time.monotonic() - _et)
         out = {}
@@ -290,7 +292,9 @@ def get_referenced_state_groups_batch(
         ]
         key_to_group = dict(zip(keys, state_groups))
         _et = time.monotonic()
-        found = _retry_on_contention(lambda: batch_get(keys))
+        found = retry_on_contention(
+            lambda: batch_get(keys), label="event_to_state_group"
+        )
         ffi_timing("ffi_batch_get", time.monotonic() - _et)
         referenced = set()
         for key, value in found:
