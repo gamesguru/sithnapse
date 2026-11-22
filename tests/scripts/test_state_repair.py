@@ -2,12 +2,17 @@
 # This file is licensed under the Affero General Public License (AGPL) version 3.
 #
 
+import sqlite3
 from collections.abc import Collection
 from typing import Any, cast
 
 from twisted.internet.testing import MemoryReactor
 
-from synapse._scripts.state_repair import _import_state, _repair_member
+from synapse._scripts.state_repair import (
+    _import_state,
+    _repair_member,
+    _room_events_from_txn,
+)
 from synapse.api.room_versions import RoomVersion
 from synapse.events import EventBase
 from synapse.rest import admin
@@ -449,6 +454,35 @@ class RepairMemberTestCase(unittest.HomeserverTestCase):
             ),
             report,
         )
+
+    def test_room_event_scan_includes_positive_ids_before_seed(self) -> None:
+        """A descendant can have a lower positive ID on a concurrent writer."""
+        conn = sqlite3.connect(":memory:")
+        try:
+            txn = conn.cursor()
+            txn.execute(
+                "CREATE TABLE events (event_id TEXT, stream_ordering BIGINT, "
+                "room_id TEXT, outlier BOOLEAN)"
+            )
+            txn.executemany(
+                "INSERT INTO events VALUES (?, ?, ?, ?)",
+                [
+                    ("older-positive", 8, self.room_id, False),
+                    ("seed", 10, self.room_id, False),
+                    ("backfilled", -1, self.room_id, False),
+                    ("other-room", 7, "!other:server", False),
+                    ("outlier", 9, self.room_id, True),
+                ],
+            )
+
+            first = _room_events_from_txn(cast(Any, txn), self.room_id, None, 2)
+            self.assertEqual(first, [("backfilled", -1), ("older-positive", 8)])
+            second = _room_events_from_txn(
+                cast(Any, txn), self.room_id, (8, "older-positive"), 2
+            )
+            self.assertEqual(second, [("seed", 10)])
+        finally:
+            conn.close()
 
     def test_empty_propagation_diff_preserves_later_extremity_state(self) -> None:
         seed, remote_state = self._bug_scenario()

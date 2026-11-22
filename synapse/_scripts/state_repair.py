@@ -582,13 +582,12 @@ def _event_stream_ordering_txn(txn: LoggingTransaction, event_id: str) -> int | 
 def _room_events_from_txn(
     txn: LoggingTransaction,
     room_id: str,
-    seed_stream_ordering: int,
     after: tuple[int, str] | None,
     limit: int,
 ) -> list[tuple[str, int]]:
-    """Return later live events and all backfilled room events in batches."""
+    """Return batches of non-outlier events for a room."""
     where_after = ""
-    args: list[Any] = [room_id, seed_stream_ordering]
+    args: list[Any] = [room_id]
     if after is not None:
         stream_ordering, event_id = after
         where_after = (
@@ -600,9 +599,7 @@ def _room_events_from_txn(
         f"""
         SELECT event_id, stream_ordering
         FROM events
-        WHERE room_id = ? AND NOT outlier
-          AND (stream_ordering < 0 OR stream_ordering >= ?)
-          {where_after}
+        WHERE room_id = ? AND NOT outlier {where_after}
         ORDER BY stream_ordering, event_id
         LIMIT ?
         """,
@@ -728,7 +725,6 @@ async def _plan_propagation(
             "synapse_state_repair_room_events",
             _room_events_from_txn,
             room_id,
-            seed_stream_ordering,
             after,
             batch_size,
         )
