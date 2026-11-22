@@ -491,7 +491,32 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
         # yet (they're still counted live from `event_push_actions`), so deleting
         # them needs no adjustment here. This mirrors how rotation counts them in
         # `_rotate_notifs_before_txn`.
+        #
+        # Serialize against `_rotate_notifs`, which updates this position row at
+        # the end of its transaction. Without the lock, rotation can commit
+        # after we compute the decrements but before we delete the rows: the
+        # events then land in the summary *and* their live rows are removed,
+        # leaving an inflated count with nothing left to correct it.
         logger.info("[purge] adjusting event_push_summary for deleted events")
+        if isinstance(self.database_engine, PostgresEngine):
+            txn.execute(
+                "SELECT stream_ordering FROM event_push_summary_stream_ordering"
+                " FOR UPDATE"
+            )
+        else:
+            # SQLite has no row locks. A no-op write takes the database write
+            # lock, so a concurrent rotation either committed before our
+            # snapshot (and we see its summary) or has to wait for us.
+            txn.execute(
+                "UPDATE event_push_summary_stream_ordering"
+                " SET stream_ordering = stream_ordering"
+            )
+            txn.execute(
+                "SELECT stream_ordering FROM event_push_summary_stream_ordering"
+            )
+        rotation_row = txn.fetchone()
+        rotated_upto = int(rotation_row[0]) if rotation_row is not None else -1
+
         txn.execute(
             """
             SELECT epa.user_id, epa.thread_id,
@@ -503,16 +528,14 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
                 AND epa.event_id IN (
                     SELECT event_id FROM events_to_purge WHERE should_delete
                 )
-                AND epa.stream_ordering <= (
-                    SELECT stream_ordering FROM event_push_summary_stream_ordering
-                )
+                AND epa.stream_ordering <= ?
                 AND (
                     eps.last_receipt_stream_ordering IS NULL
                     OR epa.stream_ordering > eps.last_receipt_stream_ordering
                 )
             GROUP BY epa.user_id, epa.thread_id
             """,
-            (room_id,),
+            (room_id, rotated_upto),
         )
         summary_decrements = cast(list[tuple[str, str, int, int]], txn.fetchall())
 
