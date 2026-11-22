@@ -992,25 +992,70 @@ class PerspectivesKeyFetcher(BaseV2KeyFetcher):
         self, keys_to_fetch: list[_FetchKeyRequest]
     ) -> dict[str, dict[str, FetchKeyResult]]:
         """see KeyFetcher._fetch_keys"""
+        # Size of this batch, for the latency logging below. This is the number
+        # of (origin server, key id) pairs being asked of every notary at once.
+        requested_key_count = sum(len(request.key_ids) for request in keys_to_fetch)
+        fanout_started = time.perf_counter()
+        notary_elapsed: dict[str, float] = {}
+        notary_failures: set[str] = set()
 
         async def get_key(key_server: TrustedKeyServer) -> dict:
+            notary_started = time.perf_counter()
             try:
-                return await self.get_server_verify_key_v2_indirect(
+                result = await self.get_server_verify_key_v2_indirect(
                     keys_to_fetch, key_server
                 )
             except KeyLookupError as e:
+                elapsed = time.perf_counter() - notary_started
+                notary_elapsed[key_server.server_name] = elapsed
+                notary_failures.add(key_server.server_name)
                 logger.warning(
-                    "Key lookup failed from %r: %s", key_server.server_name, e
-                )
-            except Exception as e:
-                logger.exception(
-                    "Unable to get key from %r: %s %s",
+                    "Key lookup failed from %r after %.3fs: %s",
                     key_server.server_name,
+                    elapsed,
+                    e,
+                )
+                return {}
+            except Exception as e:
+                elapsed = time.perf_counter() - notary_started
+                notary_elapsed[key_server.server_name] = elapsed
+                notary_failures.add(key_server.server_name)
+                logger.exception(
+                    "Unable to get key from %r after %.3fs: %s %s",
+                    key_server.server_name,
+                    elapsed,
                     type(e).__name__,
                     str(e),
                 )
+                return {}
 
-            return {}
+            elapsed = time.perf_counter() - notary_started
+            notary_elapsed[key_server.server_name] = elapsed
+            returned_key_count = sum(len(keys) for keys in result.values())
+
+            # Per-notary latency. A slow notary gates the whole fan-out
+            # (we wait for all of them so the most lenient answer wins), so
+            # surface the slow ones at INFO; the rest are debug-only.
+            if elapsed >= 0.5:
+                logger.info(
+                    "Slow notary key response from %r: %.3fs for %d requested "
+                    "key(s), returned %d",
+                    key_server.server_name,
+                    elapsed,
+                    requested_key_count,
+                    returned_key_count,
+                )
+            else:
+                logger.debug(
+                    "Notary key response from %r: %.3fs for %d requested "
+                    "key(s), returned %d",
+                    key_server.server_name,
+                    elapsed,
+                    requested_key_count,
+                    returned_key_count,
+                )
+
+            return result
 
         results = await make_deferred_yieldable(
             defer.gatherResults(
@@ -1022,7 +1067,47 @@ class PerspectivesKeyFetcher(BaseV2KeyFetcher):
         union_of_keys: dict[str, dict[str, FetchKeyResult]] = {}
         for result in results:
             for server_name, keys in result.items():
-                union_of_keys.setdefault(server_name, {}).update(keys)
+                merged = union_of_keys.setdefault(server_name, {})
+                for key_id, key in keys.items():
+                    existing = merged.get(key_id)
+                    if existing is None:
+                        merged[key_id] = key
+                    elif key.valid_until_ts > existing.valid_until_ts:
+                        # Notaries can disagree on a key's validity window.
+                        # Keep the most lenient (furthest-future) answer so a
+                        # stale or short view from one notary cannot mask a
+                        # still-valid one from another in the same fan-out.
+                        logger.debug(
+                            "Notary key for %s %s: preferring valid_until %d over %d",
+                            server_name,
+                            key_id,
+                            key.valid_until_ts,
+                            existing.valid_until_ts,
+                        )
+                        merged[key_id] = key
+
+        fanout_elapsed = time.perf_counter() - fanout_started
+        if notary_elapsed:
+            slowest_notary, slowest_elapsed = max(
+                notary_elapsed.items(), key=lambda item: item[1]
+            )
+        else:
+            slowest_notary, slowest_elapsed = None, 0.0
+
+        # The fan-out cost is the *slowest* notary, not the sum, because the
+        # requests run concurrently. Logging both makes it obvious when one
+        # notary is inflating join/verification latency.
+        log = logger.info if fanout_elapsed >= 0.5 or notary_failures else logger.debug
+        log(
+            "Notary key fan-out for %d key(s) across %d notary(s) took %.3fs; "
+            "slowest %s at %.3fs; %d notary(s) failed",
+            requested_key_count,
+            len(self.key_servers),
+            fanout_elapsed,
+            slowest_notary,
+            slowest_elapsed,
+            len(notary_failures),
+        )
 
         return union_of_keys
 

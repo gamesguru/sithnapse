@@ -187,6 +187,15 @@ class KeyStore(CacheInvalidationWorkerStore):
                                 key_id,
                             ),
                         )
+                    elif stored_ts > fetch_result.valid_until_ts:
+                        # The previously observed validity window is longer than
+                        # this response claims (e.g. a stale notary view). Return
+                        # the longer window so it cannot be shortened for this
+                        # caller; the stored row already holds it.
+                        final_keys[key_id] = FetchKeyResult(
+                            verify_key=fetch_result.verify_key,
+                            valid_until_ts=stored_ts,
+                        )
                 elif stored_from_server != server_name and from_server == server_name:
                     # Two-Tier override: direct fetch overrides provisional
                     # notary binding (different key body).

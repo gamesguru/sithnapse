@@ -38,6 +38,7 @@ from twisted.internet.defer import Deferred, ensureDeferred
 from twisted.internet.testing import MemoryReactor
 
 from synapse.api.errors import HttpResponseException, SynapseError
+from synapse.config.key import TrustedKeyServer
 from synapse.crypto import keyring
 from synapse.crypto.keyring import (
     KeyLookupError,
@@ -1062,6 +1063,80 @@ class PerspectivesKeyFetcherTestCase(unittest.HomeserverTestCase):
         # finally, ensure that only one request was sent
         self.assertEqual(self.http_client.post_json.call_count, 1)
 
+    def test_most_lenient_notary_wins(self) -> None:
+        """Notaries disagreeing on a key's validity window: the furthest-future
+        (most lenient) answer must win, regardless of notary order.
+
+        This guards against a stale/expired notary view shortening the window
+        for a key that another notary in the same fan-out still reports as
+        valid further into the future.
+        """
+        self.reactor.advance(100)
+
+        # A second notary, with its own signing key, so both responses can be
+        # individually validated.
+        other_notary = MockPerspectiveServer()
+        other_notary.server_name = "mock_server_2"
+
+        def trusted(notary: MockPerspectiveServer) -> "TrustedKeyServer":
+            verify_key = get_verify_key(notary.key)
+            return TrustedKeyServer(
+                server_name=notary.server_name,
+                verify_keys={get_key_id(verify_key): verify_key},
+            )
+
+        fetcher = PerspectivesKeyFetcher(self.hs)
+        # Deliberately put the shorter-validity notary first: a last-write-wins
+        # merge would end up with the wrong (shorter) answer.
+        fetcher.key_servers = [
+            trusted(self.mock_perspective_server),
+            trusted(other_notary),
+        ]
+
+        SERVER_NAME = "server2"
+        testkey = signedjson.key.generate_signing_key("ver1")
+        testverifykey = get_verify_key(testkey)
+        testverifykey_id = get_key_id(testkey)
+
+        SHORT_TS = 100 * 1000
+        LONG_TS = 300 * 1000
+
+        def build_response(
+            notary: MockPerspectiveServer, valid_until_ts: int
+        ) -> JsonDict:
+            response = {
+                "server_name": SERVER_NAME,
+                "old_verify_keys": {},
+                "valid_until_ts": valid_until_ts,
+                "verify_keys": {
+                    testverifykey_id: {"key": encode_verify_key_base64(testverifykey)}
+                },
+            }
+            signedjson.sign.sign_json(response, SERVER_NAME, testkey)
+            notary.sign_response(response)
+            return response
+
+        responses = {
+            self.mock_perspective_server.server_name: build_response(
+                self.mock_perspective_server, SHORT_TS
+            ),
+            other_notary.server_name: build_response(other_notary, LONG_TS),
+        }
+
+        async def post_json(
+            destination: str, path: str, data: JsonDict, **kwargs: Any
+        ) -> JsonDict:
+            self.assertEqual(path, "/_matrix/key/v2/query")
+            return {"server_keys": [responses[destination]]}
+
+        self.http_client.post_json.side_effect = post_json
+
+        keys = self.get_success(fetcher.get_keys(SERVER_NAME, [testverifykey_id], 0))
+
+        self.assertIn(testverifykey_id, keys)
+        self.assertEqual(keys[testverifykey_id].valid_until_ts, LONG_TS)
+        self.assertEqual(keys[testverifykey_id].verify_key, testverifykey)
+
     def test_get_perspectives_own_key(self) -> None:
         """Check that we can get the perspectives server's own keys
 
@@ -1148,6 +1223,6 @@ class PerspectivesKeyFetcherTestCase(unittest.HomeserverTestCase):
         self.assertEqual(keys, {}, "Expected empty dict with missing origin server sig")
 
 
-def get_key_id(key: SigningKey) -> str:
+def get_key_id(key: SigningKey | VerifyKey) -> str:
     """Get the matrix ID tag for a given SigningKey or VerifyKey"""
     return "%s:%s" % (key.alg, key.version)
