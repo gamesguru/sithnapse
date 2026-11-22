@@ -1085,14 +1085,6 @@ class PerspectivesKeyFetcherTestCase(unittest.HomeserverTestCase):
                 verify_keys={get_key_id(verify_key): verify_key},
             )
 
-        fetcher = PerspectivesKeyFetcher(self.hs)
-        # Deliberately put the shorter-validity notary first: a last-write-wins
-        # merge would end up with the wrong (shorter) answer.
-        fetcher.key_servers = [
-            trusted(self.mock_perspective_server),
-            trusted(other_notary),
-        ]
-
         SERVER_NAME = "server2"
         testkey = signedjson.key.generate_signing_key("ver1")
         testverifykey = get_verify_key(testkey)
@@ -1131,11 +1123,22 @@ class PerspectivesKeyFetcherTestCase(unittest.HomeserverTestCase):
 
         self.http_client.post_json.side_effect = post_json
 
-        keys = self.get_success(fetcher.get_keys(SERVER_NAME, [testverifykey_id], 0))
+        # Exercise both fan-out orders. Each notary's response is controlled
+        # directly above, so a last-write-wins merge cannot pass by accident.
+        for key_servers in (
+            [trusted(self.mock_perspective_server), trusted(other_notary)],
+            [trusted(other_notary), trusted(self.mock_perspective_server)],
+        ):
+            fetcher = PerspectivesKeyFetcher(self.hs)
+            fetcher.key_servers = key_servers
 
-        self.assertIn(testverifykey_id, keys)
-        self.assertEqual(keys[testverifykey_id].valid_until_ts, LONG_TS)
-        self.assertEqual(keys[testverifykey_id].verify_key, testverifykey)
+            keys = self.get_success(
+                fetcher.get_keys(SERVER_NAME, [testverifykey_id], 0)
+            )
+
+            self.assertIn(testverifykey_id, keys)
+            self.assertEqual(keys[testverifykey_id].valid_until_ts, LONG_TS)
+            self.assertEqual(keys[testverifykey_id].verify_key, testverifykey)
 
     def test_logs_candidate_windows_when_no_notary_covers_minimum(self) -> None:
         """When no notary can satisfy the requested minimum, log every

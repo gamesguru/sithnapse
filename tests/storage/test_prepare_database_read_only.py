@@ -42,6 +42,21 @@ class ReadOnlyPrepareDatabaseTests(HomeserverTestCase):
             self.db_conn, self.db_pool.engine, self.hs.config, read_only=True
         )
 
+    def test_pending_retired_embedded_migration_is_refused(self) -> None:
+        cur = self.db_conn.cursor()
+        cur.execute(
+            "INSERT INTO background_updates (update_name, progress_json) VALUES (?, ?)",
+            ("state_hamt_embedded_migration", "{}"),
+        )
+        self.db_conn.commit()
+
+        with self.assertRaisesRegex(
+            RuntimeError, "embedded state migration is incomplete"
+        ):
+            prepare_database(
+                self.db_conn, self.db_pool.engine, self.hs.config, read_only=True
+            )
+
     def test_pending_delta_is_refused_not_applied(self) -> None:
         self._forget_delta()
         self.assertFalse(self._delta_applied())
