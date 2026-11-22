@@ -80,7 +80,7 @@ def _event_summary(event: EventBase | None) -> dict[str, Any] | None:
     return {
         "event_id": event.event_id,
         "type": event.type,
-        "state_key": event.state_key,
+        "state_key": event.get_state_key(),
         "sender": event.sender,
         "origin_server_ts": event.origin_server_ts,
         "membership": (
@@ -538,7 +538,7 @@ async def _unrepresentable_self_rewrite(
                 return {
                     "event_id": event_id,
                     "type": event.type,
-                    "state_key": event.state_key,
+                    "state_key": event.get_state_key(),
                     "would_be": replacement,
                 }
     return None
@@ -836,32 +836,87 @@ async def _plan_propagation(
     }
 
 
+_MAX_LOGGED_REPOINT_FAILURES = 5
+
+
+def _serializable_plan_steps(steps: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Plan steps for the JSON report.
+
+    Keeps each step's group IDs, affected event IDs and changes for auditing and
+    rollback. Only the internal `delta` is dropped: it is keyed by
+    `(type, state_key)` tuples, which JSON cannot represent.
+    """
+    return [{k: v for k, v in step.items() if k != "delta"} for step in steps]
+
+
 async def _apply_propagation(
     hs: HomeServer, room_id: str, plan: list[dict[str, Any]]
-) -> None:
-    """Write the planned groups, repoint their events, then fix current state."""
+) -> list[dict[str, Any]]:
+    """Write planned groups and return any work that could not be completed."""
     if not plan:
-        return
+        return []
 
     store = hs.get_datastores().main
     controllers = hs.get_storage_controllers()
     room_version = await store.get_room_version(room_id)
 
+    incomplete: list[dict[str, Any]] = []
     for step in plan:
-        new_group = await controllers.state.store_state_group(
-            step["events"][0],
-            room_id,
-            room_version,
-            prev_group=step["old_state_group"],
-            delta_ids=step["delta"],
-            current_state_ids=None,
-        )
+        try:
+            new_group = await controllers.state.store_state_group(
+                step["events"][0],
+                room_id,
+                room_version,
+                prev_group=step["old_state_group"],
+                delta_ids=step["delta"],
+                current_state_ids=None,
+            )
+        except Exception as e:
+            logger.exception(
+                "Failed to create propagated state group from %d",
+                step["old_state_group"],
+            )
+            incomplete.append(
+                {
+                    "old_state_group": step["old_state_group"],
+                    "events": step["events"],
+                    "error": str(e),
+                }
+            )
+            continue
         step["new_state_group"] = new_group
+        failed_events: list[str] = []
         for event_id in step["events"]:
-            await store.repoint_event_state_group(event_id, new_group)
+            try:
+                await store.repoint_event_state_group(event_id, new_group)
+            except Exception:
+                # Bound the tracebacks: a systemic failure over a large plan
+                # would otherwise log one per event. Every failure is still
+                # recorded in `incomplete_work`.
+                if len(failed_events) < _MAX_LOGGED_REPOINT_FAILURES:
+                    logger.exception(
+                        "Failed to repoint event %s to propagated state group %d",
+                        event_id,
+                        new_group,
+                    )
+                failed_events.append(event_id)
+        if failed_events:
+            incomplete.append(
+                {
+                    "old_state_group": step["old_state_group"],
+                    "new_state_group": new_group,
+                    "events": failed_events,
+                    "error": "one or more event mappings could not be repointed",
+                }
+            )
 
     assert controllers.persistence is not None
-    await controllers.persistence.update_current_state(room_id)
+    try:
+        await controllers.persistence.update_current_state(room_id)
+    except Exception as e:
+        logger.exception("Failed to recalculate current state after propagation")
+        incomplete.append({"room_id": room_id, "error": str(e)})
+    return incomplete
 
 
 async def _import_state(
@@ -957,6 +1012,15 @@ async def _import_state(
     tip_event = await store.get_event(at_event, allow_none=True)
     tip_key: tuple[str, str] | None = None
     if tip_event is not None and tip_event.is_state():
+        # The state event the tip supersedes is recorded locally in
+        # `replaces_state` (set when the event's context was computed).
+        replaced = tip_event.unsigned.get("replaces_state")
+        if isinstance(replaced, str) and not tip_was_returned:
+            # The requested event is absent because /state_ids reports the
+            # before-event snapshot. Its predecessor is therefore obsolete in
+            # the equivalent after-event snapshot: exclude it before applying
+            # --max-diff or fetching remote bodies.
+            remote_event_ids.discard(replaced)
         # /state_ids is the state before the requested event. Include the
         # accepted state event to compare the same after-event snapshot locally.
         remote_event_ids.add(at_event)
@@ -1097,30 +1161,18 @@ async def _import_state(
             return refuse(report["note"])
 
     if not changes:
-        # A prior publish may have updated the selected tip but stopped before
-        # rewriting another extremity. Reconcile every forward-extremity group
-        # against this remote snapshot on retries.
-        retry_plan = await _plan_state_deltas(hs, room_id, remote_state_by_key)
-        report["plan"] = [step["changes"] for step in retry_plan]
-        if retry_plan:
-            unrepresentable = await _unrepresentable_self_rewrite(
-                hs, retry_plan, "extremities"
-            )
-            if unrepresentable is not None:
-                report["unrepresentable"] = unrepresentable
-                return refuse(
-                    "a forward-extremity state event would be repointed to a "
-                    "state group that changes its own key"
-                )
-        if retry_plan and publish:
-            await _apply_state_deltas(hs, room_id, retry_plan)
-            report["published"] = True
-            report["note"] = "repaired stale forward-extremity state groups"
-            return report
-        if not retry_plan:
-            report["note"] = "nothing to do: local and remote state agree at this event"
-        else:
-            report["note"] = "dry run: pass --publish to repair stale extremities"
+        # Do not reconcile other forward-extremity groups against this remote
+        # snapshot here. With no seed diff there is no repair plan to resume:
+        # the groups and delta of an interrupted publish are not recorded, and
+        # the snapshot describes `at_event`, so applying it to another
+        # extremity would also roll back keys that changed legitimately after
+        # the seed. This applies equally to --propagate, whose snapshot is
+        # historical.
+        report["plan"] = []
+        report["note"] = (
+            "nothing to do: local and remote state agree at this event; "
+            "other groups are not re-examined without a seed diff"
+        )
         return report
 
     if propagate:
@@ -1143,10 +1195,10 @@ async def _import_state(
             return refuse(str(e))
         report["propagation"] = {
             **propagation,
-            "groups": [step["changes"] for step in propagation["groups"]],
+            "groups": _serializable_plan_steps(propagation["groups"]),
         }
         plan = propagation["groups"]
-        report["plan"] = [step["changes"] for step in plan]
+        report["plan"] = _serializable_plan_steps(plan)
         if not plan:
             incomplete = bool(
                 propagation["groups_without_events"] or propagation["stops"]
@@ -1165,7 +1217,7 @@ async def _import_state(
         plan = await _plan_state_deltas(
             hs, room_id, deltas, selected_extremity=at_event
         )
-        report["plan"] = [step["changes"] for step in plan]
+        report["plan"] = _serializable_plan_steps(plan)
         if not plan:
             report["note"] = "nothing to do: every state group already has these events"
             return report
@@ -1214,18 +1266,32 @@ async def _import_state(
         return refuse("one or more imported events were rejected on persist")
 
     if propagate:
-        await _apply_propagation(hs, room_id, plan)
+        apply_incomplete = await _apply_propagation(hs, room_id, plan)
+        # `new_state_group` is filled in while applying; refresh the report.
+        report["propagation"]["groups"] = _serializable_plan_steps(plan)
+        report["plan"] = _serializable_plan_steps(plan)
+        report["propagation"]["incomplete_work"] = apply_incomplete
         report["incomplete"] = bool(
-            report["propagation"]["groups_without_events"]
+            apply_incomplete
+            or report["propagation"]["groups_without_events"]
             or report["propagation"]["stops"]
         )
         if report["incomplete"]:
+            if apply_incomplete:
+                report["partial"] = True
             report["note"] = (
-                "published planned groups; some descendant groups remain incomplete"
+                "partially published; see propagation.incomplete_work"
+                if apply_incomplete
+                else "published planned groups; some descendant groups remain incomplete"
             )
     else:
         await _apply_state_deltas(hs, room_id, plan)
-    report["published"] = True
+        # `new_state_group` is filled in while applying; refresh the report.
+        report["plan"] = _serializable_plan_steps(plan)
+    # Some propagation work did not complete: the writes that succeeded stay
+    # in place (see `partial` and `propagation.incomplete_work`), but this must
+    # not read as a clean publish to anything checking `published` alone.
+    report["published"] = not report.get("partial", False)
     return report
 
 

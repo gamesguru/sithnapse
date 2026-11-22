@@ -43,7 +43,9 @@ snapshot; it applies one known event to one state key. The general
 
 Sithnapse does not currently provide supported commands for:
 
-- comparing a room's state with one or more remote servers;
+- comparing a room's state with several remote servers at once (a single-peer
+  comparison is available as `repair-state import` without `--publish`, which is
+  a dry run);
 - force-setting arbitrary room state from local or remote input (the narrow
   `repair-member` and `repair-state import` commands apply only verified events
   and preserve local-only keys);

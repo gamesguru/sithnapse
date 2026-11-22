@@ -223,8 +223,17 @@ Publishing imports the missing/differing events through the normal outlier auth
 path and applies them to the forward extremities with the same state-group
 rewrite as `repair-member`. Keys that exist only locally are reported but never
 removed, so local-only memberships survive. It refuses partial-state and MSC4242
-rooms, a multi-extremity room without `--at-event`, a remote that does not
-include the comparison event in its answer, and a diff larger than `--max-diff`.
+rooms, a multi-extremity room without `--at-event`, and a diff larger than
+`--max-diff`. The remote's `/state_ids` answer is the state _before_ the
+comparison event; the tool adds the accepted event itself before comparing, and
+ignores the predecessor that event supersedes.
+
+An import whose seed state already matches the remote produces no plan and makes
+no changes. That includes re-running after a publish that stopped partway: the
+remaining forward-extremity groups are not reconciled automatically, because
+there is no recorded plan to resume and applying the seed's historical snapshot
+to another extremity could roll back state that legitimately changed after it.
+Re-seed at the affected extremity with `--at-event` instead.
 
 This is the import half, and it only finds differences at the seed event. A key
 that was wrong early and was overwritten later will not appear in its diff.
@@ -247,7 +256,24 @@ Descendant groups are found through `state_group_edges`, not by replaying the
 event DAG, so the repair works when the dropped event itself is only a stateless
 outlier. A group whose value for a key was legitimately changed later is left
 alone and reported under `stops`. Groups with no local event are counted but not
-rewritten. `--max-events` bounds the descendants considered (default 200000).
+rewritten. `--max-events` bounds the descendants considered (default 200000). An
+interrupted propagation has no durable resume record. If the seed already
+matches on a later invocation, the tool leaves other groups unchanged rather
+than applying the historical snapshot to forward extremities; review and plan a
+new repair explicitly.
+
+In the JSON report, `plan` is a list of step objects with group IDs, affected
+event IDs, and `changes`; the tuple-keyed internal delta is omitted. With
+`--propagate`, the same steps are also under `propagation.groups`. A propagation
+that could not finish reports `partial: true`, `published: false` and the
+unfinished work under `propagation.incomplete_work`; save the report, since it
+is the only record.
+
+A valid local non-outlier seed can still produce no publishable plan. If any
+planned group would repoint a state event to a group that replaces that event's
+own key with a different event ID, the store cannot keep both the historical and
+the repaired mapping, so `_import_state` refuses the entire plan, including in
+dry-run mode, and reports the offending events under `unrepresentable`.
 
 The report also lists events whose `auth_events` name the replaced event
 (`auth_review`), including their current rejection status. That list is

@@ -2,9 +2,14 @@
 # This file is licensed under the Affero General Public License (AGPL) version 3.
 #
 
+from collections.abc import Collection
+from typing import Any, cast
+
 from twisted.internet.testing import MemoryReactor
 
 from synapse._scripts.state_repair import _import_state, _repair_member
+from synapse.api.room_versions import RoomVersion
+from synapse.events import EventBase
 from synapse.rest import admin
 from synapse.rest.client import login, room
 from synapse.server import HomeServer
@@ -26,6 +31,7 @@ class RepairMemberTestCase(unittest.HomeserverTestCase):
         self.controllers = hs.get_storage_controllers()
 
         alice = self.register_user("alice", "pass")
+        self.alice = alice
         self.alice_tok = self.login("alice", "pass")
         bob = self.register_user("bob", "pass")
         bob_tok = self.login("bob", "pass")
@@ -160,7 +166,7 @@ class RepairMemberTestCase(unittest.HomeserverTestCase):
         self.assertEqual(actions[self.key], "replace")
         self.assertEqual(len(report["plan"]), 1)
         self.assertEqual(
-            report["plan"][0],
+            report["plan"][0]["changes"],
             [
                 {
                     "type": self.key[0],
@@ -170,6 +176,8 @@ class RepairMemberTestCase(unittest.HomeserverTestCase):
                 }
             ],
         )
+        self.assertIn("old_state_group", report["plan"][0])
+        self.assertIn("extremities", report["plan"][0])
 
     def test_import_publish_replaces_and_sticks(self) -> None:
         self._rewind_to_join()
@@ -191,6 +199,37 @@ class RepairMemberTestCase(unittest.HomeserverTestCase):
         report = self._import(publish=False, max_diff=0)
         self.assertIn("exceeds --max-diff", report["refused"])
 
+    def _pre_event_state(self, event_id: str, key: tuple[str, str]) -> dict:
+        """Approximate `/state_ids`: the snapshot immediately before `event_id`."""
+        state = dict(
+            self.get_success(self.controllers.state.get_current_state_ids(self.room_id))
+        )
+        event = self.get_success(self.store.get_event(event_id))
+        replaces = event.unsigned.get("replaces_state")
+        if replaces is None:
+            state.pop(key, None)
+        else:
+            state[key] = replaces
+        return state
+
+    def test_empty_diff_reports_nothing_and_changes_nothing(self) -> None:
+        """A seed whose state already matches the remote gets no plan."""
+        topic_key = ("m.room.topic", "")
+        seed = self.helper.send_state(
+            self.room_id, "m.room.topic", {"topic": "tip"}, tok=self.alice_tok
+        )["event_id"]
+        remote_state = self._pre_event_state(seed, topic_key)
+
+        report = self._import_at(seed, remote_state, publish=True, propagate=False)
+
+        self.assertIsNone(report["refused"], report)
+        self.assertEqual(report["plan"], [])
+        self.assertFalse(report.get("published", False))
+        current = self.get_success(
+            self.controllers.state.get_current_state_ids(self.room_id)
+        )
+        self.assertEqual(current[topic_key], seed)
+
     def _bug_scenario(self) -> tuple[str, dict]:
         """Create a join after the leave, then rewind it to the old join.
 
@@ -199,12 +238,22 @@ class RepairMemberTestCase(unittest.HomeserverTestCase):
         """
         charlie = self.register_user("charlie", "pass")
         charlie_tok = self.login("charlie", "pass")
-        self.helper.join(self.room_id, charlie, tok=charlie_tok)
+        self.helper.invite(
+            self.room_id, src=self.alice, targ=charlie, tok=self.alice_tok
+        )
 
+        # /state_ids at Charlie's join returns this before-join snapshot,
+        # including the invitation that the join supersedes.
         remote_state = dict(
             self.get_success(self.controllers.state.get_current_state_ids(self.room_id))
         )
-        seed_event_id = remote_state[("m.room.member", charlie)]
+        self.helper.join(self.room_id, charlie, tok=charlie_tok)
+        after_join = self.get_success(
+            self.controllers.state.get_current_state_ids(
+                self.room_id, StateFilter.from_types([("m.room.member", charlie)])
+            )
+        )
+        seed_event_id = after_join[("m.room.member", charlie)]
         seed_group = self.get_success(
             self.store._get_state_group_for_events([seed_event_id])
         )[seed_event_id]
@@ -238,6 +287,7 @@ class RepairMemberTestCase(unittest.HomeserverTestCase):
         remote_state: dict,
         publish: bool,
         propagate: bool,
+        max_diff: int = 500,
     ) -> dict:
         federation = self.hs.get_federation_client()
 
@@ -256,7 +306,7 @@ class RepairMemberTestCase(unittest.HomeserverTestCase):
                 self.room_id,
                 "remote.example",
                 at_event,
-                500,
+                max_diff,
                 publish,
                 propagate=propagate,
             )
@@ -266,6 +316,63 @@ class RepairMemberTestCase(unittest.HomeserverTestCase):
         seed, remote_state = self._bug_scenario()
         report = self._import_at(seed, remote_state, publish=False, propagate=False)
         self.assertIn("must be a forward extremity", report["refused"])
+
+    def test_superseded_predecessor_does_not_consume_diff_budget(self) -> None:
+        seed, remote_state = self._bug_scenario()
+
+        # The before-event snapshot contains Charlie's invite, but the join
+        # supersedes it. Only Bob's actual state difference should count.
+        report = self._import_at(
+            seed, remote_state, publish=True, propagate=True, max_diff=1
+        )
+
+        self.assertIsNone(report["refused"], report)
+        self.assertTrue(report["published"])
+
+    def test_unfetchable_superseded_predecessor_is_ignored(self) -> None:
+        """A predecessor the remote no longer serves must not block publish.
+
+        `/state_ids` names the invite that Charlie's join supersedes, but the
+        join is the after-event value: losing the invite costs nothing.
+        """
+        seed, remote_state = self._bug_scenario()
+        seed_event = self.get_success(self.store.get_event(seed))
+        invite_id = seed_event.unsigned["replaces_state"]
+        self.assertIn(invite_id, remote_state.values())
+
+        # Pretend the invite is neither held locally nor served by the remote.
+        store = self.store
+        real_get_event = store.get_event
+
+        async def fake_get_event(
+            event_id: str, *args: Any, **kwargs: Any
+        ) -> EventBase | None:
+            if event_id == invite_id:
+                return None
+            return await cast(Any, real_get_event)(event_id, *args, **kwargs)
+
+        self.patch(store, "get_event", fake_get_event)
+
+        federation = self.hs.get_federation_client()
+
+        pdu_requests: list[str] = []
+
+        async def fake_pdu(
+            destinations: Collection[str], event_id: str, room_version: RoomVersion
+        ) -> None:
+            pdu_requests.append(event_id)
+            return None
+
+        self.patch(federation, "get_pdu", fake_pdu)
+
+        report = self._import_at(
+            seed, remote_state, publish=True, propagate=True, max_diff=1
+        )
+
+        self.assertIsNone(report["refused"], report)
+        self.assertEqual(report["errors"], [])
+        self.assertNotIn(invite_id, pdu_requests)
+        self.assertTrue(report["published"])
 
     def test_propagate_repairs_seed_and_descendant_groups(self) -> None:
         seed, remote_state = self._bug_scenario()
@@ -279,6 +386,11 @@ class RepairMemberTestCase(unittest.HomeserverTestCase):
         self.assertEqual(report["propagation"]["group_count"], 2)
         self.assertGreaterEqual(report["propagation"]["event_count"], 2)
         self.assertEqual(report["propagation"]["stops"], [])
+        for step in report["plan"]:
+            self.assertIn("old_state_group", step)
+            self.assertIn("events", step)
+            self.assertIn("changes", step)
+            self.assertNotIn("delta", step)
 
         report = self._import_at(seed, remote_state, publish=True, propagate=True)
         self.assertIsNone(report["refused"], report)
@@ -303,6 +415,56 @@ class RepairMemberTestCase(unittest.HomeserverTestCase):
         # Idempotent: local and remote state now agree at the seed.
         again = self._import_at(seed, remote_state, publish=True, propagate=True)
         self.assertEqual(again["changes"], [])
+
+    def test_empty_propagation_diff_preserves_later_extremity_state(self) -> None:
+        seed, remote_state = self._bug_scenario()
+        repaired = self._import_at(seed, remote_state, publish=True, propagate=True)
+        self.assertTrue(repaired["published"])
+
+        # A legitimate later membership update diverges from the historical
+        # seed snapshot. An empty seed diff must not push that old snapshot to
+        # the forward extremity.
+        self.helper.join(self.room_id, self.bob, tok=self.bob_tok)
+        later_join = self._current()
+        self.assertNotEqual(later_join, self.leave_id)
+
+        again = self._import_at(seed, remote_state, publish=True, propagate=True)
+
+        self.assertEqual(again["changes"], [])
+        self.assertEqual(again["plan"], [])
+        self.assertEqual(self._current(), later_join)
+
+    def test_propagation_reports_failed_event_repoint_as_partial(self) -> None:
+        seed, remote_state = self._bug_scenario()
+        real_repoint = self.store.repoint_event_state_group
+        failed_event: str | None = None
+
+        async def fail_first_repoint(event_id: str, state_group: int) -> None:
+            nonlocal failed_event
+            if failed_event is None:
+                failed_event = event_id
+                raise RuntimeError("injected repoint failure")
+            await real_repoint(event_id, state_group)
+
+        self.patch(self.store, "repoint_event_state_group", fail_first_repoint)
+        report = self._import_at(seed, remote_state, publish=True, propagate=True)
+
+        self.assertIsNone(report["refused"], report)
+        # Some writes landed, but `published` alone must not read as success.
+        self.assertFalse(report["published"])
+        self.assertTrue(report["partial"])
+        self.assertTrue(report["incomplete"])
+        self.assertEqual(
+            report["note"], "partially published; see propagation.incomplete_work"
+        )
+        self.assertIsNotNone(failed_event)
+        self.assertTrue(
+            any(
+                failed_event in work.get("events", [])
+                for work in report["propagation"]["incomplete_work"]
+            ),
+            report,
+        )
 
     def test_propagate_stops_at_later_membership_change(self) -> None:
         seed, remote_state = self._bug_scenario()
