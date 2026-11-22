@@ -772,6 +772,20 @@ class Porter:
         # 0 means off. 1 means full. 2 means incremental.
         return autovacuum_setting != 0
 
+    @staticmethod
+    def _events_live_outside_sql(txn: LoggingTransaction) -> bool:
+        """Whether the source has events whose JSON is not in SQL.
+
+        A heuristic: a SQL-backed database has an `event_json` row for every
+        event, so events with none at all mean the bodies live in mtxdb.
+        """
+        txn.execute("SELECT 1 FROM events LIMIT 1")
+        has_events = txn.fetchone() is not None
+        if not has_events:
+            return False
+        txn.execute("SELECT 1 FROM event_json LIMIT 1")
+        return txn.fetchone() is None
+
     async def remove_ignored_background_updates_from_database(self) -> None:
         def _remove_delete_unreferenced_state_groups_bg_updates(
             txn: LoggingTransaction,
@@ -801,6 +815,28 @@ class Porter:
                 DatabaseConnectionConfig("master-sqlite", self.sqlite_config),
                 allow_outdated_version=True,
             )
+
+            # Events and edges owned by the embedded engine (mtxdb) are not in
+            # the SQLite tables this script copies, so a port would silently
+            # produce a database missing them. Refuse rather than report success.
+            if self.hs.config.database.embedded_db_engine:
+                end_error = (
+                    "The configuration enables the embedded (mtxdb) engine, which"
+                    " owns event data that this script does not copy. Porting"
+                    " only the SQLite tables would produce an incomplete database,"
+                    " so refusing."
+                )
+                return
+            if await self.sqlite_store.db_pool.runInteraction(
+                "sqlite_events_live_outside_sql", self._events_live_outside_sql
+            ):
+                end_error = (
+                    "The SQLite database has events but no event_json rows: the"
+                    " event bodies are stored in the embedded (mtxdb) engine,"
+                    " which this script does not copy. Refusing to port an"
+                    " incomplete database."
+                )
+                return
 
             # For safety, ensure auto_vacuums are disabled.
             if await self.sqlite_store.db_pool.runInteraction(
