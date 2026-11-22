@@ -3939,6 +3939,152 @@ pub fn materialize_state_hamts(
     })
 }
 
+/// Key for the embedded `event_id -> state_group` mapping, matching
+/// `_event_to_state_group_key` in `embedded_event_to_state_group.py`.
+fn event_to_state_group_key(namespace: &str, event_id: &str) -> Vec<u8> {
+    let namespace_hash = Sha256::digest(namespace.as_bytes());
+    let mut key = Vec::with_capacity(b"event_to_state_group:".len() + 32 + 1 + event_id.len());
+    key.extend_from_slice(b"event_to_state_group:");
+    key.extend_from_slice(hex::encode(&namespace_hash[..16]).as_bytes());
+    key.push(b':');
+    key.extend_from_slice(event_id.as_bytes());
+    key
+}
+
+/// Key for one state group's event reference count, matching
+/// `_state_group_refcount_key` in `embedded_event_to_state_group.py`.
+fn state_group_refcount_key(namespace: &str, state_group: i64) -> Vec<u8> {
+    let namespace_hash = Sha256::digest(namespace.as_bytes());
+    let mut key = Vec::with_capacity(b"state_group_refcount:".len() + 32 + 1 + 8);
+    key.extend_from_slice(b"state_group_refcount:");
+    key.extend_from_slice(hex::encode(&namespace_hash[..16]).as_bytes());
+    key.push(b':');
+    key.extend_from_slice(&state_group.to_be_bytes());
+    key
+}
+
+fn decode_counter(data: Option<&NodeData>) -> i64 {
+    data.filter(|data| data.bytes.len() == 8)
+        .map(|data| {
+            i64::from_be_bytes(
+                data.bytes
+                    .as_ref()
+                    .try_into()
+                    .expect("counter length was checked"),
+            )
+        })
+        .unwrap_or(0)
+}
+
+/// Atomically point an event at a different state group and move the state
+/// group reference counts with it.
+///
+/// The mapping write and both counter updates are staged in one mtxdb
+/// transaction, so a crash or error cannot expose the new mapping with the
+/// old reference counts (or only half of a decrement/increment pair). Record
+/// version expectations make the read-modify-write of each counter safe
+/// against a concurrent `increment_counters_batch`; a conflict retries the
+/// whole operation.
+#[pyfunction]
+pub fn repoint_event_state_group(
+    py: Python<'_>,
+    namespace: String,
+    event_id: String,
+    state_group: i64,
+) -> PyResult<Option<i64>> {
+    assert_writable()?;
+    py.detach(|| {
+        let _guard = RMW_LOCK
+            .lock()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}")))?;
+        let database = pools()?.shared_database.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "mtxdb repoint requires the shared WAL opened by open_client",
+            )
+        })?;
+        let collection = kv_room_id();
+        let mapping_node = kv_node_id(&event_to_state_group_key(&namespace, &event_id));
+        let new_mapping = NodeData::new(bytes::Bytes::copy_from_slice(&state_group.to_be_bytes()));
+
+        const MAX_ATTEMPTS: usize = 8;
+        for attempt in 0..MAX_ATTEMPTS {
+            let txn = database.begin_transaction();
+            let (records, versions) = txn
+                .get_with_record_versions(ShardType::State, &collection, &[mapping_node])
+                .map_err(|e| map_transaction_error("read event_to_state_group", e))?;
+            txn.expect_record_version(ShardType::State, collection, mapping_node, versions[0])
+                .map_err(|e| map_transaction_io_error("expect event_to_state_group version", e))?;
+
+            let old = match records[0].as_ref() {
+                Some(data) if data.bytes.is_empty() => None,
+                Some(data) => {
+                    let bytes: [u8; 8] = data.bytes.as_ref().try_into().map_err(|_| {
+                        pyo3::exceptions::PyRuntimeError::new_err(
+                            "invalid event_to_state_group record",
+                        )
+                    })?;
+                    Some(i64::from_be_bytes(bytes))
+                }
+                None => None,
+            };
+
+            let mut counter_updates: Vec<(Vec<u8>, i64)> = Vec::new();
+            if old != Some(state_group) {
+                if let Some(old) = old {
+                    counter_updates.push((state_group_refcount_key(&namespace, old), -1));
+                }
+                counter_updates.push((state_group_refcount_key(&namespace, state_group), 1));
+            }
+
+            let counter_nodes: Vec<NodeId> = counter_updates
+                .iter()
+                .map(|(key, _)| kv_node_id(key))
+                .collect();
+            let (counter_records, counter_versions) = if counter_nodes.is_empty() {
+                (Vec::new(), Vec::new())
+            } else {
+                txn.get_with_record_versions(ShardType::State, &collection, &counter_nodes)
+                    .map_err(|e| map_transaction_error("read state_group_refcount", e))?
+            };
+
+            txn.put(ShardType::State, collection, mapping_node, &new_mapping)
+                .map_err(|e| map_transaction_io_error("stage event_to_state_group", e))?;
+
+            for (((_, delta), node_id), (record, version)) in counter_updates
+                .into_iter()
+                .zip(counter_nodes)
+                .zip(counter_records.into_iter().zip(counter_versions))
+            {
+                txn.expect_record_version(ShardType::State, collection, node_id, version)
+                    .map_err(|e| {
+                        map_transaction_io_error("expect state_group_refcount version", e)
+                    })?;
+                let next = decode_counter(record.as_ref()) + delta;
+                txn.put(
+                    ShardType::State,
+                    collection,
+                    node_id,
+                    &NodeData::new(bytes::Bytes::copy_from_slice(&next.to_be_bytes())),
+                )
+                .map_err(|e| map_transaction_io_error("stage state_group_refcount", e))?;
+            }
+
+            match txn.commit() {
+                Ok(()) => return Ok(old),
+                Err(StorageError::StaleRead { .. }) if attempt + 1 < MAX_ATTEMPTS => continue,
+                Err(error) if attempt + 1 < MAX_ATTEMPTS && is_retryable_contention(&error) => {
+                    continue
+                }
+                Err(error) => return Err(map_transaction_error("commit", error)),
+            }
+        }
+
+        Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "mtxdb repoint_event_state_group did not settle after repeated contention",
+        ))
+    })
+}
+
 pub type PySelectiveQuery = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<(String, String)>);
 
 #[pyfunction]
@@ -4772,6 +4918,7 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(put_room_index, m)?)?;
     m.add_function(wrap_pyfunction!(get_room_index, m)?)?;
     m.add_function(wrap_pyfunction!(increment_counters_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(repoint_event_state_group, m)?)?;
     m.add_function(wrap_pyfunction!(sync, m)?)?;
     m.add_function(wrap_pyfunction!(sync_state, m)?)?;
     m.add_function(wrap_pyfunction!(sync_event_dag, m)?)?;
@@ -5210,5 +5357,83 @@ pub(crate) mod auth_chain_closure_tests {
             .expect("read after re-put")
         });
         assert_eq!(roots, vec![Some(value)]);
+    }
+
+    #[test]
+    fn repoint_event_state_group_moves_mapping_and_refcounts() {
+        ensure_open();
+        let namespace = "ns-repoint-atomic";
+        let event_id = "$repoint-atomic";
+        let old_group: i64 = 71;
+        let new_group: i64 = 72;
+        let collection = kv_room_id();
+
+        batch_put_impl(vec![
+            (
+                event_to_state_group_key(namespace, event_id),
+                old_group.to_be_bytes().to_vec(),
+            ),
+            (
+                state_group_refcount_key(namespace, old_group),
+                3i64.to_be_bytes().to_vec(),
+            ),
+        ])
+        .expect("seed mapping and old refcount");
+
+        let read_group = |key: Vec<u8>| -> Option<i64> {
+            state_db()
+                .expect("state db")
+                .get_read_committed(&collection, &[kv_node_id(&key)])
+                .expect("read record")
+                .remove(0)
+                .filter(|data| !data.bytes.is_empty())
+                .map(|data| i64::from_be_bytes(data.bytes.as_ref().try_into().unwrap()))
+        };
+
+        let old = pyo3::Python::attach(|py| {
+            repoint_event_state_group(py, namespace.to_owned(), event_id.to_owned(), new_group)
+        })
+        .expect("repoint");
+        assert_eq!(old, Some(old_group));
+        assert_eq!(
+            read_group(event_to_state_group_key(namespace, event_id)),
+            Some(new_group)
+        );
+        assert_eq!(
+            read_group(state_group_refcount_key(namespace, old_group)),
+            Some(2)
+        );
+        assert_eq!(
+            read_group(state_group_refcount_key(namespace, new_group)),
+            Some(1)
+        );
+
+        // Repeating the same repoint must not move either counter again.
+        let old = pyo3::Python::attach(|py| {
+            repoint_event_state_group(py, namespace.to_owned(), event_id.to_owned(), new_group)
+        })
+        .expect("idempotent repoint");
+        assert_eq!(old, Some(new_group));
+        assert_eq!(
+            read_group(state_group_refcount_key(namespace, old_group)),
+            Some(2)
+        );
+        assert_eq!(
+            read_group(state_group_refcount_key(namespace, new_group)),
+            Some(1)
+        );
+
+        // A previously unmapped event only adds a reference to its new group.
+        let missing_event_id = "$repoint-atomic-missing";
+        let old = pyo3::Python::attach(|py| {
+            repoint_event_state_group(py, namespace.to_owned(), missing_event_id.to_owned(), 73)
+        })
+        .expect("insert repoint");
+        assert_eq!(old, None);
+        assert_eq!(
+            read_group(event_to_state_group_key(namespace, missing_event_id)),
+            Some(73)
+        );
+        assert_eq!(read_group(state_group_refcount_key(namespace, 73)), Some(1));
     }
 }

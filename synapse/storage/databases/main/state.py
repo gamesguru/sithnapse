@@ -63,6 +63,7 @@ from synapse.storage.databases.main.embedded_event_to_state_group import (
     get_state_group_for_events_batch,
     increment_state_group_refcounts_batch,
     put_event_to_state_group_batch,
+    repoint_event_state_group,
 )
 from synapse.storage.databases.main.events_worker import EventsWorkerStore
 from synapse.storage.databases.main.roommember import RoomMemberWorkerStore
@@ -946,29 +947,12 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             self.db_pool.simple_delete_txn(
                 txn, table="event_to_state_groups", keyvalues={"event_id": event_id}
             )
-            old = get_state_group_for_events_batch(
+            repoint_event_state_group(
                 self._embedded_db_engine,
                 self._embedded_db_namespace,
-                [event_id],
-                purpose="repoint_event_state_group",
-            ).get(event_id)
-            put_event_to_state_group_batch(
-                self._embedded_db_engine,
-                self._embedded_db_namespace,
-                [(event_id, state_group)],
+                event_id,
+                state_group,
             )
-            if old != state_group:
-                if old is not None:
-                    decrement_state_group_refcounts_batch(
-                        self._embedded_db_engine,
-                        self._embedded_db_namespace,
-                        [old],
-                    )
-                increment_state_group_refcounts_batch(
-                    self._embedded_db_engine,
-                    self._embedded_db_namespace,
-                    [state_group],
-                )
             if publishes_at_commit():
                 txn.call_after(mark_dirty, Pool.STATE)
             else:

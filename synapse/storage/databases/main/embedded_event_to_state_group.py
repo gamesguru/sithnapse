@@ -129,6 +129,26 @@ def put_event_to_state_group_batch(
         ffi_timing("ffi_batch_put", time.monotonic() - _et)
 
 
+def repoint_event_state_group(
+    engine_name: str | None,
+    namespace: str,
+    event_id: str,
+    state_group: int,
+) -> None:
+    """Atomically rewrite one event's state group and move its refcounts.
+
+    A single mtxdb transaction covers the mapping write, the old group's
+    decrement and the new group's increment. Splitting those writes (as
+    `put_event_to_state_group_batch` plus the two refcount helpers do for
+    insertion/purge callers) leaves a crash window where the mapping points
+    at the new group while only some of the counters have moved.
+    """
+    with mirror_timing("repoint_event_state_group"):
+        get_embedded_engine(engine_name).repoint_event_state_group(
+            namespace, event_id, state_group
+        )
+
+
 def get_state_group_for_events_batch(
     engine_name: str | None,
     namespace: str,
