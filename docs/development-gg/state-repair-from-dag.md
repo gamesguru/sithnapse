@@ -201,7 +201,7 @@ replacement does not supersede it). `--publish` requires
 
 ## Importing a state diff: `repair-state import`
 
-`repair-member` fixes one known event. To find out *which* keys were dropped,
+`repair-member` fixes one known event. To find out _which_ keys were dropped,
 `repair-state import` compares local state with a remote server's state at the
 room's single forward extremity:
 
@@ -219,17 +219,23 @@ checked against the keyring. The report lists every differing key with the local
 and remote event, the action (`import`, `replace`, or `keep-local`), and the
 state-group rewrite plan.
 
-Publishing imports the missing/differing events through the normal outlier
-auth path and applies them to the forward extremities with the same state-group
+Publishing imports the missing/differing events through the normal outlier auth
+path and applies them to the forward extremities with the same state-group
 rewrite as `repair-member`. Keys that exist only locally are reported but never
 removed, so local-only memberships survive. It refuses partial-state and MSC4242
 rooms, a multi-extremity room without `--at-event`, a remote that does not
-include the comparison event in its answer, and a diff larger than
-`--max-diff`.
+include the comparison event in its answer, and a diff larger than `--max-diff`.
 
-This is the first half of the range-repair story. The second half, a
-`repair-state sweep`, would walk the local DAG in topological order and rewrite
-only the per-event state groups whose stored state differs from the recomputed
-state. That is not implemented: import fixes the tip and future events, while
-historical `state-at-event` values for events already in the DAG keep their old
-groups until a sweep exists.
+This is the import half, and it only finds differences at the current tip. A key
+that was wrong early and was overwritten later will not appear in its diff.
+
+The second half, a `repair-state sweep`, would walk every locally
+reconstructible event in topological order — not only events after our join —
+and rewrite only the per-event state groups whose stored state differs from the
+recomputed state. A single-parent state event can reuse the parent group plus a
+one-key delta; a merge needs real state resolution. Events whose prev or auth
+inputs are missing must be refused rather than synthesized, so a sweep can only
+reconstruct from inputs available locally: deeper history needs import or
+backfill first. Re-running the sweep must write nothing once the groups agree.
+It is not implemented; until then, historical `state-at-event` values for events
+already in the DAG keep their old groups.
