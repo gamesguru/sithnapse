@@ -278,6 +278,35 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             sum(1 for e in event_rows if e[1]),
         )
 
+        # Take the summary watermark now: the purge is about to start its
+        # destructive work, and the row lock is held until this transaction
+        # commits. Rotation and receipt processing therefore cannot summarize
+        # rows we are about to delete. Doing this before the deletes matters on
+        # Postgres: the transaction snapshot is fixed at its first data
+        # statement, so a rotation that commits during a long purge would
+        # otherwise make a late write fail with a serialization error and redo
+        # every delete (the pool only retries a handful of times). The cost is
+        # that rotation and receipt summary updates wait for the purge to
+        # finish.
+        #
+        # Placing it after `events_to_purge` is populated skips the lock
+        # entirely for purges that find nothing to delete, and still catches
+        # serialization conflicts before any expensive work.
+        #
+        # This must be a write, not just `SELECT ... FOR UPDATE`: both sides run
+        # at REPEATABLE READ, so a lock that leaves the row unmodified would not
+        # make an older snapshot retry. SQLite commits on the temporary-table
+        # DDL above, so the write starts a fresh transaction here.
+        txn.execute(
+            "UPDATE event_push_summary_stream_ordering"
+            " SET stream_ordering = stream_ordering"
+        )
+        txn.execute("SELECT stream_ordering FROM event_push_summary_stream_ordering")
+        rotation_row = txn.fetchone()
+        if rotation_row is None:
+            raise RuntimeError("event push summary rotation watermark is missing")
+        rotated_upto = int(rotation_row[0])
+
         logger.info("[purge] Finding new backward extremities")
 
         # We calculate the new entries for the backward extremities by finding
@@ -492,29 +521,10 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
         # them needs no adjustment here. This mirrors how rotation counts them in
         # `_rotate_notifs_before_txn`.
         #
-        # Serialize against `_rotate_notifs` and the receipt-driven summary
-        # updates, which read push actions and write summary rows. Without this,
-        # rotation can read the rows we are about to delete and commit their
-        # counts after we delete them, leaving an inflated summary with no live
-        # rows left to correct it.
-        #
-        # This must be a *write*, not just `SELECT ... FOR UPDATE`. Both sides
-        # run at REPEATABLE READ, so an in-flight rotation holds a snapshot that
-        # predates our deletes; a lock that leaves the row unmodified lets it
-        # carry on without noticing. Rewriting the row makes that rotation fail
-        # with a serialization error and retry against our committed state (and,
-        # symmetrically, makes us retry if rotation committed after our
-        # snapshot). SQLite takes its single write lock here instead.
+        # `rotated_upto` was read while holding the watermark write lock before
+        # the deletes started, so rotation and receipt processing have not been
+        # able to add these rows to the summary since.
         logger.info("[purge] adjusting event_push_summary for deleted events")
-        txn.execute(
-            "UPDATE event_push_summary_stream_ordering"
-            " SET stream_ordering = stream_ordering"
-        )
-        txn.execute("SELECT stream_ordering FROM event_push_summary_stream_ordering")
-        rotation_row = txn.fetchone()
-        if rotation_row is None:
-            raise RuntimeError("event push summary rotation watermark is missing")
-        rotated_upto = int(rotation_row[0])
 
         txn.execute(
             """

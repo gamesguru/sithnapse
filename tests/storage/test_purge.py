@@ -192,11 +192,15 @@ class PurgeTests(HomeserverTestCase):
         self,
     ) -> None:
         """Purge rewrites the rotation watermark row (not merely locks it)
-        before it computes the `event_push_summary` decrements.
+        after it knows there are events to delete, but before any destructive
+        SQL and the `event_push_summary` decrement.
 
         Rotation and purge both run at REPEATABLE READ, so a lock that leaves
         the row unmodified would let an in-flight rotation commit counts for
-        rows purge has deleted. The write forces it to retry instead.
+        rows purge has deleted. Taking the write before the deletes also keeps
+        a long purge from being retried from scratch by a rotation that commits
+        while it runs. Taking it after `events_to_purge` is populated avoids
+        holding the lock for purges with nothing to delete.
         """
         self.helper.send(self.room_id, body="test1")
         last = self.helper.send(self.room_id, body="test2")
@@ -231,11 +235,21 @@ class PurgeTests(HomeserverTestCase):
             for i, sql in enumerate(statements)
             if "FROM event_push_actions AS epa" in sql
         )
+        populated = next(
+            i
+            for i, sql in enumerate(statements)
+            if sql.startswith("INSERT INTO events_to_purge")
+        )
+        first_delete = next(
+            i for i, sql in enumerate(statements) if sql.startswith("DELETE FROM")
+        )
         delete = next(
             i
             for i, sql in enumerate(statements)
             if sql.startswith("DELETE FROM event_push_actions")
         )
+        self.assertLess(populated, write, statements)
+        self.assertLess(write, first_delete, statements)
         self.assertLess(write, adjust, statements)
         self.assertLess(adjust, delete, statements)
 
