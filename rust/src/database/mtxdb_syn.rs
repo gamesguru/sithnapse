@@ -3963,28 +3963,15 @@ fn state_group_refcount_key(namespace: &str, state_group: i64) -> Vec<u8> {
     key
 }
 
-fn decode_counter(data: Option<&NodeData>) -> i64 {
-    data.filter(|data| data.bytes.len() == 8)
-        .map(|data| {
-            i64::from_be_bytes(
-                data.bytes
-                    .as_ref()
-                    .try_into()
-                    .expect("counter length was checked"),
-            )
-        })
-        .unwrap_or(0)
-}
-
 /// Atomically point an event at a different state group and move the state
 /// group reference counts with it.
 ///
 /// The mapping write and both counter updates are staged in one mtxdb
 /// transaction, so a crash or error cannot expose the new mapping with the
-/// old reference counts (or only half of a decrement/increment pair). Record
-/// version expectations make the read-modify-write of each counter safe
-/// against a concurrent `increment_counters_batch`; a conflict retries the
-/// whole operation.
+/// old reference counts (or only half of a decrement/increment pair). The
+/// engine's `increment_counters` stages the version preconditions, so a
+/// concurrent counter writer makes the commit stale; that retries the whole
+/// operation (the primitive itself never retries).
 #[pyfunction]
 pub fn repoint_event_state_group(
     py: Python<'_>,
@@ -4006,7 +3993,11 @@ pub fn repoint_event_state_group(
         let mapping_node = kv_node_id(&event_to_state_group_key(&namespace, &event_id));
         let new_mapping = NodeData::new(bytes::Bytes::copy_from_slice(&state_group.to_be_bytes()));
 
-        const MAX_ATTEMPTS: usize = 8;
+        // A racing writer can make several consecutive reads stale before
+        // either side gets a quiet commit window. Each retry is cheap, so keep
+        // enough headroom for a hot counter without turning contention into a
+        // hard error.
+        const MAX_ATTEMPTS: usize = 64;
         for attempt in 0..MAX_ATTEMPTS {
             let txn = database.begin_transaction();
             let (records, versions) = txn
@@ -4028,52 +4019,31 @@ pub fn repoint_event_state_group(
                 None => None,
             };
 
-            let mut counter_updates: Vec<(Vec<u8>, i64)> = Vec::new();
-            if old != Some(state_group) {
-                if let Some(old) = old {
-                    counter_updates.push((state_group_refcount_key(&namespace, old), -1));
-                }
-                counter_updates.push((state_group_refcount_key(&namespace, state_group), 1));
-            }
-
-            let counter_nodes: Vec<NodeId> = counter_updates
-                .iter()
-                .map(|(key, _)| kv_node_id(key))
-                .collect();
-            let (counter_records, counter_versions) = if counter_nodes.is_empty() {
-                (Vec::new(), Vec::new())
-            } else {
-                txn.get_with_record_versions(ShardType::State, &collection, &counter_nodes)
-                    .map_err(|e| map_transaction_error("read state_group_refcount", e))?
-            };
-
             txn.put(ShardType::State, collection, mapping_node, &new_mapping)
                 .map_err(|e| map_transaction_io_error("stage event_to_state_group", e))?;
 
-            for (((_, delta), node_id), (record, version)) in counter_updates
-                .into_iter()
-                .zip(counter_nodes)
-                .zip(counter_records.into_iter().zip(counter_versions))
-            {
-                txn.expect_record_version(ShardType::State, collection, node_id, version)
-                    .map_err(|e| {
-                        map_transaction_io_error("expect state_group_refcount version", e)
-                    })?;
-                let next = decode_counter(record.as_ref()) + delta;
-                txn.put(
-                    ShardType::State,
-                    collection,
-                    node_id,
-                    &NodeData::new(bytes::Bytes::copy_from_slice(&next.to_be_bytes())),
-                )
-                .map_err(|e| map_transaction_io_error("stage state_group_refcount", e))?;
+            // The engine owns the counter read-modify-write and its conflict
+            // tracking; a concurrent writer surfaces as a stale commit below.
+            if old != Some(state_group) {
+                let mut deltas: Vec<(NodeId, i64)> = Vec::with_capacity(2);
+                if let Some(old) = old {
+                    deltas.push((kv_node_id(&state_group_refcount_key(&namespace, old)), -1));
+                }
+                deltas.push((
+                    kv_node_id(&state_group_refcount_key(&namespace, state_group)),
+                    1,
+                ));
+                txn.increment_counters(ShardType::State, collection, &deltas)
+                    .map_err(|e| map_transaction_error("increment state_group_refcount", e))?;
             }
 
             match txn.commit() {
                 Ok(()) => return Ok(old),
-                Err(StorageError::StaleRead { .. }) if attempt + 1 < MAX_ATTEMPTS => continue,
+                Err(StorageError::StaleRead { .. }) if attempt + 1 < MAX_ATTEMPTS => {
+                    std::thread::yield_now();
+                }
                 Err(error) if attempt + 1 < MAX_ATTEMPTS && is_retryable_contention(&error) => {
-                    continue
+                    std::thread::yield_now();
                 }
                 Err(error) => return Err(map_transaction_error("commit", error)),
             }
@@ -5435,5 +5405,114 @@ pub(crate) mod auth_chain_closure_tests {
             Some(73)
         );
         assert_eq!(read_group(state_group_refcount_key(namespace, 73)), Some(1));
+
+        // A malformed refcount must abort the whole rewrite rather than being
+        // treated as zero and silently resetting the counter.
+        let corrupt_event_id = "$repoint-atomic-corrupt";
+        batch_put_impl(vec![
+            (
+                event_to_state_group_key(namespace, corrupt_event_id),
+                74i64.to_be_bytes().to_vec(),
+            ),
+            (state_group_refcount_key(namespace, 74), vec![1, 2, 3]),
+        ])
+        .expect("seed corrupt refcount");
+        let result = pyo3::Python::attach(|py| {
+            repoint_event_state_group(py, namespace.to_owned(), corrupt_event_id.to_owned(), 75)
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            read_group(event_to_state_group_key(namespace, corrupt_event_id)),
+            Some(74)
+        );
+    }
+
+    /// A writer that bypasses `RMW_LOCK` (another process on the shared WAL,
+    /// or a direct transaction) races the repoint helper on the same counters.
+    /// Stale commits must retry inside the helper and lose no update.
+    #[test]
+    fn repoint_event_state_group_retries_stale_counter_commits() {
+        ensure_open();
+        let namespace = "ns-repoint-race";
+        let (old_group, new_group): (i64, i64) = (81, 82);
+        let events: Vec<String> = (0..16).map(|i| format!("$repoint-race-{i}")).collect();
+        let bumps = 200;
+        let collection = kv_room_id();
+
+        let mut seed = vec![(
+            state_group_refcount_key(namespace, old_group),
+            (events.len() as i64).to_be_bytes().to_vec(),
+        )];
+        for event_id in &events {
+            seed.push((
+                event_to_state_group_key(namespace, event_id),
+                old_group.to_be_bytes().to_vec(),
+            ));
+        }
+        batch_put_impl(seed).expect("seed");
+
+        let new_node = kv_node_id(&state_group_refcount_key(namespace, new_group));
+        let outsider = std::thread::spawn(move || {
+            let database = pools()
+                .expect("pools")
+                .shared_database
+                .as_ref()
+                .expect("shared database");
+            let mut done = 0;
+            while done < bumps {
+                let txn = database.begin_transaction();
+                txn.increment_counters(ShardType::State, collection, &[(new_node, 1)])
+                    .expect("increment");
+                match txn.commit() {
+                    Ok(()) => {
+                        done += 1;
+                        std::thread::sleep(std::time::Duration::from_micros(300));
+                    }
+                    Err(e)
+                        if is_retryable_contention(&e)
+                            || matches!(e, StorageError::StaleRead { .. }) => {}
+                    Err(e) => panic!("outsider commit: {e}"),
+                }
+            }
+        });
+        let workers: Vec<_> = events
+            .iter()
+            .cloned()
+            .map(|event_id| {
+                std::thread::spawn(move || {
+                    pyo3::Python::attach(|py| {
+                        repoint_event_state_group(py, namespace.to_owned(), event_id, new_group)
+                    })
+                })
+            })
+            .collect();
+        for worker in workers {
+            assert_eq!(
+                worker.join().expect("join").expect("repoint"),
+                Some(old_group)
+            );
+        }
+        outsider.join().expect("outsider");
+
+        let read = |key: Vec<u8>| -> i64 {
+            let record = state_db()
+                .expect("state db")
+                .get_read_committed(&collection, &[kv_node_id(&key)])
+                .expect("read")
+                .remove(0)
+                .expect("present");
+            i64::from_be_bytes(record.bytes.as_ref().try_into().unwrap())
+        };
+        assert_eq!(read(state_group_refcount_key(namespace, old_group)), 0);
+        assert_eq!(
+            read(state_group_refcount_key(namespace, new_group)),
+            events.len() as i64 + bumps
+        );
+        for event_id in &events {
+            assert_eq!(
+                read(event_to_state_group_key(namespace, event_id)),
+                new_group
+            );
+        }
     }
 }

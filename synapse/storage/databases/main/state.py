@@ -58,11 +58,8 @@ from synapse.storage.databases.main.embedded_common import (
     sync_now,
 )
 from synapse.storage.databases.main.embedded_event_to_state_group import (
-    decrement_state_group_refcounts_batch,
     get_referenced_state_groups_batch,
     get_state_group_for_events_batch,
-    increment_state_group_refcounts_batch,
-    put_event_to_state_group_batch,
     repoint_event_state_group,
 )
 from synapse.storage.databases.main.events_worker import EventsWorkerStore
@@ -1006,57 +1003,31 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
         assert state_group is not None
 
         if getattr(self, "_embedded_event_json_enabled", False):
-            # Update the mtxdb mapping and refcounts. Unlike
-            # put_event_to_state_group_batch's
-            # initial-insert callers, this is a genuine rewrite of the state
-            # group for this event: the old one loses a reference and the new
-            # one gains one, so the refcount must move with it, not just get
-            # incremented again (that would double-count the old group's
-            # reference forever, since a partial-state event's placeholder
-            # group is never otherwise decremented).
+            # Update the mtxdb mapping and refcounts atomically. This is a
+            # genuine rewrite of the state group for this event: the old one
+            # loses a reference and the new one gains one, so the refcount must
+            # move with it, not just get incremented again (that would
+            # double-count the old group's reference forever, since a
+            # partial-state event's placeholder group is never otherwise
+            # decremented).
+            #
             # Drop any not-yet-migrated SQL row first. A migration batch holds
             # a row lock on it (`FOR UPDATE` on Postgres) while it copies the
             # row to mtxdb, so this waits for that batch to commit, or makes it
             # skip the row: it can't overwrite the rewrite with the stale
-            # placeholder group. It must precede the mtxdb read below, which
-            # then sees the migrated mapping if the batch won.
+            # placeholder group. It must precede the mtxdb rewrite, which then
+            # sees the migrated mapping if the batch won.
             self.db_pool.simple_delete_txn(
                 txn,
                 table="event_to_state_groups",
                 keyvalues={"event_id": event.event_id},
             )
-            old = get_state_group_for_events_batch(
+            repoint_event_state_group(
                 self._embedded_db_engine,
                 self._embedded_db_namespace,
-                [event.event_id],
-                purpose="partial_state_rewrite",
+                event.event_id,
+                state_group,
             )
-            put_event_to_state_group_batch(
-                self._embedded_db_engine,
-                self._embedded_db_namespace,
-                [(event.event_id, state_group)],
-            )
-            old_state_group = old.get(event.event_id)
-            if old_state_group is None:
-                # There is no embedded mapping or refcount to move, so only
-                # the new mapping needs a reference. This also covers an
-                # unmigrated SQL-only mapping.
-                increment_state_group_refcounts_batch(
-                    self._embedded_db_engine,
-                    self._embedded_db_namespace,
-                    [state_group],
-                )
-            elif old_state_group != state_group:
-                decrement_state_group_refcounts_batch(
-                    self._embedded_db_engine,
-                    self._embedded_db_namespace,
-                    [old_state_group],
-                )
-                increment_state_group_refcounts_batch(
-                    self._embedded_db_engine,
-                    self._embedded_db_namespace,
-                    [state_group],
-                )
             # The mapping is already visible in mtxdb. In interval/off mode,
             # durability is handled separately by the coalescer; always mode
             # retains the strict barrier.
