@@ -24,19 +24,26 @@ import itertools
 import json
 import logging
 import time
-from typing import Iterable, Mapping, cast
+from typing import TYPE_CHECKING, Iterable, Mapping, cast
 
 from canonicaljson import encode_canonical_json
 from signedjson.key import decode_verify_key_bytes
 from unpaddedbase64 import decode_base64
 
-from synapse.storage.database import LoggingTransaction
+from synapse.storage.database import (
+    DatabasePool,
+    LoggingDatabaseConnection,
+    LoggingTransaction,
+)
 from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
 from synapse.storage.keys import FetchKeyResult, FetchKeyResultForRemote
 from synapse.storage.types import Cursor
 from synapse.types import JsonDict
 from synapse.util.caches.descriptors import cached, cachedList
 from synapse.util.iterutils import batch_iter
+
+if TYPE_CHECKING:
+    from synapse.server import HomeServer
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +59,26 @@ MAX_RETIRED_SERVER_KEYS = 3000
 
 class KeyStore(CacheInvalidationWorkerStore):
     """Persistence for signature verification keys"""
+
+    def __init__(
+        self,
+        database: DatabasePool,
+        db_conn: LoggingDatabaseConnection,
+        hs: "HomeServer",
+    ):
+        super().__init__(database, db_conn, hs)
+
+        # `server_keys_json.response_id` is an existing column, so the index
+        # cannot be created synchronously by the delta (see
+        # `scripts-dev/check_schema_delta.py`). The delta only queues this
+        # update; build the partial index here.
+        self.db_pool.updates.register_background_index_update(
+            update_name="server_keys_json_response_id_index",
+            index_name="server_keys_json_response_id",
+            table="server_keys_json",
+            columns=["response_id"],
+            where_clause="response_id IS NOT NULL",
+        )
 
     async def store_server_keys_response(
         self,
