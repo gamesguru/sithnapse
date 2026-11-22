@@ -370,6 +370,17 @@ async def _repair_member(
         report["note"] = "nothing to do: every extremity already has this event"
         return report
 
+    unrepresentable = await _unrepresentable_self_rewrite(
+        hs, plan, "extremities", fallback_delta={key: event_id}
+    )
+    if unrepresentable is not None:
+        report["unrepresentable"] = unrepresentable
+        return refuse(
+            "a selected state event would be repointed to a state group that "
+            "changes its own key; a repair cannot preserve both historical "
+            "mappings"
+        )
+
     if not publish:
         report["note"] = "dry run: pass --publish to apply"
         return report
@@ -495,6 +506,42 @@ async def _apply_state_deltas(
 
     assert controllers.persistence is not None
     await controllers.persistence.update_current_state(room_id)
+
+
+async def _unrepresentable_self_rewrite(
+    hs: HomeServer,
+    plan: list[dict[str, Any]],
+    events_key: str,
+    fallback_delta: dict[tuple[str, str], str] | None = None,
+) -> dict[str, Any] | None:
+    """Find a state event whose own state key the repair would rewrite.
+
+    `event_to_state_groups` maps each event to the state *after* it. Repointing
+    a state event to a group where its own key names a different event would
+    make historical state reads claim that event replaced itself. Message
+    events have no own key and are always safe to repoint.
+    """
+    store = hs.get_datastores().main
+    for step in plan:
+        delta = step.get("delta", fallback_delta or {})
+        if not delta:
+            continue
+        event_ids = step.get(events_key, ())
+        events = await store.get_events(event_ids, allow_rejected=True)
+        for event_id in event_ids:
+            event = events.get(event_id)
+            if event is None or not event.is_state():
+                continue
+            key = (event.type, event.state_key)
+            replacement = delta.get(key)
+            if replacement is not None and replacement != event_id:
+                return {
+                    "event_id": event_id,
+                    "type": event.type,
+                    "state_key": event.state_key,
+                    "would_be": replacement,
+                }
+    return None
 
 
 class _PropagationError(Exception):
@@ -906,11 +953,14 @@ async def _import_state(
         return refuse(f"failed to fetch state from {via}: {e}")
 
     remote_event_ids = set(remote_ids)
+    tip_was_returned = at_event in remote_event_ids
     tip_event = await store.get_event(at_event, allow_none=True)
+    tip_key: tuple[str, str] | None = None
     if tip_event is not None and tip_event.is_state():
         # /state_ids is the state before the requested event. Include the
         # accepted state event to compare the same after-event snapshot locally.
         remote_event_ids.add(at_event)
+        tip_key = (tip_event.type, tip_event.state_key)
     only_remote_ids = remote_event_ids - local_event_ids
     only_local_ids = local_event_ids - remote_event_ids
 
@@ -962,6 +1012,10 @@ async def _import_state(
             )
             continue
         key = (event.type, event.state_key)
+        if key == tip_key and not tip_was_returned:
+            # /state_ids returns the state *before* the requested event, so an
+            # event for the tip's own key is the value the tip supersedes.
+            continue
         previous = remote_events.get(key)
         if previous is not None and previous.event_id != event.event_id:
             errors.append(
@@ -1048,6 +1102,16 @@ async def _import_state(
         # against this remote snapshot on retries.
         retry_plan = await _plan_state_deltas(hs, room_id, remote_state_by_key)
         report["plan"] = [step["changes"] for step in retry_plan]
+        if retry_plan:
+            unrepresentable = await _unrepresentable_self_rewrite(
+                hs, retry_plan, "extremities"
+            )
+            if unrepresentable is not None:
+                report["unrepresentable"] = unrepresentable
+                return refuse(
+                    "a forward-extremity state event would be repointed to a "
+                    "state group that changes its own key"
+                )
         if retry_plan and publish:
             await _apply_state_deltas(hs, room_id, retry_plan)
             report["published"] = True
@@ -1105,6 +1169,16 @@ async def _import_state(
         if not plan:
             report["note"] = "nothing to do: every state group already has these events"
             return report
+
+    unrepresentable = await _unrepresentable_self_rewrite(
+        hs, plan, "events" if propagate else "extremities"
+    )
+    if unrepresentable is not None:
+        report["unrepresentable"] = unrepresentable
+        return refuse(
+            "a state event would be repointed to a state group that changes its "
+            "own key; a repair cannot preserve both historical mappings"
+        )
 
     if not publish:
         report["note"] = "dry run: pass --publish to import and apply"

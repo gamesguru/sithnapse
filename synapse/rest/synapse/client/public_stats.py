@@ -45,6 +45,7 @@ class PublicStatsResource(DirectServeJsonResource):
         super().__init__(clock=hs.get_clock())
         self.store = hs.get_datastores().main
         self._clock = hs.get_clock()
+        self._reactor = hs.get_reactor()
         self._embedded_db_path = hs.config.database.embedded_db_path
         self._cached: JsonDict | None = None
         self._cached_at_ms = 0
@@ -127,7 +128,9 @@ class PublicStatsResource(DirectServeJsonResource):
             "joined_members": joined_members,
             "local_joined_members": local_joined_members,
             "postgres_bytes": postgres_bytes,
-            "mtxdb_bytes": get_embedded_db_disk_bytes(self._embedded_db_path),
+            "mtxdb_bytes": await get_embedded_db_disk_bytes(
+                self._reactor, self._embedded_db_path
+            ),
         }
 
         result: JsonDict = {

@@ -764,7 +764,7 @@ class PaginationHandler:
                         next_key,
                         chunk_limited,
                     )
-                if not chunk:
+                if not chunk and next_key == cursor:
                     return [], next_key, chunk_limited
                 cursor = next_key
                 chunk_live_cursor_key = cursor
