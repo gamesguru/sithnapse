@@ -87,6 +87,22 @@ class ServerStatsResource(DirectServeJsonResource):
             total_events = None
             total_state_events = None
 
+        try:
+            local_users = await self.store.count_local_users()
+        except Exception:
+            logger.exception("Failed to count local users for server statistics")
+            local_users = None
+
+        try:
+            (
+                joined_members,
+                local_joined_members,
+            ) = await self.store.get_joined_member_counts()
+        except Exception:
+            logger.exception("Failed to count joined members for server statistics")
+            joined_members = None
+            local_joined_members = None
+
         mtxdb_bytes = get_embedded_db_disk_bytes(
             self.hs.config.database.embedded_db_path
         )
@@ -100,6 +116,9 @@ class ServerStatsResource(DirectServeJsonResource):
             "database": {
                 "events": total_events,
                 "state_events": total_state_events,
+                "local_users": local_users,
+                "joined_members": joined_members,
+                "local_joined_members": local_joined_members,
                 "mtxdb_bytes": mtxdb_bytes,
             },
             "server_version": self.hs.version_string,

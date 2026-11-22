@@ -33,9 +33,10 @@ class PublicStatsResource(DirectServeJsonResource):
     """Opt-in public endpoint exposing only aggregate counts.
 
     Returns the total registered users, known rooms, federation peers, the
-    number of distinct servers present in room state, event/state-event counts
-    and the embedded engine's on-disk size. No identifiers or per-user/room
-    details are exposed. Any count that fails to load is returned as `null`.
+    number of distinct servers present in room state, local-user and joined
+    membership counts, event/state-event counts and the embedded engine's
+    on-disk size. No identifiers or per-user/room details are exposed. Any
+    count that fails to load is returned as `null`.
     """
 
     def __init__(self, hs: "HomeServer"):
@@ -93,9 +94,30 @@ class PublicStatsResource(DirectServeJsonResource):
             total_events = None
             total_state_events = None
 
+        try:
+            local_users = await self.store.count_local_users()
+        except Exception:
+            logger.exception("Failed to count local users for public server statistics")
+            local_users = None
+
+        try:
+            (
+                joined_members,
+                local_joined_members,
+            ) = await self.store.get_joined_member_counts()
+        except Exception:
+            logger.exception(
+                "Failed to count joined members for public server statistics"
+            )
+            joined_members = None
+            local_joined_members = None
+
         database: JsonDict = {
             "events": total_events,
             "state_events": total_state_events,
+            "local_users": local_users,
+            "joined_members": joined_members,
+            "local_joined_members": local_joined_members,
             "mtxdb_bytes": get_embedded_db_disk_bytes(self._embedded_db_path),
         }
 

@@ -168,6 +168,35 @@ class RoomMemberWorkerStore(EventsWorkerStore, CacheInvalidationWorkerStore):
 
         return await self.db_pool.runInteraction("get_known_servers_count", _transact)
 
+    async def get_joined_member_counts(self) -> tuple[int, int]:
+        """Count currently joined memberships across all rooms and locally.
+
+        Returns `(joined_members, local_joined_members)`. These are membership
+        rows, not distinct users: a user joined to three rooms counts three
+        times. `local_current_membership` already contains only users local to
+        this homeserver.
+        """
+
+        def _transact(txn: LoggingTransaction) -> tuple[int, int]:
+            txn.execute(
+                "SELECT COUNT(*) FROM current_state_events"
+                " WHERE type = ? AND membership = ?",
+                (EventTypes.Member, Membership.JOIN),
+            )
+            row = txn.fetchone()
+            joined_members = int(row[0]) if row and row[0] is not None else 0
+
+            txn.execute(
+                "SELECT COUNT(*) FROM local_current_membership WHERE membership = ?",
+                (Membership.JOIN,),
+            )
+            row = txn.fetchone()
+            local_joined_members = int(row[0]) if row and row[0] is not None else 0
+
+            return joined_members, local_joined_members
+
+        return await self.db_pool.runInteraction("get_joined_member_counts", _transact)
+
     @cached(max_entries=100000, iterable=True)
     async def get_users_in_room(self, room_id: str) -> Sequence[str]:
         """Returns a list of users in the room.

@@ -1075,6 +1075,26 @@ class RegistrationWorkerStore(StatsStore, CacheInvalidationWorkerStore):
 
         return await self.db_pool.runInteraction("count_users", _count_users)
 
+    async def count_local_users(self) -> int:
+        """Counts users whose MXID belongs to this homeserver's domain."""
+
+        def _count_local_users(txn: LoggingTransaction) -> int:
+            # User IDs are `@localpart:server_name`; localparts cannot contain
+            # `:`, so comparing the trailing segment is enough. `substr` is
+            # available on both SQLite and PostgreSQL.
+            txn.execute(
+                "SELECT COUNT(*) FROM users"
+                " WHERE substr(name, length(name) - length(?) + 1) = ?",
+                (self.server_name, self.server_name),
+            )
+            row = txn.fetchone()
+            assert row is not None
+            return row[0]
+
+        return await self.db_pool.runInteraction(
+            "count_local_users", _count_local_users
+        )
+
     async def count_daily_user_type(self) -> dict[str, int]:
         """
         Counts 1) native non guest users
