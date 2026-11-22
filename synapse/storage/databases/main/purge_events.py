@@ -20,7 +20,7 @@
 #
 
 import logging
-from typing import Any, cast
+from typing import Any, Callable, cast
 
 from synapse.api.errors import SynapseError
 from synapse.storage.database import (
@@ -67,9 +67,34 @@ def _delete_purge_event_mirrors(
 
     def delete() -> None:
         delete_redactions_batch(engine_name, namespace, redacted_event_ids)
+        if redacted_event_ids:
+            # Redaction tombstones live in the State pool, which the event_json
+            # delete below does not sync. Make their removal durable first, so
+            # a crash cannot bring back a redaction mirror for events whose
+            # event_json is already gone.
+            sync_now(pools=[Pool.STATE])
         delete_event_json_batch(engine_name, namespace, deleted_event_ids)
 
     retry_on_contention(delete, label="purge_mirrors")
+
+
+def _run_purge_cleanups(steps: list[tuple[str, Callable[[], None]]]) -> None:
+    """Run each post-commit purge cleanup even if an earlier one fails.
+
+    `txn.call_after` callbacks run in a plain loop, so one that raises would stop
+    every later callback, including the cache invalidations. Each step is
+    isolated here and every failure is logged; the SQL purge has already
+    committed, so there is nothing to roll back.
+    """
+    for label, step in steps:
+        try:
+            step()
+        except Exception:
+            logger.exception(
+                "[purge] post-commit cleanup of %s failed; the SQL purge is "
+                "committed but this mirror may still hold purged data",
+                label,
+            )
 
 
 purge_room_tables_with_event_id_index = (
@@ -509,24 +534,33 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
         # keys that must be removed too, or purged events keep serving their
         # pre-purge content forever from mtxdb -- see embedded_event_json.py.
         # Deferred until after commit for the same reason as above.
+        deleted_ids = [
+            event_id for event_id, should_delete in event_rows if should_delete
+        ]
+        cleanups: list[tuple[str, Callable[[], None]]] = []
         if getattr(self, "_embedded_event_json_enabled", False):
-            txn.call_after(
-                _delete_purge_event_mirrors,
-                self._embedded_db_engine,
-                self._embedded_db_namespace,
-                redacted_event_ids,
-                [event_id for event_id, should_delete in event_rows if should_delete],
-            )
-        if getattr(self, "_embedded_event_edges_writable", False):
-            deleted_edge_ids = [
-                event_id for event_id, should_delete in event_rows if should_delete
-            ]
-            if deleted_edge_ids:
-                txn.call_after(
-                    delete_event_edges_batch,
-                    self._embedded_db_namespace,
-                    deleted_edge_ids,
+            cleanups.append(
+                (
+                    "event_json/redaction mirrors",
+                    lambda: _delete_purge_event_mirrors(
+                        self._embedded_db_engine,
+                        self._embedded_db_namespace,
+                        redacted_event_ids,
+                        deleted_ids,
+                    ),
                 )
+            )
+        if getattr(self, "_embedded_event_edges_writable", False) and deleted_ids:
+            cleanups.append(
+                (
+                    "event edges",
+                    lambda: delete_event_edges_batch(
+                        self._embedded_db_namespace, deleted_ids
+                    ),
+                )
+            )
+        if cleanups:
+            txn.call_after(_run_purge_cleanups, cleanups)
 
         # Some of the `event_push_actions` we're about to delete may have already
         # been rotated into the aggregate `event_push_summary` counts. Deleting
@@ -840,21 +874,31 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
 
         # As in _purge_history_txn, the mirrors are deleted only after the SQL
         # purge commits. The callbacks retry transient mtxdb contention.
+        room_cleanups: list[tuple[str, Callable[[], None]]] = []
         if room_event_ids and getattr(self, "_embedded_event_json_enabled", False):
-            txn.call_after(
-                _delete_purge_event_mirrors,
-                self._embedded_db_engine,
-                self._embedded_db_namespace,
-                room_redacted_event_ids,
-                room_event_ids,
-            )
-        if room_event_ids:
-            if getattr(self, "_embedded_event_edges_writable", False):
-                txn.call_after(
-                    delete_event_edges_batch,
-                    self._embedded_db_namespace,
-                    room_event_ids,
+            room_cleanups.append(
+                (
+                    "event_json/redaction mirrors",
+                    lambda: _delete_purge_event_mirrors(
+                        self._embedded_db_engine,
+                        self._embedded_db_namespace,
+                        room_redacted_event_ids,
+                        room_event_ids,
+                    ),
                 )
+            )
+        if room_event_ids and getattr(self, "_embedded_event_edges_writable", False):
+            room_cleanups.append(
+                (
+                    "event edges",
+                    lambda: delete_event_edges_batch(
+                        self._embedded_db_namespace, room_event_ids
+                    ),
+                )
+            )
+        if room_cleanups:
+            txn.call_after(_run_purge_cleanups, room_cleanups)
+        if room_event_ids:
             # Same for event_to_state_groups: fetch state_groups before
             # deleting so the refcount can be rebalanced.
             event_id_to_state_group = get_state_group_for_events_batch(

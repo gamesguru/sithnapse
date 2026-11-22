@@ -272,6 +272,53 @@ class PurgeTests(HomeserverTestCase):
         )
         self._assert_mirrors(engine, namespace, target["event_id"], present=False)
 
+    def test_purge_cleanup_steps_run_even_if_one_fails(self) -> None:
+        """One failing post-commit cleanup must not stop the others (the
+        callbacks run in a plain loop that a raised exception would break)."""
+        ran: list[str] = []
+
+        def failing() -> None:
+            raise RuntimeError("mirror delete failed")
+
+        with self.assertLogs(
+            "synapse.storage.databases.main.purge_events", level="ERROR"
+        ) as logs:
+            purge_events_module._run_purge_cleanups(
+                [
+                    ("first", failing),
+                    ("second", lambda: ran.append("second")),
+                ]
+            )
+
+        self.assertEqual(ran, ["second"])
+        self.assertTrue(any("first" in line for line in logs.output))
+
+    def test_redaction_mirror_delete_is_synced_before_event_json(self) -> None:
+        order: list[str] = []
+
+        with (
+            patch.object(
+                purge_events_module,
+                "delete_redactions_batch",
+                lambda *a: order.append("redactions"),
+            ),
+            patch.object(
+                purge_events_module,
+                "sync_now",
+                lambda pools=None: order.append("sync"),
+            ),
+            patch.object(
+                purge_events_module,
+                "delete_event_json_batch",
+                lambda *a: order.append("event_json"),
+            ),
+        ):
+            purge_events_module._delete_purge_event_mirrors(
+                "mtxdb", "test", ["$redacted"], ["$event"]
+            )
+
+        self.assertEqual(order, ["redactions", "sync", "event_json"])
+
     def test_purge_history_writes_rotation_watermark_before_summary_adjustment(
         self,
     ) -> None:
