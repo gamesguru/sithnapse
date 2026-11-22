@@ -18,6 +18,9 @@
 #
 #
 
+from typing import Any
+from unittest.mock import patch
+
 from parameterized import parameterized
 
 from twisted.internet.testing import MemoryReactor
@@ -32,6 +35,7 @@ from synapse.api.room_versions import (
 from synapse.events import EventBase
 from synapse.rest.client import room
 from synapse.server import HomeServer
+from synapse.storage.database import LoggingTransaction
 from synapse.storage.databases.main.embedded_common import (
     enable_ffi_counting,
     get_ffi_count,
@@ -183,6 +187,57 @@ class PurgeTests(HomeserverTestCase):
         self.get_failure(self.store.get_event(second["event_id"]), NotFoundError)
         self.get_failure(self.store.get_event(third["event_id"]), NotFoundError)
         self.get_success(self.store.get_event(last["event_id"]))
+
+    def test_purge_history_writes_rotation_watermark_before_summary_adjustment(
+        self,
+    ) -> None:
+        """Purge rewrites the rotation watermark row (not merely locks it)
+        before it computes the `event_push_summary` decrements.
+
+        Rotation and purge both run at REPEATABLE READ, so a lock that leaves
+        the row unmodified would let an in-flight rotation commit counts for
+        rows purge has deleted. The write forces it to retry instead.
+        """
+        self.helper.send(self.room_id, body="test1")
+        last = self.helper.send(self.room_id, body="test2")
+        token = self.get_success(
+            self.store.get_topological_token_for_event(last["event_id"])
+        )
+        token_str = self.get_success(token.to_string(self.store))
+
+        statements: list[str] = []
+        original_execute = LoggingTransaction.execute
+
+        def record_execute(
+            txn: LoggingTransaction, sql: str, *args: Any, **kwargs: Any
+        ) -> Any:
+            statements.append(" ".join(sql.split()))
+            return original_execute(txn, sql, *args, **kwargs)
+
+        with patch.object(LoggingTransaction, "execute", record_execute):
+            self.get_success(
+                self._storage_controllers.purge_events.purge_history(
+                    self.room_id, token_str, True
+                )
+            )
+
+        write = next(
+            i
+            for i, sql in enumerate(statements)
+            if sql.startswith("UPDATE event_push_summary_stream_ordering")
+        )
+        adjust = next(
+            i
+            for i, sql in enumerate(statements)
+            if "FROM event_push_actions AS epa" in sql
+        )
+        delete = next(
+            i
+            for i, sql in enumerate(statements)
+            if sql.startswith("DELETE FROM event_push_actions")
+        )
+        self.assertLess(write, adjust, statements)
+        self.assertLess(adjust, delete, statements)
 
     def test_purge_history_wont_delete_extrems(self) -> None:
         """

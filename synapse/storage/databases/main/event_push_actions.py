@@ -1470,7 +1470,43 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
 
         limit = 100
 
-        # The (inclusive) receipt stream ID that was previously processed..
+        # Cheap unlocked check first: most calls find no new receipts, and
+        # taking the watermark write lock below would make each of them
+        # serialize against rotation and purge for nothing. A receipt that
+        # lands after this read is picked up by the next call.
+        max_receipts_stream_id = self._receipts_id_gen.get_current_token()
+        last_seen_receipts_stream_id = self.db_pool.simple_select_one_onecol_txn(
+            txn,
+            table="event_push_summary_last_receipt_stream_id",
+            keyvalues={},
+            retcol="stream_id",
+        )
+        if last_seen_receipts_stream_id >= max_receipts_stream_id:
+            return True
+
+        # Serialize receipt-driven summary changes with rotation and history
+        # purge. Each of those operations reads push actions and updates the
+        # summary; without a shared lock, a purge can delete rows after this
+        # transaction reads them and this transaction can then restore stale
+        # counts.
+        #
+        # This is a write, not just a row lock: at REPEATABLE READ a lock that
+        # leaves the row unmodified would not make a transaction holding an
+        # older snapshot retry.
+        txn.execute(
+            "UPDATE event_push_summary_stream_ordering"
+            " SET stream_ordering = stream_ordering"
+        )
+        txn.execute("SELECT stream_ordering FROM event_push_summary_stream_ordering")
+        rotation_row = txn.fetchone()
+        if rotation_row is None:
+            raise RuntimeError("event push summary rotation watermark is missing")
+        old_rotate_stream_ordering = int(rotation_row[0])
+
+        # The (inclusive) receipt stream ID that was previously processed.
+        # Read it again now that we hold the watermark write lock, so a worker
+        # that waited behind another receipt processor cannot reprocess its
+        # stale batch.
         min_receipts_stream_id = self.db_pool.simple_select_one_onecol_txn(
             txn,
             table="event_push_summary_last_receipt_stream_id",
@@ -1478,14 +1514,12 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
             retcol="stream_id",
         )
 
-        max_receipts_stream_id = self._receipts_id_gen.get_current_token()
-
-        # The (inclusive) event stream ordering that was previously summarised.
-        old_rotate_stream_ordering = self.db_pool.simple_select_one_onecol_txn(
-            txn,
-            table="event_push_summary_stream_ordering",
-            keyvalues={},
-            retcol="stream_ordering",
+        # Re-read the upper bound too. The one from the unlocked check above
+        # may be older than a checkpoint that another processor advanced while
+        # we waited for the lock; writing it back would move the checkpoint
+        # backwards and reprocess (double-apply) those receipts.
+        max_receipts_stream_id = max(
+            self._receipts_id_gen.get_current_token(), min_receipts_stream_id
         )
 
         sql = """
@@ -1672,9 +1706,9 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
                 "SELECT stream_ordering FROM event_push_summary_stream_ordering"
             )
         rotation_row = txn.fetchone()
-        old_rotate_stream_ordering = (
-            int(rotation_row[0]) if rotation_row is not None else 0
-        )
+        if rotation_row is None:
+            raise RuntimeError("event push summary rotation watermark is missing")
+        old_rotate_stream_ordering = int(rotation_row[0])
 
         # We don't to try and rotate millions of rows at once, so we cap the
         # maximum stream ordering we'll rotate before.
@@ -1849,7 +1883,8 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
             # are read and safe to delete.
             if isinstance(self.database_engine, PostgresEngine):
                 # Take the watermark row lock before reading the bound: receipt
-                # writes take it FOR SHARE before inserting, so none can commit
+                # writes (`insert_linearized_receipt` in `receipts.py`) take it
+                # FOR SHARE before inserting, so none can commit
                 # between the bound and the DELETE below, though they don't
                 # serialize against each other.
                 txn.execute(

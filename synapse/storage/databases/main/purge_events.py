@@ -492,30 +492,29 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
         # them needs no adjustment here. This mirrors how rotation counts them in
         # `_rotate_notifs_before_txn`.
         #
-        # Serialize against `_rotate_notifs`, which updates this position row at
-        # the end of its transaction. Without the lock, rotation can commit
-        # after we compute the decrements but before we delete the rows: the
-        # events then land in the summary *and* their live rows are removed,
-        # leaving an inflated count with nothing left to correct it.
+        # Serialize against `_rotate_notifs` and the receipt-driven summary
+        # updates, which read push actions and write summary rows. Without this,
+        # rotation can read the rows we are about to delete and commit their
+        # counts after we delete them, leaving an inflated summary with no live
+        # rows left to correct it.
+        #
+        # This must be a *write*, not just `SELECT ... FOR UPDATE`. Both sides
+        # run at REPEATABLE READ, so an in-flight rotation holds a snapshot that
+        # predates our deletes; a lock that leaves the row unmodified lets it
+        # carry on without noticing. Rewriting the row makes that rotation fail
+        # with a serialization error and retry against our committed state (and,
+        # symmetrically, makes us retry if rotation committed after our
+        # snapshot). SQLite takes its single write lock here instead.
         logger.info("[purge] adjusting event_push_summary for deleted events")
-        if isinstance(self.database_engine, PostgresEngine):
-            txn.execute(
-                "SELECT stream_ordering FROM event_push_summary_stream_ordering"
-                " FOR UPDATE"
-            )
-        else:
-            # SQLite has no row locks. A no-op write takes the database write
-            # lock, so a concurrent rotation either committed before our
-            # snapshot (and we see its summary) or has to wait for us.
-            txn.execute(
-                "UPDATE event_push_summary_stream_ordering"
-                " SET stream_ordering = stream_ordering"
-            )
-            txn.execute(
-                "SELECT stream_ordering FROM event_push_summary_stream_ordering"
-            )
+        txn.execute(
+            "UPDATE event_push_summary_stream_ordering"
+            " SET stream_ordering = stream_ordering"
+        )
+        txn.execute("SELECT stream_ordering FROM event_push_summary_stream_ordering")
         rotation_row = txn.fetchone()
-        rotated_upto = int(rotation_row[0]) if rotation_row is not None else -1
+        if rotation_row is None:
+            raise RuntimeError("event push summary rotation watermark is missing")
+        rotated_upto = int(rotation_row[0])
 
         txn.execute(
             """

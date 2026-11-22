@@ -852,6 +852,64 @@ class EventPushActionsStoreTestCase(HomeserverTestCase):
         self.assertLess(lock, bound, statements)
         self.assertLess(bound, delete, statements)
 
+    def test_summary_writers_lock_rotation_watermark_first(self) -> None:
+        """Receipt processing and rotation serialize with purge's summary fix."""
+        if not isinstance(self.store.database_engine, PostgresEngine):
+            raise SkipTest("row locks only apply to Postgres")
+
+        user_id, _, _, other_token, room_id = self._create_users_and_room()
+        event_id = self.helper.send(room_id, body="msg", tok=other_token)["event_id"]
+        self.get_success(
+            self.store.insert_receipt(
+                room_id,
+                "m.read",
+                user_id=user_id,
+                event_ids=[event_id],
+                thread_id=None,
+                data={},
+            )
+        )
+
+        def assert_locked_before(
+            statements: list[str], lock_sql: str, later_sql: str
+        ) -> None:
+            lock_index = next(
+                index for index, sql in enumerate(statements) if lock_sql in sql
+            )
+            later_index = next(
+                index for index, sql in enumerate(statements) if later_sql in sql
+            )
+            self.assertLess(lock_index, later_index, statements)
+
+        receipt_statements = self._record_statements(
+            lambda: self.get_success(
+                self.store.db_pool.runInteraction(
+                    "_handle_new_receipts_for_notifs_txn",
+                    self.store._handle_new_receipts_for_notifs_txn,
+                )
+            )
+        )
+        assert_locked_before(
+            receipt_statements,
+            "UPDATE event_push_summary_stream_ordering",
+            "FROM receipts_linearized AS r",
+        )
+
+        rotation_statements = self._record_statements(
+            lambda: self.get_success(
+                self.store.db_pool.runInteraction(
+                    "_rotate_notifs", self.store._rotate_notifs_txn
+                )
+            )
+        )
+        # The lock precedes every push-action access, including the OFFSET
+        # query that bounds the batch.
+        assert_locked_before(
+            rotation_statements,
+            "event_push_summary_stream_ordering FOR UPDATE",
+            "FROM event_push_actions",
+        )
+
     def test_count_aggregation_after_purge_then_new_message(self) -> None:
         user_id, _, _, other_token, room_id = self._create_users_and_room()
 
