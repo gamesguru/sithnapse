@@ -776,15 +776,17 @@ class Porter:
     def _events_live_outside_sql(txn: LoggingTransaction) -> bool:
         """Whether the source has events whose JSON is not in SQL.
 
-        A heuristic: a SQL-backed database has an `event_json` row for every
-        event, so events with none at all mean the bodies live in mtxdb.
+        A SQL-backed database has an `event_json` row for every event. Any event
+        without one means its body lives in mtxdb (including a source that is
+        only partly migrated, where some bodies are still in SQL), so a copy
+        would be incomplete. An empty source has no such event and is accepted.
         """
-        txn.execute("SELECT 1 FROM events LIMIT 1")
-        has_events = txn.fetchone() is not None
-        if not has_events:
-            return False
-        txn.execute("SELECT 1 FROM event_json LIMIT 1")
-        return txn.fetchone() is None
+        txn.execute(
+            "SELECT 1 FROM events AS e"
+            " LEFT JOIN event_json AS j ON j.event_id = e.event_id"
+            " WHERE j.event_id IS NULL LIMIT 1"
+        )
+        return txn.fetchone() is not None
 
     async def remove_ignored_background_updates_from_database(self) -> None:
         def _remove_delete_unreferenced_state_groups_bg_updates(
