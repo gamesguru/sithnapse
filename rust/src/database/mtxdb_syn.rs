@@ -193,7 +193,11 @@ fn check_pid_guard() -> PyResult<bool> {
 pub(crate) static RMW_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
-type RepointTestHook = (String, Arc<std::sync::Barrier>, Arc<std::sync::Barrier>);
+struct RepointTestHook {
+    namespace: String,
+    staged: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
 
 #[cfg(test)]
 static REPOINT_TEST_HOOK: Mutex<Option<RepointTestHook>> = Mutex::new(None);
@@ -4048,16 +4052,18 @@ pub fn repoint_event_state_group(
                 let hook = REPOINT_TEST_HOOK.lock().ok().and_then(|mut hook| {
                     if hook
                         .as_ref()
-                        .is_some_and(|(test_namespace, _, _)| test_namespace == &namespace)
+                        .is_some_and(|hook| hook.namespace == namespace)
                     {
                         hook.take()
                     } else {
                         None
                     }
                 });
-                if let Some((_, staged, resume)) = hook {
-                    staged.wait();
-                    resume.wait();
+                if let Some(hook) = hook {
+                    // Channels, not barriers: if the test side is gone, neither
+                    // call can block forever.
+                    let _ = hook.staged.send(());
+                    let _ = hook.resume.recv();
                 }
             }
 
@@ -5472,13 +5478,13 @@ pub(crate) mod auth_chain_closure_tests {
         ])
         .expect("seed mapping and old refcount");
 
-        let staged = Arc::new(std::sync::Barrier::new(2));
-        let resume = Arc::new(std::sync::Barrier::new(2));
-        *REPOINT_TEST_HOOK.lock().expect("test hook lock") = Some((
-            namespace.to_owned(),
-            Arc::clone(&staged),
-            Arc::clone(&resume),
-        ));
+        let (staged_tx, staged_rx) = std::sync::mpsc::channel::<()>();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+        *REPOINT_TEST_HOOK.lock().expect("test hook lock") = Some(RepointTestHook {
+            namespace: namespace.to_owned(),
+            staged: staged_tx,
+            resume: resume_rx,
+        });
         let event_id_owned = event_id.to_owned();
         let worker = std::thread::spawn(move || {
             pyo3::Python::attach(|py| {
@@ -5486,8 +5492,17 @@ pub(crate) mod auth_chain_closure_tests {
             })
         });
 
-        // The repoint has read and staged both counters, but cannot publish yet.
-        staged.wait();
+        // The repoint has read and staged both counters, but cannot publish
+        // yet. If the worker exits before staging (so the hook never fires),
+        // report its result instead of blocking the test forever.
+        if staged_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_err()
+        {
+            drop(resume_tx);
+            let result = worker.join().expect("worker panicked before staging");
+            panic!("repoint finished without staging a commit: {result:?}");
+        }
         let database = pools()
             .expect("pools")
             .shared_database
@@ -5495,11 +5510,14 @@ pub(crate) mod auth_chain_closure_tests {
             .expect("shared database");
         let target_node = kv_node_id(&state_group_refcount_key(namespace, new_group));
         let writer = database.begin_transaction();
-        writer
+        let writer_result = writer
             .increment_counters(ShardType::State, collection, &[(target_node, 1)])
-            .expect("concurrent counter increment");
-        writer.commit().expect("concurrent writer commits first");
-        resume.wait();
+            .map(|_| ())
+            .and_then(|()| writer.commit());
+        // Always let the repoint resume, so a failed competing write cannot
+        // leave the worker blocked.
+        resume_tx.send(()).expect("resume the repoint");
+        writer_result.expect("concurrent writer commits first");
 
         assert_eq!(
             worker.join().expect("join").expect("repoint"),
