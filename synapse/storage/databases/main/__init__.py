@@ -400,37 +400,32 @@ def check_database_before_upgrade(
     """
     logger.info("Checking database for consistency with configuration...")
 
-    if config.database.embedded_db_engine:
-        # The handlers for these SQL-to-mtxdb copies have been retired. If a
-        # queue entry is still pending, the data has not been copied yet and
-        # the embedded store would treat the missing records as a real miss.
-        # Refuse to upgrade until the previous version has finished the copy,
-        # rather than letting the schema delta discard the queued work.
-        retired_migrations = (
-            "event_to_state_group_embedded_migration",
-            "event_auth_chain_links_embedded_migration",
-            "state_hamt_embedded_migration",
-        )
-        try:
-            clause = ", ".join("?" for _ in retired_migrations)
-            cur.execute(
-                "SELECT update_name FROM background_updates"
-                f" WHERE update_name IN ({clause})",
-                retired_migrations,
-            )
-            pending = sorted(row[0] for row in cur)
-        except Exception:
-            # An old schema may not have `background_updates` yet; there
-            # cannot be a pending retired migration in that case.
-            pending = []
+    # The handlers for these SQL-to-mtxdb copies have been retired. If a queue
+    # entry is still pending, the data has not been copied yet and the embedded
+    # store would treat the missing records as a real miss. Refuse to upgrade
+    # until the previous version has finished the copy, rather than letting the
+    # schema delta discard the queued work. This does not depend on whether this
+    # process has the embedded engine configured: the delta discards the queue
+    # entries either way.
+    retired_migrations = (
+        "event_to_state_group_embedded_migration",
+        "event_auth_chain_links_embedded_migration",
+        "state_hamt_embedded_migration",
+    )
+    clause = ", ".join("?" for _ in retired_migrations)
+    cur.execute(
+        f"SELECT update_name FROM background_updates WHERE update_name IN ({clause})",
+        retired_migrations,
+    )
+    pending = sorted(row[0] for row in cur)
 
-        if pending:
-            raise RuntimeError(
-                "The embedded state migration is incomplete: %s still queued. "
-                "Run the previous Synapse version until these background updates "
-                "finish before upgrading; the mtxdb store has no SQL fallback "
-                "for the records they have not copied." % ", ".join(pending)
-            )
+    if pending:
+        raise RuntimeError(
+            "The embedded state migration is incomplete: %s still queued. "
+            "Run the previous Synapse version until these background updates "
+            "finish before upgrading; the mtxdb store has no SQL fallback "
+            "for the records they have not copied." % ", ".join(pending)
+        )
 
     # if there are any users in the database, check that the username matches our
     # configured server name.
