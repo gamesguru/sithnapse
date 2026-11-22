@@ -26,6 +26,8 @@ logger = logging.getLogger("synapse_state_repair")
 
 class RepairHomeserver(HomeServer):
     DATASTORE_CLASS = DataStore
+    # Never migrate the database from a repair tool: refuse on a pending delta.
+    DATABASE_SCHEMA_READ_ONLY = True
 
     def __init__(self, config: HomeServerConfig):
         super().__init__(

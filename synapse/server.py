@@ -314,6 +314,10 @@ class HomeServer(metaclass=abc.ABCMeta):
         "stats",
     ]
 
+    # Diagnostic and repair tools set this so that `prepare_database` refuses to
+    # apply schema deltas (or create a schema) instead of migrating the database.
+    DATABASE_SCHEMA_READ_ONLY: bool = False
+
     @property
     @abc.abstractmethod
     def DATASTORE_CLASS(self) -> type["SQLBaseStore"]:

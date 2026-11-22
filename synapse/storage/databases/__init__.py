@@ -136,6 +136,7 @@ class Databases(Generic[DataStoreT]):
                     db_is_fresh=bool(
                         database_config.config.get("_TEST_DB_IS_FRESH", False)
                     ),
+                    read_only=hs.DATABASE_SCHEMA_READ_ONLY,
                 )
                 if _pgt is not None:
                     _pgt("prepare_database", time.monotonic() - _t)

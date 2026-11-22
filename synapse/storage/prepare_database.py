@@ -63,6 +63,10 @@ EMPTY_DATABASE_ON_WORKER_ERROR = (
     "schema before starting worker processes."
 )
 
+EMPTY_DATABASE_READ_ONLY_ERROR = (
+    "Uninitialised database: refusing to create the schema in read-only mode."
+)
+
 UNAPPLIED_DELTA_ON_WORKER_ERROR = (
     "Database schema delta %s has not been applied: run the main synapse process to "
     "upgrade the database schema before starting worker processes."
@@ -97,6 +101,7 @@ def prepare_database(
     config: HomeServerConfig | None,
     databases: Collection[str] = ("main", "state"),
     db_is_fresh: bool = False,
+    read_only: bool = False,
 ) -> None:
     """Prepares a physical database for usage. Will either create all necessary tables
     or upgrade from an older schema version.
@@ -116,6 +121,9 @@ def prepare_database(
             only run _apply_module_schemas so config-specific module schemas are
             applied.  Must only be set by the test harness immediately after
             CREATE DATABASE ... WITH TEMPLATE.
+        read_only: If True, never change the schema: refuse (rather than apply) any
+            unapplied delta, an outdated schema version, or an empty database. Used
+            by diagnostic and repair tools that must not migrate a live database.
     Raises:
         ValueError: Passing `config=None` when a database already has a schema raises
             `ValueError`, as we can't upgrade an existing database without the config.
@@ -179,10 +187,14 @@ def prepare_database(
                     database_engine,
                     config,
                     databases=databases,
+                    read_only=read_only,
                 )
 
             else:
                 logger.info("%r: Initialising new database", databases)
+
+                if read_only:
+                    raise UpgradeDatabaseException(EMPTY_DATABASE_READ_ONLY_ERROR)
 
                 # if it's a worker app, refuse to upgrade the database, to avoid multiple
                 # workers doing it at once.
@@ -332,6 +344,7 @@ def _upgrade_existing_database(
     config: HomeServerConfig | None,
     databases: Collection[str],
     is_empty: bool = False,
+    read_only: bool = False,
 ) -> None:
     """Upgrades an existing physical database.
 
@@ -389,7 +402,7 @@ def _upgrade_existing_database(
     else:
         assert config
 
-    is_worker = config and config.worker.worker_app is not None
+    is_worker = (config and config.worker.worker_app is not None) or read_only
 
     # If the schema version needs to be updated, and we are on a worker, we immediately
     # know to bail out as workers cannot update the database schema. Only one process
