@@ -48,6 +48,18 @@ def _wait_for_child(pid: int, timeout: float = 10.0) -> int:
     raise AssertionError(f"forked child {pid} did not exit within {timeout:g}s")
 
 
+def _kill_and_reap(pid: int) -> None:
+    """Cleanup: never leave a forked test child behind, even if an assert fails."""
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        os.waitpid(pid, 0)
+    except ChildProcessError:
+        pass  # Already reaped by _wait_for_child.
+
+
 @py_unittest.skipUnless(hasattr(os, "fork"), "requires fork()")
 class TimingsFlushForkTestCase(unittest.TestCase):
     def test_forked_child_runs_registered_flusher(self) -> None:
@@ -78,6 +90,8 @@ class TimingsFlushForkTestCase(unittest.TestCase):
             timings_flush.register_periodic_flush(flusher)
 
             pid = os.fork()
+            if pid != 0:
+                self.addCleanup(_kill_and_reap, pid)
             if pid == 0:
                 # Child: only exit paths below; never return into the test runner.
                 code = 1
@@ -184,6 +198,7 @@ class TimingsFlushForkTestCase(unittest.TestCase):
                 release_flush.set()
                 self.assertTrue(fork_returned.wait(5), "fork() never completed")
                 thread.join(5)
+                self.addCleanup(_kill_and_reap, forked[0])
 
                 status = _wait_for_child(forked[0])
                 child_exit_codes.append(os.waitstatus_to_exitcode(status))

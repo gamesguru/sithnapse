@@ -505,9 +505,16 @@ jobs:
         if: ${{ matrix.job.postgres-version }}
         timeout-minutes: 2
         run: until pg_isready -h localhost; do sleep 1; done
-      - run: uv run trial --jobs="$(nproc)" tests
+      # `timeout` kills the whole hung process tree (timeout-minutes alone
+      # leaves workers to the runner); the sitecustomize on PYTHONPATH makes every
+      # trial process dump its stacks periodically, so a wedged worker is named.
+      - run: timeout --kill-after=2m 40m uv run trial --jobs="$(nproc)" tests
         timeout-minutes: 45
         env:
+          PYTHONFAULTHANDLER: "1"
+          PYTHONPATH: ${{ github.workspace }}/.ci/hang-dump
+          SYNAPSE_HANG_DUMP_DIR: /tmp/trial-hang
+          SYNAPSE_HANG_DUMP_SECONDS: "600"
           SYNAPSE_POSTGRES: ${{ matrix.job.database == 'postgres' || '' }}
           SYNAPSE_POSTGRES_HOST: /var/run/postgresql
           SYNAPSE_POSTGRES_USER: postgres
@@ -534,12 +541,18 @@ jobs:
         # Note: Dumps to workflow logs instead of using actions/upload-artifact
         #       This keeps logs colocated with failing jobs
         #       It also ignores find's exit code; this is a best effort affair
-        run: >-
-          find _trial_temp -name '*.log'
-          -exec echo "::group::{}" \;
-          -exec cat {} \;
-          -exec echo "::endgroup::" \;
-          || true
+        run: |
+          find _trial_temp -name '*.log' \
+            -exec echo "::group::{}" \; \
+            -exec cat {} \; \
+            -exec echo "::endgroup::" \; \
+            || true
+          # Stack dumps from a hung trial process (see the trial step).
+          find /tmp/trial-hang -name 'hang-*.txt' -size +0 \
+            -exec echo "::group::{}" \; \
+            -exec cat {} \; \
+            -exec echo "::endgroup::" \; \
+            || true
 
   trial-mtxdb:
     # Runs the trial suite with the embedded mtxdb engine for HAMT state
