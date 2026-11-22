@@ -6,6 +6,7 @@
 #
 import os
 import shutil
+import signal
 import sys
 import tempfile
 import threading
@@ -26,6 +27,25 @@ def _is_running_in(thread: threading.Thread, function_name: str) -> bool:
             return True
         frame = frame.f_back
     return False
+
+
+def _wait_for_child(pid: int, timeout: float = 10.0) -> int:
+    """Wait for a forked test child, without letting a wedged child hang Trial."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        waited_pid, status = os.waitpid(pid, os.WNOHANG)
+        if waited_pid == pid:
+            return status
+        time.sleep(0.01)
+
+    # The child may be stuck in an at-fork callback, before its test body can
+    # reach its own timeout and exit. Reap it so the worker can report failure.
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    os.waitpid(pid, 0)
+    raise AssertionError(f"forked child {pid} did not exit within {timeout:g}s")
 
 
 @py_unittest.skipUnless(hasattr(os, "fork"), "requires fork()")
@@ -72,7 +92,7 @@ class TimingsFlushForkTestCase(unittest.TestCase):
                 finally:
                     os._exit(code)
 
-            _, status = os.waitpid(pid, 0)
+            status = _wait_for_child(pid)
             self.assertEqual(
                 os.waitstatus_to_exitcode(status),
                 0,
@@ -165,7 +185,7 @@ class TimingsFlushForkTestCase(unittest.TestCase):
                 self.assertTrue(fork_returned.wait(5), "fork() never completed")
                 thread.join(5)
 
-                _, status = os.waitpid(forked[0], 0)
+                status = _wait_for_child(forked[0])
                 child_exit_codes.append(os.waitstatus_to_exitcode(status))
                 self.assertEqual(
                     child_exit_codes,

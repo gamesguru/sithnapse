@@ -506,6 +506,7 @@ jobs:
         timeout-minutes: 2
         run: until pg_isready -h localhost; do sleep 1; done
       - run: uv run trial --jobs="$(nproc)" tests
+        timeout-minutes: 45
         env:
           SYNAPSE_POSTGRES: ${{ matrix.job.database == 'postgres' || '' }}
           SYNAPSE_POSTGRES_HOST: /var/run/postgresql
