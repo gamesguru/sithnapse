@@ -57,6 +57,7 @@ class PublicStatsTests(unittest.HomeserverTestCase):
                 "total_destinations",
                 "total_known_servers",
                 "database",
+                "memory",
             },
         )
         self.assertEqual(channel.json_body["total_users"], 1)
@@ -73,6 +74,7 @@ class PublicStatsTests(unittest.HomeserverTestCase):
                 "local_users",
                 "joined_members",
                 "local_joined_members",
+                "postgres_bytes",
                 "mtxdb_bytes",
             },
         )
@@ -81,3 +83,10 @@ class PublicStatsTests(unittest.HomeserverTestCase):
         self.assertEqual(database["local_users"], 1)
         self.assertEqual(database["joined_members"], 1)
         self.assertEqual(database["local_joined_members"], 1)
+        # PostgreSQL is only reported when it is the main database engine.
+        self.assertTrue(
+            database["postgres_bytes"] is None
+            or isinstance(database["postgres_bytes"], int)
+        )
+
+        self.assertIsInstance(channel.json_body["memory"]["rss_bytes"], int)

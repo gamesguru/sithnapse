@@ -498,16 +498,31 @@
 
         <div class="telemetry-card">
           <span class="telemetry-label">Holocron Vault</span>
-          <span class="telemetry-value" id="stat-mtxdb">...</span>
+          <span class="telemetry-pair">
+            <span class="telemetry-value" id="stat-postgres">...</span>
+            <span class="telemetry-sub">POSTGRES</span>
+          </span>
+          <span class="telemetry-pair">
+            <span class="telemetry-value" id="stat-mtxdb">...</span>
+            <span class="telemetry-sub">MTXDB</span>
+          </span>
           <span class="telemetry-sub" id="stat-mtxdb-sub"
             >EVENTS · STATE · ON DISK</span
           >
         </div>
 
         <div class="telemetry-card">
-          <span class="telemetry-label">Force Latency</span>
-          <span class="telemetry-value" id="stat-latency">-- ms</span>
-          <span class="telemetry-sub">DARK SIDE ROUND TRIP</span>
+          <span class="telemetry-label"
+            >Force Resonance &amp;<br />Force Latency</span
+          >
+          <span class="telemetry-pair">
+            <span class="telemetry-value" id="stat-memory">...</span>
+            <span class="telemetry-sub">PROCESS MEMORY · RSS</span>
+          </span>
+          <span class="telemetry-pair">
+            <span class="telemetry-value" id="stat-latency">-- ms</span>
+            <span class="telemetry-sub">DARK SIDE ROUND TRIP</span>
+          </span>
         </div>
 
         <div class="telemetry-card">
@@ -766,6 +781,10 @@
               }
               const db = stats.database;
               if (db && typeof db === "object") {
+                if (typeof db.postgres_bytes === "number") {
+                  const pgEl = document.getElementById("stat-postgres");
+                  if (pgEl) pgEl.textContent = formatBytes(db.postgres_bytes);
+                }
                 if (typeof db.mtxdb_bytes === "number") {
                   const mtxdbEl = document.getElementById("stat-mtxdb");
                   if (mtxdbEl)
@@ -781,6 +800,17 @@
                   const subEl = document.getElementById("stat-mtxdb-sub");
                   if (subEl) subEl.textContent = dbParts.join(" · ");
                 }
+              }
+
+              const memory = stats.memory;
+              if (
+                memory &&
+                typeof memory === "object" &&
+                typeof memory.rss_bytes === "number"
+              ) {
+                const memoryEl = document.getElementById("stat-memory");
+                if (memoryEl)
+                  memoryEl.textContent = formatBytes(memory.rss_bytes);
               }
             }
           } catch (e) {}
@@ -821,9 +851,7 @@
               // Show only the release version, not the build metadata
               // (`1.163.0 (b=branch,commit)`).
               const version = fedData.server.version.split(" ")[0];
-              const vStr = version.startsWith("v")
-                ? version
-                : `v${version}`;
+              const vStr = version.startsWith("v") ? version : `v${version}`;
               const titleEl = document.getElementById("server-title-text");
               const engineEl = document.getElementById("stat-engine-sub");
               if (titleEl)
@@ -860,7 +888,9 @@
           ["stat-galactic", "0"],
           ["stat-jedi", "0"],
           ["stat-sanctums", "0"],
+          ["stat-postgres", "--"],
           ["stat-mtxdb", "--"],
+          ["stat-memory", "--"],
         ]) {
           const el = document.getElementById(id);
           if (el && el.textContent === "...") el.textContent = fallback;

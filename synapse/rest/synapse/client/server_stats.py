@@ -21,6 +21,7 @@ from synapse.http.site import SynapseRequest
 from synapse.storage.databases.embedded_engine import get_embedded_db_disk_bytes
 from synapse.storage.databases.main.transactions import DestinationSortOrder
 from synapse.types import JsonDict
+from synapse.util.memory import get_process_rss_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +104,7 @@ class ServerStatsResource(DirectServeJsonResource):
             joined_members = None
             local_joined_members = None
 
+        postgres_bytes = await self.store.get_postgres_disk_bytes()
         mtxdb_bytes = get_embedded_db_disk_bytes(
             self.hs.config.database.embedded_db_path
         )
@@ -119,7 +121,9 @@ class ServerStatsResource(DirectServeJsonResource):
                 "local_users": local_users,
                 "joined_members": joined_members,
                 "local_joined_members": local_joined_members,
+                "postgres_bytes": postgres_bytes,
                 "mtxdb_bytes": mtxdb_bytes,
             },
+            "memory": {"rss_bytes": get_process_rss_bytes()},
             "server_version": self.hs.version_string,
         }

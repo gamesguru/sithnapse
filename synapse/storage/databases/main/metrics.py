@@ -35,6 +35,7 @@ from synapse.storage.database import (
 from synapse.storage.databases.main.event_push_actions import (
     EventPushActionsWorkerStore,
 )
+from synapse.storage.engines import PostgresEngine
 from synapse.util.duration import Duration
 
 if TYPE_CHECKING:
@@ -84,6 +85,25 @@ class ServerMetricsStore(EventPushActionsWorkerStore, SQLBaseStore):
 
         # Used in _generate_user_daily_visits to keep track of progress
         self._last_user_visit_update = self._get_start_of_day()
+
+    async def get_postgres_disk_bytes(self) -> int | None:
+        """Return the on-disk size of the main PostgreSQL database, in bytes.
+
+        Returns `None` when the main database isn't PostgreSQL or the size
+        can't be read.
+        """
+        if not isinstance(self.db_pool.engine, PostgresEngine):
+            return None
+
+        try:
+            rows = await self.db_pool.execute(
+                "get_postgres_disk_bytes",
+                "SELECT pg_database_size(current_database())",
+            )
+            return int(rows[0][0]) if rows else None
+        except Exception:
+            logger.exception("Failed to read PostgreSQL database size")
+            return None
 
     @wrap_as_background_process("read_forward_extremities")
     async def _read_forward_extremities(self) -> None:
