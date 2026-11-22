@@ -294,6 +294,7 @@ class RepairMemberTestCase(unittest.HomeserverTestCase):
         publish: bool,
         propagate: bool,
         max_diff: int = 500,
+        max_events: int = 200_000,
     ) -> dict:
         federation = self.hs.get_federation_client()
 
@@ -315,6 +316,7 @@ class RepairMemberTestCase(unittest.HomeserverTestCase):
                 max_diff,
                 publish,
                 propagate=propagate,
+                max_events=max_events,
             )
         )
 
@@ -455,6 +457,36 @@ class RepairMemberTestCase(unittest.HomeserverTestCase):
             report,
         )
 
+    def test_propagation_refuses_untraced_group_with_seed_value(self) -> None:
+        seed, remote_state = self._bug_scenario()
+        event_id = self.helper.send(
+            self.room_id, "standalone snapshot", tok=self.alice_tok
+        )["event_id"]
+        state_group = self.get_success(
+            self.store._get_state_group_for_events([event_id])
+        )[event_id]
+        state = self.get_success(
+            self.controllers.state.get_state_ids_for_group(state_group)
+        )
+        standalone_group = self.get_success(
+            self.controllers.state.store_state_group(
+                event_id,
+                self.room_id,
+                self.get_success(self.store.get_room_version(self.room_id)),
+                prev_group=None,
+                delta_ids=None,
+                current_state_ids=state,
+            )
+        )
+        self.get_success(
+            self.store.repoint_event_state_group(event_id, standalone_group)
+        )
+
+        report = self._import_at(seed, remote_state, publish=True, propagate=True)
+
+        self.assertFalse(report["published"])
+        self.assertIn("outside its recorded lineage", report["refused"])
+
     def test_room_event_scan_includes_positive_ids_before_seed(self) -> None:
         """A descendant can have a lower positive ID on a concurrent writer."""
         conn = sqlite3.connect(":memory:")
@@ -552,6 +584,17 @@ class RepairMemberTestCase(unittest.HomeserverTestCase):
         self.assertIsNone(report["refused"], report)
         stops = report["propagation"]["stops"]
         self.assertTrue(any(stop["current"] == later_join for stop in stops), report)
+
+        # The limit applies to the rewrite plan, not the groups that are
+        # deliberately left alone at a legitimate later state value.
+        bounded = self._import_at(
+            seed,
+            remote_state,
+            publish=False,
+            propagate=True,
+            max_events=report["propagation"]["event_count"],
+        )
+        self.assertIsNone(bounded["refused"], bounded)
 
         report = self._import_at(seed, remote_state, publish=True, propagate=True)
         self.assertIsNone(report["refused"], report)

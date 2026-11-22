@@ -714,10 +714,11 @@ async def _plan_propagation(
     if seed_stream_ordering is None:
         raise _PropagationError(f"{seed_event.event_id} has no local stream ordering")
 
+    keys = list(deltas)
     events_by_group: dict[int, list[str]] = {}
+    untraced_groups: set[int] = set()
     not_descendant = 0
     without_group = 0
-    affected_event_count = 0
     after: tuple[int, str] | None = None
     batch_size = 1000
     while True:
@@ -738,30 +739,44 @@ async def _plan_propagation(
         for event_id, stream_ordering in rows:
             group = group_by_event.get(event_id)
             if group is not None and group in descendant_groups:
-                affected_event_count += 1
-                if affected_event_count > max_events:
-                    raise _PropagationError(
-                        "more than --max-events (%d) affected local events; raise "
-                        "the limit or seed at a later event" % max_events
-                    )
                 events_by_group.setdefault(group, []).append(event_id)
             elif stream_ordering >= seed_stream_ordering:
                 if group is None:
                     without_group += 1
                 else:
                     not_descendant += 1
+                    untraced_groups.add(group)
 
         last_event_id, last_stream_ordering = rows[-1]
         after = (last_stream_ordering, last_event_id)
         if len(rows) < batch_size:
             break
 
-    keys = list(deltas)
+    # Some state groups are standalone snapshots and therefore have no path
+    # from the seed in state_group_edges. If one of their events is later than
+    # the seed and it still carries an original value being changed, we cannot
+    # prove whether it should be rewritten. Refuse the plan rather than claim
+    # that propagation is complete while silently omitting that group.
+    for group in sorted(untraced_groups):
+        state = await controllers.state.get_state_ids_for_group(
+            group, StateFilter.from_types(keys)
+        )
+        if any(
+            state.get(key) == seed_state.get(key)
+            for key in keys
+            if seed_state.get(key) != deltas[key]
+        ):
+            raise _PropagationError(
+                "state group %d holds the seed value but is outside its recorded "
+                "lineage; refusing an incomplete propagation plan" % group
+            )
+
     plan: list[dict[str, Any]] = []
     stops: list[dict[str, Any]] = []
     stop_markers: set[tuple[tuple[str, str], str | None]] = set()
     already_correct = 0
     empty_groups = 0
+    affected_event_count = 0
 
     for group in sorted(descendant_groups):
         state = await controllers.state.get_state_ids_for_group(
@@ -795,6 +810,13 @@ async def _plan_propagation(
         if not events:
             empty_groups += 1
             continue
+
+        affected_event_count += len(events)
+        if affected_event_count > max_events:
+            raise _PropagationError(
+                "more than --max-events (%d) events need rewriting; raise "
+                "the limit or seed at a later event" % max_events
+            )
 
         plan.append(
             {
