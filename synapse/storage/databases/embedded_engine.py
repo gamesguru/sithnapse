@@ -30,8 +30,11 @@ switching engines (or renaming the module) is a one-file change.
 import os
 from types import ModuleType
 
+from synapse.logging.context import defer_to_thread
+from synapse.types import ISynapseReactor
 
-def get_embedded_db_disk_bytes(path: str | None) -> int | None:
+
+def _get_embedded_db_disk_bytes(path: str | None) -> int | None:
     """Return the on-disk size of an embedded DB path, in bytes.
 
     Prefer the open embedded driver's own shard sizes, which avoids walking the
@@ -71,6 +74,13 @@ def get_embedded_db_disk_bytes(path: str | None) -> int | None:
         return total
     except OSError:
         return None
+
+
+async def get_embedded_db_disk_bytes(
+    reactor: ISynapseReactor, path: str | None
+) -> int | None:
+    """Collect embedded DB disk size without blocking the request thread."""
+    return await defer_to_thread(reactor, _get_embedded_db_disk_bytes, path)
 
 
 def get_embedded_engine(engine_name: str | None) -> ModuleType:

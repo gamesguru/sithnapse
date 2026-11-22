@@ -105,8 +105,8 @@ class ServerStatsResource(DirectServeJsonResource):
             local_joined_members = None
 
         postgres_bytes = await self.store.get_postgres_disk_bytes()
-        mtxdb_bytes = get_embedded_db_disk_bytes(
-            self.hs.config.database.embedded_db_path
+        mtxdb_bytes = await get_embedded_db_disk_bytes(
+            self.hs.get_reactor(), self.hs.config.database.embedded_db_path
         )
 
         return HTTPStatus.OK, {
