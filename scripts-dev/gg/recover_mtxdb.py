@@ -224,7 +224,7 @@ def record_latest(
             for key, digest in live_latest.items()
             if key[0].lower() not in deleted
         }
-    if packs and not live_latest and not deleted:
+    if packs and not latest and not deleted:
         sys.exit(
             f"{root}/{directory}: has pack files but the frame scan found no "
             "records; refusing to build a baseline from nothing"

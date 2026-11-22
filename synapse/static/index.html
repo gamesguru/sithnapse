@@ -885,9 +885,9 @@
         // Counts that never arrived are shown as unavailable rather than 0, so
         // a disabled endpoint is not mistaken for a real empty database.
         for (const [id, fallback] of [
-          ["stat-galactic", "0"],
-          ["stat-jedi", "0"],
-          ["stat-sanctums", "0"],
+          ["stat-galactic", "--"],
+          ["stat-jedi", "--"],
+          ["stat-sanctums", "--"],
           ["stat-postgres", "--"],
           ["stat-mtxdb", "--"],
           ["stat-memory", "--"],

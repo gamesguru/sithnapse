@@ -314,7 +314,8 @@ class KeyStore(KeyBackgroundUpdateStore):
                     """
                     INSERT INTO server_key_response_blobs (response_id, key_json)
                     VALUES (?, ?)
-                    ON CONFLICT (response_id) DO NOTHING
+                    ON CONFLICT (response_id) DO UPDATE
+                    SET key_json = EXCLUDED.key_json
                     """,
                     (response_id, db_binary_type(key_json_bytes)),
                 )

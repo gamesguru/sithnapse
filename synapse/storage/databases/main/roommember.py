@@ -152,19 +152,20 @@ class RoomMemberWorkerStore(EventsWorkerStore, CacheInvalidationWorkerStore):
         def _transact(txn: LoggingTransaction) -> int:
             if isinstance(self.database_engine, Sqlite3Engine):
                 query = """
-                    SELECT COUNT(DISTINCT substr(state_key, instr(state_key, ':') + 1))
+                    SELECT DISTINCT substr(state_key, instr(state_key, ':') + 1)
                     FROM current_state_events
                     WHERE type = 'm.room.member' AND membership = 'join';
                 """
             else:
                 query = """
-                    SELECT COUNT(DISTINCT split_part(state_key, ':', 2))
+                    SELECT DISTINCT substring(state_key FROM '@[^:]*:(.*)$')
                     FROM current_state_events
                     WHERE type = 'm.room.member' AND membership = 'join';
                 """
             txn.execute(query)
-            row = txn.fetchone()
-            return int(row[0]) if row and row[0] is not None else 0
+            servers = {row[0] for row in txn if row[0] is not None}
+            servers.add(self.server_name)
+            return len(servers)
 
         return await self.db_pool.runInteraction("get_known_servers_count", _transact)
 
