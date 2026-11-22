@@ -11,7 +11,8 @@ STYLE_RESET := $(shell tput sgr0 2>/dev/null || echo -e "\033[0m")
 
 .PHONY: format
 format: ##H Format with ruff
-	npx --yes --package=prettier@3.6.2 prettier --prose-wrap always --print-width 80 --write docs/development-gg/
+	npx --yes --package=prettier@3.6.2 prettier --prose-wrap always --print-width 80 --write \
+		docs/development-gg/ synapse/static/index.html
 	uv run --no-sync ruff format .
 	uv run --no-sync ruff check --fix .
 	cargo +nightly fmt
@@ -145,8 +146,8 @@ install/build: ##H Build, pip-install $(INSTALL_SRC) to $(INSTALL_DIR)
 	dirty=""; \
 	if [ -n "$$(git -C "$(INSTALL_SRC)" status --porcelain --untracked-files=no)" ]; then dirty=",dirty"; fi; \
 	pkg="$$("$$install_python" -I -c 'import importlib.util as u; print(u.find_spec("synapse").submodule_search_locations[0])')"; \
-	echo "Recording version $$ver (b=$$branch,$$rev$$dirty) in $$pkg"; \
-	echo "$$ver (b=$$branch,$$rev$$dirty)" | sudo tee "$$pkg/_build_version.txt" >/dev/null
+	echo "Recording version $$ver (b=$$branch,commit=$$rev$$dirty) in $$pkg"; \
+	echo "$$ver (b=$$branch,commit=$$rev$$dirty)" | sudo tee "$$pkg/_build_version.txt" >/dev/null
 
 .PHONY: install/gen-config
 install/gen-config: ##H Generate homeserver config as $(INSTALL_USER)

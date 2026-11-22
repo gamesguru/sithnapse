@@ -480,11 +480,11 @@
           >
           <span class="telemetry-pair">
             <span class="telemetry-value" id="stat-galactic">...</span>
-            <span class="telemetry-sub">LIVE RELAYS,</span>
+            <span class="telemetry-sub">SERVERS</span>
           </span>
           <span class="telemetry-pair">
             <span class="telemetry-value" id="stat-sanctums">...</span>
-            <span class="telemetry-sub">KNOWN ROOMS</span>
+            <span class="telemetry-sub">FED. ROOMS</span>
           </span>
         </div>
 
@@ -529,7 +529,7 @@
           <span class="telemetry-label">Matrix Protocol</span>
           <span class="telemetry-value" id="stat-spec">...</span>
           <span class="telemetry-sub" id="stat-engine-sub"
-            >SERVER SPEC LEVEL</span
+            >SITHNAPSE VERSION</span
           >
         </div>
       </section>
@@ -748,6 +748,14 @@
         }).format(value);
       }
 
+      function renderServerVersion(version) {
+        if (typeof version !== "string" || !version.trim()) return;
+        const cleanVersion = version.trim().replace(/^Synapse\//, "");
+        const versionEl = document.getElementById("stat-engine-sub");
+        if (versionEl)
+          versionEl.textContent = `Sithnapse v${cleanVersion.replace(/^v/, "")}`;
+      }
+
       async function measureTelemetry() {
         const startTime = performance.now();
 
@@ -765,6 +773,10 @@
             );
             if (publicStatsRes.ok) {
               const stats = await publicStatsRes.json();
+
+              if (typeof stats.server_version === "string") {
+                renderServerVersion(stats.server_version);
+              }
 
               if (typeof stats.total_destinations === "number") {
                 const galacticEl = document.getElementById("stat-galactic");
@@ -842,9 +854,7 @@
           }
         } catch (err) {
           const latencyEl = document.getElementById("stat-latency");
-          const specEl = document.getElementById("stat-spec");
           if (latencyEl) latencyEl.textContent = "unavailable";
-          if (specEl) specEl.textContent = "unavailable";
         }
 
         // 3. Fallback discovery if public stats are not available
@@ -852,17 +862,8 @@
           const fedRes = await fetch("/_matrix/federation/v1/version");
           if (fedRes.ok) {
             const fedData = await fedRes.json();
-            if (fedData.server && fedData.server.version) {
-              // Show only the release version, not the build metadata
-              // (`1.163.0 (b=branch,commit)`).
-              const version = fedData.server.version.split(" ")[0];
-              const vStr = version.startsWith("v") ? version : `v${version}`;
-              const titleEl = document.getElementById("server-title-text");
-              const engineEl = document.getElementById("stat-engine-sub");
-              if (titleEl)
-                titleEl.textContent = `Sithnapse ${vStr} (Synapse Dark, but runs lite)`;
-              if (engineEl) engineEl.textContent = `Sithnapse ${vStr}`;
-            }
+            if (fedData.server && fedData.server.version)
+              renderServerVersion(fedData.server.version);
           }
         } catch (e) {}
 
