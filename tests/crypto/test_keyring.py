@@ -1137,6 +1137,90 @@ class PerspectivesKeyFetcherTestCase(unittest.HomeserverTestCase):
         self.assertEqual(keys[testverifykey_id].valid_until_ts, LONG_TS)
         self.assertEqual(keys[testverifykey_id].verify_key, testverifykey)
 
+    def test_logs_candidate_windows_when_no_notary_covers_minimum(self) -> None:
+        """When no notary can satisfy the requested minimum, log every
+        notary's candidate window for that key.
+
+        This is the failure mode that used to be silent: all notaries answer
+        200, the merge succeeds, and only a later signature check reports
+        that the key had expired before the event.
+        """
+        self.reactor.advance(100)
+
+        other_notary = MockPerspectiveServer()
+        other_notary.server_name = "mock_server_2"
+
+        def trusted(notary: MockPerspectiveServer) -> "TrustedKeyServer":
+            verify_key = get_verify_key(notary.key)
+            return TrustedKeyServer(
+                server_name=notary.server_name,
+                verify_keys={get_key_id(verify_key): verify_key},
+            )
+
+        fetcher = PerspectivesKeyFetcher(self.hs)
+        fetcher.key_servers = [
+            trusted(self.mock_perspective_server),
+            trusted(other_notary),
+        ]
+
+        SERVER_NAME = "server2"
+        testkey = signedjson.key.generate_signing_key("ver1")
+        testverifykey = get_verify_key(testkey)
+        testverifykey_id = get_key_id(testkey)
+
+        EARLY_TS = 100 * 1000
+        LATER_TS = 150 * 1000
+        MINIMUM_TS = 200 * 1000
+
+        def build_response(
+            notary: MockPerspectiveServer, valid_until_ts: int
+        ) -> JsonDict:
+            response = {
+                "server_name": SERVER_NAME,
+                "old_verify_keys": {},
+                "valid_until_ts": valid_until_ts,
+                "verify_keys": {
+                    testverifykey_id: {"key": encode_verify_key_base64(testverifykey)}
+                },
+            }
+            signedjson.sign.sign_json(response, SERVER_NAME, testkey)
+            notary.sign_response(response)
+            return response
+
+        responses = {
+            self.mock_perspective_server.server_name: build_response(
+                self.mock_perspective_server, EARLY_TS
+            ),
+            other_notary.server_name: build_response(other_notary, LATER_TS),
+        }
+
+        async def post_json(
+            destination: str, path: str, data: JsonDict, **kwargs: Any
+        ) -> JsonDict:
+            self.assertEqual(path, "/_matrix/key/v2/query")
+            return {"server_keys": [responses[destination]]}
+
+        self.http_client.post_json.side_effect = post_json
+
+        with self.assertLogs("synapse.crypto.keyring", level="WARNING") as logs:
+            keys = self.get_success(
+                fetcher.get_keys(SERVER_NAME, [testverifykey_id], MINIMUM_TS)
+            )
+
+        # The merged key is still returned (the caller decides what to do with
+        # it), but the log must show both notary windows and the minimum.
+        self.assertEqual(keys[testverifykey_id].valid_until_ts, LATER_TS)
+        warning = "\n".join(logs.output)
+        self.assertIn("could not satisfy", warning)
+        self.assertIn(f"{SERVER_NAME}/{testverifykey_id}", warning)
+        self.assertIn(str(MINIMUM_TS), warning)
+        self.assertIn(
+            f"{self.mock_perspective_server.server_name}: {SERVER_NAME}/", warning
+        )
+        self.assertIn(f"{other_notary.server_name}: {SERVER_NAME}/", warning)
+        self.assertIn(str(EARLY_TS), warning)
+        self.assertIn(str(LATER_TS), warning)
+
     def test_get_perspectives_own_key(self) -> None:
         """Check that we can get the perspectives server's own keys
 

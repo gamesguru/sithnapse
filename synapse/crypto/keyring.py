@@ -998,6 +998,9 @@ class PerspectivesKeyFetcher(BaseV2KeyFetcher):
         fanout_started = time.perf_counter()
         notary_elapsed: dict[str, float] = {}
         notary_failures: set[str] = set()
+        # notary -> (origin server, key id) -> valid_until_ts, for diagnosing a
+        # fan-out where no notary returned a key that covers the requested event.
+        notary_windows: dict[str, dict[tuple[str, str], int]] = {}
 
         async def get_key(key_server: TrustedKeyServer) -> dict:
             notary_started = time.perf_counter()
@@ -1032,6 +1035,19 @@ class PerspectivesKeyFetcher(BaseV2KeyFetcher):
             elapsed = time.perf_counter() - notary_started
             notary_elapsed[key_server.server_name] = elapsed
             returned_key_count = sum(len(keys) for keys in result.values())
+            windows = {
+                (server_name, key_id): key.valid_until_ts
+                for server_name, server_keys in result.items()
+                for key_id, key in server_keys.items()
+            }
+            notary_windows[key_server.server_name] = windows
+            window_parts = sorted(
+                f"{server_name}/{key_id}={valid_until_ts}"
+                for (server_name, key_id), valid_until_ts in windows.items()
+            )
+            windows_text = ", ".join(window_parts[:20])
+            if len(window_parts) > 20:
+                windows_text += f", … ({len(window_parts) - 20} more)"
 
             # Per-notary latency. A slow notary gates the whole fan-out
             # (we wait for all of them so the most lenient answer wins), so
@@ -1039,20 +1055,22 @@ class PerspectivesKeyFetcher(BaseV2KeyFetcher):
             if elapsed >= 0.5:
                 logger.info(
                     "Slow notary key response from %r: %.3fs for %d requested "
-                    "key(s), returned %d",
+                    "key(s), returned %d; candidate windows: %s",
                     key_server.server_name,
                     elapsed,
                     requested_key_count,
                     returned_key_count,
+                    windows_text or "none",
                 )
             else:
                 logger.debug(
                     "Notary key response from %r: %.3fs for %d requested "
-                    "key(s), returned %d",
+                    "key(s), returned %d; candidate windows: %s",
                     key_server.server_name,
                     elapsed,
                     requested_key_count,
                     returned_key_count,
+                    windows_text or "none",
                 )
 
             return result
@@ -1094,19 +1112,70 @@ class PerspectivesKeyFetcher(BaseV2KeyFetcher):
         else:
             slowest_notary, slowest_elapsed = None, 0.0
 
+        def _format_windows(
+            windows: dict[tuple[str, str], int],
+            only: tuple[str, str] | None = None,
+        ) -> str:
+            parts = sorted(
+                f"{server_name}/{key_id}={valid_until_ts}"
+                for (server_name, key_id), valid_until_ts in windows.items()
+                if only is None or (server_name, key_id) == only
+            )
+            text = ", ".join(parts[:20])
+            if len(parts) > 20:
+                text += f", … ({len(parts) - 20} more)"
+            return text
+
+        # A key that no notary can satisfy is the failure mode that used to be
+        # silent: the fan-out succeeds as a request, but verification later
+        # fails because every candidate window ends before the event. Report
+        # the per-notary windows for exactly those keys so the disagreement is
+        # visible in the log even when every notary answered 200.
+        unsatisfied: list[str] = []
+        for request in keys_to_fetch:
+            for key_id in request.key_ids:
+                merged_key = union_of_keys.get(request.server_name, {}).get(key_id)
+                if (
+                    merged_key is None
+                    or merged_key.valid_until_ts < request.minimum_valid_until_ts
+                ):
+                    candidates = "; ".join(
+                        f"{notary}: "
+                        f"{_format_windows(windows, (request.server_name, key_id)) or 'missing'}"
+                        for notary, windows in sorted(notary_windows.items())
+                    )
+                    unsatisfied.append(
+                        f"{request.server_name}/{key_id} needs >= "
+                        f"{request.minimum_valid_until_ts}, best merged "
+                        f"{merged_key.valid_until_ts if merged_key else 'none'}; "
+                        f"candidates [{candidates}]"
+                    )
+
+        if unsatisfied:
+            logger.warning(
+                "Notary key fan-out could not satisfy %d requested key(s): %s",
+                len(unsatisfied),
+                " | ".join(unsatisfied),
+            )
+
         # The fan-out cost is the *slowest* notary, not the sum, because the
         # requests run concurrently. Logging both makes it obvious when one
         # notary is inflating join/verification latency.
         log = logger.info if fanout_elapsed >= 0.5 or notary_failures else logger.debug
         log(
             "Notary key fan-out for %d key(s) across %d notary(s) took %.3fs; "
-            "slowest %s at %.3fs; %d notary(s) failed",
+            "slowest %s at %.3fs; %d notary(s) failed; candidate windows: %s",
             requested_key_count,
             len(self.key_servers),
             fanout_elapsed,
             slowest_notary,
             slowest_elapsed,
             len(notary_failures),
+            "; ".join(
+                f"{notary}: {_format_windows(windows)}"
+                for notary, windows in sorted(notary_windows.items())
+            )
+            or "none",
         )
 
         return union_of_keys

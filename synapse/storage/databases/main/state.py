@@ -922,6 +922,66 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
 
         return {row[0] for row in rows}
 
+    async def repoint_event_state_group(self, event_id: str, state_group: int) -> None:
+        """Point an already-persisted event at a different state group.
+
+        Used by the offline `synapse_state_repair` tool to move a forward
+        extremity onto a repaired state group. The old state group is left in
+        place (only its reference count moves) so that the repair can be
+        audited or rolled back.
+        """
+        await self.db_pool.runInteraction(
+            "repoint_event_state_group",
+            self._repoint_event_state_group_txn,
+            event_id,
+            state_group,
+        )
+
+    def _repoint_event_state_group_txn(
+        self, txn: LoggingTransaction, event_id: str, state_group: int
+    ) -> None:
+        if getattr(self, "_embedded_event_json_enabled", False):
+            # Drop any not-yet-migrated SQL row first, for the same reason as in
+            # `_update_state_for_partial_state_event_txn`.
+            self.db_pool.simple_delete_txn(
+                txn, table="event_to_state_groups", keyvalues={"event_id": event_id}
+            )
+            old = get_state_group_for_events_batch(
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
+                [event_id],
+                purpose="repoint_event_state_group",
+            ).get(event_id)
+            put_event_to_state_group_batch(
+                self._embedded_db_engine,
+                self._embedded_db_namespace,
+                [(event_id, state_group)],
+            )
+            if old != state_group:
+                if old is not None:
+                    decrement_state_group_refcounts_batch(
+                        self._embedded_db_engine,
+                        self._embedded_db_namespace,
+                        [old],
+                    )
+                increment_state_group_refcounts_batch(
+                    self._embedded_db_engine,
+                    self._embedded_db_namespace,
+                    [state_group],
+                )
+            if publishes_at_commit():
+                txn.call_after(mark_dirty, Pool.STATE)
+            else:
+                txn.call_after(sync_now, [Pool.STATE])
+        else:
+            self.db_pool.simple_update_one_txn(
+                txn,
+                table="event_to_state_groups",
+                keyvalues={"event_id": event_id},
+                updatevalues={"state_group": state_group},
+            )
+        txn.call_after(self._get_state_group_for_event_sql.invalidate, (event_id,))
+
     async def update_state_for_partial_state_event(
         self,
         event: EventBase,
