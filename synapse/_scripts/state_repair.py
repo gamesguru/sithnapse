@@ -36,6 +36,13 @@ class RepairHomeserver(HomeServer):
             reactor=reactor,
         )
 
+        # The tool never runs the homeserver, but some stores change what they
+        # register or schedule based on these flags. Force them off so a repair
+        # invocation cannot start pushers or background work, whatever the
+        # config says.
+        self.config.worker.run_background_tasks = False
+        self.config.worker.start_pushers = False
+
 
 def _load_room_ids(room: list[str], room_file: str | None) -> list[str]:
     room_ids = list(room)
@@ -357,6 +364,9 @@ async def _repair_member(
         )
     report["plan"] = plan
     if not plan:
+        if publish:
+            assert controllers.persistence is not None
+            await controllers.persistence.update_current_state(room_id)
         report["note"] = "nothing to do: every extremity already has this event"
         return report
 
@@ -405,6 +415,7 @@ async def _plan_state_deltas(
     hs: HomeServer,
     room_id: str,
     deltas: dict[tuple[str, str], str],
+    selected_extremity: str | None = None,
 ) -> list[dict[str, Any]]:
     """Work out the state-group rewrites needed to apply `deltas`.
 
@@ -424,6 +435,8 @@ async def _plan_state_deltas(
 
     plan: list[dict[str, Any]] = []
     for group, extremities in sorted(extremities_by_group.items()):
+        if selected_extremity is not None and selected_extremity not in extremities:
+            continue
         state = await controllers.state.get_state_ids_for_group(group)
         group_delta = {
             key: event_id
@@ -484,6 +497,326 @@ async def _apply_state_deltas(
     await controllers.persistence.update_current_state(room_id)
 
 
+class _PropagationError(Exception):
+    """The propagation plan cannot be built safely."""
+
+
+def _descendant_state_groups_txn(txn: LoggingTransaction, seed_group: int) -> set[int]:
+    """Return the seed group and every group that descends from it.
+
+    `state_group_edges` records the group each new group was derived from, so
+    this finds the groups whose state is a descendant of the state at the seed
+    even when the leave itself is not in the local event DAG.
+    """
+    txn.execute(
+        """
+        WITH RECURSIVE descendants(state_group) AS (
+            SELECT CAST(? AS BIGINT)
+            UNION
+            SELECT edges.state_group
+            FROM state_group_edges AS edges
+            JOIN descendants ON edges.prev_state_group = descendants.state_group
+        )
+        SELECT state_group FROM descendants
+        """,
+        (seed_group,),
+    )
+    return {int(row[0]) for row in txn.fetchall()}
+
+
+def _event_stream_ordering_txn(txn: LoggingTransaction, event_id: str) -> int | None:
+    txn.execute("SELECT stream_ordering FROM events WHERE event_id = ?", (event_id,))
+    row = txn.fetchone()
+    if row is None or row[0] is None:
+        return None
+    return int(row[0])
+
+
+def _room_events_from_txn(
+    txn: LoggingTransaction,
+    room_id: str,
+    stream_ordering: int,
+    limit: int,
+) -> list[tuple[str, int]]:
+    """Return the non-outlier events persisted at or after `stream_ordering`."""
+    txn.execute(
+        """
+        SELECT event_id, stream_ordering
+        FROM events
+        WHERE room_id = ? AND NOT outlier AND stream_ordering >= ?
+        ORDER BY stream_ordering, event_id
+        LIMIT ?
+        """,
+        (room_id, stream_ordering, limit + 1),
+    )
+    return [(row[0], int(row[1])) for row in txn.fetchall()]
+
+
+def _rejoin_candidates_txn(
+    txn: LoggingTransaction, room_id: str, auth_event_id: str, limit: int
+) -> list[str]:
+    """Events whose stored auth_events name `auth_event_id`."""
+    txn.execute(
+        """
+        SELECT ea.event_id
+        FROM event_auth AS ea
+        JOIN events AS e USING (event_id)
+        WHERE ea.room_id = ? AND ea.auth_id = ? AND e.room_id = ?
+        ORDER BY e.stream_ordering
+        LIMIT ?
+        """,
+        (room_id, auth_event_id, room_id, limit),
+    )
+    return [row[0] for row in txn.fetchall()]
+
+
+async def _events_authenticated_by(
+    store: Any, room_id: str, auth_event_id: str, limit: int
+) -> list[str]:
+    """Event IDs that name `auth_event_id` in their auth_events.
+
+    `event_auth` covers imported edges; when the embedded event store is in
+    use, recently persisted children only exist there, so union both.
+    """
+    event_ids = set(
+        await store.db_pool.runInteraction(
+            "synapse_state_repair_auth_children",
+            _rejoin_candidates_txn,
+            room_id,
+            auth_event_id,
+            limit,
+        )
+    )
+
+    if getattr(store, "_embedded_event_json_enabled", False):
+        try:
+            from synapse.storage.databases.main.embedded_event_auth_chains import (
+                get_embedded_auth_children_batch,
+                resolve_event_ids_to_short_ids,
+                resolve_namespace,
+                resolve_short_ids_to_event_ids,
+            )
+
+            namespace = resolve_namespace(store)
+            engine_name = getattr(store, "_embedded_db_engine", None)
+            if namespace is not None:
+                short_ids = resolve_event_ids_to_short_ids(
+                    engine_name, namespace, room_id, [auth_event_id]
+                )
+                if short_ids and short_ids[0] is not None:
+                    children = get_embedded_auth_children_batch(
+                        engine_name, namespace, room_id, [short_ids[0]]
+                    ).get(short_ids[0], [])
+                    for child in resolve_short_ids_to_event_ids(
+                        engine_name, namespace, room_id, children[:limit]
+                    ):
+                        if child is not None:
+                            event_ids.add(child)
+        except Exception:
+            logger.warning(
+                "could not read embedded auth children for %s; the auth review "
+                "may be incomplete",
+                auth_event_id,
+                exc_info=True,
+            )
+
+    return sorted(event_ids)[:limit]
+
+
+async def _plan_propagation(
+    hs: HomeServer,
+    room_id: str,
+    seed_event: EventBase,
+    seed_group: int,
+    seed_state: dict[tuple[str, str], str],
+    deltas: dict[tuple[str, str], str],
+    max_events: int,
+) -> dict[str, Any]:
+    """Plan the state-group rewrites that carry `deltas` down from the seed.
+
+    Every descendant group whose value for a changed key is still the seed's
+    value is rewritten as `old_group + delta`. A group with a different value
+    for that key is a later legitimate change: it is left alone and reported
+    as a stop. Groups with no local event need no rewrite and are skipped.
+    """
+    store = hs.get_datastores().main
+    controllers = hs.get_storage_controllers()
+
+    descendant_groups = await store.db_pool.runInteraction(
+        "synapse_state_repair_descendant_groups",
+        _descendant_state_groups_txn,
+        seed_group,
+    )
+
+    seed_stream_ordering = await store.db_pool.runInteraction(
+        "synapse_state_repair_seed_stream_ordering",
+        _event_stream_ordering_txn,
+        seed_event.event_id,
+    )
+    if seed_stream_ordering is None:
+        raise _PropagationError(f"{seed_event.event_id} has no local stream ordering")
+
+    rows = await store.db_pool.runInteraction(
+        "synapse_state_repair_room_events",
+        _room_events_from_txn,
+        room_id,
+        seed_stream_ordering,
+        max_events,
+    )
+    if len(rows) > max_events:
+        raise _PropagationError(
+            "more than --max-events (%d) local events follow the seed; raise the "
+            "limit or seed at a later event" % max_events
+        )
+
+    event_ids = [event_id for event_id, _ in rows]
+    group_by_event: dict[str, int] = {}
+    for start in range(0, len(event_ids), 1000):
+        group_by_event.update(
+            await store._get_state_group_for_events(
+                event_ids[start : start + 1000], raise_on_missing=False
+            )
+        )
+
+    events_by_group: dict[int, list[str]] = {}
+    not_descendant = 0
+    without_group = 0
+    for event_id in event_ids:
+        group = group_by_event.get(event_id)
+        if group is None:
+            without_group += 1
+        elif group not in descendant_groups:
+            not_descendant += 1
+        else:
+            events_by_group.setdefault(group, []).append(event_id)
+
+    keys = list(deltas)
+    plan: list[dict[str, Any]] = []
+    stops: list[dict[str, Any]] = []
+    stop_markers: set[tuple[tuple[str, str], str | None]] = set()
+    already_correct = 0
+    empty_groups = 0
+
+    for group in sorted(descendant_groups):
+        state = await controllers.state.get_state_ids_for_group(
+            group, StateFilter.from_types(keys)
+        )
+        group_delta: dict[tuple[str, str], str] = {}
+        for key in keys:
+            current = state.get(key)
+            if current == deltas[key]:
+                already_correct += 1
+            elif current == seed_state.get(key):
+                group_delta[key] = deltas[key]
+            else:
+                marker = (key, current)
+                if marker not in stop_markers:
+                    stop_markers.add(marker)
+                    stops.append(
+                        {
+                            "type": key[0],
+                            "state_key": key[1],
+                            "state_group": group,
+                            "current": current,
+                            "seed_value": seed_state.get(key),
+                            "would_be": deltas[key],
+                        }
+                    )
+        if not group_delta:
+            continue
+
+        events = sorted(events_by_group.get(group, ()))
+        if not events:
+            empty_groups += 1
+            continue
+
+        plan.append(
+            {
+                "old_state_group": group,
+                "events": events,
+                "event_count": len(events),
+                "delta": group_delta,
+                "changes": [
+                    {
+                        "type": key[0],
+                        "state_key": key[1],
+                        "from": state.get(key),
+                        "to": event_id,
+                    }
+                    for key, event_id in sorted(group_delta.items())
+                ],
+            }
+        )
+
+    review: list[dict[str, Any]] = []
+    for key, new_event_id in sorted(deltas.items()):
+        old_event_id = seed_state.get(key)
+        if old_event_id is None:
+            continue
+        candidates = await _events_authenticated_by(store, room_id, old_event_id, 50)
+        if not candidates:
+            continue
+        auth_events = []
+        for event_id in candidates:
+            event = await store.get_event(
+                event_id, allow_none=True, allow_rejected=True
+            )
+            if event is not None:
+                summary = _event_summary(event)
+                if summary is not None:
+                    auth_events.append(summary)
+        review.append(
+            {
+                "type": key[0],
+                "state_key": key[1],
+                "replaced": old_event_id,
+                "replacement": new_event_id,
+                "events": auth_events,
+            }
+        )
+
+    return {
+        "groups": plan,
+        "group_count": len(plan),
+        "event_count": sum(step["event_count"] for step in plan),
+        "already_correct": already_correct,
+        "stops": stops,
+        "groups_without_events": empty_groups,
+        "events_without_state_group": without_group,
+        "events_not_descended_from_seed": not_descendant,
+        "auth_review": review,
+        "note": "auth_review is report-only; existing rejections are not changed",
+    }
+
+
+async def _apply_propagation(
+    hs: HomeServer, room_id: str, plan: list[dict[str, Any]]
+) -> None:
+    """Write the planned groups, repoint their events, then fix current state."""
+    if not plan:
+        return
+
+    store = hs.get_datastores().main
+    controllers = hs.get_storage_controllers()
+    room_version = await store.get_room_version(room_id)
+
+    for step in plan:
+        new_group = await controllers.state.store_state_group(
+            step["events"][0],
+            room_id,
+            room_version,
+            prev_group=step["old_state_group"],
+            delta_ids=step["delta"],
+            current_state_ids=None,
+        )
+        step["new_state_group"] = new_group
+        for event_id in step["events"]:
+            await store.repoint_event_state_group(event_id, new_group)
+
+    assert controllers.persistence is not None
+    await controllers.persistence.update_current_state(room_id)
+
+
 async def _import_state(
     hs: HomeServer,
     room_id: str,
@@ -491,6 +824,8 @@ async def _import_state(
     at_event: str | None,
     max_diff: int,
     publish: bool,
+    propagate: bool = False,
+    max_events: int = 200_000,
 ) -> dict[str, Any]:
     """Compare local state with a remote server's state at our tip.
 
@@ -502,6 +837,14 @@ async def _import_state(
     locally (or differ), then applies their state keys to the forward
     extremities through the same state-group rewrite as `repair-member`.
     Keys that exist only locally are reported but never removed.
+
+    With `propagate=True`, `at_event` may be any local non-outlier event, and
+    the changed keys are carried forward: every descendant state group that
+    still holds the seed value is rewritten as `old_group + delta`, and its
+    events are repointed. Groups with a later value for a key are left alone
+    and reported as stops. This repairs historical state maps, not just the
+    tip. The leave itself is still only an outlier, so it is not inserted into
+    the timeline.
     """
     store = hs.get_datastores().main
     controllers = hs.get_storage_controllers()
@@ -509,6 +852,7 @@ async def _import_state(
         "room_id": room_id,
         "via": via,
         "at_event": at_event,
+        "propagate": propagate,
         "published": False,
         "refused": None,
     }
@@ -531,17 +875,24 @@ async def _import_state(
                 % len(latest_event_ids)
             )
         at_event = next(iter(latest_event_ids))
-    elif at_event not in latest_event_ids:
-        return refuse(
-            "--at-event must be the room's single forward extremity; use "
-            "repair-state sweep for historical ranges"
-        )
+    else:
+        event = await store.get_event(at_event, allow_none=True, allow_rejected=True)
+        if event is None or event.room_id != room_id:
+            return refuse(f"{at_event} is not a local event in this room")
+        if at_event not in latest_event_ids and not propagate:
+            return refuse(
+                "--at-event must be a forward extremity unless --propagate is used"
+            )
     report["at_event"] = at_event
 
-    group_by_event = await store._get_state_group_for_events({at_event})
+    group_by_event = await store._get_state_group_for_events(
+        {at_event}, raise_on_missing=False
+    )
     state_group = group_by_event.get(at_event)
     if state_group is None:
-        return refuse(f"no state group for {at_event}")
+        return refuse(
+            f"no state group for {at_event}; an outlier has no state to compare from"
+        )
 
     local_state = await controllers.state.get_state_ids_for_group(state_group)
     local_event_ids = set(local_state.values())
@@ -555,6 +906,11 @@ async def _import_state(
         return refuse(f"failed to fetch state from {via}: {e}")
 
     remote_event_ids = set(remote_ids)
+    tip_event = await store.get_event(at_event, allow_none=True)
+    if tip_event is not None and tip_event.is_state():
+        # /state_ids is the state before the requested event. Include the
+        # accepted state event to compare the same after-event snapshot locally.
+        remote_event_ids.add(at_event)
     only_remote_ids = remote_event_ids - local_event_ids
     only_local_ids = local_event_ids - remote_event_ids
 
@@ -571,22 +927,6 @@ async def _import_state(
             "large diff" % max_diff
         )
 
-    tip_event = await store.get_event(at_event, allow_none=True)
-    if (
-        tip_event is not None
-        and tip_event.is_state()
-        and at_event not in remote_event_ids
-    ):
-        # The remote did not return the event we asked for in the state at that
-        # event, so it probably does not know it. Its answer is not a state at
-        # our tip and must not be applied.
-        report["warning"] = (
-            f"{via} did not include {at_event} in the state it returned for "
-            "that event; it may not know the event"
-        )
-        if publish:
-            return refuse(report["warning"])
-
     errors: list[dict[str, str]] = []
     remote_events: dict[tuple[str, str], EventBase] = {}
     for event_id in sorted(only_remote_ids):
@@ -602,6 +942,9 @@ async def _import_state(
                 errors.append({"event_id": event_id, "error": "not returned"})
                 continue
             event = pulled.pdu
+        if event.event_id != event_id:
+            errors.append({"event_id": event_id, "error": f"returned {event.event_id}"})
+            continue
         if event.room_id != room_id:
             errors.append(
                 {"event_id": event_id, "error": f"belongs to {event.room_id}"}
@@ -618,13 +961,17 @@ async def _import_state(
                 }
             )
             continue
-        remote_events[(event.type, event.state_key)] = event
-
-    local_events: dict[tuple[str, str], EventBase | None] = {}
-    for key, event_id in local_state.items():
-        local_events[key] = await store.get_event(
-            event_id, allow_none=True, allow_rejected=True
-        )
+        key = (event.type, event.state_key)
+        previous = remote_events.get(key)
+        if previous is not None and previous.event_id != event.event_id:
+            errors.append(
+                {
+                    "event_id": event_id,
+                    "error": f"conflicts with {previous.event_id} for state key {key}",
+                }
+            )
+            continue
+        remote_events[key] = event
 
     # Keys whose event ID is present on both sides are unchanged. We only have
     # the remote event objects for the symmetric difference, so map the shared
@@ -634,9 +981,24 @@ async def _import_state(
         for key, event_id in local_state.items()
         if event_id in remote_event_ids
     }
-    remote_state_by_key.update(
-        {key: event.event_id for key, event in remote_events.items()}
-    )
+    for key, event in remote_events.items():
+        shared_id = remote_state_by_key.get(key)
+        if shared_id is not None and shared_id != event.event_id:
+            errors.append(
+                {
+                    "event_id": event.event_id,
+                    "error": f"conflicts with shared event {shared_id} for state key {key}",
+                }
+            )
+        else:
+            remote_state_by_key[key] = event.event_id
+
+    changed_local_ids = {
+        local_id
+        for key, local_id in local_state.items()
+        if remote_state_by_key.get(key) != local_id
+    }
+    local_events = await store.get_events(changed_local_ids, allow_rejected=True)
 
     changes: list[dict[str, Any]] = []
     deltas: dict[tuple[str, str], str] = {}
@@ -661,7 +1023,11 @@ async def _import_state(
                 "type": key[0],
                 "state_key": key[1],
                 "action": action,
-                "local": _event_summary(local_events.get(key)),
+                "local": (
+                    _event_summary(local_events.get(local_id))
+                    if local_id is not None
+                    else None
+                ),
                 "remote": _event_summary(remote_event),
             }
         )
@@ -677,14 +1043,68 @@ async def _import_state(
             return refuse(report["note"])
 
     if not changes:
-        report["note"] = "nothing to do: local and remote state agree at this event"
+        # A prior publish may have updated the selected tip but stopped before
+        # rewriting another extremity. Reconcile every forward-extremity group
+        # against this remote snapshot on retries.
+        retry_plan = await _plan_state_deltas(hs, room_id, remote_state_by_key)
+        report["plan"] = [step["changes"] for step in retry_plan]
+        if retry_plan and publish:
+            await _apply_state_deltas(hs, room_id, retry_plan)
+            report["published"] = True
+            report["note"] = "repaired stale forward-extremity state groups"
+            return report
+        if not retry_plan:
+            report["note"] = "nothing to do: local and remote state agree at this event"
+        else:
+            report["note"] = "dry run: pass --publish to repair stale extremities"
         return report
 
-    plan = await _plan_state_deltas(hs, room_id, deltas)
-    report["plan"] = plan
-    if not plan:
-        report["note"] = "nothing to do: every state group already has these events"
-        return report
+    if propagate:
+        seed_event = await store.get_event(
+            at_event, allow_none=True, allow_rejected=True
+        )
+        if seed_event is None:
+            return refuse(f"{at_event} is no longer available locally")
+        try:
+            propagation = await _plan_propagation(
+                hs,
+                room_id,
+                seed_event,
+                state_group,
+                dict(local_state),
+                deltas,
+                max_events,
+            )
+        except _PropagationError as e:
+            return refuse(str(e))
+        report["propagation"] = {
+            **propagation,
+            "groups": [step["changes"] for step in propagation["groups"]],
+        }
+        plan = propagation["groups"]
+        report["plan"] = [step["changes"] for step in plan]
+        if not plan:
+            incomplete = bool(
+                propagation["groups_without_events"] or propagation["stops"]
+            )
+            report["incomplete"] = incomplete
+            if publish:
+                assert controllers.persistence is not None
+                await controllers.persistence.update_current_state(room_id)
+            report["note"] = (
+                "incomplete: some descendant state groups need review"
+                if incomplete
+                else "nothing to do: no descendant state group still has the seed value"
+            )
+            return report
+    else:
+        plan = await _plan_state_deltas(
+            hs, room_id, deltas, selected_extremity=at_event
+        )
+        report["plan"] = [step["changes"] for step in plan]
+        if not plan:
+            report["note"] = "nothing to do: every state group already has these events"
+            return report
 
     if not publish:
         report["note"] = "dry run: pass --publish to import and apply"
@@ -719,7 +1139,18 @@ async def _import_state(
         report["rejected_on_persist"] = rejected
         return refuse("one or more imported events were rejected on persist")
 
-    await _apply_state_deltas(hs, room_id, plan)
+    if propagate:
+        await _apply_propagation(hs, room_id, plan)
+        report["incomplete"] = bool(
+            report["propagation"]["groups_without_events"]
+            or report["propagation"]["stops"]
+        )
+        if report["incomplete"]:
+            report["note"] = (
+                "published planned groups; some descendant groups remain incomplete"
+            )
+    else:
+        await _apply_state_deltas(hs, room_id, plan)
     report["published"] = True
     return report
 
@@ -868,8 +1299,27 @@ def main() -> None:
     repair_state_import.add_argument(
         "--at-event",
         help=(
-            "Local forward extremity to compare at. Defaults to the room's "
-            "single forward extremity."
+            "Local event to compare at. Defaults to the room's single forward "
+            "extremity. Any local event is accepted with --propagate."
+        ),
+    )
+    repair_state_import.add_argument(
+        "--propagate",
+        action="store_true",
+        help=(
+            "Carry the imported key changes forward through every descendant "
+            "state group, repairing historical state maps rather than only the "
+            "chosen event's group. Requires --at-event to be the historical "
+            "seed (usually the local join)."
+        ),
+    )
+    repair_state_import.add_argument(
+        "--max-events",
+        type=int,
+        default=200_000,
+        help=(
+            "Refuse --propagate if more than this many local events follow the "
+            "seed (default: 200000)."
         ),
     )
     repair_state_import.add_argument(
@@ -933,6 +1383,8 @@ def main() -> None:
             "via": args.via,
             "max_diff": max(0, int(args.max_diff)),
             "publish": bool(args.publish),
+            "propagate": bool(args.propagate),
+            "max_events": max(0, int(args.max_events)),
         }
     else:
         room_ids = _load_room_ids(args.room, getattr(args, "room_file", None))

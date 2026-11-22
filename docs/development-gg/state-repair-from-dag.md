@@ -226,16 +226,35 @@ removed, so local-only memberships survive. It refuses partial-state and MSC4242
 rooms, a multi-extremity room without `--at-event`, a remote that does not
 include the comparison event in its answer, and a diff larger than `--max-diff`.
 
-This is the import half, and it only finds differences at the current tip. A key
+This is the import half, and it only finds differences at the seed event. A key
 that was wrong early and was overwritten later will not appear in its diff.
 
-The second half, a `repair-state sweep`, would walk every locally
-reconstructible event in topological order — not only events after our join —
-and rewrite only the per-event state groups whose stored state differs from the
-recomputed state. A single-parent state event can reuse the parent group plus a
-one-key delta; a merge needs real state resolution. Events whose prev or auth
-inputs are missing must be refused rather than synthesized, so a sweep can only
-reconstruct from inputs available locally: deeper history needs import or
-backfill first. Re-running the sweep must write nothing once the groups agree.
-It is not implemented; until then, historical `state-at-event` values for events
-already in the DAG keep their old groups.
+### Propagating the diff: `--propagate`
+
+`repair-state import --propagate --at-event <join>` seeds the comparison at a
+historical event instead of the tip. Any local non-outlier event is accepted,
+including a non-extremity. After importing the missing events, every descendant
+state group that still holds the seed's value for a changed key is rewritten as
+`old_group + delta`, and the events on that group are repointed:
+
+```
+synapse_state_repair --config homeserver.yaml repair-state import \
+    --room '!room:id' --via unredacted.org \
+    --at-event '$local-join' --propagate                    # dry run
+```
+
+Descendant groups are found through `state_group_edges`, not by replaying the
+event DAG, so the repair works when the dropped event itself is only a stateless
+outlier. A group whose value for a key was legitimately changed later is left
+alone and reported under `stops`. Groups with no local event are counted but not
+rewritten. `--max-events` bounds the descendants considered (default 200000).
+
+The report also lists events whose `auth_events` name the replaced event
+(`auth_review`), including their current rejection status. That list is
+report-only; published repairs never change existing rejections. The leave is
+still not inserted into the timeline at its historical position.
+
+The full `repair-state sweep` remains unimplemented. Unlike `--propagate`, it
+would recompute every event's state from its prev groups (with real state
+resolution at merges) and report auth decisions, rather than applying a known
+key delta to the groups that descend from one seed.

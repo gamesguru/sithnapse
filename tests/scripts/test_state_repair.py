@@ -29,6 +29,8 @@ class RepairMemberTestCase(unittest.HomeserverTestCase):
         self.alice_tok = self.login("alice", "pass")
         bob = self.register_user("bob", "pass")
         bob_tok = self.login("bob", "pass")
+        self.bob_tok = bob_tok
+        self.bob = bob
         self.room_id = self.helper.create_room_as(alice, tok=self.alice_tok)
         self.key = ("m.room.member", bob)
 
@@ -158,7 +160,7 @@ class RepairMemberTestCase(unittest.HomeserverTestCase):
         self.assertEqual(actions[self.key], "replace")
         self.assertEqual(len(report["plan"]), 1)
         self.assertEqual(
-            report["plan"][0]["changes"],
+            report["plan"][0],
             [
                 {
                     "type": self.key[0],
@@ -188,3 +190,140 @@ class RepairMemberTestCase(unittest.HomeserverTestCase):
         self._rewind_to_join()
         report = self._import(publish=False, max_diff=0)
         self.assertIn("exceeds --max-diff", report["refused"])
+
+    def _bug_scenario(self) -> tuple[str, dict]:
+        """Create a join after the leave, then rewind it to the old join.
+
+        This mirrors the production bug: the local state at a later join lacks
+        the earlier leave, while the remote state at that join has it.
+        """
+        charlie = self.register_user("charlie", "pass")
+        charlie_tok = self.login("charlie", "pass")
+        self.helper.join(self.room_id, charlie, tok=charlie_tok)
+
+        remote_state = self.get_success(
+            self.controllers.state.get_current_state_ids(self.room_id)
+        )
+        seed_event_id = remote_state[("m.room.member", charlie)]
+        seed_group = self.get_success(
+            self.store._get_state_group_for_events([seed_event_id])
+        )[seed_event_id]
+
+        bad_group = self.get_success(
+            self.controllers.state.store_state_group(
+                seed_event_id,
+                self.room_id,
+                self.get_success(self.store.get_room_version(self.room_id)),
+                prev_group=seed_group,
+                delta_ids={self.key: self.join_id},
+                current_state_ids=None,
+            )
+        )
+        self.get_success(self.store.repoint_event_state_group(seed_event_id, bad_group))
+        persistence = self.controllers.persistence
+        assert persistence is not None
+        self.get_success(persistence.update_current_state(self.room_id))
+
+        # Make the seed a non-extremity and give propagation a second group.
+        self.helper.send(self.room_id, "after seed", tok=self.alice_tok)
+        self.helper.send_state(
+            self.room_id, "m.room.topic", {"topic": "after seed"}, tok=self.alice_tok
+        )
+        self.assertEqual(self._current(), self.join_id)
+        return seed_event_id, remote_state
+
+    def _import_at(
+        self,
+        at_event: str,
+        remote_state: dict,
+        publish: bool,
+        propagate: bool,
+    ) -> dict:
+        federation = self.hs.get_federation_client()
+
+        async def fake_state_ids(
+            destination: str, room_id: str, event_id: str
+        ) -> tuple[list[str], list[str]]:
+            self.assertEqual(destination, "remote.example")
+            self.assertEqual(room_id, self.room_id)
+            self.assertEqual(event_id, at_event)
+            return list(remote_state.values()), []
+
+        self.patch(federation, "get_room_state_ids", fake_state_ids)
+        return self.get_success(
+            _import_state(
+                self.hs,
+                self.room_id,
+                "remote.example",
+                at_event,
+                500,
+                publish,
+                propagate=propagate,
+            )
+        )
+
+    def test_at_event_outside_extremity_requires_propagate(self) -> None:
+        seed, remote_state = self._bug_scenario()
+        report = self._import_at(seed, remote_state, publish=False, propagate=False)
+        self.assertIn("must be a forward extremity", report["refused"])
+
+    def test_propagate_repairs_seed_and_descendant_groups(self) -> None:
+        seed, remote_state = self._bug_scenario()
+
+        report = self._import_at(seed, remote_state, publish=False, propagate=True)
+        self.assertIsNone(report["refused"], report)
+        self.assertFalse(report["published"])
+        self.assertEqual(self._current(), self.join_id)
+
+        # The seed group and the topic group both still have the old join.
+        self.assertEqual(report["propagation"]["group_count"], 2)
+        self.assertGreaterEqual(report["propagation"]["event_count"], 2)
+        self.assertEqual(report["propagation"]["stops"], [])
+
+        report = self._import_at(seed, remote_state, publish=True, propagate=True)
+        self.assertIsNone(report["refused"], report)
+        self.assertTrue(report["published"])
+        self.assertEqual(self._current(), self.leave_id)
+
+        # Historical state maps now carry the leave too: the seed and the
+        # descendant state event both descend from the repaired group.
+        tip = next(
+            iter(
+                self.get_success(self.store.get_latest_event_ids_in_room(self.room_id))
+            )
+        )
+        for event_id in (seed, tip):
+            state = self.get_success(
+                self.controllers.state.get_state_ids_for_event(
+                    event_id, StateFilter.from_types([self.key])
+                )
+            )
+            self.assertEqual(state.get(self.key), self.leave_id, event_id)
+
+        # Idempotent: local and remote state now agree at the seed.
+        again = self._import_at(seed, remote_state, publish=True, propagate=True)
+        self.assertEqual(again["changes"], [])
+
+    def test_propagate_stops_at_later_membership_change(self) -> None:
+        seed, remote_state = self._bug_scenario()
+
+        # A later real membership change must not be overwritten.
+        self.helper.leave(self.room_id, self.bob, tok=self.bob_tok)
+        self.helper.join(self.room_id, self.bob, tok=self.bob_tok)
+        later_state = self.get_success(
+            self.controllers.state.get_current_state_ids(
+                self.room_id, StateFilter.from_types([self.key])
+            )
+        )
+        later_join = later_state[self.key]
+        self.assertEqual(self._current(), later_join)
+
+        report = self._import_at(seed, remote_state, publish=False, propagate=True)
+        self.assertIsNone(report["refused"], report)
+        stops = report["propagation"]["stops"]
+        self.assertTrue(any(stop["current"] == later_join for stop in stops), report)
+
+        report = self._import_at(seed, remote_state, publish=True, propagate=True)
+        self.assertIsNone(report["refused"], report)
+        self.assertTrue(report["published"])
+        self.assertEqual(self._current(), later_join)
