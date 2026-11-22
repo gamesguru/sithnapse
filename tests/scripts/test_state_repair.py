@@ -201,8 +201,8 @@ class RepairMemberTestCase(unittest.HomeserverTestCase):
         charlie_tok = self.login("charlie", "pass")
         self.helper.join(self.room_id, charlie, tok=charlie_tok)
 
-        remote_state = self.get_success(
-            self.controllers.state.get_current_state_ids(self.room_id)
+        remote_state = dict(
+            self.get_success(self.controllers.state.get_current_state_ids(self.room_id))
         )
         seed_event_id = remote_state[("m.room.member", charlie)]
         seed_group = self.get_success(
