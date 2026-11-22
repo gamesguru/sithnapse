@@ -4,7 +4,7 @@
 
 from twisted.internet.testing import MemoryReactor
 
-from synapse._scripts.state_repair import _repair_member
+from synapse._scripts.state_repair import _import_state, _repair_member
 from synapse.rest import admin
 from synapse.rest.client import login, room
 from synapse.server import HomeServer
@@ -46,6 +46,11 @@ class RepairMemberTestCase(unittest.HomeserverTestCase):
             )
         )[self.key]
         self.assertNotEqual(self.join_id, self.leave_id)
+
+        # The correct full state at the tip, captured before we rewind.
+        self.correct_state = self.get_success(
+            self.controllers.state.get_current_state_ids(self.room_id)
+        )
 
     def _current(self) -> str | None:
         return self.get_success(
@@ -113,3 +118,73 @@ class RepairMemberTestCase(unittest.HomeserverTestCase):
         # join must be refused.
         report = self._repair(self.join_id, publish=False)
         self.assertIn("does not supersede", report["refused"])
+
+    def _import(self, publish: bool, max_diff: int = 500) -> dict:
+        federation = self.hs.get_federation_client()
+
+        async def fake_state_ids(
+            destination: str, room_id: str, event_id: str
+        ) -> tuple[list[str], list[str]]:
+            self.assertEqual(destination, "remote.example")
+            self.assertEqual(room_id, self.room_id)
+            return list(self.correct_state.values()), []
+
+        self.patch(federation, "get_room_state_ids", fake_state_ids)
+        return self.get_success(
+            _import_state(
+                self.hs,
+                self.room_id,
+                "remote.example",
+                None,
+                max_diff,
+                publish,
+            )
+        )
+
+    def test_import_dry_run_reports_key_diff(self) -> None:
+        self._rewind_to_join()
+        report = self._import(publish=False)
+
+        self.assertIsNone(report["refused"], report)
+        self.assertEqual(report["counts"]["only_remote"], 1)
+        self.assertEqual(report["counts"]["only_local"], 1)
+        self.assertFalse(report["published"])
+        self.assertEqual(self._current(), self.join_id)
+
+        actions = {
+            (change["type"], change["state_key"]): change["action"]
+            for change in report["changes"]
+        }
+        self.assertEqual(actions[self.key], "replace")
+        self.assertEqual(len(report["plan"]), 1)
+        self.assertEqual(
+            report["plan"][0]["changes"],
+            [
+                {
+                    "type": self.key[0],
+                    "state_key": self.key[1],
+                    "from": self.join_id,
+                    "to": self.leave_id,
+                }
+            ],
+        )
+
+    def test_import_publish_replaces_and_sticks(self) -> None:
+        self._rewind_to_join()
+        report = self._import(publish=True)
+
+        self.assertIsNone(report["refused"], report)
+        self.assertTrue(report["published"])
+        self.assertEqual(self._current(), self.leave_id)
+
+        self.helper.send(self.room_id, "after import", tok=self.alice_tok)
+        self.assertEqual(self._current(), self.leave_id)
+
+        # Idempotent: the local and remote state now agree.
+        again = self._import(publish=True)
+        self.assertEqual(again["changes"], [])
+
+    def test_import_refuses_large_diff(self) -> None:
+        self._rewind_to_join()
+        report = self._import(publish=False, max_diff=0)
+        self.assertIn("exceeds --max-diff", report["refused"])

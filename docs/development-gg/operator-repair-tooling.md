@@ -23,6 +23,10 @@ The following are available today:
   signature-checked `m.room.member` event through the normal federation path and
   repoints that state key without a leave/rejoin. It is dry-run by default and
   only writes with `--publish --homeserver-is-stopped`.
+- `repair-state import` compares local state with a remote server's
+  `/_matrix/federation/v1/state_ids` at the room's forward extremity, reports
+  every differing key, and (when published) imports the missing or newer events
+  and applies those keys. Local-only keys are preserved.
 - The Synapse manhole provides an SSH/TCP Python shell for low-level
   introspection. It is not a Unix-socket admin command console and should not be
   treated as a repeatable repair interface.
@@ -37,8 +41,10 @@ Sithnapse does not currently provide supported commands for:
 
 - comparing a room's state with one or more remote servers;
 - force-setting arbitrary room state from local or remote input (the narrow
-  `repair-member` command covers only one member event);
-- rebuilding room state by replaying the persisted DAG;
+  `repair-member` and `repair-state import` commands apply only verified events
+  at the current tip and preserve local-only keys);
+- sweeping historical per-event state groups, or rebuilding room state by
+  replaying the persisted DAG;
 - reordering or reindexing a room timeline topologically;
 - bulk backfill/export of a room DAG;
 - importing JSONL PDU/DAG files or outlier exports;

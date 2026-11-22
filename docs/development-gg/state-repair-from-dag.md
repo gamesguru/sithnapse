@@ -198,3 +198,38 @@ event is rejected or not a member event of that room, or when the current value
 for the key is not one of the replacement event's `auth_events` (i.e. the
 replacement does not supersede it). `--publish` requires
 `--homeserver-is-stopped`.
+
+## Importing a state diff: `repair-state import`
+
+`repair-member` fixes one known event. To find out *which* keys were dropped,
+`repair-state import` compares local state with a remote server's state at the
+room's single forward extremity:
+
+```
+synapse_state_repair --config homeserver.yaml repair-state import \
+    --room '!room:id' --via unredacted.org                    # dry run
+synapse_state_repair --config homeserver.yaml --publish --homeserver-is-stopped \
+    repair-state import --room '!room:id' --via unredacted.org
+```
+
+It fetches `/_matrix/federation/v1/state_ids` at the extremity, diffs by event
+ID, and fetches only the symmetric difference. Remote events already held
+locally are reused; the rest go through `get_pdu`, so signatures and hashes are
+checked against the keyring. The report lists every differing key with the local
+and remote event, the action (`import`, `replace`, or `keep-local`), and the
+state-group rewrite plan.
+
+Publishing imports the missing/differing events through the normal outlier
+auth path and applies them to the forward extremities with the same state-group
+rewrite as `repair-member`. Keys that exist only locally are reported but never
+removed, so local-only memberships survive. It refuses partial-state and MSC4242
+rooms, a multi-extremity room without `--at-event`, a remote that does not
+include the comparison event in its answer, and a diff larger than
+`--max-diff`.
+
+This is the first half of the range-repair story. The second half, a
+`repair-state sweep`, would walk the local DAG in topological order and rewrite
+only the per-event state groups whose stored state differs from the recomputed
+state. That is not implemented: import fixes the tip and future events, while
+historical `state-at-event` values for events already in the DAG keep their old
+groups until a sweep exists.
