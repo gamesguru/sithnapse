@@ -582,19 +582,31 @@ def _event_stream_ordering_txn(txn: LoggingTransaction, event_id: str) -> int | 
 def _room_events_from_txn(
     txn: LoggingTransaction,
     room_id: str,
-    stream_ordering: int,
+    seed_stream_ordering: int,
+    after: tuple[int, str] | None,
     limit: int,
 ) -> list[tuple[str, int]]:
-    """Return the non-outlier events persisted at or after `stream_ordering`."""
+    """Return later live events and all backfilled room events in batches."""
+    where_after = ""
+    args: list[Any] = [room_id, seed_stream_ordering]
+    if after is not None:
+        stream_ordering, event_id = after
+        where_after = (
+            "AND (stream_ordering > ? OR (stream_ordering = ? AND event_id > ?))"
+        )
+        args.extend((stream_ordering, stream_ordering, event_id))
+    args.append(limit)
     txn.execute(
-        """
+        f"""
         SELECT event_id, stream_ordering
         FROM events
-        WHERE room_id = ? AND NOT outlier AND stream_ordering >= ?
+        WHERE room_id = ? AND NOT outlier
+          AND (stream_ordering < 0 OR stream_ordering >= ?)
+          {where_after}
         ORDER BY stream_ordering, event_id
         LIMIT ?
         """,
-        (room_id, stream_ordering, limit + 1),
+        args,
     )
     return [(row[0], int(row[1])) for row in txn.fetchall()]
 
@@ -689,7 +701,9 @@ async def _plan_propagation(
     store = hs.get_datastores().main
     controllers = hs.get_storage_controllers()
 
-    descendant_groups = await store.db_pool.runInteraction(
+    # `state_group_edges` is a state-database table: with a separate state
+    # database the main pool cannot see it.
+    descendant_groups = await hs.get_datastores().state.db_pool.runInteraction(
         "synapse_state_repair_descendant_groups",
         _descendant_state_groups_txn,
         seed_group,
@@ -703,39 +717,48 @@ async def _plan_propagation(
     if seed_stream_ordering is None:
         raise _PropagationError(f"{seed_event.event_id} has no local stream ordering")
 
-    rows = await store.db_pool.runInteraction(
-        "synapse_state_repair_room_events",
-        _room_events_from_txn,
-        room_id,
-        seed_stream_ordering,
-        max_events,
-    )
-    if len(rows) > max_events:
-        raise _PropagationError(
-            "more than --max-events (%d) local events follow the seed; raise the "
-            "limit or seed at a later event" % max_events
-        )
-
-    event_ids = [event_id for event_id, _ in rows]
-    group_by_event: dict[str, int] = {}
-    for start in range(0, len(event_ids), 1000):
-        group_by_event.update(
-            await store._get_state_group_for_events(
-                event_ids[start : start + 1000], raise_on_missing=False
-            )
-        )
-
     events_by_group: dict[int, list[str]] = {}
     not_descendant = 0
     without_group = 0
-    for event_id in event_ids:
-        group = group_by_event.get(event_id)
-        if group is None:
-            without_group += 1
-        elif group not in descendant_groups:
-            not_descendant += 1
-        else:
-            events_by_group.setdefault(group, []).append(event_id)
+    affected_event_count = 0
+    after: tuple[int, str] | None = None
+    batch_size = 1000
+    while True:
+        rows = await store.db_pool.runInteraction(
+            "synapse_state_repair_room_events",
+            _room_events_from_txn,
+            room_id,
+            seed_stream_ordering,
+            after,
+            batch_size,
+        )
+        if not rows:
+            break
+
+        event_ids = [event_id for event_id, _ in rows]
+        group_by_event = await store._get_state_group_for_events(
+            event_ids, raise_on_missing=False
+        )
+        for event_id, stream_ordering in rows:
+            group = group_by_event.get(event_id)
+            if group is not None and group in descendant_groups:
+                affected_event_count += 1
+                if affected_event_count > max_events:
+                    raise _PropagationError(
+                        "more than --max-events (%d) affected local events; raise "
+                        "the limit or seed at a later event" % max_events
+                    )
+                events_by_group.setdefault(group, []).append(event_id)
+            elif stream_ordering >= seed_stream_ordering:
+                if group is None:
+                    without_group += 1
+                else:
+                    not_descendant += 1
+
+        last_event_id, last_stream_ordering = rows[-1]
+        after = (last_stream_ordering, last_event_id)
+        if len(rows) < batch_size:
+            break
 
     keys = list(deltas)
     plan: list[dict[str, Any]] = []

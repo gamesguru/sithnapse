@@ -17,6 +17,7 @@ from synapse.types.state import StateFilter
 from synapse.util.clock import Clock
 
 from tests import unittest
+from tests.test_utils.event_injection import create_event
 
 
 class RepairMemberTestCase(unittest.HomeserverTestCase):
@@ -415,6 +416,39 @@ class RepairMemberTestCase(unittest.HomeserverTestCase):
         # Idempotent: local and remote state now agree at the seed.
         again = self._import_at(seed, remote_state, publish=True, propagate=True)
         self.assertEqual(again["changes"], [])
+
+    def test_propagate_includes_backfilled_descendant_events(self) -> None:
+        seed, remote_state = self._bug_scenario()
+        event, context = self.get_success(
+            create_event(
+                self.hs,
+                room_id=self.room_id,
+                sender=self.alice,
+                type="m.room.message",
+                content={"msgtype": "m.text", "body": "backfilled child"},
+                prev_event_ids=[seed],
+            )
+        )
+        persistence = self.controllers.persistence
+        assert persistence is not None
+        self.get_success(persistence.persist_event(event, context, backfilled=True))
+        stream_ordering = self.get_success(
+            self.store.db_pool.simple_select_one_onecol(
+                "events", {"event_id": event.event_id}, "stream_ordering"
+            )
+        )
+        self.assertLess(stream_ordering, 0)
+
+        report = self._import_at(seed, remote_state, publish=False, propagate=True)
+
+        self.assertIsNone(report["refused"], report)
+        self.assertTrue(
+            any(
+                event.event_id in step["events"]
+                for step in report["propagation"]["groups"]
+            ),
+            report,
+        )
 
     def test_empty_propagation_diff_preserves_later_extremity_state(self) -> None:
         seed, remote_state = self._bug_scenario()
