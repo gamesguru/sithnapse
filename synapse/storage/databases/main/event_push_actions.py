@@ -1655,12 +1655,25 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
         Returns whether the archiving process has caught up or not.
         """
 
-        # The (inclusive) event stream ordering that was previously summarised.
-        old_rotate_stream_ordering = self.db_pool.simple_select_one_onecol_txn(
-            txn,
-            table="event_push_summary_stream_ordering",
-            keyvalues={},
-            retcol="stream_ordering",
+        # Lock the rotation position before touching any summary rows. Purge
+        # takes the same lock first, so the two operations serialize in a
+        # consistent order and cannot deadlock on the summary rows.
+        if isinstance(self.database_engine, PostgresEngine):
+            txn.execute(
+                "SELECT stream_ordering FROM event_push_summary_stream_ordering"
+                " FOR UPDATE"
+            )
+        else:
+            txn.execute(
+                "UPDATE event_push_summary_stream_ordering"
+                " SET stream_ordering = stream_ordering"
+            )
+            txn.execute(
+                "SELECT stream_ordering FROM event_push_summary_stream_ordering"
+            )
+        rotation_row = txn.fetchone()
+        old_rotate_stream_ordering = (
+            int(rotation_row[0]) if rotation_row is not None else 0
         )
 
         # We don't to try and rotate millions of rows at once, so we cap the
