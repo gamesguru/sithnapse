@@ -40,6 +40,32 @@ class ReadOnlyPrepareDatabaseTests(HomeserverTestCase):
         cur.execute("DELETE FROM applied_schema_deltas WHERE file = ?", (_DELTA,))
         self.db_conn.commit()
 
+    def _restore_delta(self) -> None:
+        version = int(_DELTA.split("/", 1)[0])
+        cur = self.db_conn.cursor()
+        cur.execute(
+            "INSERT INTO applied_schema_deltas (version, file)"
+            " SELECT ?, ? WHERE NOT EXISTS ("
+            "  SELECT 1 FROM applied_schema_deltas WHERE file = ?"
+            ")",
+            (version, _DELTA, _DELTA),
+        )
+        self.db_conn.commit()
+
+    def _remove_background_update(self, update_name: str) -> None:
+        cur = self.db_conn.cursor()
+        cur.execute(
+            "DELETE FROM background_updates WHERE update_name = ?", (update_name,)
+        )
+        self.db_conn.commit()
+
+    def _remove_module_schema(self, module_name: str) -> None:
+        cur = self.db_conn.cursor()
+        cur.execute(
+            "DELETE FROM applied_module_schemas WHERE module_name = ?", (module_name,)
+        )
+        self.db_conn.commit()
+
     def _delta_applied(self) -> bool:
         cur = self.db_conn.cursor()
         cur.execute("SELECT 1 FROM applied_schema_deltas WHERE file = ?", (_DELTA,))
@@ -59,6 +85,7 @@ class ReadOnlyPrepareDatabaseTests(HomeserverTestCase):
             ("state_hamt_embedded_migration", "{}"),
         )
         self.db_conn.commit()
+        self.addCleanup(self._remove_background_update, "state_hamt_embedded_migration")
 
         with self.assertRaisesRegex(
             RuntimeError, "embedded state migration is incomplete"
@@ -69,6 +96,7 @@ class ReadOnlyPrepareDatabaseTests(HomeserverTestCase):
 
     def test_pending_delta_is_refused_not_applied(self) -> None:
         self._forget_delta()
+        self.addCleanup(self._restore_delta)
         self.assertFalse(self._delta_applied())
 
         with self.assertRaises(PrepareDatabaseException):
@@ -88,6 +116,7 @@ class ReadOnlyPrepareDatabaseTests(HomeserverTestCase):
             ("state_hamt_embedded_migration", "{}"),
         )
         self.db_conn.commit()
+        self.addCleanup(self._remove_background_update, "state_hamt_embedded_migration")
 
         with self.assertRaisesRegex(
             RuntimeError, "embedded state migration is incomplete"
@@ -125,6 +154,7 @@ class ReadOnlyPrepareDatabaseTests(HomeserverTestCase):
             "INSERT INTO applied_module_schemas (module_name, file) VALUES (?, ?)",
             ("tests.module", "old_schema.sql"),
         )
+        self.addCleanup(self._remove_module_schema, "tests.module")
         _apply_module_schema_files(
             cur,
             self.db_pool.engine,
@@ -145,3 +175,18 @@ class ReadOnlyPrepareDatabaseTests(HomeserverTestCase):
             check_retired_migrations_before_upgrade(conn.cursor(), self.db_pool.engine)
         finally:
             conn.close()
+
+    def test_read_only_leaves_schema_compat_version_untouched(self) -> None:
+        cur = self.db_conn.cursor()
+        cur.execute("DELETE FROM schema_compat_version")
+        cur.execute("INSERT INTO schema_compat_version(compat_version) VALUES (1)")
+        self.db_conn.commit()
+
+        prepare_database(
+            self.db_conn, self.db_pool.engine, self.hs.config, read_only=True
+        )
+
+        cur = self.db_conn.cursor()
+        cur.execute("SELECT compat_version FROM schema_compat_version")
+        self.assertEqual(cur.fetchall(), [(1,)])
+        self.db_conn.commit()

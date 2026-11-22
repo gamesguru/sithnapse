@@ -444,7 +444,7 @@ def _upgrade_existing_database(
 
     # update schema_compat_version before we run any upgrades, so that if synapse
     # gets downgraded again, it won't try to run against the upgraded database.
-    if (
+    if not read_only and (
         current_schema_state.compat_version is None
         or current_schema_state.compat_version < SCHEMA_COMPAT_VERSION
     ):
