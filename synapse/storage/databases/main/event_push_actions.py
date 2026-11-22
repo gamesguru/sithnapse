@@ -1514,13 +1514,13 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
             retcol="stream_id",
         )
 
-        # Re-read the upper bound too. The one from the unlocked check above
-        # may be older than a checkpoint that another processor advanced while
-        # we waited for the lock; writing it back would move the checkpoint
-        # backwards and reprocess (double-apply) those receipts.
-        max_receipts_stream_id = max(
-            self._receipts_id_gen.get_current_token(), min_receipts_stream_id
-        )
+        # Reuse the upper bound sampled before our first SQL read; do not ask
+        # the id generator again now that the snapshot has begun. A fresher
+        # token could name receipts this snapshot cannot see, and the
+        # checkpoint written below would then skip them for good. Clamp it to
+        # the checkpoint so a processor that advanced it while we waited for
+        # the lock cannot be moved backwards (reprocessing its receipts).
+        max_receipts_stream_id = max(max_receipts_stream_id, min_receipts_stream_id)
 
         sql = """
             SELECT r.stream_id, r.room_id, r.user_id, r.thread_id, r.event_stream_ordering
