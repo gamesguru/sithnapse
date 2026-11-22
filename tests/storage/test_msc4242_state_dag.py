@@ -26,14 +26,10 @@ from synapse.rest.client import room
 from synapse.server import HomeServer
 from synapse.util.clock import Clock
 
-from tests.unittest import (
-    HomeserverTestCase,
-    KnownRoomVersionsCleanupMixin,
-    override_config,
-)
+from tests.unittest import HomeserverTestCase, override_config
 
 
-class MSC4242StateDagsTests(KnownRoomVersionsCleanupMixin, HomeserverTestCase):
+class MSC4242StateDagsTests(HomeserverTestCase):
     user_id = "@user1:server"
     servlets = [room.register_servlets]
 
@@ -117,9 +113,7 @@ class MSC4242StateDagsTests(KnownRoomVersionsCleanupMixin, HomeserverTestCase):
         )
 
 
-class MSC4242EventPersistenceStateDagsStoreTestCase(
-    KnownRoomVersionsCleanupMixin, HomeserverTestCase
-):
+class MSC4242EventPersistenceStateDagsStoreTestCase(HomeserverTestCase):
     servlets = [
         room.register_servlets,
     ]

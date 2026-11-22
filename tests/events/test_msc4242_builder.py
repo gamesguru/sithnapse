@@ -27,7 +27,6 @@ lexicographic truncation: `test_late_sorting_extremity_is_eventually_cited` is t
 requirement, and is expected to fail until a fair selection policy exists.
 """
 
-import unittest
 from unittest.mock import AsyncMock, patch
 
 from twisted.test.proto_helpers import MemoryReactor
@@ -38,16 +37,10 @@ from synapse.rest.client import room
 from synapse.server import HomeServer
 from synapse.util.clock import Clock
 
-from tests.unittest import (
-    HomeserverTestCase,
-    KnownRoomVersionsCleanupMixin,
-    override_config,
-)
+from tests.unittest import HomeserverTestCase, override_config
 
 
-class MSC4242BuilderPrevStateEventsTestCase(
-    KnownRoomVersionsCleanupMixin, HomeserverTestCase
-):
+class MSC4242BuilderPrevStateEventsTestCase(HomeserverTestCase):
     user_id = "@user1:server"
     servlets = [room.register_servlets]
 
@@ -121,10 +114,6 @@ class MSC4242BuilderPrevStateEventsTestCase(
         self.assertNotIn(extremities[-1], cited)
         self.assertEqual(sorted(cited), extremities[: StateDag.MAX_PREV_STATE_EVENTS])
 
-    @unittest.skip(
-        "expected failure: lexicographic truncation starves late-sorting "
-        "extremities until a fair selection policy exists"
-    )
     @override_config({"experimental_features": {"msc4242_enabled": True}})
     def test_late_sorting_extremity_is_eventually_cited(self) -> None:
         """The requirement. Expected to FAIL until a fair selection policy exists.
@@ -162,3 +151,9 @@ class MSC4242BuilderPrevStateEventsTestCase(
             f"{StateDag.MAX_PREV_STATE_EVENTS} state DAG extremities: it is starved "
             "and stays concurrent with every later event"
         )
+
+    # Trial's todo marker records this known failure as an expected failure,
+    # while the cap and truncation tests above remain ordinary passing tests.
+    test_late_sorting_extremity_is_eventually_cited.__dict__["todo"] = (
+        "A fair prev_state_events selection policy has not been implemented"
+    )

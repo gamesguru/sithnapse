@@ -1718,9 +1718,7 @@ class IsStateDagConnectedTests(unittest.TestCase):
         self.assertFalse(is_state_dag_connected([create, third]))
 
 
-class BackfilledStateDagEventTests(
-    unittest.KnownRoomVersionsCleanupMixin, unittest.FederatingHomeserverTestCase
-):
+class BackfilledStateDagEventTests(unittest.FederatingHomeserverTestCase):
     servlets = [
         admin.register_servlets,
         login.register_servlets,

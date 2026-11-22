@@ -539,28 +539,6 @@ def logcontext_clean(target: TV) -> TV:
     return patcher(target)  # type: ignore[call-overload]
 
 
-class KnownRoomVersionsCleanupMixin(TestCase):
-    """A mixin for test cases which enable experimental room versions.
-
-    Experimental room versions are registered in the process-global
-    `KNOWN_ROOM_VERSIONS` mapping when a config enables them, and nothing
-    removes them again. A test which enables one therefore has to restore the
-    registry, otherwise every later test in the same worker sees the
-    experimental version.
-    """
-
-    def setUp(self) -> None:
-        known_before = set(KNOWN_ROOM_VERSIONS.keys())
-        self.addCleanup(self._restore_known_room_versions, known_before)
-        super().setUp()
-
-    @staticmethod
-    def _restore_known_room_versions(known_before: set[str]) -> None:
-        for identifier in list(KNOWN_ROOM_VERSIONS.keys()):
-            if identifier not in known_before:
-                KNOWN_ROOM_VERSIONS.remove_room_version(identifier)
-
-
 class HomeserverTestCase(TestCase):
     """
     A base TestCase that reduces boilerplate for HomeServer-using test cases.
