@@ -406,6 +406,17 @@ pub struct KnownRoomVersionsMapping {
 
 #[pymethods]
 impl KnownRoomVersionsMapping {
+    /// Remove a room version from the mapping, if present. Intended for tests
+    /// which enable experimental room versions and need to restore the registry.
+    fn remove_room_version(&self, identifier: &str) -> PyResult<()> {
+        let mut versions = self
+            .versions
+            .write()
+            .map_err(|_| PyRuntimeError::new_err("KnownRoomVersionsMapping lock poisoned"))?;
+        versions.retain(|v| v.identifier != identifier);
+        Ok(())
+    }
+
     /// Add a new room version to the mapping, indicating that this instance
     /// supports it.
     fn add_room_version(&self, version: Bound<'_, RoomVersion>) -> PyResult<()> {

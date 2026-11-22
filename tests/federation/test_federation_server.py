@@ -558,7 +558,9 @@ def _create_acl_event(content: JsonDict) -> EventBase:
     )
 
 
-class GetMissingEventsStateDagTests(unittest.FederatingHomeserverTestCase):
+class GetMissingEventsStateDagTests(
+    unittest.KnownRoomVersionsCleanupMixin, unittest.FederatingHomeserverTestCase
+):
     """
     Tests for walking the MSC4242 state DAG via /get_missing_events.
 
@@ -1302,7 +1304,9 @@ class EventAuthFederationTests(unittest.FederatingHomeserverTestCase):
         )
 
 
-class SendJoinFederationTests(unittest.FederatingHomeserverTestCase):
+class SendJoinFederationTests(
+    unittest.KnownRoomVersionsCleanupMixin, unittest.FederatingHomeserverTestCase
+):
     servlets = [
         admin.register_servlets,
         room.register_servlets,

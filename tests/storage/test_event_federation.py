@@ -199,7 +199,9 @@ class _BackfillSetupInfo:
     depth_map: dict[str, int]
 
 
-class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
+class EventFederationWorkerStoreTestCase(
+    tests.unittest.KnownRoomVersionsCleanupMixin, tests.unittest.HomeserverTestCase
+):
     servlets = [
         admin.register_servlets,
         room.register_servlets,
@@ -1348,7 +1350,7 @@ class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
 
 
 class EventFederationGetMissingEventsStateDAGTestCase(
-    tests.unittest.HomeserverTestCase
+    tests.unittest.KnownRoomVersionsCleanupMixin, tests.unittest.HomeserverTestCase
 ):
     servlets = [
         admin.register_servlets,
