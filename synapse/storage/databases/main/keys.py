@@ -57,8 +57,14 @@ db_binary_type = memoryview
 MAX_RETIRED_SERVER_KEYS = 3000
 
 
-class KeyStore(CacheInvalidationWorkerStore):
-    """Persistence for signature verification keys"""
+class KeyBackgroundUpdateStore(CacheInvalidationWorkerStore):
+    """Background updates for the key stores.
+
+    This is a separate class from `KeyStore` so that tools which build a
+    reduced store (notably `synapse_port_db`) can register the handlers for
+    the updates queued by schema deltas without pulling in the whole key
+    store.
+    """
 
     def __init__(
         self,
@@ -79,6 +85,10 @@ class KeyStore(CacheInvalidationWorkerStore):
             columns=["response_id"],
             where_clause="response_id IS NOT NULL",
         )
+
+
+class KeyStore(KeyBackgroundUpdateStore):
+    """Persistence for signature verification keys"""
 
     async def store_server_keys_response(
         self,

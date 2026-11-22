@@ -69,6 +69,7 @@ from synapse.storage.databases.main.event_push_actions import EventPushActionsSt
 from synapse.storage.databases.main.events_bg_updates import (
     EventsBackgroundUpdatesStore,
 )
+from synapse.storage.databases.main.keys import KeyBackgroundUpdateStore
 from synapse.storage.databases.main.media_repository import (
     MediaRepositoryBackgroundUpdateStore,
 )
@@ -298,6 +299,7 @@ class Store(
     UserDirectoryBackgroundUpdateStore,
     EndToEndKeyBackgroundStore,
     EndToEndRoomKeyBackgroundStore,
+    KeyBackgroundUpdateStore,
     StatsStore,
     AccountDataWorkerStore,
     FilteringWorkerStore,
