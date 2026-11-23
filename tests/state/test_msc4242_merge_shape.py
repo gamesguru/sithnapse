@@ -241,7 +241,14 @@ class MSC4242MergeShapeTestCase(unittest.FederatingHomeserverTestCase):
         pl_a = None
         for nonce in range(1000):
             candidate = self._remote(
-                room_id, rv, "m.room.power_levels", "", ADMIN, [t0], 12, depth,
+                room_id,
+                rv,
+                "m.room.power_levels",
+                "",
+                ADMIN,
+                [t0],
+                12,
+                depth,
                 {
                     "users": {ADMIN: 100, DAVE: 50},
                     "events": PL_EVENTS,
@@ -257,12 +264,23 @@ class MSC4242MergeShapeTestCase(unittest.FederatingHomeserverTestCase):
         assert pl_a is not None
 
         def grind_below(
-            kind: str, state_key: str, sender: str, parents: list[str], ts: int,
+            kind: str,
+            state_key: str,
+            sender: str,
+            parents: list[str],
+            ts: int,
             base_content: JsonDict,
         ) -> EventBase:
             for nonce in range(1000):
                 candidate = self._remote(
-                    room_id, rv, kind, state_key, sender, parents, ts, depth,
+                    room_id,
+                    rv,
+                    kind,
+                    state_key,
+                    sender,
+                    parents,
+                    ts,
+                    depth,
                     {**base_content, "nonce": nonce},
                 )
                 if candidate.event_id < pl_a.event_id:
@@ -271,7 +289,14 @@ class MSC4242MergeShapeTestCase(unittest.FederatingHomeserverTestCase):
 
         x = grind_below("m.room.topic", "", DAVE, [t0], 10, {"topic": "X"})
         pl_b = self._remote(
-            room_id, rv, "m.room.power_levels", "", BOB, [t0], 15, depth,
+            room_id,
+            rv,
+            "m.room.power_levels",
+            "",
+            BOB,
+            [t0],
+            15,
+            depth,
             {
                 "users": {ADMIN: 100, BOB: 90, DAVE: 50, CAROL: 50},
                 "events": PL_EVENTS,
@@ -282,7 +307,11 @@ class MSC4242MergeShapeTestCase(unittest.FederatingHomeserverTestCase):
         y = grind_below("m.room.topic", "", CAROL, [pl_b.event_id], 20, {"topic": "Y"})
         fillers = [
             grind_below(
-                "org.example.filler", f"filler-{i}", ADMIN, [t0], 40 + i,
+                "org.example.filler",
+                f"filler-{i}",
+                ADMIN,
+                [t0],
+                40 + i,
                 {"n": i},
             )
             for i in range(18)
@@ -290,10 +319,16 @@ class MSC4242MergeShapeTestCase(unittest.FederatingHomeserverTestCase):
         heads = [x, y, pl_a, *fillers]
         self.assertEqual(len(heads), 21)
         self.get_success(
-            handler._process_pulled_events(OTHER, [x, pl_b, y, pl_a, *fillers], backfilled=True)
+            handler._process_pulled_events(
+                OTHER, [x, pl_b, y, pl_a, *fillers], backfilled=True
+            )
         )
-        self.assertEqual(len(self.get_success(store.get_state_dag_extremities(room_id))), 21)
-        self.assertEqual(self._topic(room_id), "X", "the full 21-head frontier should resolve to X")
+        self.assertEqual(
+            len(self.get_success(store.get_state_dag_extremities(room_id))), 21
+        )
+        self.assertEqual(
+            self._topic(room_id), "X", "the full 21-head frontier should resolve to X"
+        )
 
         # This goes through EventBuilder.build, which selects the sorted lowest
         # 20 extremities. Its signed event therefore omits the late PL_A head.
