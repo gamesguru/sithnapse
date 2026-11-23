@@ -1,0 +1,1 @@
+Retain several authenticated public-key bodies per server and key ID, so events signed before a key ID was reused for a different body can still be verified. The existing binding stays preferred; alternate bodies are bounded and evicted oldest-first.

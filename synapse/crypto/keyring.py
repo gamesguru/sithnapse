@@ -20,6 +20,7 @@
 #
 
 import abc
+import hashlib
 import logging
 import time
 from contextlib import ExitStack
@@ -53,7 +54,7 @@ from synapse.logging.context import (
     make_deferred_yieldable,
     run_in_background,
 )
-from synapse.storage.keys import FetchKeyResult
+from synapse.storage.keys import FetchKeyResult, merge_fetch_key_results
 from synapse.synapse_rust.events import redact_event
 from synapse.types import JsonDict
 from synapse.util import unwrapFirstError
@@ -117,12 +118,20 @@ class VerifyJsonRequest:
             be valid. (0 implies we don't care)
 
         key_ids: The set of key_ids to that could be used to verify the JSON object
+
+        event_id: The event being verified, when this request is for an event.
+            Only used for diagnostics.
+
+        room_id: The room of the event being verified, when known. Only used for
+            diagnostics.
     """
 
     server_name: str
     get_json_object: Callable[[], JsonDict]
     minimum_valid_until_ts: int
     key_ids: list[str]
+    event_id: str | None = None
+    room_id: str | None = None
 
     @staticmethod
     def from_json_object(
@@ -168,6 +177,8 @@ class VerifyJsonRequest:
             lambda: redact_event(event).get_pdu_json(),
             minimum_valid_until_ms,
             key_ids=key_ids,
+            event_id=event.event_id,
+            room_id=event.room_id,
         )
 
 
@@ -551,37 +562,65 @@ class Keyring:
             # from other servers, so we pull out only the ones we care about.
             found_keys.update(found_keys_by_server.get(verify_request.server_name, {}))
 
-        # Verify each signature we got valid keys for, raising if we can't
-        # verify any of them.
+        # Try every authenticated body we have for each ID. Some servers
+        # reused a key ID for a different body, and older events still carry
+        # signatures made by the earlier key.
         verified = False
+        last_signature_error: SynapseError | None = None
+        banned_key_error: SynapseError | None = None
         for key_id in verify_request.key_ids:
             key_result = found_keys.get(key_id)
             if not key_result:
                 continue
+            for verify_key, valid_until_ts in key_result.candidates():
+                if valid_until_ts < verify_request.minimum_valid_until_ts:
+                    continue
 
-            if key_result.valid_until_ts < verify_request.minimum_valid_until_ts:
-                continue
-
-            key = encode_verify_key_base64(key_result.verify_key)
-            if key in BANNED_SERVER_SIGNING_KEYS:
-                raise SynapseError(
-                    HTTPStatus.UNAUTHORIZED,
-                    "Server signing key %s:%s for server %s has been banned by this server"
-                    % (
-                        key_result.verify_key.alg,
-                        key_result.verify_key.version,
+                if verify_key.encode() != key_result.verify_key.encode():
+                    logger.warning(
+                        "MSC4499: verifying %s in %s from %s with a retained "
+                        "alternate key body for %s (sha256 %s)",
+                        verify_request.event_id or "a signed object",
+                        verify_request.room_id or "an unknown room",
                         verify_request.server_name,
-                    ),
-                    Codes.UNAUTHORIZED,
-                )
+                        key_id,
+                        hashlib.sha256(verify_key.encode()).hexdigest(),
+                    )
 
-            await self.process_json(key_result.verify_key, verify_request)
-            verified = True
+                key = encode_verify_key_base64(verify_key)
+                if key in BANNED_SERVER_SIGNING_KEYS:
+                    banned_key_error = SynapseError(
+                        HTTPStatus.UNAUTHORIZED,
+                        "Server signing key %s:%s for server %s has been banned by this server"
+                        % (
+                            verify_key.alg,
+                            verify_key.version,
+                            verify_request.server_name,
+                        ),
+                        Codes.UNAUTHORIZED,
+                    )
+                    continue
+
+                try:
+                    await self.process_json(verify_key, verify_request)
+                except SynapseError as e:
+                    last_signature_error = e
+                    continue
+                verified = True
+                break
+
+            if verified:
+                break
 
         if not verified:
+            if last_signature_error is not None:
+                raise last_signature_error
+            if banned_key_error is not None:
+                raise banned_key_error
             raise SynapseError(
                 401,
-                f"Failed to find any key to satisfy: {key_request}",
+                "Failed to find any key to satisfy signature from %s"
+                % verify_request.server_name,
                 Codes.UNAUTHORIZED,
             )
 
@@ -668,8 +707,11 @@ class Keyring:
             to_return_by_server = to_return.setdefault(request.server_name, {})
             for key_id, key_result in results.items():
                 existing = to_return_by_server.get(key_id)
-                if not existing or existing.valid_until_ts < key_result.valid_until_ts:
-                    to_return_by_server[key_id] = key_result
+                to_return_by_server[key_id] = (
+                    merge_fetch_key_results(existing, key_result)
+                    if existing is not None
+                    else key_result
+                )
 
         return to_return
 
@@ -717,8 +759,8 @@ class Keyring:
                 # If we already have a result for the given key ID, we keep the
                 # one with the highest `valid_until_ts`.
                 existing_key = found_keys.get(key_id)
-                if existing_key and existing_key.valid_until_ts > key.valid_until_ts:
-                    continue
+                if existing_key is not None:
+                    key = merge_fetch_key_results(existing_key, key)
 
                 # Check if this key's expiry timestamp is valid for the verify request.
                 if key.valid_until_ts >= verify_request.minimum_valid_until_ts:
@@ -1090,19 +1132,17 @@ class PerspectivesKeyFetcher(BaseV2KeyFetcher):
                     existing = merged.get(key_id)
                     if existing is None:
                         merged[key_id] = key
-                    elif key.valid_until_ts > existing.valid_until_ts:
-                        # Notaries can disagree on a key's validity window.
-                        # Keep the most lenient (furthest-future) answer so a
-                        # stale or short view from one notary cannot mask a
-                        # still-valid one from another in the same fan-out.
+                    else:
+                        # Notaries may return different bodies for a reused
+                        # ID. Preserve each body and its validity window.
                         logger.debug(
-                            "Notary key for %s %s: preferring valid_until %d over %d",
+                            "Merging notary key candidates for %s %s: %d vs %d",
                             server_name,
                             key_id,
-                            key.valid_until_ts,
                             existing.valid_until_ts,
+                            key.valid_until_ts,
                         )
-                        merged[key_id] = key
+                        merged[key_id] = merge_fetch_key_results(existing, key)
 
         fanout_elapsed = time.perf_counter() - fanout_started
         if notary_elapsed:
@@ -1279,15 +1319,10 @@ class PerspectivesKeyFetcher(BaseV2KeyFetcher):
                         key,
                     )
 
-                    if already_present_key.valid_until_ts > key.valid_until_ts:
-                        # Favour the entry with the largest valid_until_ts,
-                        # as `old_verify_keys` are also collected from this
-                        # response.
-                        continue
+                    key = merge_fetch_key_results(already_present_key, key)
 
                 added_keys[dict_key] = key
-
-            keys.setdefault(server_name, {}).update(processed_response)
+                keys.setdefault(server_name, {})[key_id] = key
 
         return keys
 

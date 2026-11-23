@@ -353,6 +353,42 @@ class KeyringTestCase(unittest.HomeserverTestCase):
         d = kr.verify_json_for_server(self.hs.hostname, json1, 0)
         self.get_success(d)
 
+    def test_retained_alternate_body_verifies_and_warns(self) -> None:
+        """A body retained under a reused key ID verifies historical signatures,
+        and the use is logged at warning level."""
+        primary = signedjson.key.generate_signing_key("reuse")
+        alternate = signedjson.key.generate_signing_key("reuse")
+        primary_verify = get_verify_key(primary)
+        alternate_verify = get_verify_key(alternate)
+        self.assertNotEqual(primary_verify.encode(), alternate_verify.encode())
+        key_id = get_key_id(primary)
+
+        async def get_keys(
+            server_name: str, key_ids: list[str], minimum_valid_until_ts: int
+        ) -> dict[str, FetchKeyResult]:
+            return {
+                key_id: FetchKeyResult(
+                    primary_verify,
+                    1200,
+                    ((alternate_verify, 1200),),
+                )
+            }
+
+        mock_fetcher = Mock()
+        mock_fetcher.get_keys = Mock(side_effect=get_keys)
+        kr = keyring.Keyring(self.hs, test_only_key_fetchers=[mock_fetcher])
+
+        json1: JsonDict = {}
+        signedjson.sign.sign_json(json1, "server1", alternate)
+
+        with self.assertLogs("synapse.crypto.keyring", level="WARNING") as logs:
+            self.get_success(kr.verify_json_for_server("server1", json1, 0))
+
+        self.assertIn(
+            "retained alternate key body",
+            "\n".join(logs.output),
+        )
+
     def test_verify_json_dedupes_key_requests(self) -> None:
         """Two requests for the same key should be deduped."""
         key1 = signedjson.key.generate_signing_key("1")

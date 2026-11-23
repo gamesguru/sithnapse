@@ -239,3 +239,110 @@ class ServerKeyResponseStorageTestCase(HomeserverTestCase):
             )
             blobs, rows, refs = self._count_rows()
             self.assertEqual((blobs, rows, refs), (1, 1, 1))
+
+    def test_expired_document_body_is_not_retained(self) -> None:
+        """MSC4499 §11 admission: a replayed expired `verify_keys` document is
+        not retained, while a retired body is."""
+        now = self.clock.time_msec()
+        server_name = "remote.example"
+        expired = now - 600_000
+
+        active = generate_signing_key("active")
+        active_verify = get_verify_key(active)
+        active_id = f"{active_verify.alg}:{active_verify.version}"
+        retired = generate_signing_key("retired")
+        retired_verify = get_verify_key(retired)
+        retired_id = f"{retired_verify.alg}:{retired_verify.version}"
+
+        response = {
+            "server_name": server_name,
+            "valid_until_ts": expired,
+            "verify_keys": {
+                active_id: {"key": encode_verify_key_base64(active_verify)}
+            },
+            "old_verify_keys": {
+                retired_id: {
+                    "key": encode_verify_key_base64(retired_verify),
+                    "expired_ts": expired,
+                }
+            },
+        }
+        self.get_success(
+            self.store.store_server_keys_response(
+                server_name=server_name,
+                from_server=server_name,
+                ts_added_ms=now,
+                verify_keys={
+                    active_id: FetchKeyResult(active_verify, expired),
+                    retired_id: FetchKeyResult(retired_verify, expired),
+                },
+                response_json=response,
+            )
+        )
+
+        def _retained(txn: LoggingTransaction) -> set[str]:
+            txn.execute(
+                "SELECT key_id FROM server_signature_key_candidates"
+                " WHERE server_name = ?",
+                (server_name,),
+            )
+            return {row[0] for row in txn.fetchall()}
+
+        retained = self.get_success(
+            self.store.db_pool.runInteraction("retained_bodies", _retained)
+        )
+        self.assertEqual(retained, {retired_id})
+
+    def test_colliding_body_is_retained_but_not_authoritative(self) -> None:
+        """MSC4499 §11: a second body for one key ID is kept as an alternate,
+        while the First Seen Wins body stays the binding."""
+        now = self.clock.time_msec()
+        server_name = "remote.example"
+        original = generate_signing_key("reuse")
+        original_verify = get_verify_key(original)
+        key_id, _ = self._store_response(
+            server_name, server_name, original, now + 3_600_000, now
+        )
+
+        colliding = generate_signing_key("reuse")
+        colliding_verify = get_verify_key(colliding)
+        self.assertNotEqual(colliding_verify.encode(), original_verify.encode())
+        _, colliding_result = self._store_response(
+            server_name, server_name, colliding, now + 3_600_000, now + 1
+        )
+
+        # The caller keeps the first body as the binding...
+        self.assertEqual(
+            colliding_result[key_id].verify_key.encode(),
+            original_verify.encode(),
+        )
+        # ...and can see the colliding body as an alternate.
+        self.assertEqual(
+            [key.encode() for key, _ in colliding_result[key_id].alternate_keys],
+            [colliding_verify.encode()],
+        )
+
+        local = self.get_success(
+            self.store.get_server_keys_json([(server_name, key_id)])
+        )
+        result = local[(server_name, key_id)]
+        self.assertEqual(result.verify_key.encode(), original_verify.encode())
+        self.assertEqual(
+            [key.encode() for key, _ in result.alternate_keys],
+            [colliding_verify.encode()],
+        )
+
+        def _binding(txn: LoggingTransaction) -> bytes:
+            txn.execute(
+                "SELECT verify_key FROM server_signature_keys"
+                " WHERE server_name = ? AND key_id = ?",
+                (server_name, key_id),
+            )
+            row = txn.fetchone()
+            assert row is not None
+            return bytes(row[0])
+
+        stored = self.get_success(
+            self.store.db_pool.runInteraction("get_binding", _binding)
+        )
+        self.assertEqual(stored, original_verify.encode())

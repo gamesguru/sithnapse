@@ -36,7 +36,11 @@ from synapse.storage.database import (
     LoggingTransaction,
 )
 from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
-from synapse.storage.keys import FetchKeyResult, FetchKeyResultForRemote
+from synapse.storage.keys import (
+    FetchKeyResult,
+    FetchKeyResultForRemote,
+    merge_fetch_key_results,
+)
 from synapse.storage.types import Cursor
 from synapse.types import JsonDict
 from synapse.util.caches.descriptors import cached, cachedList
@@ -55,6 +59,22 @@ db_binary_type = memoryview
 # signatures may still need verifying), then evict by earliest expiry within
 # each tier.
 MAX_RETIRED_SERVER_KEYS = 3000
+
+# Bound the number of distinct public-key bodies accepted for one key ID. A
+# server can keep reusing an ID, so retaining every collision forever would
+# let a signed key endpoint grow this table without limit.
+MAX_KEY_BODIES_PER_ID = 8
+
+# MSC4499 §11 retention ceilings, independent of the retired-key ceiling.
+# Eviction is deterministic: oldest first-seen observation, then key ID, then
+# body digest. Reaching either ceiling is itself the anomaly signal.
+MAX_KEY_BODIES_PER_SERVER = 24_000
+MAX_KEY_BODIES = 200_000
+
+# A `verify_keys` body is retained only if its document was still unexpired at
+# reception, allowing for clock skew. A replayed expired document is not
+# admitted: its asserted window cannot be distinguished from a fresh one.
+MAX_KEY_RETENTION_SKEW_MS = 5 * 60 * 1000
 
 
 class KeyBackgroundUpdateStore(CacheInvalidationWorkerStore):
@@ -98,9 +118,11 @@ class KeyStore(KeyBackgroundUpdateStore):
         verify_keys: dict[str, FetchKeyResult],
         response_json: JsonDict,
     ) -> dict[str, FetchKeyResult]:
-        """Stores the keys for the given server that we got from `from_server`,
-        atomically enforcing MSC4499 First Seen Wins, except that direct origin
-        responses may replace conflicting provisional notary bindings.
+        """Stores the keys for the given server that we got from `from_server`.
+
+        The legacy signature-key row keeps the MSC4499 preferred binding, while
+        `server_signature_key_candidates` retains a bounded set of distinct,
+        validated key bodies for historical event signature checks.
 
         Retain at most 3,000 retired keys per server. Evict keys never seen
         active before those that were, then unknown or earliest expiry first.
@@ -117,9 +139,9 @@ class KeyStore(KeyBackgroundUpdateStore):
             response_json: The full *signed* response JSON that contains the keys.
 
         Returns:
-            Map of supplied key IDs to results, retaining stored results on
-            collisions unless the origin overrides a notary binding. The map
-            can include retired keys evicted by this call.
+            Map of supplied key IDs to all retained candidate bodies and their
+            validity windows. The map can include retired keys evicted by this
+            call.
         """
 
         key_json_bytes = encode_canonical_json(response_json)
@@ -137,6 +159,89 @@ class KeyStore(KeyBackgroundUpdateStore):
             final_keys: dict[str, FetchKeyResult] = dict(verify_keys)
             keys_to_persist: dict[str, FetchKeyResult] = dict(verify_keys)
             per_key_started = time.perf_counter()
+
+            # Preserve every distinct body we have observed, even when the
+            # strict binding table below keeps another body as its preferred
+            # value. The response itself was validated by BaseV2KeyFetcher.
+            old_key_ids = set(response_json.get("old_verify_keys", {}))
+            active_key_ids = set(response_json.get("verify_keys", {}))
+            document_valid_until = response_json.get("valid_until_ts")
+            retained_any = False
+            for key_id, fetch_result in verify_keys.items():
+                # MSC4499 §11 admission: a retired body is published evidence;
+                # an active body is admitted only while its document is still
+                # unexpired, so a replayed expired payload cannot be retained.
+                if key_id not in old_key_ids:
+                    if key_id not in active_key_ids:
+                        continue
+                    if (
+                        not isinstance(document_valid_until, int)
+                        or document_valid_until
+                        < ts_added_ms - MAX_KEY_RETENTION_SKEW_MS
+                    ):
+                        continue
+                retained_any = True
+                key_bytes = fetch_result.verify_key.encode()
+                key_hash = hashlib.sha256(key_bytes).hexdigest()
+                active_now = fetch_result.valid_until_ts > ts_added_ms
+                txn.execute(
+                    """
+                    INSERT INTO server_signature_key_candidates
+                        (server_name, key_id, key_hash, from_server, ts_added_ms,
+                         verify_key, ts_valid_until_ms, seen_active)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (server_name, key_id, key_hash) DO UPDATE SET
+                        ts_added_ms = CASE
+                            WHEN server_signature_key_candidates.ts_added_ms
+                                > EXCLUDED.ts_added_ms
+                            THEN server_signature_key_candidates.ts_added_ms
+                            ELSE EXCLUDED.ts_added_ms
+                        END,
+                        ts_valid_until_ms = CASE
+                            WHEN server_signature_key_candidates.ts_valid_until_ms
+                                > EXCLUDED.ts_valid_until_ms
+                            THEN server_signature_key_candidates.ts_valid_until_ms
+                            ELSE EXCLUDED.ts_valid_until_ms
+                        END,
+                        seen_active = (
+                            server_signature_key_candidates.seen_active
+                            OR EXCLUDED.seen_active
+                        )
+                    """,
+                    (
+                        server_name,
+                        key_id,
+                        key_hash,
+                        from_server,
+                        ts_added_ms,
+                        db_binary_type(key_bytes),
+                        fetch_result.valid_until_ts,
+                        active_now,
+                    ),
+                )
+
+                txn.execute(
+                    """
+                    SELECT key_hash FROM server_signature_key_candidates
+                    WHERE server_name = ? AND key_id = ?
+                    ORDER BY seen_active DESC, ts_added_ms ASC, key_hash ASC
+                    """,
+                    (server_name, key_id),
+                )
+                excess_candidates = [
+                    row[0] for row in txn.fetchall()[MAX_KEY_BODIES_PER_ID:]
+                ]
+                if excess_candidates:
+                    placeholders = ", ".join("?" for _ in excess_candidates)
+                    txn.execute(
+                        f"DELETE FROM server_signature_key_candidates "
+                        f"WHERE server_name = ? AND key_id = ? "
+                        f"AND key_hash IN ({placeholders})",
+                        (server_name, key_id, *excess_candidates),
+                    )
+
+            if retained_any:
+                self._prune_key_candidates_txn(txn, server_name)
 
             # ----------------------------------------------------------------
             # MSC4499 conflict resolution: insert-and-reload.
@@ -276,10 +381,12 @@ class KeyStore(KeyBackgroundUpdateStore):
                         ),
                     )
                 else:
-                    # Collision: First Seen Wins -- retain original binding.
+                    # Preserve the legacy preferred binding. The candidate
+                    # body has already been retained separately above for
+                    # verification of events signed before this collision.
                     logger.warning(
                         "MSC4499: key ID collision for %s %s -- retaining "
-                        "original key body (First Seen Wins). "
+                        "original preferred body and caching alternate body. "
                         "cached_sha256=%s new_sha256=%s",
                         server_name,
                         key_id,
@@ -291,6 +398,51 @@ class KeyStore(KeyBackgroundUpdateStore):
                         valid_until_ts=stored_ts if stored_ts is not None else 0,
                     )
                     keys_to_persist.pop(key_id, None)
+
+            # Return all retained bodies to the caller so the signature checker
+            # can try them against historical events signed with a reused ID.
+            for key_id in verify_keys:
+                txn.execute(
+                    """
+                    SELECT verify_key, ts_valid_until_ms
+                    FROM server_signature_key_candidates
+                    WHERE server_name = ? AND key_id = ?
+                    ORDER BY ts_added_ms, key_hash
+                    """,
+                    (server_name, key_id),
+                )
+                candidates = [
+                    FetchKeyResult(
+                        verify_key=decode_verify_key_bytes(key_id, bytes(row[0])),
+                        valid_until_ts=row[1],
+                    )
+                    for row in txn.fetchall()
+                ]
+                txn.execute(
+                    """
+                    SELECT verify_key, ts_valid_until_ms
+                    FROM server_signature_keys
+                    WHERE server_name = ? AND key_id = ?
+                    """,
+                    (server_name, key_id),
+                )
+                legacy_row = txn.fetchone()
+                if legacy_row is not None:
+                    # The First Seen Wins binding stays the primary body; the
+                    # candidate rows are alternates for historical signatures.
+                    authoritative = FetchKeyResult(
+                        verify_key=decode_verify_key_bytes(
+                            key_id, bytes(legacy_row[0])
+                        ),
+                        valid_until_ts=legacy_row[1] or 0,
+                    )
+                    final_keys[key_id] = merge_fetch_key_results(
+                        authoritative, *candidates
+                    )
+                elif candidates:
+                    final_keys[key_id] = merge_fetch_key_results(
+                        candidates[0], *candidates[1:]
+                    )
 
             per_key_seconds = time.perf_counter() - per_key_started
             post_key_started = time.perf_counter()
@@ -373,7 +525,7 @@ class KeyStore(KeyBackgroundUpdateStore):
                         """,
                         (old_response_id, old_response_id),
                     )
-                for key_id in keys_to_persist:
+                for key_id in verify_keys:
                     txn.call_after(
                         self._get_server_keys_json.invalidate,
                         ((server_name, key_id),),
@@ -381,10 +533,18 @@ class KeyStore(KeyBackgroundUpdateStore):
                 self._send_invalidation_to_replication_bulk(
                     txn,
                     self._get_server_keys_json.__name__,
-                    [
-                        (json.dumps([server_name, key_id]),)
-                        for key_id in keys_to_persist
-                    ],
+                    [(json.dumps([server_name, key_id]),) for key_id in verify_keys],
+                )
+            elif verify_keys:
+                for key_id in verify_keys:
+                    txn.call_after(
+                        self._get_server_keys_json.invalidate,
+                        ((server_name, key_id),),
+                    )
+                self._send_invalidation_to_replication_bulk(
+                    txn,
+                    self._get_server_keys_json.__name__,
+                    [(json.dumps([server_name, key_id]),) for key_id in verify_keys],
                 )
                 self._invalidate_cache_and_stream_bulk(
                     txn,
@@ -428,6 +588,11 @@ class KeyStore(KeyBackgroundUpdateStore):
                 txn.execute(
                     f"DELETE FROM server_signature_keys WHERE server_name = ? "
                     f"AND key_id IN ({placeholders})",
+                    (server_name, *evicted_key_ids),
+                )
+                txn.execute(
+                    f"DELETE FROM server_signature_key_candidates "
+                    f"WHERE server_name = ? AND key_id IN ({placeholders})",
                     (server_name, *evicted_key_ids),
                 )
                 txn.execute(
@@ -504,6 +669,63 @@ class KeyStore(KeyBackgroundUpdateStore):
                 interaction_seconds,
             )
         return result
+
+    def _prune_key_candidates_txn(
+        self, txn: LoggingTransaction, server_name: str
+    ) -> None:
+        """Evict retained key bodies beyond the per-origin/global ceilings.
+
+        The order is deterministic: oldest first-seen observation, then key ID,
+        then body digest. These ceilings are independent of the retired-key
+        limit; reaching one is itself the anomaly signal.
+        """
+
+        def _evict(count: int, where: str, args: tuple[object, ...]) -> None:
+            txn.execute(
+                "SELECT server_name, key_id, key_hash "
+                "FROM server_signature_key_candidates "
+                f"{where} ORDER BY ts_added_ms, key_id, key_hash LIMIT ?",
+                (*args, count),
+            )
+            for row_server, key_id, key_hash in txn.fetchall():
+                txn.execute(
+                    "DELETE FROM server_signature_key_candidates "
+                    "WHERE server_name = ? AND key_id = ? AND key_hash = ?",
+                    (row_server, key_id, key_hash),
+                )
+
+        txn.execute(
+            "SELECT COUNT(*) FROM server_signature_key_candidates "
+            "WHERE server_name = ?",
+            (server_name,),
+        )
+        server_count_row = txn.fetchone()
+        assert server_count_row is not None
+        (server_count,) = server_count_row
+        excess = server_count - MAX_KEY_BODIES_PER_SERVER
+        if excess > 0:
+            _evict(excess, "WHERE server_name = ?", (server_name,))
+            logger.warning(
+                "MSC4499: evicting %d retained key bodies for %s beyond the "
+                "per-origin ceiling of %d",
+                excess,
+                server_name,
+                MAX_KEY_BODIES_PER_SERVER,
+            )
+
+        txn.execute("SELECT COUNT(*) FROM server_signature_key_candidates")
+        total_count_row = txn.fetchone()
+        assert total_count_row is not None
+        (total_count,) = total_count_row
+        excess = total_count - MAX_KEY_BODIES
+        if excess > 0:
+            _evict(excess, "", ())
+            logger.warning(
+                "MSC4499: evicting %d retained key bodies beyond the global "
+                "ceiling of %d",
+                excess,
+                MAX_KEY_BODIES,
+            )
 
     @cached()
     def _get_server_keys_json(
@@ -585,6 +807,53 @@ class KeyStore(KeyBackgroundUpdateStore):
                         key_id, decode_base64(key_base64)
                     ),
                     valid_until_ts=ts_valid_until_ms,
+                )
+
+            candidate_where = " OR (server_name=? AND key_id=?)" * len(batch)
+            params = tuple(itertools.chain.from_iterable(batch))
+            txn.execute(
+                f"""
+                SELECT server_name, key_id, verify_key, ts_valid_until_ms
+                FROM server_signature_key_candidates
+                WHERE 1=0 {candidate_where}
+                """,
+                params,
+            )
+            for server_name, key_id, key_bytes, valid_until_ts in txn:
+                candidate = FetchKeyResult(
+                    verify_key=decode_verify_key_bytes(key_id, bytes(key_bytes)),
+                    valid_until_ts=valid_until_ts,
+                )
+                cache_key = (server_name, key_id)
+                existing = keys.get(cache_key)
+                keys[cache_key] = (
+                    merge_fetch_key_results(existing, candidate)
+                    if existing is not None
+                    else candidate
+                )
+
+            txn.execute(
+                f"""
+                SELECT server_name, key_id, verify_key, ts_valid_until_ms
+                FROM server_signature_keys
+                WHERE 1=0 {candidate_where}
+                """,
+                params,
+            )
+            for server_name, key_id, key_bytes, valid_until_ts in txn:
+                candidate = FetchKeyResult(
+                    verify_key=decode_verify_key_bytes(key_id, bytes(key_bytes)),
+                    valid_until_ts=valid_until_ts or 0,
+                )
+                cache_key = (server_name, key_id)
+                existing = keys.get(cache_key)
+                # `server_signature_keys` holds the First Seen Wins binding, so
+                # it must stay the primary body even when a stored response
+                # blob or a retained candidate carries a colliding one.
+                keys[cache_key] = (
+                    merge_fetch_key_results(candidate, existing)
+                    if existing is not None
+                    else candidate
                 )
 
         def _txn(txn: Cursor) -> dict[tuple[str, str], FetchKeyResult]:
