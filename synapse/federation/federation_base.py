@@ -83,6 +83,18 @@ class FederationBase:
             self._policy_handler = self.hs.get_room_policy_handler()
         return self._policy_handler
 
+    def _is_operator_accepted(self, room_version: RoomVersion, pdu: EventBase) -> bool:
+        """Whether the operator has chosen to accept `pdu` without a valid signature.
+
+        Only honoured where the event ID is a hash of the event's content
+        (room versions after v2), so the listed ID pins exactly what is accepted.
+        In v1/v2 the event ID is an arbitrary string and would pin nothing.
+        """
+        return (
+            room_version.event_format != EventFormatVersions.ROOM_V1_V2
+            and pdu.event_id in self.hs.config.federation.accept_unverifiable_event_ids
+        )
+
     @trace
     async def _check_sigs_and_hash(
         self,
@@ -123,9 +135,17 @@ class FederationBase:
         try:
             await _check_sigs_on_pdu(self.keyring, room_version, pdu)
         except InvalidEventSignatureError as exc:
-            if record_failure_callback:
-                await record_failure_callback(pdu, str(exc))
-            raise exc
+            if self._is_operator_accepted(room_version, pdu):
+                logger.warning(
+                    "Accepting %s despite a signature failure because the operator "
+                    "listed it in federation.accept_unverifiable_event_ids: %s",
+                    pdu.event_id,
+                    exc,
+                )
+            else:
+                if record_failure_callback:
+                    await record_failure_callback(pdu, str(exc))
+                raise exc
 
         if not check_event_content_hash(pdu):
             # let's try to distinguish between failures because the event was

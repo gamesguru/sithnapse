@@ -1,0 +1,1 @@
+Add `federation.accept_unverifiable_event_ids`, an operator-only list of event IDs to accept despite an unverifiable origin signature (for example an origin that reused a signing key ID and never published the old key).

@@ -1395,6 +1395,8 @@ This setting has the following sub-options:
 
 * `allow_partial_state` (boolean): Whether to use partial-state federation joins when possible. When false, Synapse requests full room state during joins. Defaults to `true`.
 
+* `accept_unverifiable_event_ids` (array): Event IDs to accept even though the origin server's signature cannot be verified, for example because the origin reused a signing key ID for a different key and never published the old one. Operator-only: nothing received over federation can add to this list. Only applies to room versions whose event IDs are content hashes, so each ID pins that event's exact content; the content hash is still checked. The event is accepted on your say-so, not because anyone proved who wrote it. Each use is logged at warning level. Defaults to `[]`.
+
 * `client_timeout` (duration): Timeout for the federation requests. Defaults to `"60s"`.
 
 * `max_short_retry_delay` (duration): Maximum delay to be used for the short retry algo. Defaults to `"2s"`.

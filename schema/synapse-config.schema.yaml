@@ -1728,6 +1728,23 @@ properties:
           Whether to use partial-state federation joins when possible. When
           false, Synapse requests full room state during joins.
         default: true
+      accept_unverifiable_event_ids:
+        type: array
+        items:
+          type: string
+          pattern: "^\\$"
+        description: >-
+          Event IDs to accept even though the origin server's signature cannot
+          be verified, for example because the origin reused a signing key ID
+          for a different key and never published the old one. Operator-only:
+          nothing received over federation can add to this list. Only applies
+          to room versions whose event IDs are content hashes, so each ID pins
+          that event's exact content; the content hash is still checked. The
+          event is accepted on your say-so, not because anyone proved who
+          wrote it. Each use is logged at warning level.
+        default: []
+        examples:
+          - ["$1w9Ok7ddXiOwP_Vgw3PYIxwwzRlb67SCTasOGLy0GU8"]
       client_timeout:
         $ref: "#/$defs/duration"
         description: Timeout for the federation requests.
