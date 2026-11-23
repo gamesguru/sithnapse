@@ -224,3 +224,92 @@ class MSC4242MergeShapeTestCase(unittest.FederatingHomeserverTestCase):
     test_merge_shape_does_not_change_resolved_topic.__dict__["todo"] = (
         "MSC4242 state resolution currently depends on merge shape"
     )
+
+    @unittest.override_config({"experimental_features": {"msc4242_enabled": True}})
+    def test_twenty_parent_cap_can_drop_the_auth_relevant_head(self) -> None:
+        """Exercise the same state loss with the real builder's 20-parent cap."""
+        store = self.hs.get_datastores().main
+        handler = self.hs.get_federation_event_handler()
+        room_id, t0 = self._make_room("capped")
+        rv = self.get_success(store.get_room_version(room_id))
+        tok = self.login("capped", "test")
+        depth = 100
+
+        # Grind PL_A into the late-sorting part of the event-ID space. The 20
+        # other heads are then ground below it, so Synapse's sorted(... )[:20]
+        # selection necessarily leaves PL_A out.
+        pl_a = None
+        for nonce in range(1000):
+            candidate = self._remote(
+                room_id, rv, "m.room.power_levels", "", ADMIN, [t0], 12, depth,
+                {
+                    "users": {ADMIN: 100, DAVE: 50},
+                    "events": PL_EVENTS,
+                    "state_default": 50,
+                    "events_default": 0,
+                    "nonce": nonce,
+                },
+            )
+            if candidate.event_id.startswith("$z"):
+                pl_a = candidate
+                break
+        self.assertIsNotNone(pl_a, "failed to grind a late-sorting PL_A event")
+        assert pl_a is not None
+
+        def grind_below(
+            kind: str, state_key: str, sender: str, parents: list[str], ts: int,
+            base_content: JsonDict,
+        ) -> EventBase:
+            for nonce in range(1000):
+                candidate = self._remote(
+                    room_id, rv, kind, state_key, sender, parents, ts, depth,
+                    {**base_content, "nonce": nonce},
+                )
+                if candidate.event_id < pl_a.event_id:
+                    return candidate
+            self.fail(f"failed to grind {kind} below the PL_A event ID")
+
+        x = grind_below("m.room.topic", "", DAVE, [t0], 10, {"topic": "X"})
+        pl_b = self._remote(
+            room_id, rv, "m.room.power_levels", "", BOB, [t0], 15, depth,
+            {
+                "users": {ADMIN: 100, BOB: 90, DAVE: 50, CAROL: 50},
+                "events": PL_EVENTS,
+                "state_default": 50,
+                "events_default": 0,
+            },
+        )
+        y = grind_below("m.room.topic", "", CAROL, [pl_b.event_id], 20, {"topic": "Y"})
+        fillers = [
+            grind_below(
+                "org.example.filler", f"filler-{i}", ADMIN, [t0], 40 + i,
+                {"n": i},
+            )
+            for i in range(18)
+        ]
+        heads = [x, y, pl_a, *fillers]
+        self.assertEqual(len(heads), 21)
+        self.get_success(
+            handler._process_pulled_events(OTHER, [x, pl_b, y, pl_a, *fillers], backfilled=True)
+        )
+        self.assertEqual(len(self.get_success(store.get_state_dag_extremities(room_id))), 21)
+        self.assertEqual(self._topic(room_id), "X", "the full 21-head frontier should resolve to X")
+
+        # This goes through EventBuilder.build, which selects the sorted lowest
+        # 20 extremities. Its signed event therefore omits the late PL_A head.
+        response = self.helper.send_state(
+            room_id, "org.example.merge", {}, tok=tok, state_key="m1"
+        )
+        m1 = self.get_success(store.get_event(response["event_id"]))
+        self.assertEqual(len(m1.prev_state_events), 20)  # type: ignore[attr-defined]
+        self.assertNotIn(pl_a.event_id, m1.prev_state_events)  # type: ignore[attr-defined]
+        self.assertIn(x.event_id, m1.prev_state_events)  # type: ignore[attr-defined]
+        self.assertIn(y.event_id, m1.prev_state_events)  # type: ignore[attr-defined]
+
+        # The omitted branch remains concurrent, but the state-group resolver
+        # loses X when resolving the new M1 head with PL_A.
+        self.assertEqual(self._topic(room_id), "X")
+
+    test_twenty_parent_cap_can_drop_the_auth_relevant_head.__dict__["todo"] = (
+        "MSC4242 merge-shape state loss under Synapse's 20-parent selection is under investigation"
+    )
