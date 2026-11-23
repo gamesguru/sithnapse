@@ -11,7 +11,7 @@ Needs the sithnapse python (the synapse_rust extension), e.g.:
   or in the repo: uv run --no-sync python -I verify_mtxdb.py ...
 
 Usage:
-  verify_mtxdb.py ROOT IDS_FILE [--namespace sith.nutra.tk] [--show-missing N]
+  verify_mtxdb.py ROOT IDS_FILE [--show-missing N]
 
 IDS_FILE: one event id per line, e.g.
   psql sithnapse -Atc "select event_id from events" > ids.txt
@@ -28,7 +28,6 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("root", type=Path)
     ap.add_argument("ids", type=Path)
-    ap.add_argument("--namespace", default="sith.nutra.tk")
     ap.add_argument("--show-missing", type=int, default=5)
     args = ap.parse_args()
 
@@ -50,7 +49,7 @@ def main() -> int:
         batch_size = 1000
         for offset in range(0, len(ids), batch_size):
             batch = ids[offset : offset + batch_size]
-            found = event_json_get(args.namespace, batch)
+            found = event_json_get(batch)
             for eid, record in found:
                 if record is None:
                     missing_count += 1

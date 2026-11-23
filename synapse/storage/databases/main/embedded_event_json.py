@@ -231,7 +231,7 @@ def get_event_json_batch(
         from synapse.synapse_rust.mtxdb_engine import event_json_get
 
         _et = time.monotonic()
-        found = event_json_get(namespace, event_ids)
+        found = event_json_get(event_ids)
         ffi_timing("ffi_event_json_get", time.monotonic() - _et)
         result: dict[str, tuple[str, str, int | None]] = {}
         for event_id, record in found:
@@ -261,5 +261,5 @@ def delete_event_json_batch(
         return
     from synapse.synapse_rust.mtxdb_engine import event_json_delete
 
-    event_json_delete(namespace, event_ids)
+    event_json_delete(event_ids)
     sync_now(pools=[Pool.EVENT_DAG])

@@ -3100,11 +3100,12 @@ type EventJsonGetRow = (String, Option<Vec<u8>>);
 /// every other `NodeId` in this adapter is (first 16 bytes of SHA-256 over a
 /// domain-separated key -- see `kv_node_id`/`chain_node_id`/`root_node_id`).
 /// No u64 truncation of the event id anywhere; the id is hashed in full.
-pub(crate) fn event_node_id(namespace: &str, event_id: &str) -> NodeId {
+///
+/// Unsalted: the key is `event:<event_id>`. Event ids are globally unique, so
+/// nothing needs to separate one homeserver's ids from another's.
+pub(crate) fn event_node_id(event_id: &str) -> NodeId {
     let mut hasher = Sha256::new();
-    hasher.update(b"event_json:event:");
-    hasher.update(namespace.as_bytes());
-    hasher.update(b"\0");
+    hasher.update(b"event:");
     hasher.update(event_id.as_bytes());
     let hash = hasher.finalize();
     let mut id = [0u8; 16];
@@ -3116,7 +3117,7 @@ pub(crate) fn event_node_id(namespace: &str, event_id: &str) -> NodeId {
 /// `EVENT_LOCATOR_BUCKETS` collections, picked from low bits of the event's
 /// own node id so a server's event ids spread evenly across canonical locator collections
 /// (`sys:event-locator:{bucket}`).
-pub(crate) fn event_locator_collection_id(_namespace: &str, node_id: &NodeId) -> [u8; 16] {
+pub(crate) fn event_locator_collection_id(node_id: &NodeId) -> [u8; 16] {
     let bucket = u32::from_le_bytes([node_id[0], node_id[1], node_id[2], node_id[3]])
         % EVENT_LOCATOR_BUCKETS;
     let canonical = format!("sys:event-locator:{bucket}");
@@ -3288,9 +3289,9 @@ fn event_json_puts(
     let mut locator_puts: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
     let mut dag_puts: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
     for (room_id, event_id, record) in rows {
-        let identity = event_node_id(namespace, &event_id);
+        let identity = event_node_id(&event_id);
         let room_collection = event_dag_room_id(namespace, &room_id);
-        let locator_collection = event_locator_collection_id(namespace, &identity);
+        let locator_collection = event_locator_collection_id(&identity);
         let puts = dag_puts.entry(room_collection).or_default();
         puts.push((identity, NodeData::new(bytes::Bytes::from(record))));
         locator_puts.entry(locator_collection).or_default().push((
@@ -3673,24 +3674,17 @@ pub fn begin_transaction() -> PyResult<Option<PyMtxdbTransaction>> {
 /// Returns `(event_id, record)` in input order; ids the mirror has nowhere
 /// return `None` and the caller's SQL `event_json` fallback takes over.
 #[pyfunction]
-pub fn event_json_get(
-    py: Python<'_>,
-    namespace: String,
-    event_ids: Vec<String>,
-) -> PyResult<Vec<EventJsonGetRow>> {
+pub fn event_json_get(py: Python<'_>, event_ids: Vec<String>) -> PyResult<Vec<EventJsonGetRow>> {
     py.detach(|| {
         let engine = event_dag_db()?;
-        let node_ids: Vec<NodeId> = event_ids
-            .iter()
-            .map(|id| event_node_id(&namespace, id))
-            .collect();
+        let node_ids: Vec<NodeId> = event_ids.iter().map(|id| event_node_id(id)).collect();
 
         // Phase 1 -- resolve room collections via the locator, grouped by
         // bucket collection so each is fetched with a single get_many.
         let mut locator_ids: HashMap<[u8; 16], Vec<(usize, NodeId)>> = HashMap::new();
         for (position, node_id) in node_ids.iter().enumerate() {
             locator_ids
-                .entry(event_locator_collection_id(&namespace, node_id))
+                .entry(event_locator_collection_id(node_id))
                 .or_default()
                 .push((position, *node_id));
         }
@@ -3774,24 +3768,17 @@ pub fn event_json_get(
 /// Locator-driven: no room_id needed, so history purge, which only has event
 /// ids, can use it directly.
 #[pyfunction]
-pub fn event_json_delete(
-    py: Python<'_>,
-    namespace: String,
-    event_ids: Vec<String>,
-) -> PyResult<()> {
+pub fn event_json_delete(py: Python<'_>, event_ids: Vec<String>) -> PyResult<()> {
     assert_writable()?;
     py.detach(|| {
         let engine = event_dag_db()?;
-        let node_ids: Vec<NodeId> = event_ids
-            .iter()
-            .map(|id| event_node_id(&namespace, id))
-            .collect();
+        let node_ids: Vec<NodeId> = event_ids.iter().map(|id| event_node_id(id)).collect();
 
         // Resolve locators first (grouped by bucket collection).
         let mut locator_ids: HashMap<[u8; 16], Vec<(usize, NodeId)>> = HashMap::new();
         for (position, node_id) in node_ids.iter().enumerate() {
             locator_ids
-                .entry(event_locator_collection_id(&namespace, node_id))
+                .entry(event_locator_collection_id(node_id))
                 .or_default()
                 .push((position, *node_id));
         }
@@ -3819,7 +3806,7 @@ pub fn event_json_delete(
         let mut dag_tombs: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
         for (position, room_collection) in room_collections.iter().enumerate() {
             let identity = node_ids[position];
-            let locator_collection = event_locator_collection_id(&namespace, &identity);
+            let locator_collection = event_locator_collection_id(&identity);
             locator_tombs
                 .entry(locator_collection)
                 .or_default()

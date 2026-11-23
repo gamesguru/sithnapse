@@ -434,8 +434,8 @@ fn insert_event_locator(
     event_id: &str,
 ) {
     let room_collection = prev_edges_room_id(namespace, room_id);
-    let identity = event_node_id(namespace, event_id);
-    let locator_collection = event_locator_collection_id(namespace, &identity);
+    let identity = event_node_id(event_id);
+    let locator_collection = event_locator_collection_id(&identity);
     locators.entry(locator_collection).or_default().insert(
         identity,
         NodeData::new(bytes::Bytes::copy_from_slice(&room_collection)),
@@ -784,14 +784,14 @@ pub fn event_edges_get_backward(
         let engine = state_db()?;
         let node_ids: Vec<NodeId> = event_ids
             .iter()
-            .map(|id| event_node_id(&namespace, id))
+            .map(|id| event_node_id(id))
             .collect();
 
         // Phase 1: resolve room collections via locator
         let mut locator_ids: HashMap<[u8; 16], Vec<(usize, NodeId)>> = HashMap::new();
         for (position, node_id) in node_ids.iter().enumerate() {
             locator_ids
-                .entry(event_locator_collection_id(&namespace, node_id))
+                .entry(event_locator_collection_id(node_id))
                 .or_default()
                 .push((position, *node_id));
         }
@@ -871,16 +871,13 @@ pub fn event_edges_get_forward(
 ) -> PyResult<Vec<(String, Option<Vec<String>>)>> {
     py.detach(|| {
         let engine = state_db()?;
-        let node_ids: Vec<NodeId> = prev_event_ids
-            .iter()
-            .map(|id| event_node_id(&namespace, id))
-            .collect();
+        let node_ids: Vec<NodeId> = prev_event_ids.iter().map(|id| event_node_id(id)).collect();
 
         // Phase 1: resolve room collections via locator
         let mut locator_ids: HashMap<[u8; 16], Vec<(usize, NodeId)>> = HashMap::new();
         for (position, node_id) in node_ids.iter().enumerate() {
             locator_ids
-                .entry(event_locator_collection_id(&namespace, node_id))
+                .entry(event_locator_collection_id(node_id))
                 .or_default()
                 .push((position, *node_id));
         }
@@ -1040,15 +1037,12 @@ pub fn event_edges_delete(
             // it happens without any lock (see the module-level doc and
             // `lock_rooms`).
             let locator_started = std::time::Instant::now();
-            let node_ids: Vec<NodeId> = event_ids
-                .iter()
-                .map(|id| event_node_id(&namespace, id))
-                .collect();
+            let node_ids: Vec<NodeId> = event_ids.iter().map(|id| event_node_id(id)).collect();
 
             let mut locator_ids: HashMap<[u8; 16], Vec<(usize, NodeId)>> = HashMap::new();
             for (position, node_id) in node_ids.iter().enumerate() {
                 locator_ids
-                    .entry(event_locator_collection_id(&namespace, node_id))
+                    .entry(event_locator_collection_id(node_id))
                     .or_default()
                     .push((position, *node_id));
             }
