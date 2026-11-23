@@ -498,7 +498,6 @@ fn py_to_lean_event(py_ev: &Bound<'_, PyAny>) -> PyResult<LeanEvent<String, Reso
     let depth: u64 = py_ev.getattr("depth")?.extract()?;
 
     let prev_events: Vec<String> = py_ev.call_method0("prev_event_ids")?.extract()?;
-    let auth_events: Vec<String> = py_ev.call_method0("auth_event_ids")?.extract()?;
     let prev_state_events: Vec<String> = py_ev
         .getattr("prev_state_events")
         .and_then(|value| value.extract())
@@ -517,7 +516,7 @@ fn py_to_lean_event(py_ev: &Bound<'_, PyAny>) -> PyResult<LeanEvent<String, Reso
     let auth_events = if msc4242_state_dags {
         prev_state_events
     } else {
-        auth_events
+        py_ev.call_method0("auth_event_ids")?.extract()?
     };
     let rejected_reason: Option<String> = py_ev.getattr("rejected_reason")?.extract()?;
     let soft_failed: bool = py_ev

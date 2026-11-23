@@ -1421,6 +1421,37 @@ class RustAuthChainDifferenceInputTestCase(unittest.TestCase):
     both the exact-`dict` fast path and the `values()` fallback honest.
     """
 
+    def test_msc4242_resolver_does_not_require_calculated_auth_event_ids(self) -> None:
+        """MSC4242's Rust resolver uses prev_state_events, not auth_events."""
+        import synapse.synapse_rust.state_res as rust_res
+
+        room_version = RoomVersions.MSC4242v12
+        event = make_test_event(
+            {"state_key": ""},
+            room_version=room_version,
+            room_id="!msc4242:test",
+            type=EventTypes.Topic,
+            sender=ALICE,
+            origin_server_ts=1,
+            depth=1,
+            prev_state_events=[],
+            prev_events=[],
+            content={"topic": "topic"},
+        )
+
+        # The event deliberately has no calculated auth-event metadata. The
+        # MSC4242 resolver must take its graph edges from prev_state_events.
+        self.assertEqual(
+            rust_res.resolve_v2_via_lattice_fold(
+                {},
+                [],
+                {event.event_id: event},
+                room_version=room_version.identifier,
+                state_res_version=room_version.state_res,
+            ),
+            {},
+        )
+
     def setUp(self) -> None:
         # A -> B -> C, all present in the event map. The production caller only
         # takes this path when every state-set ID *and its whole auth chain* is
