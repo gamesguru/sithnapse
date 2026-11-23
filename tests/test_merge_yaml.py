@@ -40,7 +40,9 @@ class MergePlainSampleTests(TestCase):
         ]
         lines = mod.enable_disabled(sample, mod.SAMPLE_DISABLED_RE)
         out, used = mod.merge(lines, {"commented": 10, "active": 20})
-        text = "".join("#" + ln if isinstance(ln, mod.Off) else ln for ln in out)
+        text = "".join(
+            mod.commented(ln) if isinstance(ln, mod.Off) else ln for ln in out
+        )
         self.assertIn("# Prose: not an option\n", text)
         self.assertIn("commented: 10\n", text)
         self.assertNotIn("#commented: 10", text)
@@ -68,3 +70,75 @@ class MergePlainSampleTests(TestCase):
             }
         )
         self.assertEqual(user, {"stats": {"public_stats_enabled": False}})
+
+    def test_user_comments_and_quotes_in_block_lists_survive(self) -> None:
+        mod = _load()
+        user_text = (
+            "federation:\n"
+            "  accept_unverifiable_event_ids:\n"
+            "    # room !abc (alias: #x:example.org)\n"
+            '    - "$one"\n'
+            "    # second origin\n"
+            '    - "$two"\n'
+            "    # END ROOM\n"
+            "  other: 1\n"
+        )
+        user = mod.yaml.safe_load(user_text)
+        sample = [
+            "federation:\n",
+            "  #accept_unverifiable_event_ids: []\n",
+            "  #other: 0\n",
+        ]
+        lines = mod.enable_disabled(sample, mod.SAMPLE_DISABLED_RE)
+        out, _ = mod.merge(lines, user, user_text.splitlines(True))
+        text = "".join(out)
+        self.assertIn("    # room !abc (alias: #x:example.org)\n", text)
+        self.assertIn('    - "$one"\n', text)
+        self.assertIn("    # second origin\n", text)
+        self.assertIn("    # END ROOM\n", text)
+
+    def test_block_list_falls_back_to_dump_when_text_is_not_found(self) -> None:
+        mod = _load()
+        text = mod.user_block([], ("a", "b"), ["x"], 4)
+        self.assertIsNone(text)
+
+    def test_template_comments_are_aligned_like_prettier(self) -> None:
+        mod = _load()
+        schema = {
+            "properties": {
+                "block": {
+                    "type": "object",
+                    "default": {},
+                    "description": "Block docs.",
+                    "properties": {
+                        "first": {"type": "integer", "default": 1, "description": "A."},
+                        "last": {"type": "integer", "default": 2, "description": "B."},
+                    },
+                },
+                "other": {"type": "integer", "default": 3, "description": "C."},
+            }
+        }
+        lines = mod.enable_disabled(mod.render_schema(schema))
+        out, _ = mod.merge(lines, {"block": {"first": 10}})
+        mod.align_comments(out)
+        text = "".join(
+            mod.commented(ln) if isinstance(ln, mod.Off) else ln for ln in out
+        )
+        # Documentation for a set option sits at the option's column ...
+        self.assertIn("  ##   A.\n  first: 10\n", text)
+        # ... and for an option left at its default after the last set one, at column 0.
+        self.assertIn("##   B.\n#  last: 2\n", text)
+
+    def test_dumped_lists_are_indented_and_double_quoted(self) -> None:
+        mod = _load()
+        self.assertEqual(
+            mod.dump_block({"a": ["!x:y", "plain"]}, 2),
+            '  a:\n    - "!x:y"\n    - plain\n',
+        )
+
+    def test_leading_document_start_marker_is_kept(self) -> None:
+        mod = _load()
+        self.assertTrue(mod.has_document_start(["---\n", "a: 1\n"]))
+        self.assertTrue(mod.has_document_start(["# c\n", "\n", "---\n", "a: 1\n"]))
+        self.assertFalse(mod.has_document_start(["a: 1\n", "---\n"]))
+        self.assertFalse(mod.has_document_start(["a: 1\n"]))

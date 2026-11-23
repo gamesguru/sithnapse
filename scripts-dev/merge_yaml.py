@@ -108,13 +108,97 @@ def trailing_comment(text: str) -> str:
     return ""
 
 
+class _BlockDumper(yaml.SafeDumper):
+    """Dump sequences indented under their key and quote strings with double quotes.
+
+    That is how prettier formats YAML, so dumped values need no reformatting.
+    """
+
+    def increase_indent(self, flow: bool = False, indentless: bool = False) -> None:
+        return super().increase_indent(flow, False)
+
+
+def _represent_str(dumper: yaml.SafeDumper, data: str) -> yaml.ScalarNode:
+    plain = yaml.safe_dump(data, width=10**9)
+    quoted = plain.startswith(("'", '"')) and "\n" not in data
+    return dumper.represent_scalar(
+        "tag:yaml.org,2002:str", data, style='"' if quoted else None
+    )
+
+
+_BlockDumper.add_representer(str, _represent_str)
+
+
 def dump_block(v: Any, indent: int) -> str:
     """Dump v as indented block-style YAML lines."""
-    text = yaml.safe_dump(
-        v, default_flow_style=False, sort_keys=False, allow_unicode=True
+    text = yaml.dump(
+        v,
+        Dumper=_BlockDumper,
+        default_flow_style=False,
+        sort_keys=False,
+        allow_unicode=True,
     )
     pad = " " * indent
     return "".join(pad + ln + "\n" for ln in text.splitlines())
+
+
+def user_block(
+    user_lines: Sequence[str], path: Sequence[str], value: Any, indent: int
+) -> str | None:
+    """Return the user's own text for a block-style list/dict value, comments kept.
+
+    Finds `path` in the raw user file, takes the lines indented under it (comments and
+    quoting included), and re-indents them to `indent`. The text is only used if it
+    parses back to exactly `value`; otherwise None, and the caller re-dumps the value.
+    """
+    stack: list[tuple[int, str]] = []
+    for i, line in enumerate(user_lines):
+        m = KEY_RE.match(line.rstrip("\n"))
+        if not m or line.lstrip().startswith(("#", "-")):
+            continue
+        key_indent, key, inline = len(m.group(1)), m.group(2), m.group(3) or ""
+        while stack and stack[-1][0] >= key_indent:
+            stack.pop()
+        stack.append((key_indent, key))
+        if tuple(k for _, k in stack) != tuple(path):
+            continue
+        if inline.strip() and not inline.lstrip().startswith("#"):
+            return None  # flow or scalar value on the key line: not a block
+        body: list[str] = []
+        for ln in user_lines[i + 1 :]:
+            stripped = ln.strip()
+            ln_indent = len(ln) - len(ln.lstrip())
+            if not stripped:
+                body.append(ln)
+            elif stripped.startswith("#"):
+                if ln_indent <= key_indent:
+                    break
+                body.append(ln)
+            elif ln_indent > key_indent or (
+                ln_indent == key_indent and stripped.startswith("-")
+            ):
+                body.append(ln)
+            else:
+                break
+        while body and not body[-1].strip():
+            body.pop()
+        real = [ln for ln in body if ln.strip() and not ln.lstrip().startswith("#")]
+        if not real:
+            return None
+        base = len(real[0]) - len(real[0].lstrip())
+        text = "".join(
+            " " * max(0, len(ln) - len(ln.lstrip()) + indent - base) + ln.lstrip()
+            if ln.strip()
+            else "\n"
+            for ln in (ln if ln.endswith("\n") else ln + "\n" for ln in body)
+        )
+        try:
+            if yaml.safe_load(text) != value:
+                return None
+        except yaml.YAMLError:
+            return None
+        return text
+    return None
 
 
 def lookup(cfg: Any, path: Sequence[str]) -> tuple[bool, Any]:
@@ -136,18 +220,27 @@ def leaves(v: Any, path: tuple[str, ...] = ()) -> Iterator[tuple[tuple[str, ...]
         yield path, v
 
 
-class Off(str):
-    """A template line that is commented out in the output unless overlaid."""
+class Off(str):  # noqa: SLOT000 (str subclasses cannot have non-empty __slots__)
+    """A template line that is commented out in the output unless overlaid.
 
-    __slots__ = ()
+    `pre` is the indentation written before the `#`, so a nested option's comment sits
+    at the same column as the option (where prettier would put it).
+    """
+
+    pre: str = ""
 
 
-DISABLED_RE = re.compile(r"^#( *)((?:[A-Za-z0-9_.\-]+:|-)(?:\s.*)?)$")
+def commented(line: str) -> str:
+    """Render a template line as the comment it is when no user value is set."""
+    return (line.pre if isinstance(line, Off) else "") + "#" + line
+
+
+DISABLED_RE = re.compile(r"^( *)#( *)((?:[A-Za-z0-9_.\-]+:|-)(?:\s.*)?)$")
 
 
 # A plain sample marks options as `#key:` or `#  key:` (two or more spaces);
 # a single space after `#` is prose, so it is left alone.
-SAMPLE_DISABLED_RE = re.compile(r"^#( {2,}|)((?:[A-Za-z0-9_.\-]+:|-)(?:\s.*)?)$")
+SAMPLE_DISABLED_RE = re.compile(r"^( *)#( {2,}|)((?:[A-Za-z0-9_.\-]+:|-)(?:\s.*)?)$")
 
 
 def resolve(node: dict[str, Any], defs: dict[str, Any]) -> dict[str, Any]:
@@ -184,14 +277,14 @@ def render_schema(schema: dict[str, Any]) -> list[str]:
                 example[0], default_flow_style=None, sort_keys=False, allow_unicode=True
             )
             lines += ["", "Example:"] + [x for x in dumped.splitlines() if x != "..."]
-        pad = "##" + " " * (indent + 1)
+        pad = " " * indent + "##" + " " * (indent + 1)
         out.extend((pad + ln).rstrip() + "\n" for ln in lines)
 
     def emit(props: dict[str, Any], indent: int) -> None:
         for key, raw in props.items():
             node = resolve(raw, defs)
             doc(node, indent)
-            pad = "#" + " " * indent
+            pad = " " * indent + "#" + " " * indent
             # Objects whose default is empty are expanded too, so their options
             # are documented rather than hidden behind `#key: {}`.
             if (
@@ -214,13 +307,43 @@ def render_schema(schema: dict[str, Any]) -> list[str]:
                 else:
                     out.append(f"{pad}{key}:\n")
                     out.extend(
-                        "#" + ln for ln in dump_block(val, indent + 2).splitlines(True)
+                        " " * indent + "#" + ln
+                        for ln in dump_block(val, indent + 2).splitlines(True)
                     )
             if indent == 0:
                 out.append("\n")
 
     emit(schema["properties"], 0)
     return out
+
+
+def has_document_start(lines: Sequence[str]) -> bool:
+    """True if the file's first line that is not blank or a comment is a `---` marker."""
+    for ln in lines:
+        text = ln.strip()
+        if text and not text.startswith("#"):
+            return text == "---" or text.startswith("--- ")
+    return False
+
+
+def align_comments(out: list[str]) -> None:
+    """Indent each run of template comments to the line that follows it.
+
+    prettier attaches a comment to the next YAML node and indents it to match, so a
+    nested option's documentation sits at the option's column when the option is set,
+    and at column 0 when it is the last thing in its block (or the block has no set
+    options). Doing it here keeps the output stable under prettier. Only single-line
+    template comments move; the user's own blocks are left as written.
+    """
+    next_indent = 0
+    for i in range(len(out) - 1, -1, -1):
+        ln = out[i]
+        if isinstance(ln, Off):
+            ln.pre = " " * next_indent
+        elif ln.count("\n") == 1 and ln.lstrip().startswith("##"):
+            out[i] = " " * next_indent + ln.lstrip()
+        elif ln.strip():
+            next_indent = len(ln) - len(ln.lstrip())
 
 
 def enable_disabled(
@@ -230,14 +353,23 @@ def enable_disabled(
     res = []
     for ln in lines:
         m = pattern.match(ln.rstrip("\n"))
-        res.append(Off(m.group(1) + m.group(2) + "\n") if m else ln)
+        if not m:
+            res.append(ln)
+            continue
+        off = Off(m.group(2) + m.group(3) + "\n")
+        off.pre = m.group(1)
+        res.append(off)
     return res
 
 
 def merge(  # pylint: disable=too-many-locals
-    sample_lines: Sequence[str], user: Any
+    sample_lines: Sequence[str], user: Any, user_lines: Sequence[str] = ()
 ) -> tuple[list[str], set[tuple[str, ...]]]:
-    """Overlay user values onto the sample lines; return (lines, used paths)."""
+    """Overlay user values onto the sample lines; return (lines, used paths).
+
+    `user_lines` is the raw text of the user's file; when given, block lists and dicts
+    are copied from it so the user's comments and quoting survive the merge.
+    """
     out: list[str] = []
     stack: list[tuple[int, str]] = []
     used: set[tuple[str, ...]] = set()
@@ -320,7 +452,8 @@ def merge(  # pylint: disable=too-many-locals
                 else f"{' ' * indent}{key}: {'[]' if isinstance(val, list) else '{}'}{comment}\n"
             )
             if val:
-                out.append(dump_block(val, indent + 2))
+                raw = user_block(user_lines, path, val, indent + 2)
+                out.append(raw if raw is not None else dump_block(val, indent + 2))
             used.update(p for p, _ in leaves(val, path))
             i = child_end
         else:
@@ -339,19 +472,27 @@ def main() -> None:
     ap.add_argument("-o", "--output", default="homeserver.merged.yaml")
     a = ap.parse_args()
     with open(a.config, encoding="utf-8") as f:
-        user = apply_renames(yaml.safe_load(f) or {})
+        user_lines = f.readlines()
+    user = apply_renames(yaml.safe_load("".join(user_lines)) or {})
     with open(a.sample, encoding="utf-8") as f:
         if a.sample.endswith((".schema.yaml", ".schema.yml")):
             lines = enable_disabled(render_schema(yaml.safe_load(f)))
         else:
             lines = enable_disabled(f.readlines(), SAMPLE_DISABLED_RE)
-    out, used = merge(lines, user)
-    out = ["#" + ln if isinstance(ln, Off) else ln for ln in out]
+    out, used = merge(lines, user, user_lines)
+    align_comments(out)
+    out = [commented(ln) if isinstance(ln, Off) else ln for ln in out]
+    if has_document_start(user_lines):
+        out.insert(0, "---\n")
     missing = [
         p
         for p, _ in leaves(user)
         if p and p not in used and not any(p[:k] in used for k in range(1, len(p)))
     ]
+    # The template ends each top-level section with a blank line; drop the final one so
+    # the file ends with a single newline, like the file being merged.
+    while out and not out[-1].strip():
+        out.pop()
     if missing:
         rest: dict[str, Any] = {}
         for p, v in leaves(user):
