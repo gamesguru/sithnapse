@@ -1836,6 +1836,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-postgres",
+ "tracing",
  "ulid",
 ]
 
