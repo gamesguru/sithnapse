@@ -20,6 +20,7 @@
 #
 import calendar
 import logging
+import os
 import time
 from typing import TYPE_CHECKING, cast
 
@@ -103,6 +104,54 @@ class ServerMetricsStore(EventPushActionsWorkerStore, SQLBaseStore):
             return int(rows[0][0]) if rows else None
         except Exception:
             logger.exception("Failed to read PostgreSQL database size")
+            return None
+
+    async def get_postgres_process_pss_bytes(self) -> int | None:
+        """Return local PostgreSQL process PSS, when its processes are visible.
+
+        PSS apportions shared pages across processes, so summing it avoids the
+        large double count that would result from adding every backend's RSS.
+        """
+        if not isinstance(self.db_pool.engine, PostgresEngine):
+            return None
+        try:
+            rows = await self.db_pool.execute(
+                "get_postgres_backend_pid", "SELECT pg_backend_pid()"
+            )
+            if not rows:
+                return None
+            backend_pid = int(rows[0][0])
+            with open(f"/proc/{backend_pid}/stat", encoding="ascii") as stat_file:
+                stat = stat_file.read()
+            # Fields after comm begin at field 3 (state), then field 4 (PPID).
+            fields = stat[stat.rfind(")") + 2 :].split()
+            postmaster_pid = int(fields[1])
+            total_pss_kb = 0
+            found_process = False
+            for pid in os.listdir("/proc"):
+                if not pid.isdecimal():
+                    continue
+                try:
+                    with open(f"/proc/{pid}/stat", encoding="ascii") as f:
+                        process_stat = f.read()
+                    process_fields = process_stat[process_stat.rfind(")") + 2 :].split()
+                    process_ppid = int(process_fields[1])
+                    process_pid = int(pid)
+                    if process_pid != postmaster_pid and process_ppid != postmaster_pid:
+                        continue
+                    with open(f"/proc/{pid}/comm", encoding="ascii") as f:
+                        if f.read().strip() != "postgres":
+                            continue
+                    with open(f"/proc/{pid}/smaps_rollup", encoding="ascii") as f:
+                        for line in f:
+                            if line.startswith("Pss:"):
+                                total_pss_kb += int(line.split()[1])
+                                found_process = True
+                                break
+                except (OSError, ValueError, IndexError):
+                    continue
+            return total_pss_kb * 1024 if found_process else None
+        except (OSError, ValueError, IndexError, TypeError):
             return None
 
     @wrap_as_background_process("read_forward_extremities")

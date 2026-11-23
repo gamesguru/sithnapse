@@ -503,6 +503,10 @@
             <span class="telemetry-sub">POSTGRES (DISK)</span>
           </span>
           <span class="telemetry-pair">
+            <span class="telemetry-value" id="stat-postgres-memory">...</span>
+            <span class="telemetry-sub">POSTGRES PROCESS MEMORY · PSS</span>
+          </span>
+          <span class="telemetry-pair">
             <span class="telemetry-value" id="stat-mtxdb">...</span>
             <span class="telemetry-sub">MTXDB (DISK)</span>
           </span>
@@ -806,6 +810,13 @@
                   const pgEl = document.getElementById("stat-postgres");
                   if (pgEl) pgEl.textContent = formatBytes(db.postgres_bytes);
                 }
+                if (typeof db.postgres_pss_bytes === "number") {
+                  const pgMemoryEl = document.getElementById(
+                    "stat-postgres-memory",
+                  );
+                  if (pgMemoryEl)
+                    pgMemoryEl.textContent = formatBytes(db.postgres_pss_bytes);
+                }
                 if (typeof db.mtxdb_bytes === "number") {
                   const mtxdbEl = document.getElementById("stat-mtxdb");
                   if (mtxdbEl)
@@ -904,6 +915,7 @@
           ["stat-jedi", "--"],
           ["stat-sanctums", "--"],
           ["stat-postgres", "--"],
+          ["stat-postgres-memory", "--"],
           ["stat-mtxdb", "--"],
           ["stat-mtxdb-index", "--"],
           ["stat-memory", "--"],

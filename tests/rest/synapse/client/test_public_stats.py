@@ -75,6 +75,7 @@ class PublicStatsTests(unittest.HomeserverTestCase):
                 "joined_members",
                 "local_joined_members",
                 "postgres_bytes",
+                "postgres_pss_bytes",
                 "mtxdb_bytes",
                 "mtxdb_index_bytes",
             },
@@ -88,6 +89,10 @@ class PublicStatsTests(unittest.HomeserverTestCase):
         self.assertTrue(
             database["postgres_bytes"] is None
             or isinstance(database["postgres_bytes"], int)
+        )
+        self.assertTrue(
+            database["postgres_pss_bytes"] is None
+            or isinstance(database["postgres_pss_bytes"], int)
         )
         self.assertTrue(
             database["mtxdb_index_bytes"] is None

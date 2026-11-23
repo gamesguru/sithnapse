@@ -124,6 +124,12 @@ class PublicStatsResource(DirectServeJsonResource):
             logger.exception("Failed to read database size for public statistics")
             postgres_bytes = None
 
+        try:
+            postgres_pss_bytes = await self.store.get_postgres_process_pss_bytes()
+        except Exception:
+            logger.exception("Failed to read PostgreSQL memory for public statistics")
+            postgres_pss_bytes = None
+
         database: JsonDict = {
             "events": total_events,
             "state_events": total_state_events,
@@ -131,6 +137,7 @@ class PublicStatsResource(DirectServeJsonResource):
             "joined_members": joined_members,
             "local_joined_members": local_joined_members,
             "postgres_bytes": postgres_bytes,
+            "postgres_pss_bytes": postgres_pss_bytes,
             "mtxdb_bytes": await get_embedded_db_disk_bytes(
                 self._reactor, self._embedded_db_path
             ),

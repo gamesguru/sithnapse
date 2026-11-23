@@ -108,6 +108,7 @@ class ServerStatsResource(DirectServeJsonResource):
             local_joined_members = None
 
         postgres_bytes = await self.store.get_postgres_disk_bytes()
+        postgres_pss_bytes = await self.store.get_postgres_process_pss_bytes()
         mtxdb_bytes = await get_embedded_db_disk_bytes(
             self.hs.get_reactor(), self.hs.config.database.embedded_db_path
         )
@@ -128,6 +129,7 @@ class ServerStatsResource(DirectServeJsonResource):
                 "joined_members": joined_members,
                 "local_joined_members": local_joined_members,
                 "postgres_bytes": postgres_bytes,
+                "postgres_pss_bytes": postgres_pss_bytes,
                 "mtxdb_bytes": mtxdb_bytes,
                 "mtxdb_index_bytes": mtxdb_index_bytes,
             },
