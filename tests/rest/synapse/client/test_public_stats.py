@@ -11,6 +11,8 @@
 # See the GNU Affero General Public License for more details:
 # <https://www.gnu.org/licenses/agpl-3.0.html>.
 
+from unittest import mock
+
 from twisted.web.resource import Resource
 
 from synapse.rest import admin
@@ -74,6 +76,7 @@ class PublicStatsTests(unittest.HomeserverTestCase):
                 "local_users",
                 "joined_members",
                 "local_joined_members",
+                "ever_seen_users",
                 "postgres_bytes",
                 "postgres_pss_bytes",
                 "mtxdb_bytes",
@@ -85,6 +88,7 @@ class PublicStatsTests(unittest.HomeserverTestCase):
         self.assertEqual(database["local_users"], 1)
         self.assertEqual(database["joined_members"], 1)
         self.assertEqual(database["local_joined_members"], 1)
+        self.assertEqual(database["ever_seen_users"], 1)
         # PostgreSQL is only reported when it is the main database engine.
         self.assertTrue(
             database["postgres_bytes"] is None
@@ -100,3 +104,33 @@ class PublicStatsTests(unittest.HomeserverTestCase):
         )
 
         self.assertIsInstance(channel.json_body["memory"]["rss_bytes"], int)
+
+    @unittest.override_config({"stats": {"public_stats_enabled": True}})
+    def test_failed_count_serves_last_good_value(self) -> None:
+        """A failed count must not blank the field once a value exists."""
+        user = self.register_user("user", "password")
+        tok = self.login("user", "password")
+        self.helper.create_room_as(user, tok=tok)
+
+        channel = self.make_request(
+            "GET", "/_synapse/client/public_stats", shorthand=False
+        )
+        self.assertEqual(channel.code, 200, channel.result)
+        ever_seen = channel.json_body["database"]["ever_seen_users"]
+        self.assertEqual(ever_seen, 1)
+
+        # Let the cache expire so the next request recomputes.
+        self.reactor.advance(61)
+
+        store = self.hs.get_datastores().main
+        with mock.patch.object(
+            store,
+            "get_ever_seen_user_count",
+            new=mock.AsyncMock(side_effect=RuntimeError("boom")),
+        ):
+            channel = self.make_request(
+                "GET", "/_synapse/client/public_stats", shorthand=False
+            )
+
+        self.assertEqual(channel.code, 200, channel.result)
+        self.assertEqual(channel.json_body["database"]["ever_seen_users"], ever_seen)

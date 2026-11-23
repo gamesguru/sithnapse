@@ -489,22 +489,26 @@
         </div>
 
         <div class="telemetry-card">
-          <span class="telemetry-label">Jedi Enclave</span>
-          <span class="telemetry-value" id="stat-jedi">...</span>
-          <span class="telemetry-sub" id="stat-jedi-sub"
-            >MEMBERS OF THE ORDER</span
-          >
+          <span class="telemetry-label">Members of the Order</span>
+          <span class="telemetry-pair">
+            <span class="telemetry-value" id="stat-jedi">--</span>
+            <span class="telemetry-sub" id="stat-jedi-sub">EVER SEEN</span>
+          </span>
+          <span class="telemetry-pair">
+            <span class="telemetry-value" id="stat-jedi-local">--</span>
+            <span class="telemetry-sub">LOCAL SITH</span>
+          </span>
         </div>
 
         <div class="telemetry-card">
           <span class="telemetry-label">Holocron Vault</span>
           <span class="telemetry-pair">
             <span class="telemetry-value" id="stat-postgres">...</span>
-            <span class="telemetry-sub">POSTGRES (DISK)</span>
+            <span class="telemetry-sub">PSQL (DISK)</span>
           </span>
           <span class="telemetry-pair">
             <span class="telemetry-value" id="stat-postgres-memory">...</span>
-            <span class="telemetry-sub">POSTGRES PROCESS MEMORY · PSS</span>
+            <span class="telemetry-sub">PSQL (MEM / PSS)</span>
           </span>
           <span class="telemetry-pair">
             <span class="telemetry-value" id="stat-mtxdb">...</span>
@@ -524,8 +528,8 @@
             >Force Resonance &amp;<br />Force Latency</span
           >
           <span class="telemetry-pair">
-            <span class="telemetry-value" id="stat-memory">...</span>
-            <span class="telemetry-sub">PROCESS MEMORY · RSS</span>
+            <span class="telemetry-value" id="stat-memory">--</span>
+            <span class="telemetry-sub">PROC MEM · RSS</span>
           </span>
           <span class="telemetry-pair">
             <span class="telemetry-value" id="stat-latency">-- ms</span>
@@ -535,10 +539,14 @@
 
         <div class="telemetry-card">
           <span class="telemetry-label">Matrix Protocol</span>
-          <span class="telemetry-value" id="stat-spec">...</span>
-          <span class="telemetry-sub" id="stat-engine-sub"
-            >SITHNAPSE VERSION</span
-          >
+          <span class="telemetry-pair">
+            <span class="telemetry-value" id="stat-spec">--</span>
+            <span class="telemetry-sub">CLIENT-SERVER</span>
+          </span>
+          <span class="telemetry-pair">
+            <span class="telemetry-value" id="stat-engine">--</span>
+            <span class="telemetry-sub">SITHNAPSE</span>
+          </span>
         </div>
       </section>
 
@@ -758,10 +766,15 @@
 
       function renderServerVersion(version) {
         if (typeof version !== "string" || !version.trim()) return;
-        const cleanVersion = version.trim().replace(/^Synapse\//, "");
-        const versionEl = document.getElementById("stat-engine-sub");
-        if (versionEl)
-          versionEl.textContent = `Sithnapse v${cleanVersion.replace(/^v/, "")}`;
+        // Federation reports e.g. "1.163.0 (b=branch,commit=abc)" or
+        // "Synapse/1.163.0"; keep only the version token.
+        const cleanVersion = version
+          .trim()
+          .split(/\s+/)[0]
+          .replace(/^Synapse\//, "")
+          .replace(/^v/, "");
+        const versionEl = document.getElementById("stat-engine");
+        if (versionEl) versionEl.textContent = `v${cleanVersion}`;
       }
 
       async function measureTelemetry() {
@@ -792,11 +805,23 @@
                   galacticEl.textContent =
                     stats.total_destinations.toLocaleString();
               }
-              if (typeof stats.total_known_servers === "number") {
+              if (
+                stats.database &&
+                typeof stats.database.ever_seen_users === "number"
+              ) {
                 const jediEl = document.getElementById("stat-jedi");
                 if (jediEl)
                   jediEl.textContent =
-                    stats.total_known_servers.toLocaleString();
+                    stats.database.ever_seen_users.toLocaleString();
+              }
+              if (
+                stats.database &&
+                typeof stats.database.local_users === "number"
+              ) {
+                const jediLocalEl = document.getElementById("stat-jedi-local");
+                if (jediLocalEl)
+                  jediLocalEl.textContent =
+                    stats.database.local_users.toLocaleString();
               }
               if (typeof stats.total_rooms === "number") {
                 const sanctumsEl = document.getElementById("stat-sanctums");
@@ -874,7 +899,7 @@
           }
         } catch (err) {
           const latencyEl = document.getElementById("stat-latency");
-          if (latencyEl) latencyEl.textContent = "unavailable";
+          if (latencyEl) latencyEl.textContent = "-- ms";
         }
 
         // 3. Fallback discovery if public stats are not available
@@ -913,12 +938,15 @@
         for (const [id, fallback] of [
           ["stat-galactic", "--"],
           ["stat-jedi", "--"],
+          ["stat-jedi-local", "--"],
           ["stat-sanctums", "--"],
           ["stat-postgres", "--"],
           ["stat-postgres-memory", "--"],
           ["stat-mtxdb", "--"],
           ["stat-mtxdb-index", "--"],
           ["stat-memory", "--"],
+          ["stat-spec", "--"],
+          ["stat-engine", "--"],
         ]) {
           const el = document.getElementById(id);
           if (el && el.textContent === "...") el.textContent = fallback;

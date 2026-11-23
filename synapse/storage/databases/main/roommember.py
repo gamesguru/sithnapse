@@ -198,6 +198,22 @@ class RoomMemberWorkerStore(EventsWorkerStore, CacheInvalidationWorkerStore):
 
         return await self.db_pool.runInteraction("get_joined_member_counts", _transact)
 
+    async def get_ever_seen_user_count(self) -> int:
+        """Count distinct user ids with any membership in a room we hold.
+
+        This includes remote users and users who have since left or been
+        banned, so it is a "users ever seen" figure rather than a current
+        membership count. It reads `room_memberships`, which keeps history,
+        and is served by the `room_memberships_user_id` index.
+        """
+
+        def _transact(txn: LoggingTransaction) -> int:
+            txn.execute("SELECT COUNT(DISTINCT user_id) FROM room_memberships")
+            row = txn.fetchone()
+            return int(row[0] or 0) if row is not None else 0
+
+        return await self.db_pool.runInteraction("get_ever_seen_user_count", _transact)
+
     @cached(max_entries=100000, iterable=True)
     async def get_users_in_room(self, room_id: str) -> Sequence[str]:
         """Returns a list of users in the room.

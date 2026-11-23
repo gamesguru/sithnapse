@@ -52,6 +52,10 @@ class PublicStatsResource(DirectServeJsonResource):
         self._embedded_db_path = hs.config.database.embedded_db_path
         self._cached: JsonDict | None = None
         self._cached_at_ms = 0
+        # The ever-seen user count is the most expensive part of a refresh.
+        # Keep the last successful value so a failed query serves the previous
+        # number instead of dropping the field from the page.
+        self._last_ever_seen_users: int | None = None
 
     async def _async_render_GET(self, request: SynapseRequest) -> tuple[int, JsonDict]:
         now_ms = self._clock.time_msec()
@@ -118,6 +122,19 @@ class PublicStatsResource(DirectServeJsonResource):
             joined_members = None
             local_joined_members = None
 
+        counts_fresh = True
+        ever_seen_users: int | None
+        try:
+            ever_seen_users = await self.store.get_ever_seen_user_count()
+        except Exception:
+            logger.exception(
+                "Failed to count ever-seen users for public server statistics"
+            )
+            counts_fresh = False
+            ever_seen_users = self._last_ever_seen_users
+        else:
+            self._last_ever_seen_users = ever_seen_users
+
         try:
             postgres_bytes = await self.store.get_postgres_disk_bytes()
         except Exception:
@@ -136,6 +153,7 @@ class PublicStatsResource(DirectServeJsonResource):
             "local_users": local_users,
             "joined_members": joined_members,
             "local_joined_members": local_joined_members,
+            "ever_seen_users": ever_seen_users,
             "postgres_bytes": postgres_bytes,
             "postgres_pss_bytes": postgres_pss_bytes,
             "mtxdb_bytes": await get_embedded_db_disk_bytes(
@@ -169,7 +187,9 @@ class PublicStatsResource(DirectServeJsonResource):
             joined_members,
             local_joined_members,
         )
-        if all(value is not None for value in required):
+        # A degraded refresh (last-good count) must not extend the cache, or
+        # the failure would be hidden for another lifetime.
+        if counts_fresh and all(value is not None for value in required):
             self._cached = result
             self._cached_at_ms = now_ms
         return HTTPStatus.OK, result
