@@ -535,6 +535,12 @@ class KeyStore(KeyBackgroundUpdateStore):
                     self._get_server_keys_json.__name__,
                     [(json.dumps([server_name, key_id]),) for key_id in verify_keys],
                 )
+                self._invalidate_cache_and_stream_bulk(
+                    txn,
+                    self.get_server_key_json_for_remote,
+                    [(server_name, key_id) for key_id in keys_to_persist],
+                )
+                mark("persist_invalidation")
             elif verify_keys:
                 for key_id in verify_keys:
                     txn.call_after(
@@ -546,12 +552,6 @@ class KeyStore(KeyBackgroundUpdateStore):
                     self._get_server_keys_json.__name__,
                     [(json.dumps([server_name, key_id]),) for key_id in verify_keys],
                 )
-                self._invalidate_cache_and_stream_bulk(
-                    txn,
-                    self.get_server_key_json_for_remote,
-                    [(server_name, key_id) for key_id in keys_to_persist],
-                )
-                mark("persist_invalidation")
 
             # MSC4499: bound the number of retired keys retained for a server.
             # Keys we saw active before retirement may have signed events we
