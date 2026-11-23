@@ -1029,6 +1029,28 @@ class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
             set(),
         )
 
+    def test_record_event_failed_pull_attempt_unknown_room(self) -> None:
+        """Failed-pull bookkeeping must tolerate a room we do not have yet.
+
+        A PDU can fail its signature check while joining, before the `rooms` row
+        exists. The `event_failed_pull_attempts.room_id` foreign key would then
+        raise and mask the signature failure, so recording is skipped instead.
+        """
+        self.get_success(
+            self.store.record_event_failed_pull_attempt(
+                "!unknown:test", "$unknown", "invalid signature"
+            )
+        )
+
+        rows = self.get_success(
+            self.store.db_pool.simple_select_list(
+                "event_failed_pull_attempts",
+                {"room_id": "!unknown:test"},
+                ["event_id"],
+            )
+        )
+        self.assertEqual(rows, [])
+
     def test_get_backfill_points_in_room_excludes_events_we_have_attempted(
         self,
     ) -> None:

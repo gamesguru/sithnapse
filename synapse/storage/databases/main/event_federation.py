@@ -1903,6 +1903,18 @@ class EventFederationWorkerStore(
         event_id: str,
         cause: str,
     ) -> None:
+        # `event_failed_pull_attempts.room_id` references `rooms`. A pull can
+        # fail for a room we do not have yet (for example while joining, before
+        # the `rooms` row is created), and we must not create a room row from an
+        # untrusted event just to record bookkeeping. Skipping is safe: there is
+        # nothing to retry yet, and raising here would mask the real failure.
+        txn.execute("SELECT 1 FROM rooms WHERE room_id = ?", (room_id,))
+        if txn.fetchone() is None:
+            logger.debug(
+                "Not recording failed pull attempt for unknown room %s", room_id
+            )
+            return
+
         sql = """
             INSERT INTO event_failed_pull_attempts (
                 room_id, event_id, num_attempts, last_attempt_ts, last_cause
