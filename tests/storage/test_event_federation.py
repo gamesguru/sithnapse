@@ -1674,11 +1674,13 @@ class AuthChainReaderWorkerTestCase(tests.unittest.HomeserverTestCase):
         self.store = hs.get_datastores().main
 
     @tests.unittest.skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
-    def test_non_writer_v21_fails_loud(self) -> None:
-        """Non-writer instances must fail loud when the mtxdb auth graph is
-        incomplete for a state res v2.1 request, rather than falling back to the
-        SQL legacy BFS (which cannot compute the conflicted subgraph)."""
-        room_id = "!v21_fail_loud:test"
+    def test_state_set_members_never_persisted_are_leaves(self) -> None:
+        """A state set can name events we never persisted (for example, dropped for an
+        auth event whose signature cannot be verified). They have no short id and no
+        edges, so, as in stock Synapse, they are leaves: in the difference when the
+        sets disagree, and in the v2.1 conflicted subgraph when conflicted. They must
+        not fail the whole calculation."""
+        room_id = "!v21_unpersisted:test"
 
         def setup_room(txn: LoggingTransaction) -> None:
             self.store.db_pool.simple_insert_txn(
@@ -1697,21 +1699,22 @@ class AuthChainReaderWorkerTestCase(tests.unittest.HomeserverTestCase):
         # Simulate running on a reader worker (not in writers.events)
         self.hs.get_instance_name = lambda: "federation_reader1"  # type: ignore[method-assign]
 
-        self.get_failure(
+        result = self.get_success(
             self.store.get_auth_chain_difference_extended(
                 room_id,
-                state_sets=[{"$e1"}, {"$e2"}],
+                state_sets=[{"$e1", "$common"}, {"$e2", "$common"}],
                 conflicted_set={"$e1", "$e2"},
                 additional_backwards_reachable_conflicted_events=set(),
-            ),
-            RuntimeError,
+            )
         )
+        self.assertEqual(result.auth_difference, {"$e1", "$e2"})
+        self.assertEqual(result.conflicted_subgraph, {"$e1", "$e2"})
 
     @tests.unittest.skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
-    def test_non_writer_incomplete_graph_does_not_fall_back_to_sql(self) -> None:
-        """The mtxdb auth graph is authoritative. A reader worker that finds a
-        missing short id must fail loud, not silently rebuild an answer from the
-        legacy SQL event_auth rows."""
+    def test_non_writer_unpersisted_event_ignores_sql_rows(self) -> None:
+        """The mtxdb auth graph is authoritative. A reader worker that has no short
+        id for an event treats it as an edge-less leaf; it must not rebuild an answer
+        from the legacy SQL event_auth rows."""
         room_id = "!incomplete_cover:test"
 
         def insert_test_events(txn: LoggingTransaction) -> None:
@@ -1769,11 +1772,17 @@ class AuthChainReaderWorkerTestCase(tests.unittest.HomeserverTestCase):
         # Simulate reader worker
         self.hs.get_instance_name = lambda: "federation_reader1"  # type: ignore[method-assign]
 
-        # The SQL rows above are a decoy: with mtxdb authoritative the reader
-        # must not use them, and must fail loud on the missing graph instead.
-        self.get_failure(
-            self.store.get_auth_chain_ids(room_id, ["$s1"], include_given=True),
-            RuntimeError,
+        # The SQL rows above are a decoy: with mtxdb authoritative the reader must
+        # not use them, so `$s1` is a leaf and `$pl`/`$create` are not returned.
+        result = self.get_success(
+            self.store.get_auth_chain_ids(room_id, ["$s1"], include_given=True)
+        )
+        self.assertEqual(result, {"$s1"})
+        self.assertEqual(
+            self.get_success(
+                self.store.get_auth_chain_ids(room_id, ["$s1"], include_given=False)
+            ),
+            set(),
         )
 
 

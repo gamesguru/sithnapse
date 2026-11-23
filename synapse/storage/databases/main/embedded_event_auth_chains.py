@@ -690,11 +690,29 @@ class ClosureCache:
             if cached is not None:
                 out[short_id] = cached
                 continue
-            closure, is_complete = self._walk(
-                namespace, room_id, short_id, generation, memo, direct_edges, pinned
-            )
+            try:
+                closure, is_complete = self._walk(
+                    namespace, room_id, short_id, generation, memo, direct_edges, pinned
+                )
+            except IncompleteAuthGraph as e:
+                missing = e.args[0] if e.args else short_id
+                if isinstance(missing, int):
+                    resolved = resolve_short_ids_to_event_ids(
+                        engine_name, namespace, room_id, [missing]
+                    )
+                    if resolved and resolved[0] is not None:
+                        missing = resolved[0]
+                raise IncompleteAuthGraph(missing) from None
             if not is_complete:
-                raise IncompleteAuthGraph(short_id)
+                # Report the event id when we can, so the surfaced error names
+                # the gap rather than an opaque per-room short id.
+                resolved = resolve_short_ids_to_event_ids(
+                    engine_name, namespace, room_id, [short_id]
+                )
+                event_id = resolved[0] if resolved else None
+                raise IncompleteAuthGraph(
+                    event_id if event_id is not None else short_id
+                )
             self._put(namespace, room_id, generation, short_id, closure)
             out[short_id] = closure
         return out
@@ -790,9 +808,7 @@ class ClosureCache:
                 room_id,
                 namespace,
             )
-            result = (BitMap(), False)
-            memo[event_short_id] = result
-            return result
+            raise IncompleteAuthGraph(event_short_id)
 
         # Frames hold [event id, next child index, accumulated closure,
         # completeness]. `active` tracks only the current DFS path, so a cycle
@@ -827,8 +843,7 @@ class ClosureCache:
                 if child_id in active:
                     # Cycles cannot be produced by valid event auth edges. Use
                     # the established incomplete-graph path for corrupt data.
-                    frame[3] = False
-                    continue
+                    raise IncompleteAuthGraph(child_id)
 
                 child_edges = direct_edges.get(child_id)
                 if child_edges is None:
@@ -840,9 +855,7 @@ class ClosureCache:
                         room_id,
                         namespace,
                     )
-                    memo[child_id] = (BitMap(), False)
-                    frame[3] = False
-                    continue
+                    raise IncompleteAuthGraph(child_id)
 
                 logger.debug(
                     "auth-chain closure walk: short_id=%s has %d direct auth "

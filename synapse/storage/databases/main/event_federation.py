@@ -116,6 +116,45 @@ _LONGEST_BACKOFF_PERIOD_MILLISECONDS = (
 assert 0 < _LONGEST_BACKOFF_PERIOD_MILLISECONDS <= ((2**31) - 1)
 
 
+# State-set members we have already warned about, so a room that keeps hitting the
+# same unpersisted event does not log it on every state resolution.
+_WARNED_UNEMBEDDED: set[tuple[str, str]] = set()
+_MAX_WARNED_UNEMBEDDED = 10_000
+
+
+def _note_unembedded_state_members(room_id: str, event_ids: Collection[str]) -> None:
+    """Log state-set members that have no auth-graph entry at all.
+
+    A state group can name an event we never persisted, e.g. one dropped because an
+    auth event's signature could not be verified. Such an event has no short id and
+    no edges, so there is nothing to walk. Stock Synapse tolerates this, so the
+    closure code treats it as an edge-less leaf. This is distinct from an event that
+    *has* a short id but no edge record, which is genuine corruption and still raises
+    `IncompleteAuthGraph`.
+    """
+    for event_id in event_ids:
+        key = (room_id, event_id)
+        if (
+            key in _WARNED_UNEMBEDDED
+            or len(_WARNED_UNEMBEDDED) >= _MAX_WARNED_UNEMBEDDED
+        ):
+            logger.debug(
+                "State set member %s in %s is not in the auth graph; "
+                "treating it as having no auth events",
+                event_id,
+                room_id,
+            )
+            continue
+        _WARNED_UNEMBEDDED.add(key)
+        logger.warning(
+            "State set member %s in %s is not in the auth graph (never persisted, "
+            "e.g. dropped for an unverifiable auth event); treating it as having no "
+            "auth events",
+            event_id,
+            room_id,
+        )
+
+
 # All the info we need while iterating the DAG while backfilling
 @attr.s(frozen=True, slots=True, auto_attribs=True)
 class BackfillQueueNavigationItem:
@@ -253,9 +292,13 @@ class EventFederationWorkerStore(
                     event_ids,
                     include_given,
                 )
-            except IncompleteAuthGraph:
+            except IncompleteAuthGraph as e:
+                missing = await self._describe_incomplete_auth_graph(
+                    embedded_db_namespace, room_id, e
+                )
                 raise RuntimeError(
-                    "Auth-chain graph is incomplete after the mtxdb cutover"
+                    "Auth-chain graph is incomplete after the mtxdb cutover; "
+                    f"missing event or auth edge: {missing}"
                 ) from None
             _auth_coverage(
                 "get_auth_chain_ids",
@@ -286,6 +329,35 @@ class EventFederationWorkerStore(
 
         return await self.db_pool.runInteraction(desc, _run)
 
+    async def _describe_incomplete_auth_graph(
+        self, namespace: str, room_id: str, error: Exception
+    ) -> str:
+        """Resolve an incomplete-graph marker to an event ID where possible."""
+        from synapse.storage.databases.main.embedded_event_auth_chains import (
+            resolve_short_ids_to_event_ids,
+        )
+
+        marker = error.args[0] if error.args else "unknown"
+        if isinstance(marker, int):
+            try:
+                event_ids = await self._run_embedded_off_reactor(
+                    "resolve_incomplete_auth_graph_event_id",
+                    resolve_short_ids_to_event_ids,
+                    self._embedded_db_engine,
+                    namespace,
+                    room_id,
+                    [marker],
+                )
+                if event_ids and event_ids[0] is not None:
+                    return event_ids[0]
+            except Exception:
+                # Keep the short ID as a useful diagnostic if reverse lookup
+                # itself fails.
+                pass
+            return f"unknown (room short ID {marker})"
+
+        return str(marker)
+
     def _get_auth_chain_ids_using_embedded_closures(
         self,
         embedded_db_namespace: str,
@@ -305,7 +377,6 @@ class EventFederationWorkerStore(
         caller translates that to `RuntimeError`.
         """
         from synapse.storage.databases.main.embedded_event_auth_chains import (
-            IncompleteAuthGraph,
             resolve_event_ids_to_short_ids,
             resolve_short_ids_to_event_ids,
         )
@@ -327,11 +398,17 @@ class EventFederationWorkerStore(
         resolved_short_ids = resolve_event_ids_to_short_ids(
             engine_name, embedded_db_namespace, room_id, initial_events
         )
-        if any(short_id is None for short_id in resolved_short_ids):
-            raise IncompleteAuthGraph(initial_events[0])
+        unembedded = [
+            event_id
+            for event_id, short_id in zip(initial_events, resolved_short_ids)
+            if short_id is None
+        ]
+        _note_unembedded_state_members(room_id, unembedded)
         short_ids = [
             short_id for short_id in resolved_short_ids if short_id is not None
         ]
+        if not short_ids:
+            return set(unembedded) if include_given else set()
 
         closures = self._auth_chain_closure_cache.get_closures_batch(
             engine_name,
@@ -347,8 +424,9 @@ class EventFederationWorkerStore(
         if include_given:
             result_short_ids.update(short_ids)
 
+        result: set[str] = set(unembedded) if include_given else set()
         if not result_short_ids:
-            return set()
+            return result
 
         resolved = resolve_short_ids_to_event_ids(
             engine_name,
@@ -356,7 +434,8 @@ class EventFederationWorkerStore(
             room_id,
             list(result_short_ids),
         )
-        return {event_id for event_id in resolved if event_id is not None}
+        result.update(event_id for event_id in resolved if event_id is not None)
+        return result
 
     def _get_auth_chain_ids_txn(
         self, txn: LoggingTransaction, event_ids: Collection[str], include_given: bool
@@ -481,9 +560,13 @@ class EventFederationWorkerStore(
                     conflicted_set,
                     additional_backwards_reachable_conflicted_events,
                 )
-            except IncompleteAuthGraph:
+            except IncompleteAuthGraph as e:
+                missing = await self._describe_incomplete_auth_graph(
+                    embedded_db_namespace, room_id, e
+                )
                 raise RuntimeError(
-                    "Auth-chain graph is incomplete after the mtxdb cutover"
+                    "Auth-chain graph is incomplete after the mtxdb cutover; "
+                    f"missing event or auth edge: {missing}"
                 ) from None
             _auth_coverage(
                 "get_auth_chain_difference",
@@ -548,7 +631,6 @@ class EventFederationWorkerStore(
         translates that to `RuntimeError`.
         """
         from synapse.storage.databases.main.embedded_event_auth_chains import (
-            IncompleteAuthGraph,
             get_forward_reachable_short_ids,
             resolve_event_ids_to_short_ids,
             resolve_short_ids_to_event_ids,
@@ -581,13 +663,17 @@ class EventFederationWorkerStore(
         resolved_short_ids = resolve_event_ids_to_short_ids(
             engine_name, embedded_db_namespace, room_id, event_ids
         )
-        if any(short_id is None for short_id in resolved_short_ids):
-            missing = event_ids[resolved_short_ids.index(None)]
-            raise IncompleteAuthGraph(missing)
-        short_ids = [
-            short_id for short_id in resolved_short_ids if short_id is not None
-        ]
-        short_id_of = dict(zip(event_ids, short_ids))
+        unembedded = {
+            event_id
+            for event_id, short_id in zip(event_ids, resolved_short_ids)
+            if short_id is None
+        }
+        _note_unembedded_state_members(room_id, sorted(unembedded))
+        short_id_of = {
+            event_id: short_id
+            for event_id, short_id in zip(event_ids, resolved_short_ids)
+            if short_id is not None
+        }
 
         # State-set closures: union of each set's members' ancestor closures,
         # *plus the members themselves* -- auth-chain-difference semantics are
@@ -598,7 +684,11 @@ class EventFederationWorkerStore(
         # events are seeded into `event_to_missing_sets`).
         set_closures: list[set[int]] = []
         for state_set in state_sets:
-            member_short_ids = [short_id_of[event_id] for event_id in state_set]
+            member_short_ids = [
+                short_id_of[event_id]
+                for event_id in state_set
+                if event_id in short_id_of
+            ]
             closures = self._auth_chain_closure_cache.get_closures_batch(
                 engine_name,
                 embedded_db_namespace,
@@ -618,7 +708,9 @@ class EventFederationWorkerStore(
         if is_state_res_v21:
             assert conflicted_set is not None
             conflicted_short_ids = [
-                short_id_of[event_id] for event_id in conflicted_set
+                short_id_of[event_id]
+                for event_id in conflicted_set
+                if event_id in short_id_of
             ]
 
             # Inclusive backwards-reachable universe: the conflicted events
@@ -636,6 +728,7 @@ class EventFederationWorkerStore(
                 additional_short_ids = [
                     short_id_of[event_id]
                     for event_id in additional_backwards_reachable_conflicted_events
+                    if event_id in short_id_of
                 ]
                 backwards_ids.update(additional_short_ids)
                 for closure in self._auth_chain_closure_cache.get_closures_batch(
@@ -668,13 +761,26 @@ class EventFederationWorkerStore(
             )
             return {event_id for event_id in resolved if event_id is not None}
 
+        # A state-set member we never persisted has no auth edges to walk. Like
+        # the legacy BFS, treat it as a leaf: it is in the difference when the
+        # sets disagree about it, and in the conflicted subgraph when it is
+        # itself conflicted.
+        auth_difference = resolve(auth_difference_ids)
+        auth_difference.update(
+            event_id
+            for event_id in unembedded
+            if not all(event_id in state_set for state_set in state_sets)
+        )
         if is_state_res_v21:
+            assert conflicted_set is not None
+            conflicted_subgraph = resolve(conflicted_subgraph_ids)
+            conflicted_subgraph.update(unembedded & conflicted_set)
             return StateDifference(
-                auth_difference=resolve(auth_difference_ids),
-                conflicted_subgraph=resolve(conflicted_subgraph_ids),
+                auth_difference=auth_difference,
+                conflicted_subgraph=conflicted_subgraph,
             )
         return StateDifference(
-            auth_difference=resolve(auth_difference_ids),
+            auth_difference=auth_difference,
             conflicted_subgraph=None,
         )
 

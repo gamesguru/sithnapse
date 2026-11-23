@@ -166,8 +166,10 @@ class ClosureWalkTests(TestCase):
         )
         embed_auth_edges_batch(None, NAMESPACE, ROOM_ID, [(a_id, [missing_id])])
 
-        with self.assertRaises(IncompleteAuthGraph):
+        with self.assertRaises(IncompleteAuthGraph) as raised:
             self.cache.get_closure(None, NAMESPACE, ROOM_ID, a_id)
+
+        self.assertEqual(raised.exception.args, ("$missing",))
 
         # An incomplete walk must not be cached: retrying must raise again,
         # not silently return a partial closure.
