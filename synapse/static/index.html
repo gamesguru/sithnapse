@@ -500,11 +500,15 @@
           <span class="telemetry-label">Holocron Vault</span>
           <span class="telemetry-pair">
             <span class="telemetry-value" id="stat-postgres">...</span>
-            <span class="telemetry-sub">POSTGRES</span>
+            <span class="telemetry-sub">POSTGRES (DISK)</span>
           </span>
           <span class="telemetry-pair">
             <span class="telemetry-value" id="stat-mtxdb">...</span>
-            <span class="telemetry-sub">MTXDB</span>
+            <span class="telemetry-sub">MTXDB (DISK)</span>
+          </span>
+          <span class="telemetry-pair">
+            <span class="telemetry-value" id="stat-mtxdb-index">...</span>
+            <span class="telemetry-sub">MTXDB (INDEX)</span>
           </span>
           <span class="telemetry-sub" id="stat-mtxdb-sub"
             >EVENTS · STATE · ON DISK</span
@@ -807,6 +811,11 @@
                   if (mtxdbEl)
                     mtxdbEl.textContent = formatBytes(db.mtxdb_bytes);
                 }
+                if (typeof db.mtxdb_index_bytes === "number") {
+                  const indexEl = document.getElementById("stat-mtxdb-index");
+                  if (indexEl)
+                    indexEl.textContent = formatBytes(db.mtxdb_index_bytes);
+                }
 
                 const dbParts = [];
                 if (typeof db.events === "number")
@@ -896,6 +905,7 @@
           ["stat-sanctums", "--"],
           ["stat-postgres", "--"],
           ["stat-mtxdb", "--"],
+          ["stat-mtxdb-index", "--"],
           ["stat-memory", "--"],
         ]) {
           const el = document.getElementById(id);

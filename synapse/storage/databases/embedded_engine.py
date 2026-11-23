@@ -83,6 +83,31 @@ async def get_embedded_db_disk_bytes(
     return await defer_to_thread(reactor, _get_embedded_db_disk_bytes, path)
 
 
+def _get_embedded_db_index_bytes(path: str | None) -> int | None:
+    """Return mtxdb's in-memory index allocation, in bytes, when it is open."""
+    if not path:
+        return None
+    try:
+        from synapse.synapse_rust import mtxdb_engine
+
+        stats = mtxdb_engine.stats()
+        sizes = [
+            int(pool["index_bytes"])
+            for pool in stats.values()
+            if isinstance(pool, dict) and isinstance(pool.get("index_bytes"), int)
+        ]
+        return sum(sizes) if sizes else None
+    except Exception:
+        return None
+
+
+async def get_embedded_db_index_bytes(
+    reactor: ISynapseReactor, path: str | None
+) -> int | None:
+    """Collect embedded DB index memory without blocking the request thread."""
+    return await defer_to_thread(reactor, _get_embedded_db_index_bytes, path)
+
+
 def get_embedded_engine(engine_name: str | None) -> ModuleType:
     """Return the PyO3 module implementing the named embedded DB engine.
 

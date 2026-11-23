@@ -18,7 +18,10 @@ from synapse.api.constants import Direction
 from synapse.api.errors import AuthError
 from synapse.http.server import DirectServeJsonResource
 from synapse.http.site import SynapseRequest
-from synapse.storage.databases.embedded_engine import get_embedded_db_disk_bytes
+from synapse.storage.databases.embedded_engine import (
+    get_embedded_db_disk_bytes,
+    get_embedded_db_index_bytes,
+)
 from synapse.storage.databases.main.transactions import DestinationSortOrder
 from synapse.types import JsonDict
 from synapse.util.memory import get_process_rss_bytes
@@ -108,6 +111,9 @@ class ServerStatsResource(DirectServeJsonResource):
         mtxdb_bytes = await get_embedded_db_disk_bytes(
             self.hs.get_reactor(), self.hs.config.database.embedded_db_path
         )
+        mtxdb_index_bytes = await get_embedded_db_index_bytes(
+            self.hs.get_reactor(), self.hs.config.database.embedded_db_path
+        )
 
         return HTTPStatus.OK, {
             "total_users": total_users,
@@ -123,6 +129,7 @@ class ServerStatsResource(DirectServeJsonResource):
                 "local_joined_members": local_joined_members,
                 "postgres_bytes": postgres_bytes,
                 "mtxdb_bytes": mtxdb_bytes,
+                "mtxdb_index_bytes": mtxdb_index_bytes,
             },
             "memory": {"rss_bytes": get_process_rss_bytes()},
             "server_version": self.hs.version_string,

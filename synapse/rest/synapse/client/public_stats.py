@@ -15,7 +15,10 @@ from typing import TYPE_CHECKING
 from synapse.api.constants import Direction
 from synapse.http.server import DirectServeJsonResource
 from synapse.http.site import SynapseRequest
-from synapse.storage.databases.embedded_engine import get_embedded_db_disk_bytes
+from synapse.storage.databases.embedded_engine import (
+    get_embedded_db_disk_bytes,
+    get_embedded_db_index_bytes,
+)
 from synapse.storage.databases.main.transactions import DestinationSortOrder
 from synapse.types import JsonDict
 from synapse.util.memory import get_process_rss_bytes
@@ -129,6 +132,9 @@ class PublicStatsResource(DirectServeJsonResource):
             "local_joined_members": local_joined_members,
             "postgres_bytes": postgres_bytes,
             "mtxdb_bytes": await get_embedded_db_disk_bytes(
+                self._reactor, self._embedded_db_path
+            ),
+            "mtxdb_index_bytes": await get_embedded_db_index_bytes(
                 self._reactor, self._embedded_db_path
             ),
         }
