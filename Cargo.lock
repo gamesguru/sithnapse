@@ -1025,7 +1025,7 @@ dependencies = [
 [[package]]
 name = "mtxdb"
 version = "0.1.0-beta.3"
-source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?rev=0c4df3430342011de3cb332c79111bef4691122d#0c4df3430342011de3cb332c79111bef4691122d"
+source = "git+https://gitlab.com/wombat-foundation/mtxdb.git?branch=dev#b8895b7fc7ba83451ff92a5d592255e3a9930856"
 dependencies = [
  "arc-swap",
  "base64 0.23.1",
@@ -1455,7 +1455,7 @@ dependencies = [
 [[package]]
 name = "rezzy"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#d3ceff0e84c358097d002ccce023cd11f01d654d"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#19aa0784664e900f872a5acf8486f3126526b0ea"
 dependencies = [
  "base64 0.23.1",
  "blake3",
@@ -1469,7 +1469,7 @@ dependencies = [
 [[package]]
 name = "rezzy-json"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#d3ceff0e84c358097d002ccce023cd11f01d654d"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#19aa0784664e900f872a5acf8486f3126526b0ea"
 dependencies = [
  "ryu",
 ]
@@ -1477,7 +1477,7 @@ dependencies = [
 [[package]]
 name = "rezzy-log"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#d3ceff0e84c358097d002ccce023cd11f01d654d"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#19aa0784664e900f872a5acf8486f3126526b0ea"
 dependencies = [
  "tracing",
 ]
@@ -1485,7 +1485,7 @@ dependencies = [
 [[package]]
 name = "rezzy-recon"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#d3ceff0e84c358097d002ccce023cd11f01d654d"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#19aa0784664e900f872a5acf8486f3126526b0ea"
 dependencies = [
  "base64 0.23.1",
  "blake3",
@@ -1872,7 +1872,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
