@@ -4779,6 +4779,18 @@ fn stats_impl(py: Python<'_>, take_diagnostics: bool) -> PyResult<Py<PyDict>> {
         ])
     })?;
     let out = PyDict::new(py);
+    // The shared WAL belongs to the database root, rather than to any one
+    // pool. Report its current on-disk length once at the top level.
+    let wal_bytes = OPENED_ROOT
+        .lock()
+        .ok()
+        .and_then(|root| root.as_ref().cloned())
+        .and_then(|root| DatabaseLayout::open(root).ok())
+        .and_then(|layout| std::fs::metadata(layout.shared_wal_path()).ok())
+        .map(|metadata| metadata.len());
+    if let Some(wal_bytes) = wal_bytes {
+        out.set_item("wal_bytes", wal_bytes)?;
+    }
     for (name, s, diagnostics, publish_signal_active, disk_bytes) in &snapshots {
         out.set_item(
             *name,

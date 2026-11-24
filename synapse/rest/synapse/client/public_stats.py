@@ -18,6 +18,7 @@ from synapse.http.site import SynapseRequest
 from synapse.storage.databases.embedded_engine import (
     get_embedded_db_disk_bytes,
     get_embedded_db_index_bytes,
+    get_embedded_db_wal_bytes,
 )
 from synapse.storage.databases.main.transactions import DestinationSortOrder
 from synapse.types import JsonDict
@@ -168,6 +169,9 @@ class PublicStatsResource(DirectServeJsonResource):
                 self._reactor, self._embedded_db_path
             ),
             "mtxdb_index_bytes": await get_embedded_db_index_bytes(
+                self._reactor, self._embedded_db_path
+            ),
+            "mtxdb_wal_bytes": await get_embedded_db_wal_bytes(
                 self._reactor, self._embedded_db_path
             ),
         }

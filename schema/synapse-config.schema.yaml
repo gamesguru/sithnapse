@@ -5394,7 +5394,8 @@ properties:
           `total_rooms`, `total_destinations`, `total_known_servers`,
           `database.events`, `database.state_events`, `database.local_users`,
           `database.joined_members`, `database.local_joined_members`,
-          `database.postgres_bytes`, `database.mtxdb_bytes`, and
+          `database.postgres_bytes`, `database.mtxdb_bytes`,
+          `database.mtxdb_index_bytes`, `database.mtxdb_wal_bytes`, and
           `memory.rss_bytes`). Joined member counts are membership rows, not
           distinct users. No identifiers are exposed. This is disabled by
           default.

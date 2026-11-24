@@ -108,6 +108,27 @@ async def get_embedded_db_index_bytes(
     return await defer_to_thread(reactor, _get_embedded_db_index_bytes, path)
 
 
+def _get_embedded_db_wal_bytes(path: str | None) -> int | None:
+    """Return the open mtxdb shared WAL size in bytes, when available."""
+    if not path:
+        return None
+    try:
+        from synapse.synapse_rust import mtxdb_engine
+
+        stats = mtxdb_engine.stats()
+        size = stats.get("wal_bytes")
+        return int(size) if isinstance(size, int) else None
+    except Exception:
+        return None
+
+
+async def get_embedded_db_wal_bytes(
+    reactor: ISynapseReactor, path: str | None
+) -> int | None:
+    """Collect mtxdb WAL size without blocking the request thread."""
+    return await defer_to_thread(reactor, _get_embedded_db_wal_bytes, path)
+
+
 def get_embedded_engine(engine_name: str | None) -> ModuleType:
     """Return the PyO3 module implementing the named embedded DB engine.
 
