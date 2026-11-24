@@ -22,7 +22,7 @@ from tests.unittest import HomeserverTestCase
 
 # Must be at the current `SCHEMA_VERSION`: older deltas are not re-checked once
 # the schema version has advanced past them (see `_get_or_create_schema_state`).
-_DELTA = "98/01_retire_sql_event_edges.sql"
+_DELTA = "97/09_retire_sql_event_edges.sql"
 
 
 class ReadOnlyPrepareDatabaseTests(HomeserverTestCase):

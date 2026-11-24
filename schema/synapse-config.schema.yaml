@@ -2096,8 +2096,10 @@ properties:
     type: object
     description: >-
       Configures the embedded `mtxdb` storage engine, which holds event JSON,
-      state groups and event edges outside the SQL database. Both `engine` and
-      `path` must be set together; setting only one is a configuration error.
+      state groups and event edges outside the SQL database. This is required:
+      event adjacency has no SQL fallback, so the server refuses to start
+      without it. Both `engine` and `path` must be set; setting only one is a
+      configuration error.
 
 
       Worker deployments have extra requirements: the sole events writer must be
@@ -2114,28 +2116,20 @@ properties:
       the `mtxdb` engine.
     properties:
       engine:
-        type: ["string", "null"]
-        enum: [mtxdb, null]
-        description: The embedded engine to use. `mtxdb` is the only supported value.
-        default: null
+        type: string
+        enum: [mtxdb]
+        description: >-
+          The embedded engine to use. Required; `mtxdb` is the only supported
+          value.
         examples:
           - mtxdb
       path:
-        type: ["string", "null"]
+        type: string
         description: >-
-          Path of the mtxdb data file or directory. Required whenever `engine` is
-          set. Persistent state is never placed in a temporary directory, so there
-          is no default.
-        default: null
+          Path of the mtxdb data file or directory. Required, and never placed in
+          a temporary directory, so there is no default.
         examples:
           - /var/lib/synapse/mtxdb
-      namespace:
-        type: ["string", "null"]
-        description: >-
-          Namespace for HAMT keys in the embedded engine. Defaults to the server
-          name when unset. Only useful for isolating several homeservers that
-          share one embedded-engine file; not a normal deployment concern.
-        default: null
       sync_mode:
         type: string
         enum: [interval, always, "off"]
