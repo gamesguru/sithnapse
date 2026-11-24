@@ -51,6 +51,21 @@ from tests.server import (
 )
 
 
+class RepeatedHomeserverSetupTests(unittest.TestCase):
+    """Plain TestCases create homeservers without HomeserverTestCase's teardown.
+
+    Each homeserver gets its own mtxdb root, but the engine client is
+    process-global, so a homeserver left open by one test must not make the
+    next one's open fail.
+    """
+
+    def test_two_homeservers_in_one_test(self) -> None:
+        first = setup_test_homeserver(cleanup_func=self.addCleanup)
+        second = setup_test_homeserver(cleanup_func=self.addCleanup)
+        self.assertIsNot(first, second)
+        self.assertIsNotNone(second.get_datastores().state)
+
+
 class JsonResourceTests(unittest.TestCase):
     def setUp(self) -> None:
         reactor, clock = get_clock()

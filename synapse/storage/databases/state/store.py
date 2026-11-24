@@ -251,8 +251,13 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                     self._embedded_db_path,
                 )
             except Exception as e:
+                # Include the underlying failure in the message: in CI the
+                # chained cause is often all that distinguishes "the store is
+                # locked", "the disk is full" and "a different root is already
+                # open in this process".
                 raise RuntimeError(
-                    f"Failed to open embedded {self._embedded_db_engine} engine at {self._embedded_db_path}"
+                    f"Failed to open embedded {self._embedded_db_engine} engine at "
+                    f"{self._embedded_db_path}: {e!r}"
                 ) from e
 
             # Gated on being the mtxdb *writer* (the events-writer

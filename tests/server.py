@@ -2409,6 +2409,21 @@ def setup_test_homeserver(
     if os.environ.get("SYNAPSE_PG_TIMINGS"):
         set_pg_timing_callback(_pg_timing)
 
+    # The mtxdb client is process-global and each test homeserver gets its own
+    # root. Close one left open by an earlier test before opening this one (a
+    # plain unittest.TestCase has no HomeserverTestCase teardown), and close
+    # this one when the test ends. Without this, a test that builds a
+    # homeserver outside HomeserverTestCase leaves the store open, and the next
+    # homeserver's open fails because a different root is already open in this
+    # process.
+    from synapse.synapse_rust import mtxdb_engine
+
+    def _close_embedded_client() -> None:
+        mtxdb_engine.close_client(durable=False)
+
+    mtxdb_engine.close_client(durable=False)
+    cleanup_func(_close_embedded_client)
+
     with patch("synapse.storage.database.make_pool", side_effect=make_fake_db_pool):
         hs.setup()
     if USE_POSTGRES_FOR_TESTS:
