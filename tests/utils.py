@@ -270,6 +270,57 @@ if EMBEDDED_DB_ENGINE:
 
     atexit.register(_cleanup_per_homeserver_roots)
 
+_EMBEDDED_DB_TEMPLATE: str | None = None
+_EMBEDDED_DB_TEMPLATE_FAILED = False
+
+
+def _embedded_db_template(parent: str) -> str | None:
+    """An empty, closed mtxdb root, created once per process in a subprocess.
+
+    Creating a store fsyncs its descriptor, WAL and their directories (about
+    8 syncs, ~95ms on a slow disk), and every test homeserver needs its own
+    root. Copying a pre-built empty root costs no fsyncs. The subprocess keeps
+    the template out of this process's global store handle.
+    """
+    global _EMBEDDED_DB_TEMPLATE, _EMBEDDED_DB_TEMPLATE_FAILED
+    if _EMBEDDED_DB_TEMPLATE is not None or _EMBEDDED_DB_TEMPLATE_FAILED:
+        return _EMBEDDED_DB_TEMPLATE
+    import subprocess
+
+    template = os.path.join(parent, ".empty-template")
+    try:
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import sys;"
+                "from synapse.synapse_rust import mtxdb_engine as e;"
+                "e.open_client(sys.argv[1]);e.close_client()",
+                template,
+            ],
+            check=True,
+            capture_output=True,
+            timeout=120,
+        )
+    except Exception:
+        # Fall back to letting each homeserver create its own root.
+        _EMBEDDED_DB_TEMPLATE_FAILED = True
+        return None
+    _EMBEDDED_DB_TEMPLATE = template
+    return template
+
+
+def _new_embedded_homeserver_root(parent: str) -> str:
+    """A fresh per-homeserver root, copied from the empty template when possible."""
+    root = os.path.join(parent, uuid.uuid4().hex)
+    template = _embedded_db_template(parent)
+    if template is not None:
+        import shutil
+
+        shutil.copytree(template, root)
+    return root
+
+
 # the dbname we will connect to in order to create the base database.
 POSTGRES_DBNAME_FOR_INITIAL_CREATE = "postgres"
 
@@ -584,7 +635,7 @@ def default_config(
         # root so those ids cannot collide now that keys are unsalted.
         # `HomeserverTestCase.tearDown` closes the global client after every
         # test, so the next homeserver actually opens this path.
-        homeserver_root = os.path.join(EMBEDDED_DB_PATH, uuid.uuid4().hex)
+        homeserver_root = _new_embedded_homeserver_root(EMBEDDED_DB_PATH)
         _EMBEDDED_DB_PER_HOMESERVER_ROOTS.append(homeserver_root)
         config_dict["embedded_db"] = {
             "engine": EMBEDDED_DB_ENGINE,
