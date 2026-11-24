@@ -202,12 +202,12 @@ def main() -> int:
             )
         )
         if len(batch) >= args.batch_size:
-            mtxdb_engine.event_json_put(namespace, batch)
+            mtxdb_engine.event_json_put(batch)
             written += len(batch)
             print(f"Rewrote {written}/{count} events", file=sys.stderr)
             batch.clear()
     if batch:
-        mtxdb_engine.event_json_put(namespace, batch)
+        mtxdb_engine.event_json_put(batch)
         written += len(batch)
     if written != count:
         raise RuntimeError(

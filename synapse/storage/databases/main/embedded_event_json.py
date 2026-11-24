@@ -207,10 +207,10 @@ def put_event_json_batch(
         ]
         _et = time.monotonic()
         if transaction is not None:
-            transaction.event_json_put(namespace, tuples)
+            transaction.event_json_put(tuples)
             ffi_timing("ffi_event_json_put", time.monotonic() - _et)
             return
-        event_json_put(namespace, tuples)
+        event_json_put(tuples)
         ffi_timing("ffi_event_json_put", time.monotonic() - _et)
 
         if sync or _FORCE_SYNC_EVENT_JSON:
