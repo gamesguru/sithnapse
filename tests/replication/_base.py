@@ -18,6 +18,8 @@
 #
 #
 import logging
+import shutil
+import tempfile
 from collections import defaultdict
 from typing import Any, cast
 
@@ -294,6 +296,24 @@ class BaseMultiWorkerStreamTestCase(unittest.HomeserverTestCase):
         # on nothing but a weakref keeping it alive past explicit shutdown.
         self._worker_homeservers: list[HomeServer] = []
 
+        # Worker-shaped configs (sharded event writers plus an instance_map)
+        # cannot carry `embedded_db`: WorkerConfig rejects it in production,
+        # and `make_homeserver_config_obj` therefore drops it here. Event
+        # adjacency has no SQL fallback, so tests that persist events still
+        # need a CSR store. If the main homeserver already opened its
+        # configured store (the normal case), leave it alone -- prepare() may
+        # already have written into it. Otherwise open one shared in-process
+        # root; these fake workers share this process and so share the global
+        # client. Then mark their edge stores writable.
+        from synapse.synapse_rust import mtxdb_engine
+
+        embedded_path = self.hs.config.database.embedded_db_path
+        if not embedded_path:
+            embedded_path = tempfile.mkdtemp(prefix="test-multiworker-mtxdb-")
+            self.addCleanup(shutil.rmtree, embedded_path, ignore_errors=True)
+            mtxdb_engine.open_client(embedded_path)
+        self._enable_embedded_edges(self.hs)
+
         # build a replication server
         self.streamer = self.hs.get_replication_streamer()
 
@@ -347,6 +367,21 @@ class BaseMultiWorkerStreamTestCase(unittest.HomeserverTestCase):
 
         return resource
 
+    @staticmethod
+    def _enable_embedded_edges(hs: HomeServer) -> None:
+        """Route a test homeserver's event adjacency through the open client.
+
+        Config-level `embedded_db` is absent on worker-shaped test configs, so
+        the stores were constructed with the edges backend disabled. The CSR
+        reader is unconditional, so the writer gate must be opened too or
+        persisted events would have no adjacency to read.
+        """
+        datastores = hs.get_datastores()
+        for store in (datastores.main, datastores.persist_events):
+            if store is not None:
+                store._embedded_event_edges_enabled = True
+                store._embedded_event_edges_writable = True
+
     def make_worker_hs(
         self, worker_app: str, extra_config: dict | None = None, **kwargs: Any
     ) -> HomeServer:
@@ -376,6 +411,7 @@ class BaseMultiWorkerStreamTestCase(unittest.HomeserverTestCase):
         # Keep this worker HS alive for the duration of the test -- see the
         # comment on `self._worker_homeservers` in `setUp`.
         self._worker_homeservers.append(worker_hs)
+        self._enable_embedded_edges(worker_hs)
 
         # If the instance is in the `instance_map` config then workers may try
         # and send HTTP requests to it, so we register it with

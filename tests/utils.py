@@ -107,11 +107,13 @@ def get_postgres_clone_strategy() -> tuple[str, str]:
 # DB to disk and query it with the sqlite CLI.
 SQLITE_PERSIST_DB = os.environ.get("SYNAPSE_TEST_PERSIST_SQLITE_DB") is not None
 
-# When set, every test homeserver runs its HAMT state store through the
-# embedded engine (mtxdb) instead of plain SQL -- the trial-embedded
-# CI job's whole purpose. The embedded engine is just a local file, so no
-# "is a server reachable" check is needed here -- config/database.py opens
-# it directly.
+# Every test homeserver runs with the embedded engine (mtxdb). Event
+# adjacency now lives only in mtxdb's CSR store -- the SQL `event_edges` path
+# was removed -- and the forward lookup runs during ordinary room creation, so
+# a homeserver that never opened a store fails with "mtxdb not opened". The
+# engine is just a local file, so no "is a server reachable" check is needed;
+# config/database.py opens it directly. Tests of the missing-engine config
+# error exercise DatabaseConfig directly instead of creating a homeserver.
 #
 # Deliberately *not* falling back to the bare deployment switches
 # (SYNAPSE_EMBEDDED_DB_ENGINE / SYNAPSE_EMBEDDED_DB_PATH / SYNAPSE_MTXDB):
@@ -121,12 +123,15 @@ SQLITE_PERSIST_DB = os.environ.get("SYNAPSE_TEST_PERSIST_SQLITE_DB") is not None
 # store. Only the SYNAPSE_TEST_-prefixed, test-only variables are honoured
 # here. SYNAPSE_TEST_MTXDB is a shorthand alias for
 # the common case of just wanting the mtxdb engine, without spelling out the name.
-EMBEDDED_DB_ENGINE = os.environ.get("SYNAPSE_TEST_EMBEDDED_DB_ENGINE")
-if EMBEDDED_DB_ENGINE is None and os.environ.get("SYNAPSE_TEST_MTXDB"):
+# Event adjacency is CSR-backed and has no SQL fallback, so every test
+# homeserver must have an mtxdb store even when a test run did not explicitly
+# opt into exercising the embedded state/event-json backend.
+EMBEDDED_DB_ENGINE = os.environ.get("SYNAPSE_TEST_EMBEDDED_DB_ENGINE", "mtxdb")
+if os.environ.get("SYNAPSE_TEST_MTXDB"):
     EMBEDDED_DB_ENGINE = "mtxdb"
 
 EMBEDDED_DB_PATH = os.environ.get("SYNAPSE_TEST_EMBEDDED_DB_PATH")
-_embedded_db_path_is_tmp = EMBEDDED_DB_PATH is None and EMBEDDED_DB_ENGINE
+_embedded_db_path_is_tmp = EMBEDDED_DB_PATH is None
 if _embedded_db_path_is_tmp:
     EMBEDDED_DB_PATH = tempfile.mkdtemp()
 elif EMBEDDED_DB_PATH is not None:

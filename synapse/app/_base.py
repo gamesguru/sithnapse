@@ -674,6 +674,19 @@ async def start(hs: "HomeServer", *, freeze: bool = True) -> None:
     server_name = hs.hostname
     reactor = hs.get_reactor()
 
+    # Event adjacency now lives only in mtxdb's CSR store: the SQL
+    # `event_edges` path (and its fallback reads) was removed, and ordinary
+    # room creation reads the forward index. Without a store those reads fail
+    # with "mtxdb not opened" at the first event, long after startup. Refuse to
+    # start instead, with the fix in the message.
+    if not hs.config.database.embedded_db_engine:
+        quit_with_error(
+            "embedded_db.engine must be set to 'mtxdb': event adjacency, "
+            "event JSON and state groups live in the embedded store, and the "
+            "SQL fallbacks were removed. Set embedded_db.engine: mtxdb and "
+            "embedded_db.path to a persistent directory."
+        )
+
     from synapse.storage.databases.main.embedded_event_auth_chains import (
         AuthChainBackendMismatchError,
         check_backend as check_auth_chain_backend,

@@ -20,7 +20,9 @@ from synapse.util.clock import Clock
 
 from tests.unittest import HomeserverTestCase
 
-_DELTA = "97/06_server_key_response_blobs.sql"
+# Must be at the current `SCHEMA_VERSION`: older deltas are not re-checked once
+# the schema version has advanced past them (see `_get_or_create_schema_state`).
+_DELTA = "98/01_retire_sql_event_edges.sql"
 
 
 class ReadOnlyPrepareDatabaseTests(HomeserverTestCase):

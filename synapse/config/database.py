@@ -39,6 +39,12 @@ database:
   name: sqlite3
   args:
     database: %(database_path)s
+
+# Event adjacency, event JSON and state groups live in the embedded mtxdb
+# store, so it is required: the server refuses to start without it.
+embedded_db:
+  engine: mtxdb
+  path: %(embedded_db_path)s
 """
 
 
@@ -271,6 +277,12 @@ class DatabaseConfig(Config):
                 f"embedded_db.engine is {self.embedded_db_engine!r}, "
                 "but only 'mtxdb' is supported."
             )
+        # The server refuses to *start* without this (see app/_base.py), but
+        # DatabaseConfig deliberately permits it: unit tests build worker-shaped
+        # configs that omit embedded_db to avoid the worker guards below, and
+        # they never run the real startup path. Keeping the requirement at
+        # startup also lets `config read`/generation work on a config before
+        # its embedded store path exists.
 
         # Whether the embedded engine requires the write-ahead journal
         # (SYNAPSE_MTXDB_WAL) is a *worker-deployment* question, not a
@@ -310,7 +322,8 @@ class DatabaseConfig(Config):
 
     def generate_config_section(self, data_dir_path: str, **kwargs: Any) -> str:
         return DEFAULT_CONFIG % {
-            "database_path": os.path.join(data_dir_path, "homeserver.db")
+            "database_path": os.path.join(data_dir_path, "homeserver.db"),
+            "embedded_db_path": os.path.join(data_dir_path, "mtxdb"),
         }
 
     def read_arguments(self, args: argparse.Namespace) -> None:

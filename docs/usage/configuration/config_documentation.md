@@ -1646,7 +1646,7 @@ databases:
 ---
 ### `embedded_db`
 
-*(object)* Configures the embedded `mtxdb` storage engine, which holds event JSON, state groups and event edges outside the SQL database. Both `engine` and `path` must be set together; setting only one is a configuration error.
+*(object)* Configures the embedded `mtxdb` storage engine, which holds event JSON, state groups and event edges outside the SQL database. This is required: event adjacency has no SQL fallback, so the server refuses to start without it. Both `engine` and `path` must be set; setting only one is a configuration error.
 
 Worker deployments have extra requirements: the sole events writer must be `main`, only one events writer is allowed, `run_background_tasks_on` must be unset or select `main`, and the `SYNAPSE_MTXDB_WAL=1` environment variable must be set.
 
@@ -1654,11 +1654,9 @@ Environment variables override these options: `SYNAPSE_EMBEDDED_DB_ENGINE`, `SYN
 
 This setting has the following sub-options:
 
-* `engine` (string|null): The embedded engine to use. `mtxdb` is the only supported value. Defaults to `null`.
+* `engine` (string): The embedded engine to use. Required; `mtxdb` is the only supported value.
 
-* `path` (string|null): Path of the mtxdb data file or directory. Required whenever `engine` is set. Persistent state is never placed in a temporary directory, so there is no default. Defaults to `null`.
-
-* `namespace` (string|null): Namespace for HAMT keys in the embedded engine. Defaults to the server name when unset. Only useful for isolating several homeservers that share one embedded-engine file; not a normal deployment concern. Defaults to `null`.
+* `path` (string): Path of the mtxdb data file or directory. Required, and never placed in a temporary directory, so there is no default.
 
 * `sync_mode` (string): How persists make embedded writes visible and durable.
 
