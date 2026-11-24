@@ -4208,9 +4208,19 @@ class PersistEventsStore:
                 # durable when it returns, so a SQL rollback can leave orphan
                 # adjacency (an event no reader can see), but a committed event
                 # cannot lack it. Disposable test stores defer that fsync.
+                #
+                # `sync_mode: off` is the newer spelling of `no_sync` ("as
+                # interval but never fsync"), and it must defer here too. Only
+                # checking `no_sync` left an off-mode store fsyncing the whole
+                # adjacency tail once per persisted event, which is the one
+                # per-event fsync the mode promises not to do.
+                sync_mode = self.hs.config.database.embedded_db_sync_mode
                 put_event_edges_batch(
                     edge_rows,
-                    durable=not self.hs.config.database.embedded_db_no_sync,
+                    durable=not (
+                        self.hs.config.database.embedded_db_no_sync
+                        or sync_mode == "off"
+                    ),
                     transaction=mtxdb_txn,
                 )
                 txn.call_after(mark_dirty, Pool.EVENT_DAG)
