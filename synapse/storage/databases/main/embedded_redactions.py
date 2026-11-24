@@ -52,9 +52,7 @@ layer. SQL stays authoritative through this phase, so writes are
 `SyncTier.CACHE`: a lost unflushed write only costs a slower SQL-fallback read,
 never data loss.
 
-Every key is namespaced (`namespace_hash`) for the same reason as the other
-mirrors: multiple homeservers sharing one mtxdb file must not collide on
-event_id.
+Event ids are globally unique, so the keys are unsalted.
 """
 
 from __future__ import annotations
@@ -67,19 +65,13 @@ from synapse.storage.databases.embedded_engine import get_embedded_engine
 from synapse.storage.databases.main.embedded_common import (
     ffi_timing,
     mirror_timing,
-    namespace_hash,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def _redaction_key(namespace: str, redacts_event_id: str) -> bytes:
-    return (
-        b"redaction:"
-        + namespace_hash(namespace).hex().encode("ascii")
-        + b":"
-        + redacts_event_id.encode("utf-8")
-    )
+def _redaction_key(redacts_event_id: str) -> bytes:
+    return b"redaction:" + redacts_event_id.encode("utf-8")
 
 
 def _encode_redaction(redaction_event_id: str, have_censored: bool) -> bytes:
@@ -101,7 +93,6 @@ def _decode_redaction(value: bytes) -> tuple[str, bool]:
 
 def _write_redaction_batch(
     engine_name: str | None,
-    namespace: str,
     rows: list[tuple[str, str, bool]],
 ) -> None:
     """Raw unconditional write of `(redacts_event_id, redaction_event_id,
@@ -115,7 +106,7 @@ def _write_redaction_batch(
         engine = get_embedded_engine(engine_name)
         pairs = [
             (
-                _redaction_key(namespace, redacts_event_id),
+                _redaction_key(redacts_event_id),
                 _encode_redaction(redaction_event_id, have_censored),
             )
             for redacts_event_id, redaction_event_id, have_censored in rows
@@ -127,7 +118,6 @@ def _write_redaction_batch(
 
 def put_redaction_batch(
     engine_name: str | None,
-    namespace: str,
     rows: list[tuple[str, str, bool]],
 ) -> None:
     """`rows`: `(redacts_event_id, redaction_event_id, have_censored)`.
@@ -143,16 +133,15 @@ def put_redaction_batch(
     """
     if not rows:
         return
-    existing = get_redactions_batch(engine_name, namespace, [r[0] for r in rows])
+    existing = get_redactions_batch(engine_name, [r[0] for r in rows])
     _write_redaction_batch(
         engine_name,
-        namespace,
         [row for row in rows if row[0] not in existing],
     )
 
 
 def get_redactions_batch(
-    engine_name: str | None, namespace: str, redacts_event_ids: list[str]
+    engine_name: str | None, redacts_event_ids: list[str]
 ) -> dict[str, tuple[str, bool]]:
     """Returns `redacts_event_id -> (redaction_event_id, have_censored)` for
     every id found in the embedded engine; a missing id is simply absent from
@@ -162,7 +151,7 @@ def get_redactions_batch(
         return {}
     with mirror_timing("get_redactions"):
         engine = get_embedded_engine(engine_name)
-        keys = [_redaction_key(namespace, event_id) for event_id in redacts_event_ids]
+        keys = [_redaction_key(event_id) for event_id in redacts_event_ids]
         key_to_event_id = dict(zip(keys, redacts_event_ids))
         _et = time.monotonic()
         found = engine.batch_get(keys)
@@ -175,7 +164,6 @@ def get_redactions_batch(
 
 def set_have_censored_batch(
     engine_name: str | None,
-    namespace: str,
     redacts_event_ids: list[str],
     have_censored: bool,
 ) -> None:
@@ -190,12 +178,11 @@ def set_have_censored_batch(
     """
     if not redacts_event_ids:
         return
-    existing = get_redactions_batch(engine_name, namespace, redacts_event_ids)
+    existing = get_redactions_batch(engine_name, redacts_event_ids)
     if not existing:
         return
     _write_redaction_batch(
         engine_name,
-        namespace,
         [
             (redacts_event_id, redaction_event_id, have_censored)
             for redacts_event_id, (redaction_event_id, _) in existing.items()
@@ -204,7 +191,7 @@ def set_have_censored_batch(
 
 
 def delete_redactions_batch(
-    engine_name: str | None, namespace: str, redacts_event_ids: list[str]
+    engine_name: str | None, redacts_event_ids: list[str]
 ) -> None:
     """Removes `redacts_event_id`s from the embedded mirror. Must be called
     wherever `redactions` rows are deleted from SQL (purge_events.py) so the
@@ -214,5 +201,5 @@ def delete_redactions_batch(
     if not redacts_event_ids:
         return
     engine = get_embedded_engine(engine_name)
-    keys = [_redaction_key(namespace, event_id) for event_id in redacts_event_ids]
+    keys = [_redaction_key(event_id) for event_id in redacts_event_ids]
     engine.batch_delete(keys)

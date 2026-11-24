@@ -98,7 +98,7 @@ pub fn adjacency_put(py: Python<'_>, rows: Vec<PutRow>) -> PyResult<()> {
                 })
                 .collect();
             adjacency_for(&room_collection)
-                .record_events(database, &records)
+                .record_events(&database, &records)
                 .map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
                         "mtxdb adjacency record error: {e}"
@@ -214,7 +214,7 @@ pub fn adjacency_purge_room(py: Python<'_>, room_id: String) -> PyResult<()> {
     let database = csr_writer()?;
     py.detach(|| {
         adjacency_for(&event_dag_room_id(&room_id))
-            .purge(database)
+            .purge(&database)
             .map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
                     "mtxdb adjacency purge error: {e}"

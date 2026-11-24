@@ -13,7 +13,6 @@ use std::sync::Mutex;
 
 use lru::LruCache;
 use rezzy::hamt::{HamtNode, StructuralHash};
-use sha2::{Digest, Sha256};
 
 use crate::state_hamt::{
     decode_persisted_node_verified, lookup_from_node_map_preencoded, materialize_from_node_map,
@@ -44,7 +43,7 @@ pub type SelectiveQuery = (
 );
 
 /// Process-wide in-memory cache of decoded HAMT nodes, keyed by their full
-/// (namespaced, room-prefixed) storage key. HAMT nodes are immutable and
+/// room-prefixed storage key. HAMT nodes are immutable and
 /// content-addressed, so a cache hit is always correct modulo the
 /// structural-hash check performed on every hit.
 const NODE_CACHE_CAPACITY: usize = 100_000;
@@ -56,32 +55,28 @@ pub fn new_node_cache() -> NodeCache {
     ))
 }
 
-/// Namespaced, room-prefixed HAMT node key:
-/// `hamt:node:<namespace_hash>:<room_prefix_hex>:<structural_hash_hex>`.
-pub fn node_key(
-    namespace: &str,
-    room_prefix: &[u8; ROOM_PREFIX_LEN],
-    structural_hash: &StructuralHash,
-) -> Vec<u8> {
-    let namespace_hash = Sha256::digest(namespace.as_bytes());
-    let mut key = Vec::with_capacity(10 + 32 + 1 + ROOM_PREFIX_LEN * 2 + 1 + 32);
+/// Room-prefixed HAMT node key:
+/// `hamt:node:<room_prefix_hex>:<structural_hash_hex>`.
+///
+/// Unsalted: the room prefix plus the content-addressed structural hash is
+/// already globally unique, and the physical record id is derived from the
+/// same two components.
+pub fn node_key(room_prefix: &[u8; ROOM_PREFIX_LEN], structural_hash: &StructuralHash) -> Vec<u8> {
+    let mut key = Vec::with_capacity(10 + ROOM_PREFIX_LEN * 2 + 1 + 32);
     key.extend_from_slice(b"hamt:node:");
-    key.extend_from_slice(hex::encode(&namespace_hash[..16]).as_bytes());
-    key.push(b':');
     key.extend_from_slice(hex::encode(room_prefix).as_bytes());
     key.push(b':');
     key.extend_from_slice(hex::encode(structural_hash).as_bytes());
     key
 }
 
-/// Per-namespace HAMT root key: `hamt:root:<namespace_hash_hex[..16]><state_group>`.
-/// Must match `_state_hamt_root_key` in `synapse/storage/databases/
-/// state/bg_updates.py` byte-for-byte.
-pub fn root_key(namespace: &str, state_group: i64) -> Vec<u8> {
-    let namespace_hash = Sha256::digest(namespace.as_bytes());
-    let mut key = Vec::with_capacity(10 + 32 + 20);
+/// HAMT root key: `hamt:root:<state_group>`.
+///
+/// Unsalted: a state-group id is unique inside the database the store
+/// belongs to, which is the only scope a root key is ever used in.
+pub fn root_key(state_group: i64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(10 + 20);
     key.extend_from_slice(b"hamt:root:");
-    key.extend_from_slice(hex::encode(&namespace_hash[..16]).as_bytes());
     key.extend_from_slice(state_group.to_string().as_bytes());
     key
 }
@@ -133,15 +128,14 @@ pub fn decode_root_value(value: &[u8]) -> Result<RootRecord, String> {
 /// return) into `(node_key, node_bytes)` pairs ready for `batch_put` --
 /// shared by both engines' `put_state_hamt_nodes` so callers never write
 /// under a raw structural_hash key (which the BFS walk above can't find,
-/// since it always looks up the namespaced/room-prefixed key).
+/// since it always looks up the room-prefixed key).
 pub fn encode_node_writes(
-    namespace: &str,
     room_prefix: &[u8; ROOM_PREFIX_LEN],
     nodes: Vec<(StructuralHash, Vec<u8>)>,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
     nodes
         .into_iter()
-        .map(|(hash, bytes)| (node_key(namespace, room_prefix, &hash), bytes))
+        .map(|(hash, bytes)| (node_key(room_prefix, &hash), bytes))
         .collect()
 }
 
@@ -155,7 +149,6 @@ const NODE_FETCH_BATCH_SIZE: usize = 100;
 pub fn materialize_state_hamt(
     store: &dyn NodeStore,
     cache: &NodeCache,
-    namespace: &str,
     room_prefix: &[u8; ROOM_PREFIX_LEN],
     root_structural_hash: StructuralHash,
     structural_key: &[u8],
@@ -172,7 +165,7 @@ pub fn materialize_state_hamt(
             {
                 let mut cache = cache.lock().unwrap();
                 for hash in chunk {
-                    let key = node_key(namespace, room_prefix, hash);
+                    let key = node_key(room_prefix, hash);
                     match cache.get(&key) {
                         Some(node) => {
                             if node.structural_hash != *hash {
@@ -220,7 +213,6 @@ pub fn materialize_state_hamt(
 pub fn materialize_state_hamts(
     store: &dyn NodeStore,
     cache: &NodeCache,
-    namespace: &str,
     roots: Vec<NodeLocation>,
 ) -> Result<Vec<StateEntries>, String> {
     let mut node_map: HashMap<NodeLocation, Arc<HamtNode<String, String>>> = HashMap::new();
@@ -235,7 +227,7 @@ pub fn materialize_state_hamts(
             {
                 let mut cache = cache.lock().unwrap();
                 for (room_prefix, structural_key, hash) in chunk {
-                    let key = node_key(namespace, room_prefix, hash);
+                    let key = node_key(room_prefix, hash);
                     match cache.get(&key) {
                         Some(node) => {
                             if node.structural_hash != *hash {
@@ -316,7 +308,6 @@ pub fn materialize_state_hamts(
 pub fn lookup_state_hamts(
     store: &dyn NodeStore,
     cache: &NodeCache,
-    namespace: &str,
     queries: Vec<SelectiveQuery>,
 ) -> Result<Vec<StateEntries>, String> {
     let mut node_map: HashMap<NodeLocation, Arc<HamtNode<String, String>>> = HashMap::new();
@@ -349,7 +340,7 @@ pub fn lookup_state_hamts(
             {
                 let mut cache = cache.lock().unwrap();
                 for (room_prefix, structural_key, hash) in chunk {
-                    let key = node_key(namespace, room_prefix, hash);
+                    let key = node_key(room_prefix, hash);
                     match cache.get(&key) {
                         Some(node) => {
                             if node.structural_hash != *hash {
@@ -452,7 +443,6 @@ mod tests {
     #[test]
     fn lookup_returns_entry_resolved_by_the_last_fetch_round() {
         let room_id = "!lookup:test.example";
-        let namespace = "test";
         let entries = (0..1_000)
             .map(|index| {
                 (
@@ -469,14 +459,13 @@ mod tests {
         let store = MemoryStore(
             nodes
                 .into_iter()
-                .map(|(hash, bytes)| (node_key(namespace, &room_prefix, &hash), bytes))
+                .map(|(hash, bytes)| (node_key(&room_prefix, &hash), bytes))
                 .collect(),
         );
 
         let result = lookup_state_hamts(
             &store,
             &new_node_cache(),
-            namespace,
             vec![(
                 room_prefix,
                 root_hash,

@@ -697,7 +697,6 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
         if getattr(self, "_embedded_event_json_enabled", False):
             found = get_state_group_for_events_batch(
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 [event_id],
                 purpose="read_point",
             )
@@ -770,7 +769,6 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
                 )
             res = get_state_group_for_events_batch(
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 event_ids,
                 purpose="read_batch",
             )
@@ -824,7 +822,6 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
                     res.update(
                         get_state_group_for_events_batch(
                             self._embedded_db_engine,
-                            self._embedded_db_namespace,
                             list(still_missing),
                             purpose="read_batch_after_sql_fallback",
                         )
@@ -878,7 +875,6 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             state_groups = list(state_groups)
             referenced = get_referenced_state_groups_batch(
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 state_groups,
             )
             # Rows not yet migrated from SQL aren't in the refcount, but still
@@ -901,7 +897,6 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
                 if remaining:
                     referenced = referenced | get_referenced_state_groups_batch(
                         self._embedded_db_engine,
-                        self._embedded_db_namespace,
                         list(remaining),
                     )
             return referenced
@@ -946,7 +941,6 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             )
             repoint_event_state_group(
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 event_id,
                 state_group,
             )
@@ -1024,7 +1018,6 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             )
             repoint_event_state_group(
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 event.event_id,
                 state_group,
             )

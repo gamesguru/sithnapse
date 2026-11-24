@@ -288,7 +288,6 @@ class StickyEventsWorkerStore(StateGroupWorkerStore, CacheInvalidationWorkerStor
         if missing_meta_ids and getattr(self, "_embedded_event_json_enabled", False):
             found = get_event_json_batch(
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 missing_meta_ids,
             )
             for eid, (m, _, _) in found.items():
@@ -370,7 +369,6 @@ class StickyEventsWorkerStore(StateGroupWorkerStore, CacheInvalidationWorkerStor
         if missing_ids and getattr(self, "_embedded_event_json_enabled", False):
             found = get_event_json_batch(
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 missing_ids,
             )
             for eid, (m, _, _) in found.items():
@@ -790,7 +788,6 @@ class StickyEventsWorkerStore(StateGroupWorkerStore, CacheInvalidationWorkerStor
         ):
             found = get_event_json_batch(
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 possibly_soft_failed_ids,
             )
             for eid, (m, _, _) in found.items():
@@ -852,7 +849,6 @@ class StickyEventsWorkerStore(StateGroupWorkerStore, CacheInvalidationWorkerStor
         if getattr(self, "_embedded_event_json_enabled", False):
             found = get_event_json_batch(
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 list(sticky_event_ids),
             )
             mirror_rows: list[tuple[str, str, str, str, int | None]] = []
@@ -887,7 +883,6 @@ class StickyEventsWorkerStore(StateGroupWorkerStore, CacheInvalidationWorkerStor
             if mirror_rows:
                 put_event_json_batch(
                     self._embedded_db_engine,
-                    self._embedded_db_namespace,
                     mirror_rows,
                 )
 

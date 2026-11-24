@@ -393,7 +393,6 @@ class EventsBackgroundUpdatesStore(
             ):
                 found = get_event_json_batch(
                     self._embedded_db_engine,
-                    self._embedded_db_namespace,
                     missing_json_ids,
                 )
                 for eid, (_, j, _) in found.items():
@@ -648,7 +647,6 @@ class EventsBackgroundUpdatesStore(
             ):
                 found = get_event_json_batch(
                     self._embedded_db_engine,
-                    self._embedded_db_namespace,
                     missing_meta_ids,
                 )
                 for eid, (m, _, _) in found.items():
@@ -706,7 +704,6 @@ class EventsBackgroundUpdatesStore(
                 ):
                     found = get_event_json_batch(
                         self._embedded_db_engine,
-                        self._embedded_db_namespace,
                         missing_meta_ids,
                     )
                     for eid, (m, _, _) in found.items():
@@ -894,7 +891,6 @@ class EventsBackgroundUpdatesStore(
             ):
                 found = get_event_json_batch(
                     self._embedded_db_engine,
-                    self._embedded_db_namespace,
                     missing_meta_ids,
                 )
                 for eid, (m, _, _) in found.items():
@@ -1004,7 +1000,6 @@ class EventsBackgroundUpdatesStore(
             ):
                 found = get_event_json_batch(
                     self._embedded_db_engine,
-                    self._embedded_db_namespace,
                     missing_json_ids,
                 )
                 for event_id, (_meta, body, _format_version) in found.items():
@@ -1124,7 +1119,6 @@ class EventsBackgroundUpdatesStore(
             ):
                 found = get_event_json_batch(
                     self._embedded_db_engine,
-                    self._embedded_db_namespace,
                     missing_json_ids,
                 )
                 for eid, (_, j, _) in found.items():
@@ -1260,7 +1254,6 @@ class EventsBackgroundUpdatesStore(
             ):
                 found = get_event_json_batch(
                     self._embedded_db_engine,
-                    self._embedded_db_namespace,
                     missing_json_ids,
                 )
                 for eid, (_, j, _) in found.items():
@@ -2709,7 +2702,6 @@ class EventsBackgroundUpdatesStore(
                 if getattr(self, "_embedded_event_json_enabled", False):
                     put_event_json_batch(
                         self._embedded_db_engine,
-                        self._embedded_db_namespace,
                         [
                             (
                                 event_id,

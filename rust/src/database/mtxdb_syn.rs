@@ -111,15 +111,21 @@ struct MtxdbPools {
     state: Arc<PackfileStorage>,
     event_dag: Arc<PackfileStorage>,
     server_info: Arc<PackfileStorage>,
-    shared_database: Option<Database>,
-    read_graph: Option<ReadOnlyGraph>,
+    shared_database: Option<Arc<Database>>,
+    read_graph: Option<Arc<ReadOnlyGraph>>,
 }
 
 /// Base directory for the state_group -> room_prefix room-index file (see
-/// `room_index` module below), set once by `open_client`.
-static ROOM_INDEX_DIR: OnceCell<std::path::PathBuf> = OnceCell::new();
+/// `room_index` module below), set by `open_client` and cleared by
+/// `close_client`.
+static ROOM_INDEX_DIR: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 
-static DBS: OnceCell<MtxdbPools> = OnceCell::new();
+/// The open store. `None` until `open_client`/`open_client_read_only` opens
+/// it, and again after `close_client` drops it. A plain `OnceCell` is not
+/// enough: tests open one root per homeserver (state-group ids restart at 1
+/// in each fresh SQL database, and keys are unsalted), so they must be able
+/// to close and reopen between cases.
+static DBS: Mutex<Option<Arc<MtxdbPools>>> = Mutex::new(None);
 /// Whether this process opened mtxdb writable (`open_client`) or
 /// read-only (`open_client_read_only`). Checked by every mutating
 /// pyfunction via `assert_writable()` before touching any fd -- a
@@ -129,25 +135,33 @@ static DBS: OnceCell<MtxdbPools> = OnceCell::new();
 /// process sharing it. Gating once here, at the single choke point every
 /// mutating call passes through, means no future write door can reopen
 /// that hole the way a per-Python-callsite guard could.
-static WRITE_MODE: OnceCell<bool> = OnceCell::new();
+static WRITE_MODE: Mutex<Option<bool>> = Mutex::new(None);
 /// Serializes the semantic collision check with the corresponding root write
 /// within this process. Cross-process writers are serialized by the mtxdb
 /// writer handle, while this closes the read/check/write window between local
 /// Python workers sharing the process.
 static STATE_HAMT_ROOT_WRITE_LOCK: OnceCell<Mutex<()>> = OnceCell::new();
 /// The pid that actually opened `DBS`, recorded alongside it. `DBS` is a
-/// process-global `OnceCell`; under a fork()-based worker launcher a
+/// process-global slot; under a fork()-based worker launcher a
 /// child that inherits an already-`Some` `DBS` from its parent's address
 /// space must not silently reuse those fds as if it had opened them
 /// itself -- see `check_pid_guard`.
-static OPENER_PID: OnceCell<u32> = OnceCell::new();
+static OPENER_PID: Mutex<Option<u32>> = Mutex::new(None);
 
 /// Raises if this process opened mtxdb read-only (or never opened it),
 /// before any mutating pyfunction touches a fd. See `WRITE_MODE`'s doc
 /// comment for why this must be the single choke point, not a per-caller
 /// guard.
+/// True when this process opened the store read-only.
+fn opened_read_only() -> bool {
+    matches!(WRITE_MODE.lock().map(|mode| *mode), Ok(Some(false)))
+}
+
 pub(crate) fn assert_writable() -> PyResult<()> {
-    match WRITE_MODE.get() {
+    let write_mode = *WRITE_MODE
+        .lock()
+        .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("WRITE_MODE lock poisoned"))?;
+    match write_mode {
         Some(true) => Ok(()),
         Some(false) => Err(pyo3::exceptions::PyRuntimeError::new_err(
             "mtxdb opened read-only in this process; refusing to write \
@@ -174,12 +188,19 @@ pub(crate) fn assert_writable() -> PyResult<()> {
 /// use opens mtxdb strictly post-fork, per the topology audit), but a
 /// future pre-fork opener would otherwise reintroduce it silently.
 fn check_pid_guard() -> PyResult<bool> {
-    if DBS.get().is_none() {
+    let is_open = DBS
+        .lock()
+        .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("DBS lock poisoned"))?
+        .is_some();
+    if !is_open {
         return Ok(false);
     }
     let current = std::process::id();
-    match OPENER_PID.get() {
-        Some(&opener) if opener == current => Ok(true),
+    let opener = *OPENER_PID
+        .lock()
+        .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("OPENER_PID lock poisoned"))?;
+    match opener {
+        Some(opener) if opener == current => Ok(true),
         opener => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
             "mtxdb DBS state was inherited from another process (opener \
              pid {opener:?}, current pid {current}); refusing to reuse \
@@ -196,7 +217,6 @@ pub(crate) static RMW_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 struct RepointTestHook {
-    namespace: String,
     staged: std::sync::mpsc::Sender<()>,
     resume: std::sync::mpsc::Receiver<()>,
 }
@@ -210,35 +230,46 @@ static REPOINT_TEST_HOOK: Mutex<Option<RepointTestHook>> = Mutex::new(None);
 static REFCOUNT_INITS: AtomicU64 = AtomicU64::new(0);
 static REFCOUNT_EXISTING: AtomicU64 = AtomicU64::new(0);
 
-fn pools() -> PyResult<&'static MtxdbPools> {
-    DBS.get()
+fn pools() -> PyResult<Arc<MtxdbPools>> {
+    DBS.lock()
+        .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("DBS lock poisoned"))?
+        .as_ref()
+        .map(Arc::clone)
         .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("mtxdb not opened"))
 }
 
-pub(crate) fn state_db() -> PyResult<&'static Arc<PackfileStorage>> {
-    Ok(&pools()?.state)
+pub(crate) fn state_db() -> PyResult<Arc<PackfileStorage>> {
+    Ok(Arc::clone(&pools()?.state))
 }
 
-pub(crate) fn event_dag_db() -> PyResult<&'static Arc<PackfileStorage>> {
-    Ok(&pools()?.event_dag)
+pub(crate) fn event_dag_db() -> PyResult<Arc<PackfileStorage>> {
+    Ok(Arc::clone(&pools()?.event_dag))
 }
 
-pub(crate) fn server_info_db() -> PyResult<&'static Arc<PackfileStorage>> {
-    Ok(&pools()?.server_info)
+pub(crate) fn server_info_db() -> PyResult<Arc<PackfileStorage>> {
+    Ok(Arc::clone(&pools()?.server_info))
+}
+
+fn room_index_dir() -> PyResult<std::path::PathBuf> {
+    ROOM_INDEX_DIR
+        .lock()
+        .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("ROOM_INDEX_DIR lock poisoned"))?
+        .clone()
+        .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("mtxdb not opened"))
 }
 
 /// Read view for adjacency lookups: the writer's `Database`, or the read-only
 /// view a worker opened.
-pub(crate) enum CsrReader<'a> {
-    Writer(&'a Database),
-    ReadOnly(&'a ReadOnlyGraph),
+pub(crate) enum CsrReader {
+    Writer(Arc<Database>),
+    ReadOnly(Arc<ReadOnlyGraph>),
 }
 
-impl GraphReader for CsrReader<'_> {
+impl GraphReader for CsrReader {
     fn layout(&self) -> &DatabaseLayout {
         match self {
-            Self::Writer(db) => GraphReader::layout(*db),
-            Self::ReadOnly(graph) => graph.layout(),
+            Self::Writer(db) => GraphReader::layout(&**db),
+            Self::ReadOnly(graph) => GraphReader::layout(&**graph),
         }
     }
 
@@ -249,32 +280,36 @@ impl GraphReader for CsrReader<'_> {
         ids: &[NodeId],
     ) -> Result<Vec<Option<NodeData>>, StorageError> {
         match self {
-            Self::Writer(db) => GraphReader::read_nodes(*db, pool, collection, ids),
-            Self::ReadOnly(graph) => GraphReader::read_nodes(*graph, pool, collection, ids),
+            Self::Writer(db) => GraphReader::read_nodes(&**db, pool, collection, ids),
+            Self::ReadOnly(graph) => GraphReader::read_nodes(&**graph, pool, collection, ids),
         }
     }
 }
 
-pub(crate) fn csr_reader() -> PyResult<CsrReader<'static>> {
+pub(crate) fn csr_reader() -> PyResult<CsrReader> {
     let pools = pools()?;
     if let Some(db) = pools.shared_database.as_ref() {
-        return Ok(CsrReader::Writer(db));
+        return Ok(CsrReader::Writer(Arc::clone(db)));
     }
     pools
         .read_graph
         .as_ref()
-        .map(CsrReader::ReadOnly)
+        .map(|graph| CsrReader::ReadOnly(Arc::clone(graph)))
         .ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err("mtxdb adjacency reader unavailable")
         })
 }
 
 /// The writer's `Database`, for adjacency writes.
-pub(crate) fn csr_writer() -> PyResult<&'static Database> {
+pub(crate) fn csr_writer() -> PyResult<Arc<Database>> {
     assert_writable()?;
-    pools()?.shared_database.as_ref().ok_or_else(|| {
-        pyo3::exceptions::PyRuntimeError::new_err("mtxdb adjacency writer unavailable")
-    })
+    pools()?
+        .shared_database
+        .as_ref()
+        .map(Arc::clone)
+        .ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("mtxdb adjacency writer unavailable")
+        })
 }
 
 const RETRYABLE_READ_ERROR_PREFIX: &str = "__MTXDB_RETRYABLE_READ__: ";
@@ -328,7 +363,7 @@ fn shard_type_for_key(key: &[u8]) -> ShardType {
     }
 }
 
-fn db_for_shard_type(shard_type: ShardType) -> PyResult<&'static Arc<PackfileStorage>> {
+fn db_for_shard_type(shard_type: ShardType) -> PyResult<Arc<PackfileStorage>> {
     match shard_type {
         ShardType::State => state_db(),
         ShardType::EventDag => event_dag_db(),
@@ -345,17 +380,17 @@ fn parse_node_key(key: &[u8]) -> Option<([u8; ROOM_PREFIX_LEN], [u8; 32])> {
     if !key.starts_with(b"hamt:node:") {
         return None;
     }
-    if key.len() != 124 {
+    if key.len() != 91 {
         return None;
     }
 
-    let room_prefix_hex = &key[43..59];
+    let room_prefix_hex = &key[10..26];
     let mut room_prefix = [0u8; ROOM_PREFIX_LEN];
     if hex::decode_to_slice(room_prefix_hex, &mut room_prefix).is_err() {
         return None;
     }
 
-    let hash_hex = &key[60..124];
+    let hash_hex = &key[27..91];
     let mut hash = [0u8; 32];
     if hex::decode_to_slice(hash_hex, &mut hash).is_err() {
         return None;
@@ -383,10 +418,9 @@ fn parse_node_key(key: &[u8]) -> Option<([u8; ROOM_PREFIX_LEN], [u8; 32])> {
 /// several state groups -- including state groups in other rooms that resolved
 /// to identical state -- share that single copy, and it is what
 /// `get_state_hamt_roots_for_room` follows to find the root.
-fn root_node_id(namespace: &str, state_group: i64) -> [u8; 16] {
-    let mut buf = Vec::with_capacity(b"hamt:root:".len() + namespace.len() + 8);
+fn root_node_id(state_group: i64) -> [u8; 16] {
+    let mut buf = Vec::with_capacity(b"hamt:root:".len() + 8);
     buf.extend_from_slice(b"hamt:root:");
-    buf.extend_from_slice(namespace.as_bytes());
     buf.extend_from_slice(&state_group.to_be_bytes());
     let hash = Sha256::digest(&buf);
     let mut id = [0u8; 16];
@@ -396,12 +430,9 @@ fn root_node_id(namespace: &str, state_group: i64) -> [u8; 16] {
 
 /// Semantic root index key, addressing the room's canonical LtHash-derived state
 /// identity to the single encoded root stored for it.
-fn state_group_root_node_id(namespace: &str, state_group_id: &[u8; 32]) -> [u8; 16] {
-    let namespace_len = u32::try_from(namespace.len()).expect("namespace length fits u32");
-    let mut buf = Vec::with_capacity(b"hamt:root-id:v1:".len() + 4 + namespace.len() + 32);
+fn state_group_root_node_id(state_group_id: &[u8; 32]) -> [u8; 16] {
+    let mut buf = Vec::with_capacity(b"hamt:root-id:v1:".len() + 32);
     buf.extend_from_slice(b"hamt:root-id:v1:");
-    buf.extend_from_slice(&namespace_len.to_be_bytes());
-    buf.extend_from_slice(namespace.as_bytes());
     buf.extend_from_slice(state_group_id);
     let hash = Sha256::digest(&buf);
     let mut id = [0u8; 16];
@@ -409,12 +440,9 @@ fn state_group_root_node_id(namespace: &str, state_group_id: &[u8; 32]) -> [u8; 
     id
 }
 
-fn state_group_refcount_node_id(namespace: &str, state_group_id: &[u8; 32]) -> [u8; 16] {
-    let namespace_len = u32::try_from(namespace.len()).expect("namespace length fits u32");
-    let mut buf = Vec::with_capacity(b"hamt:root-refcount:v1:".len() + 4 + namespace.len() + 32);
+fn state_group_refcount_node_id(state_group_id: &[u8; 32]) -> [u8; 16] {
+    let mut buf = Vec::with_capacity(b"hamt:root-refcount:v1:".len() + 32);
     buf.extend_from_slice(b"hamt:root-refcount:v1:");
-    buf.extend_from_slice(&namespace_len.to_be_bytes());
-    buf.extend_from_slice(namespace.as_bytes());
     buf.extend_from_slice(state_group_id);
     let hash = Sha256::digest(&buf);
     let mut id = [0u8; 16];
@@ -579,7 +607,6 @@ fn room_id_from_prefix(room_prefix: &[u8]) -> [u8; 16] {
 #[pyfunction]
 pub fn put_state_hamt_roots(
     py: Python<'_>,
-    namespace: String,
     room_prefix: Vec<u8>,
     roots: Vec<(i64, Vec<u8>)>,
 ) -> PyResult<()> {
@@ -624,7 +651,7 @@ pub fn put_state_hamt_roots(
         // root writes nothing at all.
         let pointer_node_ids: Vec<NodeId> = validated_roots
             .iter()
-            .map(|(state_group, _, _)| root_node_id(&namespace, *state_group))
+            .map(|(state_group, _, _)| root_node_id(*state_group))
             .collect();
         let existing_pointers = engine
             .get_read_committed(&room_id, &pointer_node_ids)
@@ -632,7 +659,7 @@ pub fn put_state_hamt_roots(
 
         let semantic_node_ids: Vec<NodeId> = semantic_ids
             .iter()
-            .map(|id| state_group_root_node_id(&namespace, id))
+            .map(state_group_root_node_id)
             .collect();
         let existing_semantics = engine
             .get_read_committed(&room_id, &semantic_node_ids)
@@ -655,7 +682,7 @@ pub fn put_state_hamt_roots(
 
         let refcount_node_ids: Vec<NodeId> = semantic_ids
             .iter()
-            .map(|id| state_group_refcount_node_id(&namespace, id))
+            .map(state_group_refcount_node_id)
             .collect();
         let refcounts = engine
             .get_read_committed(&room_id, &refcount_node_ids)
@@ -728,12 +755,12 @@ pub fn put_state_hamt_roots(
             // same state share this one copy.
             if !semantic_present.get(state_group_id).copied().unwrap_or(false) {
                 pairs.push((
-                    state_group_root_node_id(&namespace, state_group_id),
+                    state_group_root_node_id(state_group_id),
                     NodeData::new(bytes::Bytes::from(value.clone())),
                 ));
             }
             pairs.push((
-                root_node_id(&namespace, *state_group),
+                root_node_id(*state_group),
                 NodeData::from_slice(state_group_id),
             ));
         }
@@ -744,7 +771,7 @@ pub fn put_state_hamt_roots(
                 .map(|count| (id, count))
         }) {
             pairs.push((
-                state_group_refcount_node_id(&namespace, &state_group_id),
+                state_group_refcount_node_id(&state_group_id),
                 NodeData::from_slice(&count.to_be_bytes()),
             ));
         }
@@ -785,7 +812,6 @@ pub fn put_state_hamt_roots(
 #[pyfunction]
 pub fn delete_state_hamt_roots_for_room(
     py: Python<'_>,
-    namespace: String,
     room_prefix: Vec<u8>,
     state_groups: Vec<i64>,
 ) -> PyResult<()> {
@@ -804,7 +830,7 @@ pub fn delete_state_hamt_roots_for_room(
         let engine = state_db()?;
         let pointer_ids: Vec<NodeId> = state_groups
             .iter()
-            .map(|&state_group| root_node_id(&namespace, state_group))
+            .map(|&state_group| root_node_id(state_group))
             .collect();
         let pointers = engine
             .get_read_committed(&room_id, &pointer_ids)
@@ -826,7 +852,7 @@ pub fn delete_state_hamt_roots_for_room(
                 .transpose()?;
             resolved.push((*state_group, state_group_id));
             pairs.push((
-                root_node_id(&namespace, *state_group),
+                root_node_id(*state_group),
                 NodeData::new(bytes::Bytes::new()),
             ));
         }
@@ -839,7 +865,7 @@ pub fn delete_state_hamt_roots_for_room(
             .collect();
         let refcount_node_ids: Vec<NodeId> = semantic_ids
             .iter()
-            .map(|id| state_group_refcount_node_id(&namespace, id))
+            .map(state_group_refcount_node_id)
             .collect();
         let refcounts = engine
             .get_read_committed(&room_id, &refcount_node_ids)
@@ -883,17 +909,17 @@ pub fn delete_state_hamt_roots_for_room(
                 }
                 Some(count) if count > decrement => {
                     pairs.push((
-                        state_group_refcount_node_id(&namespace, &state_group_id),
+                        state_group_refcount_node_id(&state_group_id),
                         NodeData::from_slice(&(count - decrement).to_be_bytes()),
                     ));
                 }
                 Some(_) => {
                     pairs.push((
-                        state_group_refcount_node_id(&namespace, &state_group_id),
+                        state_group_refcount_node_id(&state_group_id),
                         NodeData::new(bytes::Bytes::new()),
                     ));
                     pairs.push((
-                        state_group_root_node_id(&namespace, &state_group_id),
+                        state_group_root_node_id(&state_group_id),
                         NodeData::new(bytes::Bytes::new()),
                     ));
                 }
@@ -931,7 +957,6 @@ pub fn delete_state_hamt_roots_for_room(
 #[pyfunction]
 pub fn get_state_hamt_roots_for_room(
     py: Python<'_>,
-    namespace: String,
     room_prefix: Vec<u8>,
     state_groups: Vec<i64>,
 ) -> PyResult<Vec<Option<Vec<u8>>>> {
@@ -941,7 +966,7 @@ pub fn get_state_hamt_roots_for_room(
         // Read-only workers hold an open-time collection index; refresh on a
         // miss so a state group root the writer appended after this worker
         // opened is visible (same pattern as `auth_chain_edges_get`).
-        follow_root_pointers(engine, &room_id, &namespace, &state_groups)
+        follow_root_pointers(&engine, &room_id, &state_groups)
     })
 }
 
@@ -954,13 +979,9 @@ pub fn get_state_hamt_roots_for_room(
 fn follow_root_pointers(
     engine: &PackfileStorage,
     room_id: &[u8; 16],
-    namespace: &str,
     state_groups: &[i64],
 ) -> std::result::Result<Vec<Option<Vec<u8>>>, PyErr> {
-    let pointer_ids: Vec<NodeId> = state_groups
-        .iter()
-        .map(|&sg| root_node_id(namespace, sg))
-        .collect();
+    let pointer_ids: Vec<NodeId> = state_groups.iter().map(|&sg| root_node_id(sg)).collect();
     let pointers = engine
         .get_read_committed(room_id, &pointer_ids)
         .map_err(map_read_storage_error)?;
@@ -987,10 +1008,7 @@ fn follow_root_pointers(
         resolved.push(state_group_id);
     }
 
-    let semantic_ids: Vec<NodeId> = wanted
-        .iter()
-        .map(|id| state_group_root_node_id(namespace, id))
-        .collect();
+    let semantic_ids: Vec<NodeId> = wanted.iter().map(state_group_root_node_id).collect();
     let values = engine
         .get_read_committed(room_id, &semantic_ids)
         .map_err(map_read_storage_error)?;
@@ -1016,7 +1034,6 @@ fn follow_root_pointers(
 #[pyfunction]
 pub fn get_state_hamt_roots_by_state_group_id(
     py: Python<'_>,
-    namespace: String,
     room_prefix: Vec<u8>,
     state_group_ids: Vec<Vec<u8>>,
 ) -> PyResult<Vec<Option<Vec<u8>>>> {
@@ -1030,10 +1047,7 @@ pub fn get_state_hamt_roots_by_state_group_id(
             Ok(id)
         })
         .collect::<PyResult<_>>()?;
-    let node_ids: Vec<NodeId> = parsed_ids
-        .iter()
-        .map(|id| state_group_root_node_id(&namespace, id))
-        .collect();
+    let node_ids: Vec<NodeId> = parsed_ids.iter().map(state_group_root_node_id).collect();
     py.detach(|| {
         let engine = state_db()?;
         let results = engine
@@ -1114,11 +1128,10 @@ fn decode_state_hamt_root(value: &[u8]) -> PyResult<(Vec<u8>, Vec<u8>, String)> 
 #[allow(clippy::type_complexity)]
 pub fn get_state_hamt_roots_bulk(
     py: Python<'_>,
-    namespace: String,
     state_groups: Vec<i64>,
 ) -> PyResult<Vec<Option<(Vec<u8>, Vec<u8>, String)>>> {
     py.detach(|| {
-        let room_prefixes = room_index::get_many(&namespace, &state_groups)?;
+        let room_prefixes = room_index::get_many(&state_groups)?;
 
         let mut groups_by_room: HashMap<Vec<u8>, Vec<(usize, i64)>> = HashMap::new();
         for (index, (&state_group, room_prefix)) in
@@ -1146,7 +1159,7 @@ pub fn get_state_hamt_roots_bulk(
                 .iter()
                 .map(|(_, state_group)| *state_group)
                 .collect();
-            let mut found = follow_root_pointers(engine, &room_id, &namespace, &wanted)?;
+            let mut found = follow_root_pointers(&engine, &room_id, &wanted)?;
 
             if found.iter().any(Option::is_none) {
                 engine.refresh_collection(&room_id).map_err(|e| {
@@ -1158,7 +1171,7 @@ pub fn get_state_hamt_roots_bulk(
                     .iter()
                     .map(|(_, state_group)| *state_group)
                     .collect();
-                found = follow_root_pointers(engine, &room_id, &namespace, &wanted)?;
+                found = follow_root_pointers(&engine, &room_id, &wanted)?;
             }
 
             for ((index, _), record) in room_groups.into_iter().zip(found) {
@@ -1196,11 +1209,10 @@ pub fn get_state_hamt_roots_bulk(
 #[pyfunction]
 pub fn refresh_state_hamt_collections_for_groups(
     py: Python<'_>,
-    namespace: String,
     state_groups: Vec<i64>,
 ) -> PyResult<()> {
     py.detach(|| {
-        let room_prefixes = room_index::get_many(&namespace, &state_groups)?;
+        let room_prefixes = room_index::get_many(&state_groups)?;
         let mut seen_rooms: HashSet<Vec<u8>> = HashSet::new();
         let engine = state_db()?;
         for room_prefix in room_prefixes.into_iter().flatten() {
@@ -1241,15 +1253,13 @@ mod room_index {
 
     use lru::LruCache;
     use pyo3::PyResult;
-    use sha2::{Digest, Sha256};
 
-    use super::{ROOM_INDEX_DIR, ROOM_PREFIX_LEN};
+    use super::ROOM_PREFIX_LEN;
 
     const INDEX_MAGIC: [u8; 4] = *b"MTRI";
     const SHARD_COUNT: u8 = 64;
     const HANDLE_CACHE_CAPACITY: usize = SHARD_COUNT as usize;
-    const NAMESPACE_DIGEST_LEN: usize = 16;
-    const RECORD_LEN: usize = 4 + NAMESPACE_DIGEST_LEN + 8 + ROOM_PREFIX_LEN;
+    const RECORD_LEN: usize = 4 + 8 + ROOM_PREFIX_LEN;
 
     // A real `room_prefix` is always exactly `ROOM_PREFIX_LEN` (8) bytes --
     // `room_hamt_prefix_raw` truncates to that length unconditionally in
@@ -1265,10 +1275,7 @@ mod room_index {
     // turning the index into an unbounded second copy of all state groups.
     const PREFIX_CACHE_CAPACITY: usize = 100_000;
 
-    #[allow(clippy::type_complexity)]
-    static PREFIX_CACHE: Mutex<
-        Option<LruCache<([u8; NAMESPACE_DIGEST_LEN], i64), [u8; ROOM_PREFIX_LEN]>>,
-    > = Mutex::new(None);
+    static PREFIX_CACHE: Mutex<Option<LruCache<i64, [u8; ROOM_PREFIX_LEN]>>> = Mutex::new(None);
 
     /// Handles are cached by fixed shard and access mode, never by namespace.
     /// A read-only lookup must never poison the writable handle used by `put`.
@@ -1290,40 +1297,22 @@ mod room_index {
     /// physical pools.
     static DIRTY: Mutex<Option<HashSet<u8>>> = Mutex::new(None);
 
-    /// Shard for a namespace, from its already-computed digest. Callers hash
-    /// the namespace once and pass the digest down rather than re-hashing it.
-    fn shard_for(digest: &[u8; NAMESPACE_DIGEST_LEN]) -> u8 {
-        digest[0] % SHARD_COUNT
+    /// Shard for a state group. State-group ids are the only index key now
+    /// that the namespace salt is gone, so the id itself picks the shard.
+    fn shard_for(state_group: i64) -> u8 {
+        (state_group as u64 % u64::from(SHARD_COUNT)) as u8
     }
 
     fn index_path(shard: u8, create: bool) -> PyResult<std::path::PathBuf> {
-        let dir = ROOM_INDEX_DIR
-            .get()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("mtxdb not opened"))?;
+        let dir = super::room_index_dir()?;
         if create {
-            std::fs::create_dir_all(dir).map_err(|e| {
+            std::fs::create_dir_all(&dir).map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
                     "failed to create room_index dir: {e}"
                 ))
             })?;
         }
         Ok(dir.join(format!("index-{shard:02x}.bin")))
-    }
-
-    fn legacy_index_path(
-        namespace_digest: &[u8; NAMESPACE_DIGEST_LEN],
-    ) -> PyResult<std::path::PathBuf> {
-        let dir = ROOM_INDEX_DIR
-            .get()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("mtxdb not opened"))?;
-        Ok(dir.join(format!("{}.bin", hex::encode(namespace_digest))))
-    }
-
-    fn namespace_digest(namespace: &str) -> [u8; NAMESPACE_DIGEST_LEN] {
-        let digest = Sha256::digest(namespace.as_bytes());
-        let mut out = [0u8; NAMESPACE_DIGEST_LEN];
-        out.copy_from_slice(&digest[..NAMESPACE_DIGEST_LEN]);
-        out
     }
 
     fn cached_handle(shard: u8, create: bool) -> PyResult<Option<std::sync::Arc<File>>> {
@@ -1358,32 +1347,10 @@ mod room_index {
         Ok(Some(file))
     }
 
-    pub fn put(namespace: &str, entries: &[(i64, Vec<u8>)]) -> PyResult<()> {
+    pub fn put(entries: &[(i64, Vec<u8>)]) -> PyResult<()> {
         if entries.is_empty() {
             return Ok(());
         }
-        let namespace_digest = namespace_digest(namespace);
-        let shard = shard_for(&namespace_digest);
-        let mut file = cached_handle(shard, true)?.expect("create=true never returns None");
-        for (state_group, room_prefix) in entries {
-            let mut record = [0u8; RECORD_LEN];
-            record[..INDEX_MAGIC.len()].copy_from_slice(&INDEX_MAGIC);
-            record[INDEX_MAGIC.len()..INDEX_MAGIC.len() + NAMESPACE_DIGEST_LEN]
-                .copy_from_slice(&namespace_digest);
-            let group_start = INDEX_MAGIC.len() + NAMESPACE_DIGEST_LEN;
-            record[group_start..group_start + 8].copy_from_slice(&state_group.to_be_bytes());
-            let prefix_start = group_start + 8;
-            let n = std::cmp::min(room_prefix.len(), ROOM_PREFIX_LEN);
-            record[prefix_start..prefix_start + n].copy_from_slice(&room_prefix[..n]);
-            file.write_all(&record).map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("room_index write failed: {e}"))
-            })?;
-        }
-        DIRTY
-            .lock()
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}")))?
-            .get_or_insert_with(HashSet::new)
-            .insert(shard);
         let mut cache = PREFIX_CACHE
             .lock()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}")))?;
@@ -1391,13 +1358,31 @@ mod room_index {
             LruCache::new(NonZeroUsize::new(PREFIX_CACHE_CAPACITY).expect("nonzero capacity"))
         });
         for (state_group, room_prefix) in entries {
-            let mut record = [0u8; ROOM_PREFIX_LEN];
+            let shard = shard_for(*state_group);
+            let mut file = cached_handle(shard, true)?.expect("create=true never returns None");
+            let mut record = [0u8; RECORD_LEN];
+            record[..INDEX_MAGIC.len()].copy_from_slice(&INDEX_MAGIC);
+            let group_start = INDEX_MAGIC.len();
+            record[group_start..group_start + 8].copy_from_slice(&state_group.to_be_bytes());
+            let prefix_start = group_start + 8;
             let n = std::cmp::min(room_prefix.len(), ROOM_PREFIX_LEN);
-            record[..n].copy_from_slice(&room_prefix[..n]);
+            record[prefix_start..prefix_start + n].copy_from_slice(&room_prefix[..n]);
+            file.write_all(&record).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("room_index write failed: {e}"))
+            })?;
+            DIRTY
+                .lock()
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}"))
+                })?
+                .get_or_insert_with(HashSet::new)
+                .insert(shard);
+            let mut prefix = [0u8; ROOM_PREFIX_LEN];
+            prefix[..n].copy_from_slice(&room_prefix[..n]);
             // Preserve the on-disk all-zero sentinel's miss semantics even
             // for a malformed caller-provided empty prefix.
-            if record.iter().any(|&b| b != 0) {
-                cache.put((namespace_digest, *state_group), record);
+            if prefix.iter().any(|&b| b != 0) {
+                cache.put(*state_group, prefix);
             }
         }
         Ok(())
@@ -1416,7 +1401,6 @@ mod room_index {
     /// record is ignored, matching a forward `chunks_exact` scan.
     fn scan_latest_prefixes(
         file: &File,
-        namespace_digest: &[u8; NAMESPACE_DIGEST_LEN],
         wanted: &HashSet<i64>,
     ) -> HashMap<i64, [u8; ROOM_PREFIX_LEN]> {
         let mut found = HashMap::new();
@@ -1441,13 +1425,10 @@ mod room_index {
                 break;
             }
             for record in bytes.as_chunks::<RECORD_LEN>().0.iter().rev() {
-                if record[..INDEX_MAGIC.len()] != INDEX_MAGIC
-                    || record[INDEX_MAGIC.len()..INDEX_MAGIC.len() + NAMESPACE_DIGEST_LEN]
-                        != *namespace_digest
-                {
+                if record[..INDEX_MAGIC.len()] != INDEX_MAGIC {
                     continue;
                 }
-                let group_start = INDEX_MAGIC.len() + NAMESPACE_DIGEST_LEN;
+                let group_start = INDEX_MAGIC.len();
                 let group =
                     i64::from_be_bytes(record[group_start..group_start + 8].try_into().unwrap());
                 if !wanted.contains(&group) || found.contains_key(&group) {
@@ -1465,17 +1446,16 @@ mod room_index {
         found
     }
 
-    pub fn get_many(namespace: &str, state_groups: &[i64]) -> PyResult<Vec<Option<Vec<u8>>>> {
+    pub fn get_many(state_groups: &[i64]) -> PyResult<Vec<Option<Vec<u8>>>> {
         let mut out: Vec<Option<Vec<u8>>> = vec![None; state_groups.len()];
         let mut missing = Vec::new();
-        let namespace_digest = namespace_digest(namespace);
         {
             let mut cache = PREFIX_CACHE.lock().map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}"))
             })?;
             if let Some(cache) = cache.as_mut() {
                 for (index, &state_group) in state_groups.iter().enumerate() {
-                    if let Some(room_prefix) = cache.get(&(namespace_digest, state_group)) {
+                    if let Some(room_prefix) = cache.get(&state_group) {
                         out[index] = Some(room_prefix.to_vec());
                     } else {
                         missing.push((index, state_group));
@@ -1488,35 +1468,22 @@ mod room_index {
         if missing.is_empty() {
             return Ok(out);
         }
-        let wanted: HashSet<i64> = missing.iter().map(|&(_, group)| group).collect();
-        let found = cached_handle(shard_for(&namespace_digest), false)?
-            .map(|file| scan_latest_prefixes(&file, &namespace_digest, &wanted))
-            .unwrap_or_default();
+        // Group the misses by shard so each index file is scanned once.
+        let mut by_shard: HashMap<u8, Vec<(usize, i64)>> = HashMap::new();
         for (index, state_group) in missing {
-            if let Some(prefix) = found.get(&state_group) {
-                out[index] = Some(prefix.to_vec());
-            }
+            by_shard
+                .entry(shard_for(state_group))
+                .or_default()
+                .push((index, state_group));
         }
-        // Read compatibility for databases written before the shared file
-        // format. New writes never create another per-namespace file.
-        // Skipped entirely when the shared-file scan above resolved
-        // everything: the legacy open would only return NotFound.
-        if out.iter().any(Option::is_none) {
-            let legacy = legacy_index_path(&namespace_digest)
-                .ok()
-                .and_then(|path| File::open(path).ok());
-            if let Some(file) = legacy {
-                for (index, state_group) in state_groups.iter().enumerate() {
-                    if out[index].is_some() {
-                        continue;
-                    }
-                    let mut record = [0u8; ROOM_PREFIX_LEN];
-                    let offset = (*state_group as u64).saturating_mul(ROOM_PREFIX_LEN as u64);
-                    if file.read_exact_at(&mut record, offset).is_ok()
-                        && record.iter().any(|&b| b != 0)
-                    {
-                        out[index] = Some(record.to_vec());
-                    }
+        for (shard, groups) in by_shard {
+            let wanted: HashSet<i64> = groups.iter().map(|&(_, group)| group).collect();
+            let found = cached_handle(shard, false)?
+                .map(|file| scan_latest_prefixes(&file, &wanted))
+                .unwrap_or_default();
+            for (index, state_group) in groups {
+                if let Some(prefix) = found.get(&state_group) {
+                    out[index] = Some(prefix.to_vec());
                 }
             }
         }
@@ -1531,7 +1498,7 @@ mod room_index {
                 if let Some(value) = value {
                     let mut record = [0u8; ROOM_PREFIX_LEN];
                     record.copy_from_slice(value);
-                    cache.put((namespace_digest, *state_group), record);
+                    cache.put(*state_group, record);
                 }
             }
         }
@@ -1588,15 +1555,14 @@ mod room_index {
         use super::*;
 
         #[test]
-        fn shared_handle_is_reused_across_namespaces() {
+        fn shared_handle_is_reused_across_state_groups() {
             super::super::auth_chain_closure_tests::ensure_open();
-            let ns_kept = "ns-lru-kept";
+            let base = 1_000_000i64;
             let prefix: Vec<u8> = b"ROOM1ABC".to_vec();
-            put(ns_kept, &[(1, prefix.clone())]).expect("put kept");
+            put(&[(base, prefix.clone())]).expect("put kept");
 
-            // Many namespaces share the same physical index file and handle.
-            for i in 0..256 {
-                put(&format!("ns-lru-rot-{i}"), &[(1, b"ROOM2XYZ".to_vec())]).expect("put rot");
+            for group in base + 1..base + 257 {
+                put(&[(group, b"ROOM2XYZ".to_vec())]).expect("put rot");
             }
 
             {
@@ -1611,28 +1577,27 @@ mod room_index {
             // the shared index file.
             *PREFIX_CACHE.lock().expect("no poison") = None;
 
-            let got = get_many(ns_kept, &[1]).expect("get kept");
+            let got = get_many(&[base]).expect("get kept");
             assert_eq!(got, vec![Some(prefix)]);
         }
 
         #[test]
         fn read_handle_does_not_poison_later_write() {
             super::super::auth_chain_closure_tests::ensure_open();
-            let namespace = "ns-read-before-write";
 
-            put(namespace, &[(10_001, b"ROOM4GHI".to_vec())]).expect("initial put");
+            put(&[(2_000_001, b"ROOM4GHI".to_vec())]).expect("initial put");
             *HANDLES.lock().expect("no poison") = None;
             *PREFIX_CACHE.lock().expect("no poison") = None;
 
             // This opens the shard read-only because the file already exists.
             assert_eq!(
-                get_many(namespace, &[10_001]).expect("read"),
+                get_many(&[2_000_001]).expect("read"),
                 vec![Some(b"ROOM4GHI".to_vec())]
             );
 
             // A later write must open a separate writable handle, rather than
             // reusing the read-only handle cached above.
-            put(namespace, &[(10_002, b"ROOM5JKL".to_vec())]).expect("write after read");
+            put(&[(2_000_002, b"ROOM5JKL".to_vec())]).expect("write after read");
         }
 
         #[test]
@@ -1640,23 +1605,19 @@ mod room_index {
             use std::io::Write as _;
 
             super::super::auth_chain_closure_tests::ensure_open();
-            let ns = "ns-backward-scan";
-            let other = "ns-backward-scan-other";
 
-            // More records than one scan chunk, interleaved with another
-            // namespace that may share the shard.
+            // More records than one scan chunk in a single shard.
+            let base = 3_000_000i64;
             let total = (SCAN_CHUNK_RECORDS as i64) * 2 + 37;
-            for group in 0..total {
-                put(ns, &[(group, b"OLDPREFX".to_vec())]).expect("put");
-                put(other, &[(group, b"OTHERPFX".to_vec())]).expect("put other");
+            for group in base..base + total {
+                put(&[(group, b"OLDPREFX".to_vec())]).expect("put");
             }
             // Newest write wins; a later all-zero record must not erase it.
-            put(ns, &[(7, b"NEWPREFX".to_vec())]).expect("overwrite");
-            put(ns, &[(8, b"KEEPPFX1".to_vec())]).expect("put");
-            put(ns, &[(8, Vec::new())]).expect("zero record");
+            put(&[(base + 7, b"NEWPREFX".to_vec())]).expect("overwrite");
+            put(&[(base + 8, b"KEEPPFX1".to_vec())]).expect("put");
+            put(&[(base + 8, Vec::new())]).expect("zero record");
             // A torn trailing partial record is ignored.
-            let digest = namespace_digest(ns);
-            let path = index_path(shard_for(&digest), false).expect("path");
+            let path = index_path(shard_for(base), false).expect("path");
             OpenOptions::new()
                 .append(true)
                 .open(path)
@@ -1664,91 +1625,26 @@ mod room_index {
                 .expect("append torn tail");
 
             *PREFIX_CACHE.lock().expect("no poison") = None;
-            let got = get_many(ns, &[0, 7, 8, total - 1, total + 5]).expect("get");
+            let got = get_many(&[base, base + 7, base + 8, base + total - 1, base + total + 5])
+                .expect("get");
             assert_eq!(got[0], Some(b"OLDPREFX".to_vec()));
             assert_eq!(got[1], Some(b"NEWPREFX".to_vec()));
             assert_eq!(got[2], Some(b"KEEPPFX1".to_vec()));
             assert_eq!(got[3], Some(b"OLDPREFX".to_vec()));
             assert_eq!(got[4], None, "never-written group is a miss");
-
-            // The other namespace's records are not returned for this one.
-            *PREFIX_CACHE.lock().expect("no poison") = None;
-            assert_eq!(
-                get_many(other, &[0]).expect("get other"),
-                vec![Some(b"OTHERPFX".to_vec())]
-            );
         }
 
         #[test]
-        fn legacy_per_namespace_file_is_still_readable() {
-            use std::io::Write as _;
-
+        fn sync_only_touches_dirty_shards_and_is_idempotent() {
             super::super::auth_chain_closure_tests::ensure_open();
-            let ns = "ns-legacy-compat";
-            let dir = ROOM_INDEX_DIR.get().expect("room_index dir");
-            std::fs::create_dir_all(dir).expect("room_index dir");
+            put(&[(4_000_001, b"ROOM3DEF".to_vec())]).expect("put");
 
-            // Build the pre-shared-format filename the way the old writer
-            // did -- hex(sha256(namespace)[..16]) + ".bin" -- independently
-            // of legacy_index_path, so this pins byte-compatibility with
-            // files written before the shared shard existed.
-            let legacy_name = format!("{}.bin", hex::encode(&Sha256::digest(ns.as_bytes())[..16]));
-            let legacy_path = dir.join(&legacy_name);
-            let record = *b"LEGACY01";
-            let mut contents = vec![0u8; ROOM_PREFIX_LEN * 43];
-            contents[ROOM_PREFIX_LEN * 42..ROOM_PREFIX_LEN * 43].copy_from_slice(&record);
-            OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&legacy_path)
-                .and_then(|mut f| f.write_all(&contents))
-                .expect("write legacy file");
-
-            *PREFIX_CACHE.lock().expect("no poison") = None;
-
-            // A group only the legacy file has still reads back...
-            assert_eq!(
-                get_many(ns, &[42]).expect("read legacy"),
-                vec![Some(record.to_vec())]
-            );
-            // ...but a group neither store has stays a miss.
-            assert_eq!(get_many(ns, &[43]).expect("miss"), vec![None]);
-
-            // A shared-shard write wins over the stale legacy record, and
-            // put() never rewrites the per-namespace file.
-            put(ns, &[(42, b"SHARED02".to_vec())]).expect("put");
-            *PREFIX_CACHE.lock().expect("no poison") = None;
-            assert_eq!(
-                get_many(ns, &[42]).expect("read shared"),
-                vec![Some(b"SHARED02".to_vec())]
-            );
-
-            std::fs::remove_file(&legacy_path).expect("remove legacy file");
-        }
-
-        #[test]
-        fn sync_only_touches_dirty_namespaces_and_is_idempotent() {
-            super::super::auth_chain_closure_tests::ensure_open();
-            let ns = "ns-dirty-sync";
-            put(ns, &[(1, b"ROOM3DEF".to_vec())]).expect("put");
-
-            // A namespace `put` wrote to is dirty-marked and must sync
-            // without error.
             sync().expect("sync after write");
-
-            // Nothing was written since the prior sync -- must still
-            // succeed (empty dirty set is a no-op, not an error). This
-            // only proves the dirty-set bookkeeping doesn't panic/error on
-            // an empty set; it does not measure the fsync count actually
-            // skipped in production (a syscall count isn't something a
-            // portable unit test can assert on).
             sync().expect("sync with nothing dirty");
 
-            // The write is still durably readable either way.
             *PREFIX_CACHE.lock().expect("no poison") = None;
             assert_eq!(
-                get_many(ns, &[1]).expect("get after sync"),
+                get_many(&[4_000_001]).expect("get after sync"),
                 vec![Some(b"ROOM3DEF".to_vec())]
             );
         }
@@ -1756,11 +1652,7 @@ mod room_index {
 }
 
 #[pyfunction]
-pub fn put_room_index(
-    py: Python<'_>,
-    namespace: String,
-    entries: Vec<(i64, Vec<u8>)>,
-) -> PyResult<u64> {
+pub fn put_room_index(py: Python<'_>, entries: Vec<(i64, Vec<u8>)>) -> PyResult<u64> {
     assert_writable()?;
     // `room_index::put` does blocking local I/O and takes its own handle
     // cache mutex. Release the GIL while it runs so concurrent Python threads
@@ -1771,18 +1663,14 @@ pub fn put_room_index(
     // timing the whole call can separate the write from GIL re-acquisition.
     py.detach(|| {
         let started = std::time::Instant::now();
-        room_index::put(&namespace, &entries)?;
+        room_index::put(&entries)?;
         Ok(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX))
     })
 }
 
 #[pyfunction]
-pub fn get_room_index(
-    py: Python<'_>,
-    namespace: String,
-    state_groups: Vec<i64>,
-) -> PyResult<Vec<Option<Vec<u8>>>> {
-    py.detach(|| room_index::get_many(&namespace, &state_groups))
+pub fn get_room_index(py: Python<'_>, state_groups: Vec<i64>) -> PyResult<Vec<Option<Vec<u8>>>> {
+    py.detach(|| room_index::get_many(&state_groups))
 }
 
 pub struct MtxdbStore {
@@ -1846,7 +1734,7 @@ impl NodeStore for MtxdbStore {
 
 /// A room-scoped collection id for the short-id/edge closure skeleton,
 /// derived as the member collection with the `AUTH` tag under the room's group identity.
-pub(crate) fn auth_chain_closure_room_id(_namespace: &str, room_id: &str) -> [u8; 16] {
+pub(crate) fn auth_chain_closure_room_id(room_id: &str) -> [u8; 16] {
     let group_digest = group_full_logical_id(room_id.as_bytes());
     member_collection_id(*b"AUTH", &group_digest)
 }
@@ -1968,11 +1856,10 @@ fn decode_auth_edges(bytes: &[u8]) -> PyResult<Vec<u32>> {
 /// appends.
 fn stage_auth_chain_edges(
     txn: &DatabaseTransaction<'_>,
-    namespace: &str,
     room_id: &str,
     rows: &[(u32, Vec<u32>)],
 ) -> PyResult<()> {
-    let collection = auth_chain_closure_room_id(namespace, room_id);
+    let collection = auth_chain_closure_room_id(room_id);
     let mut children_by_parent: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
 
     for (event_short_id, auth_short_ids) in rows {
@@ -2178,16 +2065,26 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
             state.set_checkpoint_rewrite_budget(interval, max_bytes);
             event_dag.set_checkpoint_rewrite_budget(interval, max_bytes);
         }
-        let _ = DBS.set(MtxdbPools {
-            state,
-            event_dag,
-            server_info,
-            shared_database: Some(shared_database),
-            read_graph: None,
-        });
-        let _ = OPENER_PID.set(std::process::id());
-        let _ = WRITE_MODE.set(true);
-        let _ = ROOM_INDEX_DIR.set(std::path::PathBuf::from(&path).join("room_index"));
+        *DBS.lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("DBS lock poisoned"))? =
+            Some(Arc::new(MtxdbPools {
+                state,
+                event_dag,
+                server_info,
+                shared_database: Some(Arc::new(shared_database)),
+                read_graph: None,
+            }));
+        *OPENER_PID
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("OPENER_PID lock poisoned"))? =
+            Some(std::process::id());
+        *WRITE_MODE
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("WRITE_MODE lock poisoned"))? =
+            Some(true);
+        *ROOM_INDEX_DIR.lock().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err("ROOM_INDEX_DIR lock poisoned")
+        })? = Some(std::path::PathBuf::from(&path).join("room_index"));
         Ok(())
     })
 }
@@ -2295,16 +2192,83 @@ pub fn open_client_read_only(py: Python<'_>, path: String) -> PyResult<()> {
             layout,
             [state.clone(), event_dag.clone(), server_info.clone()],
         );
-        let _ = DBS.set(MtxdbPools {
-            state,
-            event_dag,
-            server_info,
-            shared_database: None,
-            read_graph: Some(read_only_graph),
-        });
-        let _ = OPENER_PID.set(std::process::id());
-        let _ = WRITE_MODE.set(false);
-        let _ = ROOM_INDEX_DIR.set(std::path::PathBuf::from(&path).join("room_index"));
+        *DBS
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("DBS lock poisoned"))? =
+            Some(Arc::new(MtxdbPools {
+                state,
+                event_dag,
+                server_info,
+                shared_database: None,
+                read_graph: Some(Arc::new(read_only_graph)),
+            }));
+        *OPENER_PID
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("OPENER_PID lock poisoned"))? =
+            Some(std::process::id());
+        *WRITE_MODE
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("WRITE_MODE lock poisoned"))? =
+            Some(false);
+        *ROOM_INDEX_DIR
+            .lock()
+            .map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err("ROOM_INDEX_DIR lock poisoned")
+            })? = Some(std::path::PathBuf::from(&path).join("room_index"));
+        Ok(())
+    })
+}
+
+/// Close the open store and release its file handles, WAL lock, and the
+/// room-index directory registration. The next `open_client` or
+/// `open_client_read_only` call may then open a different root in the same
+/// process.
+///
+/// This exists for tests: keys are unsalted, so independent test databases
+/// must not share one physical store (their state-group ids restart at 1).
+/// Production never closes a store mid-process.
+///
+/// Fails loudly rather than detaching state: if any cloned handle is still
+/// alive (a reader or writer in flight), the store is left open and the call
+/// raises. Syncs every pool first, so a successful close implies the data is
+/// durable.
+#[pyfunction]
+pub fn close_client(py: Python<'_>) -> PyResult<()> {
+    py.detach(|| {
+        let mut guard = DBS
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("DBS lock poisoned"))?;
+        let Some(pools) = guard.as_ref() else {
+            return Ok(());
+        };
+        let live = Arc::strong_count(pools);
+        if live != 1 {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "mtxdb close_client: {live} live handles to the store remain; \
+                 refusing to close while readers or writers are in flight"
+            )));
+        }
+        for (name, store) in [
+            ("state", &pools.state),
+            ("event_dag", &pools.event_dag),
+            ("server_info", &pools.server_info),
+        ] {
+            sync_one(name, store)?;
+        }
+        // Dropping the last reference releases the writer lock and fds.
+        *guard = None;
+        drop(guard);
+        *WRITE_MODE
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("WRITE_MODE lock poisoned"))? =
+            None;
+        *OPENER_PID
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("OPENER_PID lock poisoned"))? =
+            None;
+        *ROOM_INDEX_DIR.lock().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err("ROOM_INDEX_DIR lock poisoned")
+        })? = None;
         Ok(())
     })
 }
@@ -2312,7 +2276,6 @@ pub fn open_client_read_only(py: Python<'_>, path: String) -> PyResult<()> {
 #[pyfunction]
 pub fn put_state_hamt_nodes(
     py: Python<'_>,
-    _namespace: String,
     room_prefix: Vec<u8>,
     nodes: Vec<(Vec<u8>, Vec<u8>)>,
 ) -> PyResult<()> {
@@ -2380,11 +2343,7 @@ pub fn put_state_hamt_nodes(
 /// No ordering can produce a reverse mapping without a matching forward
 /// one, which is the only inconsistency this design cannot tolerate.
 #[pyfunction]
-pub fn get_or_create_short_ids(
-    namespace: String,
-    room_id: String,
-    event_ids: Vec<String>,
-) -> PyResult<Vec<u32>> {
+pub fn get_or_create_short_ids(room_id: String, event_ids: Vec<String>) -> PyResult<Vec<u32>> {
     assert_writable()?;
     Python::attach(|py| {
         py.detach(|| {
@@ -2392,7 +2351,7 @@ pub fn get_or_create_short_ids(
                 pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}"))
             })?;
             let engine = db_for_shard_type(ShardType::State)?;
-            let collection = auth_chain_closure_room_id(&namespace, &room_id);
+            let collection = auth_chain_closure_room_id(&room_id);
 
             let mut out = Vec::with_capacity(event_ids.len());
             let mut counter_value: Option<u64> = None;
@@ -2521,13 +2480,12 @@ pub fn get_or_create_short_ids(
 #[pyfunction]
 pub fn resolve_event_ids_to_short_ids(
     py: Python<'_>,
-    namespace: String,
     room_id: String,
     event_ids: Vec<String>,
 ) -> PyResult<Vec<Option<u32>>> {
     py.detach(|| {
         let engine = db_for_shard_type(ShardType::State)?;
-        let collection = auth_chain_closure_room_id(&namespace, &room_id);
+        let collection = auth_chain_closure_room_id(&room_id);
         let node_ids: Vec<NodeId> = event_ids
             .iter()
             .map(|event_id| short_id_forward_node_id(event_id))
@@ -2556,13 +2514,12 @@ pub fn resolve_event_ids_to_short_ids(
 #[pyfunction]
 pub fn resolve_short_ids_to_event_ids(
     py: Python<'_>,
-    namespace: String,
     room_id: String,
     short_ids: Vec<u32>,
 ) -> PyResult<Vec<Option<String>>> {
     py.detach(|| {
         let engine = db_for_shard_type(ShardType::State)?;
-        let collection = auth_chain_closure_room_id(&namespace, &room_id);
+        let collection = auth_chain_closure_room_id(&room_id);
         let node_ids: Vec<NodeId> = short_ids
             .iter()
             .map(|&s| short_id_reverse_node_id(s))
@@ -2595,13 +2552,12 @@ pub fn resolve_short_ids_to_event_ids(
 #[pyfunction]
 pub fn auth_chain_edges_get(
     py: Python<'_>,
-    namespace: String,
     room_id: String,
     short_ids: Vec<u32>,
 ) -> PyResult<Vec<Option<Vec<u32>>>> {
     py.detach(|| {
         let engine = db_for_shard_type(ShardType::State)?;
-        let collection = auth_chain_closure_room_id(&namespace, &room_id);
+        let collection = auth_chain_closure_room_id(&room_id);
         let node_ids: Vec<NodeId> = short_ids
             .iter()
             .map(|&s| auth_chain_edge_node_id(s))
@@ -2627,14 +2583,13 @@ pub fn auth_chain_edges_get(
 #[pyfunction]
 pub fn auth_chain_edges_put(
     py: Python<'_>,
-    namespace: String,
     room_id: String,
     rows: Vec<(u32, Vec<u32>)>,
 ) -> PyResult<()> {
     assert_writable()?;
     py.detach(|| {
         let engine = db_for_shard_type(ShardType::State)?;
-        let collection = auth_chain_closure_room_id(&namespace, &room_id);
+        let collection = auth_chain_closure_room_id(&room_id);
         let pairs: Vec<(NodeId, NodeData)> = rows
             .into_iter()
             .map(|(short_id, auth_short_ids)| {
@@ -2668,13 +2623,12 @@ pub fn auth_chain_edges_put(
 #[pyfunction]
 pub fn auth_chain_children_get(
     py: Python<'_>,
-    namespace: String,
     room_id: String,
     short_ids: Vec<u32>,
 ) -> PyResult<Vec<Option<Vec<u32>>>> {
     py.detach(|| {
         let engine = db_for_shard_type(ShardType::State)?;
-        let collection = auth_chain_closure_room_id(&namespace, &room_id);
+        let collection = auth_chain_closure_room_id(&room_id);
         let node_ids: Vec<NodeId> = short_ids
             .iter()
             .map(|&s| auth_chain_child_node_id(s))
@@ -2701,11 +2655,7 @@ pub fn auth_chain_children_get(
 /// incrementally as new children are persisted over the room's lifetime,
 /// so this must read-modify-write and dedupe.
 #[pyfunction]
-pub fn auth_chain_children_append(
-    namespace: String,
-    room_id: String,
-    rows: Vec<(u32, Vec<u32>)>,
-) -> PyResult<()> {
+pub fn auth_chain_children_append(room_id: String, rows: Vec<(u32, Vec<u32>)>) -> PyResult<()> {
     assert_writable()?;
     Python::attach(|py| {
         py.detach(|| {
@@ -2713,7 +2663,7 @@ pub fn auth_chain_children_append(
                 pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}"))
             })?;
             let engine = db_for_shard_type(ShardType::State)?;
-            let collection = auth_chain_closure_room_id(&namespace, &room_id);
+            let collection = auth_chain_closure_room_id(&room_id);
 
             // Aggregate by parent first: the batched put below only applies at the
             // end, so two rows for the same parent in one call would otherwise each
@@ -2773,11 +2723,11 @@ pub fn auth_chain_children_append(
 /// purely in-process on the Python side (plan §3/§4), and the caller must
 /// bump that generation *before* calling this, not after.
 #[pyfunction]
-pub fn auth_chain_purge_room(py: Python<'_>, namespace: String, room_id: String) -> PyResult<()> {
+pub fn auth_chain_purge_room(py: Python<'_>, room_id: String) -> PyResult<()> {
     assert_writable()?;
     py.detach(|| {
         let engine = db_for_shard_type(ShardType::State)?;
-        let collection = auth_chain_closure_room_id(&namespace, &room_id);
+        let collection = auth_chain_closure_room_id(&room_id);
         engine.delete_collection(&collection).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb delete_collection error: {e}"))
         })
@@ -3186,7 +3136,11 @@ pub fn event_json_put(py: Python<'_>, rows: Vec<(String, String, Vec<u8>)>) -> P
 /// with the shared WAL (see `begin_transaction`).
 #[pyclass(frozen, name = "MtxdbTransaction")]
 pub struct PyMtxdbTransaction {
+    /// `inner` borrows `_database` for `'static`; the `Arc` keeps the
+    /// `Database` alive and at a stable address for the struct's lifetime.
+    /// `inner` is declared first so it is dropped before the `Arc`.
     inner: DatabaseTransaction<'static>,
+    _database: Arc<Database>,
 }
 
 /// `DatabaseTransaction::put` (`event_json_put`/edges staging) fails with a
@@ -3381,11 +3335,10 @@ impl PyMtxdbTransaction {
     fn auth_chain_edges_put(
         &self,
         py: Python<'_>,
-        namespace: String,
         room_id: String,
         rows: Vec<(u32, Vec<u32>)>,
     ) -> PyResult<()> {
-        py.detach(|| stage_auth_chain_edges(&self.inner, &namespace, &room_id, &rows))
+        py.detach(|| stage_auth_chain_edges(&self.inner, &room_id, &rows))
     }
 
     /// Publish every staged write as one group. After an error, the writes may
@@ -3452,7 +3405,8 @@ type CommitPhaseRows = Vec<(&'static str, f64, u64)>;
 /// the shared database opened, or `None` without a shared WAL. Diagnostics only.
 #[pyfunction]
 pub fn txn_commit_phases() -> PyResult<Option<CommitPhaseRows>> {
-    let Some(database) = pools()?.shared_database.as_ref() else {
+    let pools = pools()?;
+    let Some(database) = pools.shared_database.as_ref() else {
         return Ok(None);
     };
     let stats = database.commit_phase_stats();
@@ -3471,12 +3425,19 @@ pub fn txn_commit_phases() -> PyResult<Option<CommitPhaseRows>> {
 #[pyfunction]
 pub fn begin_transaction() -> PyResult<Option<PyMtxdbTransaction>> {
     assert_writable()?;
-    Ok(pools()?
-        .shared_database
-        .as_ref()
-        .map(|database| PyMtxdbTransaction {
-            inner: database.begin_transaction(),
-        }))
+    let pools = pools()?;
+    Ok(pools.shared_database.as_ref().map(|database| {
+        let database = Arc::clone(database);
+        // SAFETY: `database` owns the allocation; the `Arc` stored in the
+        // transaction keeps it alive and address-stable until `inner` (which
+        // is dropped first) is gone. The transaction only borrows immutably.
+        let inner: DatabaseTransaction<'static> =
+            unsafe { std::mem::transmute(database.begin_transaction()) };
+        PyMtxdbTransaction {
+            inner,
+            _database: database,
+        }
+    }))
 }
 
 /// Read event_json records by event id: resolve each id's locator to
@@ -3516,8 +3477,7 @@ pub fn event_json_get(py: Python<'_>, event_ids: Vec<String>) -> PyResult<Vec<Ev
             let mut found = engine
                 .get_read_committed(&collection, &node_ids_only)
                 .map_err(map_read_storage_error)?;
-            if matches!(WRITE_MODE.get(), Some(false)) && found.iter().any(|value| value.is_none())
-            {
+            if opened_read_only() && found.iter().any(|value| value.is_none()) {
                 engine.refresh_collection(&collection).map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
                         "mtxdb refresh_collection error: {e}"
@@ -3558,8 +3518,7 @@ pub fn event_json_get(py: Python<'_>, event_ids: Vec<String>) -> PyResult<Vec<Ev
             let mut found = engine
                 .get_read_committed(&collection, &node_ids_only)
                 .map_err(map_read_storage_error)?;
-            if matches!(WRITE_MODE.get(), Some(false)) && found.iter().any(|value| value.is_none())
-            {
+            if opened_read_only() && found.iter().any(|value| value.is_none()) {
                 engine.refresh_collection(&collection).map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
                         "mtxdb refresh_collection error: {e}"
@@ -3688,7 +3647,6 @@ fn node_cache() -> &'static NodeCache {
 #[pyfunction]
 pub fn materialize_state_hamt(
     py: Python<'_>,
-    namespace: String,
     room_prefix: Vec<u8>,
     root_structural_hash: Vec<u8>,
     room_id: &str,
@@ -3705,14 +3663,11 @@ pub fn materialize_state_hamt(
 
     py.detach(|| {
         let engine = state_db()?;
-        let store = MtxdbStore {
-            engine: Arc::clone(engine),
-        };
+        let store = MtxdbStore { engine };
 
         hamt_store::materialize_state_hamt(
             &store,
             node_cache(),
-            &namespace,
             &room_prefix,
             root_structural_hash,
             &structural_key,
@@ -3725,7 +3680,6 @@ pub fn materialize_state_hamt(
 #[pyfunction]
 pub fn materialize_state_hamts(
     py: Python<'_>,
-    namespace: String,
     roots: Vec<(Vec<u8>, Vec<u8>, String)>,
 ) -> PyResult<Vec<StateEntries>> {
     let roots = roots
@@ -3746,35 +3700,27 @@ pub fn materialize_state_hamts(
 
     py.detach(|| {
         let engine = state_db()?;
-        let store = MtxdbStore {
-            engine: Arc::clone(engine),
-        };
+        let store = MtxdbStore { engine };
 
-        hamt_store::materialize_state_hamts(&store, node_cache(), &namespace, roots)
+        hamt_store::materialize_state_hamts(&store, node_cache(), roots)
             .map_err(map_hamt_read_error)
     })
 }
 
 /// Key for the embedded `event_id -> state_group` mapping, matching
 /// `_event_to_state_group_key` in `embedded_event_to_state_group.py`.
-fn event_to_state_group_key(namespace: &str, event_id: &str) -> Vec<u8> {
-    let namespace_hash = Sha256::digest(namespace.as_bytes());
-    let mut key = Vec::with_capacity(b"event_to_state_group:".len() + 32 + 1 + event_id.len());
+fn event_to_state_group_key(event_id: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(b"event_to_state_group:".len() + event_id.len());
     key.extend_from_slice(b"event_to_state_group:");
-    key.extend_from_slice(hex::encode(&namespace_hash[..16]).as_bytes());
-    key.push(b':');
     key.extend_from_slice(event_id.as_bytes());
     key
 }
 
 /// Key for one state group's event reference count, matching
 /// `_state_group_refcount_key` in `embedded_event_to_state_group.py`.
-fn state_group_refcount_key(namespace: &str, state_group: i64) -> Vec<u8> {
-    let namespace_hash = Sha256::digest(namespace.as_bytes());
-    let mut key = Vec::with_capacity(b"state_group_refcount:".len() + 32 + 1 + 8);
+fn state_group_refcount_key(state_group: i64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(b"state_group_refcount:".len() + 8);
     key.extend_from_slice(b"state_group_refcount:");
-    key.extend_from_slice(hex::encode(&namespace_hash[..16]).as_bytes());
-    key.push(b':');
     key.extend_from_slice(&state_group.to_be_bytes());
     key
 }
@@ -3791,7 +3737,6 @@ fn state_group_refcount_key(namespace: &str, state_group: i64) -> Vec<u8> {
 #[pyfunction]
 pub fn repoint_event_state_group(
     py: Python<'_>,
-    namespace: String,
     event_id: String,
     state_group: i64,
 ) -> PyResult<Option<i64>> {
@@ -3800,13 +3745,14 @@ pub fn repoint_event_state_group(
         let _guard = RMW_LOCK
             .lock()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}")))?;
-        let database = pools()?.shared_database.as_ref().ok_or_else(|| {
+        let pools = pools()?;
+        let database = pools.shared_database.as_ref().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err(
                 "mtxdb repoint requires the shared WAL opened by open_client",
             )
         })?;
         let collection = kv_room_id();
-        let mapping_node = kv_node_id(&event_to_state_group_key(&namespace, &event_id));
+        let mapping_node = kv_node_id(&event_to_state_group_key(&event_id));
         let new_mapping = NodeData::new(bytes::Bytes::copy_from_slice(&state_group.to_be_bytes()));
 
         // A racing writer can make several consecutive reads stale before
@@ -3843,28 +3789,19 @@ pub fn repoint_event_state_group(
             if old != Some(state_group) {
                 let mut deltas: Vec<(NodeId, i64)> = Vec::with_capacity(2);
                 if let Some(old) = old {
-                    deltas.push((kv_node_id(&state_group_refcount_key(&namespace, old)), -1));
+                    deltas.push((kv_node_id(&state_group_refcount_key(old)), -1));
                 }
-                deltas.push((
-                    kv_node_id(&state_group_refcount_key(&namespace, state_group)),
-                    1,
-                ));
+                deltas.push((kv_node_id(&state_group_refcount_key(state_group)), 1));
                 txn.increment_counters(ShardType::State, collection, &deltas)
                     .map_err(|e| map_transaction_error("increment state_group_refcount", e))?;
             }
 
             #[cfg(test)]
             if attempt == 0 {
-                let hook = REPOINT_TEST_HOOK.lock().ok().and_then(|mut hook| {
-                    if hook
-                        .as_ref()
-                        .is_some_and(|hook| hook.namespace == namespace)
-                    {
-                        hook.take()
-                    } else {
-                        None
-                    }
-                });
+                let hook = REPOINT_TEST_HOOK
+                    .lock()
+                    .ok()
+                    .and_then(|mut hook| hook.take());
                 if let Some(hook) = hook {
                     // Channels, not barriers: if the test side is gone, neither
                     // call can block forever.
@@ -3896,7 +3833,6 @@ pub type PySelectiveQuery = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<(String, String)>);
 #[pyfunction]
 pub fn lookup_state_hamts(
     py: Python<'_>,
-    namespace: String,
     queries: Vec<PySelectiveQuery>,
 ) -> PyResult<Vec<StateEntries>> {
     let parsed_queries = queries
@@ -3916,11 +3852,9 @@ pub fn lookup_state_hamts(
 
     py.detach(|| {
         let engine = state_db()?;
-        let store = MtxdbStore {
-            engine: Arc::clone(engine),
-        };
+        let store = MtxdbStore { engine };
 
-        hamt_store::lookup_state_hamts(&store, node_cache(), &namespace, parsed_queries)
+        hamt_store::lookup_state_hamts(&store, node_cache(), parsed_queries)
             .map_err(map_hamt_read_error)
     })
 }
@@ -3990,7 +3924,6 @@ pub fn increment_counters_batch(pairs: Vec<(Vec<u8>, i64)>) -> PyResult<Vec<i64>
 #[pyfunction]
 pub fn get_state_hamt_nodes_batch(
     py: Python<'_>,
-    _namespace: String,
     room_prefix: Vec<u8>,
     hashes: Vec<Vec<u8>>,
 ) -> PyResult<Vec<Option<Vec<u8>>>> {
@@ -4031,7 +3964,7 @@ pub fn sync(py: Python<'_>) -> PyResult<()> {
         // Sync mtxdb pools before publishing the room index. A durable
         // index entry must never point at a root that was not yet synced.
         for (name, engine) in [("state", state_db()?), ("event-dag", event_dag_db()?)] {
-            sync_one(name, engine)?;
+            sync_one(name, &engine)?;
         }
         room_index::sync()?;
         Ok(())
@@ -4048,7 +3981,8 @@ pub fn sync(py: Python<'_>) -> PyResult<()> {
 pub fn sync_state(py: Python<'_>) -> PyResult<()> {
     assert_writable()?;
     py.detach(|| {
-        sync_one("state", state_db()?)?;
+        let state = state_db()?;
+        sync_one("state", &state)?;
         room_index::sync()
     })
 }
@@ -4058,7 +3992,8 @@ pub fn sync_state(py: Python<'_>) -> PyResult<()> {
 #[pyfunction]
 pub fn sync_event_dag(py: Python<'_>) -> PyResult<()> {
     assert_writable()?;
-    py.detach(|| sync_one("event-dag", event_dag_db()?))
+    let event_dag = event_dag_db()?;
+    py.detach(|| sync_one("event-dag", &event_dag))
 }
 
 /// Force a durable index checkpoint in every pool and wait for it.
@@ -4208,7 +4143,7 @@ pub fn wait_durable(py: Python<'_>, targets: Vec<u64>) -> PyResult<()> {
     })
 }
 
-fn sync_one(name: &str, engine: &Arc<PackfileStorage>) -> PyResult<()> {
+fn sync_one(name: &str, engine: &PackfileStorage) -> PyResult<()> {
     engine.sync().map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb sync error for {name} pool: {e}"))
     })
@@ -4652,7 +4587,7 @@ pub fn set_checkpoint_rewrite_budget(
 #[pyfunction]
 pub fn repack(py: Python<'_>) -> PyResult<Py<PyDict>> {
     let summaries = py.detach(|| -> PyResult<Vec<(&'static str, usize, usize, usize)>> {
-        let Some(pools) = DBS.get() else {
+        let Ok(pools) = pools() else {
             return Ok(Vec::new());
         };
         assert_writable()?;
@@ -4689,6 +4624,7 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("StaleReadError", StaleReadError::type_object(m.py()))?;
     m.add_function(wrap_pyfunction!(open_client, m)?)?;
     m.add_function(wrap_pyfunction!(open_client_read_only, m)?)?;
+    m.add_function(wrap_pyfunction!(close_client, m)?)?;
     m.add_function(wrap_pyfunction!(put_state_hamt_nodes, m)?)?;
     m.add_function(wrap_pyfunction!(get_state_hamt_nodes_batch, m)?)?;
     m.add_function(wrap_pyfunction!(get_or_create_short_ids, m)?)?;
@@ -4783,13 +4719,12 @@ pub(crate) mod auth_chain_closure_tests {
         // by member tag, not a lucky digest: for one fixed room, each family
         // must derive from exactly its own tag and differ from the others.
         let room = "!edge-domain-separation:example.org";
-        let namespace = "namespace";
         let group = group_full_logical_id(room.as_bytes());
         let state = member_collection_id(*b"STAT", &group);
         let auth = member_collection_id(*b"AUTH", &group);
 
         assert_eq!(state, state_hamt_room_id(room));
-        assert_eq!(auth, auth_chain_closure_room_id(namespace, room));
+        assert_eq!(auth, auth_chain_closure_room_id(room));
 
         assert_ne!(auth, state, "AUTH must not reuse the STAT tag");
     }
@@ -4808,15 +4743,10 @@ pub(crate) mod auth_chain_closure_tests {
         value
     }
 
-    fn test_put_root(namespace: &str, room_id: &str, state_group: i64, value: Vec<u8>) {
+    fn test_put_root(room_id: &str, state_group: i64, value: Vec<u8>) {
         pyo3::Python::attach(|py| {
-            put_state_hamt_roots(
-                py,
-                namespace.to_owned(),
-                room_id.as_bytes().to_vec(),
-                vec![(state_group, value)],
-            )
-            .expect("test root write");
+            put_state_hamt_roots(py, room_id.as_bytes().to_vec(), vec![(state_group, value)])
+                .expect("test root write");
         });
     }
 
@@ -4838,18 +4768,12 @@ pub(crate) mod auth_chain_closure_tests {
     #[test]
     fn state_root_batch_rejects_conflicting_duplicate_operational_ids() {
         ensure_open();
-        let namespace = "ns-root-duplicate-operational";
         let room = "!root-duplicate-operational:example.org";
         let a = test_root_value(room, 1, 1);
         let b = test_root_value(room, 2, 2);
         let error = pyo3::Python::attach(|py| {
-            put_state_hamt_roots(
-                py,
-                namespace.to_owned(),
-                room.as_bytes().to_vec(),
-                vec![(7, a), (7, b)],
-            )
-            .expect_err("duplicate operational ids must be rejected")
+            put_state_hamt_roots(py, room.as_bytes().to_vec(), vec![(7, a), (7, b)])
+                .expect_err("duplicate operational ids must be rejected")
         });
         assert!(error.to_string().contains("duplicate state_group"));
     }
@@ -4857,20 +4781,14 @@ pub(crate) mod auth_chain_closure_tests {
     #[test]
     fn state_root_batch_rejects_conflicting_duplicate_semantic_ids() {
         ensure_open();
-        let namespace = "ns-root-duplicate-semantic";
         let room = "!root-duplicate-semantic:example.org";
         // Same lattice means the same LtHash StateGroupId; different root
         // bytes must not silently replace one another in the semantic index.
         let a = test_root_value(room, 1, 9);
         let b = test_root_value(room, 2, 9);
         let error = pyo3::Python::attach(|py| {
-            put_state_hamt_roots(
-                py,
-                namespace.to_owned(),
-                room.as_bytes().to_vec(),
-                vec![(7, a), (8, b)],
-            )
-            .expect_err("duplicate semantic ids must be rejected")
+            put_state_hamt_roots(py, room.as_bytes().to_vec(), vec![(7, a), (8, b)])
+                .expect_err("duplicate semantic ids must be rejected")
         });
         assert!(error.to_string().contains("duplicate StateGroupId"));
     }
@@ -4878,21 +4796,18 @@ pub(crate) mod auth_chain_closure_tests {
     #[test]
     fn state_root_batch_deduplicates_identical_writes() {
         ensure_open();
-        let namespace = "ns-root-duplicate-identical";
         let room = "!root-duplicate-identical:example.org";
         let value = test_root_value(room, 3, 4);
         let id = test_root_id(&value);
         pyo3::Python::attach(|py| {
             put_state_hamt_roots(
                 py,
-                namespace.to_owned(),
                 room.as_bytes().to_vec(),
                 vec![(9, value.clone()), (9, value.clone())],
             )
             .expect("identical duplicate writes are safe");
             let roots = get_state_hamt_roots_by_state_group_id(
                 py,
-                namespace.to_owned(),
                 room.as_bytes().to_vec(),
                 vec![id.to_vec()],
             )
@@ -4904,13 +4819,11 @@ pub(crate) mod auth_chain_closure_tests {
     #[test]
     fn state_root_rejects_existing_operational_pointer_collision() {
         ensure_open();
-        let namespace = "ns-root-alias-collision";
         let room = "!root-alias-collision:example.org";
-        test_put_root(namespace, room, 11, test_root_value(room, 1, 1));
+        test_put_root(room, 11, test_root_value(room, 1, 1));
         let error = pyo3::Python::attach(|py| {
             put_state_hamt_roots(
                 py,
-                namespace.to_owned(),
                 room.as_bytes().to_vec(),
                 vec![(11, test_root_value(room, 2, 2))],
             )
@@ -4922,52 +4835,34 @@ pub(crate) mod auth_chain_closure_tests {
     #[test]
     fn state_root_delete_preserves_shared_semantic_root_until_last_pointer() {
         ensure_open();
-        let namespace = "ns-root-shared-semantic";
         let room = "!root-shared-semantic:example.org";
         let value = test_root_value(room, 1, 2);
         let id = test_root_id(&value);
-        test_put_root(namespace, room, 41, value.clone());
-        test_put_root(namespace, room, 42, value.clone());
+        test_put_root(room, 41, value.clone());
+        test_put_root(room, 42, value.clone());
 
         pyo3::Python::attach(|py| {
-            delete_state_hamt_roots_for_room(
-                py,
-                namespace.to_owned(),
-                room.as_bytes().to_vec(),
-                vec![41, 41],
-            )
-            .expect("first alias deletion");
+            delete_state_hamt_roots_for_room(py, room.as_bytes().to_vec(), vec![41, 41])
+                .expect("first alias deletion");
             assert_eq!(
-                get_state_hamt_roots_for_room(
-                    py,
-                    namespace.to_owned(),
-                    room.as_bytes().to_vec(),
-                    vec![42],
-                )
-                .expect("remaining operational lookup"),
+                get_state_hamt_roots_for_room(py, room.as_bytes().to_vec(), vec![42],)
+                    .expect("remaining operational lookup"),
                 vec![Some(value.clone())]
             );
             assert_eq!(
                 get_state_hamt_roots_by_state_group_id(
                     py,
-                    namespace.to_owned(),
                     room.as_bytes().to_vec(),
                     vec![id.to_vec()],
                 )
                 .expect("shared semantic lookup"),
                 vec![Some(value.clone())]
             );
-            delete_state_hamt_roots_for_room(
-                py,
-                namespace.to_owned(),
-                room.as_bytes().to_vec(),
-                vec![42],
-            )
-            .expect("last alias deletion");
+            delete_state_hamt_roots_for_room(py, room.as_bytes().to_vec(), vec![42])
+                .expect("last alias deletion");
             assert_eq!(
                 get_state_hamt_roots_by_state_group_id(
                     py,
-                    namespace.to_owned(),
                     room.as_bytes().to_vec(),
                     vec![id.to_vec()],
                 )
@@ -4980,30 +4875,24 @@ pub(crate) mod auth_chain_closure_tests {
     #[test]
     fn state_root_rejects_new_pointer_when_refcount_is_uninitialized() {
         ensure_open();
-        let namespace = "ns-root-uninitialized-refcount";
         let room = "!root-uninitialized-refcount:example.org";
         let value = test_root_value(room, 1, 2);
-        test_put_root(namespace, room, 61, value.clone());
+        test_put_root(room, 61, value.clone());
         let id = test_root_id(&value);
         state_db()
             .expect("state db")
             .put_many(
                 &room_id_from_prefix(room.as_bytes()),
                 &[(
-                    state_group_refcount_node_id(namespace, &id),
+                    state_group_refcount_node_id(&id),
                     NodeData::new(bytes::Bytes::new()),
                 )],
             )
             .expect("remove reference count");
 
         let error = pyo3::Python::attach(|py| {
-            put_state_hamt_roots(
-                py,
-                namespace.to_owned(),
-                room.as_bytes().to_vec(),
-                vec![(62, value)],
-            )
-            .expect_err("mixed pre-refcount aliases must not be guessed")
+            put_state_hamt_roots(py, room.as_bytes().to_vec(), vec![(62, value)])
+                .expect_err("mixed pre-refcount aliases must not be guessed")
         });
         assert!(error.to_string().contains("uninitialized reference count"));
     }
@@ -5011,13 +4900,11 @@ pub(crate) mod auth_chain_closure_tests {
     #[test]
     fn state_root_rejects_root_from_another_room_collection() {
         ensure_open();
-        let namespace = "ns-root-room-mismatch";
         let room_a = "!root-room-a:example.org";
         let room_b = "!root-room-b:example.org";
         let error = pyo3::Python::attach(|py| {
             put_state_hamt_roots(
                 py,
-                namespace.to_owned(),
                 room_a.as_bytes().to_vec(),
                 vec![(51, test_root_value(room_b, 3, 4))],
             )
@@ -5033,7 +4920,6 @@ pub(crate) mod auth_chain_closure_tests {
     #[test]
     fn state_roots_sharing_a_state_group_id_store_one_copy() {
         ensure_open();
-        let namespace = "ns-root-shared";
         let room = "!root-shared:example.org";
         let value = test_root_value(room, 0x33, 0x44);
         let id = test_root_id(&value);
@@ -5041,7 +4927,6 @@ pub(crate) mod auth_chain_closure_tests {
         pyo3::Python::attach(|py| {
             put_state_hamt_roots(
                 py,
-                namespace.to_owned(),
                 room.as_bytes().to_vec(),
                 vec![(41, value.clone()), (42, value.clone())],
             )
@@ -5052,7 +4937,7 @@ pub(crate) mod auth_chain_closure_tests {
             for state_group in [41, 42] {
                 let stored = state_db()
                     .expect("state db")
-                    .get_read_committed(&room_id, &[root_node_id(namespace, state_group)])
+                    .get_read_committed(&room_id, &[root_node_id(state_group)])
                     .expect("read pointer")
                     .remove(0)
                     .expect("pointer present");
@@ -5060,43 +4945,22 @@ pub(crate) mod auth_chain_closure_tests {
                 assert_eq!(stored.bytes.as_ref(), id.as_slice());
             }
 
-            let roots = get_state_hamt_roots_for_room(
-                py,
-                namespace.to_owned(),
-                room.as_bytes().to_vec(),
-                vec![41, 42],
-            )
-            .expect("read both state groups");
+            let roots = get_state_hamt_roots_for_room(py, room.as_bytes().to_vec(), vec![41, 42])
+                .expect("read both state groups");
             assert_eq!(roots, vec![Some(value.clone()), Some(value.clone())]);
 
             // Deleting one must leave the shared copy for the other.
-            delete_state_hamt_roots_for_room(
-                py,
-                namespace.to_owned(),
-                room.as_bytes().to_vec(),
-                vec![41],
-            )
-            .expect("delete one state group");
-            let roots = get_state_hamt_roots_for_room(
-                py,
-                namespace.to_owned(),
-                room.as_bytes().to_vec(),
-                vec![41, 42],
-            )
-            .expect("read after partial delete");
+            delete_state_hamt_roots_for_room(py, room.as_bytes().to_vec(), vec![41])
+                .expect("delete one state group");
+            let roots = get_state_hamt_roots_for_room(py, room.as_bytes().to_vec(), vec![41, 42])
+                .expect("read after partial delete");
             assert_eq!(roots, vec![None, Some(value.clone())]);
 
             // Deleting the last referent releases the shared copy.
-            delete_state_hamt_roots_for_room(
-                py,
-                namespace.to_owned(),
-                room.as_bytes().to_vec(),
-                vec![42],
-            )
-            .expect("delete remaining state group");
+            delete_state_hamt_roots_for_room(py, room.as_bytes().to_vec(), vec![42])
+                .expect("delete remaining state group");
             let roots = get_state_hamt_roots_by_state_group_id(
                 py,
-                namespace.to_owned(),
                 room.as_bytes().to_vec(),
                 vec![id.to_vec()],
             )
@@ -5110,26 +4974,25 @@ pub(crate) mod auth_chain_closure_tests {
     #[test]
     fn state_root_reput_is_idempotent() {
         ensure_open();
-        let namespace = "ns-root-reput";
         let room = "!root-reput:example.org";
         let value = test_root_value(room, 0x55, 0x66);
         let id = test_root_id(&value);
-        test_put_root(namespace, room, 51, value.clone());
+        test_put_root(room, 51, value.clone());
 
         let room_id = room_id_from_prefix(room.as_bytes());
         let refcount_before = state_db()
             .expect("state db")
-            .get_read_committed(&room_id, &[state_group_refcount_node_id(namespace, &id)])
+            .get_read_committed(&room_id, &[state_group_refcount_node_id(&id)])
             .expect("read refcount")
             .remove(0)
             .expect("refcount present");
         assert_eq!(refcount_before.bytes.as_ref(), 1u64.to_be_bytes());
 
-        test_put_root(namespace, room, 51, value.clone());
+        test_put_root(room, 51, value.clone());
 
         let refcount_after = state_db()
             .expect("state db")
-            .get_read_committed(&room_id, &[state_group_refcount_node_id(namespace, &id)])
+            .get_read_committed(&room_id, &[state_group_refcount_node_id(&id)])
             .expect("read refcount")
             .remove(0)
             .expect("refcount present");
@@ -5141,13 +5004,8 @@ pub(crate) mod auth_chain_closure_tests {
 
         // And the root still reads back.
         let roots = pyo3::Python::attach(|py| {
-            get_state_hamt_roots_for_room(
-                py,
-                namespace.to_owned(),
-                room.as_bytes().to_vec(),
-                vec![51],
-            )
-            .expect("read after re-put")
+            get_state_hamt_roots_for_room(py, room.as_bytes().to_vec(), vec![51])
+                .expect("read after re-put")
         });
         assert_eq!(roots, vec![Some(value)]);
     }
@@ -5155,7 +5013,6 @@ pub(crate) mod auth_chain_closure_tests {
     #[test]
     fn repoint_event_state_group_moves_mapping_and_refcounts() {
         ensure_open();
-        let namespace = "ns-repoint-atomic";
         let event_id = "$repoint-atomic";
         let old_group: i64 = 71;
         let new_group: i64 = 72;
@@ -5163,11 +5020,11 @@ pub(crate) mod auth_chain_closure_tests {
 
         batch_put_impl(vec![
             (
-                event_to_state_group_key(namespace, event_id),
+                event_to_state_group_key(event_id),
                 old_group.to_be_bytes().to_vec(),
             ),
             (
-                state_group_refcount_key(namespace, old_group),
+                state_group_refcount_key(old_group),
                 3i64.to_be_bytes().to_vec(),
             ),
         ])
@@ -5184,68 +5041,56 @@ pub(crate) mod auth_chain_closure_tests {
         };
 
         let old = pyo3::Python::attach(|py| {
-            repoint_event_state_group(py, namespace.to_owned(), event_id.to_owned(), new_group)
+            repoint_event_state_group(py, event_id.to_owned(), new_group)
         })
         .expect("repoint");
         assert_eq!(old, Some(old_group));
         assert_eq!(
-            read_group(event_to_state_group_key(namespace, event_id)),
+            read_group(event_to_state_group_key(event_id)),
             Some(new_group)
         );
-        assert_eq!(
-            read_group(state_group_refcount_key(namespace, old_group)),
-            Some(2)
-        );
-        assert_eq!(
-            read_group(state_group_refcount_key(namespace, new_group)),
-            Some(1)
-        );
+        assert_eq!(read_group(state_group_refcount_key(old_group)), Some(2));
+        assert_eq!(read_group(state_group_refcount_key(new_group)), Some(1));
 
         // Repeating the same repoint must not move either counter again.
         let old = pyo3::Python::attach(|py| {
-            repoint_event_state_group(py, namespace.to_owned(), event_id.to_owned(), new_group)
+            repoint_event_state_group(py, event_id.to_owned(), new_group)
         })
         .expect("idempotent repoint");
         assert_eq!(old, Some(new_group));
-        assert_eq!(
-            read_group(state_group_refcount_key(namespace, old_group)),
-            Some(2)
-        );
-        assert_eq!(
-            read_group(state_group_refcount_key(namespace, new_group)),
-            Some(1)
-        );
+        assert_eq!(read_group(state_group_refcount_key(old_group)), Some(2));
+        assert_eq!(read_group(state_group_refcount_key(new_group)), Some(1));
 
         // A previously unmapped event only adds a reference to its new group.
         let missing_event_id = "$repoint-atomic-missing";
         let old = pyo3::Python::attach(|py| {
-            repoint_event_state_group(py, namespace.to_owned(), missing_event_id.to_owned(), 73)
+            repoint_event_state_group(py, missing_event_id.to_owned(), 73)
         })
         .expect("insert repoint");
         assert_eq!(old, None);
         assert_eq!(
-            read_group(event_to_state_group_key(namespace, missing_event_id)),
+            read_group(event_to_state_group_key(missing_event_id)),
             Some(73)
         );
-        assert_eq!(read_group(state_group_refcount_key(namespace, 73)), Some(1));
+        assert_eq!(read_group(state_group_refcount_key(73)), Some(1));
 
         // A malformed refcount must abort the whole rewrite rather than being
         // treated as zero and silently resetting the counter.
         let corrupt_event_id = "$repoint-atomic-corrupt";
         batch_put_impl(vec![
             (
-                event_to_state_group_key(namespace, corrupt_event_id),
+                event_to_state_group_key(corrupt_event_id),
                 74i64.to_be_bytes().to_vec(),
             ),
-            (state_group_refcount_key(namespace, 74), vec![1, 2, 3]),
+            (state_group_refcount_key(74), vec![1, 2, 3]),
         ])
         .expect("seed corrupt refcount");
         let result = pyo3::Python::attach(|py| {
-            repoint_event_state_group(py, namespace.to_owned(), corrupt_event_id.to_owned(), 75)
+            repoint_event_state_group(py, corrupt_event_id.to_owned(), 75)
         });
         assert!(result.is_err());
         assert_eq!(
-            read_group(event_to_state_group_key(namespace, corrupt_event_id)),
+            read_group(event_to_state_group_key(corrupt_event_id)),
             Some(74)
         );
     }
@@ -5255,17 +5100,16 @@ pub(crate) mod auth_chain_closure_tests {
     #[test]
     fn repoint_event_state_group_retries_stale_counter_commits() {
         ensure_open();
-        let namespace = "ns-repoint-race";
         let (old_group, new_group): (i64, i64) = (81, 82);
         let event_id = "$repoint-race-one";
         let collection = kv_room_id();
         batch_put_impl(vec![
             (
-                event_to_state_group_key(namespace, event_id),
+                event_to_state_group_key(event_id),
                 old_group.to_be_bytes().to_vec(),
             ),
             (
-                state_group_refcount_key(namespace, old_group),
+                state_group_refcount_key(old_group),
                 1i64.to_be_bytes().to_vec(),
             ),
         ])
@@ -5274,15 +5118,12 @@ pub(crate) mod auth_chain_closure_tests {
         let (staged_tx, staged_rx) = std::sync::mpsc::channel::<()>();
         let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
         *REPOINT_TEST_HOOK.lock().expect("test hook lock") = Some(RepointTestHook {
-            namespace: namespace.to_owned(),
             staged: staged_tx,
             resume: resume_rx,
         });
         let event_id_owned = event_id.to_owned();
         let worker = std::thread::spawn(move || {
-            pyo3::Python::attach(|py| {
-                repoint_event_state_group(py, namespace.to_owned(), event_id_owned, new_group)
-            })
+            pyo3::Python::attach(|py| repoint_event_state_group(py, event_id_owned, new_group))
         });
 
         // The repoint has read and staged both counters, but cannot publish
@@ -5296,12 +5137,9 @@ pub(crate) mod auth_chain_closure_tests {
             let result = worker.join().expect("worker panicked before staging");
             panic!("repoint finished without staging a commit: {result:?}");
         }
-        let database = pools()
-            .expect("pools")
-            .shared_database
-            .as_ref()
-            .expect("shared database");
-        let target_node = kv_node_id(&state_group_refcount_key(namespace, new_group));
+        let pools = pools().expect("pools");
+        let database = pools.shared_database.as_ref().expect("shared database");
+        let target_node = kv_node_id(&state_group_refcount_key(new_group));
         let writer = database.begin_transaction();
         let writer_result = writer
             .increment_counters(ShardType::State, collection, &[(target_node, 1)])
@@ -5325,11 +5163,8 @@ pub(crate) mod auth_chain_closure_tests {
                 .expect("present");
             i64::from_be_bytes(record.bytes.as_ref().try_into().unwrap())
         };
-        assert_eq!(
-            read(event_to_state_group_key(namespace, event_id)),
-            new_group
-        );
-        assert_eq!(read(state_group_refcount_key(namespace, old_group)), 0);
-        assert_eq!(read(state_group_refcount_key(namespace, new_group)), 2);
+        assert_eq!(read(event_to_state_group_key(event_id)), new_group);
+        assert_eq!(read(state_group_refcount_key(old_group)), 0);
+        assert_eq!(read(state_group_refcount_key(new_group)), 2);
     }
 }

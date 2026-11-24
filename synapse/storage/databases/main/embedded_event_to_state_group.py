@@ -20,13 +20,10 @@ configured, new writes are mtxdb-exclusive; SQL rows are only legacy input
 for the one-time migration. See `_store_event_state_mappings_txn` in
 `events.py` and the partial-state rewrite in `state.py`.
 
-Every key here is namespaced (see `namespace` on each function, and
-`hamt_namespace` on the state datastore) for the same reason the HAMT
-node/root keys are: multiple homeservers/deployments can share one mtxdb
-file (e.g. many trial test processes), and state_group ids restart at 1 for
-each -- without a namespace prefix, two different deployments' state_group
-9 would collide and silently share (and corrupt) each other's refcounts and
-event mappings.
+Every key here is unsalted: event ids are globally unique, and a state-group
+id is unique within the database this store belongs to. A process that needs
+two independent stores must give each its own mtxdb root, not a shared file
+with a namespace prefix.
 
 NOT write-once/immutable: partial-state events (fast-join) get their
 `state_group` rewritten in place once resolution completes -- see
@@ -63,33 +60,22 @@ from synapse.storage.databases.main.embedded_common import (
     ffi_count,
     ffi_timing,
     mirror_timing,
-    namespace_hash,
     retry_on_contention,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def _event_to_state_group_key(namespace: str, event_id: str) -> bytes:
-    return (
-        b"event_to_state_group:"
-        + namespace_hash(namespace).hex().encode("ascii")
-        + b":"
-        + event_id.encode("utf-8")
-    )
+def _event_to_state_group_key(event_id: str) -> bytes:
+    return b"event_to_state_group:" + event_id.encode("utf-8")
 
 
-def _state_group_refcount_key(namespace: str, state_group: int) -> bytes:
-    return (
-        b"state_group_refcount:"
-        + namespace_hash(namespace).hex().encode("ascii")
-        + b":"
-        + struct.pack(">q", state_group)
-    )
+def _state_group_refcount_key(state_group: int) -> bytes:
+    return b"state_group_refcount:" + struct.pack(">q", state_group)
 
 
 def put_event_to_state_group_batch(
-    engine_name: str | None, namespace: str, rows: list[tuple[str, int]]
+    engine_name: str | None, rows: list[tuple[str, int]]
 ) -> None:
     """`rows`: `(event_id, state_group)`. Called both from the event
     persister (initial insert) and from `update_state_for_partial_state_event`
@@ -119,7 +105,7 @@ def put_event_to_state_group_batch(
 
         pairs = [
             (
-                _event_to_state_group_key(namespace, event_id),
+                _event_to_state_group_key(event_id),
                 struct.pack(">q", state_group),
             )
             for event_id, state_group in rows
@@ -131,7 +117,6 @@ def put_event_to_state_group_batch(
 
 def repoint_event_state_group(
     engine_name: str | None,
-    namespace: str,
     event_id: str,
     state_group: int,
 ) -> None:
@@ -145,13 +130,12 @@ def repoint_event_state_group(
     """
     with mirror_timing("repoint_event_state_group"):
         get_embedded_engine(engine_name).repoint_event_state_group(
-            namespace, event_id, state_group
+            event_id, state_group
         )
 
 
 def get_state_group_for_events_batch(
     engine_name: str | None,
-    namespace: str,
     event_ids: list[str],
     purpose: str = "read_batch",
 ) -> dict[str, int]:
@@ -166,9 +150,7 @@ def get_state_group_for_events_batch(
         engine = get_embedded_engine(engine_name)
         batch_get = engine.batch_get
 
-        keys = [
-            _event_to_state_group_key(namespace, event_id) for event_id in event_ids
-        ]
+        keys = [_event_to_state_group_key(event_id) for event_id in event_ids]
         key_to_event_id = dict(zip(keys, event_ids))
         _et = time.monotonic()
         found = retry_on_contention(
@@ -197,7 +179,7 @@ def get_state_group_for_events_batch(
 
 
 def delete_event_to_state_group_batch(
-    engine_name: str | None, namespace: str, event_ids: list[str]
+    engine_name: str | None, event_ids: list[str]
 ) -> None:
     """Removes `event_id`s from the embedded mirror. Must be called wherever
     `event_to_state_groups` rows are purged, alongside
@@ -213,12 +195,12 @@ def delete_event_to_state_group_batch(
     engine = get_embedded_engine(engine_name)
     batch_delete = engine.batch_delete
 
-    keys = [_event_to_state_group_key(namespace, event_id) for event_id in event_ids]
+    keys = [_event_to_state_group_key(event_id) for event_id in event_ids]
     batch_delete(keys)
 
 
 def increment_state_group_refcounts_batch(
-    engine_name: str | None, namespace: str, state_groups: list[int]
+    engine_name: str | None, state_groups: list[int]
 ) -> None:
     """Adds +1 to each listed state group's reference count (repeats count
     multiple times, e.g. `[5, 5, 7]` adds 2 to group 5's count and 1 to
@@ -237,7 +219,7 @@ def increment_state_group_refcounts_batch(
         for state_group in state_groups:
             counts[state_group] = counts.get(state_group, 0) + 1
         pairs = [
-            (_state_group_refcount_key(namespace, state_group), delta)
+            (_state_group_refcount_key(state_group), delta)
             for state_group, delta in counts.items()
         ]
         _et = time.monotonic()
@@ -246,7 +228,7 @@ def increment_state_group_refcounts_batch(
 
 
 def decrement_state_group_refcounts_batch(
-    engine_name: str | None, namespace: str, state_groups: list[int]
+    engine_name: str | None, state_groups: list[int]
 ) -> None:
     """The inverse of `increment_state_group_refcounts_batch` -- call once
     per purged `(event_id, state_group)` mapping. Never lets a counter go
@@ -265,7 +247,7 @@ def decrement_state_group_refcounts_batch(
         for state_group in state_groups:
             counts[state_group] = counts.get(state_group, 0) + 1
         pairs = [
-            (_state_group_refcount_key(namespace, state_group), -delta)
+            (_state_group_refcount_key(state_group), -delta)
             for state_group, delta in counts.items()
         ]
         _et = time.monotonic()
@@ -274,7 +256,7 @@ def decrement_state_group_refcounts_batch(
 
 
 def get_referenced_state_groups_batch(
-    engine_name: str | None, namespace: str, state_groups: list[int]
+    engine_name: str | None, state_groups: list[int]
 ) -> set[int]:
     """Returns the subset of `state_groups` whose reference count is > 0 --
     the embedded-engine equivalent of the SQL `get_referenced_state_groups`
@@ -286,10 +268,7 @@ def get_referenced_state_groups_batch(
         engine = get_embedded_engine(engine_name)
         batch_get = engine.batch_get
 
-        keys = [
-            _state_group_refcount_key(namespace, state_group)
-            for state_group in state_groups
-        ]
+        keys = [_state_group_refcount_key(state_group) for state_group in state_groups]
         key_to_group = dict(zip(keys, state_groups))
         _et = time.monotonic()
         found = retry_on_contention(

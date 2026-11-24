@@ -165,7 +165,6 @@ class CensorEventsStore(EventsWorkerStore, CacheInvalidationWorkerStore, SQLBase
                 if getattr(self, "_embedded_event_json_enabled", False):
                     set_have_censored_batch(
                         self._embedded_db_engine,
-                        self._embedded_db_namespace,
                         [event_id],
                         True,
                     )
@@ -202,7 +201,6 @@ class CensorEventsStore(EventsWorkerStore, CacheInvalidationWorkerStore, SQLBase
         if getattr(self, "_embedded_event_json_enabled", False):
             found = get_event_json_batch(
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 [event_id],
             )
             if event_id in found:
@@ -217,7 +215,6 @@ class CensorEventsStore(EventsWorkerStore, CacheInvalidationWorkerStore, SQLBase
                 if room_id is not None:
                     put_event_json_batch(
                         self._embedded_db_engine,
-                        self._embedded_db_namespace,
                         [
                             (
                                 event_id,
@@ -242,7 +239,6 @@ class CensorEventsStore(EventsWorkerStore, CacheInvalidationWorkerStore, SQLBase
                     room_id, internal_metadata, format_version = row
                     put_event_json_batch(
                         self._embedded_db_engine,
-                        self._embedded_db_namespace,
                         [
                             (
                                 event_id,

@@ -6,7 +6,7 @@
 #
 """Line-driven mtxdb process for `test_mtxdb_journal_visibility.py`.
 
-    python mtxdb_visibility_worker.py {writer|reader} <store dir> [namespace]
+    python mtxdb_visibility_worker.py {writer|reader} <store dir>
 
 mtxdb's Python binding owns process-global pools, so a writer and a read-only
 worker cannot share an interpreter: the test drives each in its own process.
@@ -72,7 +72,6 @@ def _fsyncs() -> int:
 
 def main() -> None:
     role, path = sys.argv[1], sys.argv[2]
-    namespace = sys.argv[3] if len(sys.argv) > 3 else "vis"
     # Importing Synapse is the slow part of starting this process. Report it
     # done, then wait for "open": the test starts several processes at once so
     # their imports overlap, while still opening the writer before any reader.
@@ -107,13 +106,12 @@ def main() -> None:
                 room_id, event_id, body = args
                 put_event_json_batch(
                     "mtxdb",
-                    namespace,
                     [(event_id, room_id, "{}", body, 1)],
                     sync=False,
                 )
                 reply = "ok"
             elif command == "event_json_get":
-                found_json = get_event_json_batch("mtxdb", namespace, [args[0]])
+                found_json = get_event_json_batch("mtxdb", [args[0]])
                 reply = json.dumps(
                     found_json[args[0]][1] if args[0] in found_json else None
                 )
@@ -126,7 +124,6 @@ def main() -> None:
                 room_id, event_id, body = args
                 put_event_json_batch(
                     "mtxdb",
-                    namespace,
                     [(event_id, room_id, "{}", body, 1)],
                     transaction=transaction,
                 )

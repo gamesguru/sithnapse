@@ -330,9 +330,6 @@ class PersistEventsStore:
         self._embedded_event_edges_enabled = open_embedded_event_edges_engine(hs)
         self._embedded_event_edges_writable = embedded_event_edges_is_writable(hs)
         self._embedded_db_engine = hs.config.database.embedded_db_engine
-        self._embedded_db_namespace = (
-            hs.config.database.embedded_db_namespace or hs.hostname
-        )
 
         # This should only exist on instances that are configured to write
         assert hs.get_instance_name() in hs.config.worker.writers.events, (
@@ -945,7 +942,6 @@ class PersistEventsStore:
             return {}
         found = get_event_json_batch(
             self._embedded_db_engine,
-            self._embedded_db_namespace,
             missing_meta_ids,
         )
         return {eid: m for eid, (m, _, _) in found.items()}
@@ -1367,7 +1363,6 @@ class PersistEventsStore:
         if self._embedded_event_json_enabled and de_outliered_events:
             put_event_json_batch(
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 [
                     (
                         event.event_id,
@@ -1635,11 +1630,9 @@ class PersistEventsStore:
         from synapse.storage.databases.main.embedded_event_auth_chains import (
             embed_auth_edges_batch,
             get_or_create_short_ids,
-            resolve_namespace,
         )
 
-        embedded_db_namespace = resolve_namespace(self)
-        if embedded_db_namespace is not None:
+        if getattr(self, "_embedded_db_engine", None) is not None:
             # Auth edges are durable, not a cache: write them before the SQL
             # COMMIT rather than from a post-commit callback, which could be
             # lost to a crash or fail without aborting the persist. A SQL
@@ -1657,7 +1650,6 @@ class PersistEventsStore:
             )
             short_ids = get_or_create_short_ids(
                 self._embedded_db_engine,
-                embedded_db_namespace,
                 room_id,
                 event_ids + auth_ids,
             )
@@ -1671,7 +1663,6 @@ class PersistEventsStore:
             ]
             embed_auth_edges_batch(
                 self._embedded_db_engine,
-                embedded_db_namespace,
                 room_id,
                 rows,
                 transaction=mtxdb_txn,
@@ -2610,7 +2601,6 @@ class PersistEventsStore:
             ):
                 found = get_event_json_batch(
                     self._embedded_db_engine,
-                    self._embedded_db_namespace,
                     [event_id],
                 )
                 if event_id in found:
@@ -3195,7 +3185,6 @@ class PersistEventsStore:
             # to mtxdb without duplicating the highest-disk-usage table in SQL.
             put_event_json_batch(
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 [
                     (event_id, room_id, internal_metadata, json, format_version)
                     for event_id, room_id, internal_metadata, json, format_version in event_json_rows
@@ -3287,7 +3276,6 @@ class PersistEventsStore:
         if unredacted_events and getattr(self, "_embedded_event_json_enabled", False):
             set_have_censored_batch(
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 unredacted_events,
                 False,
             )
@@ -3539,7 +3527,6 @@ class PersistEventsStore:
         if getattr(self, "_embedded_event_json_enabled", False):
             put_redaction_batch(
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 [(event.redacts, event.event_id, False)],
             )
 
@@ -4140,7 +4127,6 @@ class PersistEventsStore:
             # increment.
             existing = get_state_group_for_events_batch(
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 list(state_groups.keys()),
                 purpose="persist_existence_check",
             )
@@ -4149,12 +4135,10 @@ class PersistEventsStore:
             ]
             put_event_to_state_group_batch(
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 list(non_null_state_groups.items()),
             )
             increment_state_group_refcounts_batch(
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 [
                     non_null_state_groups[event_id]
                     for event_id in new_event_ids

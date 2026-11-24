@@ -87,7 +87,7 @@ class PurgeTests(HomeserverTestCase):
         self.state_deletion_store = hs.get_datastores().state_deletion
         self._storage_controllers = self.hs.get_storage_controllers()
 
-    def _enable_embedded_engine(self) -> tuple[str, str]:
+    def _enable_embedded_engine(self) -> str:
         """Force-enable the embedded mtxdb path for a single test.
 
         Enables both the main and persister stores *before* the room under
@@ -97,15 +97,14 @@ class PurgeTests(HomeserverTestCase):
         routes its auth-chain lookup through a mirror that never saw it,
         403ing with "No create event in auth events".
 
-        The engine itself is process-global (`mtxdb_engine.open_client` is
-        backed by a Rust `OnceCell`), so the module-level store opened at
-        import time is reused; a per-test directory would be unlinked while
-        the engine still pointed at it.
+        The adapter's store is process-global but closable, so this closes
+        whatever the previous test opened and reopens a fixed test root.
 
-        Returns the configured (engine, namespace).
+        Returns the configured engine.
         """
         from synapse.synapse_rust import mtxdb_engine
 
+        mtxdb_engine.close_client()
         mtxdb_engine.open_client(_EMBEDDED_ENGINE_TMPDIR)
 
         persist_store = self.hs.get_datastores().persist_events
@@ -116,10 +115,10 @@ class PurgeTests(HomeserverTestCase):
 
         engine = self.store._embedded_db_engine
         assert engine is not None
-        return engine, self.store._embedded_db_namespace
+        return engine
 
     def _seed_redaction_and_rejection_mirror(
-        self, engine: str, namespace: str, target_id: str, redaction_id: str
+        self, engine: str, target_id: str, redaction_id: str
     ) -> None:
         """Seed the SQL rows and matching mirror entries for a redaction
         (keyed by its target) and a rejection (keyed by the event id)."""
@@ -144,12 +143,10 @@ class PurgeTests(HomeserverTestCase):
                 },
             )
         )
-        put_redaction_batch(engine, namespace, [(target_id, redaction_id, True)])
+        put_redaction_batch(engine, [(target_id, redaction_id, True)])
 
-    def _assert_mirrors(
-        self, engine: str, namespace: str, target_id: str, present: bool
-    ) -> None:
-        redactions = get_redactions_batch(engine, namespace, [target_id])
+    def _assert_mirrors(self, engine: str, target_id: str, present: bool) -> None:
+        redactions = get_redactions_batch(engine, [target_id])
         if present:
             self.assertIn(target_id, redactions)
         else:
@@ -189,17 +186,13 @@ class PurgeTests(HomeserverTestCase):
         redaction_calls = 0
         event_json_calls = 0
 
-        def delete_redactions(
-            engine_name: str | None, namespace: str, event_ids: list[str]
-        ) -> None:
+        def delete_redactions(engine_name: str | None, event_ids: list[str]) -> None:
             nonlocal redaction_calls
             redaction_calls += 1
             if redaction_calls == 1:
                 raise BlockingIOError("temporary mtxdb contention")
 
-        def delete_event_json(
-            engine_name: str | None, namespace: str, event_ids: list[str]
-        ) -> None:
+        def delete_event_json(engine_name: str | None, event_ids: list[str]) -> None:
             nonlocal event_json_calls
             event_json_calls += 1
 
@@ -212,7 +205,7 @@ class PurgeTests(HomeserverTestCase):
             ),
         ):
             purge_events_module._delete_purge_event_mirrors(
-                "mtxdb", "test", ["$redacted"], ["$event"]
+                "mtxdb", ["$redacted"], ["$event"]
             )
 
         self.assertEqual(redaction_calls, 2)
@@ -224,14 +217,14 @@ class PurgeTests(HomeserverTestCase):
         They are not rolled back with the transaction, so running them inline
         would lose the mirror for events whose SQL rows survive a failed purge.
         """
-        engine, namespace = self._enable_embedded_engine()
+        engine = self._enable_embedded_engine()
 
         room_id = self.helper.create_room_as(self.user_id)
         target = self.helper.send(room_id, body="target")
         redaction = self.helper.send(room_id, body="redaction event")
         last = self.helper.send(room_id, body="last")
         self._seed_redaction_and_rejection_mirror(
-            engine, namespace, target["event_id"], redaction["event_id"]
+            engine, target["event_id"], redaction["event_id"]
         )
         token = self.get_success(
             self.store.get_topological_token_for_event(last["event_id"])
@@ -258,7 +251,7 @@ class PurgeTests(HomeserverTestCase):
             )
 
         # The purge rolled back, so the mirror must still be there.
-        self._assert_mirrors(engine, namespace, target["event_id"], present=True)
+        self._assert_mirrors(engine, target["event_id"], present=True)
 
         # A purge that commits removes it.
         self.get_success(
@@ -266,7 +259,7 @@ class PurgeTests(HomeserverTestCase):
                 room_id, token_str, True
             )
         )
-        self._assert_mirrors(engine, namespace, target["event_id"], present=False)
+        self._assert_mirrors(engine, target["event_id"], present=False)
 
     def test_purge_cleanup_steps_run_even_if_one_fails(self) -> None:
         """One failing post-commit cleanup must not stop the others (the
@@ -310,7 +303,7 @@ class PurgeTests(HomeserverTestCase):
             ),
         ):
             purge_events_module._delete_purge_event_mirrors(
-                "mtxdb", "test", ["$redacted"], ["$event"]
+                "mtxdb", ["$redacted"], ["$event"]
             )
 
         self.assertEqual(order, ["redactions", "sync", "event_json"])
@@ -438,25 +431,23 @@ class PurgeTests(HomeserverTestCase):
         self.get_failure(self.store.get_event(first["event_id"]), NotFoundError)
 
     def test_purge_room_clears_embedded_redaction_and_rejection_mirrors(self) -> None:
-        engine, namespace = self._enable_embedded_engine()
+        engine = self._enable_embedded_engine()
 
         room_id = self.helper.create_room_as(self.user_id)
         target = self.helper.send(room_id, body="target")
         redaction = self.helper.send(room_id, body="redaction event")
 
         self._seed_redaction_and_rejection_mirror(
-            engine, namespace, target["event_id"], redaction["event_id"]
+            engine, target["event_id"], redaction["event_id"]
         )
-        self._assert_mirrors(engine, namespace, target["event_id"], present=True)
+        self._assert_mirrors(engine, target["event_id"], present=True)
 
         self.get_success(self._storage_controllers.purge_events.purge_room(room_id))
 
-        self._assert_mirrors(engine, namespace, target["event_id"], present=False)
+        self._assert_mirrors(engine, target["event_id"], present=False)
 
     def test_purge_room_clears_embedded_auth_chain(self) -> None:
-        engine, namespace = self._enable_embedded_engine()
-        if namespace is None:
-            self.skipTest("embedded auth-chain namespace not configured")
+        engine = self._enable_embedded_engine()
 
         room_id = self.helper.create_room_as(self.user_id)
         event_id = self.helper.send(room_id, body="auth chain event")["event_id"]
@@ -475,14 +466,14 @@ class PurgeTests(HomeserverTestCase):
             )
         )
 
-        short_id = get_or_create_short_ids(engine, namespace, room_id, [event_id])[0]
-        embed_auth_edges_batch(engine, namespace, room_id, [(short_id, [])])
+        short_id = get_or_create_short_ids(engine, room_id, [event_id])[0]
+        embed_auth_edges_batch(engine, room_id, [(short_id, [])])
         self.assertEqual(
-            get_embedded_auth_edges_batch(engine, namespace, room_id, [short_id]),
+            get_embedded_auth_edges_batch(engine, room_id, [short_id]),
             {short_id: []},
         )
         self.assertEqual(
-            resolve_short_ids_to_event_ids(engine, namespace, room_id, [short_id]),
+            resolve_short_ids_to_event_ids(engine, room_id, [short_id]),
             [event_id],
         )
 
@@ -498,18 +489,18 @@ class PurgeTests(HomeserverTestCase):
         self.assertEqual(sql_auth_rows, [])
 
         self.assertEqual(
-            get_embedded_auth_edges_batch(engine, namespace, room_id, [short_id]),
+            get_embedded_auth_edges_batch(engine, room_id, [short_id]),
             {short_id: None},
         )
         self.assertEqual(
-            resolve_short_ids_to_event_ids(engine, namespace, room_id, [short_id]),
+            resolve_short_ids_to_event_ids(engine, room_id, [short_id]),
             [None],
         )
 
     def test_purge_history_clears_embedded_redaction_and_rejection_mirrors(
         self,
     ) -> None:
-        engine, namespace = self._enable_embedded_engine()
+        engine = self._enable_embedded_engine()
 
         room_id = self.helper.create_room_as(self.user_id)
         target = self.helper.send(room_id, body="target")
@@ -517,9 +508,9 @@ class PurgeTests(HomeserverTestCase):
         last = self.helper.send(room_id, body="last")
 
         self._seed_redaction_and_rejection_mirror(
-            engine, namespace, target["event_id"], redaction["event_id"]
+            engine, target["event_id"], redaction["event_id"]
         )
-        self._assert_mirrors(engine, namespace, target["event_id"], present=True)
+        self._assert_mirrors(engine, target["event_id"], present=True)
 
         token = self.get_success(
             self.store.get_topological_token_for_event(last["event_id"])
@@ -531,7 +522,7 @@ class PurgeTests(HomeserverTestCase):
             )
         )
 
-        self._assert_mirrors(engine, namespace, target["event_id"], present=False)
+        self._assert_mirrors(engine, target["event_id"], present=False)
 
     def test_purge_history_deletes_unmigrated_sql_state_group_rows(self) -> None:
         """A purged event whose `event_to_state_groups` row is still SQL-only
@@ -543,7 +534,7 @@ class PurgeTests(HomeserverTestCase):
             get_state_group_for_events_batch,
         )
 
-        engine, namespace = self._enable_embedded_engine()
+        engine = self._enable_embedded_engine()
         room_id = self.helper.create_room_as(self.user_id)
         first = self.helper.send(room_id, body="unmigrated")
         last = self.helper.send(room_id, body="last")
@@ -551,10 +542,8 @@ class PurgeTests(HomeserverTestCase):
 
         # Turn `first`'s mapping back into the pre-migration shape: present in
         # SQL only.
-        state_group = get_state_group_for_events_batch(engine, namespace, [first_id])[
-            first_id
-        ]
-        delete_event_to_state_group_batch(engine, namespace, [first_id])
+        state_group = get_state_group_for_events_batch(engine, [first_id])[first_id]
+        delete_event_to_state_group_batch(engine, [first_id])
         self.get_success(
             self.store.db_pool.simple_upsert(
                 table="event_to_state_groups",
@@ -863,12 +852,10 @@ class PurgeTests(HomeserverTestCase):
 
             put_event_to_state_group_batch(
                 self.store._embedded_db_engine,
-                self.store._embedded_db_namespace,
                 [("$new_event", referenced_chain_state_group)],
             )
             increment_state_group_refcounts_batch(
                 self.store._embedded_db_engine,
-                self.store._embedded_db_namespace,
                 [referenced_chain_state_group],
             )
         else:

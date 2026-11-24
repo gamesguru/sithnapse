@@ -511,14 +511,11 @@ class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
         from synapse.storage.databases.main.embedded_event_auth_chains import (
             embed_auth_edges_batch,
             get_or_create_short_ids,
-            resolve_namespace,
         )
 
-        embedded_db_namespace = resolve_namespace(self.store)
-        if embedded_db_namespace is None:
-            self.skipTest("embedded closures namespace not configured")
-
         engine_name = getattr(self.store, "_embedded_db_engine", None)
+        if engine_name is None:
+            self.skipTest("embedded engine not configured")
         room_id = "!conflicted_subgraph_embedded_closures"
 
         # Direct auth edges reproducing the same ancestry as the chain
@@ -543,13 +540,10 @@ class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
             "G2": ["G1"],
         }
         event_ids = list(auth_edges)
-        short_ids = get_or_create_short_ids(
-            engine_name, embedded_db_namespace, room_id, event_ids
-        )
+        short_ids = get_or_create_short_ids(engine_name, room_id, event_ids)
         short_id_of = dict(zip(event_ids, short_ids))
         embed_auth_edges_batch(
             engine_name,
-            embedded_db_namespace,
             room_id,
             [
                 (short_id_of[event_id], [short_id_of[auth_id] for auth_id in auths])
@@ -634,7 +628,6 @@ class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
 
         def run_test(test_case: TestCase) -> None:
             result = self.store._get_auth_chain_difference_using_embedded_closures(
-                embedded_db_namespace,
                 room_id,
                 [test_case.conflicted.union(test_case.additional_backwards_reachable)],
                 test_case.conflicted,

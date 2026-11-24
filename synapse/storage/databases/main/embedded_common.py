@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import atexit
-import hashlib
 import json
 import logging
 import os
@@ -1116,17 +1115,6 @@ def _set_engine_configured() -> None:
     init when `embedded_db.engine` + `embedded_db.path` are set."""
     global _engine_configured
     _engine_configured = True
-
-
-def namespace_hash(namespace: str) -> bytes:
-    """16-byte digest of a namespace, used to key every embedded mirror.
-
-    Namespaced keys keep multiple homeservers sharing one mtxdb file from
-    colliding on event ids / state-group ids. Kept here so every
-    embedded_* module derives keys identically (see `_state_hamt_node_key`
-    in `rust/src/database/core.rs` for the matching Rust-side derivation).
-    """
-    return hashlib.sha256(namespace.encode("utf-8")).digest()[:16]
 
 
 class SyncTier(Enum):

@@ -367,7 +367,6 @@ class RedactionTestCase(unittest.HomeserverTestCase):
 
             found = get_event_json_batch(
                 self.store._embedded_db_engine,
-                self.store._embedded_db_namespace,
                 [msg_event.event_id],
             )
             event_json = found[msg_event.event_id][1]
@@ -397,7 +396,6 @@ class RedactionTestCase(unittest.HomeserverTestCase):
 
             found = get_event_json_batch(
                 self.store._embedded_db_engine,
-                self.store._embedded_db_namespace,
                 [msg_event.event_id],
             )
             event_json = found[msg_event.event_id][1]

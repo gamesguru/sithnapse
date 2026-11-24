@@ -145,7 +145,6 @@ class EventForwardExtremitiesStore(
         if getattr(self, "_embedded_event_json_enabled", False):
             state_groups = get_state_group_for_events_batch(
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 event_ids,
                 purpose="forward_extremities",
             )

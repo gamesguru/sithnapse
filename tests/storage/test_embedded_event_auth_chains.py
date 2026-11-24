@@ -30,7 +30,6 @@ from synapse.storage.databases.main.embedded_event_auth_chains import (
     get_or_create_short_ids,
 )
 
-NAMESPACE = "test-ns"
 ROOM_ID = "!room:example.org"
 
 
@@ -43,68 +42,65 @@ class FakeEngine(ModuleType):
 
     def __init__(self, name: str = "fake_mtxdb_engine") -> None:
         super().__init__(name)
-        self._counters: dict[tuple[str, str], int] = {}
-        self._forward: dict[tuple[str, str, str], int] = {}
-        self._reverse: dict[tuple[str, str, int], str] = {}
-        self._edges: dict[tuple[str, str, int], list[int]] = {}
-        self._children: dict[tuple[str, str, int], list[int]] = {}
-        self._purged: set[tuple[str, str]] = set()
+        self._counters: dict[str, int] = {}
+        self._forward: dict[tuple[str, str], int] = {}
+        self._reverse: dict[tuple[str, int], str] = {}
+        self._edges: dict[tuple[str, int], list[int]] = {}
+        self._children: dict[tuple[str, int], list[int]] = {}
+        self._purged: set[str] = set()
 
-    def get_or_create_short_ids(
-        self, namespace: str, room_id: str, event_ids: list[str]
-    ) -> list[int]:
+    def get_or_create_short_ids(self, room_id: str, event_ids: list[str]) -> list[int]:
         out = []
         for event_id in event_ids:
-            key = (namespace, room_id, event_id)
+            key = (room_id, event_id)
             if key in self._forward:
                 out.append(self._forward[key])
                 continue
-            counter_key = (namespace, room_id)
+            counter_key = room_id
             next_id = self._counters.get(counter_key, 0) + 1
             self._counters[counter_key] = next_id
             self._forward[key] = next_id
-            self._reverse[(namespace, room_id, next_id)] = event_id
+            self._reverse[(room_id, next_id)] = event_id
             out.append(next_id)
         return out
 
     def resolve_short_ids_to_event_ids(
-        self, namespace: str, room_id: str, short_ids: list[int]
+        self, room_id: str, short_ids: list[int]
     ) -> list[str | None]:
-        return [self._reverse.get((namespace, room_id, s)) for s in short_ids]
+        return [self._reverse.get((room_id, s)) for s in short_ids]
 
     def auth_chain_edges_get(
-        self, namespace: str, room_id: str, short_ids: list[int]
+        self, room_id: str, short_ids: list[int]
     ) -> list[list[int] | None]:
-        return [self._edges.get((namespace, room_id, s)) for s in short_ids]
+        return [self._edges.get((room_id, s)) for s in short_ids]
 
     def auth_chain_edges_put(
-        self, namespace: str, room_id: str, rows: list[tuple[int, list[int]]]
+        self, room_id: str, rows: list[tuple[int, list[int]]]
     ) -> None:
         for short_id, auth_short_ids in rows:
-            self._edges[(namespace, room_id, short_id)] = list(auth_short_ids)
+            self._edges[(room_id, short_id)] = list(auth_short_ids)
 
     def auth_chain_children_get(
-        self, namespace: str, room_id: str, short_ids: list[int]
+        self, room_id: str, short_ids: list[int]
     ) -> list[list[int] | None]:
-        return [self._children.get((namespace, room_id, s)) for s in short_ids]
+        return [self._children.get((room_id, s)) for s in short_ids]
 
     def auth_chain_children_append(
-        self, namespace: str, room_id: str, rows: list[tuple[int, list[int]]]
+        self, room_id: str, rows: list[tuple[int, list[int]]]
     ) -> None:
         for parent_short_id, new_children in rows:
-            key = (namespace, room_id, parent_short_id)
+            key = (room_id, parent_short_id)
             existing = self._children.setdefault(key, [])
             for child in new_children:
                 if child not in existing:
                     existing.append(child)
 
-    def auth_chain_purge_room(self, namespace: str, room_id: str) -> None:
-        key = (namespace, room_id)
-        self._forward = {k: v for k, v in self._forward.items() if k[:2] != key}
-        self._reverse = {k: v for k, v in self._reverse.items() if k[:2] != key}
-        self._edges = {k: v for k, v in self._edges.items() if k[:2] != key}
-        self._children = {k: v for k, v in self._children.items() if k[:2] != key}
-        self._counters.pop(key, None)
+    def auth_chain_purge_room(self, room_id: str) -> None:
+        self._forward = {k: v for k, v in self._forward.items() if k[0] != room_id}
+        self._reverse = {k: v for k, v in self._reverse.items() if k[0] != room_id}
+        self._edges = {k: v for k, v in self._edges.items() if k[0] != room_id}
+        self._children = {k: v for k, v in self._children.items() if k[0] != room_id}
+        self._counters.pop(room_id, None)
 
 
 class ClosureWalkTests(TestCase):
@@ -123,11 +119,10 @@ class ClosureWalkTests(TestCase):
 
     def _embed_graph(self, graph: dict[str, list[str]]) -> dict[str, int]:
         event_ids = list(graph)
-        short_ids = get_or_create_short_ids(None, NAMESPACE, ROOM_ID, event_ids)
+        short_ids = get_or_create_short_ids(None, ROOM_ID, event_ids)
         short_id_of = dict(zip(event_ids, short_ids))
         embed_auth_edges_batch(
             None,
-            NAMESPACE,
             ROOM_ID,
             [
                 (short_id_of[event_id], [short_id_of[parent] for parent in parents])
@@ -151,30 +146,28 @@ class ClosureWalkTests(TestCase):
         )
         create_id, a_id, b_id, c_id = (ids[k] for k in ("$create", "$a", "$b", "$c"))
 
-        closure = self.cache.get_closure(None, NAMESPACE, ROOM_ID, c_id)
+        closure = self.cache.get_closure(None, ROOM_ID, c_id)
         self.assertEqual(set(closure), {a_id, b_id, create_id})
         # Ancestors only -- c itself is not included.
         self.assertNotIn(c_id, closure)
 
         # The leaf's own closure is empty (zero auth events), not an error.
-        leaf_closure = self.cache.get_closure(None, NAMESPACE, ROOM_ID, create_id)
+        leaf_closure = self.cache.get_closure(None, ROOM_ID, create_id)
         self.assertEqual(len(leaf_closure), 0)
 
     def test_missing_edge_raises_and_is_not_cached(self) -> None:
-        a_id, missing_id = get_or_create_short_ids(
-            None, NAMESPACE, ROOM_ID, ["$a", "$missing"]
-        )
-        embed_auth_edges_batch(None, NAMESPACE, ROOM_ID, [(a_id, [missing_id])])
+        a_id, missing_id = get_or_create_short_ids(None, ROOM_ID, ["$a", "$missing"])
+        embed_auth_edges_batch(None, ROOM_ID, [(a_id, [missing_id])])
 
         with self.assertRaises(IncompleteAuthGraph) as raised:
-            self.cache.get_closure(None, NAMESPACE, ROOM_ID, a_id)
+            self.cache.get_closure(None, ROOM_ID, a_id)
 
         self.assertEqual(raised.exception.args, ("$missing",))
 
         # An incomplete walk must not be cached: retrying must raise again,
         # not silently return a partial closure.
         with self.assertRaises(IncompleteAuthGraph):
-            self.cache.get_closure(None, NAMESPACE, ROOM_ID, a_id)
+            self.cache.get_closure(None, ROOM_ID, a_id)
 
     def test_deep_uncached_chain_does_not_recurse(self) -> None:
         chain_length = 1_500
@@ -184,7 +177,7 @@ class ClosureWalkTests(TestCase):
         ids = self._embed_graph(graph)
 
         closure = self.cache.get_closure(
-            None, NAMESPACE, ROOM_ID, ids[f"$event{chain_length - 1}"]
+            None, ROOM_ID, ids[f"$event{chain_length - 1}"]
         )
 
         self.assertEqual(len(closure), chain_length - 1)
@@ -194,26 +187,26 @@ class ClosureWalkTests(TestCase):
         ids = self._embed_graph({"$a": ["$b"], "$b": ["$a"]})
 
         with self.assertRaises(IncompleteAuthGraph):
-            self.cache.get_closure(None, NAMESPACE, ROOM_ID, ids["$a"])
+            self.cache.get_closure(None, ROOM_ID, ids["$a"])
 
     def test_cache_generation_invalidation_on_purge(self) -> None:
         ids = self._embed_graph({"$create": [], "$a": ["$create"]})
         create_id, a_id = ids["$create"], ids["$a"]
 
-        first = self.cache.get_closure(None, NAMESPACE, ROOM_ID, a_id)
+        first = self.cache.get_closure(None, ROOM_ID, a_id)
         self.assertEqual(set(first), {create_id})
 
         # Purge the room: bump generation first (as purge_events.py must),
         # then delete the underlying skeleton.
-        bump_room_generation(NAMESPACE, ROOM_ID)
-        self.engine.auth_chain_purge_room(NAMESPACE, ROOM_ID)
+        bump_room_generation(ROOM_ID)
+        self.engine.auth_chain_purge_room(ROOM_ID)
 
         # Re-allocate short ids in the "new" room generation. An unused
         # placeholder alloc first shifts every subsequent id so
         # `create2_id` is guaranteed *not* to numerically equal
         # `create_id` -- otherwise a stale-cache bug could coincidentally
         # produce the right-looking set after the counter resets.
-        get_or_create_short_ids(None, NAMESPACE, ROOM_ID, ["$placeholder"])
+        get_or_create_short_ids(None, ROOM_ID, ["$placeholder"])
         # Allocate `$a` first so it reuses its pre-purge short id; the stale
         # cache entry for (old_generation, a_id) would be hit if the
         # generation were not part of the key.
@@ -222,7 +215,7 @@ class ClosureWalkTests(TestCase):
         self.assertEqual(a2_id, a_id)
         self.assertNotEqual(create2_id, create_id)
 
-        second = self.cache.get_closure(None, NAMESPACE, ROOM_ID, a2_id)
+        second = self.cache.get_closure(None, ROOM_ID, a2_id)
         # The post-purge lookup must recompute against the new graph, not
         # serve the pre-purge cached bitmap for (old_generation, a_id).
         self.assertEqual(set(second), {create2_id})
@@ -235,10 +228,10 @@ class ClosureWalkTests(TestCase):
         create_id, a_id, b_id, c_id = (ids[k] for k in ("$create", "$a", "$b", "$c"))
         # Cache only `$a`'s closure, then shrink the LRU so that computing `$b`
         # evicts it before `$c` is walked.
-        self.cache.get_closure(None, NAMESPACE, ROOM_ID, a_id)
+        self.cache.get_closure(None, ROOM_ID, a_id)
         self.cache._max_size = 1
 
-        results = self.cache.get_closures_batch(None, NAMESPACE, ROOM_ID, [b_id, c_id])
+        results = self.cache.get_closures_batch(None, ROOM_ID, [b_id, c_id])
         self.assertEqual(set(results[b_id]), {a_id, create_id})
         self.assertEqual(set(results[c_id]), {a_id, create_id})
 
@@ -253,7 +246,7 @@ class ClosureWalkTests(TestCase):
         )
         create_id, a_id, b_id, c_id = (ids[k] for k in ("$create", "$a", "$b", "$c"))
 
-        results = self.cache.get_closures_batch(None, NAMESPACE, ROOM_ID, [b_id, c_id])
+        results = self.cache.get_closures_batch(None, ROOM_ID, [b_id, c_id])
         self.assertEqual(set(results[b_id]), {a_id, create_id})
         self.assertEqual(set(results[c_id]), {a_id, create_id})
 
@@ -274,15 +267,14 @@ class ForwardReachabilityTests(TestCase):
         embedded_engine_module.get_embedded_engine = self._real_get_embedded_engine
 
     def _short_id(self, event_id: str) -> int:
-        return get_or_create_short_ids(None, NAMESPACE, ROOM_ID, [event_id])[0]
+        return get_or_create_short_ids(None, ROOM_ID, [event_id])[0]
 
     def _embed_graph(self, graph: dict[str, list[str]]) -> dict[str, int]:
         event_ids = list(graph)
-        short_ids = get_or_create_short_ids(None, NAMESPACE, ROOM_ID, event_ids)
+        short_ids = get_or_create_short_ids(None, ROOM_ID, event_ids)
         short_id_of = dict(zip(event_ids, short_ids))
         embed_auth_edges_batch(
             None,
-            NAMESPACE,
             ROOM_ID,
             [
                 (short_id_of[event_id], [short_id_of[parent] for parent in parents])
@@ -302,9 +294,7 @@ class ForwardReachabilityTests(TestCase):
         ids = self._embed_graph(graph)
         create_id, a_id, b_id, c_id = (ids[k] for k in graph)
 
-        reachable = get_forward_reachable_short_ids(
-            None, NAMESPACE, ROOM_ID, [create_id]
-        )
+        reachable = get_forward_reachable_short_ids(None, ROOM_ID, [create_id])
         # Seed-inclusive (see the function docstring): the starting event
         # itself is part of the forward-reachable set, matching the v2.1
         # chain-cover/rezzy forward-pass contract the conflicted-subgraph
@@ -321,16 +311,14 @@ class ForwardReachabilityTests(TestCase):
         ids = self._embed_graph(graph)
         create_id, a_id, b_id, c_id = (ids[k] for k in graph)
 
-        reachable = get_forward_reachable_short_ids(
-            None, NAMESPACE, ROOM_ID, [create_id]
-        )
+        reachable = get_forward_reachable_short_ids(None, ROOM_ID, [create_id])
         self.assertEqual(reachable, {create_id, a_id, b_id, c_id})
 
     def test_leaf_has_no_forward_reachable_events(self) -> None:
         graph = {"$create": [], "$a": ["$create"]}
         a_id = self._embed_graph(graph)["$a"]
 
-        reachable = get_forward_reachable_short_ids(None, NAMESPACE, ROOM_ID, [a_id])
+        reachable = get_forward_reachable_short_ids(None, ROOM_ID, [a_id])
         self.assertEqual(reachable, {a_id})
 
     def test_candidate_prune_bounds_walk_to_intersectable_universe(self) -> None:
@@ -353,7 +341,6 @@ class ForwardReachabilityTests(TestCase):
         candidate = {create_id, a_id}
         reachable = get_forward_reachable_short_ids(
             None,
-            NAMESPACE,
             ROOM_ID,
             [create_id],
             candidate_short_ids=candidate,
@@ -373,7 +360,6 @@ class ForwardReachabilityTests(TestCase):
 
         reachable = get_forward_reachable_short_ids(
             None,
-            NAMESPACE,
             ROOM_ID,
             [a_id],
             candidate_short_ids={create_id},
@@ -390,14 +376,14 @@ class ForwardReachabilityTests(TestCase):
         create_id, a_id = ids["$create"], ids["$a"]
 
         # First walk: only $a is a child of $create.
-        first = get_forward_reachable_short_ids(None, NAMESPACE, ROOM_ID, [create_id])
+        first = get_forward_reachable_short_ids(None, ROOM_ID, [create_id])
         self.assertEqual(first, {create_id, a_id})
 
         # A new event "$b" is persisted, also authed by $create.
         b_id = self._short_id("$b")
-        embed_auth_edges_batch(None, NAMESPACE, ROOM_ID, [(b_id, [create_id])])
+        embed_auth_edges_batch(None, ROOM_ID, [(b_id, [create_id])])
 
-        second = get_forward_reachable_short_ids(None, NAMESPACE, ROOM_ID, [create_id])
+        second = get_forward_reachable_short_ids(None, ROOM_ID, [create_id])
         self.assertEqual(second, {create_id, a_id, b_id})
 
     def test_candidate_walk_uses_only_mtxdb_edges(self) -> None:
@@ -413,7 +399,6 @@ class ForwardReachabilityTests(TestCase):
 
         reachable = get_forward_reachable_short_ids(
             None,
-            NAMESPACE,
             ROOM_ID,
             [ids["$create"]],
             candidate_short_ids=candidate,

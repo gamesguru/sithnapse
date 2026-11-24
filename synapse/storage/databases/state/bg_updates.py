@@ -42,7 +42,7 @@ from synapse.storage.database import (
     LoggingTransaction,
 )
 from synapse.storage.databases.embedded_engine import get_embedded_engine
-from synapse.storage.databases.main.embedded_common import ffi_timing, namespace_hash
+from synapse.storage.databases.main.embedded_common import ffi_timing
 from synapse.storage.engines import PostgresEngine
 from synapse.types import MutableStateMap, StateMap
 from synapse.types.state import StateFilter
@@ -507,34 +507,6 @@ if _PG_TIMINGS_ENABLED:
 MAX_STATE_DELTA_HOPS = 100
 
 
-def _state_hamt_node_key(
-    namespace: str, room_prefix: bytes, structural_hash: bytes
-) -> bytes:
-    # Must match `node_key` in `rust/src/database/core.rs`.
-    ns_hash = namespace_hash(namespace)
-    return (
-        b"hamt:node:"
-        + ns_hash.hex().encode("ascii")
-        + b":"
-        + room_prefix.hex().encode("ascii")
-        + b":"
-        + structural_hash.hex().encode("ascii")
-    )
-
-
-def _state_hamt_root_key(namespace: str, state_group: int) -> bytes:
-    """Return the per-namespace HAMT root key.
-
-    State-group ids are only unique inside one Synapse database, so the
-    namespace is part of the key. The room prefix is stored in the
-    value, allowing readers to locate a root from only its state-group id.
-    """
-    ns_hash = namespace_hash(namespace)
-    return (
-        b"hamt:root:" + ns_hash.hex().encode("ascii") + str(state_group).encode("ascii")
-    )
-
-
 def _encode_state_hamt_root(
     room_prefix: bytes,
     root_hash: bytes,
@@ -588,28 +560,6 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
         hs: "HomeServer",
     ):
         super().__init__(database, db_conn, hs)
-        self._hamt_namespace_override: str | None = None
-
-    @property
-    def hamt_namespace(self) -> str:
-        """Namespaces HAMT root/node keys in the embedded engine so that
-        independent deployments sharing a filesystem (e.g. multiple trial
-        workers in the same test run) can't overwrite each other's state.
-        Defaults to the server name; tests override it to a fresh value per
-        run (see `tests/utils.py`).
-        """
-        if self._hamt_namespace_override is not None:
-            return self._hamt_namespace_override
-        db_pool_ns = getattr(self.db_pool, "_hamt_namespace", None)
-        if db_pool_ns:
-            return str(db_pool_ns)
-        return self.hs.hostname
-
-    @hamt_namespace.setter
-    def hamt_namespace(self, value: str) -> None:
-        self._hamt_namespace_override = value
-        if hasattr(self, "db_pool") and self.db_pool is not None:
-            self.db_pool._hamt_namespace = value
 
     @trace
     @tag_args
@@ -727,15 +677,7 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
                     refresh_state_hamt_collections_for_groups,
                 )
 
-                namespace = getattr(self, "_embedded_db_namespace", None)
-                # __init__ always sets this alongside `_embedded_db_engine`
-                # in the same branch (see store.py) -- reaching here with
-                # the engine set but not the namespace would be an init bug,
-                # not a normal runtime state.
-                assert namespace is not None
-                refresh_state_hamt_collections_for_groups(
-                    namespace, list(existing_in_sql)
-                )
+                refresh_state_hamt_collections_for_groups(list(existing_in_sql))
                 retry_results, _ = self._get_state_groups_from_hamt_txn(
                     txn, list(existing_in_sql), state_filter
                 )
@@ -1382,10 +1324,9 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
         to Python. This keeps the whole operation to one FFI crossing.
         """
         engine = get_embedded_engine(getattr(self, "_embedded_db_engine", None))
-        namespace = getattr(self, "_embedded_db_namespace", None)
         found: dict[int, tuple[bytes, bytes, str]] = {}
 
-        roots = engine.get_state_hamt_roots_bulk(namespace, groups)
+        roots = engine.get_state_hamt_roots_bulk(groups)
         for group, root in zip(groups, roots):
             # A miss is a real miss: no SQL read alongside mtxdb.
             if root is None:
@@ -1407,8 +1348,7 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
         ordered_groups = list(roots.keys())
         _et = time.monotonic()
         materialized = engine.materialize_state_hamts(
-            getattr(self, "_embedded_db_namespace", None),
-            [roots[group] for group in ordered_groups],
+            [roots[group] for group in ordered_groups]
         )
         ffi_timing("ffi_materialize_hamts", time.monotonic() - _et)
         for group, entries in zip(ordered_groups, materialized):
@@ -1434,9 +1374,7 @@ class StateGroupBackgroundUpdateStore(SQLBaseStore):
             for room_prefix, root_hash, room_id in (roots[g] for g in ordered_groups)
         ]
         _et = time.monotonic()
-        looked_up = engine.lookup_state_hamts(
-            getattr(self, "_embedded_db_namespace", None), queries
-        )
+        looked_up = engine.lookup_state_hamts(queries)
         ffi_timing("ffi_lookup_hamts", time.monotonic() - _et)
         for group, entries in zip(ordered_groups, looked_up):
             results[group] = entries

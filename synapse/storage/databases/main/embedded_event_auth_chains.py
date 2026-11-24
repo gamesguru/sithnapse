@@ -77,17 +77,6 @@ class IncompleteAuthGraph(Exception):
     """
 
 
-def resolve_namespace(store: object) -> str | None:
-    """The namespace to use for this feature's mtxdb calls for `store`, or
-    `None` if the legacy SQL backend is configured (no embedded engine).
-    """
-    return (
-        store._embedded_db_namespace  # type: ignore[attr-defined]
-        if getattr(store, "_embedded_db_engine", None)
-        else None
-    )
-
-
 class AuthChainBackendMismatchError(Exception):
     """The configured auth-edge backend does not hold the migrated graph."""
 
@@ -148,10 +137,6 @@ async def migrate_auth_chain_edges(
 
     store = hs.get_datastores().main  # type: ignore[attr-defined]
     engine_name = hs.config.database.embedded_db_engine  # type: ignore[attr-defined]
-    namespace = (
-        hs.config.database.embedded_db_namespace  # type: ignore[attr-defined]
-        or hs.hostname  # type: ignore[attr-defined]
-    )
 
     def _read_marker(txn: Any) -> str:
         txn.execute("SELECT backend FROM auth_chain_backend WHERE lock = 'X'")
@@ -195,8 +180,8 @@ async def migrate_auth_chain_edges(
     from synapse.storage.databases.main.embedded_common import Pool, sync_now
 
     for room_id in rooms:
-        bump_room_generation(namespace, room_id)
-        purge_room(engine_name, namespace, room_id)
+        bump_room_generation(room_id)
+        purge_room(engine_name, room_id)
         sync_now(pools=[Pool.STATE])
         last_event_id = ""
 
@@ -252,17 +237,15 @@ async def migrate_auth_chain_edges(
                     ]
                 )
             )
-            short_ids = get_or_create_short_ids(
-                engine_name, namespace, room_id, all_ids
-            )
+            short_ids = get_or_create_short_ids(engine_name, room_id, all_ids)
             short_id_of = dict(zip(all_ids, short_ids))
             rows = [
                 (short_id_of[event_id], [short_id_of[a] for a in auth_events[event_id]])
                 for event_id in event_ids
             ]
-            embed_auth_edges_batch(engine_name, namespace, room_id, rows)
+            embed_auth_edges_batch(engine_name, room_id, rows)
             embedded = get_embedded_auth_edges_batch(
-                engine_name, namespace, room_id, [short_id for short_id, _ in rows]
+                engine_name, room_id, [short_id for short_id, _ in rows]
             )
             for (event_id, auth_ids), (short_id, _) in zip(
                 ((event_id, auth_events[event_id]) for event_id in event_ids), rows
@@ -345,9 +328,7 @@ async def migrate_auth_chain_edges(
             )
             if not parent_ids:
                 break
-            parent_short_ids = get_or_create_short_ids(
-                engine_name, namespace, room_id, parent_ids
-            )
+            parent_short_ids = get_or_create_short_ids(engine_name, room_id, parent_ids)
             all_child_ids = list(
                 dict.fromkeys(
                     child for parent in parent_ids for child in children[parent]
@@ -356,13 +337,11 @@ async def migrate_auth_chain_edges(
             child_short_ids = dict(
                 zip(
                     all_child_ids,
-                    get_or_create_short_ids(
-                        engine_name, namespace, room_id, all_child_ids
-                    ),
+                    get_or_create_short_ids(engine_name, room_id, all_child_ids),
                 )
             )
             actual = get_embedded_auth_children_batch(
-                engine_name, namespace, room_id, parent_short_ids
+                engine_name, room_id, parent_short_ids
             )
             for parent_id, parent_short_id in zip(parent_ids, parent_short_ids):
                 expected = sorted(
@@ -397,7 +376,7 @@ def _engine(engine_name: str | None):  # type: ignore[no-untyped-def]
 
 
 def get_or_create_short_ids(
-    engine_name: str | None, namespace: str, room_id: str, event_ids: list[str]
+    engine_name: str | None, room_id: str, event_ids: list[str]
 ) -> list[int]:
     """Room-scoped `event_id -> u32 short_id`, allocating as needed.
     Thin pass-through to the Rust primitive -- see its docstring in
@@ -405,22 +384,20 @@ def get_or_create_short_ids(
     """
     if not event_ids:
         return []
-    return _engine(engine_name).get_or_create_short_ids(namespace, room_id, event_ids)
+    return _engine(engine_name).get_or_create_short_ids(room_id, event_ids)
 
 
 def resolve_event_ids_to_short_ids(
-    engine_name: str | None, namespace: str, room_id: str, event_ids: list[str]
+    engine_name: str | None, room_id: str, event_ids: list[str]
 ) -> list[int | None]:
     """Resolve existing short ids without allocating, for read-only workers."""
     if not event_ids:
         return []
-    return _engine(engine_name).resolve_event_ids_to_short_ids(
-        namespace, room_id, event_ids
-    )
+    return _engine(engine_name).resolve_event_ids_to_short_ids(room_id, event_ids)
 
 
 def resolve_short_ids_to_event_ids(
-    engine_name: str | None, namespace: str, room_id: str, short_ids: list[int]
+    engine_name: str | None, room_id: str, short_ids: list[int]
 ) -> list[str | None]:
     """Room-scoped batch reverse lookup. `None` for an unresolved/dangling
     short id (never an error) -- callers must filter these, not treat them
@@ -428,9 +405,7 @@ def resolve_short_ids_to_event_ids(
     """
     if not short_ids:
         return []
-    return _engine(engine_name).resolve_short_ids_to_event_ids(
-        namespace, room_id, short_ids
-    )
+    return _engine(engine_name).resolve_short_ids_to_event_ids(room_id, short_ids)
 
 
 # -----------------------------------------------------------------------------
@@ -440,7 +415,6 @@ def resolve_short_ids_to_event_ids(
 
 def embed_auth_edges_batch(
     engine_name: str | None,
-    namespace: str,
     room_id: str,
     rows: list[tuple[int, list[int]]],
     *,
@@ -469,34 +443,34 @@ def embed_auth_edges_batch(
     if not rows:
         return
     if transaction is not None:
-        transaction.auth_chain_edges_put(namespace, room_id, rows)
+        transaction.auth_chain_edges_put(room_id, rows)
         return
 
     engine = _engine(engine_name)
-    engine.auth_chain_edges_put(namespace, room_id, rows)
+    engine.auth_chain_edges_put(room_id, rows)
 
     child_rows: list[tuple[int, list[int]]] = []
     for event_short_id, auth_short_ids in rows:
         for auth_short_id in auth_short_ids:
             child_rows.append((auth_short_id, [event_short_id]))
     if child_rows:
-        engine.auth_chain_children_append(namespace, room_id, child_rows)
+        engine.auth_chain_children_append(room_id, child_rows)
 
 
 def get_embedded_auth_edges_batch(
-    engine_name: str | None, namespace: str, room_id: str, short_ids: list[int]
+    engine_name: str | None, room_id: str, short_ids: list[int]
 ) -> dict[int, list[int] | None]:
     """`None` for a short id with no embedded edge record (corruption after
     the cutover); an empty list is a genuine leaf (zero auth events).
     """
     if not short_ids:
         return {}
-    results = _engine(engine_name).auth_chain_edges_get(namespace, room_id, short_ids)
+    results = _engine(engine_name).auth_chain_edges_get(room_id, short_ids)
     return dict(zip(short_ids, results))
 
 
 def get_embedded_auth_children_batch(
-    engine_name: str | None, namespace: str, room_id: str, short_ids: list[int]
+    engine_name: str | None, room_id: str, short_ids: list[int]
 ) -> dict[int, list[int]]:
     """Inbound (child) edges: for each parent short id, the children known
     to directly name it as an auth event so far. Missing/`None` and
@@ -506,9 +480,7 @@ def get_embedded_auth_children_batch(
     """
     if not short_ids:
         return {}
-    results = _engine(engine_name).auth_chain_children_get(
-        namespace, room_id, short_ids
-    )
+    results = _engine(engine_name).auth_chain_children_get(room_id, short_ids)
     return {
         short_id: (children if children is not None else [])
         for short_id, children in zip(short_ids, results)
@@ -520,16 +492,16 @@ def get_embedded_auth_children_batch(
 # -----------------------------------------------------------------------------
 
 # Purely in-process; deliberately never persisted to mtxdb (see module
-# docstring). Keyed by `(namespace, room_id)` since one process may serve
-# multiple namespaces (e.g. trial tests).
-_room_generations: dict[tuple[str, str], int] = {}
+# docstring). Keyed by room id; the namespace salt is gone, so a room has
+# exactly one generation counter per process.
+_room_generations: dict[str, int] = {}
 
 
-def _room_generation(namespace: str, room_id: str) -> int:
-    return _room_generations.get((namespace, room_id), 0)
+def _room_generation(room_id: str) -> int:
+    return _room_generations.get(room_id, 0)
 
 
-def bump_room_generation(namespace: str, room_id: str) -> None:
+def bump_room_generation(room_id: str) -> None:
     """Invalidates every RAM-cached closure for this room. Must be called
     *before* `purge_room`, not after: bumping first means a concurrent
     read that lands between the two calls at worst recomputes from data
@@ -538,18 +510,17 @@ def bump_room_generation(namespace: str, room_id: str) -> None:
     entire window between the delete completing and the generation bump
     landing.
     """
-    key = (namespace, room_id)
-    _room_generations[key] = _room_generations.get(key, 0) + 1
+    _room_generations[room_id] = _room_generations.get(room_id, 0) + 1
 
 
-def purge_room(engine_name: str | None, namespace: str, room_id: str) -> None:
+def purge_room(engine_name: str | None, room_id: str) -> None:
     """Deletes the entire durable skeleton (counter, short-id mappings,
     edges) for one room. Caller must have already called
     `bump_room_generation` for this room first -- this function does not
     do so itself, and does not touch any cache-generation state (that's
     purely in-process, per the module docstring).
     """
-    _engine(engine_name).auth_chain_purge_room(namespace, room_id)
+    _engine(engine_name).auth_chain_purge_room(room_id)
 
 
 # -----------------------------------------------------------------------------
@@ -579,26 +550,24 @@ class ClosureCache:
         # handle) doesn't carry. A follow-up can size this via the
         # existing `*_cache_capacity` config convention (plan §6).
         #
-        # Keyed by (namespace, room_id, generation, short_id) -- NOT just
+        # Keyed by (room_id, generation, short_id) -- NOT just
         # (generation, short_id). short_id is only unique within one room's
         # own mtxdb collection (every room's counter independently starts
         # at 1), and generation defaults to 0 for every room that's never
         # been purged, so two different rooms' short_id=1, 2, 3... land on
         # the exact same (generation, short_id) pair. A single process-wide
-        # ClosureCache instance keyed without namespace/room_id will serve
+        # ClosureCache instance keyed without room_id will serve
         # one room's cached ancestor closure for another room's identical
         # short_id -- silently, since a cache hit never re-walks or
-        # re-verifies anything. Namespace and room_id must be part of the
-        # key for this cache to be safe with more than one room per process.
-        self._cache: OrderedDict[tuple[str, str, int, int], BitMap] = OrderedDict()
+        # re-verifies anything. room_id must be part of the key for this cache to
+        # be safe with more than one room per process.
+        self._cache: OrderedDict[tuple[str, int, int], BitMap] = OrderedDict()
         # Reads run on database threads (see event_federation.py), so the
         # check-then-evict sequences below must be serialized.
         self._lock = threading.RLock()
 
-    def _get(
-        self, namespace: str, room_id: str, generation: int, short_id: int
-    ) -> BitMap | None:
-        key = (namespace, room_id, generation, short_id)
+    def _get(self, room_id: str, generation: int, short_id: int) -> BitMap | None:
+        key = (room_id, generation, short_id)
         value = self._cache.get(key)
         if value is not None:
             self._cache.move_to_end(key)
@@ -606,13 +575,12 @@ class ClosureCache:
 
     def _put(
         self,
-        namespace: str,
         room_id: str,
         generation: int,
         short_id: int,
         closure: BitMap,
     ) -> None:
-        key = (namespace, room_id, generation, short_id)
+        key = (room_id, generation, short_id)
         self._cache[key] = closure
         self._cache.move_to_end(key)
         while len(self._cache) > self._max_size:
@@ -628,7 +596,6 @@ class ClosureCache:
     def get_closure(
         self,
         engine_name: str | None,
-        namespace: str,
         room_id: str,
         event_short_id: int,
     ) -> BitMap:
@@ -639,14 +606,13 @@ class ClosureCache:
         embedded auth-edge record; after the cutover that is a data gap, not
         an ordinary cache miss.
         """
-        return self.get_closures_batch(
-            engine_name, namespace, room_id, [event_short_id]
-        )[event_short_id]
+        return self.get_closures_batch(engine_name, room_id, [event_short_id])[
+            event_short_id
+        ]
 
     def get_closures_batch(
         self,
         engine_name: str | None,
-        namespace: str,
         room_id: str,
         event_short_ids: list[int],
     ) -> dict[int, BitMap]:
@@ -656,17 +622,16 @@ class ClosureCache:
         """
         with self._lock:
             return self._get_closures_batch_locked(
-                engine_name, namespace, room_id, event_short_ids
+                engine_name, room_id, event_short_ids
             )
 
     def _get_closures_batch_locked(
         self,
         engine_name: str | None,
-        namespace: str,
         room_id: str,
         event_short_ids: list[int],
     ) -> dict[int, BitMap]:
-        generation = _room_generation(namespace, room_id)
+        generation = _room_generation(room_id)
         # Closures found in the LRU while preloading. `_put` below may evict
         # them before the walk reaches them; the preload skipped loading their
         # edges because they were cached, so the walk must keep using these
@@ -674,13 +639,13 @@ class ClosureCache:
         pinned: dict[int, BitMap] = {}
         roots_to_load: list[int] = []
         for short_id in event_short_ids:
-            cached = self._get(namespace, room_id, generation, short_id)
+            cached = self._get(room_id, generation, short_id)
             if cached is None:
                 roots_to_load.append(short_id)
             else:
                 pinned[short_id] = cached
         direct_edges = self._load_direct_edges(
-            engine_name, namespace, room_id, roots_to_load, generation, pinned
+            engine_name, room_id, roots_to_load, generation, pinned
         )
 
         memo: dict[int, tuple[BitMap, bool]] = {}
@@ -692,13 +657,13 @@ class ClosureCache:
                 continue
             try:
                 closure, is_complete = self._walk(
-                    namespace, room_id, short_id, generation, memo, direct_edges, pinned
+                    room_id, short_id, generation, memo, direct_edges, pinned
                 )
             except IncompleteAuthGraph as e:
                 missing = e.args[0] if e.args else short_id
                 if isinstance(missing, int):
                     resolved = resolve_short_ids_to_event_ids(
-                        engine_name, namespace, room_id, [missing]
+                        engine_name, room_id, [missing]
                     )
                     if resolved and resolved[0] is not None:
                         missing = resolved[0]
@@ -707,20 +672,19 @@ class ClosureCache:
                 # Report the event id when we can, so the surfaced error names
                 # the gap rather than an opaque per-room short id.
                 resolved = resolve_short_ids_to_event_ids(
-                    engine_name, namespace, room_id, [short_id]
+                    engine_name, room_id, [short_id]
                 )
                 event_id = resolved[0] if resolved else None
                 raise IncompleteAuthGraph(
                     event_id if event_id is not None else short_id
                 )
-            self._put(namespace, room_id, generation, short_id, closure)
+            self._put(room_id, generation, short_id, closure)
             out[short_id] = closure
         return out
 
     def _load_direct_edges(
         self,
         engine_name: str | None,
-        namespace: str,
         room_id: str,
         root_short_ids: list[int],
         generation: int,
@@ -747,7 +711,7 @@ class ClosureCache:
             for short_id in layer:
                 cached = pinned.get(short_id)
                 if cached is None:
-                    cached = self._get(namespace, room_id, generation, short_id)
+                    cached = self._get(room_id, generation, short_id)
                 if cached is None:
                     uncached.add(short_id)
                 else:
@@ -756,9 +720,7 @@ class ClosureCache:
             if not layer:
                 continue
 
-            embedded = get_embedded_auth_edges_batch(
-                engine_name, namespace, room_id, list(layer)
-            )
+            embedded = get_embedded_auth_edges_batch(engine_name, room_id, list(layer))
             for short_id, auth_short_ids in embedded.items():
                 if auth_short_ids is None:
                     direct_edges[short_id] = None
@@ -770,7 +732,6 @@ class ClosureCache:
 
     def _walk(
         self,
-        namespace: str,
         room_id: str,
         event_short_id: int,
         generation: int,
@@ -790,7 +751,7 @@ class ClosureCache:
         def cached_closure(short_id: int) -> BitMap | None:
             cached = pinned.get(short_id)
             if cached is None:
-                cached = self._get(namespace, room_id, generation, short_id)
+                cached = self._get(room_id, generation, short_id)
             return cached
 
         root_cached = cached_closure(event_short_id)
@@ -802,11 +763,10 @@ class ClosureCache:
         if root_edges is None:
             logger.debug(
                 "auth-chain closure walk: genuine gap at short_id=%s "
-                "(room=%s namespace=%s) -- no embedded edges; treating as "
+                "(room=%s) -- no embedded edges; treating as "
                 "incomplete",
                 event_short_id,
                 room_id,
-                namespace,
             )
             raise IncompleteAuthGraph(event_short_id)
 
@@ -849,11 +809,10 @@ class ClosureCache:
                 if child_edges is None:
                     logger.debug(
                         "auth-chain closure walk: genuine gap at short_id=%s "
-                        "(room=%s namespace=%s) -- no embedded edges; treating "
+                        "(room=%s) -- no embedded edges; treating "
                         "as incomplete",
                         child_id,
                         room_id,
-                        namespace,
                     )
                     raise IncompleteAuthGraph(child_id)
 
@@ -900,7 +859,6 @@ class ClosureCache:
 
 def get_forward_reachable_short_ids(
     engine_name: str | None,
-    namespace: str,
     room_id: str,
     start_short_ids: list[int],
     candidate_short_ids: set[int] | None = None,
@@ -952,7 +910,7 @@ def get_forward_reachable_short_ids(
             continue
 
         children_by_parent = get_embedded_auth_children_batch(
-            engine_name, namespace, room_id, list(current_layer)
+            engine_name, room_id, list(current_layer)
         )
         seen.update(current_layer)
         for children in children_by_parent.values():

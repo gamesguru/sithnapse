@@ -633,22 +633,20 @@ async def _events_authenticated_by(
             from synapse.storage.databases.main.embedded_event_auth_chains import (
                 get_embedded_auth_children_batch,
                 resolve_event_ids_to_short_ids,
-                resolve_namespace,
                 resolve_short_ids_to_event_ids,
             )
 
-            namespace = resolve_namespace(store)
             engine_name = getattr(store, "_embedded_db_engine", None)
-            if namespace is not None:
+            if engine_name is not None:
                 short_ids = resolve_event_ids_to_short_ids(
-                    engine_name, namespace, room_id, [auth_event_id]
+                    engine_name, room_id, [auth_event_id]
                 )
                 if short_ids and short_ids[0] is not None:
                     children = get_embedded_auth_children_batch(
-                        engine_name, namespace, room_id, [short_ids[0]]
+                        engine_name, room_id, [short_ids[0]]
                     ).get(short_ids[0], [])
                     for child in resolve_short_ids_to_event_ids(
-                        engine_name, namespace, room_id, children[:limit]
+                        engine_name, room_id, children[:limit]
                     ):
                         if child is not None:
                             event_ids.add(child)

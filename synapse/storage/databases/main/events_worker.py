@@ -264,15 +264,6 @@ class EventsWorkerStore(SQLBaseStore):
             # Only read-only handles map the writer's publish signal.
             register_publish_signal_gauge(hs)
         self._embedded_db_engine = hs.config.database.embedded_db_engine
-        # Namespaces event_to_state_group/refcount keys in the embedded
-        # engine -- see embedded_event_to_state_group.py's module docstring.
-        # Independent from (but must agree with) the state datastore's own
-        # hamt_namespace property: both default to the server name unless
-        # embedded_db.namespace is set in config, so they naturally agree
-        # without needing to share an instance.
-        self._embedded_db_namespace = (
-            hs.config.database.embedded_db_namespace or hs.hostname
-        )
 
         txn = db_conn.cursor()
         txn.execute("SELECT event_id FROM un_partial_stated_event_stream")
@@ -540,7 +531,6 @@ class EventsWorkerStore(SQLBaseStore):
         if getattr(self, "_embedded_event_json_enabled", False):
             found = get_redactions_batch(
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 [event_id],
             )
             if event_id in found:
@@ -1712,9 +1702,7 @@ class EventsWorkerStore(SQLBaseStore):
         found: dict[str, tuple[str, str, int | None]] = {}
         still_missing = event_ids
         if self._embedded_event_json_enabled:
-            found = get_event_json_batch(
-                self._embedded_db_engine, self._embedded_db_namespace, event_ids
-            )
+            found = get_event_json_batch(self._embedded_db_engine, event_ids)
             still_missing = [e for e in event_ids if e not in found]
 
         if still_missing:

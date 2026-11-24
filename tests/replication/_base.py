@@ -129,7 +129,6 @@ class BaseStreamTestCase(unittest.HomeserverTestCase):
             config["embedded_db"] = {
                 "engine": self.hs.config.database.embedded_db_engine,
                 "path": self.hs.config.database.embedded_db_path,
-                "namespace": self.hs.config.database.embedded_db_namespace,
                 "no_sync": self.hs.config.database.embedded_db_no_sync,
                 "flush_delay_secs": self.hs.config.database.embedded_db_flush_delay_secs,
             }
@@ -443,7 +442,6 @@ class BaseMultiWorkerStreamTestCase(unittest.HomeserverTestCase):
             config["embedded_db"] = {
                 "engine": self.hs.config.database.embedded_db_engine,
                 "path": self.hs.config.database.embedded_db_path,
-                "namespace": self.hs.config.database.embedded_db_namespace,
                 "no_sync": self.hs.config.database.embedded_db_no_sync,
                 "flush_delay_secs": self.hs.config.database.embedded_db_flush_delay_secs,
             }

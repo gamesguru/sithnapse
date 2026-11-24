@@ -182,13 +182,6 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             mode=SyncMode(hs.config.database.embedded_db_sync_mode),
         )
 
-        # Defaults to the server name when unset (see the comment on
-        # DatabaseConfig.embedded_db_namespace) -- must always be
-        # assigned here, since every call site below reads
-        # self._embedded_db_namespace unconditionally.
-        self._embedded_db_namespace = (
-            hs.config.database.embedded_db_namespace or self.server_name
-        )
         # state_group -> root_structural_hash for groups created on a
         # non-writer instance whose mtxdb mirror write was skipped. Keep this
         # available even when embedded DB is disabled: the replication
@@ -587,7 +580,6 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         # read barrier.
         if self._embedded_db_engine and self._embedded_db_is_writer and groups:
             engine = get_embedded_engine(self._embedded_db_engine)
-            namespace = self._embedded_db_namespace
             exact_keys = (
                 list(state_filter.concrete_types())
                 if not state_filter.has_wildcards()
@@ -600,7 +592,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 # `state_read_embedded` keeps covering the same work as the
                 # one `_get_state_groups_from_hamt_txn` records per call.
                 _ee_start = time.monotonic()
-                roots = engine.get_state_hamt_roots_bulk(namespace, chunk)
+                roots = engine.get_state_hamt_roots_bulk(chunk)
                 # `get_state_hamt_roots_bulk` returns exactly one entry per
                 # input group, in input order. Assert rather than assume: a
                 # short result would zip down to fewer groups than requested
@@ -610,9 +602,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                     chunk_roots = [root for _, root in zip(chunk, roots)]
                     if exact_keys is None:
                         _et = time.monotonic()
-                        materialized = engine.materialize_state_hamts(
-                            namespace, chunk_roots
-                        )
+                        materialized = engine.materialize_state_hamts(chunk_roots)
                         ffi_timing("ffi_materialize_hamts", time.monotonic() - _et)
                     else:
                         queries = [
@@ -627,7 +617,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                             )
                         ]
                         _et = time.monotonic()
-                        materialized = engine.lookup_state_hamts(namespace, queries)
+                        materialized = engine.lookup_state_hamts(queries)
                         ffi_timing("ffi_lookup_hamts", time.monotonic() - _et)
                 _state_timing("state_read_embedded", time.monotonic() - _ee_start)
 
@@ -1300,7 +1290,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             engine = get_embedded_engine(self._embedded_db_engine)
             _et = time.monotonic()
             _ct = time.thread_time()
-            engine.put_state_hamt_nodes(self._embedded_db_namespace, room_prefix, nodes)
+            engine.put_state_hamt_nodes(room_prefix, nodes)
             ffi_timing("ffi_put_hamt_nodes", time.monotonic() - _et)
             ffi_timing("ffi_put_hamt_nodes:cpu", time.thread_time() - _ct)
             _state_timing("state_write_nodes_embedded", time.monotonic() - _et)
@@ -1347,9 +1337,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         engine = get_embedded_engine(self._embedded_db_engine)
 
         _et = time.monotonic()
-        (raw,) = engine.get_state_hamt_roots_for_room(
-            self._embedded_db_namespace, room_prefix, [state_group]
-        )
+        (raw,) = engine.get_state_hamt_roots_for_room(room_prefix, [state_group])
         ffi_timing("ffi_get_hamt_root", time.monotonic() - _et)
         if raw is None:
             if logger.isEnabledFor(logging.DEBUG):
@@ -1385,9 +1373,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         engine = get_embedded_engine(self._embedded_db_engine)
 
         _et = time.monotonic()
-        results = engine.get_state_hamt_nodes_batch(
-            self._embedded_db_namespace, room_prefix, [node_hash]
-        )
+        results = engine.get_state_hamt_nodes_batch(room_prefix, [node_hash])
         ffi_timing("ffi_get_hamt_node", time.monotonic() - _et)
         _state_counter("state_node_point_requests")
         if not results or results[0] is None:
@@ -1409,9 +1395,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         engine = get_embedded_engine(self._embedded_db_engine)
 
         _et = time.monotonic()
-        results = engine.get_state_hamt_nodes_batch(
-            self._embedded_db_namespace, room_prefix, node_hashes
-        )
+        results = engine.get_state_hamt_nodes_batch(room_prefix, node_hashes)
         ffi_timing("ffi_get_hamt_nodes_batch", time.monotonic() - _et)
         ffi_count("ffi_get_hamt_nodes_node_hashes_requested", len(node_hashes))
         ffi_count(
@@ -1510,9 +1494,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                     return
                 _et = time.monotonic()
                 _ct = time.thread_time()
-                inner_ns = engine.put_room_index(
-                    self._embedded_db_namespace, [(state_group, room_prefix)]
-                )
+                inner_ns = engine.put_room_index([(state_group, room_prefix)])
                 ffi_timing("ffi_put_room_index", time.monotonic() - _et)
                 ffi_timing("ffi_put_room_index:cpu", time.thread_time() - _ct)
                 # Time inside the GIL-released write; the gap to the span
@@ -1522,7 +1504,6 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 _et = time.monotonic()
                 _ct = time.thread_time()
                 engine.put_state_hamt_roots(
-                    self._embedded_db_namespace,
                     room_prefix,
                     [(state_group, root_value)],
                 )
@@ -1633,9 +1614,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                     continue
                 for state_group, record in zip(
                     state_groups,
-                    engine.get_state_hamt_roots_for_room(
-                        self._embedded_db_namespace, room_prefix, state_groups
-                    ),
+                    engine.get_state_hamt_roots_for_room(room_prefix, state_groups),
                 ):
                     if record is not None:
                         already_embedded.add(state_group)
@@ -1942,7 +1921,6 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 # Index first, so a group's room is resolvable as soon as its
                 # root is.
                 inner_ns = engine.put_room_index(
-                    self._embedded_db_namespace,
                     [(sg, room_prefix) for sg, _ in pending_room_roots],
                 )
                 ffi_timing("ffi_put_room_index", time.monotonic() - _et)
@@ -1950,9 +1928,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 if isinstance(inner_ns, int):
                     ffi_timing("ffi_put_room_index_inner", inner_ns / 1e9)
                 _et = time.monotonic()
-                engine.put_state_hamt_roots(
-                    self._embedded_db_namespace, room_prefix, pending_room_roots
-                )
+                engine.put_state_hamt_roots(room_prefix, pending_room_roots)
                 elapsed = time.monotonic() - _et
                 _state_timing("state_write_root_embedded", elapsed)
                 _state_counter("state_write_roots_embedded", len(pending_room_roots))
@@ -2166,7 +2142,6 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             room_prefixes = await defer_to_thread(
                 self.hs.get_reactor(),
                 engine.get_room_index,
-                self._embedded_db_namespace,
                 [int(state_group) for state_group in state_groups],
             )
             by_room: dict[bytes, list[int]] = {}
@@ -2179,7 +2154,6 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 await defer_to_thread(
                     self.hs.get_reactor(),
                     engine.delete_state_hamt_roots_for_room,
-                    self._embedded_db_namespace,
                     room_prefix,
                     room_state_groups,
                 )
@@ -2421,7 +2395,6 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 room_prefixes = await defer_to_thread(
                     self.hs.get_reactor(),
                     engine.get_room_index,
-                    self._embedded_db_namespace,
                     state_groups,
                 )
                 by_room: dict[bytes, list[int]] = {}
@@ -2433,7 +2406,6 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                     await defer_to_thread(
                         self.hs.get_reactor(),
                         engine.delete_state_hamt_roots_for_room,
-                        self._embedded_db_namespace,
                         room_prefix,
                         room_state_groups,
                     )

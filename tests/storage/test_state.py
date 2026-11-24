@@ -178,21 +178,13 @@ class StateStoreTestCase(HomeserverTestCase):
 
         tmpdir = tempfile.mkdtemp(prefix="test-embedded-mtxdb-")
         self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        mtxdb_engine.close_client()
         mtxdb_engine.open_client(tmpdir)
         self.state_datastore._embedded_db_engine = "mtxdb"
         self.state_datastore._embedded_db_path = tmpdir
-        # `mtxdb_engine.open_client` is a no-op after the first call in
-        # this process (`DBS` is a process-global `OnceCell` -- see
-        # rust/src/database/mtxdb_syn.rs), so every `test_embedded_*` test
-        # in this file that opens its own "fresh" tmpdir is actually still
-        # sharing one mtxdb store for the whole trial worker process.
-        # `_embedded_db_namespace` defaults to `server_name`, which every
-        # test here shares too ("test"), so without overriding it, two
-        # tests using the same `self.room` and the same small state_group
-        # ids (both start counting from 1) collide on the same mtxdb keys.
-        # tmpdir is unique per test (tempfile.mkdtemp), so reuse it as the
-        # namespace to keep tests isolated despite the shared store.
-        self.state_datastore._embedded_db_namespace = tmpdir
+        # Each test opens its own root: keys are unsalted, so state-group
+        # ids (which restart at 1 in every fresh SQL database) must not be
+        # shared across tests.
 
         e1 = self.inject_state_event(self.room, self.u_alice, EventTypes.Create, "", {})
         e2 = self.inject_state_event(
@@ -219,10 +211,7 @@ class StateStoreTestCase(HomeserverTestCase):
             )
         )
         self.assertEqual(
-            mtxdb_engine.get_room_index(
-                self.state_datastore._embedded_db_namespace,
-                [state_group],
-            ),
+            mtxdb_engine.get_room_index([state_group]),
             [expected_room_prefix],
         )
 
@@ -266,21 +255,13 @@ class StateStoreTestCase(HomeserverTestCase):
 
         tmpdir = tempfile.mkdtemp(prefix="test-exclusive-write-mtxdb-")
         self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        mtxdb_engine.close_client()
         mtxdb_engine.open_client(tmpdir)
         self.state_datastore._embedded_db_engine = "mtxdb"
         self.state_datastore._embedded_db_path = tmpdir
-        # `mtxdb_engine.open_client` is a no-op after the first call in
-        # this process (`DBS` is a process-global `OnceCell` -- see
-        # rust/src/database/mtxdb_syn.rs), so every `test_embedded_*` test
-        # in this file that opens its own "fresh" tmpdir is actually still
-        # sharing one mtxdb store for the whole trial worker process.
-        # `_embedded_db_namespace` defaults to `server_name`, which every
-        # test here shares too ("test"), so without overriding it, two
-        # tests using the same `self.room` and the same small state_group
-        # ids (both start counting from 1) collide on the same mtxdb keys.
-        # tmpdir is unique per test (tempfile.mkdtemp), so reuse it as the
-        # namespace to keep tests isolated despite the shared store.
-        self.state_datastore._embedded_db_namespace = tmpdir
+        # Each test opens its own root: keys are unsalted, so state-group
+        # ids (which restart at 1 in every fresh SQL database) must not be
+        # shared across tests.
 
         event = self.inject_state_event(
             self.room, self.u_alice, EventTypes.Create, "", {}
@@ -332,21 +313,13 @@ class StateStoreTestCase(HomeserverTestCase):
 
         tmpdir = tempfile.mkdtemp(prefix="test-embedded-root-mtxdb-")
         self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        mtxdb_engine.close_client()
         mtxdb_engine.open_client(tmpdir)
         self.state_datastore._embedded_db_engine = "mtxdb"
         self.state_datastore._embedded_db_path = tmpdir
-        # `mtxdb_engine.open_client` is a no-op after the first call in
-        # this process (`DBS` is a process-global `OnceCell` -- see
-        # rust/src/database/mtxdb_syn.rs), so every `test_embedded_*` test
-        # in this file that opens its own "fresh" tmpdir is actually still
-        # sharing one mtxdb store for the whole trial worker process.
-        # `_embedded_db_namespace` defaults to `server_name`, which every
-        # test here shares too ("test"), so without overriding it, two
-        # tests using the same `self.room` and the same small state_group
-        # ids (both start counting from 1) collide on the same mtxdb keys.
-        # tmpdir is unique per test (tempfile.mkdtemp), so reuse it as the
-        # namespace to keep tests isolated despite the shared store.
-        self.state_datastore._embedded_db_namespace = tmpdir
+        # Each test opens its own root: keys are unsalted, so state-group
+        # ids (which restart at 1 in every fresh SQL database) must not be
+        # shared across tests.
 
         e1 = self.inject_state_event(self.room, self.u_alice, EventTypes.Create, "", {})
         e2 = self.inject_state_event(
@@ -625,21 +598,13 @@ class StateStoreTestCase(HomeserverTestCase):
 
         tmpdir = tempfile.mkdtemp(prefix=prefix)
         self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        mtxdb_engine.close_client()
         mtxdb_engine.open_client(tmpdir)
         self.state_datastore._embedded_db_engine = "mtxdb"
         self.state_datastore._embedded_db_path = tmpdir
-        # `mtxdb_engine.open_client` is a no-op after the first call in this
-        # process (`DBS` is a process-global `OnceCell` -- see
-        # rust/src/database/mtxdb_syn.rs), so every test using this helper
-        # is actually still sharing one mtxdb store for the whole trial
-        # worker process. `_embedded_db_namespace` defaults to `server_name`
-        # ("test", shared by every test here), so without overriding it,
-        # two tests using the same `self.room` and the same small
-        # state_group ids (both start counting from 1) collide on the same
-        # mtxdb keys ("state_group alias collision detected"). tmpdir is
-        # unique per test (tempfile.mkdtemp), so reuse it as the namespace
-        # to keep tests isolated despite the shared store.
-        self.state_datastore._embedded_db_namespace = tmpdir
+        # Each test opens its own root: keys are unsalted, so state-group
+        # ids (which restart at 1 in every fresh SQL database) must not be
+        # shared across tests.
 
     def test_purge_unreferenced_state_groups_deletes_embedded_root(self) -> None:
         """Regression test: `purge_unreferenced_state_groups` used to call

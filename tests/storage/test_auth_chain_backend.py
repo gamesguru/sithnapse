@@ -160,13 +160,12 @@ class AuthChainBackendCheckTestCase(HomeserverTestCase):
         self.assertEqual(self._read_marker(), "mtxdb")
 
         engine = self.hs.config.database.embedded_db_engine
-        namespace = self.hs.config.database.embedded_db_namespace or self.hs.hostname
         event_ids = list(expected)
-        short_ids = get_or_create_short_ids(engine, namespace, room_id, event_ids)
-        edges = get_embedded_auth_edges_batch(engine, namespace, room_id, short_ids)
+        short_ids = get_or_create_short_ids(engine, room_id, event_ids)
+        edges = get_embedded_auth_edges_batch(engine, room_id, short_ids)
         for event_id, short_id in zip(event_ids, short_ids):
             self.assertIsNotNone(edges[short_id])
             resolved = resolve_short_ids_to_event_ids(
-                engine, namespace, room_id, list(edges[short_id] or [])
+                engine, room_id, list(edges[short_id] or [])
             )
             self.assertEqual(set(resolved), expected[event_id])

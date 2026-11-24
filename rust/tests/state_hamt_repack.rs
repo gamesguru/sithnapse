@@ -38,7 +38,6 @@ fn room_scoped_root_indexes_survive_repack_and_delete() {
     initialize_python();
     let database = tempfile::tempdir().expect("temporary mtxdb directory");
     let database_path = database.path().to_string_lossy().into_owned();
-    let namespace = "integration-root-repack";
     let room = "!integration-root-repack:example.org";
     let state_group = 1;
     let state_group_id = test_state_group_id();
@@ -47,28 +46,17 @@ fn room_scoped_root_indexes_survive_repack_and_delete() {
 
     Python::attach(|py| {
         open_client(py, database_path).expect("open temporary mtxdb");
-        put_state_hamt_roots(
-            py,
-            namespace.to_owned(),
-            room_prefix.to_vec(),
-            vec![(state_group, value.clone())],
-        )
-        .expect("write root");
+        put_state_hamt_roots(py, room_prefix.to_vec(), vec![(state_group, value.clone())])
+            .expect("write root");
 
         assert_eq!(
-            get_state_hamt_roots_for_room(
-                py,
-                namespace.to_owned(),
-                room_prefix.to_vec(),
-                vec![state_group],
-            )
-            .expect("operational lookup before repack"),
+            get_state_hamt_roots_for_room(py, room_prefix.to_vec(), vec![state_group],)
+                .expect("operational lookup before repack"),
             vec![Some(value.clone())]
         );
         assert_eq!(
             get_state_hamt_roots_by_state_group_id(
                 py,
-                namespace.to_owned(),
                 room_prefix.to_vec(),
                 vec![state_group_id.clone()],
             )
@@ -79,19 +67,13 @@ fn room_scoped_root_indexes_survive_repack_and_delete() {
         repack(py).expect("repack temporary database");
 
         assert_eq!(
-            get_state_hamt_roots_for_room(
-                py,
-                namespace.to_owned(),
-                room_prefix.to_vec(),
-                vec![state_group],
-            )
-            .expect("operational lookup after repack"),
+            get_state_hamt_roots_for_room(py, room_prefix.to_vec(), vec![state_group],)
+                .expect("operational lookup after repack"),
             vec![Some(value.clone())]
         );
         assert_eq!(
             get_state_hamt_roots_by_state_group_id(
                 py,
-                namespace.to_owned(),
                 room_prefix.to_vec(),
                 vec![state_group_id.clone()],
             )
@@ -99,31 +81,16 @@ fn room_scoped_root_indexes_survive_repack_and_delete() {
             vec![Some(value.clone())]
         );
 
-        delete_state_hamt_roots_for_room(
-            py,
-            namespace.to_owned(),
-            room_prefix.to_vec(),
-            vec![state_group],
-        )
-        .expect("delete root");
+        delete_state_hamt_roots_for_room(py, room_prefix.to_vec(), vec![state_group])
+            .expect("delete root");
         assert_eq!(
-            get_state_hamt_roots_for_room(
-                py,
-                namespace.to_owned(),
-                room_prefix.to_vec(),
-                vec![state_group],
-            )
-            .expect("operational lookup after delete"),
+            get_state_hamt_roots_for_room(py, room_prefix.to_vec(), vec![state_group],)
+                .expect("operational lookup after delete"),
             vec![None]
         );
         assert_eq!(
-            get_state_hamt_roots_by_state_group_id(
-                py,
-                namespace.to_owned(),
-                room_prefix.to_vec(),
-                vec![state_group_id],
-            )
-            .expect("semantic lookup after delete"),
+            get_state_hamt_roots_by_state_group_id(py, room_prefix.to_vec(), vec![state_group_id],)
+                .expect("semantic lookup after delete"),
             vec![None]
         );
     });

@@ -1273,7 +1273,6 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
             ):
                 found = get_event_json_batch(
                     self._embedded_db_engine,
-                    self._embedded_db_namespace,
                     missing_json_ids,
                 )
                 for eid, (_, j, _) in found.items():
@@ -2206,7 +2205,6 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
             ):
                 found = get_event_json_batch(
                     self._embedded_db_engine,
-                    self._embedded_db_namespace,
                     [event_id],
                 )
                 if event_id in found:
@@ -2737,7 +2735,6 @@ class RoomBackgroundUpdateStore(RoomWorkerStore):
             if missing_ids and getattr(self, "_embedded_event_json_enabled", False):
                 found = get_event_json_batch(
                     self._embedded_db_engine,
-                    self._embedded_db_namespace,
                     missing_ids,
                 )
                 for eid, (_, j, _) in found.items():
@@ -2944,7 +2941,6 @@ class RoomBackgroundUpdateStore(RoomWorkerStore):
             if missing_ids and getattr(self, "_embedded_event_json_enabled", False):
                 found = get_event_json_batch(
                     self._embedded_db_engine,
-                    self._embedded_db_namespace,
                     missing_ids,
                 )
                 for eid, (_, j, _) in found.items():
@@ -3029,7 +3025,6 @@ class RoomBackgroundUpdateStore(RoomWorkerStore):
             if missing_ids and getattr(self, "_embedded_event_json_enabled", False):
                 found = get_event_json_batch(
                     self._embedded_db_engine,
-                    self._embedded_db_namespace,
                     missing_ids,
                 )
                 for eid, (_, j, _) in found.items():

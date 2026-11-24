@@ -55,7 +55,6 @@ logger = logging.getLogger(__name__)
 
 def _delete_purge_event_mirrors(
     engine_name: str | None,
-    namespace: str,
     redacted_event_ids: list[str],
     deleted_event_ids: list[str],
 ) -> None:
@@ -66,14 +65,14 @@ def _delete_purge_event_mirrors(
     """
 
     def delete() -> None:
-        delete_redactions_batch(engine_name, namespace, redacted_event_ids)
+        delete_redactions_batch(engine_name, redacted_event_ids)
         if redacted_event_ids:
             # Redaction tombstones live in the State pool, which the event_json
             # delete below does not sync. Make their removal durable first, so
             # a crash cannot bring back a redaction mirror for events whose
             # event_json is already gone.
             sync_now(pools=[Pool.STATE])
-        delete_event_json_batch(engine_name, namespace, deleted_event_ids)
+        delete_event_json_batch(engine_name, deleted_event_ids)
 
     retry_on_contention(delete, label="purge_mirrors")
 
@@ -438,7 +437,6 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             # Only mtxdb entries are refcounted, so only those are decremented.
             event_id_to_state_group = get_state_group_for_events_batch(
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 purge_set_event_ids,
                 purpose="purge_traversal",
             )
@@ -450,13 +448,11 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             txn.call_after(
                 delete_event_to_state_group_batch,
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 list(event_id_to_state_group.keys()),
             )
             txn.call_after(
                 decrement_state_group_refcounts_batch,
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 list(event_id_to_state_group.values()),
             )
             txn.call_after(sync_now, pools=[Pool.STATE])
@@ -531,7 +527,6 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
                     "event_json/redaction mirrors",
                     lambda: _delete_purge_event_mirrors(
                         self._embedded_db_engine,
-                        self._embedded_db_namespace,
                         redacted_event_ids,
                         deleted_ids,
                     ),
@@ -757,37 +752,30 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             from synapse.storage.databases.main.embedded_event_auth_chains import (
                 bump_room_generation,
                 purge_room as purge_auth_chain_room,
-                resolve_namespace,
             )
 
-            namespace = resolve_namespace(self)
-            if namespace is not None:
-                bump_room_generation(namespace, room_id)
+            bump_room_generation(room_id)
 
-                def purge_then_bump(
-                    engine_name: str | None, ns: str, purged_room_id: str
-                ) -> None:
-                    try:
-                        purge_auth_chain_room(engine_name, ns, purged_room_id)
-                    finally:
-                        # A closure computed between the bump above and this
-                        # durable delete was built from data that no longer
-                        # exists (the SQL purge has committed), and was cached
-                        # under the current generation. Advance it again so
-                        # such entries cannot be served, even when the delete
-                        # fails partway.
-                        bump_room_generation(ns, purged_room_id)
+            def purge_then_bump(engine_name: str | None, purged_room_id: str) -> None:
+                try:
+                    purge_auth_chain_room(engine_name, purged_room_id)
+                finally:
+                    # A closure computed between the bump above and this
+                    # durable delete was built from data that no longer
+                    # exists (the SQL purge has committed), and was cached
+                    # under the current generation. Advance it again so
+                    # such entries cannot be served, even when the delete
+                    # fails partway.
+                    bump_room_generation(purged_room_id)
 
-                # Isolated like the other mirrors: a failed auth-chain delete
-                # must not stop the event/edge/state-group cleanups below.
-                room_cleanups.append(
-                    (
-                        "auth-chain index",
-                        lambda: purge_then_bump(
-                            self._embedded_db_engine, namespace, room_id
-                        ),
-                    )
+            # Isolated like the other mirrors: a failed auth-chain delete
+            # must not stop the event/edge/state-group cleanups below.
+            room_cleanups.append(
+                (
+                    "auth-chain index",
+                    lambda: purge_then_bump(self._embedded_db_engine, room_id),
                 )
+            )
 
         # event_auth is still retained as an offline migration snapshot, so
         # it may contain rows whose event rows are already absent (for
@@ -846,7 +834,6 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
                     "event_json/redaction mirrors",
                     lambda: _delete_purge_event_mirrors(
                         self._embedded_db_engine,
-                        self._embedded_db_namespace,
                         room_redacted_event_ids,
                         room_event_ids,
                     ),
@@ -866,20 +853,17 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             # deleting so the refcount can be rebalanced.
             event_id_to_state_group = get_state_group_for_events_batch(
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 room_event_ids,
                 purpose="purge_traversal",
             )
             txn.call_after(
                 delete_event_to_state_group_batch,
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 list(event_id_to_state_group.keys()),
             )
             txn.call_after(
                 decrement_state_group_refcounts_batch,
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 list(event_id_to_state_group.values()),
             )
             # One sync for the whole purge batch (event_json delete +

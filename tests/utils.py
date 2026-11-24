@@ -551,16 +551,14 @@ def default_config(
     }
 
     if EMBEDDED_DB_ENGINE and EMBEDDED_DB_PATH:
-        # Many test homeservers (each with their own fresh SQL database, so
-        # each restarting its state_group id sequence at 1) can share this
-        # one mtxdb file across a whole trial worker process. Without a
-        # unique namespace per homeserver, two different tests' state_group
-        # 1 would collide on the same mtxdb keys and silently read each
-        # other's data.
+        # Each test homeserver has its own fresh SQL database, so its
+        # state_group sequence restarts at 1. Give each one its own mtxdb
+        # root so those ids cannot collide now that keys are unsalted.
         config_dict["embedded_db"] = {
             "engine": EMBEDDED_DB_ENGINE,
-            "path": EMBEDDED_DB_PATH,
-            "namespace": f"trial-{os.getpid()}-{uuid.uuid4().hex}",
+            # Each homeserver gets its own mtxdb root: without a namespace
+            # salt, state-group ids from two test databases would collide.
+            "path": os.path.join(EMBEDDED_DB_PATH, uuid.uuid4().hex),
             "no_sync": EMBEDDED_DB_NO_SYNC,
             # Tests rely on FLUSH_DELAY_SECS to know exactly how far to
             # advance the reactor to drain the coalescer. Pin the runtime

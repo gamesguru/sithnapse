@@ -137,9 +137,8 @@ class EventsTestCase(HomeserverTestCase):
         assert persist_store is not None
         self.assertTrue(persist_store._embedded_event_json_enabled)
         engine = persist_store._embedded_db_engine
-        namespace = persist_store._embedded_db_namespace
-        if engine is None or namespace is None:
-            self.skipTest("embedded auth-chain namespace not configured")
+        if engine is None:
+            self.skipTest("embedded engine not configured")
 
         user = self.register_user("auth_edges_user", "pass")
         token = self.login("auth_edges_user", "pass")
@@ -165,16 +164,10 @@ class EventsTestCase(HomeserverTestCase):
         self.assertEqual(sql_rows, [])
 
         # The mtxdb outbound edges carry the same direct auth events.
-        short_id = get_or_create_short_ids(
-            engine, namespace, room_id, [state_event_id]
-        )[0]
-        edges = get_embedded_auth_edges_batch(engine, namespace, room_id, [short_id])[
-            short_id
-        ]
+        short_id = get_or_create_short_ids(engine, room_id, [state_event_id])[0]
+        edges = get_embedded_auth_edges_batch(engine, room_id, [short_id])[short_id]
         self.assertIsNotNone(edges)
-        resolved = resolve_short_ids_to_event_ids(
-            engine, namespace, room_id, list(edges or [])
-        )
+        resolved = resolve_short_ids_to_event_ids(engine, room_id, list(edges or []))
         self.assertEqual(
             {event_id for event_id in resolved if event_id}, expected_auth_ids
         )
@@ -534,7 +527,6 @@ class EventsTestCase(HomeserverTestCase):
         path that learns an id (``get_event``) cannot find it.
         """
         self.assertTrue(self._store._embedded_event_json_enabled)
-        namespace = self._store._embedded_db_namespace
         engine = self._store._embedded_db_engine
         user = self.register_user("orphan_json_user", "pass")
         token = self.login("orphan_json_user", "pass")
@@ -566,7 +558,7 @@ class EventsTestCase(HomeserverTestCase):
                 },
             )
             embedded_event_json.put_event_json_batch(
-                engine, namespace, [(event_id, room_id, "{}", body, 1)], sync=False
+                engine, [(event_id, room_id, "{}", body, 1)], sync=False
             )
             raise RuntimeError("simulated persist rollback")
 
@@ -577,7 +569,7 @@ class EventsTestCase(HomeserverTestCase):
         self.assertEqual(str(failure.value), "simulated persist rollback")
 
         # The JSON record survives the rollback in mtxdb ...
-        found = embedded_event_json.get_event_json_batch(engine, namespace, [event_id])
+        found = embedded_event_json.get_event_json_batch(engine, [event_id])
         self.assertEqual(found[event_id][1], body)
 
         # ... but is unreachable: with no committed row there is no id for a
@@ -591,13 +583,11 @@ class EventsTestCase(HomeserverTestCase):
         expects the `RuntimeError` when `fail`."""
         persist_store = self.hs.get_datastores().persist_events
         assert persist_store is not None
-        namespace = persist_store._embedded_db_namespace
         room_id = "!staged:test"
 
         def body(txn: LoggingTransaction, **kwargs: object) -> None:
             embedded_event_json.put_event_json_batch(
                 "mtxdb",
-                namespace,
                 [(event_id, room_id, "{}", json.dumps({"body": event_id}), 1)],
                 transaction=kwargs["mtxdb_txn"],  # type: ignore[arg-type]
             )
@@ -632,9 +622,7 @@ class EventsTestCase(HomeserverTestCase):
     def _json_present(self, event_id: str) -> bool:
         persist_store = self.hs.get_datastores().persist_events
         assert persist_store is not None
-        found = embedded_event_json.get_event_json_batch(
-            "mtxdb", persist_store._embedded_db_namespace, [event_id]
-        )
+        found = embedded_event_json.get_event_json_batch("mtxdb", [event_id])
         return event_id in found
 
     @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")

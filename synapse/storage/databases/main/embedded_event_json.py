@@ -64,8 +64,8 @@ Reuses the same `embedded_db_engine`/`embedded_db_path` config and mtxdb
 keyspace the state store already opens (one flat keyspace, prefixed keys --
 `hamt:node:...`, `hamt:root:...`, `event_json:...` -- rather than a second
 mtxdb directory/config knob), and is on whenever that is -- see
-`open_embedded_event_json_engine`. Namespacing via `embedded_db_namespace`
-keeps multiple homeservers sharing one mtxdb file from colliding on event_id.
+`open_embedded_event_json_engine`. Event ids are globally unique, so the
+keys are unsalted.
 """
 
 from __future__ import annotations
@@ -108,10 +108,7 @@ def open_embedded_event_json_engine(hs: "HomeServer") -> bool:
     on whenever the embedded engine itself is (`embedded_db_engine` +
     `embedded_db_path` configured), same as every other embedded mirror.
 
-    Keys are namespaced by `embedded_db_namespace` (see `_event_json_key`),
-    same scheme `embedded_event_to_state_group.py`/
-    other embedded collections already use, so multiple
-    homeservers sharing one mtxdb file don't collide on event_id.
+    Event ids are globally unique, so the keys carry no namespace salt.
     """
     return bool(
         hs.config.database.embedded_db_engine and hs.config.database.embedded_db_path
@@ -156,7 +153,6 @@ def _decode_event_json_record(value: bytes) -> tuple[str, str, int | None]:
 
 def put_event_json_batch(
     engine_name: str | None,
-    namespace: str,
     rows: list[tuple[str, str, str, str, int | None]],
     *,
     sync: bool = False,
@@ -218,7 +214,7 @@ def put_event_json_batch(
 
 
 def get_event_json_batch(
-    engine_name: str | None, namespace: str, event_ids: list[str]
+    engine_name: str | None, event_ids: list[str]
 ) -> dict[str, tuple[str, str, int | None]]:
     """Returns `event_id -> (internal_metadata, json, format_version)` for
     every id found in the embedded engine; a missing id is simply absent
@@ -248,9 +244,7 @@ def get_event_json_batch(
     return result
 
 
-def delete_event_json_batch(
-    engine_name: str | None, namespace: str, event_ids: list[str]
-) -> None:
+def delete_event_json_batch(engine_name: str | None, event_ids: list[str]) -> None:
     """Removes `event_id`s from the embedded mirror. Must be called wherever
     `event_json` rows are deleted from SQL (purge_events.py) so the mirror
     doesn't retain data the user asked to be purged -- see also

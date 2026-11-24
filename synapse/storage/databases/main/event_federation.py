@@ -276,26 +276,21 @@ class EventFederationWorkerStore(
 
         from synapse.storage.databases.main.embedded_event_auth_chains import (
             IncompleteAuthGraph,
-            resolve_namespace,
         )
 
-        embedded_db_namespace = resolve_namespace(self)
-        if embedded_db_namespace is not None:
+        if getattr(self, "_embedded_db_engine", None) is not None:
             assert self._embedded_db_engine is not None
             _auth_coverage("get_auth_chain_ids", "embedded_attempt", len(event_ids))
             try:
                 result = await self._run_embedded_off_reactor(
                     "get_auth_chain_ids_embedded",
                     self._get_auth_chain_ids_using_embedded_closures,
-                    embedded_db_namespace,
                     room_id,
                     event_ids,
                     include_given,
                 )
             except IncompleteAuthGraph as e:
-                missing = await self._describe_incomplete_auth_graph(
-                    embedded_db_namespace, room_id, e
-                )
+                missing = await self._describe_incomplete_auth_graph(room_id, e)
                 raise RuntimeError(
                     "Auth-chain graph is incomplete after the mtxdb cutover; "
                     f"missing event or auth edge: {missing}"
@@ -330,7 +325,7 @@ class EventFederationWorkerStore(
         return await self.db_pool.runInteraction(desc, _run)
 
     async def _describe_incomplete_auth_graph(
-        self, namespace: str, room_id: str, error: Exception
+        self, room_id: str, error: Exception
     ) -> str:
         """Resolve an incomplete-graph marker to an event ID where possible."""
         from synapse.storage.databases.main.embedded_event_auth_chains import (
@@ -344,7 +339,6 @@ class EventFederationWorkerStore(
                     "resolve_incomplete_auth_graph_event_id",
                     resolve_short_ids_to_event_ids,
                     self._embedded_db_engine,
-                    namespace,
                     room_id,
                     [marker],
                 )
@@ -360,7 +354,6 @@ class EventFederationWorkerStore(
 
     def _get_auth_chain_ids_using_embedded_closures(
         self,
-        embedded_db_namespace: str,
         room_id: str,
         event_ids: Collection[str],
         include_given: bool,
@@ -387,16 +380,15 @@ class EventFederationWorkerStore(
 
         logger.debug(
             "get_auth_chain_ids: using EMBEDDED CLOSURES path for room=%s "
-            "namespace=%s initial_events=%s include_given=%s",
+            "initial_events=%s include_given=%s",
             room_id,
-            embedded_db_namespace,
             initial_events,
             include_given,
         )
 
         engine_name = self._embedded_db_engine
         resolved_short_ids = resolve_event_ids_to_short_ids(
-            engine_name, embedded_db_namespace, room_id, initial_events
+            engine_name, room_id, initial_events
         )
         unembedded = [
             event_id
@@ -412,7 +404,6 @@ class EventFederationWorkerStore(
 
         closures = self._auth_chain_closure_cache.get_closures_batch(
             engine_name,
-            embedded_db_namespace,
             room_id,
             short_ids,
         )
@@ -430,7 +421,6 @@ class EventFederationWorkerStore(
 
         resolved = resolve_short_ids_to_event_ids(
             engine_name,
-            embedded_db_namespace,
             room_id,
             list(result_short_ids),
         )
@@ -539,11 +529,9 @@ class EventFederationWorkerStore(
 
         from synapse.storage.databases.main.embedded_event_auth_chains import (
             IncompleteAuthGraph,
-            resolve_namespace,
         )
 
-        embedded_db_namespace = resolve_namespace(self)
-        if embedded_db_namespace is not None:
+        if getattr(self, "_embedded_db_engine", None) is not None:
             assert self._embedded_db_engine is not None
             _auth_coverage(
                 "get_auth_chain_difference",
@@ -554,16 +542,13 @@ class EventFederationWorkerStore(
                 result = await self._run_embedded_off_reactor(
                     "get_auth_chain_difference_embedded",
                     self._get_auth_chain_difference_using_embedded_closures,
-                    embedded_db_namespace,
                     room_id,
                     state_sets,
                     conflicted_set,
                     additional_backwards_reachable_conflicted_events,
                 )
             except IncompleteAuthGraph as e:
-                missing = await self._describe_incomplete_auth_graph(
-                    embedded_db_namespace, room_id, e
-                )
+                missing = await self._describe_incomplete_auth_graph(room_id, e)
                 raise RuntimeError(
                     "Auth-chain graph is incomplete after the mtxdb cutover; "
                     f"missing event or auth edge: {missing}"
@@ -601,7 +586,6 @@ class EventFederationWorkerStore(
 
     def _get_auth_chain_difference_using_embedded_closures(
         self,
-        embedded_db_namespace: str,
         room_id: str,
         state_sets: list[set[str]],
         conflicted_set: set[str] | None = None,
@@ -661,7 +645,7 @@ class EventFederationWorkerStore(
 
         event_ids = list(initial_events)
         resolved_short_ids = resolve_event_ids_to_short_ids(
-            engine_name, embedded_db_namespace, room_id, event_ids
+            engine_name, room_id, event_ids
         )
         unembedded = {
             event_id
@@ -691,7 +675,6 @@ class EventFederationWorkerStore(
             ]
             closures = self._auth_chain_closure_cache.get_closures_batch(
                 engine_name,
-                embedded_db_namespace,
                 room_id,
                 member_short_ids,
             )
@@ -719,7 +702,6 @@ class EventFederationWorkerStore(
             backwards_ids: set[int] = set(conflicted_short_ids)
             for closure in self._auth_chain_closure_cache.get_closures_batch(
                 engine_name,
-                embedded_db_namespace,
                 room_id,
                 conflicted_short_ids,
             ).values():
@@ -733,7 +715,6 @@ class EventFederationWorkerStore(
                 backwards_ids.update(additional_short_ids)
                 for closure in self._auth_chain_closure_cache.get_closures_batch(
                     engine_name,
-                    embedded_db_namespace,
                     room_id,
                     additional_short_ids,
                 ).values():
@@ -743,7 +724,6 @@ class EventFederationWorkerStore(
             # universe so the walk cost is bounded by |backwards|, not |room|.
             forwards_ids = get_forward_reachable_short_ids(
                 engine_name,
-                embedded_db_namespace,
                 room_id,
                 conflicted_short_ids,
                 candidate_short_ids=backwards_ids,
@@ -755,7 +735,6 @@ class EventFederationWorkerStore(
                 return set()
             resolved = resolve_short_ids_to_event_ids(
                 engine_name,
-                embedded_db_namespace,
                 room_id,
                 list(short_id_iter),
             )

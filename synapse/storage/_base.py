@@ -48,7 +48,6 @@ class SQLBaseStore(metaclass=ABCMeta):
 
     db_pool: DatabasePool
     _embedded_db_engine: str | None
-    _embedded_db_namespace: str
     _embedded_event_json_enabled: bool
 
     def __init__(
@@ -63,9 +62,6 @@ class SQLBaseStore(metaclass=ABCMeta):
         self.database_engine = database.engine
         self.db_pool = database
         self._embedded_db_engine = hs.config.database.embedded_db_engine
-        self._embedded_db_namespace = (
-            hs.config.database.embedded_db_namespace or hs.hostname
-        )
         self._embedded_event_json_enabled = getattr(
             self, "_embedded_event_json_enabled", False
         )

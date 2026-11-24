@@ -47,75 +47,67 @@ _ENGINE = "mtxdb"
 
 class EmbeddedRedactionsTestCase(unittest.TestCase):
     def test_redaction_put_get_round_trip(self) -> None:
-        ns = "test-redactions-round-trip"
         put_redaction_batch(
             _ENGINE,
-            ns,
             [
-                ("$target1", "$redaction1", False),
-                ("$target2", "$redaction2", True),
+                ("$rt-target1", "$rt-redaction1", False),
+                ("$rt-target2", "$rt-redaction2", True),
             ],
         )
 
-        found = get_redactions_batch(_ENGINE, ns, ["$target1", "$target2", "$missing"])
-        self.assertEqual(found["$target1"], ("$redaction1", False))
-        self.assertEqual(found["$target2"], ("$redaction2", True))
-        self.assertNotIn("$missing", found)
+        found = get_redactions_batch(
+            _ENGINE, ["$rt-target1", "$rt-target2", "$rt-missing"]
+        )
+        self.assertEqual(found["$rt-target1"], ("$rt-redaction1", False))
+        self.assertEqual(found["$rt-target2"], ("$rt-redaction2", True))
+        self.assertNotIn("$rt-missing", found)
 
     def test_have_censored_flips_both_directions(self) -> None:
-        ns = "test-redactions-flip"
-        put_redaction_batch(_ENGINE, ns, [("$target", "$redaction", False)])
+        put_redaction_batch(_ENGINE, [("$hc-target", "$hc-redaction", False)])
 
-        set_have_censored_batch(_ENGINE, ns, ["$target"], True)
+        set_have_censored_batch(_ENGINE, ["$hc-target"], True)
         self.assertEqual(
-            get_redactions_batch(_ENGINE, ns, ["$target"])["$target"],
-            ("$redaction", True),
+            get_redactions_batch(_ENGINE, ["$hc-target"])["$hc-target"],
+            ("$hc-redaction", True),
         )
 
         # Flipping back (the "original event re-persisted unredacted" path)
         # must preserve the redaction event id.
-        set_have_censored_batch(_ENGINE, ns, ["$target"], False)
+        set_have_censored_batch(_ENGINE, ["$hc-target"], False)
         self.assertEqual(
-            get_redactions_batch(_ENGINE, ns, ["$target"])["$target"],
-            ("$redaction", False),
+            get_redactions_batch(_ENGINE, ["$hc-target"])["$hc-target"],
+            ("$hc-redaction", False),
         )
 
     def test_put_is_create_only(self) -> None:
         """A second redaction targeting the same event must not clobber the
         existing slot's aggregate `have_censored` -- SQL's `_store_redaction`
         upsert preserves it, and `redactions.redacts` is non-unique."""
-        ns = "test-redactions-create-only"
-        put_redaction_batch(_ENGINE, ns, [("$target", "$redaction1", False)])
-        set_have_censored_batch(_ENGINE, ns, ["$target"], True)
+        put_redaction_batch(_ENGINE, [("$co-target", "$co-redaction1", False)])
+        set_have_censored_batch(_ENGINE, ["$co-target"], True)
 
         # A second redaction of the same event: the slot stays censored.
-        put_redaction_batch(_ENGINE, ns, [("$target", "$redaction2", False)])
+        put_redaction_batch(_ENGINE, [("$co-target", "$co-redaction2", False)])
         self.assertEqual(
-            get_redactions_batch(_ENGINE, ns, ["$target"])["$target"],
-            ("$redaction1", True),
+            get_redactions_batch(_ENGINE, ["$co-target"])["$co-target"],
+            ("$co-redaction1", True),
         )
 
     def test_set_have_censored_skips_absent_ids(self) -> None:
-        ns = "test-redactions-absent"
         # No mirror record for the id: a no-op, not an error.
-        set_have_censored_batch(_ENGINE, ns, ["$never-written"], True)
-        self.assertEqual(get_redactions_batch(_ENGINE, ns, ["$never-written"]), {})
+        set_have_censored_batch(_ENGINE, ["$absent-target"], True)
+        self.assertEqual(get_redactions_batch(_ENGINE, ["$absent-target"]), {})
 
-    def test_redaction_namespace_isolation(self) -> None:
-        put_redaction_batch(_ENGINE, "ns-a", [("$shared", "$redaction-a", False)])
-        put_redaction_batch(_ENGINE, "ns-b", [("$shared", "$redaction-b", True)])
+    def test_latest_write_wins_for_a_shared_slot(self) -> None:
+        put_redaction_batch(_ENGINE, [("$lw-target", "$lw-redaction-a", False)])
+        put_redaction_batch(_ENGINE, [("$lw-target", "$lw-redaction-b", True)])
 
         self.assertEqual(
-            get_redactions_batch(_ENGINE, "ns-a", ["$shared"])["$shared"],
-            ("$redaction-a", False),
-        )
-        self.assertEqual(
-            get_redactions_batch(_ENGINE, "ns-b", ["$shared"])["$shared"],
-            ("$redaction-b", True),
+            get_redactions_batch(_ENGINE, ["$lw-target"])["$lw-target"],
+            ("$lw-redaction-a", False),
         )
 
     def test_redaction_delete(self) -> None:
-        ns = "test-redactions-delete"
-        put_redaction_batch(_ENGINE, ns, [("$target", "$redaction", False)])
-        delete_redactions_batch(_ENGINE, ns, ["$target"])
-        self.assertEqual(get_redactions_batch(_ENGINE, ns, ["$target"]), {})
+        put_redaction_batch(_ENGINE, [("$del-target", "$del-redaction", False)])
+        delete_redactions_batch(_ENGINE, ["$del-target"])
+        self.assertEqual(get_redactions_batch(_ENGINE, ["$del-target"]), {})

@@ -115,12 +115,6 @@ class DatabaseConfig(Config):
         self.databases: list[DatabaseConnectionConfig] = []
         self.embedded_db_engine: str | None = None
         self.embedded_db_path: str | None = None
-        # Optional explicit namespace for HAMT keys in the embedded engine
-        # (see StateGroupDataStore.hamt_namespace) -- defaults to the server
-        # name when unset. Only useful for isolating multiple homeservers
-        # that share one embedded-engine file (e.g. many trial test
-        # processes reusing one mtxdb path), not a normal deployment concern.
-        self.embedded_db_namespace: str | None = None
         # Diagnostic escape hatch: when True, all DURABLE-tier sync() calls
         # are suppressed (maybe_sync returns immediately).  Reintroduces the
         # silent-data-loss window that SyncTier.DURABLE exists to close --
@@ -187,7 +181,6 @@ class DatabaseConfig(Config):
         if embedded_config:
             self.embedded_db_engine = embedded_config.get("engine")
             self.embedded_db_path = embedded_config.get("path")
-            self.embedded_db_namespace = embedded_config.get("namespace")
             no_sync = embedded_config.get("no_sync", False)
             if not isinstance(no_sync, bool):
                 raise ConfigError("embedded_db.no_sync must be a boolean")
