@@ -1039,7 +1039,7 @@
 {"Action":"pass","Test":"TestUnknownEndpoints/Server-server_endpoints"}
 {"Action":"pass","Test":"TestUnknownEndpoints/Unknown_prefix"}
 {"Action":"pass","Test":"TestUnrejectRejectedEvents"}
-{"Action":"fail","Test":"TestUnverifiableStateEventIsNotRefetchedForEveryGap"}
+{"Action":"pass","Test":"TestUnverifiableStateEventIsNotRefetchedForEveryGap"}
 {"Action":"pass","Test":"TestUploadKey"}
 {"Action":"pass","Test":"TestUploadKey/Parallel"}
 {"Action":"pass","Test":"TestUploadKey/Parallel/Can_claim_one_time_key_using_POST"}

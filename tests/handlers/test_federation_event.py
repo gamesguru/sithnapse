@@ -555,6 +555,41 @@ class FederationEventHandlerTests(unittest.FederatingHomeserverTestCase):
         """
         return self._test_process_pulled_event_with_missing_state(False)
 
+    def test_unfetchable_state_event_is_not_requested_again_immediately(self) -> None:
+        """A failed state-event fetch is cached for the short negative TTL."""
+        user_id = self.register_user("kermit", "test")
+        tok = self.login("kermit", "test")
+        room_id = self.helper.create_room_as(room_creator=user_id, tok=tok)
+        handler = self.hs.get_federation_event_handler()
+        federation_client = self.hs.get_federation_client()
+
+        with mock.patch.object(
+            federation_client,
+            "get_pdu",
+            new=mock.AsyncMock(return_value=None),
+        ) as get_pdu:
+            self.get_success(
+                handler._get_events_and_persist(
+                    self.OTHER_SERVER_NAME, room_id, {"$unfetchable"}
+                )
+            )
+            self.get_success(
+                handler._get_events_and_persist(
+                    self.OTHER_SERVER_NAME, room_id, {"$unfetchable"}
+                )
+            )
+
+            get_pdu.assert_awaited_once()
+
+            # Once the negative entry expires, retrying the remote is allowed.
+            self.reactor.advance(60_000)
+            self.get_success(
+                handler._get_events_and_persist(
+                    self.OTHER_SERVER_NAME, room_id, {"$unfetchable"}
+                )
+            )
+            self.assertEqual(get_pdu.await_count, 2)
+
     def test_process_pulled_event_with_missing_state_where_prev_is_outlier(
         self,
     ) -> None:

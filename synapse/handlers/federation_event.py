@@ -97,6 +97,7 @@ from synapse.util.async_helpers import (
     concurrently_execute,
     yieldable_gather_results,
 )
+from synapse.util.caches.expiringcache import ExpiringCache
 from synapse.util.duration import Duration
 from synapse.util.iterutils import batch_iter, partition, sorted_topologically
 from synapse.util.retryutils import NotRetryingDestination
@@ -107,6 +108,10 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+# How long a definitive remote lookup failure is remembered.
+_FAILED_LOOKUP_TTL_MS = 60 * 1000
 
 
 class IncompleteStateError(Exception):
@@ -205,6 +210,35 @@ class FederationEventHandler:
         self.room_queues: dict[str, list[tuple[EventBase, str]]] = {}
 
         self._room_pdu_linearizer = Linearizer(name="fed_room_pdu", clock=self._clock)
+
+        # Remember, for a short time, the remote lookups that definitely failed, so a
+        # burst of events that all need the same unobtainable data does not repeat
+        # the same doomed federation requests once per event.
+        #
+        # (destination, room_id, event_id) of events the remote did not return or
+        # that failed verification.
+        self._unfetchable_events: ExpiringCache[tuple[str, str, str], bool] = (
+            ExpiringCache(
+                cache_name="federation_unfetchable_events",
+                server_name=self.server_name,
+                hs=hs,
+                clock=self._clock,
+                max_len=10000,
+                expiry_ms=_FAILED_LOOKUP_TTL_MS,
+            )
+        )
+        # (destination, room_id, missing prev_event_id) -> why the state after that
+        # event could not be completed.
+        self._incomplete_state_lookups: ExpiringCache[tuple[str, str, str], str] = (
+            ExpiringCache(
+                cache_name="federation_incomplete_state_lookups",
+                server_name=self.server_name,
+                hs=hs,
+                clock=self._clock,
+                max_len=10000,
+                expiry_ms=_FAILED_LOOKUP_TTL_MS,
+            )
+        )
 
     async def on_receive_pdu(self, origin: str, pdu: EventBase) -> None:
         """Process a PDU received via a federation /send/ transaction
@@ -1989,6 +2023,26 @@ class FederationEventHandler:
                 )
 
                 with nested_logging_context(missing_prev):
+                    require_complete = require_complete_state and not partial_state
+                    lookup_key = (dest, room_id, missing_prev)
+                    # A recent lookup already established that this remote cannot
+                    # give us complete state here. Preserve the original handling:
+                    # strict callers fail, while pulled/non-state events continue
+                    # using the state we have.
+                    failure = self._incomplete_state_lookups.get(lookup_key)
+                    if failure is not None:
+                        if require_complete:
+                            raise IncompleteStateError(failure)
+                        state_fetch_failed = True
+                        logger.info(
+                            "Skipping state lookup for missing prev_event %s from %s "
+                            "after a recent incomplete result: %s",
+                            missing_prev,
+                            dest,
+                            failure,
+                        )
+                        continue
+
                     # note that if any of the missing prevs share missing state or
                     # auth events, the requests to fetch those events are deduped
                     # by the get_pdu_cache in federation_client.
@@ -1998,12 +2052,11 @@ class FederationEventHandler:
                                 dest,
                                 room_id,
                                 missing_prev,
-                                require_complete_state=(
-                                    require_complete_state and not partial_state
-                                ),
+                                require_complete_state=require_complete,
                             )
                         )
-                    except IncompleteStateError:
+                    except IncompleteStateError as e:
+                        self._incomplete_state_lookups[lookup_key] = str(e)
                         raise
                     except Exception as e:
                         # A forward gap whose parent we cannot fetch at all
@@ -2012,6 +2065,7 @@ class FederationEventHandler:
                         # do have. The gap stays a backward extremity and is
                         # filled by backfill later.
                         state_fetch_failed = True
+                        self._incomplete_state_lookups[lookup_key] = str(e)
                         logger.warning(
                             "_compute_event_context_with_maybe_missing_prevs(event_id=%s): "
                             "failed to fetch state for missing prev_event %s from %s: %s. "
@@ -2175,6 +2229,13 @@ class FederationEventHandler:
 
         missing_event_ids = missing_desired_event_ids | missing_auth_event_ids
 
+        # Do not re-request events the remote recently failed to give us.
+        missing_event_ids = {
+            e
+            for e in missing_event_ids
+            if (destination, room_id, e) not in self._unfetchable_events
+        }
+
         set_tag(
             SynapseTags.RESULT_PREFIX + "missing_auth_event_ids",
             str(missing_auth_event_ids),
@@ -2312,6 +2373,13 @@ class FederationEventHandler:
             set_tag(
                 SynapseTags.RESULT_PREFIX + "failed_to_fetch.length",
                 str(len(failed_to_fetch)),
+            )
+            # The state snapshot is usable only partially, but asking for it
+            # again immediately will return the same missing event IDs. Keep
+            # that negative result briefly to avoid repeating the full lookup
+            # for every event that shares this prev_event.
+            self._incomplete_state_lookups[(destination, room_id, event_id)] = (
+                f"Failed to fetch state events {sorted(failed_to_fetch)}"
             )
             if require_complete_state:
                 # The caller is about to authorise a new event against this
@@ -2570,6 +2638,15 @@ class FederationEventHandler:
         events: list[EventBase] = []
 
         async def get_event(event_id: str) -> None:
+            cache_key = (destination, room_id, event_id)
+            if cache_key in self._unfetchable_events:
+                logger.info(
+                    "Skipping recently unfetchable state/auth event %s from %s",
+                    event_id,
+                    destination,
+                )
+                return
+
             with nested_logging_context(event_id):
                 try:
                     pulled_pdu_info = await self._federation_client.get_pdu(
@@ -2583,10 +2660,12 @@ class FederationEventHandler:
                             destination,
                             event_id,
                         )
+                        self._unfetchable_events[cache_key] = True
                         return
                     events.append(pulled_pdu_info.pdu)
 
                 except Exception as e:
+                    self._unfetchable_events[cache_key] = True
                     logger.warning(
                         "Error fetching missing state/auth event %s: %s %s",
                         event_id,
