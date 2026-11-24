@@ -519,8 +519,8 @@ jobs:
           SYNAPSE_POSTGRES_HOST: /var/run/postgresql
           SYNAPSE_POSTGRES_USER: postgres
           SYNAPSE_POSTGRES_PASSWORD: postgres
-          SYNAPSE_TEST_EMBEDDED_DB_ENGINE: ${{ matrix.job.database == 'mtxdb' && 'mtxdb' || '' }}
-          SYNAPSE_TEST_EMBEDDED_DB_PATH: ${{ matrix.job.database == 'mtxdb' && '/tmp/synapse-embedded-db' || '' }}
+          SYNAPSE_TEST_EMBEDDED_DB_ENGINE: mtxdb
+          SYNAPSE_TEST_EMBEDDED_DB_PATH: /tmp/synapse-embedded-db
       - name: Dump PostgreSQL statistics
         if: ${{ always() && matrix.job.database == 'postgres' }}
         run: .ci/scripts/dump_postgres_stats.sh /tmp/postgres-stats.txt || true
