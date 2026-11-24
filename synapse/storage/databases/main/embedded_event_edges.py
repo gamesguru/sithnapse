@@ -160,9 +160,11 @@ def get_event_edges_forward_batch(
     with mirror_timing("event_edges_get_forward"):
         from synapse.synapse_rust.mtxdb_engine import adjacency_get_children
 
+        _et = time.monotonic()
         results = retry_on_contention(
             lambda: adjacency_get_children(prev_event_ids), label="event_edges"
         )
+        ffi_timing("ffi_event_edges_get_forward", time.monotonic() - _et)
         ffi_batch_size("event_edges_get_forward", len(prev_event_ids))
         return dict(results)
 
