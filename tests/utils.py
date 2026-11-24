@@ -343,6 +343,15 @@ def _drain_template_background_updates_postgres() -> None:
         reactor.advance(0.01)
     stc.successResultOf(d_sd)
 
+    # The drain homeserver is a one-off and does not go through
+    # `HomeserverTestCase.tearDown`, so release its embedded store here.
+    # Otherwise the first real test would find this root already open and
+    # (correctly) refuse to open its own.
+    if EMBEDDED_DB_ENGINE:
+        from synapse.synapse_rust import mtxdb_engine
+
+        mtxdb_engine.close_client()
+
 
 def setupdb() -> None:
     # If we're using PostgreSQL, set up the db once

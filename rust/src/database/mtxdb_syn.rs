@@ -148,6 +148,12 @@ static STATE_HAMT_ROOT_WRITE_LOCK: OnceCell<Mutex<()>> = OnceCell::new();
 /// itself -- see `check_pid_guard`.
 static OPENER_PID: Mutex<Option<u32>> = Mutex::new(None);
 
+/// Root directory `DBS` was opened from. The process-global slot is reused by
+/// successive homeservers in one process, so a second open with a different
+/// path must be rejected rather than silently serving the first root's data
+/// (state-group ids and event ids are keyed without a namespace).
+static OPENED_ROOT: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
 /// Raises if this process opened mtxdb read-only (or never opened it),
 /// before any mutating pyfunction touches a fd. See `WRITE_MODE`'s doc
 /// comment for why this must be the single choke point, not a per-caller
@@ -209,6 +215,34 @@ fn check_pid_guard() -> PyResult<bool> {
     }
 }
 
+/// Like [`check_pid_guard`], but also verifies that an already-open store was
+/// opened from `path`. Returns `Ok(true)` when the caller should short-circuit
+/// because this process already has exactly this root open; an `Err` when it is
+/// a different root, so a new homeserver cannot silently read and write the
+/// previous homeserver's store.
+fn check_already_open(path: &str) -> PyResult<bool> {
+    if !check_pid_guard()? {
+        return Ok(false);
+    }
+    let requested = std::path::PathBuf::from(path);
+    let opened = OPENED_ROOT
+        .lock()
+        .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("OPENED_ROOT lock poisoned"))?;
+    match opened.as_ref() {
+        Some(opened) if *opened == requested => Ok(true),
+        Some(opened) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "mtxdb is already open at {}; refusing to open {} in the same \
+             process. Call close_client() first (each homeserver needs its \
+             own root).",
+            opened.display(),
+            requested.display()
+        ))),
+        // Already open but the path was never recorded (only possible for a
+        // store opened before this guard existed): preserve the old no-op.
+        None => Ok(true),
+    }
+}
+
 /// Serialize all read-modify-write cycles through the embedded engine.
 /// The mtxdb `StorageEngine` trait has no atomic increment or transaction API,
 /// so we hold this across get→put_many for counters and auth-chain manifests.
@@ -218,6 +252,7 @@ pub(crate) static RMW_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 struct RepointTestHook {
+    event_id: String,
     staged: std::sync::mpsc::Sender<()>,
     resume: std::sync::mpsc::Receiver<()>,
 }
@@ -318,7 +353,7 @@ const RETRYABLE_READ_ERROR_PREFIX: &str = "__MTXDB_RETRYABLE_READ__: ";
 /// Journal/checkpoint contention: either mtxdb's dedicated `WouldBlock`
 /// variant (e.g. read-committed reload failed or checkpoint coverage
 /// advanced) or an I/O `WouldBlock`. Corruption is never contention.
-fn is_retryable_contention(error: &StorageError) -> bool {
+pub(crate) fn is_retryable_contention(error: &StorageError) -> bool {
     matches!(error, StorageError::WouldBlock(_))
         || matches!(
             error,
@@ -1359,6 +1394,21 @@ mod room_index {
                 )))
             }
         };
+        // Refuse an index written with the old 16-byte-prefix record width.
+        // Those files stride 28 bytes instead of `RECORD_LEN`, so the second
+        // record's magic would not sit at offset `RECORD_LEN`; reading or
+        // appending to them would return garbage prefixes or mix widths.
+        let length = file.metadata().map(|m| m.len()).unwrap_or(0);
+        if length >= (RECORD_LEN + INDEX_MAGIC.len()) as u64 {
+            let mut magic = [0u8; INDEX_MAGIC.len()];
+            if file.read_exact_at(&mut magic, RECORD_LEN as u64).is_ok() && magic != INDEX_MAGIC {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "room_index file {} was written with an incompatible record \
+                     layout; rebuild or migrate the index before opening this store",
+                    path.display()
+                )));
+            }
+        }
         let file = Arc::new(file);
         map.put(key, Arc::clone(&file));
         Ok(Some(file))
@@ -1550,19 +1600,40 @@ mod room_index {
         // unpredictable order. mtxdb-core's pack-shard sync sorts by `pack_id`
         // for exactly this reason.
         dirty.sort_unstable();
-        let guard = HANDLES
-            .lock()
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}")))?;
-        if let Some(map) = guard.as_ref() {
-            for shard in dirty {
-                if let Some(file) = map.peek(&(shard, true)) {
-                    file.sync_data().map_err(|e| {
-                        pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "room_index sync failed: {e}"
-                        ))
-                    })?;
-                }
+        // A dirty shard's writable handle may have been evicted from the LRU;
+        // reopen it rather than skipping, and keep the shard dirty on failure
+        // so a later sync retries it.
+        let mut failed: Option<(usize, String)> = None;
+        for (index, shard) in dirty.iter().copied().enumerate() {
+            let cached = HANDLES
+                .lock()
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}"))
+                })?
+                .as_mut()
+                .and_then(|map| map.peek(&(shard, true)).map(Arc::clone));
+            let result = match cached {
+                Some(file) => file.sync_data().map_err(|e| e.to_string()),
+                None => match cached_handle(shard, true) {
+                    Ok(Some(file)) => file.sync_data().map_err(|e| e.to_string()),
+                    Ok(None) => Ok(()),
+                    Err(e) => Err(e.to_string()),
+                },
+            };
+            if let Err(message) = result {
+                failed = Some((index, message));
+                break;
             }
+        }
+        if let Some((index, message)) = failed {
+            if let Ok(mut dirty_set) = DIRTY.lock() {
+                dirty_set
+                    .get_or_insert_with(Default::default)
+                    .extend(dirty[index..].iter().copied());
+            }
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "room_index sync failed: {message}"
+            )));
         }
         Ok(())
     }
@@ -1613,8 +1684,11 @@ mod room_index {
             );
 
             // A later write must open a separate writable handle, rather than
-            // reusing the read-only handle cached above.
-            put(&[(2_000_002, b"ROOM5JKL".to_vec())]).expect("write after read");
+            // reusing the read-only handle cached above. Use a distinct group
+            // in the same shard (`SHARD_COUNT` apart) so the write really does
+            // target the handle cached for the read.
+            put(&[(2_000_001 + i64::from(SHARD_COUNT), b"ROOM5JKL".to_vec())])
+                .expect("write after read");
         }
 
         #[test]
@@ -1623,16 +1697,19 @@ mod room_index {
 
             super::super::auth_chain_closure_tests::ensure_open();
 
-            // More records than one scan chunk in a single shard.
+            // More records than one scan chunk in a single shard. Step by the
+            // shard count so every group lands in the same shard instead of
+            // spreading the batch evenly across all 64.
             let base = 3_000_000i64;
             let total = (SCAN_CHUNK_RECORDS as i64) * 2 + 37;
-            for group in base..base + total {
-                put(&[(group, b"OLDPREFX".to_vec())]).expect("put");
+            let group_at = |index: i64| base + index * i64::from(SHARD_COUNT);
+            for index in 0..total {
+                put(&[(group_at(index), b"OLDPREFX".to_vec())]).expect("put");
             }
             // Newest write wins; a later all-zero record must not erase it.
-            put(&[(base + 7, b"NEWPREFX".to_vec())]).expect("overwrite");
-            put(&[(base + 8, b"KEEPPFX1".to_vec())]).expect("put");
-            put(&[(base + 8, Vec::new())]).expect("zero record");
+            put(&[(group_at(7), b"NEWPREFX".to_vec())]).expect("overwrite");
+            put(&[(group_at(8), b"KEEPPFX1".to_vec())]).expect("put");
+            put(&[(group_at(8), Vec::new())]).expect("zero record");
             // A torn trailing partial record is ignored.
             let path = index_path(shard_for(base), false).expect("path");
             OpenOptions::new()
@@ -1642,8 +1719,14 @@ mod room_index {
                 .expect("append torn tail");
 
             *PREFIX_CACHE.lock().expect("no poison") = None;
-            let got = get_many(&[base, base + 7, base + 8, base + total - 1, base + total + 5])
-                .expect("get");
+            let got = get_many(&[
+                group_at(0),
+                group_at(7),
+                group_at(8),
+                group_at(total - 1),
+                group_at(total + 5),
+            ])
+            .expect("get");
             assert_eq!(got[0], Some(b"OLDPREFX".to_vec()));
             assert_eq!(got[1], Some(b"NEWPREFX".to_vec()));
             assert_eq!(got[2], Some(b"KEEPPFX1".to_vec()));
@@ -2030,7 +2113,7 @@ fn synapse_pool_policies() -> mtxdb::PoolPolicies {
 #[pyfunction]
 pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
     py.detach(|| {
-        if check_pid_guard()? {
+        if check_already_open(&path)? {
             return Ok(());
         }
         // State pool holds HAMT nodes, roots, and state-group sidecars --
@@ -2095,6 +2178,9 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
             .lock()
             .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("OPENER_PID lock poisoned"))? =
             Some(std::process::id());
+        *OPENED_ROOT.lock().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err("OPENED_ROOT lock poisoned")
+        })? = Some(std::path::PathBuf::from(&path));
         *WRITE_MODE
             .lock()
             .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("WRITE_MODE lock poisoned"))? =
@@ -2125,7 +2211,7 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
 #[pyfunction]
 pub fn open_client_read_only(py: Python<'_>, path: String) -> PyResult<()> {
     py.detach(|| {
-        if check_pid_guard()? {
+        if check_already_open(&path)? {
             return Ok(());
         }
         let layout = DatabaseLayout::open(std::path::PathBuf::from(&path)).map_err(|e| {
@@ -2223,6 +2309,10 @@ pub fn open_client_read_only(py: Python<'_>, path: String) -> PyResult<()> {
             .lock()
             .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("OPENER_PID lock poisoned"))? =
             Some(std::process::id());
+        *OPENED_ROOT
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("OPENED_ROOT lock poisoned"))? =
+            Some(std::path::PathBuf::from(&path));
         *WRITE_MODE
             .lock()
             .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("WRITE_MODE lock poisoned"))? =
@@ -2246,13 +2336,16 @@ pub fn open_client_read_only(py: Python<'_>, path: String) -> PyResult<()> {
 /// Production never closes a store mid-process.
 ///
 /// Fails loudly rather than detaching state: if any cloned pool handle is
-/// still alive (a reader or writer in flight), the store is left open and the
-/// call raises. This counts `Arc<MtxdbPools>` clones, so a room-index `File`
-/// clone held directly by a thread is not covered -- test teardown is the only
-/// caller, so that is acceptable. Syncs every pool first, so a successful
-/// close implies the data is durable. Also drops the room-index handle/prefix
-/// caches, which are keyed by shard only and would otherwise keep pointing at
-/// the old root's files.
+/// still alive (a reader or writer in flight), or a transaction/reader still
+/// retains its own `Arc<Database>`, the store is left open and the call
+/// raises. This counts both `Arc<MtxdbPools>` clones and the shared
+/// `Arc<Database>` (transactions pin that so they can outlive the borrow that
+/// created them). A room-index `File` clone held directly by a thread is still
+/// not covered -- test teardown is the only caller, so that is acceptable.
+/// Syncs every pool and the room index first, so a successful close implies
+/// the data is durable. Also drops the room-index handle/prefix caches, which
+/// are keyed by shard only and would otherwise keep pointing at the old root's
+/// files.
 #[pyfunction]
 pub fn close_client(py: Python<'_>) -> PyResult<()> {
     py.detach(|| {
@@ -2269,6 +2362,19 @@ pub fn close_client(py: Python<'_>) -> PyResult<()> {
                  refusing to close while readers or writers are in flight"
             )));
         }
+        // A Python `MtxdbTransaction` (and a checked-out read graph) keeps its
+        // own clone of the shared `Database`, so the pools count above does
+        // not see it. Refuse to detach the store while one is still live.
+        if let Some(database) = pools.shared_database.as_ref() {
+            let database_live = Arc::strong_count(database);
+            if database_live != 1 {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "mtxdb close_client: {database_live} live database handles \
+                     remain; refusing to close while transactions or readers \
+                     are in flight"
+                )));
+            }
+        }
         for (name, store) in [
             ("state", &pools.state),
             ("event_dag", &pools.event_dag),
@@ -2276,6 +2382,9 @@ pub fn close_client(py: Python<'_>) -> PyResult<()> {
         ] {
             sync_one(name, store)?;
         }
+        // Flush the room index before reset() forgets its dirty shards; a
+        // failure leaves the store open so close can be retried.
+        room_index::sync()?;
         // Dropping the last reference releases the writer lock and fds.
         *guard = None;
         drop(guard);
@@ -2287,6 +2396,9 @@ pub fn close_client(py: Python<'_>) -> PyResult<()> {
             .lock()
             .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("OPENER_PID lock poisoned"))? =
             None;
+        *OPENED_ROOT.lock().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err("OPENED_ROOT lock poisoned")
+        })? = None;
         *ROOM_INDEX_DIR.lock().map_err(|_| {
             pyo3::exceptions::PyRuntimeError::new_err("ROOM_INDEX_DIR lock poisoned")
         })? = None;
@@ -3820,10 +3932,19 @@ pub fn repoint_event_state_group(
 
             #[cfg(test)]
             if attempt == 0 {
-                let hook = REPOINT_TEST_HOOK
-                    .lock()
-                    .ok()
-                    .and_then(|mut hook| hook.take());
+                // Only consume a hook meant for this event: concurrent or
+                // unrelated repoints must not swallow the test's rendezvous.
+                let hook = {
+                    let mut guard = REPOINT_TEST_HOOK.lock().ok();
+                    let matches = guard.as_ref().is_some_and(|slot| {
+                        slot.as_ref().is_some_and(|hook| hook.event_id == event_id)
+                    });
+                    if matches {
+                        guard.as_mut().and_then(|slot| slot.take())
+                    } else {
+                        None
+                    }
+                };
                 if let Some(hook) = hook {
                     // Channels, not barriers: if the test side is gone, neither
                     // call can block forever.
@@ -5140,6 +5261,7 @@ pub(crate) mod auth_chain_closure_tests {
         let (staged_tx, staged_rx) = std::sync::mpsc::channel::<()>();
         let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
         *REPOINT_TEST_HOOK.lock().expect("test hook lock") = Some(RepointTestHook {
+            event_id: event_id.to_owned(),
             staged: staged_tx,
             resume: resume_rx,
         });

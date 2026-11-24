@@ -440,6 +440,14 @@ class RedactionTestCase(unittest.HomeserverTestCase):
         persist_store._embedded_event_json_enabled = True
         persist_store._embedded_db_engine = "mtxdb"
 
+        # `prepare` created `self.room1` in the harness root that was just
+        # replaced by `tmpdir`. Recreate it in the store this test reads, so
+        # its create event and HAMT roots do not come from the old root.
+        self.room1 = RoomID.from_string("!expire-embedded:test")
+        self.get_success(
+            create_room(self.hs, self.room1.to_string(), self.u_alice.to_string())
+        )
+
         self.inject_room_member(self.room1, self.u_alice, Membership.JOIN)
         msg_event = self.inject_message(self.room1, self.u_alice, "t")
 

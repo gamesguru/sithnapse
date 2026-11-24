@@ -25,7 +25,7 @@ use pyo3::prelude::*;
 
 use super::mtxdb_syn::{
     csr_reader, csr_writer, event_dag_room_id, event_locator_collection_id, event_node_id,
-    map_read_storage_error, state_db,
+    is_retryable_contention, map_read_storage_error, state_db,
 };
 
 /// One event's adjacency row as the caller supplies it.
@@ -100,9 +100,12 @@ pub fn adjacency_put(py: Python<'_>, rows: Vec<PutRow>) -> PyResult<()> {
             adjacency_for(&room_collection)
                 .record_events(&database, &records)
                 .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "mtxdb adjacency record error: {e}"
-                    ))
+                    let message = format!("mtxdb adjacency record error: {e}");
+                    if is_retryable_contention(&e) {
+                        pyo3::exceptions::PyBlockingIOError::new_err(message)
+                    } else {
+                        pyo3::exceptions::PyRuntimeError::new_err(message)
+                    }
                 })?;
             // Locators for the event and every event it references, so reads
             // can find the room even where a parent's body is still missing.

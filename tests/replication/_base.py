@@ -45,7 +45,7 @@ from synapse.util.clock import Clock
 from synapse.util.duration import Duration
 
 from tests import unittest
-from tests.server import FakeTransport
+from tests.server import FakeTransport, ThreadedMemoryReactorClock
 from tests.utils import USE_POSTGRES_FOR_TESTS
 
 hiredis: Any = None
@@ -278,9 +278,37 @@ class BaseMultiWorkerStreamTestCase(unittest.HomeserverTestCase):
         base = super().default_config()
         base["redis"] = {"enabled": True}
         base["instance_map"] = {"main": {"host": "testserv", "port": 8765}}
+        # `setUp` opens `_shared_embedded_path` before `prepare()` runs, because
+        # `prepare()` persists events and event adjacency has no SQL fallback.
+        # Point the main homeserver at that same root instead of the per-
+        # homeserver uuid root `super().default_config()` chose; a second,
+        # different root cannot be opened in one process.
+        shared_path = getattr(self, "_shared_embedded_path", None)
+        if shared_path is not None and "embedded_db" in base:
+            base["embedded_db"] = {**base["embedded_db"], "path": shared_path}
         return base
 
+    def make_homeserver(
+        self, reactor: ThreadedMemoryReactorClock, clock: Clock
+    ) -> HomeServer:
+        hs = super().make_homeserver(reactor, clock)
+        # `prepare()` runs right after this returns and creates rooms, so the
+        # edge backend must already be writable when it does.
+        self._enable_embedded_edges(hs)
+        return hs
+
     def setUp(self) -> None:
+        # Worker-shaped configs cannot carry `embedded_db` (WorkerConfig rejects
+        # it in production), yet `prepare()` runs inside `super().setUp()` and
+        # persists events, which need a CSR store. Event adjacency has no SQL
+        # fallback, so open one shared in-process root first; these fake
+        # workers share this process and so share the global client.
+        from synapse.synapse_rust import mtxdb_engine
+
+        self._shared_embedded_path = tempfile.mkdtemp(prefix="test-multiworker-mtxdb-")
+        self.addCleanup(shutil.rmtree, self._shared_embedded_path, ignore_errors=True)
+        mtxdb_engine.open_client(self._shared_embedded_path)
+
         super().setUp()
 
         # Worker homeservers created via `make_worker_hs` are otherwise only
@@ -295,24 +323,6 @@ class BaseMultiWorkerStreamTestCase(unittest.HomeserverTestCase):
         # object -- see tests/app/test_homeserver_shutdown.py, which relies
         # on nothing but a weakref keeping it alive past explicit shutdown.
         self._worker_homeservers: list[HomeServer] = []
-
-        # Worker-shaped configs (sharded event writers plus an instance_map)
-        # cannot carry `embedded_db`: WorkerConfig rejects it in production,
-        # and `make_homeserver_config_obj` therefore drops it here. Event
-        # adjacency has no SQL fallback, so tests that persist events still
-        # need a CSR store. If the main homeserver already opened its
-        # configured store (the normal case), leave it alone -- prepare() may
-        # already have written into it. Otherwise open one shared in-process
-        # root; these fake workers share this process and so share the global
-        # client. Then mark their edge stores writable.
-        from synapse.synapse_rust import mtxdb_engine
-
-        embedded_path = self.hs.config.database.embedded_db_path
-        if not embedded_path:
-            embedded_path = tempfile.mkdtemp(prefix="test-multiworker-mtxdb-")
-            self.addCleanup(shutil.rmtree, embedded_path, ignore_errors=True)
-            mtxdb_engine.open_client(embedded_path)
-        self._enable_embedded_edges(self.hs)
 
         # build a replication server
         self.streamer = self.hs.get_replication_streamer()

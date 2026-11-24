@@ -269,9 +269,11 @@ async def migrate_auth_chain_edges(
                 "SELECT DISTINCT ea.auth_id FROM event_auth AS ea "
                 "WHERE ea.room_id = ? "
                 "AND NOT EXISTS (SELECT 1 FROM state_events AS se "
-                "                WHERE se.event_id = ea.auth_id) "
+                "                WHERE se.event_id = ea.auth_id "
+                "                AND se.room_id = ea.room_id) "
                 "AND NOT EXISTS (SELECT 1 FROM event_auth AS e2 "
-                "                WHERE e2.event_id = ea.auth_id) "
+                "                WHERE e2.event_id = ea.auth_id "
+                "                AND e2.room_id = ea.room_id) "
                 "LIMIT 5",
                 (room_id,),
             )

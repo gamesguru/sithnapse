@@ -2712,15 +2712,15 @@ class EventsWorkerStore(SQLBaseStore):
             if not children:
                 return True
             # The forward index can name children that have no committed
-            # row in `events`; only a committed, non-rejected child
-            # suppresses the gap.
+            # row in `events`; only a committed, non-outlier, non-rejected
+            # child suppresses the gap.
             clause, args = make_in_list_sql_clause(
                 self.database_engine, "e.event_id", children
             )
             txn.execute(
                 "SELECT 1 FROM events AS e "
                 "LEFT JOIN rejections AS r ON r.event_id = e.event_id "
-                f"WHERE r.event_id IS NULL AND {clause} LIMIT 1",
+                f"WHERE r.event_id IS NULL AND NOT e.outlier AND {clause} LIMIT 1",
                 args,
             )
             if txn.fetchone():

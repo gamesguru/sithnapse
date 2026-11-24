@@ -2102,6 +2102,12 @@ properties:
       configuration error.
 
 
+      Databases that still hold event edges only in SQL must have them migrated
+      into mtxdb before upgrading to this schema version; the server has no SQL
+      fallback, so skipping the migration leaves existing rooms without event
+      adjacency.
+
+
       Worker deployments have extra requirements: the sole events writer must be
       `main`, only one events writer is allowed, `run_background_tasks_on` must
       be unset or select `main`, and the `SYNAPSE_MTXDB_WAL=1`

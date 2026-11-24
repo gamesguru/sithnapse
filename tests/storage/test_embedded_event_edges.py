@@ -279,6 +279,18 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         login.register_servlets,
     ]
 
+    def default_config(self) -> dict[str, Any]:
+        config = super().default_config()
+        # `setUp` opens this module's fixed root before the homeserver is
+        # built. Point the homeserver at the same root: an already-open store
+        # refuses to be reopened at a different path in one process.
+        if "embedded_db" in config:
+            config["embedded_db"] = {
+                **config["embedded_db"],
+                "path": _TEST_ENGINE_TMPDIR,
+            }
+        return config
+
     def setUp(self) -> None:
         # This class forces the embedded path on after construction, so point
         # the client at this module's root before the homeserver is built (it

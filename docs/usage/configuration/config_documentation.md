@@ -1648,6 +1648,8 @@ databases:
 
 *(object)* Configures the embedded `mtxdb` storage engine, which holds event JSON, state groups and event edges outside the SQL database. This is required: event adjacency has no SQL fallback, so the server refuses to start without it. Both `engine` and `path` must be set; setting only one is a configuration error.
 
+Databases that still hold event edges only in SQL must have them migrated into mtxdb before upgrading to this schema version; the server has no SQL fallback, so skipping the migration leaves existing rooms without event adjacency.
+
 Worker deployments have extra requirements: the sole events writer must be `main`, only one events writer is allowed, `run_background_tasks_on` must be unset or select `main`, and the `SYNAPSE_MTXDB_WAL=1` environment variable must be set.
 
 Environment variables override these options: `SYNAPSE_EMBEDDED_DB_ENGINE`, `SYNAPSE_EMBEDDED_DB_PATH`, `SYNAPSE_MTXDB_SYNC`, `SYNAPSE_MTXDB_NO_SYNC` (a false value does not override `no_sync: true` in YAML; only a truthy value is applied) and `SYNAPSE_MTXDB_FLUSH_DELAY_SECS`. Setting `SYNAPSE_MTXDB=1` together with `SYNAPSE_MTXDB_PATH` (or `embedded_db.path`) is a shortcut that selects the `mtxdb` engine.

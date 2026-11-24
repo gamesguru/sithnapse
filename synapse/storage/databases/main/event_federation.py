@@ -415,7 +415,7 @@ class EventFederationWorkerStore(
         if include_given:
             result_short_ids.update(short_ids)
 
-        result: set[str] = set(unembedded) if include_given else set()
+        result: set[str] = set(initial_events) if include_given else set()
         if not result_short_ids:
             return result
 

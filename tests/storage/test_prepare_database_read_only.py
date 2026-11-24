@@ -20,8 +20,12 @@ from synapse.util.clock import Clock
 
 from tests.unittest import HomeserverTestCase
 
-# Must be at the current `SCHEMA_VERSION`: older deltas are not re-checked once
-# the schema version has advanced past them (see `_get_or_create_schema_state`).
+# Must be at the current `SCHEMA_VERSION`. A database created from a full
+# schema records `upgraded = 0`, which makes `_upgrade_existing_database` start
+# its delta loop at `current_version + 1`, so even the current version's deltas
+# are not checked. Marking the fixture as delta-upgraded (in the test below)
+# makes the loop include the current version, where the missing delta must be
+# detected.
 _DELTA = "97/09_retire_sql_event_edges.sql"
 
 
@@ -52,6 +56,11 @@ class ReadOnlyPrepareDatabaseTests(HomeserverTestCase):
             ")",
             (version, _DELTA, _DELTA),
         )
+        self.db_conn.commit()
+
+    def _set_upgraded(self, upgraded: bool) -> None:
+        cur = self.db_conn.cursor()
+        cur.execute("UPDATE schema_version SET upgraded = ?", (upgraded,))
         self.db_conn.commit()
 
     def _remove_background_update(self, update_name: str) -> None:
@@ -97,6 +106,12 @@ class ReadOnlyPrepareDatabaseTests(HomeserverTestCase):
             )
 
     def test_pending_delta_is_refused_not_applied(self) -> None:
+        # Simulate a database that reached the current version by applying
+        # deltas, so `_upgrade_existing_database` checks the current version's
+        # deltas instead of skipping them (`upgraded = 0` would start at
+        # `SCHEMA_VERSION + 1`).
+        self._set_upgraded(True)
+        self.addCleanup(self._set_upgraded, False)
         self._forget_delta()
         self.addCleanup(self._restore_delta)
         self.assertFalse(self._delta_applied())
