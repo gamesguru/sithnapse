@@ -1797,65 +1797,13 @@ impl NodeStore for MtxdbStore {
 }
 
 // -----------------------------------------------------------------------------
-// Auth Chain Manifests
-// -----------------------------------------------------------------------------
-
-fn namespace_room_id(namespace: &str) -> [u8; 16] {
-    let hash = Sha256::digest(namespace.as_bytes());
-    let mut room_id = [0u8; 16];
-    room_id.copy_from_slice(&hash[..16]);
-    room_id
-}
-
-fn chain_node_id(chain_id: i64) -> [u8; 16] {
-    let hash = Sha256::digest(chain_id.to_be_bytes());
-    let mut node_id = [0u8; 16];
-    node_id.copy_from_slice(&hash[..16]);
-    node_id
-}
-
-fn serialize_manifest(edges: &[(i64, i64, i64)]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(4 + edges.len() * 24);
-    buf.extend_from_slice(&(edges.len() as u32).to_be_bytes());
-    for &(o_seq, t_chain, t_seq) in edges {
-        buf.extend_from_slice(&o_seq.to_be_bytes());
-        buf.extend_from_slice(&t_chain.to_be_bytes());
-        buf.extend_from_slice(&t_seq.to_be_bytes());
-    }
-    buf
-}
-
-fn deserialize_manifest(bytes: &[u8]) -> Vec<(i64, i64, i64)> {
-    if bytes.len() < 4 {
-        return Vec::new();
-    }
-    let count = u32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize;
-    let mut edges = Vec::with_capacity(count);
-    let mut offset = 4;
-    for _ in 0..count {
-        if offset + 24 > bytes.len() {
-            break;
-        }
-        let o_seq = i64::from_be_bytes(bytes[offset..offset + 8].try_into().unwrap());
-        let t_chain = i64::from_be_bytes(bytes[offset + 8..offset + 16].try_into().unwrap());
-        let t_seq = i64::from_be_bytes(bytes[offset + 16..offset + 24].try_into().unwrap());
-        edges.push((o_seq, t_chain, t_seq));
-        offset += 24;
-    }
-    edges
-}
-
-// -----------------------------------------------------------------------------
 // Auth Chain Closures (short event ids + direct auth edges)
 // -----------------------------------------------------------------------------
 //
 // See docs/docs/auth-chain-closures-plan.md (mdb repo) for the full design.
 // Every key family here lives in one mtxdb collection derived from
-// `(namespace, room_id)` -- unlike `namespace_room_id` above (which is
-// namespace-only and shared by every room in that namespace via the
-// chain_id-keyed auth-chain-links manifest), this feature needs a real
-// per-room collection so `auth_chain_purge_room` can drop exactly one
-// room's data with a single `delete_collection` call.
+// the room's group identity, so `auth_chain_purge_room` can drop exactly
+// one room's data with a single `delete_collection` call.
 
 /// A room-scoped collection id for the short-id/edge closure skeleton,
 /// derived as the member collection with the `AUTH` tag under the room's group identity.
@@ -2379,149 +2327,6 @@ pub fn put_state_hamt_nodes(
     Ok(())
 }
 
-pub type AuthChainLinksForChain = (i64, Vec<(i64, i64, i64)>);
-
-#[pyfunction]
-pub fn get_auth_chain_links_batch(
-    py: Python<'_>,
-    namespace: String,
-    chain_ids: Vec<i64>,
-) -> PyResult<Vec<AuthChainLinksForChain>> {
-    py.detach(|| {
-        let engine = state_db()?;
-        let room_id = namespace_room_id(&namespace);
-        let node_ids: Vec<NodeId> = chain_ids.iter().map(|&c| chain_node_id(c)).collect();
-
-        // Read-only workers hold an open-time collection index; refresh on a
-        // miss so auth-chain links the writer appended after this worker
-        // opened are visible (same pattern as `auth_chain_edges_get`).
-        let results = engine
-            .get_read_committed(&room_id, &node_ids)
-            .map_err(map_read_storage_error)?;
-
-        let mut out = Vec::with_capacity(node_ids.len());
-        for (chain_id, res) in chain_ids.into_iter().zip(results) {
-            if let Some(data) = res {
-                let edges = deserialize_manifest(&data.bytes);
-                if !edges.is_empty() {
-                    out.push((chain_id, edges));
-                }
-            }
-        }
-        Ok(out)
-    })
-}
-
-#[pyfunction]
-pub fn put_auth_chain_links_batch(
-    namespace: String,
-    links: Vec<(i64, i64, i64, i64)>,
-) -> PyResult<()> {
-    assert_writable()?;
-    Python::attach(|py| {
-        py.detach(|| {
-            // Acquire the RMW lock after releasing the GIL. The lock remains held for
-            // the whole read-modify-write operation, but must not be captured by the
-            // Ungil closure (MutexGuard is !Send).
-            let _guard = RMW_LOCK.lock().map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}"))
-            })?;
-            let engine = state_db()?;
-            let room_id = namespace_room_id(&namespace);
-
-            let mut grouped: HashMap<i64, Vec<(i64, i64, i64)>> = HashMap::new();
-            for (o_chain, o_seq, t_chain, t_seq) in links {
-                grouped
-                    .entry(o_chain)
-                    .or_default()
-                    .push((o_seq, t_chain, t_seq));
-            }
-
-            let mut pairs_to_put = Vec::with_capacity(grouped.len());
-
-            for (chain_id, new_edges) in grouped {
-                let node_id = chain_node_id(chain_id);
-                let mut edges = match engine.get(&room_id, &node_id) {
-                    Ok(Some(data)) => deserialize_manifest(&data.bytes),
-                    Ok(None) => Vec::new(),
-                    Err(e) => {
-                        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "mtxdb get error reading chain {chain_id}: {e}"
-                        )))
-                    }
-                };
-                // Dedup against what's already stored: a retried caller (e.g. a
-                // retried persist_events transaction, or a re-run background
-                // migration batch) recomputes the same edges and calls this again
-                // -- these writes aren't part of the SQL transaction's rollback,
-                // so a retry after a partial success would otherwise duplicate
-                // edges here forever. Existing edges are deduped first so an edge
-                // already present twice from before this fix existed collapses
-                // down rather than being preserved.
-                let mut seen: HashSet<(i64, i64, i64)> = HashSet::with_capacity(edges.len());
-                edges.retain(|edge| seen.insert(*edge));
-                for edge in new_edges {
-                    if seen.insert(edge) {
-                        edges.push(edge);
-                    }
-                }
-                let bytes = serialize_manifest(&edges);
-                pairs_to_put.push((node_id, NodeData::new(bytes::Bytes::from(bytes))));
-            }
-
-            engine.put_many(&room_id, &pairs_to_put).map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {e}"))
-            })?;
-            Ok(())
-        })
-    })
-}
-
-#[pyfunction]
-pub fn delete_auth_chain_links_batch(namespace: String, pairs: Vec<(i64, i64)>) -> PyResult<()> {
-    assert_writable()?;
-    Python::attach(|py| {
-        py.detach(|| {
-            let _guard = RMW_LOCK.lock().map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}"))
-            })?;
-            let engine = state_db()?;
-            let room_id = namespace_room_id(&namespace);
-
-            let mut grouped: HashMap<i64, HashSet<i64>> = HashMap::new();
-            for (o_chain, o_seq) in pairs {
-                grouped.entry(o_chain).or_default().insert(o_seq);
-            }
-
-            let mut pairs_to_put = Vec::with_capacity(grouped.len());
-
-            for (chain_id, seqs_to_delete) in grouped {
-                let node_id = chain_node_id(chain_id);
-                let data = engine.get(&room_id, &node_id).map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb get error: {e}"))
-                })?;
-                if let Some(data) = data {
-                    let edges = deserialize_manifest(&data.bytes);
-                    let filtered: Vec<_> = edges
-                        .into_iter()
-                        .filter(|(seq, _, _)| !seqs_to_delete.contains(seq))
-                        .collect();
-
-                    let bytes = serialize_manifest(&filtered);
-                    pairs_to_put.push((node_id, NodeData::new(bytes::Bytes::from(bytes))));
-                }
-            }
-
-            if !pairs_to_put.is_empty() {
-                engine.put_many(&room_id, &pairs_to_put).map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {e}"))
-                })?;
-            }
-            Ok(())
-        })
-    })
-}
-
 /// Room-scoped: for each `event_id`, returns its `u32` short id, allocating
 /// one if it doesn't exist yet. See plan §0(1) for the recovery protocol
 /// this implements -- the counter, forward mapping, and reverse mapping
@@ -2857,8 +2662,7 @@ pub fn auth_chain_children_get(
 /// [new_child_short_id, ...])`. Unlike `auth_chain_edges_put` (one
 /// full overwrite per event, written once), a parent's child list grows
 /// incrementally as new children are persisted over the room's lifetime,
-/// so this must read-modify-write and dedupe -- the same shape as
-/// `put_auth_chain_links_batch`'s existing dedup-on-append pattern.
+/// so this must read-modify-write and dedupe.
 #[pyfunction]
 pub fn auth_chain_children_append(
     namespace: String,
@@ -4872,9 +4676,6 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(open_client_read_only, m)?)?;
     m.add_function(wrap_pyfunction!(put_state_hamt_nodes, m)?)?;
     m.add_function(wrap_pyfunction!(get_state_hamt_nodes_batch, m)?)?;
-    m.add_function(wrap_pyfunction!(get_auth_chain_links_batch, m)?)?;
-    m.add_function(wrap_pyfunction!(put_auth_chain_links_batch, m)?)?;
-    m.add_function(wrap_pyfunction!(delete_auth_chain_links_batch, m)?)?;
     m.add_function(wrap_pyfunction!(get_or_create_short_ids, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_event_ids_to_short_ids, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_short_ids_to_event_ids, m)?)?;
@@ -4972,7 +4773,6 @@ pub(crate) mod auth_chain_closure_tests {
         let state = member_collection_id(*b"STAT", &group);
         let auth = member_collection_id(*b"AUTH", &group);
         let prev = member_collection_id(*b"PREV", &group);
-        let manifest = namespace_room_id(namespace);
 
         assert_eq!(state, state_hamt_room_id(room));
         assert_eq!(auth, auth_chain_closure_room_id(namespace, room));
@@ -4981,11 +4781,6 @@ pub(crate) mod auth_chain_closure_tests {
         assert_ne!(auth, state, "AUTH must not reuse the STAT tag");
         assert_ne!(prev, state, "PREV must not reuse the STAT tag");
         assert_ne!(auth, prev, "AUTH must not reuse the PREV tag");
-        // The chain-links manifest collection is namespace-scoped, not
-        // room-scoped, but it shares the pool too.
-        assert_ne!(manifest, state);
-        assert_ne!(manifest, auth);
-        assert_ne!(manifest, prev);
     }
 
     fn test_root_value(room_id: &str, root_byte: u8, lattice_byte: u8) -> Vec<u8> {

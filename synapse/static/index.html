@@ -539,14 +539,10 @@
 
         <div class="telemetry-card">
           <span class="telemetry-label">Matrix Protocol</span>
-          <span class="telemetry-pair">
-            <span class="telemetry-value" id="stat-spec">--</span>
-            <span class="telemetry-sub">CLIENT-SERVER</span>
-          </span>
-          <span class="telemetry-pair">
-            <span class="telemetry-value" id="stat-engine">--</span>
-            <span class="telemetry-sub">SITHNAPSE</span>
-          </span>
+          <span class="telemetry-value" id="stat-spec">...</span>
+          <span class="telemetry-sub" id="stat-engine-sub"
+            >SITHNAPSE VERSION</span
+          >
         </div>
       </section>
 
@@ -766,15 +762,10 @@
 
       function renderServerVersion(version) {
         if (typeof version !== "string" || !version.trim()) return;
-        // Federation reports e.g. "1.163.0 (b=branch,commit=abc)" or
-        // "Synapse/1.163.0"; keep only the version token.
-        const cleanVersion = version
-          .trim()
-          .split(/\s+/)[0]
-          .replace(/^Synapse\//, "")
-          .replace(/^v/, "");
-        const versionEl = document.getElementById("stat-engine");
-        if (versionEl) versionEl.textContent = `v${cleanVersion}`;
+        const cleanVersion = version.trim().replace(/^Synapse\//, "");
+        const versionEl = document.getElementById("stat-engine-sub");
+        if (versionEl)
+          versionEl.textContent = `Sithnapse v${cleanVersion.replace(/^v/, "")}`;
       }
 
       async function measureTelemetry() {
@@ -946,7 +937,6 @@
           ["stat-mtxdb-index", "--"],
           ["stat-memory", "--"],
           ["stat-spec", "--"],
-          ["stat-engine", "--"],
         ]) {
           const el = document.getElementById(id);
           if (el && el.textContent === "...") el.textContent = fallback;
