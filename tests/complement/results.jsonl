@@ -743,6 +743,7 @@
 {"Action":"pass","Test":"TestPublicRooms/Name/topic_keys_are_correct/Creating_room_with_alias_publicroomalias_with_name"}
 {"Action":"pass","Test":"TestPublicRooms/Name/topic_keys_are_correct/Creating_room_with_alias_publicroomalias_with_name_topic"}
 {"Action":"pass","Test":"TestPublicRooms/Name/topic_keys_are_correct/Creating_room_with_alias_publicroomalias_with_topic"}
+{"Action":"pass","Test":"TestPulledHistoryDoesNotRefetchUnverifiableStateEvent"}
 {"Action":"pass","Test":"TestPushRuleCacheHealth"}
 {"Action":"pass","Test":"TestPushRuleRoomUpgrade"}
 {"Action":"pass","Test":"TestPushRuleRoomUpgrade/parallel"}
