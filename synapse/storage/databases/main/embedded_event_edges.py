@@ -74,17 +74,18 @@ def put_event_edges_batch(
     rows: Iterable[EdgeRow],
     *,
     sync: bool = False,
+    durable: bool = True,
     transaction: "MtxdbTransaction | None" = None,
 ) -> None:
     """Record `prev_events` adjacency for a batch of events.
 
     `rows`: `(room_id, event_id, prev_event_id)`.
 
-    Called from event persistence before the SQL COMMIT, so a committed event
-    always has its adjacency. `transaction` is accepted for call-site
-    compatibility and ignored: the CSR append is durable in its own right, and
-    the only failure mode it introduces is orphan rows for an event whose SQL
-    row never commits, which every reader filters out.
+    Called from event persistence before the SQL COMMIT. `transaction` is
+    accepted for call-site compatibility and ignored: the CSR append is
+    independent of the SQL transaction, and the only failure mode it
+    introduces is orphan rows for an event whose SQL row never commits, which
+    every reader filters out. `durable=False` is for disposable stores only.
 
     `sync` issues an immediate EVENT_DAG barrier after the write.
     """
@@ -107,7 +108,9 @@ def put_event_edges_batch(
         from synapse.synapse_rust.mtxdb_engine import adjacency_put
 
         _et = time.monotonic()
-        retry_on_contention(lambda: adjacency_put(put_rows), label="event_edges")
+        retry_on_contention(
+            lambda: adjacency_put(put_rows, durable=durable), label="event_edges"
+        )
         elapsed = time.monotonic() - _et
         ffi_timing("ffi_event_edges_put", elapsed)
         ffi_count("event_edges_put_rows", len(put_rows))

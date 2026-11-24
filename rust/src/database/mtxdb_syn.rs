@@ -5,6 +5,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use mtxdb::csr_adjacency::sync_all_tails;
 use mtxdb::short_id::{GraphReader, ReadOnlyGraph};
 use mtxdb::storage::{DigestAlgorithm, StorageError};
 use mtxdb::{
@@ -273,6 +274,15 @@ static REFCOUNT_EXISTING: AtomicU64 = AtomicU64::new(0);
 /// can still publish into a store whose caches and directory registration are
 /// gone.
 static ACTIVE_TRANSACTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether a deferred adjacency append has left a tail unsynced since the last
+/// explicit flush. Lets production syncs skip `sync_all_tails` entirely when
+/// every append took the durable path.
+static ADJACENCY_TAIL_DIRTY: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn mark_adjacency_tail_dirty() {
+    ADJACENCY_TAIL_DIRTY.store(true, Ordering::SeqCst);
+}
 
 fn pools() -> PyResult<Arc<MtxdbPools>> {
     DBS.lock()
@@ -2393,6 +2403,10 @@ pub fn close_client(py: Python<'_>, durable: bool) -> PyResult<()> {
             ] {
                 sync_one(name, store)?;
             }
+            // Deferred adjacency appends are not covered by a pool sync.
+            if let Some(database) = pools.shared_database.as_ref() {
+                sync_adjacency_tails(database.as_ref())?;
+            }
             // Flush the room index before reset() forgets its dirty shards; a
             // failure leaves the store open so close can be retried.
             room_index::sync()?;
@@ -4144,6 +4158,9 @@ pub fn sync(py: Python<'_>) -> PyResult<()> {
         for (name, engine) in [("state", state_db()?), ("event-dag", event_dag_db()?)] {
             sync_one(name, &engine)?;
         }
+        // Deferred adjacency appends are separate from the pool sync above.
+        let adjacency_database = csr_writer()?;
+        sync_adjacency_tails(adjacency_database.as_ref())?;
         room_index::sync()?;
         Ok(())
     })
@@ -4161,6 +4178,8 @@ pub fn sync_state(py: Python<'_>) -> PyResult<()> {
     py.detach(|| {
         let state = state_db()?;
         sync_one("state", &state)?;
+        let adjacency_database = csr_writer()?;
+        sync_adjacency_tails(adjacency_database.as_ref())?;
         room_index::sync()
     })
 }
@@ -4319,6 +4338,25 @@ pub fn wait_durable(py: Python<'_>, targets: Vec<u64>) -> PyResult<()> {
         }
         Ok(())
     })
+}
+
+/// Flush deferred CSR adjacency tails.
+///
+/// `adjacency_put(durable=false)` leaves its appended rows in the page cache,
+/// so every explicit sync/durable close must flush them before it claims the
+/// event store is durable.
+fn sync_adjacency_tails(database: &Database) -> PyResult<()> {
+    if !ADJACENCY_TAIL_DIRTY.swap(false, Ordering::SeqCst) {
+        return Ok(());
+    }
+    if let Err(error) = sync_all_tails(database) {
+        // Leave the flag set so the next sync retries the flush.
+        ADJACENCY_TAIL_DIRTY.store(true, Ordering::SeqCst);
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "mtxdb adjacency tail sync error: {error}"
+        )));
+    }
+    Ok(())
 }
 
 fn sync_one(name: &str, engine: &PackfileStorage) -> PyResult<()> {

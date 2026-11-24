@@ -18,14 +18,14 @@
 
 use std::collections::HashMap;
 
-use mtxdb::csr_adjacency::{CsrAdjacency, EventRecord};
+use mtxdb::csr_adjacency::{AppendDurability, CsrAdjacency, EventRecord};
 use mtxdb::short_id::GraphReader;
 use mtxdb::{NodeData, NodeId, StorageEngine};
 use pyo3::prelude::*;
 
 use super::mtxdb_syn::{
     csr_reader, csr_writer, event_dag_room_id, event_locator_collection_id, event_node_id,
-    is_retryable_contention, map_read_storage_error, state_db,
+    is_retryable_contention, map_read_storage_error, mark_adjacency_tail_dirty, state_db,
 };
 
 /// One event's adjacency row as the caller supplies it.
@@ -69,7 +69,8 @@ fn resolve_rooms(event_ids: &[String]) -> PyResult<Vec<Option<[u8; 16]>>> {
 /// Rows are `(room_id, event_id, prev_event_ids, auth_event_ids)`; a repeated
 /// identical row is a no-op.
 #[pyfunction]
-pub fn adjacency_put(py: Python<'_>, rows: Vec<PutRow>) -> PyResult<()> {
+#[pyo3(signature = (rows, durable = true))]
+pub fn adjacency_put(py: Python<'_>, rows: Vec<PutRow>, durable: bool) -> PyResult<()> {
     let database = csr_writer()?;
     py.detach(|| {
         let mut by_room: HashMap<String, Vec<&PutRow>> = HashMap::new();
@@ -98,7 +99,15 @@ pub fn adjacency_put(py: Python<'_>, rows: Vec<PutRow>) -> PyResult<()> {
                 })
                 .collect();
             adjacency_for(&room_collection)
-                .record_events(&database, &records)
+                .record_events_with(
+                    &database,
+                    &records,
+                    if durable {
+                        AppendDurability::Durable
+                    } else {
+                        AppendDurability::Deferred
+                    },
+                )
                 .map_err(|e| {
                     let message = format!("mtxdb adjacency record error: {e}");
                     if is_retryable_contention(&e) {
@@ -107,6 +116,10 @@ pub fn adjacency_put(py: Python<'_>, rows: Vec<PutRow>) -> PyResult<()> {
                         pyo3::exceptions::PyRuntimeError::new_err(message)
                     }
                 })?;
+            if !durable {
+                // The tail is up to the caller's next sync/durable close.
+                mark_adjacency_tail_dirty();
+            }
             // Locators for the event and every event it references, so reads
             // can find the room even where a parent's body is still missing.
             for row in room_rows {

@@ -4204,11 +4204,13 @@ class PersistEventsStore:
                 # Write adjacency before the SQL COMMIT, never from a
                 # post-commit callback: a callback could be lost to a crash or
                 # fail without aborting the persist, leaving a committed event
-                # with no adjacency. The CSR append is durable when it returns,
-                # so a SQL rollback can leave orphan adjacency (an event no
-                # reader can see), but a committed event cannot lack it.
+                # with no adjacency. In normal operation the CSR append is
+                # durable when it returns, so a SQL rollback can leave orphan
+                # adjacency (an event no reader can see), but a committed event
+                # cannot lack it. Disposable test stores defer that fsync.
                 put_event_edges_batch(
                     edge_rows,
+                    durable=not self.hs.config.database.embedded_db_no_sync,
                     transaction=mtxdb_txn,
                 )
                 txn.call_after(mark_dirty, Pool.EVENT_DAG)
