@@ -171,6 +171,15 @@ class EndToEndPerspectivesTests(BaseRemoteKeyResourceTestCase):
         # make a second homeserver, configured to use the first one as a key notary
         self.http_client2 = Mock()
         config = default_config(server_name="keyclient")
+        # Both homeservers live in this process and share the one global
+        # embedded client. Point hs2 at hs1's store instead of opening a second,
+        # different root (which `open_client` refuses).
+        hs1_embedded_path = self.hs.config.database.embedded_db_path
+        embedded_config = config.get("embedded_db")
+        if isinstance(embedded_config, dict) and hs1_embedded_path:
+            embedded_config = dict(embedded_config)
+            embedded_config["path"] = hs1_embedded_path
+            config["embedded_db"] = embedded_config
         config["trusted_key_servers"] = [
             {
                 "server_name": self.hs.hostname,

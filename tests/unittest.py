@@ -582,6 +582,15 @@ class HomeserverTestCase(TestCase):
         hijacking the authentication system to return a fixed user, and then
         calling the prepare function.
         """
+        # The embedded client is process-global and each homeserver gets its
+        # own root. Register the close as a cleanup rather than relying only on
+        # `tearDown`, because subclasses regularly override `tearDown` without
+        # calling super() -- and an unclosed store would then make the next
+        # homeserver's open fail (or silently reuse this root).
+        from synapse.synapse_rust import mtxdb_engine
+
+        self.addCleanup(mtxdb_engine.close_client)
+
         # We need to share the reactor between the homeserver and all of our test utils.
         self.reactor, self.clock = get_clock()
         self.hs = self.make_homeserver(self.reactor, self.clock)

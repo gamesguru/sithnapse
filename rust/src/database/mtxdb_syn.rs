@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use std::time::Duration;
@@ -265,6 +265,14 @@ static REPOINT_TEST_HOOK: Mutex<Option<RepointTestHook>> = Mutex::new(None);
 /// only this layer knows that a missing counter means initialization.
 static REFCOUNT_INITS: AtomicU64 = AtomicU64::new(0);
 static REFCOUNT_EXISTING: AtomicU64 = AtomicU64::new(0);
+
+/// Transactions that have been started but not yet committed or aborted.
+/// `close_client` refuses to detach the store while one is open: the
+/// transaction's own `Arc<Database>` is not visible in the pools reference
+/// count, and dropping the pools underneath it would leave an overlay that
+/// can still publish into a store whose caches and directory registration are
+/// gone.
+static ACTIVE_TRANSACTIONS: AtomicUsize = AtomicUsize::new(0);
 
 fn pools() -> PyResult<Arc<MtxdbPools>> {
     DBS.lock()
@@ -2336,16 +2344,14 @@ pub fn open_client_read_only(py: Python<'_>, path: String) -> PyResult<()> {
 /// Production never closes a store mid-process.
 ///
 /// Fails loudly rather than detaching state: if any cloned pool handle is
-/// still alive (a reader or writer in flight), or a transaction/reader still
-/// retains its own `Arc<Database>`, the store is left open and the call
-/// raises. This counts both `Arc<MtxdbPools>` clones and the shared
-/// `Arc<Database>` (transactions pin that so they can outlive the borrow that
-/// created them). A room-index `File` clone held directly by a thread is still
-/// not covered -- test teardown is the only caller, so that is acceptable.
-/// Syncs every pool and the room index first, so a successful close implies
-/// the data is durable. Also drops the room-index handle/prefix caches, which
-/// are keyed by shard only and would otherwise keep pointing at the old root's
-/// files.
+/// still alive (a reader or writer in flight), the store is left open and the
+/// call raises. This counts `Arc<MtxdbPools>` clones and live transactions
+/// (which hold their own `Arc<Database>`); a room-index `File` clone held
+/// directly by a thread is not covered -- test teardown is the only caller, so
+/// that is acceptable. Syncs every pool and the room index first, so a
+/// successful close implies the data is durable. Also drops the room-index
+/// handle/prefix caches, which are keyed by shard only and would otherwise
+/// keep pointing at the old root's files.
 #[pyfunction]
 pub fn close_client(py: Python<'_>) -> PyResult<()> {
     py.detach(|| {
@@ -2362,18 +2368,16 @@ pub fn close_client(py: Python<'_>) -> PyResult<()> {
                  refusing to close while readers or writers are in flight"
             )));
         }
-        // A Python `MtxdbTransaction` (and a checked-out read graph) keeps its
-        // own clone of the shared `Database`, so the pools count above does
-        // not see it. Refuse to detach the store while one is still live.
-        if let Some(database) = pools.shared_database.as_ref() {
-            let database_live = Arc::strong_count(database);
-            if database_live != 1 {
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "mtxdb close_client: {database_live} live database handles \
-                     remain; refusing to close while transactions or readers \
-                     are in flight"
-                )));
-            }
+        // A Python `MtxdbTransaction` holds its own clone of the shared
+        // `Database`, so the pools count above does not see it. Refuse while
+        // one is still open; `ACTIVE_TRANSACTIONS` is released on
+        // commit/abort (or drop for an uncertain failed commit).
+        let active_transactions = ACTIVE_TRANSACTIONS.load(Ordering::SeqCst);
+        if active_transactions != 0 {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "mtxdb close_client: {active_transactions} open transaction(s) \
+                 remain; refusing to close while writes are in flight"
+            )));
         }
         for (name, store) in [
             ("state", &pools.state),
@@ -3275,6 +3279,23 @@ pub struct PyMtxdbTransaction {
     /// `inner` is declared first so it is dropped before the `Arc`.
     inner: DatabaseTransaction<'static>,
     _database: Arc<Database>,
+    /// Whether this transaction has already released its slot in
+    /// `ACTIVE_TRANSACTIONS` (on commit/abort or drop).
+    finished: AtomicBool,
+}
+
+impl PyMtxdbTransaction {
+    fn finish(&self) {
+        if !self.finished.swap(true, Ordering::SeqCst) {
+            ACTIVE_TRANSACTIONS.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for PyMtxdbTransaction {
+    fn drop(&mut self) {
+        self.finish();
+    }
 }
 
 /// `DatabaseTransaction::put` (`event_json_put`/edges staging) fails with a
@@ -3486,6 +3507,7 @@ impl PyMtxdbTransaction {
             self.inner
                 .commit()
                 .map_err(|e| map_transaction_error("commit", e))?;
+            self.finish();
             Ok(started.elapsed().as_secs_f64())
         })
     }
@@ -3501,6 +3523,7 @@ impl PyMtxdbTransaction {
                 }
                 other => map_transaction_error("commit", other),
             })?;
+            self.finish();
             Ok(started.elapsed().as_secs_f64())
         })
     }
@@ -3509,7 +3532,9 @@ impl PyMtxdbTransaction {
     pub fn abort(&self) -> PyResult<()> {
         self.inner
             .abort()
-            .map_err(|e| map_transaction_error("abort", e))
+            .map_err(|e| map_transaction_error("abort", e))?;
+        self.finish();
+        Ok(())
     }
 }
 
@@ -3567,9 +3592,11 @@ pub fn begin_transaction() -> PyResult<Option<PyMtxdbTransaction>> {
         // is dropped first) is gone. The transaction only borrows immutably.
         let inner: DatabaseTransaction<'static> =
             unsafe { std::mem::transmute(database.begin_transaction()) };
+        ACTIVE_TRANSACTIONS.fetch_add(1, Ordering::SeqCst);
         PyMtxdbTransaction {
             inner,
             _database: database,
+            finished: AtomicBool::new(false),
         }
     }))
 }
