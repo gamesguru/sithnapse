@@ -110,7 +110,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# How long a definitive remote lookup failure is remembered.
+# How long a recent remote lookup result is remembered.
 _FAILED_LOOKUP_TTL_MS = 60 * 1000
 
 
@@ -211,7 +211,7 @@ class FederationEventHandler:
 
         self._room_pdu_linearizer = Linearizer(name="fed_room_pdu", clock=self._clock)
 
-        # Remember, for a short time, the remote lookups that definitely failed, so a
+        # Remember, for a short time, the remote lookups that recently failed, so a
         # burst of events that all need the same unobtainable data does not repeat
         # the same doomed federation requests once per event.
         #
@@ -226,6 +226,21 @@ class FederationEventHandler:
                 max_len=10000,
                 expiry_ms=_FAILED_LOOKUP_TTL_MS,
             )
+        )
+        # (destination, room_id, prev_event_id) -> the (state ids, auth chain ids)
+        # a /state_ids call returned. The state after an event never changes, so
+        # reusing the answer is always correct; only the (potentially huge) lists
+        # of IDs are kept, and what we already have is re-checked on every use.
+        self._state_ids_responses: ExpiringCache[
+            tuple[str, str, str], tuple[tuple[str, ...], tuple[str, ...]]
+        ] = ExpiringCache(
+            cache_name="federation_state_ids_responses",
+            server_name=self.server_name,
+            hs=hs,
+            clock=self._clock,
+            max_len=200000,
+            expiry_ms=_FAILED_LOOKUP_TTL_MS,
+            size_callback=lambda v: len(v[0]) + len(v[1]) + 1,
         )
         # (destination, room_id, missing prev_event_id) -> why the state after that
         # event could not be completed.
@@ -2187,12 +2202,24 @@ class FederationEventHandler:
         # auth_events) from this call.
         #
         # Tracked by https://github.com/matrix-org/synapse/issues/13618
-        (
-            state_event_ids,
-            auth_event_ids,
-        ) = await self._federation_client.get_room_state_ids(
-            destination, room_id, event_id=event_id
-        )
+        state_ids_key = (destination, room_id, event_id)
+        cached_response = self._state_ids_responses.get(state_ids_key)
+        if cached_response is None:
+            (
+                state_ids_list,
+                auth_ids_list,
+            ) = await self._federation_client.get_room_state_ids(
+                destination, room_id, event_id=event_id
+            )
+            cached_response = (tuple(state_ids_list), tuple(auth_ids_list))
+            self._state_ids_responses[state_ids_key] = cached_response
+        else:
+            logger.debug(
+                "Reusing recent /state_ids response for %s from %s",
+                event_id,
+                destination,
+            )
+        state_event_ids, auth_event_ids = cached_response
 
         logger.debug(
             "state_ids returned %i state events, %i auth events",
