@@ -224,7 +224,7 @@ class KeyStore(KeyBackgroundUpdateStore):
                     """
                     SELECT key_hash FROM server_signature_key_candidates
                     WHERE server_name = ? AND key_id = ?
-                    ORDER BY seen_active DESC, ts_added_ms ASC, key_hash ASC
+                    ORDER BY seen_active DESC, ts_added_ms DESC, key_hash ASC
                     """,
                     (server_name, key_id),
                 )

@@ -13,6 +13,8 @@
 
 """Storage behaviour for cached server-key responses."""
 
+import hashlib
+
 from canonicaljson import encode_canonical_json
 from signedjson.key import (
     SigningKey,
@@ -25,6 +27,7 @@ from twisted.internet.testing import MemoryReactor
 
 from synapse.server import HomeServer
 from synapse.storage.database import LoggingTransaction
+from synapse.storage.databases.main.keys import MAX_KEY_BODIES_PER_ID
 from synapse.storage.keys import FetchKeyResult
 from synapse.util.clock import Clock
 
@@ -346,3 +349,54 @@ class ServerKeyResponseStorageTestCase(HomeserverTestCase):
             self.store.db_pool.runInteraction("get_binding", _binding)
         )
         self.assertEqual(stored, original_verify.encode())
+
+    def test_reused_key_id_cap_keeps_the_newest_bodies(self) -> None:
+        """The per-ID cap evicts the oldest alternate, not the body just fetched.
+
+        A server that keeps reusing one key ID for new bodies must still have
+        its latest body retained, or events it signs cannot be verified.
+        """
+        now = self.clock.time_msec()
+        server_name = "remote.example"
+        keys = [generate_signing_key("reuse") for _ in range(MAX_KEY_BODIES_PER_ID + 1)]
+
+        result: dict[str, FetchKeyResult] = {}
+        key_id = ""
+        for offset, signing_key in enumerate(keys):
+            key_id, result = self._store_response(
+                server_name,
+                server_name,
+                signing_key,
+                now + 3_600_000,
+                now + offset,
+            )
+
+        expected_hashes = {
+            hashlib.sha256(get_verify_key(key).encode()).hexdigest() for key in keys
+        }
+        oldest_hash = hashlib.sha256(get_verify_key(keys[0]).encode()).hexdigest()
+        newest_verify = get_verify_key(keys[-1])
+
+        def _retained(txn: LoggingTransaction) -> set[str]:
+            txn.execute(
+                "SELECT key_hash FROM server_signature_key_candidates"
+                " WHERE server_name = ? AND key_id = ?",
+                (server_name, key_id),
+            )
+            return {row[0] for row in txn.fetchall()}
+
+        retained = self.get_success(
+            self.store.db_pool.runInteraction("retained_candidates", _retained)
+        )
+        self.assertEqual(len(retained), MAX_KEY_BODIES_PER_ID)
+        # The earliest body falls out of the bounded set...
+        self.assertNotIn(oldest_hash, retained)
+        # ...and every body except it is still retained.
+        self.assertEqual(retained, expected_hashes - {oldest_hash})
+
+        # The response that fetched the newest body can verify signatures made
+        # with it, even though another body remains the authoritative binding.
+        self.assertIn(
+            newest_verify.encode(),
+            [key.encode() for key, _ in result[key_id].alternate_keys],
+        )

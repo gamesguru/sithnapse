@@ -146,10 +146,7 @@ set_output("trial_test_matrix", test_matrix)
 sytest_tests = [
     {
         "sytest-tag": "bookworm",
-    },
-    {
-        "sytest-tag": "bookworm",
-        "postgres": "postgres",
+        "embedded_db": "mtxdb",
     },
     {
         "sytest-tag": "bookworm",
@@ -175,15 +172,18 @@ if not IS_PR:
             {
                 "sytest-tag": "bookworm",
                 "reactor": "asyncio",
+                "embedded_db": "mtxdb",
             },
             {
                 "sytest-tag": "bookworm",
                 "postgres": "postgres",
                 "reactor": "asyncio",
+                "embedded_db": "mtxdb",
             },
             {
                 "sytest-tag": "testing",
                 "postgres": "postgres",
+                "embedded_db": "mtxdb",
             },
         ]
     )

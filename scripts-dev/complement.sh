@@ -487,7 +487,10 @@ main() {
   SYNAPSE_EMBEDDED_DB_ENGINE="${SYNAPSE_TEST_EMBEDDED_DB_ENGINE:-}"
   SYNAPSE_EMBEDDED_DB_PATH="${SYNAPSE_TEST_EMBEDDED_DB_PATH:-}"
 
-  if [[ -n "${SYNAPSE_MTXDB:-}" && -z "$SYNAPSE_EMBEDDED_DB_ENGINE" ]]; then
+  # Synapse refuses to start without an embedded store (event adjacency, event
+  # JSON and state groups live there; the SQL fallbacks were removed), so every
+  # run uses mtxdb. SQLite/Postgres only choose the relational database.
+  if [[ -z "$SYNAPSE_EMBEDDED_DB_ENGINE" ]]; then
     SYNAPSE_EMBEDDED_DB_ENGINE="mtxdb"
   fi
 

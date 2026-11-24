@@ -23,6 +23,7 @@ import logging
 from typing import Any, Callable, cast
 
 from synapse.api.errors import SynapseError
+from synapse.logging.context import defer_to_thread
 from synapse.storage.database import (
     LoggingTransaction,
     make_in_list_sql_clause,
@@ -80,8 +81,9 @@ def _delete_purge_event_mirrors(
 def _run_purge_cleanups(steps: list[tuple[str, Callable[[], None]]]) -> None:
     """Run each post-commit purge cleanup even if an earlier one fails.
 
-    `txn.call_after` callbacks run in a plain loop, so one that raises would stop
-    every later callback, including the cache invalidations. Each step is
+    Run on a worker thread (see `_run_post_commit`): the steps delete mtxdb
+    entries and flush to disk, which must not block the reactor. A step that
+    raised would otherwise stop every later one. Each step is
     isolated here and every failure is logged; the SQL purge has already
     committed, so there is nothing to roll back.
     """
@@ -189,13 +191,26 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
 
         parsed_token = await RoomStreamToken.parse(self, token)
 
-        return await self.db_pool.runInteraction(
+        post_commit: list[tuple[str, Callable[[], None]]] = []
+        referenced_state_groups = await self.db_pool.runInteraction(
             "purge_history",
             self._purge_history_txn,
             room_id,
             parsed_token,
             delete_local_events,
+            post_commit,
         )
+        await self._run_post_commit(post_commit)
+        return referenced_state_groups
+
+    async def _run_post_commit(
+        self, steps: list[tuple[str, Callable[[], None]]]
+    ) -> None:
+        """Run the mtxdb cleanups collected by a committed purge transaction on
+        a worker thread, so the blocking deletes and disk syncs do not stall the
+        reactor."""
+        if steps:
+            await defer_to_thread(self.hs.get_reactor(), _run_purge_cleanups, steps)
 
     def _purge_history_txn(
         self,
@@ -203,7 +218,10 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
         room_id: str,
         token: RoomStreamToken,
         delete_local_events: bool,
+        post_commit: list[tuple[str, Callable[[], None]]],
     ) -> set[int]:
+        # The transaction may be retried, so drop steps queued by a failed attempt.
+        post_commit.clear()
         # Tables that should be pruned:
         #     event_auth
         #     event_backward_extremities
@@ -445,17 +463,25 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
                 "[purge] found %i referenced state groups", len(referenced_state_groups)
             )
 
-            txn.call_after(
-                delete_event_to_state_group_batch,
-                self._embedded_db_engine,
-                list(event_id_to_state_group.keys()),
+            state_group_keys = list(event_id_to_state_group.keys())
+            state_group_values = list(event_id_to_state_group.values())
+            post_commit.append(
+                (
+                    "event_to_state_group delete",
+                    lambda: delete_event_to_state_group_batch(
+                        self._embedded_db_engine, state_group_keys
+                    ),
+                )
             )
-            txn.call_after(
-                decrement_state_group_refcounts_batch,
-                self._embedded_db_engine,
-                list(event_id_to_state_group.values()),
+            post_commit.append(
+                (
+                    "state group refcounts",
+                    lambda: decrement_state_group_refcounts_batch(
+                        self._embedded_db_engine, state_group_values
+                    ),
+                )
             )
-            txn.call_after(sync_now, pools=[Pool.STATE])
+            post_commit.append(("state sync", lambda: sync_now(pools=[Pool.STATE])))
         else:
             # Get all state groups that are referenced by events that are to be
             # deleted.
@@ -532,8 +558,7 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
                     ),
                 )
             )
-        if cleanups:
-            txn.call_after(_run_purge_cleanups, cleanups)
+        post_commit.extend(cleanups)
 
         # Some of the `event_push_actions` we're about to delete may have already
         # been rotated into the aggregate `event_push_summary` counts. Deleting
@@ -713,23 +738,35 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
         # purge any of those rows which were added during the first.
 
         logger.info("[purge] Starting initial main purge of [1/2]")
+        post_commit: list[tuple[str, Callable[[], None]]] = []
         await self.db_pool.runInteraction(
             "purge_room",
             self._purge_room_txn,
             room_id=room_id,
+            post_commit=post_commit,
             isolation_level=IsolationLevel.READ_COMMITTED,
         )
+        await self._run_post_commit(post_commit)
 
         logger.info("[purge] Starting secondary main purge of [2/2]")
+        post_commit = []
         await self.db_pool.runInteraction(
             "purge_room",
             self._purge_room_txn,
             room_id=room_id,
+            post_commit=post_commit,
         )
+        await self._run_post_commit(post_commit)
 
         logger.info("[purge] Done with main purge")
 
-    def _purge_room_txn(self, txn: LoggingTransaction, room_id: str) -> None:
+    def _purge_room_txn(
+        self,
+        txn: LoggingTransaction,
+        room_id: str,
+        post_commit: list[tuple[str, Callable[[], None]]],
+    ) -> None:
+        post_commit.clear()
         # This collides with event persistence so we cannot write new events and metadata into
         # a room while deleting it or this transaction will fail.
         if isinstance(self.database_engine, PostgresEngine):
@@ -846,8 +883,7 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
                     lambda: purge_event_edges_room(room_id),
                 )
             )
-        if room_cleanups:
-            txn.call_after(_run_purge_cleanups, room_cleanups)
+        post_commit.extend(room_cleanups)
         if room_event_ids:
             # Same for event_to_state_groups: fetch state_groups before
             # deleting so the refcount can be rebalanced.
@@ -856,19 +892,29 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
                 room_event_ids,
                 purpose="purge_traversal",
             )
-            txn.call_after(
-                delete_event_to_state_group_batch,
-                self._embedded_db_engine,
-                list(event_id_to_state_group.keys()),
+            room_state_group_keys = list(event_id_to_state_group.keys())
+            room_state_group_values = list(event_id_to_state_group.values())
+            post_commit.append(
+                (
+                    "event_to_state_group delete",
+                    lambda: delete_event_to_state_group_batch(
+                        self._embedded_db_engine, room_state_group_keys
+                    ),
+                )
             )
-            txn.call_after(
-                decrement_state_group_refcounts_batch,
-                self._embedded_db_engine,
-                list(event_id_to_state_group.values()),
+            post_commit.append(
+                (
+                    "state group refcounts",
+                    lambda: decrement_state_group_refcounts_batch(
+                        self._embedded_db_engine, room_state_group_values
+                    ),
+                )
             )
             # One sync for the whole purge batch (event_json delete +
             # Immediate sync + clear dirty flags for event_dag and state.
-            txn.call_after(sync_now, pools=[Pool.EVENT_DAG, Pool.STATE])
+            post_commit.append(
+                ("state sync", lambda: sync_now(pools=[Pool.EVENT_DAG, Pool.STATE]))
+            )
 
         # Other tables we do NOT need to clear out:
         #
