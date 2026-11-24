@@ -208,6 +208,7 @@ fn check_pid_guard() -> PyResult<bool> {
         ))),
     }
 }
+
 /// Serialize all read-modify-write cycles through the embedded engine.
 /// The mtxdb `StorageEngine` trait has no atomic increment or transaction API,
 /// so we hold this across get→put_many for counters and auth-chain manifests.
@@ -1277,25 +1278,41 @@ mod room_index {
 
     static PREFIX_CACHE: Mutex<Option<LruCache<i64, [u8; ROOM_PREFIX_LEN]>>> = Mutex::new(None);
 
-    /// Handles are cached by fixed shard and access mode, never by namespace.
+    /// Handles are cached by fixed shard and access mode only.
     /// A read-only lookup must never poison the writable handle used by `put`.
-    /// This bounds the process to at most two descriptors per shard.
+    /// This bounds the process to at most two descriptors per shard. Reset by
+    /// `reset()` on close, so these never outlive the root they were opened
+    /// from.
     #[allow(clippy::type_complexity)]
     static HANDLES: Mutex<Option<LruCache<(u8, bool), std::sync::Arc<File>>>> = Mutex::new(None);
 
-    /// Namespaces `put` has written to since the last `sync()`. `sync()`
-    /// used to unconditionally `sync_data()` every cached handle -- with
-    /// `HANDLE_CACHE_CAPACITY` at 64 and one namespace per homeserver, a
-    /// workload that opens many short-lived
-    /// namespaces (e.g. the test suite, one per HS) fills the cache with
-    /// mostly-idle handles from *other* namespaces, so every write-path
-    /// sync (`sync_state`, called on essentially every event persist) paid
-    /// an `fsync_data()` on all of them, not just the one actually
-    /// written -- a roughly-constant per-call tax that scaled with cache
-    /// occupancy, not with actual write volume. Mirrors the dirty-only
-    /// fsync `PackfileStorage::sync()` (mtxdb-core) already does for the
-    /// physical pools.
+    /// Shards `put` has written to since the last `sync()`. `sync()` used to
+    /// unconditionally `sync_data()` every cached handle, so a workload that
+    /// touched many short-lived shards paid an `fsync_data()` on all of them,
+    /// not just the ones actually written -- a roughly-constant per-call tax
+    /// that scaled with cache occupancy, not with actual write volume.
+    /// Mirrors the dirty-only fsync `PackfileStorage::sync()` (mtxdb-core)
+    /// already does for the physical pools.
     static DIRTY: Mutex<Option<HashSet<u8>>> = Mutex::new(None);
+
+    /// Drop every in-process room-index cache: cached shard file handles,
+    /// decoded prefix mappings, and dirty-shard tracking. Called from
+    /// `close_client` so a later open of a different root can neither append
+    /// to nor answer from the previous root's index files. Without this, a
+    /// reopened store silently reuses the old handles/cache even though
+    /// `ROOM_INDEX_DIR` now points somewhere else.
+    pub(crate) fn reset() -> PyResult<()> {
+        *HANDLES.lock().map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}"))
+        })? = None;
+        *PREFIX_CACHE.lock().map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}"))
+        })? = None;
+        *DIRTY.lock().map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poison: {e}"))
+        })? = None;
+        Ok(())
+    }
 
     /// Shard for a state group. State-group ids are the only index key now
     /// that the namespace salt is gone, so the id itself picks the shard.
@@ -2228,10 +2245,14 @@ pub fn open_client_read_only(py: Python<'_>, path: String) -> PyResult<()> {
 /// must not share one physical store (their state-group ids restart at 1).
 /// Production never closes a store mid-process.
 ///
-/// Fails loudly rather than detaching state: if any cloned handle is still
-/// alive (a reader or writer in flight), the store is left open and the call
-/// raises. Syncs every pool first, so a successful close implies the data is
-/// durable.
+/// Fails loudly rather than detaching state: if any cloned pool handle is
+/// still alive (a reader or writer in flight), the store is left open and the
+/// call raises. This counts `Arc<MtxdbPools>` clones, so a room-index `File`
+/// clone held directly by a thread is not covered -- test teardown is the only
+/// caller, so that is acceptable. Syncs every pool first, so a successful
+/// close implies the data is durable. Also drops the room-index handle/prefix
+/// caches, which are keyed by shard only and would otherwise keep pointing at
+/// the old root's files.
 #[pyfunction]
 pub fn close_client(py: Python<'_>) -> PyResult<()> {
     py.detach(|| {
@@ -2269,6 +2290,7 @@ pub fn close_client(py: Python<'_>) -> PyResult<()> {
         *ROOM_INDEX_DIR.lock().map_err(|_| {
             pyo3::exceptions::PyRuntimeError::new_err("ROOM_INDEX_DIR lock poisoned")
         })? = None;
+        room_index::reset()?;
         Ok(())
     })
 }
@@ -2287,7 +2309,7 @@ pub fn put_state_hamt_nodes(
         .into_iter()
         .filter_map(|(key_or_hash, bytes)| {
             let mut node_id = [0u8; 16];
-            if key_or_hash.len() == 124 {
+            if key_or_hash.len() == 91 {
                 if let Some((_, structural_hash)) = parse_node_key(&key_or_hash) {
                     node_id.copy_from_slice(&structural_hash[..16]);
                 } else {

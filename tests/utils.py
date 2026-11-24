@@ -251,6 +251,20 @@ if _embedded_db_path_is_tmp and not os.environ.get(
     assert EMBEDDED_DB_PATH is not None
     atexit.register(_cleanup_embedded_db, EMBEDDED_DB_PATH)
 
+# Roots handed to individual test homeservers (see `default_config`). An
+# explicitly-configured `SYNAPSE_TEST_EMBEDDED_DB_PATH` is never removed as a
+# whole, so without this a long-lived worker would accumulate one root per
+# homeserver forever.
+_EMBEDDED_DB_PER_HOMESERVER_ROOTS: list[str] = []
+if EMBEDDED_DB_ENGINE:
+    import shutil
+
+    def _cleanup_per_homeserver_roots() -> None:
+        for root in _EMBEDDED_DB_PER_HOMESERVER_ROOTS:
+            shutil.rmtree(root, ignore_errors=True)
+
+    atexit.register(_cleanup_per_homeserver_roots)
+
 # the dbname we will connect to in order to create the base database.
 POSTGRES_DBNAME_FOR_INITIAL_CREATE = "postgres"
 
@@ -554,11 +568,13 @@ def default_config(
         # Each test homeserver has its own fresh SQL database, so its
         # state_group sequence restarts at 1. Give each one its own mtxdb
         # root so those ids cannot collide now that keys are unsalted.
+        # `HomeserverTestCase.tearDown` closes the global client after every
+        # test, so the next homeserver actually opens this path.
+        homeserver_root = os.path.join(EMBEDDED_DB_PATH, uuid.uuid4().hex)
+        _EMBEDDED_DB_PER_HOMESERVER_ROOTS.append(homeserver_root)
         config_dict["embedded_db"] = {
             "engine": EMBEDDED_DB_ENGINE,
-            # Each homeserver gets its own mtxdb root: without a namespace
-            # salt, state-group ids from two test databases would collide.
-            "path": os.path.join(EMBEDDED_DB_PATH, uuid.uuid4().hex),
+            "path": homeserver_root,
             "no_sync": EMBEDDED_DB_NO_SYNC,
             # Tests rely on FLUSH_DELAY_SECS to know exactly how far to
             # advance the reactor to drain the coalescer. Pin the runtime

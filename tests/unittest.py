@@ -662,7 +662,9 @@ class HomeserverTestCase(TestCase):
         # Reset to not use frozen dicts.
         events.USE_FROZEN_DICTS = False
 
-        if os.environ.get("SYNAPSE_TEST_MTXDB_REPACK_BETWEEN_TESTS") not in (
+        from synapse.synapse_rust import mtxdb_engine
+
+        if os.environ.get("SYNAPSE_TEST_MTXDB_REPACK_BETWEEN_TESTS") in (
             "1",
             "true",
             "True",
@@ -670,11 +672,15 @@ class HomeserverTestCase(TestCase):
             "on",
             "On",
         ):
-            return
+            mtxdb_engine.repack()
 
-        from synapse.synapse_rust import mtxdb_engine
-
-        mtxdb_engine.repack()
+        # The embedded engine's client is process-global, but each test
+        # homeserver is configured with its own root: keys are unsalted, so a
+        # shared store would make state-group ids (which restart at 1 in every
+        # fresh SQL database) collide. Open_client therefore no-ops while a
+        # root is already open, so close it here or the next homeserver would
+        # silently keep using this one's directory instead of its own.
+        mtxdb_engine.close_client()
 
     def wait_for_background_updates(self) -> None:
         """Block until all background database updates have completed."""

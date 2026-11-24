@@ -431,6 +431,7 @@ class RedactionTestCase(unittest.HomeserverTestCase):
 
         tmpdir = tempfile.mkdtemp(prefix="test-expire-embedded-")
         self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        mtxdb_engine.close_client()
         mtxdb_engine.open_client(tmpdir)
         self.store._embedded_event_json_enabled = True
         self.store._embedded_db_engine = "mtxdb"

@@ -49,16 +49,24 @@ from tests.utils import EMBEDDED_DB_ENGINE, EMBEDDED_DB_PATH
 
 if EMBEDDED_DB_ENGINE and EMBEDDED_DB_PATH:
     # The test harness has already selected a worker-specific store. Reuse
-    # that path instead of opening a private store before the homeserver is
-    # created, which would win the Rust process-global OnceCell.
+    # that path instead of opening a private one per test class.
     _TEST_ENGINE_TMPDIR = EMBEDDED_DB_PATH
 else:
     _TEST_ENGINE_TMPDIR = tempfile.mkdtemp(prefix="test-embedded-event-edges-")
-    # mtxdb's Python binding owns process-global pools. Keep this directory
-    # alive until process exit; deleting it during a test class teardown leaves
-    # the OnceCell-backed engine pointing at an unlinked store.
+    # The client is closed between tests, so this root must outlive the
+    # module and be removed at process exit.
     atexit.register(shutil.rmtree, _TEST_ENGINE_TMPDIR, ignore_errors=True)
-mtxdb_engine.open_client(_TEST_ENGINE_TMPDIR)
+
+
+def open_test_engine() -> None:
+    """Open this module's fixed root, closing whatever root was open before.
+
+    The client is process-global and every suite now closes it after each test
+    (so each test homeserver can open its own root), so a module-level open
+    would not survive to the tests that need it.
+    """
+    mtxdb_engine.close_client()
+    mtxdb_engine.open_client(_TEST_ENGINE_TMPDIR)
 
 
 class EmbeddedAdjacencyTestCase(TestCase):
@@ -70,7 +78,11 @@ class EmbeddedAdjacencyTestCase(TestCase):
     """
 
     def setUp(self) -> None:
+        open_test_engine()
         self.room_id = f"!{uuid4().hex}:example.org"
+
+    def tearDown(self) -> None:
+        mtxdb_engine.close_client()
 
     def test_put_get_backward_and_forward(self) -> None:
         # No `event_json_put` first: `adjacency_put` publishes the locators for
@@ -173,6 +185,12 @@ def _reads(server: str, path: str, outcome: str) -> float:
 class EventEdgeReaderMetricsTestCase(TestCase):
     """The always-on Prometheus metrics the SQL-read-removal gate depends on."""
 
+    def setUp(self) -> None:
+        open_test_engine()
+
+    def tearDown(self) -> None:
+        mtxdb_engine.close_client()
+
     def test_record_event_edge_read_counts_without_ffi_diagnostics(self) -> None:
         server = "metrics-" + uuid4().hex
         record_event_edge_read(server, "successor", "hit")
@@ -260,6 +278,15 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         room.register_servlets,
         login.register_servlets,
     ]
+
+    def setUp(self) -> None:
+        # This class forces the embedded path on after construction, so point
+        # the client at this module's root before the homeserver is built (it
+        # may have nothing open at all when the suite runs in SQL mode). The
+        # homeserver's own open call then sees this root already open and is a
+        # no-op, so prepare() writes where the tests read.
+        open_test_engine()
+        super().setUp()
 
     def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
         self.store = hs.get_datastores().main

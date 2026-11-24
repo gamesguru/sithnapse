@@ -69,8 +69,6 @@ else:
 
 from synapse.synapse_rust import mtxdb_engine
 
-mtxdb_engine.open_client(_EMBEDDED_ENGINE_TMPDIR)
-
 
 class PurgeTests(HomeserverTestCase):
     user_id = "@red:server"
@@ -102,7 +100,6 @@ class PurgeTests(HomeserverTestCase):
 
         Returns the configured engine.
         """
-        from synapse.synapse_rust import mtxdb_engine
 
         mtxdb_engine.close_client()
         mtxdb_engine.open_client(_EMBEDDED_ENGINE_TMPDIR)
