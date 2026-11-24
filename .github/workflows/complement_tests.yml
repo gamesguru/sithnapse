@@ -46,15 +46,18 @@ jobs:
         env:
           ONLY_WORKERS: ${{ inputs.only_workers }}
         run: |
-          # The mtxdb lanes run with sync off: Complement containers are
-          # destroyed after every test, so the durable fsync path buys nothing.
+          # Every lane runs mtxdb; `database` is the SQL backend and `sync` is
+          # the mtxdb durability mode: no_sync (fsync off), interval (engine
+          # default, coalesced fsyncs) or full_sync (fsync at every commit).
+          # Complement containers are destroyed after every test, so no_sync
+          # loses nothing here.
           include='[
-            {"arrangement": "monolith", "database": "SQLite"},
-            {"arrangement": "hybrid", "database": "SQLite (hybrid, mtxdb)", "mtxdb_sync_mode": "off"},
-            {"arrangement": "monolith", "database": "Postgres"},
-            {"arrangement": "hybrid", "database": "Postgres (hybrid, mtxdb)", "mtxdb_sync_mode": "off"},
-            {"arrangement": "workers", "database": "Postgres"},
-            {"arrangement": "workers", "database": "Postgres (hybrid, mtxdb)", "mtxdb_sync_mode": "off"}
+            {"arrangement": "monolith", "database": "SQLite", "sync": "interval"},
+            {"arrangement": "monolith", "database": "SQLite", "sync": "no_sync"},
+            {"arrangement": "monolith", "database": "Postgres", "sync": "interval"},
+            {"arrangement": "monolith", "database": "Postgres", "sync": "no_sync"},
+            {"arrangement": "workers", "database": "Postgres", "sync": "interval"},
+            {"arrangement": "workers", "database": "Postgres", "sync": "no_sync"}
           ]'
           echo "include=$(jq -c --argjson only "$ONLY_WORKERS" \
             'map(select(($only | not) or .arrangement == "workers"))' <<< "$include")" \
@@ -151,16 +154,13 @@ jobs:
           POSTGRES: ${{ (startsWith(matrix.database, 'Postgres')) && 1 || '' }}
           WORKERS: ${{ (matrix.arrangement == 'workers') && 1 || '' }}
           SYNAPSE_COMPLEMENT_WORKER_PROFILE: ${{ inputs.worker_profile }}
-          # complement.sh only honours the TEST_-scoped names (and blanks the
-          # bare ones to keep a developer's production env out of containers),
-          # so the engine/path MUST use the SYNAPSE_TEST_ prefix or the
-          # "hybrid, mtxdb" job silently boots plain SQLite.
-          SYNAPSE_TEST_EMBEDDED_DB_ENGINE: ${{ (contains(matrix.database, 'mtxdb')) && 'mtxdb' || '' }}
-          SYNAPSE_TEST_EMBEDDED_DB_PATH: ${{ (contains(matrix.database, 'mtxdb')) && '/data/embedded_db' || '' }}
-          # Complement mtxdb lanes disable fsync for speed; containers are
-          # destroyed after every test, so durability adds no value here.
-          SYNAPSE_TEST_MTXDB_SYNC_MODE: ${{ contains(matrix.database, 'mtxdb') && matrix.mtxdb_sync_mode || '' }}
-          SYNAPSE_TEST_MTXDB_STATS: ${{ (contains(matrix.database, 'mtxdb') && matrix.mtxdb_sync_mode != 'off') && '1' || '' }}
+          # `database` selects the SQL backend; every Complement lane also uses
+          # mtxdb for embedded state and event-DAG storage.
+          SYNAPSE_TEST_EMBEDDED_DB_ENGINE: mtxdb
+          SYNAPSE_TEST_EMBEDDED_DB_PATH: /data/embedded_db
+          # `sync` is no_sync (off), interval or full_sync (on); see the matrix.
+          SYNAPSE_TEST_MTXDB_SYNC_MODE: ${{ (matrix.sync == 'no_sync' && 'off') || (matrix.sync == 'full_sync' && 'on') || matrix.sync }}
+          SYNAPSE_TEST_MTXDB_STATS: ${{ matrix.sync != 'no_sync' && '1' || '' }}
           TEST_ONLY_IGNORE_POETRY_LOCKFILE: ${{ inputs.use_latest_deps && 1 || '' }}
           TEST_ONLY_SKIP_DEP_HASH_VERIFICATION: ${{ inputs.use_twisted_trunk  && 1 || '' }}
           RESULTS_DIR: tests/complement/main
@@ -203,16 +203,13 @@ jobs:
           POSTGRES: ${{ (startsWith(matrix.database, 'Postgres')) && 1 || '' }}
           WORKERS: ${{ (matrix.arrangement == 'workers') && 1 || '' }}
           SYNAPSE_COMPLEMENT_WORKER_PROFILE: ${{ inputs.worker_profile }}
-          # complement.sh only honours the TEST_-scoped names (and blanks the
-          # bare ones to keep a developer's production env out of containers),
-          # so the engine/path MUST use the SYNAPSE_TEST_ prefix or the
-          # "hybrid, mtxdb" job silently boots plain SQLite.
-          SYNAPSE_TEST_EMBEDDED_DB_ENGINE: ${{ (contains(matrix.database, 'mtxdb')) && 'mtxdb' || '' }}
-          SYNAPSE_TEST_EMBEDDED_DB_PATH: ${{ (contains(matrix.database, 'mtxdb')) && '/data/embedded_db' || '' }}
-          # Complement mtxdb lanes disable fsync for speed; containers are
-          # destroyed after every test, so durability adds no value here.
-          SYNAPSE_TEST_MTXDB_SYNC_MODE: ${{ contains(matrix.database, 'mtxdb') && matrix.mtxdb_sync_mode || '' }}
-          SYNAPSE_TEST_MTXDB_STATS: ${{ (contains(matrix.database, 'mtxdb') && matrix.mtxdb_sync_mode != 'off') && '1' || '' }}
+          # `database` selects the SQL backend; every Complement lane also uses
+          # mtxdb for embedded state and event-DAG storage.
+          SYNAPSE_TEST_EMBEDDED_DB_ENGINE: mtxdb
+          SYNAPSE_TEST_EMBEDDED_DB_PATH: /data/embedded_db
+          # `sync` is no_sync (off), interval or full_sync (on); see the matrix.
+          SYNAPSE_TEST_MTXDB_SYNC_MODE: ${{ (matrix.sync == 'no_sync' && 'off') || (matrix.sync == 'full_sync' && 'on') || matrix.sync }}
+          SYNAPSE_TEST_MTXDB_STATS: ${{ matrix.sync != 'no_sync' && '1' || '' }}
           TEST_ONLY_IGNORE_POETRY_LOCKFILE: ${{ inputs.use_latest_deps && 1 || '' }}
           TEST_ONLY_SKIP_DEP_HASH_VERIFICATION: ${{ inputs.use_twisted_trunk  && 1 || '' }}
           RESULTS_DIR: tests/complement/in-repo
@@ -278,7 +275,7 @@ jobs:
         if: ${{ always() && startsWith(matrix.database, 'Postgres') }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: Complement PostgreSQL stats - (${{ matrix.arrangement }}, ${{ matrix.database }})
+          name: Complement PostgreSQL stats - (${{ matrix.arrangement }}, ${{ matrix.database }}, ${{ matrix.sync }})
           path: /tmp/complement-postgres-stats
           if-no-files-found: warn
 
@@ -298,7 +295,7 @@ jobs:
         with:
           # The matrix values keep the name unique across the three matrix
           # combinations (upload-artifact rejects duplicate names within a run).
-          name: Complement Logs - ${{ job.status }} - (${{ matrix.arrangement }}, ${{ matrix.database }})
+          name: Complement Logs - ${{ job.status }} - (${{ matrix.arrangement }}, ${{ matrix.database }}, ${{ matrix.sync }})
           path: |
             synapse/tests/complement/main/logs.jsonl
             synapse/tests/complement/main/results.jsonl
@@ -311,6 +308,6 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ always() }}
         with:
-          name: Complement resources - (${{ matrix.arrangement }}, ${{ matrix.database }})
+          name: Complement resources - (${{ matrix.arrangement }}, ${{ matrix.database }}, ${{ matrix.sync }})
           path: /tmp/complement-resources
           if-no-files-found: warn
