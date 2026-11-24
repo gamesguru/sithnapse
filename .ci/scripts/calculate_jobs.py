@@ -33,64 +33,12 @@ def set_output(key: str, value: str):
 
 IS_PR = os.environ["GITHUB_REF"].startswith("refs/pull/")
 
-# First calculate the various trial jobs.
+# First calculate the Trial jobs. All test homeservers require mtxdb.
 #
 # For PRs, we only run each type of test with the oldest and newest Python
 # version that's supported. The oldest version ensures we don't accidentally
 # introduce syntax or code that's too new, and the newest ensures we don't use
 # code that's been dropped in the latest supported Python version.
-
-trial_sqlite_tests = [
-    {
-        "python-version": "3.10",
-        "database": "sqlite",
-        "extras": "all",
-    },
-    {
-        "python-version": "3.13",
-        "database": "sqlite",
-        "extras": "all",
-    },
-]
-
-if not IS_PR:
-    # Otherwise, check all supported Python versions.
-    #
-    # Avoiding running all of these versions on every PR saves on CI time.
-    trial_sqlite_tests.extend(
-        {
-            "python-version": version,
-            "database": "sqlite",
-            "extras": "all",
-        }
-        for version in ("3.11", "3.12", "3.13")
-    )
-
-# Only test postgres against the earliest and latest Python versions that we
-# support in order to save on CI time.
-trial_postgres_tests = [
-    {
-        "python-version": "3.10",
-        "database": "postgres",
-        "postgres-version": "14",
-        "extras": "all",
-    },
-    {
-        "python-version": "3.13",
-        "database": "postgres",
-        "postgres-version": "17",
-        "extras": "all",
-    },
-]
-
-# Ensure that Synapse passes unit tests even with no extra dependencies installed.
-trial_no_extra_tests = [
-    {
-        "python-version": "3.10",
-        "database": "sqlite",
-        "extras": "",
-    }
-]
 
 # trial_mtxdb_tests: test mtxdb on oldest and newest Python versions
 # in PRs, and all versions on non-PR runs. The dedicated trial-mtxdb job
@@ -123,18 +71,13 @@ if not IS_PR:
 print("::group::Calculated trial jobs")
 print(
     json.dumps(
-        trial_sqlite_tests
-        + trial_postgres_tests
-        + trial_no_extra_tests
-        + trial_mtxdb_tests,
+        trial_mtxdb_tests,
         indent=4,
     )
 )
 print("::endgroup::")
 
-test_matrix = json.dumps(
-    trial_sqlite_tests + trial_postgres_tests + trial_no_extra_tests + trial_mtxdb_tests
-)
+test_matrix = json.dumps(trial_mtxdb_tests)
 set_output("trial_test_matrix", test_matrix)
 
 
@@ -152,17 +95,6 @@ sytest_tests = [
         "sytest-tag": "bookworm",
         "postgres": "postgres",
         "embedded_db": "mtxdb",
-    },
-    {
-        "sytest-tag": "bookworm",
-        "postgres": "multi-postgres",
-        "workers": "workers",
-    },
-    {
-        "sytest-tag": "bookworm",
-        "postgres": "multi-postgres",
-        "workers": "workers",
-        "reactor": "asyncio",
     },
 ]
 

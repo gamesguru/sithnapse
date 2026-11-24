@@ -1385,6 +1385,28 @@ mod room_index {
         Ok(dir.join(format!("index-{shard:02x}.bin")))
     }
 
+    /// Refuse an index written with the old 16-byte-prefix record width.
+    /// Those files stride 28 bytes instead of `RECORD_LEN`, so the second
+    /// record's magic would not sit at offset `RECORD_LEN`; reading or
+    /// appending to them would return garbage prefixes or mix widths.
+    /// Only probe once a second *complete* record exists: a partial
+    /// trailing fragment after complete records is a torn write that the
+    /// scanner ignores, not layout evidence.
+    fn check_record_layout(file: &File, path: &std::path::Path) -> PyResult<()> {
+        let length = file.metadata().map(|m| m.len()).unwrap_or(0);
+        if length >= (2 * RECORD_LEN) as u64 {
+            let mut magic = [0u8; INDEX_MAGIC.len()];
+            if file.read_exact_at(&mut magic, RECORD_LEN as u64).is_ok() && magic != INDEX_MAGIC {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "room_index file {} was written with an incompatible record \
+                     layout; rebuild or migrate the index before opening this store",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn cached_handle(shard: u8, create: bool) -> PyResult<Option<std::sync::Arc<File>>> {
         let key = (shard, create);
         let mut guard = HANDLES
@@ -1412,21 +1434,7 @@ mod room_index {
                 )))
             }
         };
-        // Refuse an index written with the old 16-byte-prefix record width.
-        // Those files stride 28 bytes instead of `RECORD_LEN`, so the second
-        // record's magic would not sit at offset `RECORD_LEN`; reading or
-        // appending to them would return garbage prefixes or mix widths.
-        let length = file.metadata().map(|m| m.len()).unwrap_or(0);
-        if length >= (RECORD_LEN + INDEX_MAGIC.len()) as u64 {
-            let mut magic = [0u8; INDEX_MAGIC.len()];
-            if file.read_exact_at(&mut magic, RECORD_LEN as u64).is_ok() && magic != INDEX_MAGIC {
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "room_index file {} was written with an incompatible record \
-                     layout; rebuild or migrate the index before opening this store",
-                    path.display()
-                )));
-            }
-        }
+        check_record_layout(&file, &path)?;
         let file = Arc::new(file);
         map.put(key, Arc::clone(&file));
         Ok(Some(file))
@@ -1750,6 +1758,48 @@ mod room_index {
             assert_eq!(got[2], Some(b"KEEPPFX1".to_vec()));
             assert_eq!(got[3], Some(b"OLDPREFX".to_vec()));
             assert_eq!(got[4], None, "never-written group is a miss");
+        }
+
+        fn layout_check_file(bytes: &[u8]) -> PyResult<()> {
+            let path = std::env::temp_dir().join(format!(
+                "room-index-layout-{}-{:?}.bin",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::write(&path, bytes).expect("write fixture");
+            let file = File::open(&path).expect("open fixture");
+            let result = check_record_layout(&file, &path);
+            let _ = std::fs::remove_file(&path);
+            result
+        }
+
+        fn record() -> Vec<u8> {
+            let mut r = vec![0u8; RECORD_LEN];
+            r[..INDEX_MAGIC.len()].copy_from_slice(&INDEX_MAGIC);
+            r
+        }
+
+        #[test]
+        fn layout_check_accepts_one_complete_record_with_a_partial_tail() {
+            let mut bytes = record();
+            bytes.extend_from_slice(b"torn");
+            assert!(bytes.len() >= RECORD_LEN + INDEX_MAGIC.len());
+            layout_check_file(&bytes).expect("partial tail is not layout evidence");
+        }
+
+        #[test]
+        fn layout_check_accepts_current_records_and_rejects_old_stride() {
+            let mut current = record();
+            current.extend(record());
+            layout_check_file(&current).expect("two current records");
+
+            // Old 28-byte stride: the second magic is not at RECORD_LEN.
+            let mut old = vec![0u8; 28];
+            old[..4].copy_from_slice(&INDEX_MAGIC);
+            let mut second = vec![0u8; 28];
+            second[..4].copy_from_slice(&INDEX_MAGIC);
+            old.extend(second);
+            assert!(layout_check_file(&old).is_err());
         }
 
         #[test]
