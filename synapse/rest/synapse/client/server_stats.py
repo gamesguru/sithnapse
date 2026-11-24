@@ -134,5 +134,10 @@ class ServerStatsResource(DirectServeJsonResource):
                 "mtxdb_index_bytes": mtxdb_index_bytes,
             },
             "memory": {"rss_bytes": get_process_rss_bytes()},
+            "uptime_seconds": (
+                None
+                if self.hs.start_time is None
+                else max(0, int(self.hs.get_clock().time()) - self.hs.start_time)
+            ),
             "server_version": self.hs.version_string,
         }

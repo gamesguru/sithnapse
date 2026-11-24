@@ -535,6 +535,10 @@
             <span class="telemetry-value" id="stat-latency">-- ms</span>
             <span class="telemetry-sub">DARK SIDE ROUND TRIP</span>
           </span>
+          <span class="telemetry-pair">
+            <span class="telemetry-value" id="stat-uptime">--</span>
+            <span class="telemetry-sub">UPTIME · SINCE RESTART</span>
+          </span>
         </div>
 
         <div class="telemetry-card">
@@ -752,6 +756,16 @@
         return `${value.toFixed(value >= 100 ? 0 : 1)} ${units[unit]}`;
       }
 
+      function formatUptime(seconds) {
+        if (typeof seconds !== "number" || !isFinite(seconds)) return "--";
+        const d = Math.floor(seconds / 86400);
+        const h = Math.floor((seconds % 86400) / 3600);
+        const m = Math.floor((seconds % 3600) / 60);
+        if (d > 0) return `${d}d ${h}h`;
+        if (h > 0) return `${h}h ${m}m`;
+        return `${m}m`;
+      }
+
       function formatCompact(value) {
         if (typeof value !== "number" || !isFinite(value)) return "...";
         return new Intl.NumberFormat(undefined, {
@@ -854,6 +868,10 @@
                   if (subEl) subEl.textContent = dbParts.join(" · ");
                 }
               }
+
+              const uptimeEl = document.getElementById("stat-uptime");
+              if (uptimeEl)
+                uptimeEl.textContent = formatUptime(stats.uptime_seconds);
 
               const memory = stats.memory;
               if (

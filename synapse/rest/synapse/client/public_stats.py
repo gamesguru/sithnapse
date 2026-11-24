@@ -49,6 +49,7 @@ class PublicStatsResource(DirectServeJsonResource):
         self.store = hs.get_datastores().main
         self._clock = hs.get_clock()
         self._reactor = hs.get_reactor()
+        self._hs = hs
         self._embedded_db_path = hs.config.database.embedded_db_path
         self._cached: JsonDict | None = None
         self._cached_at_ms = 0
@@ -57,13 +58,20 @@ class PublicStatsResource(DirectServeJsonResource):
         # number instead of dropping the field from the page.
         self._last_ever_seen_users: int | None = None
 
+    def _uptime(self) -> int | None:
+        """Seconds since this process started, or `None` before setup."""
+        start = self._hs.start_time
+        if start is None:
+            return None
+        return max(0, int(self._clock.time()) - start)
+
     async def _async_render_GET(self, request: SynapseRequest) -> tuple[int, JsonDict]:
         now_ms = self._clock.time_msec()
         if (
             self._cached is not None
             and 0 <= now_ms - self._cached_at_ms < _CACHE_LIFETIME_MS
         ):
-            return HTTPStatus.OK, self._cached
+            return HTTPStatus.OK, {**self._cached, "uptime_seconds": self._uptime()}
 
         try:
             total_users = await self.store.count_all_users()
@@ -171,6 +179,7 @@ class PublicStatsResource(DirectServeJsonResource):
             "total_known_servers": total_known_servers,
             "database": database,
             "memory": {"rss_bytes": get_process_rss_bytes()},
+            "uptime_seconds": self._uptime(),
         }
         # Only cache complete results so a transient failure isn't served for
         # the whole lifetime. The storage sizes are optional: PostgreSQL and

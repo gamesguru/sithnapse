@@ -60,8 +60,10 @@ class PublicStatsTests(unittest.HomeserverTestCase):
                 "total_known_servers",
                 "database",
                 "memory",
+                "uptime_seconds",
             },
         )
+        self.assertIsInstance(channel.json_body["uptime_seconds"], int)
         self.assertEqual(channel.json_body["total_users"], 1)
         self.assertEqual(channel.json_body["total_rooms"], 1)
         self.assertIsInstance(channel.json_body["total_destinations"], int)
