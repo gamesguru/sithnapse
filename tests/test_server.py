@@ -60,8 +60,14 @@ class RepeatedHomeserverSetupTests(unittest.TestCase):
     """
 
     def test_two_homeservers_in_one_test(self) -> None:
-        first = setup_test_homeserver(cleanup_func=self.addCleanup)
-        second = setup_test_homeserver(cleanup_func=self.addCleanup)
+        # Distinct names: homeservers sharing a name share metric labels, and the
+        # second shutdown would then fail removing a label that is already gone.
+        first = setup_test_homeserver(
+            cleanup_func=self.addCleanup, server_name="first.test"
+        )
+        second = setup_test_homeserver(
+            cleanup_func=self.addCleanup, server_name="second.test"
+        )
         self.assertIsNot(first, second)
         self.assertIsNotNone(second.get_datastores().state)
 

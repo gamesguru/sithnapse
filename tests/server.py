@@ -2421,8 +2421,12 @@ def setup_test_homeserver(
     def _close_embedded_client() -> None:
         mtxdb_engine.close_client(durable=False)
 
-    mtxdb_engine.close_client(durable=False)
-    cleanup_func(_close_embedded_client)
+    # A worker homeserver shares the process-global client its test opened for
+    # the main homeserver; closing it here would leave the worker re-opening
+    # the store read-only and every later write failing.
+    if not config.worker.worker_app:
+        mtxdb_engine.close_client(durable=False)
+        cleanup_func(_close_embedded_client)
 
     with patch("synapse.storage.database.make_pool", side_effect=make_fake_db_pool):
         hs.setup()
