@@ -4243,6 +4243,19 @@ pub fn sync_event_dag(py: Python<'_>) -> PyResult<()> {
     py.detach(|| sync_one("event-dag", &event_dag))
 }
 
+/// Flush deferred CSR adjacency tails without syncing any pool.
+///
+/// Interval mode appends adjacency without its own fsync and lets the flush
+/// coalescer make it durable in the same window as the WAL, so adjacency no
+/// longer costs one `sync_data()` per persisted event. `always` keeps the
+/// per-append fsync, so this is a cheap no-op there (the dirty flag is clear).
+#[pyfunction]
+pub fn flush_adjacency_tails(py: Python<'_>) -> PyResult<()> {
+    assert_writable()?;
+    let adjacency_database = csr_writer()?;
+    py.detach(|| sync_adjacency_tails(adjacency_database.as_ref()))
+}
+
 /// Force a durable index checkpoint in every pool and wait for it.
 ///
 /// A clean stop must leave each pool's checkpoint at its current packs. Without
@@ -4939,6 +4952,7 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(sync, m)?)?;
     m.add_function(wrap_pyfunction!(sync_state, m)?)?;
     m.add_function(wrap_pyfunction!(sync_event_dag, m)?)?;
+    m.add_function(wrap_pyfunction!(flush_adjacency_tails, m)?)?;
     m.add_function(wrap_pyfunction!(begin_transaction, m)?)?;
     m.add_function(wrap_pyfunction!(recheck_collection_version, m)?)?;
     m.add_function(wrap_pyfunction!(txn_commit_phases, m)?)?;

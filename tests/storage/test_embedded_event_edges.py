@@ -168,6 +168,22 @@ class EmbeddedAdjacencyTestCase(TestCase):
         finally:
             transaction.abort()
 
+    def test_deferred_edges_survive_flush_and_reopen(self) -> None:
+        """Interval mode appends without an fsync; the flush makes it durable."""
+        put_event_edges_batch([(self.room_id, "$d1", "$dp")], durable=False)
+        mtxdb_engine.flush_adjacency_tails()
+
+        # Reopen the same root: the edges must come back from the tail/segments.
+        open_test_engine()
+        self.assertEqual(
+            get_event_edges_backward_batch(["$d1"])["$d1"],
+            ["$dp"],
+        )
+        self.assertEqual(
+            get_event_edges_forward_batch(["$dp"])["$dp"],
+            ["$d1"],
+        )
+
 
 def _sample(name: str, **labels: str) -> float:
     return REGISTRY.get_sample_value(name, labels) or 0.0

@@ -1297,6 +1297,25 @@ def request_durable() -> None:
     ffi_timing("ffi_request_durable", time.monotonic() - _st)
 
 
+def flush_adjacency_tails() -> None:
+    """Make deferred CSR adjacency appends durable.
+
+    Interval and off modes append adjacency without a per-event fsync. The
+    flush coalescer calls this at its durable barrier, so adjacency rides the
+    same window as the WAL instead of costing one `sync_data()` per persisted
+    event. In `always` mode the tails are already synced per append, so the
+    native call is a cheap no-op.
+    """
+    if not _engine_configured or _sync_disabled:
+        return
+
+    from synapse.storage.databases.embedded_engine import get_embedded_engine
+
+    _st = time.monotonic()
+    get_embedded_engine("mtxdb").flush_adjacency_tails()
+    ffi_timing("ffi_flush_adjacency_tails", time.monotonic() - _st)
+
+
 def start_background_commit(interval_secs: float, max_pending: int = 4096) -> None:
     """Start the shared mtxdb group committer for interval-mode durability."""
     if not _engine_configured or _sync_disabled or not publishes_at_commit():
@@ -1424,6 +1443,11 @@ class _FlushCoalescer:
             1,
         )
         try:
+            # Flush deferred adjacency before the WAL barrier: if a crash lands
+            # between them, an orphan adjacency row is harmless (readers filter
+            # it), while the reverse order could durably keep an event body
+            # whose edges are missing.
+            flush_adjacency_tails()
             if publishes_at_commit():
                 # All pools share a WAL in the normal layout. Publish first,
                 # then capture one boundary covering every pool; the native
@@ -1489,6 +1513,10 @@ class _FlushCoalescer:
 
         first_exc: Exception | None = None
         try:
+            # A barrier covers deferred adjacency too, whatever the pool set:
+            # a caller asking for durability now must not leave an edges-only
+            # window behind.
+            flush_adjacency_tails()
             for pool in to_flush:
                 try:
                     _do_sync_pools({pool})

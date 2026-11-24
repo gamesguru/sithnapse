@@ -147,6 +147,11 @@ class GroupCommitWiringTestCase(TestCase):
             ),
             mock.patch.object(
                 embedded_common,
+                "flush_adjacency_tails",
+                side_effect=lambda: calls.append("adjacency"),
+            ),
+            mock.patch.object(
+                embedded_common,
                 "request_durable",
                 side_effect=lambda: calls.append("request"),
             ),
@@ -156,7 +161,9 @@ class GroupCommitWiringTestCase(TestCase):
         ):
             coalescer._flush()
 
-        self.assertEqual(calls, ["request"])
+        # Adjacency first: an orphan edge is harmless, a durable event body
+        # with no durable edges is not.
+        self.assertEqual(calls, ["adjacency", "request"])
         self.assertFalse(coalescer._dirty)
 
     def test_background_failure_keeps_dirty_pools_for_retry(self) -> None:
