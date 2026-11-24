@@ -1282,7 +1282,6 @@ class FederationEventHandler:
                 break
 
             try:
-                _gme_start = self._clock.time_msec()  # TEMP timing diagnostic
                 missing_events = await self._federation_client.get_missing_events(
                     origin,
                     room_id,
@@ -1293,12 +1292,6 @@ class FederationEventHandler:
                     timeout=60000,
                 )
                 first_request = False
-                logger.info(  # TEMP timing diagnostic
-                    "TIMING get_missing_events %s took %dms (%d events)",
-                    origin,
-                    self._clock.time_msec() - _gme_start,
-                    len(missing_events),
-                )
             except (
                 RequestSendFailed,
                 HttpResponseException,
