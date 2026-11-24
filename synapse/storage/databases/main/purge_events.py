@@ -35,8 +35,8 @@ from synapse.storage.databases.main.embedded_common import (
     sync_now,
 )
 from synapse.storage.databases.main.embedded_event_edges import (
-    delete_event_edges_batch,
     get_event_edges_forward_batch,
+    purge_event_edges_room,
 )
 from synapse.storage.databases.main.embedded_event_json import delete_event_json_batch
 from synapse.storage.databases.main.embedded_event_to_state_group import (
@@ -98,7 +98,6 @@ def _run_purge_cleanups(steps: list[tuple[str, Callable[[], None]]]) -> None:
 
 
 purge_room_tables_with_event_id_index = (
-    "event_edges",
     "event_json",
     "event_push_actions_staging",
     "event_relations",
@@ -360,46 +359,35 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
         # We calculate the new entries for the backward extremities by finding
         # events to be purged that are pointed to by events we're not going to
         # purge.
-        if getattr(self, "_embedded_event_edges_enabled", False):
-            purge_ids = {event_id for event_id, _ in event_rows}
-            forward = get_event_edges_forward_batch(
-                self._embedded_db_namespace, list(purge_ids)
+        purge_ids = {event_id for event_id, _ in event_rows}
+        forward = get_event_edges_forward_batch(list(purge_ids))
+        # The forward index can name children whose SQL rows are not
+        # committed (or were deleted); only a child that is outside the
+        # purge set and still has an events row keeps its parent.
+        candidate_children = {
+            child_id
+            for event_id in purge_ids
+            for child_id in (forward.get(event_id) or ())
+            if child_id not in purge_ids
+        }
+        existing_children: set[str] = set()
+        candidate_list = list(candidate_children)
+        for start in range(0, len(candidate_list), 500):
+            clause, args = make_in_list_sql_clause(
+                self.database_engine,
+                "event_id",
+                candidate_list[start : start + 500],
             )
-            # The forward index can name children whose SQL rows are not
-            # committed (or were deleted); only a child that is outside the
-            # purge set and still has an events row keeps its parent.
-            candidate_children = {
-                child_id
-                for event_id in purge_ids
+            txn.execute(f"SELECT event_id FROM events WHERE {clause}", args)
+            existing_children.update(event_id for (event_id,) in txn)
+        new_backwards_extrems = [
+            (event_id,)
+            for event_id in purge_ids
+            if any(
+                child_id in existing_children
                 for child_id in (forward.get(event_id) or ())
-                if child_id not in purge_ids
-            }
-            existing_children: set[str] = set()
-            candidate_list = list(candidate_children)
-            for start in range(0, len(candidate_list), 500):
-                clause, args = make_in_list_sql_clause(
-                    self.database_engine,
-                    "event_id",
-                    candidate_list[start : start + 500],
-                )
-                txn.execute(f"SELECT event_id FROM events WHERE {clause}", args)
-                existing_children.update(event_id for (event_id,) in txn)
-            new_backwards_extrems = [
-                (event_id,)
-                for event_id in purge_ids
-                if any(
-                    child_id in existing_children
-                    for child_id in (forward.get(event_id) or ())
-                )
-            ]
-        else:
-            txn.execute(
-                "SELECT DISTINCT e.event_id FROM events_to_purge AS e"
-                " INNER JOIN event_edges AS ed ON e.event_id = ed.prev_event_id"
-                " LEFT JOIN events_to_purge AS ep2 ON ed.event_id = ep2.event_id"
-                " WHERE ep2.event_id IS NULL"
             )
-            new_backwards_extrems = txn.fetchall()
+        ]
 
         logger.info("[purge] replacing backward extremities: %r", new_backwards_extrems)
 
@@ -506,7 +494,6 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
 
         # Delete all remote non-state events
         for table in (
-            "event_edges",
             "events",
             "event_json",
             "event_auth",
@@ -547,15 +534,6 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
                         self._embedded_db_namespace,
                         redacted_event_ids,
                         deleted_ids,
-                    ),
-                )
-            )
-        if getattr(self, "_embedded_event_edges_writable", False) and deleted_ids:
-            cleanups.append(
-                (
-                    "event edges",
-                    lambda: delete_event_edges_batch(
-                        self._embedded_db_namespace, deleted_ids
                     ),
                 )
             )
@@ -657,48 +635,31 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
         # extremities. However, the events in event_backward_extremities
         # are ones we don't have yet so we need to look at the events that
         # point to them.
-        if getattr(self, "_embedded_event_edges_enabled", False):
-            txn.execute(
-                "SELECT event_id FROM event_backward_extremities WHERE room_id = ?",
-                (room_id,),
+        txn.execute(
+            "SELECT event_id FROM event_backward_extremities WHERE room_id = ?",
+            (room_id,),
+        )
+        extremity_ids = [event_id for (event_id,) in txn]
+        forward = get_event_edges_forward_batch(extremity_ids)
+        child_ids = {
+            child_id for children in forward.values() for child_id in (children or ())
+        }
+        # Batch the IN list like the extremity lookup above. `MIN` is NULL
+        # for a batch with no matching rows; those are ignored, and the
+        # depth is 0 only if no batch matched anything.
+        child_list = list(child_ids)
+        batch_depths: list[int] = []
+        for start in range(0, len(child_list), 500):
+            clause, args = make_in_list_sql_clause(
+                self.database_engine,
+                "event_id",
+                child_list[start : start + 500],
             )
-            extremity_ids = [event_id for (event_id,) in txn]
-            forward = get_event_edges_forward_batch(
-                self._embedded_db_namespace, extremity_ids
-            )
-            child_ids = {
-                child_id
-                for children in forward.values()
-                for child_id in (children or ())
-            }
-            # Batch the IN list like the extremity lookup above. `MIN` is NULL
-            # for a batch with no matching rows; those are ignored, and the
-            # depth is 0 only if no batch matched anything.
-            child_list = list(child_ids)
-            batch_depths: list[int] = []
-            for start in range(0, len(child_list), 500):
-                clause, args = make_in_list_sql_clause(
-                    self.database_engine,
-                    "event_id",
-                    child_list[start : start + 500],
-                )
-                txn.execute(f"SELECT MIN(depth) FROM events WHERE {clause}", args)
-                (batch_min,) = cast(tuple[int | None], txn.fetchone())
-                if batch_min is not None:
-                    batch_depths.append(batch_min)
-            min_depth = min(batch_depths) if batch_depths else 0
-        else:
-            txn.execute(
-                """
-                SELECT COALESCE(MIN(depth), 0)
-                FROM event_backward_extremities AS eb
-                INNER JOIN event_edges AS eg ON eg.prev_event_id = eb.event_id
-                INNER JOIN events AS e ON e.event_id = eg.event_id
-                WHERE eb.room_id = ?
-            """,
-                (room_id,),
-            )
-            (min_depth,) = cast(tuple[int], txn.fetchone())
+            txn.execute(f"SELECT MIN(depth) FROM events WHERE {clause}", args)
+            (batch_min,) = cast(tuple[int | None], txn.fetchone())
+            if batch_min is not None:
+                batch_depths.append(batch_min)
+        min_depth = min(batch_depths) if batch_depths else 0
 
         logger.info("[purge] updating room_depth to %d", min_depth)
 
@@ -895,9 +856,7 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             room_cleanups.append(
                 (
                     "event edges",
-                    lambda: delete_event_edges_batch(
-                        self._embedded_db_namespace, room_event_ids
-                    ),
+                    lambda: purge_event_edges_room(room_id),
                 )
             )
         if room_cleanups:

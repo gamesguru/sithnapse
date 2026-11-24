@@ -283,33 +283,6 @@ class EventsBackgroundUpdatesStore(
 
         ################################################################################
 
-        if getattr(self, "_embedded_event_edges_enabled", False):
-            # Delta 71 may have queued this SQL index update before the server
-            # was switched to mtxdb. Consume the queued update without doing
-            # SQL edge work; the index is irrelevant while SQL edges are dead.
-            async def skip_event_edges_index_update(
-                progress: JsonDict, batch_size: int
-            ) -> int:
-                await self.db_pool.updates._end_background_update(
-                    _BackgroundUpdates.EVENT_EDGES_REPLACE_INDEX
-                )
-                return 1
-
-            self.db_pool.updates.register_background_update_handler(
-                _BackgroundUpdates.EVENT_EDGES_REPLACE_INDEX,
-                skip_event_edges_index_update,
-            )
-        else:
-            self.db_pool.updates.register_background_index_update(
-                _BackgroundUpdates.EVENT_EDGES_REPLACE_INDEX,
-                index_name="event_edges_event_id_prev_event_id_idx",
-                table="event_edges",
-                columns=["event_id", "prev_event_id"],
-                unique=True,
-                # the old index which just covered event_id is now redundant.
-                replaces_index="ev_edges_id",
-            )
-
         self.db_pool.updates.register_background_update_handler(
             _BackgroundUpdates.EVENTS_POPULATE_STATE_KEY_REJECTIONS,
             self._background_events_populate_state_key_rejections,
@@ -574,7 +547,7 @@ class EventsBackgroundUpdatesStore(
         if not parent_ids:
             return []
 
-        forward = get_event_edges_forward_batch(self._embedded_db_namespace, parent_ids)
+        forward = get_event_edges_forward_batch(parent_ids)
         parents_by_child: dict[str, list[str]] = {}
         for parent_id in parent_ids:
             for child_id in forward.get(parent_id) or ():
@@ -650,31 +623,13 @@ class EventsBackgroundUpdatesStore(
             # First, we get `batch_size` events from the table, pulling out
             # their successor events, if any, and the successor events'
             # rejection status.
-            if getattr(self, "_embedded_event_edges_enabled", False):
-                txn.execute(
-                    "SELECT event_id FROM _extremities_to_check LIMIT ?",
-                    (batch_size,),
-                )
-                edge_rows = self._get_edge_child_rows_mtxdb(
-                    txn, [row[0] for row in txn], include_outlier=True
-                )
-            else:
-                txn.execute(
-                    """SELECT prev_event_id, event_id, internal_metadata,
-                        rejections.event_id IS NOT NULL, events.outlier
-                    FROM (
-                        SELECT event_id AS prev_event_id
-                        FROM _extremities_to_check
-                        LIMIT ?
-                    ) AS f
-                    LEFT JOIN event_edges USING (prev_event_id)
-                    LEFT JOIN events USING (event_id)
-                    LEFT JOIN event_json USING (event_id)
-                    LEFT JOIN rejections USING (event_id)
-                    """,
-                    (batch_size,),
-                )
-                edge_rows = txn.fetchall()
+            txn.execute(
+                "SELECT event_id FROM _extremities_to_check LIMIT ?",
+                (batch_size,),
+            )
+            edge_rows = self._get_edge_child_rows_mtxdb(
+                txn, [row[0] for row in txn], include_outlier=True
+            )
 
             # The initial query's `event_json` join is SQL-only, but the
             # embedded event-JSON backend (when enabled) is the read-path
@@ -730,32 +685,15 @@ class EventsBackgroundUpdatesStore(
                 to_check, to_defer = batch[:100], batch[100:]
                 soft_failed_events_to_lookup = set(to_defer)
 
-                if getattr(self, "_embedded_event_edges_enabled", False):
-                    recursive_rows: list[tuple[str, str, Any | None, bool]] = [
-                        (prev_event_id, event_id, metadata, rejected)
-                        for prev_event_id, event_id, metadata, rejected, _outlier in (
-                            self._get_edge_child_rows_mtxdb(
-                                txn, to_check, include_outlier=False
-                            )
+                recursive_rows: list[tuple[str, str, Any | None, bool]] = [
+                    (prev_event_id, event_id, metadata, rejected)
+                    for prev_event_id, event_id, metadata, rejected, _outlier in (
+                        self._get_edge_child_rows_mtxdb(
+                            txn, to_check, include_outlier=False
                         )
-                        if event_id is not None
-                    ]
-                else:
-                    sql = """SELECT prev_event_id, event_id, internal_metadata,
-                        rejections.event_id IS NOT NULL
-                        FROM event_edges
-                        INNER JOIN events USING (event_id)
-                        LEFT JOIN event_json USING (event_id)
-                        LEFT JOIN rejections USING (event_id)
-                        WHERE
-                            NOT events.outlier
-                            AND
-                    """
-                    clause, args = make_in_list_sql_clause(
-                        self.database_engine, "prev_event_id", to_check
                     )
-                    txn.execute(sql + clause, list(args))
-                    recursive_rows = txn.fetchall()
+                    if event_id is not None
+                ]
 
                 missing_meta_ids = [
                     event_id

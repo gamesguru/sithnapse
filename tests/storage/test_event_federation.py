@@ -734,11 +734,7 @@ class EventFederationWorkerStoreTestCase(tests.unittest.HomeserverTestCase):
         )
 
         put_event_edges_batch(
-            self.store._embedded_db_namespace,
-            [
-                (room_id, event_id, prev_event_id, False)
-                for event_id, prev_event_id in edges
-            ],
+            [(room_id, event_id, prev_event_id) for event_id, prev_event_id in edges],
             sync=True,
         )
 

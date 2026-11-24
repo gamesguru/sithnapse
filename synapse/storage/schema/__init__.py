@@ -19,7 +19,7 @@
 #
 #
 
-SCHEMA_VERSION = 97  # remember to update the list below when updating
+SCHEMA_VERSION = 98  # remember to update the list below when updating
 """Represents the expectations made by the codebase about the database schema
 
 This should be incremented whenever the codebase changes its requirements on the
@@ -199,8 +199,8 @@ Changes in SCHEMA_VERSION = 96
       embedded forward-edge index.
 
 Changes in SCHEMA_VERSION = 97
-    - Remove the retired event-edge migration background update, which is now
-      handled by the manual `synapse_event_edges_migrate` command.
+    - Remove the retired event-edge migration background update. Event DAG
+      adjacency lives in mtxdb's CSR store for every room.
     - Add the `auth_chain_backend` marker recording which backend holds
       authoritative auth edges. Existing databases remain SQL-authoritative
       until `synapse_auth_edges_migrate` verifies the mtxdb copy and flips it.
@@ -211,6 +211,10 @@ Changes in SCHEMA_VERSION = 97
     - Add `server_key_response_blobs` and `server_keys_json.response_id` so a
       signed server-key response is stored once instead of once per key.
     - Index `server_keys_json.response_id` for blob reference checks.
+
+Changes in SCHEMA_VERSION = 98
+    - Remove the retired SQL event-edge backend marker and any queued
+      replacement-index update. Event adjacency is stored in the CSR.
 """
 
 
@@ -221,7 +225,7 @@ SCHEMA_COMPAT_VERSION = (
     # present, SQL chain-cover tables have been dropped, and signed
     # server-key responses are stored once in `server_key_response_blobs`
     # rather than inline in every per-key row.
-    97
+    98
 )
 """Limit on how far the synapse codebase can be rolled back without breaking db compat
 

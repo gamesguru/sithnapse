@@ -56,7 +56,7 @@ from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
 from synapse.storage.databases.main.embedded_common import ffi_count, ffi_timing
 from synapse.storage.databases.main.events_worker import EventsWorkerStore
 from synapse.storage.databases.main.signatures import SignatureWorkerStore
-from synapse.storage.engines import PostgresEngine, Sqlite3Engine
+from synapse.storage.engines import PostgresEngine
 from synapse.types import JsonDict, StrCollection
 from synapse.util.caches.descriptors import cached
 from synapse.util.caches.lrucache import LruCache
@@ -1209,9 +1209,7 @@ class EventFederationWorkerStore(
         if not extremity_ids:
             return []
 
-        forward = get_event_edges_forward_batch(
-            self._embedded_db_namespace, extremity_ids
-        )
+        forward = get_event_edges_forward_batch(extremity_ids)
         candidates = [
             (child_id, extremity_id)
             for extremity_id in extremity_ids
@@ -1351,109 +1349,9 @@ class EventFederationWorkerStore(
         def get_backfill_points_in_room_txn(
             txn: LoggingTransaction, room_id: str
         ) -> list[tuple[str, int]]:
-            if getattr(self, "_embedded_event_edges_enabled", False):
-                return self._get_backfill_points_mtxdb(
-                    txn, room_id, nearby_depth, limit, include_failed
-                )
-
-            # Assemble a tuple lookup of event_id -> depth for the oldest events
-            # we know of in the room. Backwards extremities are the oldest
-            # events we know of in the room but we only know of them because
-            # some other event referenced them by prev_event and aren't
-            # persisted in our database yet (meaning we don't know their depth
-            # specifically). So we need to look for the approximate depth from
-            # the events connected to the current backwards extremities.
-
-            if isinstance(self.database_engine, PostgresEngine):
-                least_function = "LEAST"
-            elif isinstance(self.database_engine, Sqlite3Engine):
-                least_function = "MIN"
-            else:
-                raise RuntimeError("Unknown database engine")
-
-            sql = f"""
-                SELECT backward_extrem.event_id, event.depth FROM events AS event
-                /**
-                 * Get the edge connections from the event_edges table
-                 * so we can see whether this event's prev_events points
-                 * to a backward extremity in the next join.
-                 */
-                INNER JOIN event_edges AS edge
-                ON edge.event_id = event.event_id
-                /**
-                 * We find the "oldest" events in the room by looking for
-                 * events connected to backwards extremities (oldest events
-                 * in the room that we know of so far).
-                 */
-                INNER JOIN event_backward_extremities AS backward_extrem
-                ON edge.prev_event_id = backward_extrem.event_id
-                /**
-                 * We use this info to make sure we don't retry to use a backfill point
-                 * if we've already attempted to backfill from it recently.
-                 */
-                LEFT JOIN event_failed_pull_attempts AS failed_backfill_attempt_info
-                ON
-                    failed_backfill_attempt_info.room_id = backward_extrem.room_id
-                    AND failed_backfill_attempt_info.event_id = backward_extrem.event_id
-                WHERE
-                    backward_extrem.room_id = ?
-                    /**
-                     * We only want backwards extremities that are older than or at
-                     * the same position of the given `nearby_depth` (where older
-                     * means less than the given depth) because we're looking backwards
-                     * from the `nearby_depth` when backfilling.
-                     *
-                     * Keep in mind that `event.depth` is an approximate depth of the
-                     * backward extremity itself.
-                     *
-                     *                         nearby_depth (ignore events that come after this, ignore 2-4)
-                     *                         |
-                     *                         ▼
-                     * <oldest-in-time> [0]<--[1]<--[2]<--[3]<--[4] <newest-in-time>
-                     */
-                    AND event.depth <= ? /* nearby_depth */
-                    /**
-                     * Exponential back-off (up to the upper bound) so we don't retry the
-                     * same backfill point over and over. ex. 2hr, 4hr, 8hr, 16hr, etc.
-                     *
-                     * We use `1 << n` as a power of 2 equivalent for compatibility
-                     * with older SQLites. The left shift equivalent only works with
-                     * powers of 2 because left shift is a binary operation (base-2).
-                     * Otherwise, we would use `power(2, n)` or the power operator, `2^n`.
-                     */
-                    AND (
-                        ? /* include_failed */
-                        OR
-                        failed_backfill_attempt_info.event_id IS NULL
-                        OR ? /* current_time */ >= failed_backfill_attempt_info.last_attempt_ts + (
-                            (1 << {least_function}(failed_backfill_attempt_info.num_attempts, ? /* max doubling steps */))
-                            * ? /* step */
-                        )
-                    )
-                /**
-                 * Sort from highest (closest to the `nearby_depth`) to the lowest depth
-                 * because the closest are most relevant to backfill from first.
-                 * Then tie-break on alphabetical order of the event_ids so we get a
-                 * consistent ordering which is nice when asserting things in tests.
-                 */
-                ORDER BY event.depth DESC, backward_extrem.event_id DESC
-                LIMIT ?
-            """
-
-            txn.execute(
-                sql,
-                (
-                    room_id,
-                    nearby_depth,
-                    include_failed,
-                    self.clock.time_msec(),
-                    BACKFILL_EVENT_EXPONENTIAL_BACKOFF_MAXIMUM_DOUBLING_STEPS,
-                    BACKFILL_EVENT_EXPONENTIAL_BACKOFF_STEP_MILLISECONDS,
-                    limit,
-                ),
+            return self._get_backfill_points_mtxdb(
+                txn, room_id, nearby_depth, limit, include_failed
             )
-
-            return cast(list[tuple[str, int]], txn.fetchall())
 
         return await self.db_pool.runInteraction(
             "get_backfill_points_in_room",
@@ -1765,66 +1663,25 @@ class EventFederationWorkerStore(
         Returns:
             List of prev events that the backfill queue can process
         """
-        if getattr(self, "_embedded_event_edges_enabled", False):
-            from synapse.storage.databases.main.embedded_event_edges import (
-                get_event_edges_backward_batch,
-            )
+        from synapse.storage.databases.main.embedded_event_edges import (
+            get_event_edges_backward_batch,
+        )
 
-            backward = get_event_edges_backward_batch(
-                self._embedded_db_namespace, [event_id]
-            )
-            prev_ids = [
-                prev_event_id
-                for prev_event_id, _is_state in (backward.get(event_id) or ())
-            ]
-            if not prev_ids:
-                return []
-            clause, args = make_in_list_sql_clause(
-                self.database_engine, "event_id", prev_ids
-            )
-            txn.execute(
-                f"""
-                SELECT depth, stream_ordering, event_id, type FROM events
-                WHERE NOT outlier AND {clause}
-                ORDER BY depth DESC, stream_ordering DESC
-                LIMIT ?
-                """,
-                (*args, limit),
-            )
-            return [
-                BackfillQueueNavigationItem(
-                    depth=row[0],
-                    stream_ordering=row[1],
-                    event_id=row[2],
-                    type=row[3],
-                )
-                for row in txn
-            ]
-
-        # Look for the prev_event_id connected to the given event_id
-        connected_prev_event_query = """
-            SELECT depth, stream_ordering, prev_event_id, events.type FROM event_edges
-            /* Get the depth and stream_ordering of the prev_event_id from the events table */
-            INNER JOIN events
-            ON prev_event_id = events.event_id
-
-            /* exclude outliers from the results (we don't have the state, so cannot
-             * verify if the requesting server can see them).
-             */
-            WHERE NOT events.outlier
-
-            /* Look for an edge which matches the given event_id */
-            AND event_edges.event_id = ?
-
-            /* Because we can have many events at the same depth,
-            * we want to also tie-break and sort on stream_ordering */
+        backward = get_event_edges_backward_batch([event_id])
+        prev_ids = list(backward.get(event_id) or ())
+        if not prev_ids:
+            return []
+        clause, args = make_in_list_sql_clause(
+            self.database_engine, "event_id", prev_ids
+        )
+        txn.execute(
+            f"""
+            SELECT depth, stream_ordering, event_id, type FROM events
+            WHERE NOT outlier AND {clause}
             ORDER BY depth DESC, stream_ordering DESC
             LIMIT ?
-        """
-
-        txn.execute(
-            connected_prev_event_query,
-            (event_id, limit),
+            """,
+            (*args, limit),
         )
         return [
             BackfillQueueNavigationItem(
@@ -2151,114 +2008,55 @@ class EventFederationWorkerStore(
         latest_events: list[str],
         limit: int,
     ) -> list[str]:
-        if getattr(self, "_embedded_event_edges_enabled", False):
-            from synapse.storage.databases.main.embedded_event_edges import (
-                get_event_edges_backward_batch,
-            )
+        from synapse.storage.databases.main.embedded_event_edges import (
+            get_event_edges_backward_batch,
+        )
 
-            seen_events = set(earliest_events)
-            latest_clause, latest_args = make_in_list_sql_clause(
-                self.database_engine,
-                "event_id",
-                set(latest_events) - seen_events,
-            )
-            txn.execute(
-                f"SELECT event_id FROM events WHERE {latest_clause} AND room_id = ?",
-                (*latest_args, room_id),
-            )
-            front = {event_id for (event_id,) in txn}
-            mtxdb_results: list[str] = []
-
-            while front and len(mtxdb_results) < limit:
-                backward = get_event_edges_backward_batch(
-                    self._embedded_db_namespace, list(front)
-                )
-                candidates = {
-                    prev_event_id
-                    for edges in backward.values()
-                    if edges
-                    for prev_event_id, _is_state in edges
-                } - seen_events
-                if not candidates:
-                    break
-
-                candidate_clause, candidate_args = make_in_list_sql_clause(
-                    self.database_engine, "event_id", list(candidates)
-                )
-                txn.execute(
-                    f"SELECT event_id FROM events WHERE {candidate_clause} "
-                    "AND room_id = ?",
-                    (*candidate_args, room_id),
-                )
-                new_results = {event_id for (event_id,) in txn} - seen_events
-                if not new_results:
-                    break
-
-                limited_results = list(
-                    itertools.islice(new_results, limit - len(mtxdb_results))
-                )
-                new_front = set(limited_results)
-                seen_events |= new_front
-                mtxdb_results.extend(limited_results)
-                front = new_front
-
-            mtxdb_results.reverse()
-            return mtxdb_results
-
-        # It's OK that this has not been filtered by correct-room,
-        # because we will only compare based on event ID from the events
-        # we happen to run into.
         seen_events = set(earliest_events)
-
-        # Pre-filter the `latest_events` to only include those
-        # that are in this room (and that we know about)
-        # This makes events in the wrong room get treated the same as unknown events.
-        events_clause, events_args = make_in_list_sql_clause(
+        latest_clause, latest_args = make_in_list_sql_clause(
             self.database_engine,
             "event_id",
-            # Don't waste time looking at events that the requester told us
-            # they already know about.
-            # (They probably shouldn't send this in the first place)
             set(latest_events) - seen_events,
         )
         txn.execute(
-            f"""
-            SELECT event_id
-            FROM events
-            WHERE {events_clause} AND room_id = ?
-            """,
-            (*events_args, room_id),
+            f"SELECT event_id FROM events WHERE {latest_clause} AND room_id = ?",
+            (*latest_args, room_id),
         )
-        # Start walking back from the legitimate and known `latest_events`
-        front = {latest_event_id for (latest_event_id,) in txn}
+        front = {event_id for (event_id,) in txn}
+        mtxdb_results: list[str] = []
 
-        event_results: list[str] = []
+        while front and len(mtxdb_results) < limit:
+            backward = get_event_edges_backward_batch(list(front))
+            candidates = {
+                prev_event_id
+                for edges in backward.values()
+                if edges
+                for prev_event_id in edges
+            } - seen_events
+            if not candidates:
+                break
 
-        while front and len(event_results) < limit:
-            new_front = set()
-            for event_id in front:
-                txn.execute(
-                    """
-                    SELECT ee.prev_event_id FROM event_edges AS ee
-                    JOIN events ON events.event_id = ee.prev_event_id
-                    WHERE ee.event_id = ?
-                    AND events.room_id = ?
-                    LIMIT ?
-                    """,
-                    (event_id, room_id, limit - len(event_results)),
-                )
-                new_results = {t[0] for t in txn} - seen_events
+            candidate_clause, candidate_args = make_in_list_sql_clause(
+                self.database_engine, "event_id", list(candidates)
+            )
+            txn.execute(
+                f"SELECT event_id FROM events WHERE {candidate_clause} AND room_id = ?",
+                (*candidate_args, room_id),
+            )
+            new_results = {event_id for (event_id,) in txn} - seen_events
+            if not new_results:
+                break
 
-                new_front |= new_results
-                seen_events |= new_results
-                event_results.extend(new_results)
-
+            limited_results = list(
+                itertools.islice(new_results, limit - len(mtxdb_results))
+            )
+            new_front = set(limited_results)
+            seen_events |= new_front
+            mtxdb_results.extend(limited_results)
             front = new_front
 
-        # we built the list working backwards from latest_events; we now need to
-        # reverse it so that the events are approximately chronological.
-        event_results.reverse()
-        return event_results
+        mtxdb_results.reverse()
+        return mtxdb_results
 
     @trace
     @tag_args
@@ -2275,50 +2073,35 @@ class EventFederationWorkerStore(
             record_event_edge_read,
         )
 
-        if getattr(self, "_embedded_event_edges_enabled", False):
-            embedded_started = time.monotonic()
-            forward_map = get_event_edges_forward_batch(
-                self._embedded_db_namespace, [event_id]
-            )
-            ffi_timing(
-                "event_edges_successor_embedded_read",
-                time.monotonic() - embedded_started,
-            )
-            successors = forward_map.get(event_id)
-            if successors is not None:
-                # The forward index is written before the SQL commit, so it can
-                # name children without a committed row.
-                if successors:
-                    committed = await self.db_pool.simple_select_many_batch(
-                        table="events",
-                        column="event_id",
-                        iterable=successors,
-                        retcols=["event_id"],
-                        desc="get_successor_events_committed",
-                    )
-                    committed_ids = {row[0] for row in committed}
-                    successors = [e for e in successors if e in committed_ids]
-                ffi_count("event_edges_successor_hits", 1)
-                record_event_edge_read(self.server_name, "successor", "hit")
-                ffi_timing("event_edges_successor_total", time.monotonic() - started)
-                return successors
-
-            ffi_count("event_edges_successor_misses", 1)
-            record_event_edge_read(self.server_name, "successor", "miss")
-            ffi_timing("event_edges_successor_total", time.monotonic() - started)
-            return []
-
-        record_event_edge_read(self.server_name, "successor", "sql_only")
-        sql_started = time.monotonic()
-        sql_res = await self.db_pool.simple_select_onecol(
-            table="event_edges",
-            keyvalues={"prev_event_id": event_id},
-            retcol="event_id",
-            desc="get_successor_events",
+        embedded_started = time.monotonic()
+        forward_map = get_event_edges_forward_batch([event_id])
+        ffi_timing(
+            "event_edges_successor_embedded_read",
+            time.monotonic() - embedded_started,
         )
-        ffi_timing("event_edges_successor_sql_only", time.monotonic() - sql_started)
+        successors = forward_map.get(event_id)
+        if successors is not None:
+            # The forward index is written before the SQL commit, so it can
+            # name children without a committed row.
+            if successors:
+                committed = await self.db_pool.simple_select_many_batch(
+                    table="events",
+                    column="event_id",
+                    iterable=successors,
+                    retcols=["event_id"],
+                    desc="get_successor_events_committed",
+                )
+                committed_ids = {row[0] for row in committed}
+                successors = [e for e in successors if e in committed_ids]
+            ffi_count("event_edges_successor_hits", 1)
+            record_event_edge_read(self.server_name, "successor", "hit")
+            ffi_timing("event_edges_successor_total", time.monotonic() - started)
+            return successors
+
+        ffi_count("event_edges_successor_misses", 1)
+        record_event_edge_read(self.server_name, "successor", "miss")
         ffi_timing("event_edges_successor_total", time.monotonic() - started)
-        return sql_res
+        return []
 
     @wrap_as_background_process("delete_old_forward_extrem_cache")
     async def _delete_old_forward_extrem_cache(self) -> None:

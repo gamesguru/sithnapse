@@ -142,14 +142,12 @@ def main() -> None:
             elif command == "edges_put":
                 # edges_put <room_id> <event_id> <prev_event_id>
                 room_id, event_id, prev_event_id = args
-                mtxdb_engine.event_edges_put(
-                    namespace, [(room_id, event_id, prev_event_id, False)]
-                )
+                mtxdb_engine.adjacency_put([(room_id, event_id, [prev_event_id], [])])
                 reply = "ok"
             elif command == "edges_get":
                 # edges_get <prev_event_id>
                 (prev_event_id,) = args
-                forward = get_event_edges_forward_batch(namespace, [prev_event_id])
+                forward = get_event_edges_forward_batch([prev_event_id])
                 reply = json.dumps(forward)
             elif command == "fsyncs":
                 reply = str(_fsyncs())

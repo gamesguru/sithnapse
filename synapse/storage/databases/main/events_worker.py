@@ -2675,8 +2675,6 @@ class EventsWorkerStore(SQLBaseStore):
             "This function relies on `event_edges` and `event_forward_extremities` which won't be filled in for `outliers`."
         )
 
-        embedded_edges_trustworthy = self._embedded_event_edges_enabled
-
         def is_event_next_to_gap_txn(txn: LoggingTransaction) -> bool:
             # If the event in question is a forward extremity, we will just
             # consider any potential forward gap as not a gap since it's one of
@@ -2711,65 +2709,35 @@ class EventsWorkerStore(SQLBaseStore):
             if txn.fetchone():
                 return False
 
-            if not embedded_edges_trustworthy:
-                record_event_edge_read(self.server_name, "gap", "sql_only")
-            if embedded_edges_trustworthy:
-                from synapse.storage.databases.main.embedded_event_edges import (
-                    get_event_edges_forward_batch,
-                )
+            from synapse.storage.databases.main.embedded_event_edges import (
+                get_event_edges_forward_batch,
+            )
 
-                forward_map = get_event_edges_forward_batch(
-                    self._embedded_db_namespace, [event.event_id]
-                )
-                children = forward_map.get(event.event_id)
-                if children is None:
-                    ffi_count("event_edges_gap_misses", 1)
-                    record_event_edge_read(self.server_name, "gap", "miss")
-                    return True
-                ffi_count("event_edges_gap_hits", 1)
-                record_event_edge_read(self.server_name, "gap", "hit")
-                if not children:
-                    return True
-                # The forward index can name children that have no committed
-                # row in `events`; only a committed, non-rejected child
-                # suppresses the gap.
-                clause, args = make_in_list_sql_clause(
-                    self.database_engine, "e.event_id", children
-                )
-                txn.execute(
-                    "SELECT 1 FROM events AS e "
-                    "LEFT JOIN rejections AS r ON r.event_id = e.event_id "
-                    f"WHERE r.event_id IS NULL AND {clause} LIMIT 1",
-                    args,
-                )
-                if txn.fetchone():
-                    return False
+            forward_map = get_event_edges_forward_batch([event.event_id])
+            children = forward_map.get(event.event_id)
+            if children is None:
+                ffi_count("event_edges_gap_misses", 1)
+                record_event_edge_read(self.server_name, "gap", "miss")
                 return True
-
-            # Non-mtxdb stores keep the legacy SQL edge table. On an mtxdb
-            # store the branch above is authoritative: a missing forward record
-            # means no known children, so this event is next to a forward gap.
-            forward_edge_query = """
-                SELECT 1 FROM event_edges
-                /* Check to make sure the event referencing our event in question is not rejected */
-                LEFT JOIN rejections ON event_edges.event_id = rejections.event_id
-                WHERE
-                    event_edges.prev_event_id = ?
-                    /* It's not a valid edge if the event referencing our event in
-                     * question is rejected.
-                     */
-                    AND rejections.event_id IS NULL
-                LIMIT 1
-            """
-
-            # If there are no forward edges to the event in question (another
-            # event hasn't referenced this event in their prev_events), then we
-            # assume there is a forward gap in the history.
-            txn.execute(forward_edge_query, (event.event_id,))
-            if not txn.fetchone():
+            ffi_count("event_edges_gap_hits", 1)
+            record_event_edge_read(self.server_name, "gap", "hit")
+            if not children:
                 return True
-
-            return False
+            # The forward index can name children that have no committed
+            # row in `events`; only a committed, non-rejected child
+            # suppresses the gap.
+            clause, args = make_in_list_sql_clause(
+                self.database_engine, "e.event_id", children
+            )
+            txn.execute(
+                "SELECT 1 FROM events AS e "
+                "LEFT JOIN rejections AS r ON r.event_id = e.event_id "
+                f"WHERE r.event_id IS NULL AND {clause} LIMIT 1",
+                args,
+            )
+            if txn.fetchone():
+                return False
+            return True
 
         return await self.db_pool.runInteraction(
             "is_event_next_to_gap_txn",
@@ -2932,104 +2900,84 @@ class EventsWorkerStore(SQLBaseStore):
         # hard to do much about.
         #
         # See also: https://github.com/matrix-org/synapse/issues/13001
-        if getattr(self, "_embedded_event_edges_enabled", False):
-            from synapse.storage.databases.main.embedded_event_edges import (
-                get_event_edges_backward_batch,
-            )
-
-            ready: list[str] = []
-            # Keyset cursor (stream_ordering, event_id): rows removed
-            # concurrently cannot shift unseen candidates past the cursor.
-            cursor_stream: int | None = None
-            cursor_event_id = ""
-            while True:
-                if cursor_stream is None:
-                    txn.execute(
-                        """
-                        SELECT pse.event_id, events.stream_ordering
-                        FROM partial_state_events AS pse
-                            JOIN events USING (event_id)
-                        WHERE pse.room_id = ?
-                        ORDER BY events.stream_ordering, pse.event_id
-                        LIMIT 1000
-                        """,
-                        (room_id,),
-                    )
-                else:
-                    txn.execute(
-                        """
-                        SELECT pse.event_id, events.stream_ordering
-                        FROM partial_state_events AS pse
-                            JOIN events USING (event_id)
-                        WHERE pse.room_id = ?
-                            AND (events.stream_ordering > ?
-                                 OR (events.stream_ordering = ? AND pse.event_id > ?))
-                        ORDER BY events.stream_ordering, pse.event_id
-                        LIMIT 1000
-                        """,
-                        (room_id, cursor_stream, cursor_stream, cursor_event_id),
-                    )
-                page = [(row[0], row[1]) for row in txn]
-                if not page:
-                    break
-                candidates = [event_id for event_id, _ in page]
-                cursor_event_id, cursor_stream = page[-1]
-
-                backward = get_event_edges_backward_batch(
-                    self._embedded_db_namespace, candidates
-                )
-                prev_ids = {
-                    prev_event_id
-                    for event_id in candidates
-                    for prev_event_id, _is_state in (backward.get(event_id) or ())
-                }
-                partial_prevs: set[str] = set()
-                prev_id_list = list(prev_ids)
-                # Keep SQLite below its bind-variable limit even for events
-                # with unusually large predecessor sets.
-                for start in range(0, len(prev_id_list), 500):
-                    clause, args = make_in_list_sql_clause(
-                        self.database_engine,
-                        "event_id",
-                        prev_id_list[start : start + 500],
-                    )
-                    txn.execute(
-                        f"SELECT event_id FROM partial_state_events WHERE {clause}",
-                        args,
-                    )
-                    partial_prevs.update(row[0] for row in txn)
-
-                for event_id in candidates:
-                    if any(
-                        prev_event_id in partial_prevs
-                        for prev_event_id, _is_state in (backward.get(event_id) or ())
-                    ):
-                        continue
-                    ready.append(event_id)
-                    if len(ready) >= 100:
-                        break
-                # Return as soon as this page yielded anything; only keep
-                # scanning when nothing here was ready.
-                if ready:
-                    break
-            return ready
-
-        txn.execute(
-            """
-            SELECT event_id FROM partial_state_events AS pse
-                JOIN events USING (event_id)
-            WHERE pse.room_id = ? AND
-               NOT EXISTS(
-                  SELECT 1 FROM event_edges AS ee
-                     JOIN partial_state_events AS prev_pse ON (prev_pse.event_id=ee.prev_event_id)
-                     WHERE ee.event_id=pse.event_id
-               )
-            ORDER BY events.stream_ordering
-            LIMIT 100
-            """,
-            (room_id,),
+        from synapse.storage.databases.main.embedded_event_edges import (
+            get_event_edges_backward_batch,
         )
-        return [row[0] for row in txn]
+
+        ready: list[str] = []
+        # Keyset cursor (stream_ordering, event_id): rows removed
+        # concurrently cannot shift unseen candidates past the cursor.
+        cursor_stream: int | None = None
+        cursor_event_id = ""
+        while True:
+            if cursor_stream is None:
+                txn.execute(
+                    """
+                    SELECT pse.event_id, events.stream_ordering
+                    FROM partial_state_events AS pse
+                        JOIN events USING (event_id)
+                    WHERE pse.room_id = ?
+                    ORDER BY events.stream_ordering, pse.event_id
+                    LIMIT 1000
+                    """,
+                    (room_id,),
+                )
+            else:
+                txn.execute(
+                    """
+                    SELECT pse.event_id, events.stream_ordering
+                    FROM partial_state_events AS pse
+                        JOIN events USING (event_id)
+                    WHERE pse.room_id = ?
+                        AND (events.stream_ordering > ?
+                             OR (events.stream_ordering = ? AND pse.event_id > ?))
+                    ORDER BY events.stream_ordering, pse.event_id
+                    LIMIT 1000
+                    """,
+                    (room_id, cursor_stream, cursor_stream, cursor_event_id),
+                )
+            page = [(row[0], row[1]) for row in txn]
+            if not page:
+                break
+            candidates = [event_id for event_id, _ in page]
+            cursor_event_id, cursor_stream = page[-1]
+
+            backward = get_event_edges_backward_batch(candidates)
+            prev_ids = {
+                prev_event_id
+                for event_id in candidates
+                for prev_event_id in (backward.get(event_id) or ())
+            }
+            partial_prevs: set[str] = set()
+            prev_id_list = list(prev_ids)
+            # Keep SQLite below its bind-variable limit even for events
+            # with unusually large predecessor sets.
+            for start in range(0, len(prev_id_list), 500):
+                clause, args = make_in_list_sql_clause(
+                    self.database_engine,
+                    "event_id",
+                    prev_id_list[start : start + 500],
+                )
+                txn.execute(
+                    f"SELECT event_id FROM partial_state_events WHERE {clause}",
+                    args,
+                )
+                partial_prevs.update(row[0] for row in txn)
+
+            for event_id in candidates:
+                if any(
+                    prev_event_id in partial_prevs
+                    for prev_event_id in (backward.get(event_id) or ())
+                ):
+                    continue
+                ready.append(event_id)
+                if len(ready) >= 100:
+                    break
+            # Return as soon as this page yielded anything; only keep
+            # scanning when nothing here was ready.
+            if ready:
+                break
+        return ready
 
     def mark_event_rejected_txn(
         self,

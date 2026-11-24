@@ -977,87 +977,51 @@ class PersistEventsStore:
             Exclude outlier, rejected, and soft-failed children. Missing metadata
             is treated as not soft-failed after an optional embedded lookup.
             """
-            if self._embedded_event_edges_enabled:
-                _t = time.monotonic()
-                forward = get_event_edges_forward_batch(
-                    self._embedded_db_namespace, list(batch)
-                )
-                ffi_timing("persist_prevs_mtxdb_forward", time.monotonic() - _t)
-                parents_by_child: dict[str, list[str]] = {}
-                for parent_id, children in forward.items():
-                    if not children:
-                        continue
-                    for child_id in children:
-                        parents_by_child.setdefault(child_id, []).append(parent_id)
-                if not parents_by_child:
-                    ffi_count("persist_prevs_mtxdb_empty", len(batch))
-                    return
-
-                clause, args = make_in_list_sql_clause(
-                    self.database_engine, "event_id", list(parents_by_child)
-                )
-                _t = time.monotonic()
-                txn.execute(
-                    f"""
-                    SELECT events.event_id, event_json.internal_metadata
-                    FROM events
-                        LEFT JOIN rejections USING (event_id)
-                        LEFT JOIN event_json USING (event_id)
-                    WHERE
-                        NOT events.outlier
-                        AND rejections.event_id IS NULL
-                        AND {clause}
-                    """,
-                    args,
-                )
-                rows = txn.fetchall()
-                ffi_timing("persist_prevs_sql_exec", time.monotonic() - _t)
-                ffi_count("persist_prevs_sql_rows", len(rows))
-                if not rows:
-                    return
-
-                missing_meta_ids = [event_id for event_id, meta in rows if meta is None]
-                meta_by_id = self._get_embedded_event_metadata(txn, missing_meta_ids)
-
-                for event_id, meta in rows:
-                    if meta is None:
-                        meta = meta_by_id.get(event_id)
-                    if not meta or not db_to_json(meta).get("soft_failed"):
-                        results.extend(parents_by_child.get(event_id, ()))
+            _t = time.monotonic()
+            forward = get_event_edges_forward_batch(list(batch))
+            ffi_timing("persist_prevs_mtxdb_forward", time.monotonic() - _t)
+            parents_by_child: dict[str, list[str]] = {}
+            for parent_id, children in forward.items():
+                if not children:
+                    continue
+                for child_id in children:
+                    parents_by_child.setdefault(child_id, []).append(parent_id)
+            if not parents_by_child:
+                ffi_count("persist_prevs_mtxdb_empty", len(batch))
                 return
 
-            sql = """
-            SELECT prev_event_id, internal_metadata, event_id
-            FROM event_edges
-                INNER JOIN events USING (event_id)
-                LEFT JOIN rejections USING (event_id)
-                LEFT JOIN event_json USING (event_id)
-            WHERE
-                NOT events.outlier
-                AND rejections.event_id IS NULL
-                AND
-            """
-
             clause, args = make_in_list_sql_clause(
-                self.database_engine, "prev_event_id", batch
+                self.database_engine, "event_id", list(parents_by_child)
             )
-
             _t = time.monotonic()
-            txn.execute(sql + clause, args)
+            txn.execute(
+                f"""
+                SELECT events.event_id, event_json.internal_metadata
+                FROM events
+                    LEFT JOIN rejections USING (event_id)
+                    LEFT JOIN event_json USING (event_id)
+                WHERE
+                    NOT events.outlier
+                    AND rejections.event_id IS NULL
+                    AND {clause}
+                """,
+                args,
+            )
             rows = txn.fetchall()
             ffi_timing("persist_prevs_sql_exec", time.monotonic() - _t)
             ffi_count("persist_prevs_sql_rows", len(rows))
             if not rows:
                 return
 
-            missing_meta_ids = [event_id for _, meta, event_id in rows if meta is None]
+            missing_meta_ids = [event_id for event_id, meta in rows if meta is None]
             meta_by_id = self._get_embedded_event_metadata(txn, missing_meta_ids)
 
-            for prev_event_id, meta, event_id in rows:
+            for event_id, meta in rows:
                 if meta is None:
                     meta = meta_by_id.get(event_id)
                 if not meta or not db_to_json(meta).get("soft_failed"):
-                    results.append(prev_event_id)
+                    results.extend(parents_by_child.get(event_id, ()))
+            return
 
         for chunk in batch_iter(event_ids, 100):
             _t = time.monotonic()
@@ -1109,101 +1073,48 @@ class PersistEventsStore:
             to_recursively_check = list(batch)
 
             while to_recursively_check:
-                if self._embedded_event_edges_enabled:
-                    _t = time.monotonic()
-                    backward = get_event_edges_backward_batch(
-                        self._embedded_db_namespace, to_recursively_check
-                    )
-                    ffi_timing("persist_rejected_mtxdb_backward", time.monotonic() - _t)
-                    present = [
-                        event_id
-                        for event_id in to_recursively_check
-                        if backward.get(event_id) is not None
-                    ]
-                    if not present:
-                        break
-
-                    clause, args = make_in_list_sql_clause(
-                        self.database_engine, "event_id", present
-                    )
-                    _t = time.monotonic()
-                    txn.execute(
-                        f"""
-                        SELECT
-                            events.event_id, event_json.internal_metadata,
-                            rejections.event_id IS NOT NULL
-                        FROM events
-                            LEFT JOIN rejections USING (event_id)
-                            LEFT JOIN event_json USING (event_id)
-                        WHERE
-                            NOT events.outlier
-                            AND {clause}
-                        """,
-                        args,
-                    )
-                    rows = txn.fetchall()
-                    ffi_timing("persist_rejected_sql_exec", time.monotonic() - _t)
-                    ffi_count("persist_rejected_sql_rows", len(rows))
-                    to_recursively_check = []
-
-                    missing_meta_ids = [
-                        event_id for event_id, meta, _ in rows if meta is None
-                    ]
-                    meta_by_id = self._get_embedded_event_metadata(
-                        txn, missing_meta_ids
-                    )
-
-                    for event_id, metadata, rejected in rows:
-                        edges = backward.get(event_id)
-                        if not edges:
-                            continue
-                        if metadata is None:
-                            metadata = meta_by_id.get(event_id)
-
-                        soft_failed = (
-                            db_to_json(metadata).get("soft_failed")
-                            if metadata
-                            else False
-                        )
-                        if (include_soft_failed and soft_failed) or rejected:
-                            for prev_event_id, _is_state in edges:
-                                if prev_event_id in existing_prevs:
-                                    continue
-                                to_recursively_check.append(prev_event_id)
-                                existing_prevs.add(prev_event_id)
-                    continue
-
-                sql = """
-                SELECT
-                    event_id, prev_event_id, internal_metadata,
-                    rejections.event_id IS NOT NULL
-                FROM event_edges
-                    INNER JOIN events USING (event_id)
-                    LEFT JOIN rejections USING (event_id)
-                    LEFT JOIN event_json USING (event_id)
-                WHERE
-                    NOT events.outlier
-                    AND
-                """
+                _t = time.monotonic()
+                backward = get_event_edges_backward_batch(to_recursively_check)
+                ffi_timing("persist_rejected_mtxdb_backward", time.monotonic() - _t)
+                present = [
+                    event_id
+                    for event_id in to_recursively_check
+                    if backward.get(event_id) is not None
+                ]
+                if not present:
+                    break
 
                 clause, args = make_in_list_sql_clause(
-                    self.database_engine, "event_id", to_recursively_check
+                    self.database_engine, "event_id", present
                 )
-
                 _t = time.monotonic()
-                txn.execute(sql + clause, args)
+                txn.execute(
+                    f"""
+                    SELECT
+                        events.event_id, event_json.internal_metadata,
+                        rejections.event_id IS NOT NULL
+                    FROM events
+                        LEFT JOIN rejections USING (event_id)
+                        LEFT JOIN event_json USING (event_id)
+                    WHERE
+                        NOT events.outlier
+                        AND {clause}
+                    """,
+                    args,
+                )
                 rows = txn.fetchall()
                 ffi_timing("persist_rejected_sql_exec", time.monotonic() - _t)
                 ffi_count("persist_rejected_sql_rows", len(rows))
                 to_recursively_check = []
 
                 missing_meta_ids = [
-                    event_id for event_id, _, meta, _ in rows if meta is None
+                    event_id for event_id, meta, _ in rows if meta is None
                 ]
                 meta_by_id = self._get_embedded_event_metadata(txn, missing_meta_ids)
 
-                for event_id, prev_event_id, metadata, rejected in rows:
-                    if prev_event_id in existing_prevs:
+                for event_id, metadata, rejected in rows:
+                    edges = backward.get(event_id)
+                    if not edges:
                         continue
                     if metadata is None:
                         metadata = meta_by_id.get(event_id)
@@ -1212,8 +1123,11 @@ class PersistEventsStore:
                         db_to_json(metadata).get("soft_failed") if metadata else False
                     )
                     if (include_soft_failed and soft_failed) or rejected:
-                        to_recursively_check.append(prev_event_id)
-                        existing_prevs.add(prev_event_id)
+                        for prev_event_id in edges:
+                            if prev_event_id in existing_prevs:
+                                continue
+                            to_recursively_check.append(prev_event_id)
+                            existing_prevs.add(prev_event_id)
 
         for chunk in batch_iter(event_ids, 100):
             _t = time.monotonic()
@@ -4296,49 +4210,20 @@ class PersistEventsStore:
         For the given event, update the event edges table and forward and
         backward extremities tables.
         """
-        edge_values = list(
-            dict.fromkeys(
-                (ev.event_id, e_id) for ev in events for e_id in ev.prev_event_ids()
-            )
-        )
-        # Exactly one edge store is written: mtxdb when the embedded engine is
-        # enabled, SQL otherwise. Never both.
-        if edge_values and not self._embedded_event_edges_enabled:
-            if isinstance(self.database_engine, PostgresEngine):
-                sql = (
-                    "INSERT INTO event_edges (event_id, prev_event_id) "
-                    "VALUES ? ON CONFLICT DO NOTHING"
-                )
-                txn.execute_values(sql, edge_values, fetch=False)
-            else:
-                sql = (
-                    "INSERT INTO event_edges (event_id, prev_event_id) "
-                    "VALUES (?, ?) ON CONFLICT (event_id, prev_event_id) DO NOTHING"
-                )
-                txn.executemany(sql, edge_values)
-
         if self._embedded_event_edges_writable:
             edge_rows = [
-                (ev.room_id, ev.event_id, e_id, False)
+                (ev.room_id, ev.event_id, e_id)
                 for ev in events
                 for e_id in ev.prev_event_ids()
             ]
             if edge_rows:
-                # Write edges before the SQL COMMIT, never from a post-commit
-                # callback: a callback could be lost to a crash or fail without
-                # aborting the persist, leaving a committed event with no
-                # edges and no recovery path. With the shared WAL, stage them
-                # beside the event JSON so both are all-or-nothing. Without
-                # one, write directly: the persist's in-transaction EVENT_DAG
-                # barrier then makes them durable before SQL commits. A SQL
-                # rollback can leave orphan edges, the same trade-off event
-                # JSON already makes, but a committed event cannot lack them.
-                #
-                # Do not route this through `flush_edge_writes()`: its
-                # sync=True path drains the coalescer and would try to re-take
-                # the non-reentrant per-namespace flush lock from here.
+                # Write adjacency before the SQL COMMIT, never from a
+                # post-commit callback: a callback could be lost to a crash or
+                # fail without aborting the persist, leaving a committed event
+                # with no adjacency. The CSR append is durable when it returns,
+                # so a SQL rollback can leave orphan adjacency (an event no
+                # reader can see), but a committed event cannot lack it.
                 put_event_edges_batch(
-                    self._embedded_db_namespace,
                     edge_rows,
                     transaction=mtxdb_txn,
                 )

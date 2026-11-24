@@ -154,49 +154,33 @@ def _discover_room_txn(
     )
     rejected_count = _count_from_row(txn.fetchone())
 
-    if getattr(store, "_embedded_event_edges_enabled", False):
-        from synapse.storage.databases.main.embedded_event_edges import (
-            get_event_edges_backward_batch,
-        )
+    from synapse.storage.databases.main.embedded_event_edges import (
+        get_event_edges_backward_batch,
+    )
 
-        txn.execute("SELECT event_id FROM events WHERE room_id = ?", (room_id,))
-        room_event_ids = [row[0] for row in txn]
-        backward = get_event_edges_backward_batch(
-            store._embedded_db_namespace, room_event_ids
-        )
-        prev_event_ids = [
-            prev_event_id
-            for edges in backward.values()
-            if edges
-            for prev_event_id, _is_state in edges
-        ]
-        missing_prev_event_edges = 0
-        if prev_event_ids:
-            distinct_prev_event_ids = list(set(prev_event_ids))
-            existing: set[str] = set()
-            # Chunk the lookup: SQLite binds one placeholder per ID and a large
-            # room can exceed its bind-variable limit.
-            for start in range(0, len(distinct_prev_event_ids), 500):
-                clause, args = make_in_list_sql_clause(
-                    store.database_engine,
-                    "event_id",
-                    distinct_prev_event_ids[start : start + 500],
-                )
-                txn.execute(f"SELECT event_id FROM events WHERE {clause}", args)
-                existing.update(row[0] for row in txn)
-            missing_prev_event_edges = sum(
-                1 for prev_event_id in prev_event_ids if prev_event_id not in existing
+    txn.execute("SELECT event_id FROM events WHERE room_id = ?", (room_id,))
+    room_event_ids = [row[0] for row in txn]
+    backward = get_event_edges_backward_batch(room_event_ids)
+    prev_event_ids = [
+        prev_event_id for edges in backward.values() if edges for prev_event_id in edges
+    ]
+    missing_prev_event_edges = 0
+    if prev_event_ids:
+        distinct_prev_event_ids = list(set(prev_event_ids))
+        existing: set[str] = set()
+        # Chunk the lookup: SQLite binds one placeholder per ID and a large
+        # room can exceed its bind-variable limit.
+        for start in range(0, len(distinct_prev_event_ids), 500):
+            clause, args = make_in_list_sql_clause(
+                store.database_engine,
+                "event_id",
+                distinct_prev_event_ids[start : start + 500],
             )
-    else:
-        txn.execute(
-            """
-            SELECT COUNT(*) FROM event_edges AS edge
-            LEFT JOIN events AS prev ON prev.event_id = edge.prev_event_id
-            WHERE edge.room_id = ? AND prev.event_id IS NULL
-            """,
-            (room_id,),
+            txn.execute(f"SELECT event_id FROM events WHERE {clause}", args)
+            existing.update(row[0] for row in txn)
+        missing_prev_event_edges = sum(
+            1 for prev_event_id in prev_event_ids if prev_event_id not in existing
         )
-        missing_prev_event_edges = _count_from_row(txn.fetchone())
 
     return {
         "room_id": room_id,

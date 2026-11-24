@@ -1412,10 +1412,8 @@ class _FlushCoalescer:
         """Mark a pool as dirty.  Called via txn.call_after after SQL commit.
 
         The debounce timer is scheduled even when fsync is disabled
-        (`no_sync`): `_flush` also drains the coalesced edge-write queues, and
-        those queued rows must land in mtxdb (and be visible to reads) whether
-        or not the sync is skipped.  `_do_sync_pools` itself still no-ops under
-        `_sync_disabled`.
+        (`no_sync`) so the dirty set is still consolidated; `_do_sync_pools`
+        itself no-ops under `_sync_disabled`.
         """
         if self._closed:
             return
@@ -1428,22 +1426,6 @@ class _FlushCoalescer:
         """Flush dirty pools.  Called by the delayed callback."""
         self._delayed_call = None
         if self._closed:
-            return
-        # Drain the coalesced edge-write queues first: the rows land in the
-        # EVENT_DAG pool, and the fsync below must cover them.  On failure the
-        # rows were restored to their queues and EVENT_DAG re-marked dirty, so
-        # retry on the backoff delay.  Imported lazily (embedded_event_edges
-        # imports this module).
-        try:
-            if _drain_edge_writes():
-                self._dirty.add(Pool.EVENT_DAG)
-        except Exception:
-            logger.warning("Edge-write drain failed, will retry", exc_info=True)
-            self._dirty.add(Pool.EVENT_DAG)
-            if self._delayed_call is None:
-                self._delayed_call = self._clock.call_later(
-                    self._RETRY_DELAY, self._flush
-                )
             return
         to_flush = set(self._dirty)  # snapshot
         if not to_flush:
@@ -1503,11 +1485,11 @@ class _FlushCoalescer:
     def sync_now(self, pools: Iterable[Pool] | None = None) -> None:
         """Immediate barrier for destructive ops and shutdown.
 
-        Cancels any pending delayed flush, syncs the requested pools
-        (or all dirty pools if None), draining queued EVENT_DAG edge writes
-        first. Each pool is synced independently so a failure syncing one
-        pool neither masks nor is blamed on another: only the pool(s) whose
-        sync actually raised are re-marked dirty and cause a raise.
+        Cancels any pending delayed flush and syncs the requested pools
+        (or all dirty pools if None). Each pool is synced independently so a
+        failure syncing one pool neither masks nor is blamed on another: only
+        the pool(s) whose sync actually raised are re-marked dirty and cause a
+        raise.
         """
         if self._closed:
             return
@@ -1519,16 +1501,6 @@ class _FlushCoalescer:
 
         first_exc: Exception | None = None
         try:
-            # EVENT_DAG also owns coalesced forward-edge writes. An explicit
-            # EVENT_DAG barrier must include those queued records before
-            # syncing. A raise here must still hit the `finally` below, or
-            # EVENT_DAG can be left dirty with the timer we just cancelled
-            # never rearmed -- the same stranded-work bug fixed earlier.
-            if Pool.EVENT_DAG in to_flush:
-                self._dirty.add(Pool.EVENT_DAG)
-                if not _drain_edge_writes():
-                    self._dirty.discard(Pool.EVENT_DAG)
-
             for pool in to_flush:
                 try:
                     _do_sync_pools({pool})
@@ -1556,19 +1528,18 @@ class _FlushCoalescer:
             raise first_exc
 
     def sync_event_dag_now(self) -> None:
-        """Sync EVENT_DAG without draining the coalesced edge queues.
+        """Sync EVENT_DAG without clearing its dirty bit.
 
-        Event JSON publication uses this narrower barrier because edge writes
-        are independently coalesced and should not be forced out once per
-        event. Full barriers continue to use ``sync_now``.
+        Event JSON publication uses this narrower barrier so a background
+        flush still covers whatever else touches the pool. Full barriers
+        continue to use ``sync_now``.
         """
         if self._closed:
             return
         try:
             _do_sync_pools({Pool.EVENT_DAG})
-            # Do not clear EVENT_DAG here: the dirty bit may represent
-            # coalesced edge writes, which this narrow barrier deliberately
-            # leaves queued for the shared timer.
+            # Do not clear EVENT_DAG here: the dirty bit may represent writes
+            # this narrow barrier deliberately leaves to the shared timer.
         except Exception:
             self._dirty.add(Pool.EVENT_DAG)
             # Do not cancel an already-armed timer here either: this runs
@@ -1595,29 +1566,6 @@ class _FlushCoalescer:
         if self._delayed_call is not None:
             self._delayed_call.cancel()
             self._delayed_call = None
-        # Drain the coalesced edge-write queues before the final fsync so a
-        # shutdown racing still-queued forward-edge appends does not drop
-        # committed rows.  Imported lazily (embedded_event_edges imports this
-        # module) and done before marking closed so flush_edge_writes's
-        # mark_dirty(EVENT_DAG) lands in `_dirty` for the final sync below.
-        drained = False
-        for attempt in range(3):
-            try:
-                if _drain_edge_writes():
-                    self._dirty.add(Pool.EVENT_DAG)
-                drained = True
-                break
-            except Exception:
-                logger.warning(
-                    "Flush coalescer edge-write drain failed (attempt %d/3)",
-                    attempt + 1,
-                    exc_info=True,
-                )
-        if not drained:
-            logger.error(
-                "Unable to drain queued edge writes during shutdown; "
-                "writes remain pending (SQL fallback will cover reads)"
-            )
         self._closed = True
         if self._dirty:
             for attempt in range(3):
@@ -1673,19 +1621,6 @@ def _clear_coalescer(c: _FlushCoalescer) -> None:
     global _coalescer
     if _coalescer is c:
         _coalescer = None
-
-
-def _drain_edge_writes() -> bool:
-    """Flush every coalesced edge-write queue into mtxdb.
-
-    Returns ``True`` if any rows were written.  Imported lazily because
-    ``embedded_event_edges`` imports this module.  Called by the flush
-    coalescer's timer and by shutdown so queued edge rows land in the
-    EVENT_DAG pool before it is synced.
-    """
-    from synapse.storage.databases.main.embedded_event_edges import flush_edge_writes
-
-    return flush_edge_writes()
 
 
 def mark_dirty(pool: Pool) -> None:

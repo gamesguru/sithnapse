@@ -674,16 +674,6 @@ async def start(hs: "HomeServer", *, freeze: bool = True) -> None:
     server_name = hs.hostname
     reactor = hs.get_reactor()
 
-    from synapse.storage.databases.main.embedded_event_edges import (
-        EventEdgesBackendMismatchError,
-        check_event_edges_backend,
-    )
-
-    try:
-        await check_event_edges_backend(hs)
-    except EventEdgesBackendMismatchError as e:
-        quit_with_error(str(e))
-
     from synapse.storage.databases.main.embedded_event_auth_chains import (
         AuthChainBackendMismatchError,
         check_backend as check_auth_chain_backend,

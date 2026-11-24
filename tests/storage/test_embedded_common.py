@@ -147,11 +147,6 @@ class GroupCommitWiringTestCase(TestCase):
             ),
             mock.patch.object(
                 embedded_common,
-                "_drain_edge_writes",
-                return_value=False,
-            ),
-            mock.patch.object(
-                embedded_common,
                 "request_durable",
                 side_effect=lambda: calls.append("request"),
             ),
@@ -175,9 +170,6 @@ class GroupCommitWiringTestCase(TestCase):
         with (
             mock.patch.object(
                 embedded_common, "publishes_at_commit", return_value=True
-            ),
-            mock.patch.object(
-                embedded_common, "_drain_edge_writes", return_value=False
             ),
             mock.patch.object(embedded_common, "request_durable"),
             mock.patch.object(
@@ -217,9 +209,6 @@ class GroupCommitWiringTestCase(TestCase):
         with (
             mock.patch.object(
                 embedded_common, "publishes_at_commit", return_value=True
-            ),
-            mock.patch.object(
-                embedded_common, "_drain_edge_writes", return_value=False
             ),
             mock.patch.object(
                 embedded_common,
@@ -365,9 +354,6 @@ class ShutdownCheckpointTestCase(TestCase):
         coalescer._dirty.add(Pool.STATE)
         with (
             mock.patch.object(
-                embedded_common, "_drain_edge_writes", return_value=False
-            ),
-            mock.patch.object(
                 embedded_common,
                 "_do_sync_pools",
                 side_effect=lambda pools: order.append("sync"),
@@ -391,9 +377,6 @@ class ShutdownCheckpointTestCase(TestCase):
         clock = Clock(ThreadedMemoryReactorClock(), server_name="test_server")  # type: ignore[multiple-internal-clocks]
         coalescer = _FlushCoalescer(clock)
         with (
-            mock.patch.object(
-                embedded_common, "_drain_edge_writes", return_value=False
-            ),
             mock.patch.object(embedded_common, "_do_sync_pools") as sync,
             mock.patch.object(embedded_common, "checkpoint_pools") as checkpoint,
         ):
@@ -412,9 +395,6 @@ class ShutdownCheckpointTestCase(TestCase):
         coalescer = _FlushCoalescer(clock)
         coalescer._dirty.add(Pool.STATE)
         with (
-            mock.patch.object(
-                embedded_common, "_drain_edge_writes", return_value=False
-            ),
             mock.patch.object(
                 embedded_common,
                 "_do_sync_pools",
@@ -435,9 +415,6 @@ class ShutdownCheckpointTestCase(TestCase):
         clock = Clock(ThreadedMemoryReactorClock(), server_name="test_server")  # type: ignore[multiple-internal-clocks]
         coalescer = _FlushCoalescer(clock)
         with (
-            mock.patch.object(
-                embedded_common, "_drain_edge_writes", return_value=False
-            ),
             mock.patch.object(
                 embedded_common,
                 "checkpoint_pools",
