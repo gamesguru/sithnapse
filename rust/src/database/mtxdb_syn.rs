@@ -5,6 +5,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use mtxdb::short_id::{GraphReader, ReadOnlyGraph};
 use mtxdb::storage::{DigestAlgorithm, StorageError};
 use mtxdb::{
     derive_collection_id, derive_group_full_id, derive_member_collection_id_from_group,
@@ -111,6 +112,7 @@ struct MtxdbPools {
     event_dag: Arc<PackfileStorage>,
     server_info: Arc<PackfileStorage>,
     shared_database: Option<Database>,
+    read_graph: Option<ReadOnlyGraph>,
 }
 
 /// Base directory for the state_group -> room_prefix room-index file (see
@@ -225,17 +227,54 @@ pub(crate) fn server_info_db() -> PyResult<&'static Arc<PackfileStorage>> {
     Ok(&pools()?.server_info)
 }
 
-/// A fresh mtxdb write transaction, or `None` without a shared WAL (matches
-/// `begin_transaction`'s Python-facing contract). Internal Rust callers (e.g.
-/// `embedded_edges::event_edges_put`) that want to collapse several
-/// `put_many` calls into one journal group use this directly, without a
-/// Python round trip through `PyMtxdbTransaction`.
-pub(crate) fn begin_internal_transaction() -> PyResult<Option<DatabaseTransaction<'static>>> {
-    assert_writable()?;
-    Ok(pools()?
-        .shared_database
+/// Read view for adjacency lookups: the writer's `Database`, or the read-only
+/// view a worker opened.
+pub(crate) enum CsrReader<'a> {
+    Writer(&'a Database),
+    ReadOnly(&'a ReadOnlyGraph),
+}
+
+impl GraphReader for CsrReader<'_> {
+    fn layout(&self) -> &DatabaseLayout {
+        match self {
+            Self::Writer(db) => GraphReader::layout(*db),
+            Self::ReadOnly(graph) => graph.layout(),
+        }
+    }
+
+    fn read_nodes(
+        &self,
+        pool: ShardType,
+        collection: &[u8; 16],
+        ids: &[NodeId],
+    ) -> Result<Vec<Option<NodeData>>, StorageError> {
+        match self {
+            Self::Writer(db) => GraphReader::read_nodes(*db, pool, collection, ids),
+            Self::ReadOnly(graph) => GraphReader::read_nodes(*graph, pool, collection, ids),
+        }
+    }
+}
+
+pub(crate) fn csr_reader() -> PyResult<CsrReader<'static>> {
+    let pools = pools()?;
+    if let Some(db) = pools.shared_database.as_ref() {
+        return Ok(CsrReader::Writer(db));
+    }
+    pools
+        .read_graph
         .as_ref()
-        .map(Database::begin_transaction))
+        .map(CsrReader::ReadOnly)
+        .ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("mtxdb adjacency reader unavailable")
+        })
+}
+
+/// The writer's `Database`, for adjacency writes.
+pub(crate) fn csr_writer() -> PyResult<&'static Database> {
+    assert_writable()?;
+    pools()?.shared_database.as_ref().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err("mtxdb adjacency writer unavailable")
+    })
 }
 
 const RETRYABLE_READ_ERROR_PREFIX: &str = "__MTXDB_RETRYABLE_READ__: ";
@@ -1812,14 +1851,6 @@ pub(crate) fn auth_chain_closure_room_id(_namespace: &str, room_id: &str) -> [u8
     member_collection_id(*b"AUTH", &group_digest)
 }
 
-/// A room-scoped collection id for previous edges (DAG topology),
-/// derived as the member collection with the `PREV` tag under the room's group identity.
-#[must_use]
-pub(crate) fn prev_edges_room_id(_namespace: &str, room_id: &str) -> [u8; 16] {
-    let group_digest = group_full_logical_id(room_id.as_bytes());
-    member_collection_id(*b"PREV", &group_digest)
-}
-
 /// Distinct tag prefixes keep the counter, forward mapping, reverse
 /// mapping, and edge-list key spaces from colliding within one room's
 /// collection (all four share the same 16-byte `NodeId` space there).
@@ -2152,6 +2183,7 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
             event_dag,
             server_info,
             shared_database: Some(shared_database),
+            read_graph: None,
         });
         let _ = OPENER_PID.set(std::process::id());
         let _ = WRITE_MODE.set(true);
@@ -2259,11 +2291,16 @@ pub fn open_client_read_only(py: Python<'_>, path: String) -> PyResult<()> {
                 "mtxdb read-only worker opened (snapshot, no publish signal): state={state_signal_active} event_dag={event_dag_signal_active}",
             );
         }
+        let read_only_graph = ReadOnlyGraph::new(
+            layout,
+            [state.clone(), event_dag.clone(), server_info.clone()],
+        );
         let _ = DBS.set(MtxdbPools {
             state,
             event_dag,
             server_info,
             shared_database: None,
+            read_graph: Some(read_only_graph),
         });
         let _ = OPENER_PID.set(std::process::id());
         let _ = WRITE_MODE.set(false);
@@ -2930,7 +2967,7 @@ pub(crate) fn event_locator_collection_id(node_id: &NodeId) -> [u8; 16] {
 
 /// Room-scoped EventDag collection id: derived as the member collection
 /// with the `EVNT` tag under the room's group identity (`!room:server`).
-pub(crate) fn event_dag_room_id(_namespace: &str, room_id: &str) -> [u8; 16] {
+pub(crate) fn event_dag_room_id(room_id: &str) -> [u8; 16] {
     let group_digest = group_full_logical_id(room_id.as_bytes());
     member_collection_id(*b"EVNT", &group_digest)
 }
@@ -3086,15 +3123,12 @@ fn validate_event_json_rows(rows: &[(String, String, Vec<u8>)]) -> PyResult<()> 
 /// only ever be a miss, never a pointer to a body that isn't there. The direct
 /// and the transactional write paths both use this, so they cannot disagree
 /// about a record's key.
-fn event_json_puts(
-    namespace: &str,
-    rows: Vec<(String, String, Vec<u8>)>,
-) -> (EventJsonPuts, EventJsonPuts) {
+fn event_json_puts(rows: Vec<(String, String, Vec<u8>)>) -> (EventJsonPuts, EventJsonPuts) {
     let mut locator_puts: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
     let mut dag_puts: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
     for (room_id, event_id, record) in rows {
         let identity = event_node_id(&event_id);
-        let room_collection = event_dag_room_id(namespace, &room_id);
+        let room_collection = event_dag_room_id(&room_id);
         let locator_collection = event_locator_collection_id(&identity);
         let puts = dag_puts.entry(room_collection).or_default();
         puts.push((identity, NodeData::new(bytes::Bytes::from(record))));
@@ -3131,16 +3165,12 @@ fn event_json_puts(
 /// Generic KV (`batch_put`) remains for flat data and no longer carries
 /// event_json.
 #[pyfunction]
-pub fn event_json_put(
-    py: Python<'_>,
-    namespace: String,
-    rows: Vec<(String, String, Vec<u8>)>,
-) -> PyResult<()> {
+pub fn event_json_put(py: Python<'_>, rows: Vec<(String, String, Vec<u8>)>) -> PyResult<()> {
     assert_writable()?;
     validate_event_json_rows(&rows)?;
     py.detach(|| {
         let engine = event_dag_db()?;
-        let (dag_puts, locator_puts) = event_json_puts(&namespace, rows);
+        let (dag_puts, locator_puts) = event_json_puts(rows);
         for (collection, pairs) in dag_puts.into_iter().chain(locator_puts) {
             engine.put_many(&collection, &pairs).map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {e}"))
@@ -3331,15 +3361,10 @@ impl PyMtxdbTransaction {
     }
 
     /// Stage what `event_json_put` would write, without touching the pool.
-    fn event_json_put(
-        &self,
-        py: Python<'_>,
-        namespace: String,
-        rows: Vec<(String, String, Vec<u8>)>,
-    ) -> PyResult<()> {
+    fn event_json_put(&self, py: Python<'_>, rows: Vec<(String, String, Vec<u8>)>) -> PyResult<()> {
         validate_event_json_rows(&rows)?;
         py.detach(|| {
-            let (dag_puts, locator_puts) = event_json_puts(&namespace, rows);
+            let (dag_puts, locator_puts) = event_json_puts(rows);
             for (collection, pairs) in dag_puts.into_iter().chain(locator_puts) {
                 for (node, data) in pairs {
                     self.inner
@@ -3349,16 +3374,6 @@ impl PyMtxdbTransaction {
             }
             Ok(())
         })
-    }
-
-    /// Stage what `event_edges_put` would write, without touching the pool.
-    fn event_edges_put(
-        &self,
-        py: Python<'_>,
-        namespace: String,
-        rows: Vec<(String, String, String, bool)>,
-    ) -> PyResult<()> {
-        py.detach(|| super::embedded_edges::stage_event_edges(&self.inner, &namespace, &rows))
     }
 
     /// Stage outbound auth edges and their inbound child index in the
@@ -3644,11 +3659,11 @@ pub fn event_json_delete(py: Python<'_>, event_ids: Vec<String>) -> PyResult<()>
 /// behind resolves to a now-empty collection and its read falls back to SQL,
 /// so it is never served stale data.
 #[pyfunction]
-pub fn event_json_purge_room(py: Python<'_>, namespace: String, room_id: String) -> PyResult<()> {
+pub fn event_json_purge_room(py: Python<'_>, room_id: String) -> PyResult<()> {
     assert_writable()?;
     py.detach(|| {
         let engine = event_dag_db()?;
-        let collection = event_dag_room_id(&namespace, &room_id);
+        let collection = event_dag_room_id(&room_id);
         engine.delete_collection(&collection).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb delete_collection error: {e}"))
         })
@@ -4772,15 +4787,11 @@ pub(crate) mod auth_chain_closure_tests {
         let group = group_full_logical_id(room.as_bytes());
         let state = member_collection_id(*b"STAT", &group);
         let auth = member_collection_id(*b"AUTH", &group);
-        let prev = member_collection_id(*b"PREV", &group);
 
         assert_eq!(state, state_hamt_room_id(room));
         assert_eq!(auth, auth_chain_closure_room_id(namespace, room));
-        assert_eq!(prev, prev_edges_room_id(namespace, room));
 
         assert_ne!(auth, state, "AUTH must not reuse the STAT tag");
-        assert_ne!(prev, state, "PREV must not reuse the STAT tag");
-        assert_ne!(auth, prev, "AUTH must not reuse the PREV tag");
     }
 
     fn test_root_value(room_id: &str, root_byte: u8, lattice_byte: u8) -> Vec<u8> {
