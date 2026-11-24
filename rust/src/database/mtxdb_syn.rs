@@ -2352,8 +2352,14 @@ pub fn open_client_read_only(py: Python<'_>, path: String) -> PyResult<()> {
 /// successful close implies the data is durable. Also drops the room-index
 /// handle/prefix caches, which are keyed by shard only and would otherwise
 /// keep pointing at the old root's files.
+///
+/// `durable=False` skips the syncs for a disposable root that will never be
+/// reopened (test homeservers): each sync writes and fsyncs an index and
+/// journal checkpoint per pool, which dominates test time on slow disks even
+/// when the store was opened with `no_sync`. The default stays durable.
 #[pyfunction]
-pub fn close_client(py: Python<'_>) -> PyResult<()> {
+#[pyo3(signature = (durable = true))]
+pub fn close_client(py: Python<'_>, durable: bool) -> PyResult<()> {
     py.detach(|| {
         let mut guard = DBS
             .lock()
@@ -2379,16 +2385,18 @@ pub fn close_client(py: Python<'_>) -> PyResult<()> {
                  remain; refusing to close while writes are in flight"
             )));
         }
-        for (name, store) in [
-            ("state", &pools.state),
-            ("event_dag", &pools.event_dag),
-            ("server_info", &pools.server_info),
-        ] {
-            sync_one(name, store)?;
+        if durable {
+            for (name, store) in [
+                ("state", &pools.state),
+                ("event_dag", &pools.event_dag),
+                ("server_info", &pools.server_info),
+            ] {
+                sync_one(name, store)?;
+            }
+            // Flush the room index before reset() forgets its dirty shards; a
+            // failure leaves the store open so close can be retried.
+            room_index::sync()?;
         }
-        // Flush the room index before reset() forgets its dirty shards; a
-        // failure leaves the store open so close can be retried.
-        room_index::sync()?;
         // Dropping the last reference releases the writer lock and fds.
         *guard = None;
         drop(guard);

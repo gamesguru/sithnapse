@@ -589,7 +589,7 @@ class HomeserverTestCase(TestCase):
         # homeserver's open fail (or silently reuse this root).
         from synapse.synapse_rust import mtxdb_engine
 
-        self.addCleanup(mtxdb_engine.close_client)
+        self.addCleanup(mtxdb_engine.close_client, durable=False)
 
         # We need to share the reactor between the homeserver and all of our test utils.
         self.reactor, self.clock = get_clock()
@@ -689,7 +689,7 @@ class HomeserverTestCase(TestCase):
         # fresh SQL database) collide. Open_client therefore no-ops while a
         # root is already open, so close it here or the next homeserver would
         # silently keep using this one's directory instead of its own.
-        mtxdb_engine.close_client()
+        mtxdb_engine.close_client(durable=False)
 
     def wait_for_background_updates(self) -> None:
         """Block until all background database updates have completed."""

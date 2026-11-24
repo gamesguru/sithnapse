@@ -177,7 +177,7 @@ class MasAuthDelegation(TestCase):
         # it so later homeservers can open their own roots.
         from synapse.synapse_rust import mtxdb_engine
 
-        self.addCleanup(mtxdb_engine.close_client)
+        self.addCleanup(mtxdb_engine.close_client, durable=False)
         with self.assertRaises(ConfigError):
             setup_test_homeserver(
                 cleanup_func=self.addCleanup,

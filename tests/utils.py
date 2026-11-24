@@ -350,7 +350,7 @@ def _drain_template_background_updates_postgres() -> None:
     if EMBEDDED_DB_ENGINE:
         from synapse.synapse_rust import mtxdb_engine
 
-        mtxdb_engine.close_client()
+        mtxdb_engine.close_client(durable=False)
 
 
 def setupdb() -> None:
