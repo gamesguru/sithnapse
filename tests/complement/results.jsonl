@@ -977,6 +977,7 @@
 {"Action":"pass","Test":"TestServerNotices/Alice_cannot_reject_the_invite"}
 {"Action":"pass","Test":"TestServerNotices/Alice_is_invited_to_the_server_alert_room"}
 {"Action":"pass","Test":"TestServerNotices/Sending_a_notice_with_a_transactionID_is_idempotent"}
+{"Action":"fail","Test":"TestSharedMissingPrevStateIsNotRefetchedPerEvent"}
 {"Action":"pass","Test":"TestStateIdsFallbackFetchesFullAuthChain"}
 {"Action":"pass","Test":"TestStateIdsFallbackRecoversAfterMalformedGetMissingEventsResponse"}
 {"Action":"pass","Test":"TestSync"}
@@ -1038,6 +1039,7 @@
 {"Action":"pass","Test":"TestUnknownEndpoints/Server-server_endpoints"}
 {"Action":"pass","Test":"TestUnknownEndpoints/Unknown_prefix"}
 {"Action":"pass","Test":"TestUnrejectRejectedEvents"}
+{"Action":"fail","Test":"TestUnverifiableStateEventIsNotRefetchedForEveryGap"}
 {"Action":"pass","Test":"TestUploadKey"}
 {"Action":"pass","Test":"TestUploadKey/Parallel"}
 {"Action":"pass","Test":"TestUploadKey/Parallel/Can_claim_one_time_key_using_POST"}
