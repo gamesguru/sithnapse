@@ -16,9 +16,11 @@
 
 import atexit
 import glob
+import importlib.util
 import os
 import shutil
 import tempfile
+from pathlib import Path
 from typing import Any
 from unittest import TestCase, mock
 from uuid import uuid4
@@ -48,6 +50,24 @@ from synapse.util.clock import Clock
 from tests.test_utils.event_injection import create_event
 from tests.unittest import HomeserverTestCase
 from tests.utils import EMBEDDED_DB_ENGINE, EMBEDDED_DB_PATH
+
+REBUILD_SCRIPT = (
+    Path(__file__).parents[2] / "scripts-dev" / "mtxdb" / "mtxdb_edges_rebuild.py"
+)
+
+
+def _load_rebuild_edges() -> Any:
+    """Load the offline rebuild script on demand.
+
+    It lives in `scripts-dev/`, which some test trees (the Debian package
+    build) do not ship, so importing this module must not depend on it.
+    """
+    spec = importlib.util.spec_from_file_location("mtxdb_edges_rebuild", REBUILD_SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.rebuild_edges
+
 
 if EMBEDDED_DB_ENGINE and EMBEDDED_DB_PATH:
     # The test harness has already selected a worker-specific store. Reuse
@@ -467,6 +487,36 @@ class EventEdgesStorageIntegrationTestCase(HomeserverTestCase):
         self.assertNotIn(e2_id, get_event_edges_backward_batch([e2_id]))
         forward = get_event_edges_forward_batch([e1_id])
         self.assertNotIn(e2_id, forward.get(e1_id) or [])
+
+    def test_rebuild_restores_edges_from_event_bodies(self) -> None:
+        """The offline rebuild re-derives a room's adjacency from its events."""
+        if not REBUILD_SCRIPT.exists():
+            self.skipTest("scripts-dev/mtxdb/mtxdb_edges_rebuild.py is absent")
+        rebuild_edges = _load_rebuild_edges()
+
+        e1_id = self.helper.send(self.room_id, "first", tok=self.tok)["event_id"]
+        e2_id = self.helper.send(self.room_id, "second", tok=self.tok)["event_id"]
+
+        # A healthy room needs nothing: a dry run finds every edge in place.
+        report = self.get_success(
+            rebuild_edges(self.hs, rooms=[self.room_id], dry_run=True)
+        )
+        self.assertGreater(report["events_scanned"], 0)
+        self.assertEqual(report["events_needing_rebuild"], 0)
+        self.assertEqual(report["written"], 0)
+
+        purge_event_edges_room(self.room_id)
+        self.assertNotIn(e2_id, get_event_edges_backward_batch([e2_id]))
+
+        report = self.get_success(rebuild_edges(self.hs, rooms=[self.room_id]))
+        self.assertGreater(report["written"], 0)
+        self.assertEqual(report["mismatches_after_write"], 0)
+        self.assertIn(e1_id, get_event_edges_backward_batch([e2_id])[e2_id])
+        self.assertIn(e2_id, get_event_edges_forward_batch([e1_id])[e1_id] or [])
+
+        # Running it again changes nothing.
+        report = self.get_success(rebuild_edges(self.hs, rooms=[self.room_id]))
+        self.assertEqual(report["written"], 0)
 
     def test_read_only_worker_reads_edges(self) -> None:
         """A read-only worker can read adjacency without failing assert_writable."""
