@@ -430,6 +430,93 @@ class ShutdownCheckpointTestCase(TestCase):
         ):
             coalescer.close()  # must not raise
 
+    def test_close_skips_the_final_flush_while_a_barrier_is_wedged(self) -> None:
+        """A barrier that outlives the shutdown deadline must not block close().
+
+        A wedged barrier may hold the locks the final flush needs, so close()
+        gives up on it, skips the flush, and still reports the pools as pending.
+        """
+        from synapse.storage.databases.main.embedded_common import _FlushCoalescer
+        from synapse.util.clock import Clock
+
+        from tests.server import ThreadedMemoryReactorClock
+
+        clock = Clock(ThreadedMemoryReactorClock(), server_name="test_server")  # type: ignore[multiple-internal-clocks]
+        coalescer = _FlushCoalescer(clock)
+        coalescer._dirty.add(Pool.STATE)
+        # Stand in for a flush barrier stuck past the shutdown deadline.
+        coalescer._active_sync_barriers = 1
+        with (
+            mock.patch.object(embedded_common, "_CLOSE_BARRIER_WAIT_SECS", 0.0),
+            mock.patch.object(embedded_common, "flush_adjacency_tails") as flush_tails,
+            mock.patch.object(embedded_common, "_do_sync_pools") as sync,
+            mock.patch.object(embedded_common, "checkpoint_pools") as checkpoint,
+        ):
+            coalescer.close()
+
+        flush_tails.assert_not_called()
+        sync.assert_not_called()
+        # The write is still dirty, so no durable baseline may be published.
+        self.assertIn(Pool.STATE, coalescer._dirty)
+        checkpoint.assert_not_called()
+
+    def test_close_syncs_every_pool_strictly_after_a_committer_error(self) -> None:
+        """A failed submitted boundary is repaired even with nothing dirty.
+
+        The dirty set only covers writes not yet submitted, so an empty set is
+        not proof of durability once the background committer has failed.
+        """
+        from synapse.storage.databases.main.embedded_common import _FlushCoalescer
+        from synapse.util.clock import Clock
+
+        from tests.server import ThreadedMemoryReactorClock
+
+        clock = Clock(ThreadedMemoryReactorClock(), server_name="test_server")  # type: ignore[multiple-internal-clocks]
+        coalescer = _FlushCoalescer(clock)
+        with (
+            mock.patch.object(
+                embedded_common,
+                "background_commit_error",
+                return_value="background commit failed",
+            ),
+            mock.patch.object(embedded_common, "flush_adjacency_tails"),
+            mock.patch.object(embedded_common, "_do_sync_pools") as sync,
+            mock.patch.object(embedded_common, "checkpoint_pools") as checkpoint,
+        ):
+            coalescer.close()
+
+        # Both pools, not just the (empty) dirty set: the strict path proves all.
+        sync.assert_called_once_with(set(Pool))
+        checkpoint.assert_called_once_with()
+
+    def test_close_skips_the_checkpoint_when_strict_recovery_fails(self) -> None:
+        """If the committer failed and the strict sync also fails, keep the pool pending."""
+        from synapse.storage.databases.main.embedded_common import _FlushCoalescer
+        from synapse.util.clock import Clock
+
+        from tests.server import ThreadedMemoryReactorClock
+
+        clock = Clock(ThreadedMemoryReactorClock(), server_name="test_server")  # type: ignore[multiple-internal-clocks]
+        coalescer = _FlushCoalescer(clock)
+        with (
+            mock.patch.object(
+                embedded_common,
+                "background_commit_error",
+                return_value="background commit failed",
+            ),
+            mock.patch.object(embedded_common, "flush_adjacency_tails"),
+            mock.patch.object(
+                embedded_common,
+                "_do_sync_pools",
+                side_effect=RuntimeError("sync failed"),
+            ) as sync,
+            mock.patch.object(embedded_common, "checkpoint_pools") as checkpoint,
+        ):
+            coalescer.close()
+
+        self.assertEqual(sync.call_count, 3)
+        checkpoint.assert_not_called()
+
 
 class CoalescerConcurrentWriteTestCase(TestCase):
     def test_write_marked_during_a_barrier_stays_dirty(self) -> None:
