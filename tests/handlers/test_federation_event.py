@@ -86,10 +86,12 @@ class FederationEventHandlerTests(unittest.FederatingHomeserverTestCase):
         event_id = "$partial-state-gap"
         state_event_id = "$available-state"
         missing_state_event_id = "$missing-state"
-        self.mock_federation_transport_client.get_room_state_ids.return_value = (
-            [state_event_id, missing_state_event_id],
-            [],
-        )
+        # The transport layer returns the raw /state_ids payload; the client
+        # unwraps `pdu_ids` before handing the tuple to the handler.
+        self.mock_federation_transport_client.get_room_state_ids.return_value = {
+            "pdu_ids": [state_event_id, missing_state_event_id],
+            "auth_chain_ids": [],
+        }
         metadata = mock.Mock(
             room_id=room_id,
             event_type=EventTypes.Name,
