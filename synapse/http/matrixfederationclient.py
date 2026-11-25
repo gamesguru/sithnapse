@@ -401,6 +401,49 @@ async def _handle_response(
     return value
 
 
+async def _handle_response_with_backoff(
+    hs: "HomeServer",
+    clock: Clock,
+    reactor: IReactorTime,
+    timeout_sec: float,
+    request: MatrixFederationRequest,
+    response: IResponse,
+    start_ms: int,
+    parser: ByteParser[T],
+) -> T:
+    """Parse a federation response and mark malformed responses as failures.
+
+    The HTTP request's destination limiter is exited as soon as response headers
+    arrive. Parsing (including Content-Type validation) happens afterwards, so a
+    2xx response with malformed headers/body would otherwise count as a success
+    and clear any existing destination backoff. Treat response parsing failures
+    as destination failures too, so repeated malformed responses back off.
+    """
+    try:
+        return await _handle_response(
+            clock, reactor, timeout_sec, request, response, start_ms, parser
+        )
+    except RequestSendFailed as e:
+        try:
+            limiter = await synapse.util.retryutils.get_retry_limiter(
+                destination=request.destination,
+                our_server_name=hs.hostname,
+                hs=hs,
+                clock=clock,
+                store=hs.get_datastores().main,
+                notifier=hs.get_notifier(),
+                replication_client=hs.get_replication_command_handler(),
+            )
+        except synapse.util.retryutils.NotRetryingDestination:
+            # A concurrent request already marked this destination down.
+            raise e
+
+        # Raising inside the limiter records this malformed response using the
+        # same configured destination backoff as a transport-level failure.
+        with limiter:
+            raise
+
+
 class BinaryIOWrapper:
     """A wrapper for a TextIO which converts from bytes on the fly."""
 
@@ -1111,7 +1154,8 @@ class MatrixFederationHttpClient:
         if parser is None:
             parser = cast(ByteParser[T], JsonParser())
 
-        body = await _handle_response(
+        body = await _handle_response_with_backoff(
+            self.hs,
             self.clock,
             self.reactor,
             _sec_timeout,
@@ -1190,7 +1234,8 @@ class MatrixFederationHttpClient:
         else:
             _sec_timeout = self.default_timeout_seconds
 
-        body = await _handle_response(
+        body = await _handle_response_with_backoff(
+            self.hs,
             self.clock,
             self.reactor,
             _sec_timeout,
@@ -1402,7 +1447,8 @@ class MatrixFederationHttpClient:
         if parser is None:
             parser = cast(ByteParser[T], JsonParser())
 
-        body = await _handle_response(
+        body = await _handle_response_with_backoff(
+            self.hs,
             self.clock,
             self.reactor,
             _sec_timeout,
@@ -1476,7 +1522,8 @@ class MatrixFederationHttpClient:
         else:
             _sec_timeout = self.default_timeout_seconds
 
-        body = await _handle_response(
+        body = await _handle_response_with_backoff(
+            self.hs,
             self.clock,
             self.reactor,
             _sec_timeout,
@@ -1553,7 +1600,8 @@ class MatrixFederationHttpClient:
         else:
             _sec_timeout = self.default_timeout_seconds
 
-        return await _handle_response(
+        return await _handle_response_with_backoff(
+            self.hs,
             self.clock,
             self.reactor,
             _sec_timeout,
