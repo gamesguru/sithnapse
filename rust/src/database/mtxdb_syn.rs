@@ -4555,6 +4555,8 @@ fn stats_to_dict(
     d.set_item("read_reload_failures", s.read_reload_failures)?;
     d.set_item("read_refreshes", s.read_refreshes)?;
     d.set_item("read_refresh_bytes", s.read_refresh_bytes)?;
+    d.set_item("read_refresh_sleeps", s.read_refresh_sleeps)?;
+    d.set_item("read_refresh_sleep_micros", s.read_refresh_sleep_micros)?;
     d.set_item("delta_invalidations", s.delta_invalidations)?;
     d.set_item("cache_hits", s.cache.hits)?;
     d.set_item("cache_misses", s.cache.misses)?;
@@ -4804,6 +4806,17 @@ fn stats_impl(py: Python<'_>, take_diagnostics: bool) -> PyResult<Py<PyDict>> {
     if let Some(wal_bytes) = wal_bytes {
         out.set_item("wal_bytes", wal_bytes)?;
     }
+    let csr = mtxdb::csr::store::read_stats();
+    let csr_read = PyDict::new(py);
+    csr_read.set_item("read_lock_waits", csr.read_lock_waits)?;
+    csr_read.set_item("read_lock_wait_nanos", csr.read_lock_wait_nanos)?;
+    csr_read.set_item("tail_reads", csr.tail_reads)?;
+    csr_read.set_item("tail_full_decodes", csr.tail_full_decodes)?;
+    csr_read.set_item("tail_decoded_bytes", csr.tail_decoded_bytes)?;
+    csr_read.set_item("tail_decode_nanos", csr.tail_decode_nanos)?;
+    csr_read.set_item("segment_listings", csr.segment_listings)?;
+    csr_read.set_item("segment_listing_nanos", csr.segment_listing_nanos)?;
+    out.set_item("csr_read", csr_read)?;
     for (name, s, diagnostics, publish_signal_active, disk_bytes) in &snapshots {
         out.set_item(
             *name,

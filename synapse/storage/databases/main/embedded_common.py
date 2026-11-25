@@ -655,6 +655,22 @@ def _print_mtxdb_stats() -> None:
         return f"{us / 1_000_000:.2f}s"
 
     print("\n=== mtxdb runtime stats ===", file=out)
+    csr_read = s.get("csr_read") or {}
+    if csr_read.get("tail_reads") or csr_read.get("read_lock_waits"):
+        # Where a CSR read spends its time: store read-lock wait, tail decode
+        # (full = from byte 0, the cache-miss cost), and directory listings.
+        print(
+            "\n  [CSR reads] "
+            f"lock waits={csr_read.get('read_lock_waits', 0)} "
+            f"({_fmt_us(csr_read.get('read_lock_wait_nanos', 0) // 1000)}) | "
+            f"tail reads={csr_read.get('tail_reads', 0)} "
+            f"full decodes={csr_read.get('tail_full_decodes', 0)} "
+            f"decoded={csr_read.get('tail_decoded_bytes', 0):,}B "
+            f"({_fmt_us(csr_read.get('tail_decode_nanos', 0) // 1000)}) | "
+            f"segment listings={csr_read.get('segment_listings', 0)} "
+            f"({_fmt_us(csr_read.get('segment_listing_nanos', 0) // 1000)})",
+            file=out,
+        )
     for pool_name in ("state", "event_dag", "server_info"):
         ps = s.get(pool_name, {})
         if not ps:
@@ -664,6 +680,13 @@ def _print_mtxdb_stats() -> None:
             f"    collections: {ps.get('collection_count', 0)}  shards: {ps.get('shard_count', 0)}  index: {ps.get('index_bytes', 0):,}B",
             file=out,
         )
+
+        if ps.get("read_refresh_sleeps"):
+            print(
+                f"    journal refresh retry sleeps: {ps['read_refresh_sleeps']} "
+                f"({_fmt_us(ps.get('read_refresh_sleep_micros', 0))} slept)",
+                file=out,
+            )
 
         # Read counters (only meaningful when stats_enabled was true).
         gc = ps.get("get_calls", 0)
