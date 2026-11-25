@@ -41,6 +41,7 @@ from synapse.events.py_protocol import MSC4242Event, supports_msc4242_state_dag
 from synapse.events.snapshot import EventContext
 from synapse.federation.transport.client import StateRequestResponse
 from synapse.handlers.federation_event import (
+    BACKFILL_BATCH_MAX_EVENTS,
     BACKFILL_BATCH_STATE_LOOKUP_CONCURRENCY,
     is_state_dag_connected,
 )
@@ -475,6 +476,18 @@ class FederationEventHandlerTests(unittest.FederatingHomeserverTestCase):
         )
         self.assertFalse(result)
         persist.assert_awaited_once()
+
+    def test_backfilled_run_larger_than_a_persist_chunk_falls_back(self) -> None:
+        """Persistence commits every 100 events, so only a smaller run is atomic."""
+        for count, batched in (
+            (BACKFILL_BATCH_MAX_EVENTS, True),
+            (BACKFILL_BATCH_MAX_EVENTS + 1, False),
+        ):
+            result, persist, _ = self._run_backfilled_batch(
+                self._backfilled_run(count=count)
+            )
+            self.assertEqual(result, batched, count)
+            self.assertEqual(persist.await_count, 1 if batched else 0, count)
 
     def test_backfilled_run_does_not_probe_remembered_failures(self) -> None:
         result, persist, _ = self._run_backfilled_batch(self._backfilled_run())

@@ -112,6 +112,12 @@ logger = logging.getLogger(__name__)
 # How many gap-parent state lookups a backfilled run asks a remote about at once.
 BACKFILL_BATCH_STATE_LOOKUP_CONCURRENCY = 8
 
+# The most events a backfilled run may have and still be batched. Persistence
+# commits in chunks of 100 events, so a larger run is not all-or-nothing, and
+# falling back to the serial path after a partial commit would re-process events
+# that were already stored.
+BACKFILL_BATCH_MAX_EVENTS = 100
+
 
 # How long a recent remote lookup result is remembered.
 _FAILED_LOOKUP_TTL_MS = 60 * 1000
@@ -1823,7 +1829,11 @@ class FederationEventHandler:
         first = events[0]
         room_id = first.room_id
 
-        if first.is_state() or first.room_version.msc4242_state_dags:
+        if (
+            len(events) > BACKFILL_BATCH_MAX_EVENTS
+            or first.is_state()
+            or first.room_version.msc4242_state_dags
+        ):
             return False
 
         for event in events:
