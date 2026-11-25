@@ -83,6 +83,7 @@ class PublicStatsTests(unittest.HomeserverTestCase):
                 "postgres_pss_bytes",
                 "mtxdb_bytes",
                 "mtxdb_index_bytes",
+                "mtxdb_wal_bytes",
             },
         )
         self.assertIsInstance(database["events"], int)
@@ -103,6 +104,10 @@ class PublicStatsTests(unittest.HomeserverTestCase):
         self.assertTrue(
             database["mtxdb_index_bytes"] is None
             or isinstance(database["mtxdb_index_bytes"], int)
+        )
+        self.assertTrue(
+            database["mtxdb_wal_bytes"] is None
+            or isinstance(database["mtxdb_wal_bytes"], int)
         )
 
         self.assertIsInstance(channel.json_body["memory"]["rss_bytes"], int)
