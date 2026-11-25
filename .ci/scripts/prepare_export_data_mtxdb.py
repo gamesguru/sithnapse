@@ -13,6 +13,7 @@ from twisted.internet import defer, reactor as reactor_
 
 from synapse.config.homeserver import HomeServerConfig
 from synapse.server import HomeServer
+from synapse.storage import DataStore
 from synapse.storage.database import LoggingTransaction
 from synapse.storage.databases.main.embedded_event_edges import put_event_edges_batch
 from synapse.types import ISynapseReactor
@@ -22,6 +23,8 @@ logger = logging.getLogger("synapse_prepare_export_data_mtxdb")
 
 
 class MigrationHomeserver(HomeServer):
+    DATASTORE_CLASS = DataStore
+
     def __init__(self, config: HomeServerConfig):
         super().__init__(
             hostname=config.server.server_name, config=config, reactor=reactor
