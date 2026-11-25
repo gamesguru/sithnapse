@@ -7,7 +7,8 @@ snapshot of the mtxdb directory taken. Every record is written under the
 unsalted keys, then read back and compared with the dump; any mismatch exits
 non-zero.
 
-Old salted records are left where they are: the new build cannot address them,
+The old room-index shards are renamed to `room_index.pre-desalt` first (the new
+build cannot read their record layout). Old salted records are otherwise left where they are: the new build cannot address them,
 they only cost disk, and the snapshot is the rollback. Re-running is safe; each
 write replaces the same record.
 
@@ -17,6 +18,7 @@ After this, rebuild CSR adjacency with `mtxdb_edges_rebuild.py`.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import Any, Iterator
@@ -36,6 +38,35 @@ from _desalt import (
     read_dump,
     unb64,
 )
+
+
+def retire_old_room_index(db_path: Path) -> bool:
+    """Move prod's old-format `room_index/` aside; return whether it moved.
+
+    Prod's shards hold 36-byte records that carry a namespace digest. The new
+    build's layout probe rejects sufficiently long old shards; a short shard
+    can be misparsed. An in-place rollback would also misparse new records. A
+    rename deletes nothing. If `room_index.pre-desalt` already exists, an
+    earlier run retired the old files and the current `room_index/` is
+    new-format: leave it alone so a re-run stays safe.
+    """
+    index = db_path / "room_index"
+    aside = db_path / "room_index.pre-desalt"
+    if aside.exists() or not index.exists():
+        return False
+    index.rename(aside)
+    _fsync_directory(db_path)
+    return True
+
+
+def _fsync_directory(path: Path) -> None:
+    """Persist directory-entry changes made by the migration."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def require_new_build(engine: Any) -> None:
@@ -228,18 +259,29 @@ def main() -> int:
 
     _, db_path, _ = embedded_database(args.config)
     # Probe using a read-only handle first. This avoids opening the store as a
-    # writer when the installed extension is the source build by mistake.
+    # writer when the installed extension is the source build by mistake, and
+    # it runs before the old index is renamed so a wrong-build invocation has
+    # no side effects at all.
     engine.open_client_read_only(str(db_path))
     try:
         require_new_build(engine)
     finally:
         engine.close_client()
 
+    if retire_old_room_index(db_path):
+        print("Moved room_index/ to room_index.pre-desalt", file=sys.stderr)
+
     print(f"Writing mtxdb at {db_path}", file=sys.stderr)
     engine.open_client(str(db_path))
     try:
         written = apply_dump(engine, args.input, args.batch_size)
         engine.sync()
+        # room_index is an append-only side file outside mtxdb's WAL. Its
+        # sync() fsyncs shard contents; persist the directory entries too.
+        room_index_dir = db_path / "room_index"
+        if room_index_dir.exists():
+            _fsync_directory(room_index_dir)
+        _fsync_directory(db_path)
         if written != counts:
             raise RuntimeError(f"wrote {written}, dump holds {counts}")
         bad = verify_dump(engine, args.input, args.batch_size)

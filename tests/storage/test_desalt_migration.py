@@ -42,7 +42,9 @@ def _load() -> tuple[Any, Any]:
     no `scripts-dev/`)."""
     sys.path.insert(0, str(SCRIPTS))
     try:
-        import _desalt
+        # A dynamic import: mypy excludes scripts-dev/, so a static one cannot
+        # resolve in the repo-wide run.
+        _desalt = importlib.import_module("_desalt")
 
         spec = importlib.util.spec_from_file_location("restore_desalt", RESTORE)
         assert spec is not None and spec.loader is not None
@@ -203,3 +205,20 @@ class DesaltRestoreTestCase(TestCase):
 
         self.assertEqual(len(bad), 1)
         self.assertIn("refcount", bad[0])
+
+    def test_old_room_index_is_moved_aside_once(self) -> None:
+        index = self.dir / "room_index"
+        index.mkdir()
+        (index / "index-2d.bin").write_bytes(b"old")
+
+        self.assertTrue(self.restore.retire_old_room_index(self.dir))
+        self.assertFalse(index.exists())
+        self.assertEqual(
+            (self.dir / "room_index.pre-desalt" / "index-2d.bin").read_bytes(), b"old"
+        )
+
+        # A re-run must not move the new-format index the first run wrote.
+        index.mkdir()
+        (index / "index-2d.bin").write_bytes(b"new")
+        self.assertFalse(self.restore.retire_old_room_index(self.dir))
+        self.assertEqual((index / "index-2d.bin").read_bytes(), b"new")

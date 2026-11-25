@@ -483,8 +483,21 @@ def main() -> None:
         action="store_true",
         help="confirm the embedded store has already been rekeyed to unsalted IDs",
     )
+    parser.add_argument(
+        "--upgrade-schema",
+        action="store_true",
+        help="apply pending schema deltas first, as the new build would at its "
+        "first start. Needed on a store whose deltas are not applied yet (a "
+        "pre-migration prod snapshot). Delta 97/09 drops `edge_backend`, so "
+        "this requires an explicit --source.",
+    )
     parser.add_argument("-v", action="store_true")
     args = parser.parse_args()
+    if args.upgrade_schema and args.source == "auto":
+        parser.error(
+            "--upgrade-schema drops the edge_backend marker that --source auto "
+            "reads; read its value first and pass --source event-json or sql-edges"
+        )
     logging.basicConfig(
         level=logging.DEBUG if args.v else logging.INFO,
         format="%(asctime)s - %(name)s - %(lineno)d - %(levelname)s - %(message)s",
@@ -495,6 +508,8 @@ def main() -> None:
     if not args.rekey_complete:
         parser.error("run only after the embedded-store rekey; pass --rekey-complete")
     hs = RebuildHomeserver(config)
+    if args.upgrade_schema:
+        hs.DATABASE_SCHEMA_READ_ONLY = False
     hs.setup()
     hs.get_storage_controllers()
     exit_code = 0

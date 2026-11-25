@@ -46,6 +46,14 @@ from _desalt import (
 )
 
 
+def _close(engine: Any) -> None:
+    """Prod's build predates `close_client`; process exit releases the store
+    (this run only reads it), so a missing function is not an error."""
+    close = getattr(engine, "close_client", None)
+    if close is not None:
+        close()
+
+
 def require_old_build(engine: Any) -> None:
     """The old FFI takes a namespace first; the new one does not."""
     try:
@@ -93,7 +101,7 @@ def main() -> int:
     try:
         require_old_build(engine)
     except BaseException:
-        engine.close_client()
+        _close(engine)
         raise
 
     _, sql = sql_connection(args.config)
@@ -292,7 +300,7 @@ def main() -> int:
         except FileNotFoundError:
             pass
         raise
-    engine.close_client()
+    _close(engine)
     return 0
 
 
