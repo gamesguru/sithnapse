@@ -147,11 +147,6 @@ class GroupCommitWiringTestCase(TestCase):
             ),
             mock.patch.object(
                 embedded_common,
-                "flush_adjacency_tails",
-                side_effect=lambda: calls.append("adjacency"),
-            ),
-            mock.patch.object(
-                embedded_common,
                 "request_durable",
                 side_effect=lambda: calls.append("request"),
             ),
@@ -161,9 +156,9 @@ class GroupCommitWiringTestCase(TestCase):
         ):
             coalescer._flush()
 
-        # Adjacency first: an orphan edge is harmless, a durable event body
-        # with no durable edges is not.
-        self.assertEqual(calls, ["adjacency", "request"])
+        # The native request orders the adjacency flush against the WAL boundary
+        # itself, so the coalescer only asks for durability.
+        self.assertEqual(calls, ["request"])
         self.assertFalse(coalescer._dirty)
 
     def test_background_failure_keeps_dirty_pools_for_retry(self) -> None:
@@ -429,3 +424,30 @@ class ShutdownCheckpointTestCase(TestCase):
             ),
         ):
             coalescer.close()  # must not raise
+
+
+class CoalescerConcurrentWriteTestCase(TestCase):
+    def test_write_marked_during_a_barrier_stays_dirty(self) -> None:
+        """A commit that lands while `sync_now` runs must not be cleared by it."""
+        from synapse.storage.databases.main.embedded_common import _FlushCoalescer
+        from synapse.util.clock import Clock
+
+        from tests.server import ThreadedMemoryReactorClock
+
+        clock = Clock(ThreadedMemoryReactorClock(), server_name="test_server")  # type: ignore[multiple-internal-clocks]
+        coalescer = _FlushCoalescer(clock)
+        coalescer._dirty.add(Pool.STATE)
+
+        def sync_and_commit_more(pools: set[Pool]) -> None:
+            # A persist on another thread commits after the snapshot was taken.
+            coalescer.mark_dirty(Pool.STATE)
+
+        with (
+            mock.patch.object(embedded_common, "flush_adjacency_tails"),
+            mock.patch.object(
+                embedded_common, "_do_sync_pools", side_effect=sync_and_commit_more
+            ),
+        ):
+            coalescer.sync_now([Pool.STATE])
+
+        self.assertIn(Pool.STATE, coalescer._dirty)
