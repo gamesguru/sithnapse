@@ -171,20 +171,10 @@ class StateStoreTestCase(HomeserverTestCase):
         `_lookup_state_hamts_from_embedded_txn` against a real mtxdb
         database.
         """
-        import shutil
-        import tempfile
-
-        from synapse.synapse_rust import mtxdb_engine
-
-        tmpdir = tempfile.mkdtemp(prefix="test-embedded-mtxdb-")
-        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
-        mtxdb_engine.close_client()
-        mtxdb_engine.open_client(tmpdir)
-        self.state_datastore._embedded_db_engine = "mtxdb"
-        self.state_datastore._embedded_db_path = tmpdir
-        # Each test opens its own root: keys are unsalted, so state-group
-        # ids (which restart at 1 in every fresh SQL database) must not be
-        # shared across tests.
+        # The homeserver's config already gives this test its own embedded
+        # root (`default_config`); do not close and reopen the process-global
+        # client while the homeserver's stores and flush threads still use it.
+        self.assertEqual(self.state_datastore._embedded_db_engine, "mtxdb")
 
         e1 = self.inject_state_event(self.room, self.u_alice, EventTypes.Create, "", {})
         e2 = self.inject_state_event(
@@ -202,7 +192,7 @@ class StateStoreTestCase(HomeserverTestCase):
         # its per-room mtxdb collection. Its on-disk records must contain the
         # real eight-byte HAMT prefix, rather than an internally padded value:
         # the Rust materialize/lookup APIs reject any other length.
-        from synapse.synapse_rust import state_hamt
+        from synapse.synapse_rust import mtxdb_engine, state_hamt
 
         expected_room_prefix = bytes(
             state_hamt.room_hamt_prefix(
@@ -248,20 +238,10 @@ class StateStoreTestCase(HomeserverTestCase):
         written to mtxdb ONLY -- `state_hamt_roots`/`state_hamt_nodes` SQL
         rows are not also inserted (see `_persist_state_hamt_txn`).
         """
-        import shutil
-        import tempfile
-
-        from synapse.synapse_rust import mtxdb_engine
-
-        tmpdir = tempfile.mkdtemp(prefix="test-exclusive-write-mtxdb-")
-        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
-        mtxdb_engine.close_client()
-        mtxdb_engine.open_client(tmpdir)
-        self.state_datastore._embedded_db_engine = "mtxdb"
-        self.state_datastore._embedded_db_path = tmpdir
-        # Each test opens its own root: keys are unsalted, so state-group
-        # ids (which restart at 1 in every fresh SQL database) must not be
-        # shared across tests.
+        # The homeserver's config already gives this test its own embedded
+        # root (`default_config`); do not close and reopen the process-global
+        # client while the homeserver's stores and flush threads still use it.
+        self.assertEqual(self.state_datastore._embedded_db_engine, "mtxdb")
 
         event = self.inject_state_event(
             self.room, self.u_alice, EventTypes.Create, "", {}
@@ -306,20 +286,10 @@ class StateStoreTestCase(HomeserverTestCase):
         `_fetch_hamt_roots_for_embedded_txn` actually took the embedded-
         engine fast path rather than silently falling back to SQL.
         """
-        import shutil
-        import tempfile
-
-        from synapse.synapse_rust import mtxdb_engine
-
-        tmpdir = tempfile.mkdtemp(prefix="test-embedded-root-mtxdb-")
-        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
-        mtxdb_engine.close_client()
-        mtxdb_engine.open_client(tmpdir)
-        self.state_datastore._embedded_db_engine = "mtxdb"
-        self.state_datastore._embedded_db_path = tmpdir
-        # Each test opens its own root: keys are unsalted, so state-group
-        # ids (which restart at 1 in every fresh SQL database) must not be
-        # shared across tests.
+        # The homeserver's config already gives this test its own embedded
+        # root (`default_config`); do not close and reopen the process-global
+        # client while the homeserver's stores and flush threads still use it.
+        self.assertEqual(self.state_datastore._embedded_db_engine, "mtxdb")
 
         e1 = self.inject_state_event(self.room, self.u_alice, EventTypes.Create, "", {})
         e2 = self.inject_state_event(
@@ -588,23 +558,14 @@ class StateStoreTestCase(HomeserverTestCase):
             RuntimeError,
         )
 
-    def _setup_embedded_engine_for_room(self, prefix: str) -> None:
-        """Point `self.state_datastore` at a fresh embedded mtxdb client,
-        mirroring the other `test_embedded_*` tests in this file."""
-        import shutil
-        import tempfile
+    def _setup_embedded_engine_for_room(self, _prefix: str) -> None:
+        """Assert this test homeserver is already using its own embedded root.
 
-        from synapse.synapse_rust import mtxdb_engine
-
-        tmpdir = tempfile.mkdtemp(prefix=prefix)
-        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
-        mtxdb_engine.close_client()
-        mtxdb_engine.open_client(tmpdir)
-        self.state_datastore._embedded_db_engine = "mtxdb"
-        self.state_datastore._embedded_db_path = tmpdir
-        # Each test opens its own root: keys are unsalted, so state-group
-        # ids (which restart at 1 in every fresh SQL database) must not be
-        # shared across tests.
+        `default_config` gives every test homeserver a fresh mtxdb root, so the
+        tests must not close and reopen the process-global client while the
+        homeserver's stores and flush threads still use it.
+        """
+        self.assertEqual(self.state_datastore._embedded_db_engine, "mtxdb")
 
     def test_purge_unreferenced_state_groups_deletes_embedded_root(self) -> None:
         """Regression test: `purge_unreferenced_state_groups` used to call

@@ -78,20 +78,9 @@ class EventsTestCase(HomeserverTestCase):
         proves the embedded-engine fast path is actually taken, not a
         silent SQL fallback.
 
-        The mtxdb client is process-global, so close whatever root this test
-        homeserver opened and point it at `tmpdir` for the duration of the
-        test. The base case tearDown closes it again.
+        The test homeserver already has a fresh mtxdb root, so use that root
+        throughout the test. The base case tearDown closes the client.
         """
-        import shutil
-        import tempfile
-
-        from synapse.synapse_rust import mtxdb_engine
-
-        tmpdir = tempfile.mkdtemp(prefix="test-embedded-event-json-")
-        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
-        mtxdb_engine.close_client()
-        mtxdb_engine.open_client(tmpdir)
-
         persist_store = self.hs.get_datastores().persist_events
         assert persist_store is not None
         persist_store._embedded_event_json_enabled = True

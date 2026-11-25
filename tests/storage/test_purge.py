@@ -53,21 +53,6 @@ from synapse.util.clock import Clock
 
 from tests.test_utils.event_builders import make_test_pdu_event
 from tests.unittest import HomeserverTestCase
-from tests.utils import EMBEDDED_DB_ENGINE, EMBEDDED_DB_PATH
-
-if EMBEDDED_DB_ENGINE and EMBEDDED_DB_PATH:
-    # Reuse the test harness's worker store; opening a private one here would
-    # win the engine's process-global OnceCell.
-    _EMBEDDED_ENGINE_TMPDIR = EMBEDDED_DB_PATH
-else:
-    import atexit
-    import shutil
-    import tempfile
-
-    _EMBEDDED_ENGINE_TMPDIR = tempfile.mkdtemp(prefix="test-purge-embedded-")
-    atexit.register(shutil.rmtree, _EMBEDDED_ENGINE_TMPDIR, ignore_errors=True)
-
-from synapse.synapse_rust import mtxdb_engine
 
 
 class PurgeTests(HomeserverTestCase):
@@ -95,14 +80,11 @@ class PurgeTests(HomeserverTestCase):
         routes its auth-chain lookup through a mirror that never saw it,
         403ing with "No create event in auth events".
 
-        The adapter's store is process-global but closable, so this closes
-        whatever the previous test opened and reopens a fixed test root.
+        The test homeserver already has a fresh mtxdb root. Reuse it rather
+        than closing the process-global client while the homeserver is live.
 
         Returns the configured engine.
         """
-
-        mtxdb_engine.close_client()
-        mtxdb_engine.open_client(_EMBEDDED_ENGINE_TMPDIR)
 
         persist_store = self.hs.get_datastores().persist_events
         assert persist_store is not None

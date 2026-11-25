@@ -121,41 +121,38 @@ class TimingsFlushForkTestCase(unittest.TestCase):
         thread that no longer exists, so its first diagnostic call would
         deadlock. ``fork()`` therefore has to wait for the flush to finish.
 
-        The flush is held open by an event, and it is only released once the
-        fork thread is *observed* blocked inside the fork-gate hook (a
-        positive condition polled with a deadline, not a timed wait for
-        something not to happen). If the gate is broken, ``fork()`` returns
-        while the flusher still holds the lock, which is detected however the
-        threads happen to be scheduled.
+        Fork from the main thread. Forking a multithreaded process from a
+        worker thread can wedge CPython's at-fork handling before the child
+        gets a chance to run; that is the leading explanation for the earlier
+        stall, though it was not confirmed. A helper thread observes the main
+        thread blocked in the fork-gate hook and releases the flush.
         """
         diagnostics_lock = threading.Lock()
         in_flush = threading.Event()
         release_flush = threading.Event()
-        fork_returned = threading.Event()
-        forked: list[int] = []
-        child_exit_codes: list[int] = []
+        gate_seen = threading.Event()
 
         def flusher() -> None:
             with diagnostics_lock:
                 in_flush.set()
-                # No timeout: the cleanup below sets the event, so a slow
-                # runner cannot self-release the flush and let ``fork()``
-                # complete mid-check (which would false-fail the gate assert).
+                # No timeout: the helper below releases this once the fork is
+                # observed blocked on the gate, so a slow runner cannot
+                # self-release the flush and let ``fork()`` complete mid-check.
                 release_flush.wait()
 
-        def fork_in_thread() -> None:
-            pid = os.fork()
-            if pid == 0:
-                # Child: this thread is the only one that survived. Never
-                # return into the test runner.
-                code = 1
-                try:
-                    if diagnostics_lock.acquire(timeout=2):
-                        code = 0
-                finally:
-                    os._exit(code)
-            forked.append(pid)
-            fork_returned.set()
+        def release_when_gate_blocks() -> None:
+            """Release the flush once the main thread is stuck in the gate."""
+            deadline = time.monotonic() + 10
+            try:
+                while time.monotonic() < deadline:
+                    if _is_running_in(threading.main_thread(), "_before_fork"):
+                        gate_seen.set()
+                        return
+                    time.sleep(0.005)
+            finally:
+                # Even if the gate never appears (a broken hook), never leave
+                # the flusher thread blocked and the main thread in ``fork``.
+                release_flush.set()
 
         with tempfile.TemporaryDirectory() as run_dir:
             with patch.dict(os.environ, {"SYNAPSE_TIMINGS_RUN_DIR": run_dir}):
@@ -169,41 +166,36 @@ class TimingsFlushForkTestCase(unittest.TestCase):
 
                 self.assertTrue(in_flush.wait(5), "flusher never ran")
 
-                thread = threading.Thread(target=fork_in_thread, daemon=True)
-                thread.start()
+                helper = threading.Thread(
+                    target=release_when_gate_blocks,
+                    name="release-flush-gate",
+                    daemon=True,
+                )
+                helper.start()
 
-                # The flusher is inside its critical section and cannot finish
-                # until we say so. Wait until the fork thread is observed
-                # blocked in the fork-gate hook; never release the flusher on
-                # a timer. This checks the hook the fork thread is stuck in,
-                # not fork() in general, and it relies on CPython's
-                # ``sys._current_frames`` and on the hook keeping the name
-                # ``_before_fork``.
-                consecutive_blocked = 0
-                deadline = time.monotonic() + 10
-                while consecutive_blocked < 3:
-                    self.assertFalse(
-                        fork_returned.is_set(),
-                        "fork() completed while a flusher held the flush gate",
-                    )
-                    self.assertLess(
-                        time.monotonic(), deadline, "fork() never blocked on the gate"
-                    )
-                    if _is_running_in(thread, "_before_fork"):
-                        consecutive_blocked += 1
-                    else:
-                        consecutive_blocked = 0
-                    time.sleep(0.005)
+                # The main thread is the one forking: only the forking thread
+                # survives in the child, and the other at-fork hooks expect the
+                # main thread to be the caller.
+                pid = os.fork()
+                if pid != 0:
+                    self.addCleanup(_kill_and_reap, pid)
+                if pid == 0:
+                    # Child: never return into the test runner.
+                    code = 1
+                    try:
+                        if diagnostics_lock.acquire(timeout=2):
+                            code = 0
+                    finally:
+                        os._exit(code)
 
-                release_flush.set()
-                self.assertTrue(fork_returned.wait(5), "fork() never completed")
-                thread.join(5)
-                self.addCleanup(_kill_and_reap, forked[0])
-
-                status = _wait_for_child(forked[0])
-                child_exit_codes.append(os.waitstatus_to_exitcode(status))
+                status = _wait_for_child(pid)
+                helper.join(5)
+                self.assertTrue(
+                    gate_seen.is_set(),
+                    "fork() completed without blocking on the flush gate",
+                )
                 self.assertEqual(
-                    child_exit_codes,
-                    [0],
+                    os.waitstatus_to_exitcode(status),
+                    0,
                     "child inherited a diagnostics lock held by the flusher",
                 )
