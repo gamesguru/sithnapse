@@ -1419,6 +1419,10 @@ FLUSH_DELAY_SECS: float = 0.5
 # across an fsync.
 _DIRTY_LOCK = threading.Lock()
 _BARRIER_CONDITION = threading.Condition(_DIRTY_LOCK)
+# A barrier should finish in milliseconds. Shutdown must not wait forever for a
+# wedged one (a flush blocked on a lock the closing thread holds would otherwise
+# deadlock the process); after this long, log and continue best-effort.
+_CLOSE_BARRIER_WAIT_SECS: float = 5.0
 
 
 class _FlushCoalescer:
@@ -1478,72 +1482,77 @@ class _FlushCoalescer:
             # flush runs re-adds its pool, so the successful result below
             # cannot discard it.
             self._dirty.difference_update(to_flush)
-        ffi_count(
-            "sync_origin.coalescer_flush."
-            + "+".join(sorted(p.name.lower() for p in to_flush)),
-            1,
-        )
         try:
-            # The native `request_durable` captures the WAL boundary and
-            # requests durability up to it. Deferred adjacency tails need no
-            # ordering against it: every edge write is journaled in the edge
-            # log, which commits with the WAL, and `recover_edge_log` rebuilds
-            # any tail rows a crash loses. The tails are synced by the
-            # adjacency flush, which also prunes the log.
-            if publishes_at_commit():
-                # All pools share a WAL in the normal layout. Publish first,
-                # then capture one boundary covering every pool; the native
-                # background committer performs the eventual shared fsync.
-                request_durable()
-                if error := background_commit_error():
-                    # The native committer is terminal after an I/O error.
-                    # Recover by proving the same dirty set with the strict
-                    # synchronous path, then replace the failed committer.
-                    logger.warning(
-                        "mtxdb background committer failed; attempting strict recovery: %s",
-                        error,
-                    )
-                    _do_sync_pools(to_flush)
-                    try:
-                        stop_background_commit()
-                    except Exception:
-                        # stop_background_commit reports the already-recorded
-                        # terminal error even after strict sync succeeded.
-                        logger.info(
-                            "mtxdb failed committer stopped after strict recovery",
-                            exc_info=True,
-                        )
-                    start_background_commit(self._FLUSH_DELAY.as_secs())
-            else:
-                _do_sync_pools(to_flush)
-            if Pool.EVENT_DAG in to_flush and not _sync_disabled:
-                # This is a successful delayed/coalesced flush. The native
-                # sync counters above record the actual pool call; this
-                # counter identifies the coalescer's contribution.
-                ffi_count("event_dag_sync_coalesced", 1)
-        except Exception:
-            with _DIRTY_LOCK:
-                # Re-add everything this attempt owned. Pools re-added by a
-                # concurrent write during the attempt are already here, so
-                # this only restores what the snapshot took.
-                self._dirty.update(to_flush)
-            if Pool.EVENT_DAG in to_flush:
-                # This coarse batch signal is a subset of the native
-                # event_dag_sync_errors counter, not an independent error.
-                ffi_count("event_dag_sync_coalesced_errors", 1)
-            logger.warning(
-                "Flush coalescer sync failed for %s, will retry",
-                to_flush,
-                exc_info=True,
+            ffi_count(
+                "sync_origin.coalescer_flush."
+                + "+".join(sorted(p.name.lower() for p in to_flush)),
+                1,
             )
-        # Schedule retry if still dirty
-        with _BARRIER_CONDITION:
-            if self._dirty and self._delayed_call is None and not self._closed:
-                self._delayed_call = self._clock.call_later(
-                    self._RETRY_DELAY, self._flush
+            try:
+                # The native `request_durable` captures the WAL boundary and
+                # requests durability up to it. Deferred adjacency tails need no
+                # ordering against it: every edge write is journaled in the edge
+                # log, which commits with the WAL, and `recover_edge_log` rebuilds
+                # any tail rows a crash loses. The tails are synced by the
+                # adjacency flush, which also prunes the log.
+                if publishes_at_commit():
+                    # All pools share a WAL in the normal layout. Publish first,
+                    # then capture one boundary covering every pool; the native
+                    # background committer performs the eventual shared fsync.
+                    request_durable()
+                    if error := background_commit_error():
+                        # The native committer is terminal after an I/O error.
+                        # Recover by proving the same dirty set with the strict
+                        # synchronous path, then replace the failed committer.
+                        logger.warning(
+                            "mtxdb background committer failed; attempting strict recovery: %s",
+                            error,
+                        )
+                        _do_sync_pools(to_flush)
+                        try:
+                            stop_background_commit()
+                        except Exception:
+                            # stop_background_commit reports the already-recorded
+                            # terminal error even after strict sync succeeded.
+                            logger.info(
+                                "mtxdb failed committer stopped after strict recovery",
+                                exc_info=True,
+                            )
+                        start_background_commit(self._FLUSH_DELAY.as_secs())
+                else:
+                    _do_sync_pools(to_flush)
+                if Pool.EVENT_DAG in to_flush and not _sync_disabled:
+                    # This is a successful delayed/coalesced flush. The native
+                    # sync counters above record the actual pool call; this
+                    # counter identifies the coalescer's contribution.
+                    ffi_count("event_dag_sync_coalesced", 1)
+            except Exception:
+                with _DIRTY_LOCK:
+                    # Re-add everything this attempt owned. Pools re-added by a
+                    # concurrent write during the attempt are already here, so
+                    # this only restores what the snapshot took.
+                    self._dirty.update(to_flush)
+                if Pool.EVENT_DAG in to_flush:
+                    # This coarse batch signal is a subset of the native
+                    # event_dag_sync_errors counter, not an independent error.
+                    ffi_count("event_dag_sync_coalesced_errors", 1)
+                logger.warning(
+                    "Flush coalescer sync failed for %s, will retry",
+                    to_flush,
+                    exc_info=True,
                 )
-            self._active_sync_barriers -= 1
-            _BARRIER_CONDITION.notify_all()
+            # Schedule retry if still dirty
+            with _BARRIER_CONDITION:
+                if self._dirty and self._delayed_call is None and not self._closed:
+                    self._delayed_call = self._clock.call_later(
+                        self._RETRY_DELAY, self._flush
+                    )
+        finally:
+            # Always release the barrier, including if the failure handling
+            # above raised: `close` waits on this counter before it can finish.
+            with _BARRIER_CONDITION:
+                self._active_sync_barriers -= 1
+                _BARRIER_CONDITION.notify_all()
 
     def sync_now(self, pools: Iterable[Pool] | None = None) -> None:
         """Immediate barrier for destructive ops and shutdown.
@@ -1658,8 +1667,21 @@ class _FlushCoalescer:
                 self._delayed_call.cancel()
                 self._delayed_call = None
             self._closed = True
+            # The wait below is a real thread wait, so the deadline must be a
+            # real monotonic clock, not the injectable Synapse clock (tests use
+            # a fake clock whose time does not advance while blocked).
+            deadline = time.monotonic() + _CLOSE_BARRIER_WAIT_SECS
             while self._active_sync_barriers:
-                _BARRIER_CONDITION.wait()
+                wait = deadline - time.monotonic()
+                if wait <= 0:
+                    logger.error(
+                        "Flush coalescer close timed out with %d sync barrier(s) "
+                        "still active; continuing best-effort shutdown",
+                        self._active_sync_barriers,
+                    )
+                    break
+                _BARRIER_CONDITION.wait(timeout=wait)
+            barriers_pending = self._active_sync_barriers > 0
             to_flush = set(self._dirty)
             remaining = set(self._dirty)
         if to_flush:
@@ -1690,8 +1712,9 @@ class _FlushCoalescer:
                 )
         # Leave a durable checkpoint at the current packs. Best effort: a
         # failure must not turn a clean stop into an error, and the engine
-        # still recovers from its journal and delta logs without it.
-        if not remaining:
+        # still recovers from its journal and delta logs without it. Skip it
+        # while a barrier is still in flight: it may be writing.
+        if not remaining and not barriers_pending:
             try:
                 checkpoint_pools()
             except Exception:
