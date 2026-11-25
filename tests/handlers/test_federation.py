@@ -776,3 +776,28 @@ class PartialJoinTestCase(unittest.FederatingHomeserverTestCase):
                 other_destinations={"hs2"},
                 room_id="room_id",
             )
+
+
+class BackfillExtremityCapTestCase(unittest.TestCase):
+    def test_backfill_request_uri_stays_short(self) -> None:
+        """One `/backfill` asks about this many extremities in its query string.
+
+        Event IDs are `$` plus 43 url-safe characters (room versions 3+), and the
+        `$` is percent-encoded, so each `v=` parameter costs about 50 bytes.
+        Keep the whole request URI well under 4 KiB, and so under the 8 KiB
+        most servers accept.
+        """
+        # Imported here: importing the handler at module scope trips the
+        # federation/rest import cycle before the test class is collected.
+
+        # Imported here: importing the handler before `synapse.rest` is a circular
+        # import.
+        from synapse.handlers.federation import MAX_BACKFILL_EXTREMITIES
+
+        room_id = "!" + "r" * 43 + ":remote.example.org"
+        per_extremity = len("&v=") + len("%24") + 43
+        uri_length = (
+            len(f"/_matrix/federation/v1/backfill/{room_id}?limit=100")
+            + MAX_BACKFILL_EXTREMITIES * per_extremity
+        )
+        self.assertLess(uri_length, 4096)

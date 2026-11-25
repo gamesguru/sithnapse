@@ -160,6 +160,18 @@ The number of events we try to backfill from other servers in a single request.
 """
 
 
+MAX_BACKFILL_EXTREMITIES = 50
+"""
+The number of backward extremities asked about in a single backfill request.
+
+Each one adds a `v=` event ID to the `/backfill` query string, so this is kept
+small enough that the request URI stays well under common 8 KiB limits (see
+`tests/handlers/test_federation.py`). A room with many open gaps needs about
+one round of `/messages` per this many extremities, so a low value makes
+catching up slow without making any single request cheaper.
+"""
+
+
 # TODO: We can refactor this away now that there is only one backfill point again
 class _BackfillPointType(Enum):
     # a regular backwards extremity (ie, an event which we don't yet have, but which
@@ -506,7 +518,8 @@ class FederationHandler:
         # of resources to get redacted events. We check each extremity in turn and
         # ignore those which users on our server wouldn't be able to see.
         #
-        # Additionally, we limit ourselves to backfilling from at most 5 extremities,
+        # Additionally, we limit ourselves to backfilling from at most
+        # `MAX_BACKFILL_EXTREMITIES` extremities,
         # for two reasons:
         #
         # - The check which determines if we can see an extremity's events can be
@@ -523,7 +536,7 @@ class FederationHandler:
 
         extremities_to_request: list[str] = []
         for bp in sorted_backfill_points:
-            if len(extremities_to_request) >= 5:
+            if len(extremities_to_request) >= MAX_BACKFILL_EXTREMITIES:
                 break
 
             # For regular backwards extremities, we don't have the extremity events
