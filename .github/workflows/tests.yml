@@ -505,16 +505,16 @@ jobs:
         if: ${{ matrix.job.postgres-version }}
         timeout-minutes: 2
         run: until pg_isready -h localhost; do sleep 1; done
-      # `timeout` kills the whole hung process tree (timeout-minutes alone
-      # leaves workers to the runner); the sitecustomize on PYTHONPATH makes every
-      # trial process dump its stacks periodically, so a wedged worker is named.
-      - run: timeout --kill-after=2m 40m uv run trial --jobs="$(nproc)" tests
-        timeout-minutes: 45
+      # `timeout` is only the last-resort kill for a hang before Trial reports a
+      # result; run_trial.py stops the parent shortly after the summary, so a
+      # failed or corrupted worker cannot hold the job until this deadline. The
+      # sitecustomize still dumps stacks if the timeout does fire.
+      - run: timeout --signal=USR1 --kill-after=2m 25m .venv/bin/python .ci/scripts/run_trial.py --jobs="$(nproc)" tests
+        timeout-minutes: 30
         env:
           PYTHONFAULTHANDLER: "1"
           PYTHONPATH: ${{ github.workspace }}/.ci/hang-dump
           SYNAPSE_HANG_DUMP_DIR: /tmp/trial-hang
-          SYNAPSE_HANG_DUMP_SECONDS: "600"
           SYNAPSE_POSTGRES: ${{ matrix.job.database == 'postgres' || '' }}
           SYNAPSE_POSTGRES_HOST: /var/run/postgresql
           SYNAPSE_POSTGRES_USER: postgres
@@ -594,7 +594,8 @@ jobs:
             sleep 2
             if [ $i -eq 5 ]; then exit 1; fi
           done
-      - run: uv run trial --jobs="$(nproc)" tests
+      - run: timeout --kill-after=2m 25m uv run trial --jobs="$(nproc)" tests
+        timeout-minutes: 30
         env:
           SYNAPSE_TEST_EMBEDDED_DB_ENGINE: mtxdb
           SYNAPSE_TEST_EMBEDDED_DB_PATH: /tmp/synapse-embedded-db
@@ -654,7 +655,8 @@ jobs:
       # Sanity check we can import/run Synapse
       - run: python -m synapse.app.homeserver --help
 
-      - run: python -m twisted.trial -j"$(nproc)" tests
+      - run: timeout --kill-after=2m 25m python -m twisted.trial -j"$(nproc)" tests
+        timeout-minutes: 30
       - name: Dump logs
         # Logs are most useful when the command fails, always include them.
         if: ${{ always() }}
