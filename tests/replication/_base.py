@@ -292,6 +292,17 @@ class BaseMultiWorkerStreamTestCase(unittest.HomeserverTestCase):
         self, reactor: ThreadedMemoryReactorClock, clock: Clock
     ) -> HomeServer:
         hs = super().make_homeserver(reactor, clock)
+        # `setUp` opened `_shared_embedded_path` for this test, but building a
+        # homeserver closes whatever client is open (it must, so that a
+        # homeserver can open its own root), and this worker-shaped main
+        # homeserver does not reopen it. Reopen the shared root, which the
+        # fake workers also use, before `prepare()` creates rooms. This works
+        # around a one-store-per-process limit that exists only because the
+        # fixture runs master and workers in one process; it is not a product
+        # fix (real workers are separate processes).
+        from synapse.synapse_rust import mtxdb_engine
+
+        mtxdb_engine.open_client(self._shared_embedded_path)
         # `prepare()` runs right after this returns and creates rooms, so the
         # edge backend must already be writable when it does.
         self._enable_embedded_edges(hs)
