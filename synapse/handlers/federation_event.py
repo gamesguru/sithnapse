@@ -253,31 +253,16 @@ class FederationEventHandler:
         )
         # (destination, room_id, missing prev_event_id) -> why the state after that
         # event could not be completed.
-        self._incomplete_state_lookups: ExpiringCache[tuple[str, str, str], str] = (
-            ExpiringCache(
-                cache_name="federation_incomplete_state_lookups",
-                server_name=self.server_name,
-                hs=hs,
-                clock=self._clock,
-                max_len=10000,
-                expiry_ms=_FAILED_LOOKUP_TTL_MS,
-            )
-        )
-
-        # The usable part of a state lookup that could only be completed in part
-        # (the same key as above). A tolerant caller that meets the remembered
-        # failure still gets this state; skipping it would give adjacent events
-        # sharing a missing parent different states.
-        self._partial_state_maps: ExpiringCache[tuple[str, str, str], StateMap[str]] = (
-            ExpiringCache(
-                cache_name="federation_partial_state_maps",
-                server_name=self.server_name,
-                hs=hs,
-                clock=self._clock,
-                max_len=1000,
-                expiry_ms=_FAILED_LOOKUP_TTL_MS,
-                size_callback=lambda v: len(v) + 1,
-            )
+        self._incomplete_state_lookups: ExpiringCache[
+            tuple[str, str, str], tuple[str, StateMap[str] | None]
+        ] = ExpiringCache(
+            cache_name="federation_incomplete_state_lookups",
+            server_name=self.server_name,
+            hs=hs,
+            clock=self._clock,
+            max_len=200000,
+            expiry_ms=_FAILED_LOOKUP_TTL_MS,
+            size_callback=lambda v: len(v[1]) + 1 if v[1] is not None else 1,
         )
 
     async def on_receive_pdu(self, origin: str, pdu: EventBase) -> None:
@@ -1902,26 +1887,37 @@ class FederationEventHandler:
                 """Whether the remote cannot give us the state at this gap parent.
 
                 This is the lookup and the failure handling of
-                `_compute_event_context_with_maybe_missing_prevs`: any failure is
-                remembered and the event goes on without that parent's state. If
-                the remote does have state there, it would have to be resolved
-                into the event's context, which only the serial path does. Its
-                answer is cached, so the serial path does not ask again.
+                `_compute_event_context_with_maybe_missing_prevs`: a definitive
+                404 is remembered and the event goes on without that parent's
+                state; any other failure declines the batch so the serial path
+                retries. If the remote does have state there, it would have to
+                be resolved into the event's context, which only the serial
+                path does. A 404 is cached, so the serial path does not ask
+                again.
                 """
                 lookup_key = (origin, room_id, prev)
-                if self._incomplete_state_lookups.get(lookup_key) is not None:
+                cached_incomplete = self._incomplete_state_lookups.get(lookup_key)
+                if cached_incomplete is not None:
                     # A failed tolerant lookup may still have recovered usable
                     # state. In that case the serial path must consume the
                     # cached partial map instead of treating this parent as an
                     # empty failure and batching without it.
-                    return self._partial_state_maps.get(lookup_key) is None
+                    return cached_incomplete[1] is None
                 try:
                     await self._get_state_ids_after_missing_prev_event(
                         origin, room_id, prev, require_complete_state=False
                     )
-                except Exception as e:
-                    self._incomplete_state_lookups[lookup_key] = str(e)
-                    return True
+                except HttpResponseException as e:
+                    if e.code == 404:
+                        # The remote definitively has no state there; remember
+                        # it so the serial path does not ask again.
+                        self._incomplete_state_lookups[lookup_key] = (str(e), None)
+                        return True
+                    return False
+                except Exception:
+                    # A transient failure says nothing about whether usable
+                    # state exists. Decline and let the serial path retry.
+                    return False
                 return False
 
             # Ask a handful at a time, not all at once: the run can name dozens
@@ -2243,8 +2239,9 @@ class FederationEventHandler:
                     # give us complete state here. Preserve the original handling:
                     # strict callers fail, while pulled/non-state events continue
                     # using the state we have.
-                    failure = self._incomplete_state_lookups.get(lookup_key)
-                    if failure is not None:
+                    cached_incomplete = self._incomplete_state_lookups.get(lookup_key)
+                    if cached_incomplete is not None:
+                        failure, partial_state_map = cached_incomplete
                         if require_complete:
                             raise IncompleteStateError(failure)
                         logger.info(
@@ -2254,7 +2251,6 @@ class FederationEventHandler:
                             dest,
                             failure,
                         )
-                        partial_state_map = self._partial_state_maps.get(lookup_key)
                         if partial_state_map is not None:
                             # The first lookup returned usable state; use it again
                             # rather than resolving without it.
@@ -2276,7 +2272,7 @@ class FederationEventHandler:
                             )
                         )
                     except IncompleteStateError as e:
-                        self._incomplete_state_lookups[lookup_key] = str(e)
+                        self._incomplete_state_lookups[lookup_key] = (str(e), None)
                         raise
                     except Exception as e:
                         # A forward gap whose parent we cannot fetch at all
@@ -2285,7 +2281,7 @@ class FederationEventHandler:
                         # do have. The gap stays a backward extremity and is
                         # filled by backfill later.
                         state_fetch_failed = True
-                        self._incomplete_state_lookups[lookup_key] = str(e)
+                        self._incomplete_state_lookups[lookup_key] = (str(e), None)
                         logger.warning(
                             "_compute_event_context_with_maybe_missing_prevs(event_id=%s): "
                             "failed to fetch state for missing prev_event %s from %s: %s. "
@@ -2610,10 +2606,12 @@ class FederationEventHandler:
             # again immediately will return the same missing event IDs. Keep
             # that negative result briefly to avoid repeating the full lookup
             # for every event that shares this prev_event.
-            self._incomplete_state_lookups[(destination, room_id, event_id)] = (
-                f"Failed to fetch state events {sorted(failed_to_fetch)}"
-            )
+            failure = f"Failed to fetch state events {sorted(failed_to_fetch)}"
             if require_complete_state:
+                self._incomplete_state_lookups[(destination, room_id, event_id)] = (
+                    failure,
+                    None,
+                )
                 # The caller is about to authorise a new event against this
                 # state. Authorising against an incomplete state can accept an
                 # event the real state would reject (for example a member event
@@ -2633,7 +2631,10 @@ class FederationEventHandler:
             )
 
         if failed_to_fetch and not require_complete_state:
-            self._partial_state_maps[(destination, room_id, event_id)] = state_map
+            self._incomplete_state_lookups[(destination, room_id, event_id)] = (
+                failure,
+                state_map,
+            )
 
         return state_map
 

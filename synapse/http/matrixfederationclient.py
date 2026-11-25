@@ -410,6 +410,7 @@ async def _handle_response_with_backoff(
     response: IResponse,
     start_ms: int,
     parser: ByteParser[T],
+    ignore_backoff: bool = False,
 ) -> T:
     """Parse a federation response and mark malformed responses as failures.
 
@@ -431,11 +432,20 @@ async def _handle_response_with_backoff(
                 hs=hs,
                 clock=clock,
                 store=hs.get_datastores().main,
+                ignore_backoff=ignore_backoff,
                 notifier=hs.get_notifier(),
                 replication_client=hs.get_replication_command_handler(),
             )
         except synapse.util.retryutils.NotRetryingDestination:
             # A concurrent request already marked this destination down.
+            raise e
+        except Exception:
+            logger.warning(
+                "Failed to get retry limiter for malformed response from %s; "
+                "preserving the response error",
+                request.destination,
+                exc_info=True,
+            )
             raise e
 
         # Raising inside the limiter records this malformed response using the
@@ -1163,6 +1173,7 @@ class MatrixFederationHttpClient:
             response,
             start_ms,
             parser=parser,
+            ignore_backoff=ignore_backoff,
         )
 
         return body
@@ -1243,6 +1254,7 @@ class MatrixFederationHttpClient:
             response,
             start_ms,
             parser=JsonParser(),
+            ignore_backoff=ignore_backoff,
         )
         return body
 
@@ -1456,6 +1468,7 @@ class MatrixFederationHttpClient:
             response,
             start_ms,
             parser=parser,
+            ignore_backoff=ignore_backoff,
         )
 
         return body, headers
@@ -1531,6 +1544,7 @@ class MatrixFederationHttpClient:
             response,
             start_ms,
             parser=JsonParser(),
+            ignore_backoff=ignore_backoff,
         )
         return body
 
@@ -1609,6 +1623,7 @@ class MatrixFederationHttpClient:
             response,
             start_ms,
             parser=JsonParser(),
+            ignore_backoff=True,
         )
 
     async def get_file(

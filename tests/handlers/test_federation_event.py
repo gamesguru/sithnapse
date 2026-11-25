@@ -350,7 +350,9 @@ class FederationEventHandlerTests(unittest.FederatingHomeserverTestCase):
             "encrypted": mock.AsyncMock(),
         }
         if probe is None:
-            probe = mock.AsyncMock(side_effect=Exception("404: Not Found"))
+            probe = mock.AsyncMock(
+                side_effect=HttpResponseException(404, "Not Found", b"")
+            )
         self.probe = probe
         if cached_failures:
             for event in events:
@@ -358,7 +360,7 @@ class FederationEventHandlerTests(unittest.FederatingHomeserverTestCase):
                     if prev.startswith("$gap"):
                         handler._incomplete_state_lookups[
                             ("remote", "!room:test", prev)
-                        ] = "no state"
+                        ] = ("no state", None)
 
         with (
             mock.patch.object(handler, "_sanity_check_event"),
@@ -446,6 +448,19 @@ class FederationEventHandlerTests(unittest.FederatingHomeserverTestCase):
             self.assertIsNotNone(
                 handler._incomplete_state_lookups.get(("remote", "!room:test", gap))
             )
+
+    def test_backfilled_run_declines_on_transient_gap_probe_error(self) -> None:
+        probe = mock.AsyncMock(side_effect=RuntimeError("temporary lookup failure"))
+        result, persist, _ = self._run_backfilled_batch(
+            self._backfilled_run(), cached_failures=False, probe=probe
+        )
+
+        self.assertFalse(result)
+        persist.assert_not_awaited()
+        handler = self.hs.get_federation_event_handler()
+        self.assertIsNone(
+            handler._incomplete_state_lookups.get(("remote", "!room:test", "$gap1"))
+        )
 
     def test_backfilled_run_probes_a_bounded_number_of_gap_parents_at_once(
         self,
@@ -823,8 +838,17 @@ class FederationEventHandlerTests(unittest.FederatingHomeserverTestCase):
 
             get_pdu.assert_awaited_once()
 
-            # Once the negative entry expires, retrying the remote is allowed.
-            self.reactor.advance(60_000)
+            # It remains cached until its 60-second TTL, then the next cache
+            # prune tick removes it.
+            self.reactor.advance(59)
+            self.get_success(
+                handler._get_events_and_persist(
+                    self.OTHER_SERVER_NAME, room_id, {"$unfetchable"}
+                )
+            )
+            get_pdu.assert_awaited_once()
+
+            self.reactor.advance(31)
             self.get_success(
                 handler._get_events_and_persist(
                     self.OTHER_SERVER_NAME, room_id, {"$unfetchable"}
