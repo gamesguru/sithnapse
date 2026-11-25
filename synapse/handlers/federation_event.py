@@ -264,6 +264,22 @@ class FederationEventHandler:
             )
         )
 
+        # The usable part of a state lookup that could only be completed in part
+        # (the same key as above). A tolerant caller that meets the remembered
+        # failure still gets this state; skipping it would give adjacent events
+        # sharing a missing parent different states.
+        self._partial_state_maps: ExpiringCache[tuple[str, str, str], StateMap[str]] = (
+            ExpiringCache(
+                cache_name="federation_partial_state_maps",
+                server_name=self.server_name,
+                hs=hs,
+                clock=self._clock,
+                max_len=1000,
+                expiry_ms=_FAILED_LOOKUP_TTL_MS,
+                size_callback=lambda v: len(v) + 1,
+            )
+        )
+
     async def on_receive_pdu(self, origin: str, pdu: EventBase) -> None:
         """Process a PDU received via a federation /send/ transaction
 
@@ -1894,7 +1910,11 @@ class FederationEventHandler:
                 """
                 lookup_key = (origin, room_id, prev)
                 if self._incomplete_state_lookups.get(lookup_key) is not None:
-                    return True
+                    # A failed tolerant lookup may still have recovered usable
+                    # state. In that case the serial path must consume the
+                    # cached partial map instead of treating this parent as an
+                    # empty failure and batching without it.
+                    return self._partial_state_maps.get(lookup_key) is None
                 try:
                     await self._get_state_ids_after_missing_prev_event(
                         origin, room_id, prev, require_complete_state=False
@@ -2227,7 +2247,6 @@ class FederationEventHandler:
                     if failure is not None:
                         if require_complete:
                             raise IncompleteStateError(failure)
-                        state_fetch_failed = True
                         logger.info(
                             "Skipping state lookup for missing prev_event %s from %s "
                             "after a recent incomplete result: %s",
@@ -2235,6 +2254,13 @@ class FederationEventHandler:
                             dest,
                             failure,
                         )
+                        partial_state_map = self._partial_state_maps.get(lookup_key)
+                        if partial_state_map is not None:
+                            # The first lookup returned usable state; use it again
+                            # rather than resolving without it.
+                            state_maps.append(partial_state_map)
+                        else:
+                            state_fetch_failed = True
                         continue
 
                     # note that if any of the missing prevs share missing state or
@@ -2605,6 +2631,9 @@ class FederationEventHandler:
             state_map[(remote_event.type, remote_event.state_key)] = (
                 remote_event.event_id
             )
+
+        if failed_to_fetch and not require_complete_state:
+            self._partial_state_maps[(destination, room_id, event_id)] = state_map
 
         return state_map
 
