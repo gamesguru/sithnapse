@@ -1418,6 +1418,7 @@ FLUSH_DELAY_SECS: float = 0.5
 # concurrently. The lock is only held for those short in-memory sections, never
 # across an fsync.
 _DIRTY_LOCK = threading.Lock()
+_BARRIER_CONDITION = threading.Condition(_DIRTY_LOCK)
 
 
 class _FlushCoalescer:
@@ -1442,6 +1443,7 @@ class _FlushCoalescer:
         self._dirty: set[Pool] = set()
         self._delayed_call: DelayedCallWrapper | None = None
         self._closed: bool = False
+        self._active_sync_barriers = 0
         self._FLUSH_DELAY = Duration(seconds=flush_delay_secs)
         self._RETRY_DELAY = Duration(seconds=1.0)
 
@@ -1471,6 +1473,7 @@ class _FlushCoalescer:
             to_flush = set(self._dirty)  # snapshot
             if not to_flush:
                 return
+            self._active_sync_barriers += 1
             # Take ownership before any I/O: a write that commits while the
             # flush runs re-adds its pool, so the successful result below
             # cannot discard it.
@@ -1481,9 +1484,12 @@ class _FlushCoalescer:
             1,
         )
         try:
-            # The native `request_durable` captures the WAL boundary, flushes
-            # the deferred adjacency tails, then requests durability up to that
-            # boundary, so the edges of every event in the boundary are covered.
+            # The native `request_durable` captures the WAL boundary and
+            # requests durability up to it. Deferred adjacency tails need no
+            # ordering against it: every edge write is journaled in the edge
+            # log, which commits with the WAL, and `recover_edge_log` rebuilds
+            # any tail rows a crash loses. The tails are synced by the
+            # adjacency flush, which also prunes the log.
             if publishes_at_commit():
                 # All pools share a WAL in the normal layout. Publish first,
                 # then capture one boundary covering every pool; the native
@@ -1531,11 +1537,13 @@ class _FlushCoalescer:
                 exc_info=True,
             )
         # Schedule retry if still dirty
-        with _DIRTY_LOCK:
-            if self._dirty and self._delayed_call is None:
+        with _BARRIER_CONDITION:
+            if self._dirty and self._delayed_call is None and not self._closed:
                 self._delayed_call = self._clock.call_later(
                     self._RETRY_DELAY, self._flush
                 )
+            self._active_sync_barriers -= 1
+            _BARRIER_CONDITION.notify_all()
 
     def sync_now(self, pools: Iterable[Pool] | None = None) -> None:
         """Immediate barrier for destructive ops and shutdown.
@@ -1549,6 +1557,7 @@ class _FlushCoalescer:
         with _DIRTY_LOCK:
             if self._closed:
                 return
+            self._active_sync_barriers += 1
             if self._delayed_call is not None:
                 self._delayed_call.cancel()
                 self._delayed_call = None
@@ -1584,8 +1593,8 @@ class _FlushCoalescer:
                 self._dirty.update(to_flush)
             first_exc = first_exc or exc
         finally:
-            with _DIRTY_LOCK:
-                if self._dirty and self._delayed_call is None:
+            with _BARRIER_CONDITION:
+                if self._dirty and self._delayed_call is None and not self._closed:
                     # A pool left dirty by an unrelated write during this call
                     # (not one of our own failures) should rejoin the normal
                     # debounce cadence, not be punished with the failure
@@ -1596,6 +1605,8 @@ class _FlushCoalescer:
                         else self._FLUSH_DELAY
                     )
                     self._delayed_call = self._clock.call_later(delay, self._flush)
+                self._active_sync_barriers -= 1
+                _BARRIER_CONDITION.notify_all()
 
         if first_exc is not None:
             raise first_exc
@@ -1607,9 +1618,10 @@ class _FlushCoalescer:
         flush still covers whatever else touches the pool. Full barriers
         continue to use ``sync_now``.
         """
-        with _DIRTY_LOCK:
+        with _BARRIER_CONDITION:
             if self._closed:
                 return
+            self._active_sync_barriers += 1
         try:
             _do_sync_pools({Pool.EVENT_DAG})
             # Do not clear EVENT_DAG here: the dirty bit may represent writes
@@ -1631,19 +1643,23 @@ class _FlushCoalescer:
             # persisted event, and cancel-then-reschedule on every call would
             # perpetually push out the coalescer's flush under sustained
             # traffic, starving the actual edge drain indefinitely.
-            with _DIRTY_LOCK:
-                if self._dirty and self._delayed_call is None:
+            with _BARRIER_CONDITION:
+                if self._dirty and self._delayed_call is None and not self._closed:
                     self._delayed_call = self._clock.call_later(
                         self._RETRY_DELAY, self._flush
                     )
+                self._active_sync_barriers -= 1
+                _BARRIER_CONDITION.notify_all()
 
     def close(self) -> None:
         """Flush outstanding dirty pools and shut down."""
-        with _DIRTY_LOCK:
+        with _BARRIER_CONDITION:
             if self._delayed_call is not None:
                 self._delayed_call.cancel()
                 self._delayed_call = None
             self._closed = True
+            while self._active_sync_barriers:
+                _BARRIER_CONDITION.wait()
             to_flush = set(self._dirty)
             remaining = set(self._dirty)
         if to_flush:

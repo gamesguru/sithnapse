@@ -3,6 +3,8 @@
 #
 
 import os
+import threading
+import time
 from typing import cast
 from unittest import TestCase, mock
 
@@ -138,6 +140,7 @@ class GroupCommitWiringTestCase(TestCase):
         coalescer = object.__new__(embedded_common._FlushCoalescer)
         coalescer._delayed_call = None
         coalescer._closed = False
+        coalescer._active_sync_barriers = 0
         coalescer._dirty = {Pool.STATE, Pool.EVENT_DAG}
         calls: list[str] = []
 
@@ -156,8 +159,8 @@ class GroupCommitWiringTestCase(TestCase):
         ):
             coalescer._flush()
 
-        # The native request orders the adjacency flush against the WAL boundary
-        # itself, so the coalescer only asks for durability.
+        # The edge log makes tail flushing independent of the WAL boundary, so
+        # the coalescer only asks for durability.
         self.assertEqual(calls, ["request"])
         self.assertFalse(coalescer._dirty)
 
@@ -165,6 +168,7 @@ class GroupCommitWiringTestCase(TestCase):
         coalescer = object.__new__(embedded_common._FlushCoalescer)
         coalescer._delayed_call = None
         coalescer._closed = False
+        coalescer._active_sync_barriers = 0
         coalescer._dirty = {Pool.EVENT_DAG}
         coalescer._clock = mock.Mock()
         coalescer._RETRY_DELAY = Duration(seconds=1)
@@ -199,6 +203,7 @@ class GroupCommitWiringTestCase(TestCase):
         coalescer = object.__new__(embedded_common._FlushCoalescer)
         coalescer._delayed_call = None
         coalescer._closed = False
+        coalescer._active_sync_barriers = 0
         coalescer._dirty = {Pool.STATE, Pool.EVENT_DAG}
         coalescer._FLUSH_DELAY = mock.Mock()
         coalescer._FLUSH_DELAY.as_secs.return_value = 0.5
@@ -451,3 +456,52 @@ class CoalescerConcurrentWriteTestCase(TestCase):
             coalescer.sync_now([Pool.STATE])
 
         self.assertIn(Pool.STATE, coalescer._dirty)
+
+    def test_close_waits_for_in_flight_barrier_before_checkpoint(self) -> None:
+        """Close must wait until a barrier has finished restoring dirty state."""
+        from synapse.storage.databases.main.embedded_common import _FlushCoalescer
+        from synapse.util.clock import Clock
+
+        from tests.server import ThreadedMemoryReactorClock
+
+        clock = Clock(ThreadedMemoryReactorClock(), server_name="test_server")  # type: ignore[multiple-internal-clocks]
+        coalescer = _FlushCoalescer(clock)
+        barrier_entered = threading.Event()
+        finish_barrier = threading.Event()
+        checkpointed = threading.Event()
+
+        def block_barrier() -> None:
+            barrier_entered.set()
+            if not finish_barrier.wait(timeout=5):
+                raise TimeoutError("test did not release the active barrier")
+
+        with (
+            mock.patch.object(embedded_common, "flush_adjacency_tails", block_barrier),
+            mock.patch.object(embedded_common, "_do_sync_pools"),
+            mock.patch.object(
+                embedded_common,
+                "checkpoint_pools",
+                side_effect=lambda: checkpointed.set(),
+            ),
+        ):
+            barrier_thread = threading.Thread(
+                target=lambda: coalescer.sync_now([Pool.STATE])
+            )
+            barrier_thread.start()
+            self.assertTrue(barrier_entered.wait(timeout=5))
+
+            close_thread = threading.Thread(target=coalescer.close)
+            close_thread.start()
+            deadline = time.monotonic() + 5
+            while not coalescer._closed and time.monotonic() < deadline:
+                time.sleep(0.001)
+
+            self.assertTrue(coalescer._closed)
+            self.assertFalse(checkpointed.is_set())
+            finish_barrier.set()
+            barrier_thread.join(timeout=5)
+            close_thread.join(timeout=5)
+
+        self.assertFalse(barrier_thread.is_alive())
+        self.assertFalse(close_thread.is_alive())
+        self.assertTrue(checkpointed.is_set())

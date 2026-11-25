@@ -177,18 +177,22 @@ class EmbeddedAdjacencyTestCase(TestCase):
         WAL; opening the store replays whatever the tail lost before anything
         is served.
         """
+        # A root owned by this test, so removing tails touches no other data.
+        root = tempfile.mkdtemp(prefix="test-edge-log-recovery-")
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        mtxdb_engine.close_client()
+        mtxdb_engine.open_client(root)
+
         put_event_edges_batch([(self.room_id, "$r1", "$rp")], durable=False)
         # The WAL (and the edge log in it) is durable; the tail is not synced.
         mtxdb_engine.wait_durable(mtxdb_engine.request_durable())
         mtxdb_engine.close_client(durable=False)
-        tails = glob.glob(
-            os.path.join(_TEST_ENGINE_TMPDIR, "**", "tail.log"), recursive=True
-        )
+        tails = glob.glob(os.path.join(root, "**", "tail.log"), recursive=True)
         self.assertTrue(tails)
         for tail in tails:
             os.remove(tail)
 
-        open_test_engine()
+        mtxdb_engine.open_client(root)
         self.assertEqual(get_event_edges_backward_batch(["$r1"])["$r1"], ["$rp"])
         self.assertEqual(get_event_edges_forward_batch(["$rp"])["$rp"], ["$r1"])
 
@@ -201,7 +205,8 @@ class EmbeddedAdjacencyTestCase(TestCase):
         mtxdb_engine.close_client(durable=False)
 
         open_test_engine()
-        self.assertEqual(get_event_edges_backward_batch(["$p1"]).get("$p1", []), [])
+        self.assertNotIn("$p1", get_event_edges_backward_batch(["$p1"]))
+        self.assertIsNone(get_event_edges_forward_batch(["$pp"]).get("$pp"))
 
     def test_deferred_edges_survive_flush_and_reopen(self) -> None:
         """Interval mode appends without an fsync; the flush makes it durable."""
