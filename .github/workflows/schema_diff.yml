@@ -21,7 +21,10 @@ jobs:
   # end result, even when background updates or complex schema deltas are present.
   show-schema-diff:
     name: Show schema diff
-    runs-on: ubuntu-latest
+    # Pin to 24.04: `ubuntu-latest` moved to 26.04, where the runner image no
+    # longer resolves the `faketime` package this job installs. Revisit when
+    # the 26.04 migration settles and `faketime` installs reliably there.
+    runs-on: ubuntu-24.04
 
     permissions:
       pull-requests: write
@@ -61,7 +64,9 @@ jobs:
           fetch-depth: 0
 
       - name: Install PostgreSQL client and faketime
-        run: sudo apt-get -qq install postgresql-client faketime
+        run: |
+          sudo apt-get update
+          sudo apt-get -qq install postgresql-client faketime
 
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v7.0.0
         with:
