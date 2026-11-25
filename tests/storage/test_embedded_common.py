@@ -483,11 +483,16 @@ class ShutdownCheckpointTestCase(TestCase):
             mock.patch.object(embedded_common, "_do_sync_pools") as sync,
             mock.patch.object(embedded_common, "checkpoint_pools") as checkpoint,
         ):
+            order = mock.Mock()
+            order.attach_mock(sync, "sync")
+            order.attach_mock(checkpoint, "checkpoint")
             coalescer.close()
 
-        # Both pools, not just the (empty) dirty set: the strict path proves all.
-        sync.assert_called_once_with(set(Pool))
-        checkpoint.assert_called_once_with()
+        # Both pools, not just the (empty) dirty set: the strict path proves all,
+        # and only then is the baseline checkpointed.
+        self.assertEqual(
+            order.mock_calls, [mock.call.sync(set(Pool)), mock.call.checkpoint()]
+        )
 
     def test_close_skips_the_checkpoint_when_strict_recovery_fails(self) -> None:
         """If the committer failed and the strict sync also fails, keep the pool pending."""
@@ -564,12 +569,22 @@ class CoalescerConcurrentWriteTestCase(TestCase):
             if not finish_barrier.wait(timeout=5):
                 raise TimeoutError("test did not release the active barrier")
 
+        close_waiting = threading.Event()
+        real_wait = embedded_common._BARRIER_CONDITION.wait
+
+        def signalling_wait(timeout: float | None = None) -> bool:
+            close_waiting.set()
+            return real_wait(timeout)
+
         def record_checkpoint() -> None:
             synced_before_checkpoint.append(synced.is_set())
             checkpointed.set()
 
         with (
             mock.patch.object(embedded_common, "flush_adjacency_tails", block_barrier),
+            mock.patch.object(
+                embedded_common._BARRIER_CONDITION, "wait", signalling_wait
+            ),
             mock.patch.object(
                 embedded_common,
                 "_do_sync_pools",
@@ -594,11 +609,14 @@ class CoalescerConcurrentWriteTestCase(TestCase):
                 time.sleep(0.001)
 
             self.assertTrue(coalescer._closed)
+            # Release the barrier only once close() is really blocked on it.
+            reached_wait = close_waiting.wait(timeout=5)
             self.assertFalse(checkpointed.is_set())
             finish_barrier.set()
             barrier_thread.join(timeout=5)
             close_thread.join(timeout=5)
 
+        self.assertTrue(reached_wait)
         self.assertFalse(barrier_thread.is_alive())
         self.assertFalse(close_thread.is_alive())
         self.assertTrue(checkpointed.is_set())

@@ -465,9 +465,14 @@ class FederationEventHandler:
                 # Only reachable for the non-state forward-gap case above.
                 # Ignore a recent failed pull for the missing prev: by
                 # definition it could not be fetched, and we are explicitly
-                # accepting the event against the prevs we do have.
+                # accepting the event against the prevs we do have. The state
+                # lookup must tolerate an unfetchable prev too, or the event
+                # would be rejected for the very gap we are accepting.
                 context = await self._compute_event_context_with_maybe_missing_prevs(
-                    origin, pdu, ignore_pull_backoff=True
+                    origin,
+                    pdu,
+                    ignore_pull_backoff=True,
+                    require_complete_state=False,
                 )
             else:
                 context = await self._state_handler.compute_event_context(pdu)
@@ -481,7 +486,10 @@ class FederationEventHandler:
             )
             if missing_prevs:
                 context = await self._compute_event_context_with_maybe_missing_prevs(
-                    origin, pdu, ignore_pull_backoff=True
+                    origin,
+                    pdu,
+                    ignore_pull_backoff=True,
+                    require_complete_state=False,
                 )
             else:
                 context = await self._state_handler.compute_event_context(pdu)
@@ -635,9 +643,15 @@ class FederationEventHandler:
 
         async def build_contexts() -> list[EventPersistencePair]:
             if first_missing_prevs:
+                # Every gap parent was just confirmed unavailable above, so
+                # this is the same forward gap `on_receive_pdu` accepts: do not
+                # fail the batch on a state lookup for a parent we know is gone.
                 first_context = (
                     await self._compute_event_context_with_maybe_missing_prevs(
-                        origin, first_event, ignore_pull_backoff=True
+                        origin,
+                        first_event,
+                        ignore_pull_backoff=True,
+                        require_complete_state=False,
                     )
                 )
             else:
@@ -2144,6 +2158,10 @@ class FederationEventHandler:
                 reject. Pulled events (``/get_missing_events`` and backfill)
                 pass False, matching the historical behaviour of resolving
                 against the state we do have and treating the rest as a gap.
+                A pushed non-state event at a forward gap also passes False
+                (see ``on_receive_pdu``): its known prev_events keep it from
+                becoming the only forward extremity, and its auth is still
+                checked against the state we do have.
 
         Returns:
             The event context.
@@ -2274,9 +2292,13 @@ class FederationEventHandler:
                         # prev events we do have. Only a definitive 404 is
                         # cached; transient failures must be retried rather
                         # than treated as proof that state is absent.
-                        state_fetch_failed = True
                         if isinstance(e, HttpResponseException) and e.code == 404:
                             self._incomplete_state_lookups[lookup_key] = str(e)
+                        if require_complete:
+                            # The caller will authorise against this state, so
+                            # a failed lookup must not degrade to partial state.
+                            raise
+                        state_fetch_failed = True
                         logger.warning(
                             "_compute_event_context_with_maybe_missing_prevs(event_id=%s): "
                             "failed to fetch state for missing prev_event %s from %s: %s. "
