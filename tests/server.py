@@ -2085,6 +2085,12 @@ def setup_test_homeserver(
 
     If no datastore is supplied, one is created and given to the homeserver.
 
+    Only one non-worker homeserver may own its embedded mtxdb store at a time:
+    the engine client is process-global, so setting up another non-worker
+    homeserver closes the previous one's client (the previous homeserver's
+    store-backed calls then fail). Worker homeservers share the main
+    homeserver's client and may be created freely.
+
     Args:
         cleanup_func: The function used to register a cleanup routine for
             after the test. If the function returns a Deferred, the
