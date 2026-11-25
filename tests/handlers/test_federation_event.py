@@ -18,6 +18,7 @@
 # [This file includes modifications made by New Vector Limited]
 #
 #
+from typing import cast
 from unittest import mock
 
 from twisted.internet.testing import MemoryReactor
@@ -299,6 +300,165 @@ class FederationEventHandlerTests(unittest.FederatingHomeserverTestCase):
             )
 
         return result, persist_events_and_notify
+
+    def _backfilled_run(
+        self, count: int = 3, state_at: int | None = None
+    ) -> list[mock.Mock]:
+        """A depth-ordered run: each event has the previous one and a gap parent."""
+        events = []
+        for i in range(count):
+            event = mock.Mock(room_id="!room:test", event_id=f"$e{i}", depth=2 * i)
+            event.is_state.return_value = state_at == i
+            prevs = [f"$gap{i}"] + ([f"$e{i - 1}"] if i else ["$before"])
+            event.prev_event_ids.return_value = prevs
+            event.internal_metadata.is_outlier.return_value = False
+            event.room_version.msc4242_state_dags = False
+            events.append(event)
+        return events
+
+    def _run_backfilled_batch(
+        self,
+        events: list[mock.Mock],
+        *,
+        cached_failures: bool = True,
+        known_prevs: set[str] | None = None,
+        in_backoff: dict[str, int] | None = None,
+        reject: str | None = None,
+    ) -> tuple[bool, mock.AsyncMock, dict[str, mock.AsyncMock]]:
+        handler = self.hs.get_federation_event_handler()
+        store = self.hs.get_datastores().main
+        first_context = mock.Mock(rejected=False, state_group=1, partial_state=False)
+        persist = mock.AsyncMock()
+
+        async def check_event_auth(
+            origin: str, event: EventBase, context: EventContext
+        ) -> None:
+            if event.event_id == reject:
+                context.rejected = "auth_error"
+
+        guards = {
+            "soft_fail": mock.AsyncMock(),
+            "push": mock.AsyncMock(),
+            "encrypted": mock.AsyncMock(),
+        }
+        if cached_failures:
+            for event in events:
+                for prev in event.prev_event_ids():
+                    if prev.startswith("$gap"):
+                        handler._incomplete_state_lookups[
+                            ("remote", "!room:test", prev)
+                        ] = "no state"
+
+        with (
+            mock.patch.object(handler, "_sanity_check_event"),
+            mock.patch.object(
+                store,
+                "get_event_ids_to_not_pull_from_backoff",
+                new=mock.AsyncMock(return_value=in_backoff or {}),
+            ),
+            mock.patch.object(
+                store,
+                "have_events_in_timeline",
+                new=mock.AsyncMock(return_value=known_prevs or set()),
+            ),
+            mock.patch.object(
+                handler,
+                "_compute_event_context_with_maybe_missing_prevs",
+                new=mock.AsyncMock(return_value=first_context),
+            ),
+            mock.patch.object(
+                EventContext,
+                "with_state",
+                side_effect=lambda **kw: mock.Mock(rejected=False, **kw),
+            ),
+            mock.patch.object(
+                handler,
+                "_check_event_auth",
+                new=mock.AsyncMock(side_effect=check_event_auth),
+            ),
+            mock.patch.object(handler, "_check_for_soft_fail", new=guards["soft_fail"]),
+            mock.patch.object(
+                handler._bulk_push_rule_evaluator,
+                "action_for_events_by_user",
+                new=guards["push"],
+            ),
+            mock.patch.object(
+                handler, "_handle_encrypted_event", new=guards["encrypted"]
+            ),
+            mock.patch.object(handler, "persist_events_and_notify", new=persist),
+        ):
+            result = self.get_success(
+                handler._try_process_backfilled_events_as_batch(
+                    "remote", cast(list[EventBase], events)
+                )
+            )
+        return result, persist, guards
+
+    def test_backfilled_run_is_persisted_in_one_call_like_the_serial_path(self) -> None:
+        events = self._backfilled_run()
+        result, persist, guards = self._run_backfilled_batch(events)
+
+        self.assertTrue(result)
+        persist.assert_awaited_once()
+        call = persist.await_args
+        assert call is not None
+        args, kwargs = call
+        self.assertEqual([e.event_id for e, _ in args[1]], ["$e0", "$e1", "$e2"])
+        # Backfilled persistence: negative stream orderings, no current-state or
+        # forward-extremity changes.
+        self.assertIs(kwargs["backfilled"], True)
+        # Everything the serial backfill path skips is skipped here too.
+        guards["soft_fail"].assert_not_awaited()
+        guards["push"].assert_not_awaited()
+        guards["encrypted"].assert_not_awaited()
+        # Every event shares the first event's state group.
+        self.assertEqual({c.state_group for _, c in args[1]}, {1})
+
+    def test_backfilled_run_with_an_unprobed_gap_parent_falls_back(self) -> None:
+        """No cached failed lookup: the serial path must make that lookup itself."""
+        result, persist, _ = self._run_backfilled_batch(
+            self._backfilled_run(), cached_failures=False
+        )
+        self.assertFalse(result)
+        persist.assert_not_awaited()
+
+    def test_backfilled_run_with_a_known_extra_parent_falls_back(self) -> None:
+        """A known extra parent has state of its own, so it needs resolving."""
+        result, persist, _ = self._run_backfilled_batch(
+            self._backfilled_run(), known_prevs={"$gap1"}
+        )
+        self.assertFalse(result)
+        persist.assert_not_awaited()
+
+    def test_backfilled_run_with_a_gap_parent_in_pull_backoff_falls_back(self) -> None:
+        """The serial path skips an event whose missing parent is in backoff."""
+        result, persist, _ = self._run_backfilled_batch(
+            self._backfilled_run(), in_backoff={"$gap1": 1}
+        )
+        self.assertFalse(result)
+        persist.assert_not_awaited()
+
+    def test_backfilled_run_with_a_state_event_falls_back(self) -> None:
+        for state_at in (0, 1):
+            result, persist, _ = self._run_backfilled_batch(
+                self._backfilled_run(state_at=state_at)
+            )
+            self.assertFalse(result)
+            persist.assert_not_awaited()
+
+    def test_backfilled_run_with_a_rejected_event_falls_back(self) -> None:
+        result, persist, _ = self._run_backfilled_batch(
+            self._backfilled_run(), reject="$e2"
+        )
+        self.assertFalse(result)
+        persist.assert_not_awaited()
+
+    def test_backfilled_run_that_is_not_linear_falls_back(self) -> None:
+        events = self._backfilled_run()
+        events[2].prev_event_ids.return_value = ["$gap2", "$elsewhere"]
+        result, persist, _ = self._run_backfilled_batch(events)
+        self.assertFalse(result)
+        persist.assert_not_awaited()
 
     def test_pulled_batch_allows_confirmed_gap_parent(self) -> None:
         """A 404 for an extra predecessor means it is a gap, not a state fork."""

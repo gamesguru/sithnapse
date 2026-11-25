@@ -1529,10 +1529,12 @@ class FederationEventHandler:
             # the next event we're going to process.
             sorted_events = sorted(new_events, key=lambda x: x.depth)
 
-            if (
-                not backfilled
-                and len(sorted_events) > 1
-                and await self._try_process_pulled_events_as_batch(
+            if len(sorted_events) > 1 and (
+                await self._try_process_backfilled_events_as_batch(
+                    origin, sorted_events
+                )
+                if backfilled
+                else await self._try_process_pulled_events_as_batch(
                     origin, sorted_events
                 )
             ):
@@ -1791,6 +1793,124 @@ class FederationEventHandler:
                     event.event_id,
                 )
 
+        return True
+
+    async def _try_process_backfilled_events_as_batch(
+        self, origin: str, events: list[EventBase]
+    ) -> bool:
+        """Persist a linear run of backfilled events with one shared context.
+
+        Processing a backfilled run one event at a time computes the state before
+        every event (`_compute_event_context_with_maybe_missing_prevs`) although
+        the run is non-state: the state after each event is the state before the
+        next, so the whole run shares one state group. This computes the first
+        event's context the usual way and reuses it, then persists the run with
+        a single `persist_events_and_notify`.
+
+        This reproduces the serial backfill path exactly, never anything weaker:
+        no soft-fail check, no push actions, `backfilled=True` persistence, and no
+        post-persist handling. It sends the remote nothing the serial path would
+        not: an event whose extra parents (the gaps) have no *cached* failed
+        state lookup is left to the serial path, which will make that lookup.
+
+        Returns `False`, having persisted nothing, unless the run is a linear
+        chain of non-state events whose extra parents are all known to be
+        unfetchable, so the caller can fall back to the per-event path.
+        """
+        first = events[0]
+        room_id = first.room_id
+
+        if first.is_state() or first.room_version.msc4242_state_dags:
+            return False
+
+        for event in events:
+            try:
+                self._sanity_check_event(event)
+            except SynapseError:
+                # The serial path records the failed pull attempt.
+                return False
+
+        for previous, event in zip(events, events[1:]):
+            if (
+                event.room_id != room_id
+                or event.is_state()
+                or event.internal_metadata.is_outlier()
+                or previous.event_id not in event.prev_event_ids()
+            ):
+                return False
+
+        # Parents other than the previous event in the run. Earlier members of
+        # the run and the first event's own parents are already represented by
+        # the first event's context. Any other parent would make the serial path
+        # resolve extra state, so it must be a gap whose state lookup the serial
+        # path would skip: not known to us, and a recent lookup already failed.
+        accounted = {event.event_id for event in events}
+        accounted.update(first.prev_event_ids())
+        extra_prevs = {
+            prev
+            for previous, event in zip(events, events[1:])
+            for prev in event.prev_event_ids()
+            if prev not in accounted
+        }
+        if extra_prevs:
+            if await self._store.have_events_in_timeline(extra_prevs):
+                return False
+            if any(
+                self._incomplete_state_lookups.get((origin, room_id, prev)) is None
+                for prev in extra_prevs
+            ):
+                return False
+            # The serial path skips an event whose missing parent we recently
+            # failed to pull. Do not persist what it would have skipped.
+            if await self._store.get_event_ids_to_not_pull_from_backoff(
+                room_id, extra_prevs
+            ):
+                return False
+
+        try:
+            first_context = await self._compute_event_context_with_maybe_missing_prevs(
+                origin,
+                first,
+                allow_current_state_fallback=True,
+                require_complete_state=False,
+            )
+        except Exception:
+            return False
+
+        if (
+            first_context.rejected
+            or first_context.state_group is None
+            or first_context.partial_state
+        ):
+            return False
+
+        event_and_contexts: list[EventPersistencePair] = [(first, first_context)]
+        event_and_contexts.extend(
+            (
+                event,
+                EventContext.with_state(
+                    storage=self._storage_controllers,
+                    state_group=first_context.state_group,
+                    state_group_before_event=first_context.state_group,
+                    state_delta_due_to_event={},
+                    partial_state=False,
+                    state_group_deltas={},
+                ),
+            )
+            for event in events[1:]
+        )
+
+        try:
+            for event, context in event_and_contexts:
+                await self._check_event_auth(origin, event, context)
+                if context.rejected:
+                    return False
+        except Exception:
+            return False
+
+        await self.persist_events_and_notify(
+            room_id, event_and_contexts, backfilled=True
+        )
         return True
 
     @trace
