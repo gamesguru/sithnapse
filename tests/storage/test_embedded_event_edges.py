@@ -177,6 +177,10 @@ class EmbeddedAdjacencyTestCase(TestCase):
         WAL; opening the store replays whatever the tail lost before anything
         is served.
         """
+        probe = mtxdb_engine.begin_transaction()
+        if probe is None:
+            self.skipTest("mtxdb shared WAL is not enabled")
+        probe.abort()
         # A root owned by this test, so removing tails touches no other data.
         root = tempfile.mkdtemp(prefix="test-edge-log-recovery-")
         self.addCleanup(shutil.rmtree, root, ignore_errors=True)

@@ -469,19 +469,29 @@ class CoalescerConcurrentWriteTestCase(TestCase):
         barrier_entered = threading.Event()
         finish_barrier = threading.Event()
         checkpointed = threading.Event()
+        synced_before_checkpoint: list[bool] = []
+        synced = threading.Event()
 
         def block_barrier() -> None:
             barrier_entered.set()
             if not finish_barrier.wait(timeout=5):
                 raise TimeoutError("test did not release the active barrier")
 
+        def record_checkpoint() -> None:
+            synced_before_checkpoint.append(synced.is_set())
+            checkpointed.set()
+
         with (
             mock.patch.object(embedded_common, "flush_adjacency_tails", block_barrier),
-            mock.patch.object(embedded_common, "_do_sync_pools"),
+            mock.patch.object(
+                embedded_common,
+                "_do_sync_pools",
+                side_effect=lambda pools: synced.set(),
+            ),
             mock.patch.object(
                 embedded_common,
                 "checkpoint_pools",
-                side_effect=lambda: checkpointed.set(),
+                side_effect=record_checkpoint,
             ),
         ):
             barrier_thread = threading.Thread(
@@ -505,3 +515,5 @@ class CoalescerConcurrentWriteTestCase(TestCase):
         self.assertFalse(barrier_thread.is_alive())
         self.assertFalse(close_thread.is_alive())
         self.assertTrue(checkpointed.is_set())
+        # The barrier's own pool sync had finished when the checkpoint ran.
+        self.assertEqual(synced_before_checkpoint, [True])

@@ -80,6 +80,49 @@ class FederationEventHandlerTests(unittest.FederatingHomeserverTestCase):
             federation_transport_client=self.mock_federation_transport_client
         )
 
+    def test_partial_state_lookup_is_not_cached(self) -> None:
+        handler = self.hs.get_federation_event_handler()
+        room_id = "!room:test"
+        event_id = "$partial-state-gap"
+        state_event_id = "$available-state"
+        missing_state_event_id = "$missing-state"
+        self.mock_federation_transport_client.get_room_state_ids.return_value = (
+            [state_event_id, missing_state_event_id],
+            [],
+        )
+        metadata = mock.Mock(
+            room_id=room_id,
+            event_type=EventTypes.Name,
+            state_key="",
+        )
+
+        with (
+            mock.patch.object(
+                handler._store,
+                "have_seen_events",
+                new=mock.AsyncMock(return_value=set()),
+            ),
+            mock.patch.object(
+                handler._store,
+                "get_metadata_for_events",
+                new=mock.AsyncMock(return_value={state_event_id: metadata}),
+            ),
+            mock.patch.object(
+                handler._store, "get_event", new=mock.AsyncMock(return_value=None)
+            ),
+            mock.patch.object(handler, "_get_state_and_persist", new=mock.AsyncMock()),
+        ):
+            state_map = self.get_success(
+                handler._get_state_ids_after_missing_prev_event(
+                    "remote", room_id, event_id
+                )
+            )
+
+        self.assertEqual(state_map, {(EventTypes.Name, ""): state_event_id})
+        self.assertIsNone(
+            handler._incomplete_state_lookups.get(("remote", room_id, event_id))
+        )
+
     def test_inbound_pdu_batch_falls_back_for_rejected_event(self) -> None:
         """A rejected PDU must never be persisted with a synthetic batch context."""
         room_id = "!room:test"
@@ -360,7 +403,7 @@ class FederationEventHandlerTests(unittest.FederatingHomeserverTestCase):
                     if prev.startswith("$gap"):
                         handler._incomplete_state_lookups[
                             ("remote", "!room:test", prev)
-                        ] = ("no state", None)
+                        ] = "no state"
 
         with (
             mock.patch.object(handler, "_sanity_check_event"),

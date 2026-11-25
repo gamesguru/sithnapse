@@ -1603,19 +1603,27 @@ class _FlushCoalescer:
             first_exc = first_exc or exc
         finally:
             with _BARRIER_CONDITION:
-                if self._dirty and self._delayed_call is None and not self._closed:
-                    # A pool left dirty by an unrelated write during this call
-                    # (not one of our own failures) should rejoin the normal
-                    # debounce cadence, not be punished with the failure
-                    # backoff delay.
-                    delay = (
-                        self._RETRY_DELAY
-                        if first_exc is not None
-                        else self._FLUSH_DELAY
+                try:
+                    if self._dirty and self._delayed_call is None and not self._closed:
+                        # A pool left dirty by an unrelated write during this
+                        # call (not one of our own failures) should rejoin the
+                        # normal debounce cadence, not be punished with the
+                        # failure backoff delay.
+                        delay = (
+                            self._RETRY_DELAY
+                            if first_exc is not None
+                            else self._FLUSH_DELAY
+                        )
+                        self._delayed_call = self._clock.call_later(delay, self._flush)
+                except Exception:
+                    # Never let a scheduling failure replace the sync error
+                    # raised below, or leave the barrier counted.
+                    logger.warning(
+                        "Could not schedule the coalescer retry", exc_info=True
                     )
-                    self._delayed_call = self._clock.call_later(delay, self._flush)
-                self._active_sync_barriers -= 1
-                _BARRIER_CONDITION.notify_all()
+                finally:
+                    self._active_sync_barriers -= 1
+                    _BARRIER_CONDITION.notify_all()
 
         if first_exc is not None:
             raise first_exc
@@ -1653,12 +1661,19 @@ class _FlushCoalescer:
             # perpetually push out the coalescer's flush under sustained
             # traffic, starving the actual edge drain indefinitely.
             with _BARRIER_CONDITION:
-                if self._dirty and self._delayed_call is None and not self._closed:
-                    self._delayed_call = self._clock.call_later(
-                        self._RETRY_DELAY, self._flush
+                try:
+                    if self._dirty and self._delayed_call is None and not self._closed:
+                        self._delayed_call = self._clock.call_later(
+                            self._RETRY_DELAY, self._flush
+                        )
+                except Exception:
+                    # Keep the original sync error (if any) as the one raised.
+                    logger.warning(
+                        "Could not schedule the coalescer retry", exc_info=True
                     )
-                self._active_sync_barriers -= 1
-                _BARRIER_CONDITION.notify_all()
+                finally:
+                    self._active_sync_barriers -= 1
+                    _BARRIER_CONDITION.notify_all()
 
     def close(self) -> None:
         """Flush outstanding dirty pools and shut down."""
@@ -1684,7 +1699,38 @@ class _FlushCoalescer:
             barriers_pending = self._active_sync_barriers > 0
             to_flush = set(self._dirty)
             remaining = set(self._dirty)
+        commit_error: str | None = None
+        if barriers_pending:
+            # A wedged barrier may hold the locks the final flush needs, and
+            # would block shutdown indefinitely. Skip the flush; the pools it
+            # covers stay reported as pending below.
+            if to_flush:
+                logger.error(
+                    "Skipping the final flush of %s: a sync barrier is still active",
+                    to_flush,
+                )
+            to_flush = set()
+        else:
+            try:
+                commit_error = background_commit_error()
+            except Exception:
+                # Shutdown is best effort, but inability to inspect the
+                # committer is not evidence that its submitted boundary landed.
+                logger.exception("Unable to inspect embedded committer at close")
+                commit_error = "unable to inspect background committer"
+        if commit_error:
+            # A dirty set only describes writes not yet submitted to the
+            # background committer. Any failed submitted boundary is unproven,
+            # even if newer writes have since made the set non-empty, so prove
+            # every pool with the strict path.
+            logger.warning(
+                "Embedded background committer reported a failure before close; "
+                "syncing every pool strictly: %s",
+                commit_error,
+            )
+            to_flush = set(Pool)
         if to_flush:
+            flushed = False
             for attempt in range(3):
                 try:
                     # A durable close covers deferred adjacency too, including
@@ -1701,9 +1747,12 @@ class _FlushCoalescer:
                 else:
                     with _DIRTY_LOCK:
                         self._dirty.difference_update(to_flush)
+                    flushed = True
                     break
             with _DIRTY_LOCK:
                 remaining = set(self._dirty)
+            if not flushed:
+                remaining |= to_flush
             if remaining:
                 logger.error(
                     "Unable to durably flush embedded pools during shutdown; "

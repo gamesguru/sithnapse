@@ -21,6 +21,10 @@ import sys
 import threading
 import time
 
+# Trial's footer is "Ran N tests in Xs", a blank line, then "PASSED (...)" or
+# "FAILED (...)". Only a result line after "Ran" counts, so test output that
+# happens to start with the same words cannot look like the final result.
+RAN = re.compile(r"^Ran \d+ tests? in ")
 SUMMARY = re.compile(r"^(PASSED|FAILED) \(")
 # A healthy Trial parent exits within a second of the summary; the shutdown
 # hang this guards against lasts until the outer timeout.
@@ -47,10 +51,13 @@ def main() -> int:
 
     def forward_output() -> None:
         assert proc.stdout is not None
+        ran_seen = False
         for line in proc.stdout:
             sys.stdout.write(line)
             sys.stdout.flush()
-            if not summary_seen.is_set() and SUMMARY.match(line):
+            if RAN.match(line):
+                ran_seen = True
+            if ran_seen and not summary_seen.is_set() and SUMMARY.match(line):
                 summary.append(line.split(" ", 1)[0])
                 summary_seen.set()
 
@@ -66,8 +73,7 @@ def main() -> int:
         else:
             # Let the reader drain the last lines before returning.
             reader.join(5)
-            if summary and summary[0] == "FAILED":
-                return 1
+            # Trial exited by itself: its own status is the result.
             return returncode
 
         if summary_seen.is_set() and summary_deadline is None:
