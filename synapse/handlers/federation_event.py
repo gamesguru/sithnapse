@@ -109,6 +109,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# How many gap-parent state lookups a backfilled run asks a remote about at once.
+BACKFILL_BATCH_STATE_LOOKUP_CONCURRENCY = 8
+
 
 # How long a recent remote lookup result is remembered.
 _FAILED_LOOKUP_TTL_MS = 60 * 1000
@@ -1809,13 +1812,13 @@ class FederationEventHandler:
 
         This reproduces the serial backfill path exactly, never anything weaker:
         no soft-fail check, no push actions, `backfilled=True` persistence, and no
-        post-persist handling. It sends the remote nothing the serial path would
-        not: an event whose extra parents (the gaps) have no *cached* failed
-        state lookup is left to the serial path, which will make that lookup.
+        post-persist handling. It asks the remote the same state questions the
+        serial path would, for each gap parent, but all at once instead of one
+        per event, and leaves the run to the serial path if any answer is state.
 
         Returns `False`, having persisted nothing, unless the run is a linear
-        chain of non-state events whose extra parents are all known to be
-        unfetchable, so the caller can fall back to the per-event path.
+        chain of non-state events whose extra parents the remote has no state
+        for, so the caller can fall back to the per-event path.
         """
         first = events[0]
         room_id = first.room_id
@@ -1829,6 +1832,11 @@ class FederationEventHandler:
             except SynapseError:
                 # The serial path records the failed pull attempt.
                 return False
+            # A redaction can affect the state content produced by the
+            # per-event context computation. Keep it on the serial path until
+            # the batch context carries that delta explicitly.
+            if event.type == EventTypes.Redaction:
+                return False
 
         for previous, event in zip(events, events[1:]):
             if (
@@ -1841,9 +1849,11 @@ class FederationEventHandler:
 
         # Parents other than the previous event in the run. Earlier members of
         # the run and the first event's own parents are already represented by
-        # the first event's context. Any other parent would make the serial path
-        # resolve extra state, so it must be a gap whose state lookup the serial
-        # path would skip: not known to us, and a recent lookup already failed.
+        # the first event's context. Any other parent is a gap the serial path
+        # would ask the remote for the state at, one event at a time. The batch
+        # asks for them all at once, with the same request and the same result
+        # handling, so a gap whose state the remote cannot give is remembered
+        # and skipped exactly as the serial path does.
         accounted = {event.event_id for event in events}
         accounted.update(first.prev_event_ids())
         extra_prevs = {
@@ -1855,16 +1865,47 @@ class FederationEventHandler:
         if extra_prevs:
             if await self._store.have_events_in_timeline(extra_prevs):
                 return False
-            if any(
-                self._incomplete_state_lookups.get((origin, room_id, prev)) is None
-                for prev in extra_prevs
-            ):
-                return False
             # The serial path skips an event whose missing parent we recently
             # failed to pull. Do not persist what it would have skipped.
             if await self._store.get_event_ids_to_not_pull_from_backoff(
                 room_id, extra_prevs
             ):
+                return False
+
+            async def has_no_usable_state(prev: str) -> bool:
+                """Whether the remote cannot give us the state at this gap parent.
+
+                This is the lookup and the failure handling of
+                `_compute_event_context_with_maybe_missing_prevs`: any failure is
+                remembered and the event goes on without that parent's state. If
+                the remote does have state there, it would have to be resolved
+                into the event's context, which only the serial path does. Its
+                answer is cached, so the serial path does not ask again.
+                """
+                lookup_key = (origin, room_id, prev)
+                if self._incomplete_state_lookups.get(lookup_key) is not None:
+                    return True
+                try:
+                    await self._get_state_ids_after_missing_prev_event(
+                        origin, room_id, prev, require_complete_state=False
+                    )
+                except Exception as e:
+                    self._incomplete_state_lookups[lookup_key] = str(e)
+                    return True
+                return False
+
+            # Ask a handful at a time, not all at once: the run can name dozens
+            # of gap parents, and a burst at one destination would trip its
+            # retry limiter and cache different failures than the serial path.
+            no_usable_state: dict[str, bool] = {}
+
+            async def probe(prev: str) -> None:
+                no_usable_state[prev] = await has_no_usable_state(prev)
+
+            await concurrently_execute(
+                probe, extra_prevs, BACKFILL_BATCH_STATE_LOOKUP_CONCURRENCY
+            )
+            if not all(no_usable_state.values()):
                 return False
 
         try:
@@ -1908,9 +1949,17 @@ class FederationEventHandler:
         except Exception:
             return False
 
-        await self.persist_events_and_notify(
-            room_id, event_and_contexts, backfilled=True
-        )
+        try:
+            await self.persist_events_and_notify(
+                room_id, event_and_contexts, backfilled=True
+            )
+        except (FederationError, PartialStateConflictError):
+            # Let the serial path isolate the failing event and record its pull
+            # attempt, or recompute the context if the room was un-partial
+            # stated since the first event's context was built. The batch
+            # contains at most one backfill response, and persistence is
+            # transactional, so retrying the serial path is safe.
+            return False
         return True
 
     @trace

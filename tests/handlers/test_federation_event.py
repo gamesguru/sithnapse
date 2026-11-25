@@ -27,6 +27,7 @@ from synapse.api.constants import EventTypes
 from synapse.api.errors import (
     AuthError,
     HttpResponseException,
+    PartialStateConflictError,
     RequestSendFailed,
     StoreError,
 )
@@ -39,7 +40,10 @@ from synapse.events import EventBase
 from synapse.events.py_protocol import MSC4242Event, supports_msc4242_state_dag
 from synapse.events.snapshot import EventContext
 from synapse.federation.transport.client import StateRequestResponse
-from synapse.handlers.federation_event import is_state_dag_connected
+from synapse.handlers.federation_event import (
+    BACKFILL_BATCH_STATE_LOOKUP_CONCURRENCY,
+    is_state_dag_connected,
+)
 from synapse.logging.context import LoggingContext
 from synapse.rest import admin
 from synapse.rest.client import login, room
@@ -47,6 +51,7 @@ from synapse.server import HomeServer
 from synapse.state import StateResolutionStore
 from synapse.state.v2 import _mainline_sort, _reverse_topological_power_sort
 from synapse.types import JsonDict
+from synapse.util.async_helpers import concurrently_execute
 from synapse.util.clock import Clock
 
 from tests import unittest
@@ -322,13 +327,15 @@ class FederationEventHandlerTests(unittest.FederatingHomeserverTestCase):
         *,
         cached_failures: bool = True,
         known_prevs: set[str] | None = None,
+        probe: mock.AsyncMock | None = None,
+        persist_error: Exception | None = None,
         in_backoff: dict[str, int] | None = None,
         reject: str | None = None,
     ) -> tuple[bool, mock.AsyncMock, dict[str, mock.AsyncMock]]:
         handler = self.hs.get_federation_event_handler()
         store = self.hs.get_datastores().main
         first_context = mock.Mock(rejected=False, state_group=1, partial_state=False)
-        persist = mock.AsyncMock()
+        persist = mock.AsyncMock(side_effect=persist_error)
 
         async def check_event_auth(
             origin: str, event: EventBase, context: EventContext
@@ -341,6 +348,9 @@ class FederationEventHandlerTests(unittest.FederatingHomeserverTestCase):
             "push": mock.AsyncMock(),
             "encrypted": mock.AsyncMock(),
         }
+        if probe is None:
+            probe = mock.AsyncMock(side_effect=Exception("404: Not Found"))
+        self.probe = probe
         if cached_failures:
             for event in events:
                 for prev in event.prev_event_ids():
@@ -351,6 +361,9 @@ class FederationEventHandlerTests(unittest.FederatingHomeserverTestCase):
 
         with (
             mock.patch.object(handler, "_sanity_check_event"),
+            mock.patch.object(
+                handler, "_get_state_ids_after_missing_prev_event", new=probe
+            ),
             mock.patch.object(
                 store,
                 "get_event_ids_to_not_pull_from_backoff",
@@ -414,10 +427,66 @@ class FederationEventHandlerTests(unittest.FederatingHomeserverTestCase):
         # Every event shares the first event's state group.
         self.assertEqual({c.state_group for _, c in args[1]}, {1})
 
-    def test_backfilled_run_with_an_unprobed_gap_parent_falls_back(self) -> None:
-        """No cached failed lookup: the serial path must make that lookup itself."""
+    def test_backfilled_run_probes_each_unknown_gap_parent_once_and_batches(
+        self,
+    ) -> None:
+        """A cold cache is not a reason to decline: ask, like the serial path."""
         result, persist, _ = self._run_backfilled_batch(
             self._backfilled_run(), cached_failures=False
+        )
+        self.assertTrue(result)
+        persist.assert_awaited_once()
+        # Each gap parent beyond the first event's own is asked about once.
+        asked = sorted(call.args[2] for call in self.probe.await_args_list)
+        self.assertEqual(asked, ["$gap1", "$gap2"])
+        # The failures are remembered, so the serial path would skip them too.
+        handler = self.hs.get_federation_event_handler()
+        for gap in ("$gap1", "$gap2"):
+            self.assertIsNotNone(
+                handler._incomplete_state_lookups.get(("remote", "!room:test", gap))
+            )
+
+    def test_backfilled_run_probes_a_bounded_number_of_gap_parents_at_once(
+        self,
+    ) -> None:
+        events = self._backfilled_run(count=30)
+        recorded: list[int] = []
+
+        async def recording_execute(func: object, args: object, limit: int) -> None:
+            recorded.append(limit)
+            await concurrently_execute(func, args, limit)  # type: ignore[arg-type]
+
+        with mock.patch(
+            "synapse.handlers.federation_event.concurrently_execute",
+            new=recording_execute,
+        ):
+            result, _, _ = self._run_backfilled_batch(events, cached_failures=False)
+
+        self.assertTrue(result)
+        self.assertEqual(recorded, [BACKFILL_BATCH_STATE_LOOKUP_CONCURRENCY])
+        self.assertLess(BACKFILL_BATCH_STATE_LOOKUP_CONCURRENCY, 29)
+
+    def test_backfilled_run_falls_back_if_the_room_is_un_partial_stated(self) -> None:
+        """The serial path retries this with a fresh context, so the batch must not
+        let it escape as an error."""
+        result, persist, _ = self._run_backfilled_batch(
+            self._backfilled_run(),
+            persist_error=PartialStateConflictError(),
+        )
+        self.assertFalse(result)
+        persist.assert_awaited_once()
+
+    def test_backfilled_run_does_not_probe_remembered_failures(self) -> None:
+        result, persist, _ = self._run_backfilled_batch(self._backfilled_run())
+        self.assertTrue(result)
+        self.probe.assert_not_awaited()
+
+    def test_backfilled_run_falls_back_when_a_gap_parent_has_state(self) -> None:
+        """State at a gap parent has to be resolved into the context."""
+        result, persist, _ = self._run_backfilled_batch(
+            self._backfilled_run(),
+            cached_failures=False,
+            probe=mock.AsyncMock(return_value={}),
         )
         self.assertFalse(result)
         persist.assert_not_awaited()
