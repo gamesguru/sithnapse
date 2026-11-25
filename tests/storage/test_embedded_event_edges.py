@@ -15,6 +15,8 @@
 """Tests for event DAG adjacency in mtxdb's CSR store."""
 
 import atexit
+import glob
+import os
 import shutil
 import tempfile
 from typing import Any
@@ -168,27 +170,38 @@ class EmbeddedAdjacencyTestCase(TestCase):
         finally:
             transaction.abort()
 
-    def test_wal_group_commit_flushes_deferred_edges_before_the_fsync(self) -> None:
-        """The journal's pre-sync hook makes deferred edges durable with the WAL.
+    def test_edges_lost_with_the_unsynced_tail_are_rebuilt_on_open(self) -> None:
+        """A crash that keeps the WAL but loses the CSR tail loses no edges.
 
-        Nothing here flushes the tails explicitly: only the background
-        committer's group commit does, so a flush can only come from the hook
-        that runs between capturing the WAL boundary and its fsync.
+        Every edge write is journaled in the edge log, which commits with the
+        WAL; opening the store replays whatever the tail lost before anything
+        is served.
         """
-        flushes = lambda: int(mtxdb_engine.stats()["adjacency_tail_flushes"])  # noqa: E731
+        put_event_edges_batch([(self.room_id, "$r1", "$rp")], durable=False)
+        # The WAL (and the edge log in it) is durable; the tail is not synced.
+        mtxdb_engine.wait_durable(mtxdb_engine.request_durable())
+        mtxdb_engine.close_client(durable=False)
+        tails = glob.glob(
+            os.path.join(_TEST_ENGINE_TMPDIR, "**", "tail.log"), recursive=True
+        )
+        self.assertTrue(tails)
+        for tail in tails:
+            os.remove(tail)
 
-        before = flushes()
-        mtxdb_engine.start_background_commit(20, 4096)
-        try:
-            put_event_edges_batch([(self.room_id, "$h1", "$hp")], durable=False)
-            # The event body that the edge describes goes into the WAL too.
-            mtxdb_engine.event_json_put([(self.room_id, "$h1", b"body")])
-            mtxdb_engine.wait_durable(mtxdb_engine.request_durable())
+        open_test_engine()
+        self.assertEqual(get_event_edges_backward_batch(["$r1"])["$r1"], ["$rp"])
+        self.assertEqual(get_event_edges_forward_batch(["$rp"])["$rp"], ["$r1"])
 
-            self.assertGreater(flushes(), before)
-        finally:
-            # Stop it here: cleanups run after tearDown has closed the client.
-            mtxdb_engine.stop_background_commit()
+    def test_purged_room_edges_are_not_replayed_on_open(self) -> None:
+        """A purge prunes the edge log, so recovery cannot bring the room back."""
+        put_event_edges_batch([(self.room_id, "$p1", "$pp")], durable=False)
+        mtxdb_engine.wait_durable(mtxdb_engine.request_durable())
+        purge_event_edges_room(self.room_id)
+        mtxdb_engine.wait_durable(mtxdb_engine.request_durable())
+        mtxdb_engine.close_client(durable=False)
+
+        open_test_engine()
+        self.assertEqual(get_event_edges_backward_batch(["$p1"]).get("$p1", []), [])
 
     def test_deferred_edges_survive_flush_and_reopen(self) -> None:
         """Interval mode appends without an fsync; the flush makes it durable."""

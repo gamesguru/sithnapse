@@ -5,7 +5,8 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use mtxdb::csr_adjacency::sync_all_tails;
+use mtxdb::csr_adjacency::{sync_all_tails, CsrAdjacency};
+use mtxdb::edge_log::EdgeLog;
 use mtxdb::short_id::{GraphReader, ReadOnlyGraph};
 use mtxdb::storage::{DigestAlgorithm, StorageError};
 use mtxdb::{
@@ -282,7 +283,7 @@ static ADJACENCY_TAIL_DIRTY: AtomicBool = AtomicBool::new(false);
 
 /// Number of times the deferred adjacency tails were actually flushed (dirty
 /// tails synced), whichever path asked: an explicit sync, a close, or the
-/// journal's pre-sync hook before a WAL group commit.
+/// coalescer's timer.
 static ADJACENCY_TAIL_FLUSHES: AtomicU64 = AtomicU64::new(0);
 
 /// Serialises adjacency tail flushes so a caller never returns while another
@@ -2211,21 +2212,16 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
                     ))
                 })?;
         let shared_database = Arc::new(shared_database);
+        // Rebuild CSR rows a crash left behind (the edge log is journaled with
+        // the WAL, the tail is not) before anything can read or write.
+        CsrAdjacency::recover_edge_log(&shared_database, &EdgeLog::new()).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "mtxdb edge log recovery failed: {e}"
+            ))
+        })?;
         let state = shared_database.pool(ShardType::State).clone();
         let event_dag = shared_database.pool(ShardType::EventDag).clone();
         let server_info = shared_database.pool(ShardType::ServerInfo).clone();
-        // Make the deferred CSR adjacency tails durable before every WAL group
-        // commit (timer, explicit barrier or shutdown), after the group's
-        // boundary is fixed. A durable event body can then never lack its
-        // edges after a crash; orphan edges are harmless. Weak, so the hook
-        // does not keep the database (and its writer lock) alive.
-        if let Some(journal) = state.journal() {
-            let database = Arc::downgrade(&shared_database);
-            journal.set_pre_sync_hook(Some(Arc::new(move || match database.upgrade() {
-                Some(database) => flush_adjacency_tails_io(database.as_ref()),
-                None => Ok(()),
-            })));
-        }
         // A single writer's in-memory index is authoritative for every key it
         // has written, so a negative lookup is a true miss: refreshing would
         // only spend a durable-fingerprint probe (and, after each checkpoint,
@@ -4382,10 +4378,9 @@ pub fn background_commit_error(py: Python<'_>) -> PyResult<Option<String>> {
 pub fn request_durable(py: Python<'_>) -> PyResult<Vec<u64>> {
     assert_writable()?;
     py.detach(|| {
-        // The deferred adjacency tails are made durable by the journal's
-        // pre-sync hook, which every WAL group commit (including the
-        // background committer's) runs after capturing its boundary and before
-        // the fsync. Nothing here has to order the two.
+        // Deferred adjacency tails need no ordering against the WAL: every
+        // edge write is also journaled in the edge log, which commits with
+        // the WAL, and `recover_edge_log` rebuilds any rows a crash lost.
         let mut targets = Vec::with_capacity(2);
         for engine in [state_db()?, event_dag_db()?] {
             let target = engine
@@ -4444,9 +4439,9 @@ fn sync_adjacency_tails(database: &Database) -> PyResult<()> {
         .map_err(|error| pyo3::exceptions::PyRuntimeError::new_err(error.to_string()))
 }
 
-/// The tail flush itself, with no Python error type so the journal's pre-sync
-/// hook can run it on a committer thread without touching the interpreter.
-fn flush_adjacency_tails_io(database: &Database) -> std::io::Result<()> {
+/// The tail flush itself, with no Python error type, so callers that hold no
+/// interpreter (the purge path, the coalescer's worker) can run it.
+pub(crate) fn flush_adjacency_tails_io(database: &Database) -> std::io::Result<()> {
     // One flush at a time, held from the dirty check through the result: a
     // second caller must wait for the active flush to finish, not see the flag
     // already cleared and return before the tails are durable.
@@ -4461,6 +4456,13 @@ fn flush_adjacency_tails_io(database: &Database) -> std::io::Result<()> {
         ADJACENCY_TAIL_DIRTY.store(true, Ordering::SeqCst);
         return Err(std::io::Error::other(format!(
             "mtxdb adjacency tail sync error: {error}"
+        )));
+    }
+    // The tails are durable, so the edge log entries they cover can go.
+    if let Err(error) = CsrAdjacency::checkpoint_edge_log(database, &EdgeLog::new()) {
+        ADJACENCY_TAIL_DIRTY.store(true, Ordering::SeqCst);
+        return Err(std::io::Error::other(format!(
+            "mtxdb edge log checkpoint error: {error}"
         )));
     }
     ADJACENCY_TAIL_FLUSHES.fetch_add(1, Ordering::Relaxed);

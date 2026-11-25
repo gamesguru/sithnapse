@@ -19,13 +19,15 @@
 use std::collections::HashMap;
 
 use mtxdb::csr_adjacency::{AppendDurability, CsrAdjacency, EventRecord};
+use mtxdb::edge_log::EdgeLog;
 use mtxdb::short_id::GraphReader;
 use mtxdb::{NodeData, NodeId, StorageEngine};
 use pyo3::prelude::*;
 
 use super::mtxdb_syn::{
     csr_reader, csr_writer, event_dag_room_id, event_locator_collection_id, event_node_id,
-    is_retryable_contention, map_read_storage_error, mark_adjacency_tail_dirty, state_db,
+    flush_adjacency_tails_io, is_retryable_contention, map_read_storage_error,
+    mark_adjacency_tail_dirty, state_db,
 };
 
 /// One event's adjacency row as the caller supplies it.
@@ -98,9 +100,13 @@ pub fn adjacency_put(py: Python<'_>, rows: Vec<PutRow>, durable: bool) -> PyResu
                     relation: None,
                 })
                 .collect();
+            // Every edge write goes through the edge log: the log entry is
+            // journaled with the WAL, so a crash that loses the unsynced CSR
+            // tail is repaired by `recover_edge_log` at the next open.
             adjacency_for(&room_collection)
-                .record_events_with(
+                .record_events_logged(
                     &database,
+                    &EdgeLog::new(),
                     &records,
                     if durable {
                         AppendDurability::Durable
@@ -116,10 +122,10 @@ pub fn adjacency_put(py: Python<'_>, rows: Vec<PutRow>, durable: bool) -> PyResu
                         pyo3::exceptions::PyRuntimeError::new_err(message)
                     }
                 })?;
-            if !durable {
-                // The tail is up to the caller's next sync/durable close.
-                mark_adjacency_tail_dirty();
-            }
+            // Even a durable append leaves its log entries to prune; the next
+            // flush checkpoints the log. Deferred appends also leave the tail
+            // for that flush to sync.
+            mark_adjacency_tail_dirty();
             // Locators for the event and every event it references, so reads
             // can find the room even where a parent's body is still missing.
             for row in room_rows {
@@ -235,7 +241,16 @@ pub fn adjacency_purge_room(py: Python<'_>, room_id: String) -> PyResult<()> {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
                     "mtxdb adjacency purge error: {e}"
                 ))
-            })
+            })?;
+        // Make the tombstone durable and prune the edge log now. Entries still
+        // in the log for this room would be replayed after the tombstone by a
+        // later recovery and bring the purged room's edges back.
+        mark_adjacency_tail_dirty();
+        flush_adjacency_tails_io(&database).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "mtxdb adjacency purge flush error: {e}"
+            ))
+        })
     })
 }
 
