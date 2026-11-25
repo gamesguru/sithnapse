@@ -280,6 +280,15 @@ static ACTIVE_TRANSACTIONS: AtomicUsize = AtomicUsize::new(0);
 /// every append took the durable path.
 static ADJACENCY_TAIL_DIRTY: AtomicBool = AtomicBool::new(false);
 
+/// Number of times the deferred adjacency tails were actually flushed (dirty
+/// tails synced), whichever path asked: an explicit sync, a close, or the
+/// journal's pre-sync hook before a WAL group commit.
+static ADJACENCY_TAIL_FLUSHES: AtomicU64 = AtomicU64::new(0);
+
+/// Serialises adjacency tail flushes so a caller never returns while another
+/// caller's flush of the same tails is still running.
+static ADJACENCY_FLUSH: Mutex<()> = Mutex::new(());
+
 pub(crate) fn mark_adjacency_tail_dirty() {
     ADJACENCY_TAIL_DIRTY.store(true, Ordering::SeqCst);
 }
@@ -2201,9 +2210,22 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
                         "failed to open shared mtxdb database: {e}"
                     ))
                 })?;
+        let shared_database = Arc::new(shared_database);
         let state = shared_database.pool(ShardType::State).clone();
         let event_dag = shared_database.pool(ShardType::EventDag).clone();
         let server_info = shared_database.pool(ShardType::ServerInfo).clone();
+        // Make the deferred CSR adjacency tails durable before every WAL group
+        // commit (timer, explicit barrier or shutdown), after the group's
+        // boundary is fixed. A durable event body can then never lack its
+        // edges after a crash; orphan edges are harmless. Weak, so the hook
+        // does not keep the database (and its writer lock) alive.
+        if let Some(journal) = state.journal() {
+            let database = Arc::downgrade(&shared_database);
+            journal.set_pre_sync_hook(Some(Arc::new(move || match database.upgrade() {
+                Some(database) => flush_adjacency_tails_io(database.as_ref()),
+                None => Ok(()),
+            })));
+        }
         // A single writer's in-memory index is authoritative for every key it
         // has written, so a negative lookup is a true miss: refreshing would
         // only spend a durable-fingerprint probe (and, after each checkpoint,
@@ -2239,7 +2261,7 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
                 state,
                 event_dag,
                 server_info,
-                shared_database: Some(Arc::new(shared_database)),
+                shared_database: Some(shared_database),
                 read_graph: None,
             }));
         *OPENER_PID
@@ -4240,7 +4262,12 @@ pub fn sync_state(py: Python<'_>) -> PyResult<()> {
 pub fn sync_event_dag(py: Python<'_>) -> PyResult<()> {
     assert_writable()?;
     let event_dag = event_dag_db()?;
-    py.detach(|| sync_one("event-dag", &event_dag))
+    py.detach(|| {
+        // Adjacency belongs to the event DAG: a caller asking for its
+        // durability must not leave deferred edges behind.
+        sync_adjacency_tails(csr_writer()?.as_ref())?;
+        sync_one("event-dag", &event_dag)
+    })
 }
 
 /// Flush deferred CSR adjacency tails without syncing any pool.
@@ -4355,6 +4382,10 @@ pub fn background_commit_error(py: Python<'_>) -> PyResult<Option<String>> {
 pub fn request_durable(py: Python<'_>) -> PyResult<Vec<u64>> {
     assert_writable()?;
     py.detach(|| {
+        // The deferred adjacency tails are made durable by the journal's
+        // pre-sync hook, which every WAL group commit (including the
+        // background committer's) runs after capturing its boundary and before
+        // the fsync. Nothing here has to order the two.
         let mut targets = Vec::with_capacity(2);
         for engine in [state_db()?, event_dag_db()?] {
             let target = engine
@@ -4409,16 +4440,30 @@ pub fn wait_durable(py: Python<'_>, targets: Vec<u64>) -> PyResult<()> {
 /// so every explicit sync/durable close must flush them before it claims the
 /// event store is durable.
 fn sync_adjacency_tails(database: &Database) -> PyResult<()> {
+    flush_adjacency_tails_io(database)
+        .map_err(|error| pyo3::exceptions::PyRuntimeError::new_err(error.to_string()))
+}
+
+/// The tail flush itself, with no Python error type so the journal's pre-sync
+/// hook can run it on a committer thread without touching the interpreter.
+fn flush_adjacency_tails_io(database: &Database) -> std::io::Result<()> {
+    // One flush at a time, held from the dirty check through the result: a
+    // second caller must wait for the active flush to finish, not see the flag
+    // already cleared and return before the tails are durable.
+    let _flush = ADJACENCY_FLUSH
+        .lock()
+        .map_err(|_| std::io::Error::other("adjacency flush lock poisoned"))?;
     if !ADJACENCY_TAIL_DIRTY.swap(false, Ordering::SeqCst) {
         return Ok(());
     }
     if let Err(error) = sync_all_tails(database) {
         // Leave the flag set so the next sync retries the flush.
         ADJACENCY_TAIL_DIRTY.store(true, Ordering::SeqCst);
-        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+        return Err(std::io::Error::other(format!(
             "mtxdb adjacency tail sync error: {error}"
         )));
     }
+    ADJACENCY_TAIL_FLUSHES.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
@@ -4806,6 +4851,10 @@ fn stats_impl(py: Python<'_>, take_diagnostics: bool) -> PyResult<Py<PyDict>> {
     if let Some(wal_bytes) = wal_bytes {
         out.set_item("wal_bytes", wal_bytes)?;
     }
+    out.set_item(
+        "adjacency_tail_flushes",
+        ADJACENCY_TAIL_FLUSHES.load(Ordering::Relaxed),
+    )?;
     let csr = mtxdb::csr::store::read_stats();
     let csr_read = PyDict::new(py);
     csr_read.set_item("read_lock_waits", csr.read_lock_waits)?;

@@ -168,6 +168,28 @@ class EmbeddedAdjacencyTestCase(TestCase):
         finally:
             transaction.abort()
 
+    def test_wal_group_commit_flushes_deferred_edges_before_the_fsync(self) -> None:
+        """The journal's pre-sync hook makes deferred edges durable with the WAL.
+
+        Nothing here flushes the tails explicitly: only the background
+        committer's group commit does, so a flush can only come from the hook
+        that runs between capturing the WAL boundary and its fsync.
+        """
+        flushes = lambda: int(mtxdb_engine.stats()["adjacency_tail_flushes"])  # noqa: E731
+
+        before = flushes()
+        mtxdb_engine.start_background_commit(20, 4096)
+        try:
+            put_event_edges_batch([(self.room_id, "$h1", "$hp")], durable=False)
+            # The event body that the edge describes goes into the WAL too.
+            mtxdb_engine.event_json_put([(self.room_id, "$h1", b"body")])
+            mtxdb_engine.wait_durable(mtxdb_engine.request_durable())
+
+            self.assertGreater(flushes(), before)
+        finally:
+            # Stop it here: cleanups run after tearDown has closed the client.
+            mtxdb_engine.stop_background_commit()
+
     def test_deferred_edges_survive_flush_and_reopen(self) -> None:
         """Interval mode appends without an fsync; the flush makes it durable."""
         put_event_edges_batch([(self.room_id, "$d1", "$dp")], durable=False)
