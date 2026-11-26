@@ -72,6 +72,12 @@ from synapse.storage.database import (
     LoggingTransaction,
     make_in_list_sql_clause,
 )
+from synapse.storage.databases.main.embedded_event_timeline import (
+    page_stream,
+    page_topological,
+    report_mismatch,
+    timeline_reads_mode,
+)
 from synapse.storage.databases.main.events_worker import EventsWorkerStore
 from synapse.storage.engines import BaseDatabaseEngine, PostgresEngine, Sqlite3Engine
 from synapse.storage.roommember import RoomsForUserStateReset
@@ -415,6 +421,13 @@ def _make_generic_sql_bound(
         strict_bound=strict_bound,
         bound=bound,
     )
+
+
+def _tokens_without_instance_map(*tokens: RoomStreamToken | None) -> bool:
+    """Whether no token carries a multi-writer `instance_map`. The timeline
+    index stores no persisting instance, so it can only answer pages whose
+    bounds are plain positions."""
+    return all(token is None or not token.instance_map for token in tokens)
 
 
 def _filter_results(
@@ -935,10 +948,32 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
                     AND {bounds}
                 ORDER BY stream_ordering {order} LIMIT ?
             """
-            txn.execute(sql, (room_id, 2 * limit))
-
-            # Get all the rows and check if we hit the limit.
-            fetched_rows = txn.fetchall()
+            index_rows = None
+            reads = timeline_reads_mode() if self._embedded_db_engine else "off"
+            if reads != "off" and _tokens_without_instance_map(from_key, to_key):
+                index_rows = page_stream(
+                    room_id,
+                    from_bound[2] if from_bound else None,
+                    to_bound[2] if to_bound else None,
+                    direction == Direction.BACKWARDS,
+                    2 * limit,
+                )
+            if reads == "read" and index_rows is not None:
+                fetched_rows = [
+                    (event_id, None, stream_ordering)
+                    for event_id, _topo, _ts, stream_ordering in index_rows
+                ]
+            else:
+                txn.execute(sql, (room_id, 2 * limit))
+                # Get all the rows and check if we hit the limit.
+                fetched_rows = txn.fetchall()
+                if index_rows is not None:
+                    report_mismatch(
+                        "paginate_room_events_by_stream_ordering",
+                        room_id,
+                        [(row[0], row[2]) for row in fetched_rows],
+                        [(row[0], row[3]) for row in index_rows],
+                    )
             limited = len(fetched_rows) >= 2 * limit
 
             rows = [
@@ -2504,7 +2539,24 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
             "bounds": bounds,
             "order": order,
         }
-        txn.execute(sql, args)
+        index_rows = None
+        reads = timeline_reads_mode() if self._embedded_db_engine else "off"
+        if (
+            reads != "off"
+            and live_from_key is None
+            and not filter_clause
+            and not join_clause
+            and _tokens_without_instance_map(from_token, to_token)
+        ):
+            index_rows = page_topological(
+                room_id,
+                from_bound,
+                to_bound,
+                direction == Direction.BACKWARDS,
+                requested_limit,
+            )
+        if not (reads == "read" and index_rows is not None):
+            txn.execute(sql, args)
 
         def _filter_fetched(
             fetched_rows: list[tuple[Any, ...]],
@@ -2563,7 +2615,20 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
             return filtered_rows
 
         # Get all the rows and check if we hit the limit.
-        fetched_rows = txn.fetchall()
+        if reads == "read" and index_rows is not None:
+            fetched_rows = [
+                (event_id, None, topological, stream, ts)
+                for event_id, topological, ts, stream in index_rows
+            ]
+        else:
+            fetched_rows = txn.fetchall()
+            if index_rows is not None:
+                report_mismatch(
+                    "paginate_room_events_by_topological_ordering",
+                    room_id,
+                    [(row[0], row[2], row[4], row[3]) for row in fetched_rows],
+                    index_rows,
+                )
         filtered_rows = _filter_fetched(fetched_rows)
 
         # The tie-break handling below is only needed when the live bound is a

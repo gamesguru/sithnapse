@@ -40,6 +40,10 @@ from synapse.storage.databases.main.embedded_event_edges import (
     purge_event_edges_room,
 )
 from synapse.storage.databases.main.embedded_event_json import delete_event_json_batch
+from synapse.storage.databases.main.embedded_event_timeline import (
+    purge_room_timeline,
+    timeline_writes_enabled,
+)
 from synapse.storage.databases.main.embedded_event_to_state_group import (
     decrement_state_group_refcounts_batch,
     delete_event_to_state_group_batch,
@@ -881,6 +885,13 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
                 (
                     "event edges",
                     lambda: purge_event_edges_room(room_id),
+                )
+            )
+        if getattr(self, "_embedded_db_engine", None) and timeline_writes_enabled():
+            room_cleanups.append(
+                (
+                    "event timeline index",
+                    lambda: purge_room_timeline(room_id),
                 )
             )
         post_commit.extend(room_cleanups)

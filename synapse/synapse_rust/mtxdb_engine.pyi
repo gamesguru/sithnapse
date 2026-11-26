@@ -56,6 +56,23 @@ def adjacency_get_children(
     event_ids: list[str],
 ) -> list[tuple[str, list[str] | None]]: ...
 def adjacency_purge_room(room_id: str) -> None: ...
+def event_timeline_put(rows: list[tuple[str, str, int, int, int]]) -> None: ...
+def timeline_page_topological(
+    room_id: str,
+    from_bound: tuple[int | None, int | None, int] | None,
+    to_bound: tuple[int | None, int | None, int] | None,
+    backwards: bool,
+    limit: int,
+    scan_budget: int = 10_000,
+) -> list[tuple[str, int, int, int]] | None: ...
+def timeline_page_stream(
+    room_id: str,
+    from_stream: int | None,
+    to_stream: int | None,
+    backwards: bool,
+    limit: int,
+) -> list[tuple[str, int, int, int]] | None: ...
+def timeline_purge_room(room_id: str) -> None: ...
 def materialize_state_hamt(
     room_prefix: bytes,
     root_structural_hash: bytes,
@@ -103,6 +120,9 @@ class MtxdbTransaction:
     which publishes them as one journal group (all or nothing)."""
 
     def event_json_put(self, rows: list[tuple[str, str, bytes]]) -> None: ...
+    def event_timeline_put(
+        self, rows: list[tuple[str, str, int, int, int]]
+    ) -> None: ...
     def auth_chain_edges_put(
         self, room_id: str, rows: list[tuple[int, list[int]]]
     ) -> None: ...

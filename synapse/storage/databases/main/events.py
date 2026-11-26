@@ -88,6 +88,11 @@ from synapse.storage.databases.main.embedded_event_json import (
     open_embedded_event_json_engine,
     put_event_json_batch,
 )
+from synapse.storage.databases.main.embedded_event_timeline import (
+    put_timeline_rows,
+    timeline_rows_for_events,
+    timeline_writes_enabled,
+)
 from synapse.storage.databases.main.embedded_event_to_state_group import (
     get_state_group_for_events_batch,
     increment_state_group_refcounts_batch,
@@ -1410,6 +1415,16 @@ class PersistEventsStore:
         self._store_event_txn(
             txn, events_and_contexts=events_and_contexts, mtxdb_txn=mtxdb_txn
         )
+        if self._embedded_db_engine and timeline_writes_enabled():
+            # Rejected events are indexed too: they keep `outlier = FALSE` in
+            # `events`, so the pagination SQL returns them as well.
+            timeline_rows = timeline_rows_for_events(
+                event for event, _ in events_and_contexts
+            )
+            timeline_rows.extend(
+                self._de_outliered_timeline_rows_txn(txn, de_outliered_events)
+            )
+            put_timeline_rows(timeline_rows, mtxdb_txn)
 
         # De-outliered events were not passed to _store_event_txn, so their
         # edges have not been written to SQL event_edges or the embedded engine.
@@ -2746,6 +2761,38 @@ class PersistEventsStore:
             )
 
         self._update_min_depth_for_room_txn(txn, room_id, depth_update)
+
+    def _de_outliered_timeline_rows_txn(
+        self,
+        txn: LoggingTransaction,
+        de_outliered_events: list[EventPersistencePair],
+    ) -> list[tuple[str, str, int, int, int]]:
+        """Timeline index rows for events this persist de-outliered.
+
+        A de-outliered event keeps the `stream_ordering` it was first stored
+        with (`_update_outliers_txn` does not change it), which differs from
+        the one on the copy being persisted, so read the stored orderings.
+        """
+        if not de_outliered_events:
+            return []
+        rows = self.db_pool.simple_select_many_txn(
+            txn,
+            table="events",
+            column="event_id",
+            iterable=[event.event_id for event, _ in de_outliered_events],
+            keyvalues={},
+            retcols=(
+                "room_id",
+                "event_id",
+                "topological_ordering",
+                "origin_server_ts",
+                "stream_ordering",
+            ),
+        )
+        return [
+            (room_id, event_id, int(topological), int(ts or 0), int(stream))
+            for room_id, event_id, topological, ts, stream in rows
+        ]
 
     def _update_outliers_txn(
         self,

@@ -20,6 +20,8 @@ use once_cell::sync::OnceCell;
 use pyo3::{create_exception, exceptions::PyException, prelude::*, PyTypeInfo};
 use sha2::{Digest, Sha256};
 
+use super::embedded_timeline;
+
 create_exception!(
     synapse.synapse_rust.mtxdb_engine,
     StaleReadError,
@@ -304,6 +306,11 @@ fn pools() -> PyResult<Arc<MtxdbPools>> {
 
 pub(crate) fn state_db() -> PyResult<Arc<PackfileStorage>> {
     Ok(Arc::clone(&pools()?.state))
+}
+
+/// The writer's shared-WAL database, if this process opened one.
+pub(crate) fn shared_database() -> PyResult<Option<Arc<Database>>> {
+    Ok(pools()?.shared_database.as_ref().map(Arc::clone))
 }
 
 pub(crate) fn event_dag_db() -> PyResult<Arc<PackfileStorage>> {
@@ -3372,9 +3379,20 @@ pub struct PyMtxdbTransaction {
     /// Whether this transaction has already released its slot in
     /// `ACTIVE_TRANSACTIONS` (on commit/abort or drop).
     finished: AtomicBool,
+    /// Timeline rows buffered by `event_timeline_put`, staged at commit under
+    /// the timeline lock (see `embedded_timeline`).
+    timeline_rows: Mutex<Vec<embedded_timeline::TimelineRow>>,
 }
 
 impl PyMtxdbTransaction {
+    /// Take the buffered timeline rows, leaving the buffer empty.
+    fn take_timeline_rows(&self) -> Result<Vec<embedded_timeline::TimelineRow>, StorageError> {
+        self.timeline_rows
+            .lock()
+            .map(|mut rows| std::mem::take(&mut *rows))
+            .map_err(|_| StorageError::Internal("timeline row buffer poisoned".to_owned()))
+    }
+
     fn finish(&self) {
         if !self.finished.swap(true, Ordering::SeqCst) {
             ACTIVE_TRANSACTIONS.fetch_sub(1, Ordering::SeqCst);
@@ -3586,6 +3604,19 @@ impl PyMtxdbTransaction {
         py.detach(|| stage_auth_chain_edges(&self.inner, &room_id, &rows))
     }
 
+    /// Buffer room timeline rows for non-outlier events:
+    /// `(room_id, event_id, topological_ordering, origin_server_ts,
+    /// stream_ordering)`. They are staged into both ordered indexes, with an
+    /// event-id record each, when this transaction commits.
+    fn event_timeline_put(&self, rows: Vec<embedded_timeline::TimelineRow>) -> PyResult<()> {
+        embedded_timeline::validate_rows(&rows)?;
+        self.timeline_rows
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("timeline row buffer poisoned"))?
+            .extend(rows);
+        Ok(())
+    }
+
     /// Publish every staged write as one group. After an error, the writes may
     /// or may not have been published, so the transaction must not be aborted.
     ///
@@ -3594,9 +3625,13 @@ impl PyMtxdbTransaction {
     pub fn commit(&self, py: Python<'_>) -> PyResult<f64> {
         py.detach(|| {
             let started = std::time::Instant::now();
-            self.inner
-                .commit()
+            let rows = self
+                .take_timeline_rows()
                 .map_err(|e| map_transaction_error("commit", e))?;
+            embedded_timeline::commit_with_timeline(&self.inner, &self._database, rows, || {
+                self.inner.commit()
+            })
+            .map_err(|e| map_transaction_error("commit", e))?;
             self.finish();
             Ok(started.elapsed().as_secs_f64())
         })
@@ -3607,7 +3642,13 @@ impl PyMtxdbTransaction {
     pub fn commit_retryable(&self, py: Python<'_>) -> PyResult<f64> {
         py.detach(|| {
             let started = std::time::Instant::now();
-            self.inner.commit().map_err(|error| match error {
+            let rows = self
+                .take_timeline_rows()
+                .map_err(|e| map_transaction_error("commit", e))?;
+            embedded_timeline::commit_with_timeline(&self.inner, &self._database, rows, || {
+                self.inner.commit()
+            })
+            .map_err(|error| match error {
                 error @ StorageError::StaleRead { .. } => {
                     pyo3::exceptions::PyBlockingIOError::new_err(error.to_string())
                 }
@@ -3687,6 +3728,7 @@ pub fn begin_transaction() -> PyResult<Option<PyMtxdbTransaction>> {
             inner,
             _database: database,
             finished: AtomicBool::new(false),
+            timeline_rows: Mutex::new(Vec::new()),
         }
     }))
 }
