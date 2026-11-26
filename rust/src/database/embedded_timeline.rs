@@ -26,7 +26,8 @@ use std::sync::Mutex;
 
 use mtxdb::ordered_timeline::{
     open_event_timeline_indexes, stage_event_timeline_batch, stage_purge_room_timeline,
-    EventStreamKey, EventTimelineEntry, EventTopoKey, ReadCommittedEngine,
+    stage_remove_event_timeline_batch, EventStreamKey, EventTimelineEntry, EventTopoKey,
+    ReadCommittedEngine,
 };
 use mtxdb::storage::StorageError;
 use mtxdb::{
@@ -190,6 +191,89 @@ pub fn event_timeline_put(py: Python<'_>, rows: Vec<TimelineRow>) -> PyResult<()
             .append_untransactional(&stream_keys)
             .map_err(write_error)?;
         Ok(())
+    })
+}
+
+/// Remove event rows from both ordered indexes and their per-room ID maps.
+///
+/// With the shared WAL, all removals publish atomically. Without it, remove
+/// the ID mappings first so any concurrent page that sees an index entry
+/// falls back to SQL while the two index orders are being updated.
+#[pyfunction]
+pub fn timeline_remove_rows(py: Python<'_>, rows: Vec<TimelineRow>) -> PyResult<()> {
+    assert_writable()?;
+    validate_rows(&rows)?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let database = shared_database()?;
+    let engine = event_dag_db()?;
+    py.detach(|| {
+        let write_error = |error: StorageError| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "timeline removal error: {error}"
+            ))
+        };
+        let _guard = STAGE_LOCK.lock().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err("timeline stage lock poisoned")
+        })?;
+        let mut entries = Vec::with_capacity(rows.len());
+        let mut ids_by_collection: std::collections::HashMap<[u8; 16], Vec<NodeId>> =
+            std::collections::HashMap::new();
+        for (room_id, event_id, topological, origin_server_ts, stream) in &rows {
+            let node = event_node_id(event_id);
+            entries.push(EventTimelineEntry::new(
+                event_dag_room_id(room_id),
+                *topological,
+                *origin_server_ts,
+                *stream,
+                node,
+            ));
+            ids_by_collection
+                .entry(event_id_collection(room_id))
+                .or_default()
+                .push(node);
+        }
+        let topo_keys: Vec<_> = entries.iter().map(|entry| entry.topo_key()).collect();
+        let stream_keys: Vec<_> = entries.iter().map(|entry| entry.stream_key()).collect();
+        match &database {
+            Some(database) => {
+                let pool = database.pool(ShardType::EventDag);
+                let (topo, stream) = open_event_timeline_indexes(pool.as_ref());
+                let transaction = database.begin_transaction();
+                stage_remove_event_timeline_batch(
+                    &transaction,
+                    ShardType::EventDag,
+                    &topo,
+                    &stream,
+                    &entries,
+                )
+                .map_err(write_error)?;
+                for (collection, node_ids) in ids_by_collection {
+                    transaction
+                        .remove_many(ShardType::EventDag, collection, &node_ids)
+                        .map_err(io_error)
+                        .map_err(write_error)?;
+                }
+                transaction.commit().map_err(write_error)
+            }
+            None => {
+                let (topo, stream) = open_event_timeline_indexes(engine.as_ref());
+                for (collection, node_ids) in ids_by_collection {
+                    for node_id in node_ids {
+                        let _ = engine
+                            .remove(&collection, &node_id)
+                            .map_err(write_error)?;
+                    }
+                }
+                topo.remove_untransactional(&topo_keys)
+                    .map_err(write_error)?;
+                stream
+                    .remove_untransactional(&stream_keys)
+                    .map_err(write_error)?;
+                Ok(())
+            }
+        }
     })
 }
 
@@ -458,6 +542,7 @@ pub fn timeline_purge_room(py: Python<'_>, room_id: String) -> PyResult<()> {
 
 pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(event_timeline_put, m)?)?;
+    m.add_function(wrap_pyfunction!(timeline_remove_rows, m)?)?;
     m.add_function(wrap_pyfunction!(timeline_page_topological, m)?)?;
     m.add_function(wrap_pyfunction!(timeline_page_stream, m)?)?;
     m.add_function(wrap_pyfunction!(timeline_purge_room, m)?)?;

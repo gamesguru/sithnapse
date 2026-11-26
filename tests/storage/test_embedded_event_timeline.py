@@ -172,6 +172,22 @@ class EmbeddedEventTimelineTestCase(HomeserverTestCase):
         self.assertGreater(len(answers), 8)
         self.assertNotIn(None, answers)
 
+    def test_history_purge_removes_timeline_rows(self) -> None:
+        cutoff = self.get_success(
+            self.store.get_topological_token_for_event(self.sent[12])
+        )
+        cutoff_str = self.get_success(cutoff.to_string(self.store))
+        self.get_success(
+            self.store.purge_history(self.room_id, cutoff_str, delete_local_events=True)
+        )
+
+        rows = embedded_event_timeline.page_stream(self.room_id, None, None, True, 100)
+        self.assertIsNotNone(rows)
+        remaining_ids = {row[0] for row in rows or []}
+        self.assertNotIn(self.sent[0], remaining_ids)
+        self.assertNotIn(self.sent[11], remaining_ids)
+        self.assertIn(self.sent[-1], remaining_ids)
+
     def test_room_purge_removes_the_room_from_the_index(self) -> None:
         self.assertIsNotNone(
             embedded_event_timeline.page_stream(self.room_id, None, None, True, 5)

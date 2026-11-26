@@ -45,6 +45,8 @@ import logging
 import os
 from typing import TYPE_CHECKING, Any, Iterable, Sequence
 
+from synapse.storage.databases.main.embedded_common import retry_on_contention
+
 if TYPE_CHECKING:
     from synapse.events import EventBase
     from synapse.synapse_rust.mtxdb_engine import MtxdbTransaction
@@ -104,6 +106,17 @@ def put_timeline_rows(
     from synapse.synapse_rust.mtxdb_engine import event_timeline_put
 
     event_timeline_put(rows)
+
+
+def remove_timeline_rows(rows: Sequence[tuple[str, str, int, int, int]]) -> None:
+    """Remove timeline keys and ID mappings for SQL-purged events."""
+    if not rows:
+        return
+    from synapse.synapse_rust.mtxdb_engine import timeline_remove_rows
+
+    retry_on_contention(
+        lambda: timeline_remove_rows(list(rows)), label="timeline_remove"
+    )
 
 
 def timeline_rows_for_events(

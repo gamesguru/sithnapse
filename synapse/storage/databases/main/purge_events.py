@@ -42,6 +42,7 @@ from synapse.storage.databases.main.embedded_event_edges import (
 from synapse.storage.databases.main.embedded_event_json import delete_event_json_batch
 from synapse.storage.databases.main.embedded_event_timeline import (
     purge_room_timeline,
+    remove_timeline_rows,
     timeline_writes_enabled,
 )
 from synapse.storage.databases.main.embedded_event_to_state_group import (
@@ -331,6 +332,22 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
         txn.execute("SELECT event_id, should_delete FROM events_to_purge")
         event_rows = txn.fetchall()
 
+        timeline_rows: list[tuple[str, str, int, int, int]] = []
+        if getattr(self, "_embedded_db_engine", None) is not None:
+            txn.execute(
+                """
+                SELECT e.room_id, e.event_id, e.topological_ordering,
+                    COALESCE(e.origin_server_ts, 0), e.stream_ordering
+                FROM events AS e
+                INNER JOIN events_to_purge AS p USING (event_id)
+                WHERE p.should_delete
+                """
+            )
+            timeline_rows = [
+                (room, event_id, int(topo), int(ts), int(stream))
+                for room, event_id, topo, ts, stream in txn
+            ]
+
         if len(event_rows) == 0:
             logger.info("[purge] no events found to purge")
 
@@ -562,7 +579,14 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
                     ),
                 )
             )
-        post_commit.extend(cleanups)
+        if timeline_rows:
+        cleanups.append(
+            (
+                "event timeline index",
+                lambda: remove_timeline_rows(timeline_rows),
+            )
+        )
+post_commit.extend(cleanups)
 
         # Some of the `event_push_actions` we're about to delete may have already
         # been rotated into the aggregate `event_push_summary` counts. Deleting
