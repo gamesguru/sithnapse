@@ -63,6 +63,29 @@ def event_meta_node_id(namespace: str, event_id: str) -> bytes:
     return digest[:16]
 
 
+def _main_database_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the connection that owns Synapse's main data store."""
+    database = config.get("database")
+    if database is None:
+        databases = config.get("databases") or {}
+        if not isinstance(databases, dict):
+            raise RuntimeError("config 'databases' must be a mapping")
+        main_databases = [
+            database_config
+            for database_config in databases.values()
+            if isinstance(database_config, dict)
+            and "main" in database_config.get("data_stores", ["main", "state"])
+        ]
+        if len(main_databases) != 1:
+            raise RuntimeError(
+                "config must identify exactly one database for the 'main' data store"
+            )
+        database = main_databases[0]
+    if not isinstance(database, dict):
+        raise RuntimeError("config 'database' must be a mapping")
+    return database
+
+
 def sql_connection(config_path: str) -> tuple[str, Any]:
     """Open the main SQL database named in the same config, for reading the
     authoritative `events` (event_id, room_id) list. Node ids are hashes and
@@ -70,7 +93,7 @@ def sql_connection(config_path: str) -> tuple[str, Any]:
     recovered from mtxdb itself."""
     config_files = find_config_files([config_path])
     config = read_config_files(config_files)
-    database = config.get("database") or {}
+    database = _main_database_config(config)
     name = database.get("name")
     args = {
         key: value

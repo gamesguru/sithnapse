@@ -35,6 +35,7 @@ from synapse.server import HomeServer
 from synapse.storage.databases.main import (
     embedded_event_edges as embedded_event_edges_module,
 )
+from synapse.storage.databases.main.embedded_common import Pool
 from synapse.storage.databases.main.embedded_event_edges import (
     event_edge_publish_signal_gauge,
     get_event_edges_backward_batch,
@@ -94,14 +95,19 @@ def open_test_engine() -> None:
 class EmbeddedAdjacencyTestCase(TestCase):
     """Pure unit tests for the adjacency FFI wrappers.
 
-    Every test uses a fresh room id: adjacency is scoped by the room's event
-    collection id, so a unique room keeps the process-global store isolated
-    between tests without a namespace.
+    Every test uses a fresh room id and a fresh event-id prefix: adjacency is
+    scoped by the room's event collection id, and an event id has exactly one
+    room locator, so both must be unique to keep the process-global store
+    isolated between tests without a namespace.
     """
 
     def setUp(self) -> None:
         open_test_engine()
         self.room_id = f"!{uuid4().hex}:example.org"
+        self._event_prefix = uuid4().hex
+
+    def _eid(self, name: str) -> str:
+        return f"${self._event_prefix}-{name}"
 
     def tearDown(self) -> None:
         mtxdb_engine.close_client()
@@ -111,61 +117,116 @@ class EmbeddedAdjacencyTestCase(TestCase):
         # every event it touches, so the repair/backfill case still resolves.
         put_event_edges_batch(
             [
-                (self.room_id, "$e1", "$p1"),
-                (self.room_id, "$e1", "$p2"),
+                (self.room_id, self._eid("e1"), self._eid("p1")),
+                (self.room_id, self._eid("e1"), self._eid("p2")),
             ]
         )
 
-        backward = get_event_edges_backward_batch(["$e1", "$nonexistent"])
-        self.assertEqual(backward["$e1"], ["$p1", "$p2"])
-        self.assertNotIn("$nonexistent", backward)
+        backward = get_event_edges_backward_batch(
+            [self._eid("e1"), self._eid("nonexistent")]
+        )
+        self.assertEqual(backward[self._eid("e1")], [self._eid("p1"), self._eid("p2")])
+        self.assertNotIn(self._eid("nonexistent"), backward)
 
-        forward = get_event_edges_forward_batch(["$p1", "$p2", "$nonexistent"])
-        self.assertEqual(forward["$p1"], ["$e1"])
-        self.assertEqual(forward["$p2"], ["$e1"])
-        self.assertIsNone(forward["$nonexistent"])
+        forward = get_event_edges_forward_batch(
+            [self._eid("p1"), self._eid("p2"), self._eid("nonexistent")]
+        )
+        self.assertEqual(forward[self._eid("p1")], [self._eid("e1")])
+        self.assertEqual(forward[self._eid("p2")], [self._eid("e1")])
+        self.assertIsNone(forward[self._eid("nonexistent")])
 
-        put_event_edges_batch([(self.room_id, "$e2", "$p1")])
-        forward2 = get_event_edges_forward_batch(["$p1"])
-        self.assertCountEqual(forward2["$p1"] or [], ["$e1", "$e2"])
+        put_event_edges_batch([(self.room_id, self._eid("e2"), self._eid("p1"))])
+        forward2 = get_event_edges_forward_batch([self._eid("p1")])
+        self.assertCountEqual(
+            forward2[self._eid("p1")] or [], [self._eid("e1"), self._eid("e2")]
+        )
 
     def test_event_without_prev_has_an_empty_row(self) -> None:
-        put_event_edges_batch([(self.room_id, "$create", None)])
+        put_event_edges_batch([(self.room_id, self._eid("create"), None)])
 
-        self.assertEqual(get_event_edges_backward_batch(["$create"])["$create"], [])
-        self.assertIsNone(get_event_edges_forward_batch(["$create"])["$create"])
+        self.assertEqual(
+            get_event_edges_backward_batch([self._eid("create")])[self._eid("create")],
+            [],
+        )
+        self.assertIsNone(
+            get_event_edges_forward_batch([self._eid("create")])[self._eid("create")]
+        )
 
     def test_rooms_do_not_leak(self) -> None:
         # Event ids are globally unique and belong to one room; the locator
         # maps an id to exactly one room collection. Two rooms therefore use
         # distinct parents here, and each read must stay inside its own scope.
         other_room = f"!{uuid4().hex}:example.org"
-        put_event_edges_batch([(self.room_id, "$a", "$parent_a")])
-        put_event_edges_batch([(other_room, "$b", "$parent_b")])
+        put_event_edges_batch([(self.room_id, self._eid("a"), self._eid("parent_a"))])
+        put_event_edges_batch([(other_room, self._eid("b"), self._eid("parent_b"))])
 
-        self.assertEqual(get_event_edges_backward_batch(["$a"])["$a"], ["$parent_a"])
-        self.assertEqual(get_event_edges_backward_batch(["$b"])["$b"], ["$parent_b"])
         self.assertEqual(
-            get_event_edges_forward_batch(["$parent_a"])["$parent_a"], ["$a"]
+            get_event_edges_backward_batch([self._eid("a")])[self._eid("a")],
+            [self._eid("parent_a")],
         )
         self.assertEqual(
-            get_event_edges_forward_batch(["$parent_b"])["$parent_b"], ["$b"]
+            get_event_edges_backward_batch([self._eid("b")])[self._eid("b")],
+            [self._eid("parent_b")],
         )
+        self.assertEqual(
+            get_event_edges_forward_batch([self._eid("parent_a")])[
+                self._eid("parent_a")
+            ],
+            [self._eid("a")],
+        )
+        self.assertEqual(
+            get_event_edges_forward_batch([self._eid("parent_b")])[
+                self._eid("parent_b")
+            ],
+            [self._eid("b")],
+        )
+
+    def test_cross_room_parent_does_not_overwrite_its_locator(self) -> None:
+        other_room = f"!{uuid4().hex}:example.org"
+        put_event_edges_batch([(other_room, self._eid("shared_parent"), None)])
+
+        with self.assertRaisesRegex(ValueError, "already belongs to another room"):
+            put_event_edges_batch(
+                [(self.room_id, self._eid("child"), self._eid("shared_parent"))]
+            )
+
+        self.assertEqual(
+            get_event_edges_backward_batch([self._eid("shared_parent")])[
+                self._eid("shared_parent")
+            ],
+            [],
+        )
+
+    def test_sync_barrier_covers_event_dag_and_locator_pools(self) -> None:
+        with mock.patch.object(embedded_event_edges_module, "sync_now") as sync_now:
+            put_event_edges_batch(
+                [(self.room_id, self._eid("synced"), None)], sync=True
+            )
+
+        sync_now.assert_called_once_with(pools=[Pool.EVENT_DAG, Pool.STATE])
 
     def test_purge_room_drops_the_whole_scope(self) -> None:
         put_event_edges_batch(
             [
-                (self.room_id, "$e1", "$p1"),
-                (self.room_id, "$e2", "$e1"),
+                (self.room_id, self._eid("e1"), self._eid("p1")),
+                (self.room_id, self._eid("e2"), self._eid("e1")),
             ]
         )
-        self.assertIn("$e1", get_event_edges_backward_batch(["$e1"]))
+        self.assertIn(
+            self._eid("e1"), get_event_edges_backward_batch([self._eid("e1")])
+        )
 
         purge_event_edges_room(self.room_id)
 
-        self.assertNotIn("$e1", get_event_edges_backward_batch(["$e1"]))
-        self.assertNotIn("$e2", get_event_edges_backward_batch(["$e2"]))
-        self.assertIsNone(get_event_edges_forward_batch(["$p1"])["$p1"])
+        self.assertNotIn(
+            self._eid("e1"), get_event_edges_backward_batch([self._eid("e1")])
+        )
+        self.assertNotIn(
+            self._eid("e2"), get_event_edges_backward_batch([self._eid("e2")])
+        )
+        self.assertIsNone(
+            get_event_edges_forward_batch([self._eid("p1")])[self._eid("p1")]
+        )
 
     def test_write_is_immediate_even_with_a_transaction(self) -> None:
         """The CSR append does not join the persist transaction.
@@ -181,11 +242,14 @@ class EmbeddedAdjacencyTestCase(TestCase):
 
         try:
             put_event_edges_batch(
-                [(self.room_id, "$staged", "$parent")], transaction=transaction
+                [(self.room_id, self._eid("staged"), self._eid("parent"))],
+                transaction=transaction,
             )
             self.assertEqual(
-                get_event_edges_backward_batch(["$staged"])["$staged"],
-                ["$parent"],
+                get_event_edges_backward_batch([self._eid("staged")])[
+                    self._eid("staged")
+                ],
+                [self._eid("parent")],
             )
         finally:
             transaction.abort()
@@ -207,7 +271,9 @@ class EmbeddedAdjacencyTestCase(TestCase):
         mtxdb_engine.close_client()
         mtxdb_engine.open_client(root)
 
-        put_event_edges_batch([(self.room_id, "$r1", "$rp")], durable=False)
+        put_event_edges_batch(
+            [(self.room_id, self._eid("r1"), self._eid("rp"))], durable=False
+        )
         # The WAL (and the edge log in it) is durable; the tail is not synced.
         mtxdb_engine.wait_durable(mtxdb_engine.request_durable())
         mtxdb_engine.close_client(durable=False)
@@ -217,35 +283,49 @@ class EmbeddedAdjacencyTestCase(TestCase):
             os.remove(tail)
 
         mtxdb_engine.open_client(root)
-        self.assertEqual(get_event_edges_backward_batch(["$r1"])["$r1"], ["$rp"])
-        self.assertEqual(get_event_edges_forward_batch(["$rp"])["$rp"], ["$r1"])
+        self.assertEqual(
+            get_event_edges_backward_batch([self._eid("r1")])[self._eid("r1")],
+            [self._eid("rp")],
+        )
+        self.assertEqual(
+            get_event_edges_forward_batch([self._eid("rp")])[self._eid("rp")],
+            [self._eid("r1")],
+        )
 
     def test_purged_room_edges_are_not_replayed_on_open(self) -> None:
         """A purge prunes the edge log, so recovery cannot bring the room back."""
-        put_event_edges_batch([(self.room_id, "$p1", "$pp")], durable=False)
+        put_event_edges_batch(
+            [(self.room_id, self._eid("p1"), self._eid("pp"))], durable=False
+        )
         mtxdb_engine.wait_durable(mtxdb_engine.request_durable())
         purge_event_edges_room(self.room_id)
         mtxdb_engine.wait_durable(mtxdb_engine.request_durable())
         mtxdb_engine.close_client(durable=False)
 
         open_test_engine()
-        self.assertNotIn("$p1", get_event_edges_backward_batch(["$p1"]))
-        self.assertIsNone(get_event_edges_forward_batch(["$pp"]).get("$pp"))
+        self.assertNotIn(
+            self._eid("p1"), get_event_edges_backward_batch([self._eid("p1")])
+        )
+        self.assertIsNone(
+            get_event_edges_forward_batch([self._eid("pp")]).get(self._eid("pp"))
+        )
 
     def test_deferred_edges_survive_flush_and_reopen(self) -> None:
         """Interval mode appends without an fsync; the flush makes it durable."""
-        put_event_edges_batch([(self.room_id, "$d1", "$dp")], durable=False)
+        put_event_edges_batch(
+            [(self.room_id, self._eid("d1"), self._eid("dp"))], durable=False
+        )
         mtxdb_engine.flush_adjacency_tails()
 
         # Reopen the same root: the edges must come back from the tail/segments.
         open_test_engine()
         self.assertEqual(
-            get_event_edges_backward_batch(["$d1"])["$d1"],
-            ["$dp"],
+            get_event_edges_backward_batch([self._eid("d1")])[self._eid("d1")],
+            [self._eid("dp")],
         )
         self.assertEqual(
-            get_event_edges_forward_batch(["$dp"])["$dp"],
-            ["$d1"],
+            get_event_edges_forward_batch([self._eid("dp")])[self._eid("dp")],
+            [self._eid("d1")],
         )
 
 

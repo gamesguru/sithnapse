@@ -87,7 +87,8 @@ def put_event_edges_batch(
     introduces is orphan rows for an event whose SQL row never commits, which
     every reader filters out. `durable=False` is for disposable stores only.
 
-    `sync` issues an immediate EVENT_DAG barrier after the write.
+    `sync` issues an immediate barrier for both the EVENT_DAG records and the
+    State-pool event locators after the write.
     """
     by_event: dict[tuple[str, str], list[str]] = {}
     for room_id, event_id, prev_event_id in rows:
@@ -117,7 +118,7 @@ def put_event_edges_batch(
         ffi_batch_size("event_edges_put", len(put_rows))
 
     if sync:
-        sync_now(pools=[Pool.EVENT_DAG])
+        sync_now(pools=[Pool.EVENT_DAG, Pool.STATE])
 
 
 def purge_event_edges_room(room_id: str) -> None:
@@ -128,7 +129,7 @@ def purge_event_edges_room(room_id: str) -> None:
         _et = time.monotonic()
         retry_on_contention(lambda: adjacency_purge_room(room_id), label="event_edges")
         ffi_timing("ffi_event_edges_purge_room", time.monotonic() - _et)
-    sync_now(pools=[Pool.EVENT_DAG])
+    sync_now(pools=[Pool.EVENT_DAG, Pool.STATE])
 
 
 def get_event_edges_backward_batch(event_ids: list[str]) -> dict[str, list[str]]:

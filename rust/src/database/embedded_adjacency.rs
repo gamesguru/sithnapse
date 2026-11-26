@@ -73,8 +73,43 @@ fn resolve_rooms(event_ids: &[String]) -> PyResult<Vec<Option<[u8; 16]>>> {
 #[pyfunction]
 #[pyo3(signature = (rows, durable = true))]
 pub fn adjacency_put(py: Python<'_>, rows: Vec<PutRow>, durable: bool) -> PyResult<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
     let database = csr_writer()?;
     py.detach(|| {
+        // An event id has one room locator. Reject malformed cross-room edges
+        // before appending any CSR records, or publishing locators could move
+        // an existing event to the referencing event's room.
+        let mut expected_rooms: HashMap<String, String> = HashMap::new();
+        for row in &rows {
+            for event_id in std::iter::once(&row.1).chain(&row.2).chain(&row.3) {
+                match expected_rooms.entry(event_id.clone()) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(row.0.clone());
+                    }
+                    std::collections::hash_map::Entry::Occupied(entry) if entry.get() != &row.0 => {
+                        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                            "event {event_id} is referenced from multiple rooms"
+                        )));
+                    }
+                    std::collections::hash_map::Entry::Occupied(_) => {}
+                }
+            }
+        }
+        let event_ids: Vec<String> = expected_rooms.keys().cloned().collect();
+        let existing_rooms = resolve_rooms(&event_ids)?;
+        for (event_id, existing_room) in event_ids.iter().zip(existing_rooms) {
+            if let Some(existing_room) = existing_room {
+                let expected_room = event_dag_room_id(&expected_rooms[event_id]);
+                if existing_room != expected_room {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "event {event_id} already belongs to another room"
+                    )));
+                }
+            }
+        }
+
         let mut by_room: HashMap<String, Vec<&PutRow>> = HashMap::new();
         for row in &rows {
             by_room.entry(row.0.clone()).or_default().push(row);
@@ -145,7 +180,12 @@ pub fn adjacency_put(py: Python<'_>, rows: Vec<PutRow>, durable: bool) -> PyResu
         for (collection, pairs) in locators {
             let pairs: Vec<(NodeId, NodeData)> = pairs.into_iter().collect();
             engine.put_many(&collection, &pairs).map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb locator put error: {e}"))
+                let message = format!("mtxdb locator put error: {e}");
+                if is_retryable_contention(&e) {
+                    pyo3::exceptions::PyBlockingIOError::new_err(message)
+                } else {
+                    pyo3::exceptions::PyRuntimeError::new_err(message)
+                }
             })?;
         }
         Ok(())

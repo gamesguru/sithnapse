@@ -37,7 +37,7 @@ SCRIPTS = Path(__file__).parents[2] / "scripts-dev" / "mtxdb"
 RESTORE = SCRIPTS / "restore_desalt-001-4db1a920f-11c6125cab.py"
 
 
-def _load() -> tuple[Any, Any]:
+def _load() -> tuple[Any, Any, Any]:
     """Load `_desalt` and the restore script on demand (the Debian build ships
     no `scripts-dev/`)."""
     sys.path.insert(0, str(SCRIPTS))
@@ -45,6 +45,7 @@ def _load() -> tuple[Any, Any]:
         # A dynamic import: mypy excludes scripts-dev/, so a static one cannot
         # resolve in the repo-wide run.
         _desalt = importlib.import_module("_desalt")
+        common = importlib.import_module("_common")
 
         spec = importlib.util.spec_from_file_location("restore_desalt", RESTORE)
         assert spec is not None and spec.loader is not None
@@ -52,14 +53,14 @@ def _load() -> tuple[Any, Any]:
         spec.loader.exec_module(restore)
     finally:
         sys.path.remove(str(SCRIPTS))
-    return _desalt, restore
+    return _desalt, restore, common
 
 
 class DesaltKeyTestCase(TestCase):
     def setUp(self) -> None:
         if not RESTORE.exists():
             self.skipTest("scripts-dev/mtxdb is absent")
-        self.desalt, _ = _load()
+        self.desalt, _, _ = _load()
 
     def test_old_keys_match_prods_salted_layout(self) -> None:
         # Literal values derived from 4db1a920f's `embedded_common.namespace_hash`
@@ -104,12 +105,40 @@ class DesaltKeyTestCase(TestCase):
         with self.assertRaisesRegex(RuntimeError, "no header"):
             self.desalt.count_records([record])
 
+    def test_resolves_main_database_from_sharded_config(self) -> None:
+        _, _, common = _load()
+        main = {
+            "name": "psycopg2",
+            "data_stores": ["main"],
+            "args": {"dbname": "synapse_main"},
+        }
+        state = {
+            "name": "psycopg2",
+            "data_stores": ["state"],
+            "args": {"dbname": "synapse_state"},
+        }
+
+        self.assertEqual(
+            common._main_database_config(
+                {"databases": {"main_db": main, "state_db": state}}
+            ),
+            main,
+        )
+
+    def test_resolves_default_main_database_from_sharded_config(self) -> None:
+        _, _, common = _load()
+        main = {"name": "psycopg2", "args": {"dbname": "synapse"}}
+
+        self.assertEqual(
+            common._main_database_config({"databases": {"main_db": main}}), main
+        )
+
 
 class DesaltRestoreTestCase(TestCase):
     def setUp(self) -> None:
         if not RESTORE.exists():
             self.skipTest("scripts-dev/mtxdb is absent")
-        self.desalt, self.restore = _load()
+        self.desalt, self.restore, _ = _load()
         self.dir = Path(tempfile.mkdtemp(prefix="test-desalt-restore-"))
         self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
         mtxdb_engine.close_client()

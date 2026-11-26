@@ -390,7 +390,7 @@ async def rebuild(
             put_event_edges_batch(rows)
             stats["written"] += len(event_ids)
             after = event_ids[-1]
-        sync_now(pools=[Pool.EVENT_DAG])
+        sync_now(pools=[Pool.EVENT_DAG, Pool.STATE])
         after = ""
         while True:
             event_ids = await store.db_pool.runInteraction(
