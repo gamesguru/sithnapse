@@ -80,7 +80,10 @@ def _table_exists(txn: LoggingTransaction, postgres: bool) -> bool:
         txn.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'edge_backend'"
         )
-    return txn.fetchone() is not None
+    row = txn.fetchone()
+    # Postgres's to_regclass returns a NULL row for a missing relation, so a
+    # present row alone is not enough.
+    return row is not None and row[0] is not None
 
 
 def _select_source(txn: LoggingTransaction, postgres: bool, requested: str) -> str:
