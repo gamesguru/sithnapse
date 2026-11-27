@@ -197,11 +197,14 @@ def _main_database_config(config: dict[str, Any]) -> dict[str, Any]:
     return database
 
 
-def sql_connection(config_path: str) -> tuple[str, Any]:
-    """Open the main SQL database named in the same config, for reading the
-    authoritative `events` (event_id, room_id) list. Node ids are hashes and
-    the stored PDU JSON has no event_id for room v3+, so ids cannot be
-    recovered from mtxdb itself."""
+def sql_connection(config_path: str, *, read_only: bool = True) -> tuple[str, Any]:
+    """Open the main SQL database named in the same config.
+
+    Reads the authoritative `events` (event_id, room_id) list; node ids are
+    hashes and the stored PDU JSON has no event_id for room v3+, so ids cannot
+    be recovered from mtxdb itself. Pass `read_only=False` only when the
+    caller also writes the migration marker.
+    """
     config_files = find_config_files([config_path])
     config = read_config_files(config_files)
     database = _main_database_config(config)
@@ -214,7 +217,9 @@ def sql_connection(config_path: str) -> tuple[str, Any]:
     if name == "sqlite3":
         import sqlite3
 
-        return name, sqlite3.connect(f"file:{args['database']}?mode=ro", uri=True)
+        if read_only:
+            return name, sqlite3.connect(f"file:{args['database']}?mode=ro", uri=True)
+        return name, sqlite3.connect(str(args["database"]))
     if name == "psycopg2":
         import psycopg2
 

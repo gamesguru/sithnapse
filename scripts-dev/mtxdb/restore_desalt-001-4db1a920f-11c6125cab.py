@@ -297,7 +297,7 @@ def main() -> int:
     if retire_old_room_index(db_path):
         print("Moved room_index/ to room_index.pre-desalt", file=sys.stderr)
 
-    sql_name, sql = sql_connection(args.config)
+    sql_name, sql = sql_connection(args.config, read_only=False)
     print(f"Writing mtxdb at {db_path}", file=sys.stderr)
     engine.open_client(str(db_path))
     try:

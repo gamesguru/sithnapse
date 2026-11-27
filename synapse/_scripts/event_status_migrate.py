@@ -64,11 +64,6 @@ def main() -> None:
         action="store_true",
         help="Report events whose locator status differs without writing.",
     )
-    parser.add_argument(
-        "--start-after",
-        default="",
-        help="Resume after this event id instead of the marker position.",
-    )
     args = parser.parse_args()
     logging.basicConfig(
         level=logging.DEBUG if args.v else logging.INFO,
@@ -89,7 +84,6 @@ def main() -> None:
                 hs,
                 batch_size=args.batch_size,
                 dry_run=args.dry_run,
-                start_after=args.start_after,
             )
             print(json.dumps(result, indent=2, sort_keys=True))
         except Exception:

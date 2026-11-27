@@ -216,7 +216,7 @@ def main() -> int:
     from synapse.synapse_rust import mtxdb_engine
 
     mtxdb_engine.open_client(str(db_path))
-    sql_name, sql = sql_connection(args.config)
+    sql_name, sql = sql_connection(args.config, read_only=False)
     batch: list[dict[str, object]] = []
     written = 0
     rows = read_dump(args.input)
@@ -252,15 +252,17 @@ def main() -> int:
                 ],
             )
             verify_batch(mtxdb_engine, sql, sql_name, batch)
+        if written != count:
+            raise RuntimeError(
+                f"restore coverage failed: wrote {written}, expected {count}"
+            )
+        # Make every record durable before vouching for the migration: a
+        # crash after the marker but before the sync would leave an
+        # incomplete store that startup accepts.
+        mtxdb_engine.sync_event_dag()
         mark_event_status_locators_complete(sql, sql_name)
     finally:
         sql.close()
-    if written != count:
-        raise RuntimeError(
-            f"restore coverage failed: wrote {written}, expected {count}"
-        )
-
-    mtxdb_engine.sync_event_dag()
     print(f"Rewrote and synced {written} event records in {db_path}", file=sys.stderr)
     return 0
 

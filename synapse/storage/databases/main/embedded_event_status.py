@@ -158,7 +158,6 @@ async def migrate_event_statuses(
     *,
     batch_size: int = 1000,
     dry_run: bool = False,
-    start_after: str = "",
 ) -> dict[str, int]:
     """Rewrite every event's EventDag locator with its status flags.
 
@@ -168,7 +167,9 @@ async def migrate_event_statuses(
     a pre-status locator is not readable through the normal path. The scan is
     ordered by event id, resumes from the marker's `last_event_id`, and verifies
     each batch by reading it back. A dry run reports mismatches without writing
-    or advancing the marker, including after a completed migration.
+    or advancing the marker, including after a completed migration. There is no
+    way to start past the marker: doing so could mark the store complete while
+    earlier events were never rewritten.
     """
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
@@ -193,8 +194,6 @@ async def migrate_event_statuses(
             "unchanged": 0,
             "mismatched": 0,
         }
-    if start_after:
-        last_event_id = start_after
 
     stats = {"events": 0, "written": 0, "unchanged": 0, "mismatched": 0}
 
@@ -233,11 +232,14 @@ async def migrate_event_statuses(
 
         try:
             existing = get_event_statuses([event_id for event_id, *_ in rows])
-        except RuntimeError:
+        except RuntimeError as error:
             # A pre-status locator is unreadable through the normal path; the
             # whole batch needs a rewrite and its soft-failed bit must come
             # from the body, which was the authoritative store before status
-            # moved into the locator.
+            # moved into the locator. Any other read failure must abort the
+            # migration instead of being mistaken for an old-format batch.
+            if "invalid or legacy EventDag event locator" not in str(error):
+                raise
             existing = None
 
         expected: dict[str, tuple[str, EventStatus]] = {}
