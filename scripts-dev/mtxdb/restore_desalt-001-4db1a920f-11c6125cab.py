@@ -312,14 +312,17 @@ def main() -> int:
         if written != counts:
             raise RuntimeError(f"wrote {written}, dump holds {counts}")
         bad = verify_dump(engine, sql, sql_name, args.input, args.batch_size)
+        if bad:
+            for line in bad[:20]:
+                print("  mismatch: " + line, file=sys.stderr)
+            raise RuntimeError(f"{len(bad)} records did not read back equal")
+        # Only now is every body and status header verified. A failed or
+        # partial run must leave the marker incomplete so startup still
+        # refuses and the restore can be repeated.
         mark_event_status_locators_complete(sql, sql_name)
     finally:
         sql.close()
         engine.close_client()
-    if bad:
-        for line in bad[:20]:
-            print("  mismatch: " + line, file=sys.stderr)
-        raise RuntimeError(f"{len(bad)} records did not read back equal")
     print(f"restored and verified {written}", file=sys.stderr)
     return 0
 
