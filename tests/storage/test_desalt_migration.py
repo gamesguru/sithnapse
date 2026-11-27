@@ -145,6 +145,18 @@ class DesaltRestoreTestCase(TestCase):
         mtxdb_engine.open_client(str(self.dir))
         self.addCleanup(mtxdb_engine.close_client)
 
+    class _EventStatusSql:
+        """Minimal SQL result for the event row included in the test dump."""
+
+        def cursor(self) -> Any:
+            return self
+
+        def execute(self, _query: str, event_ids: list[str]) -> None:
+            self.event_ids = event_ids
+
+        def fetchall(self) -> list[tuple[str, bool, bool]]:
+            return [(event_id, False, False) for event_id in self.event_ids]
+
     def _dump(self) -> Path:
         d = self.desalt
         room_id = "!desalt:example.org"
@@ -203,13 +215,18 @@ class DesaltRestoreTestCase(TestCase):
         # HAMT nodes are intentionally unchanged by the namespace migration;
         # seed them as they would already exist in the source store.
         mtxdb_engine.put_state_hamt_nodes(room_prefix, nodes)
-        written = self.restore.apply_dump(mtxdb_engine, path, batch_size=2)
+        sql = self._EventStatusSql()
+        written = self.restore.apply_dump(
+            mtxdb_engine, sql, "sqlite3", path, batch_size=2
+        )
         self.assertEqual(
             written, self.desalt.count_records(self.desalt.read_dump(path))
         )
 
         # The running build reads what the restore wrote, through its own keys.
-        self.assertEqual(self.restore.verify_dump(mtxdb_engine, path, 2), [])
+        self.assertEqual(
+            self.restore.verify_dump(mtxdb_engine, sql, "sqlite3", path, 2), []
+        )
         found = dict(mtxdb_engine.batch_get([_event_to_state_group_key("$one")]))
         self.assertEqual(
             struct.unpack(">q", found[_event_to_state_group_key("$one")])[0], 41
@@ -222,15 +239,18 @@ class DesaltRestoreTestCase(TestCase):
         )
 
         # Running it again is safe.
-        self.restore.apply_dump(mtxdb_engine, path, batch_size=2)
-        self.assertEqual(self.restore.verify_dump(mtxdb_engine, path, 2), [])
+        self.restore.apply_dump(mtxdb_engine, sql, "sqlite3", path, batch_size=2)
+        self.assertEqual(
+            self.restore.verify_dump(mtxdb_engine, sql, "sqlite3", path, 2), []
+        )
 
     def test_verify_reports_a_record_that_did_not_land(self) -> None:
         path = self._dump()
-        self.restore.apply_dump(mtxdb_engine, path, batch_size=10)
+        sql = self._EventStatusSql()
+        self.restore.apply_dump(mtxdb_engine, sql, "sqlite3", path, batch_size=10)
         mtxdb_engine.batch_delete([_state_group_refcount_key(41)])
 
-        bad = self.restore.verify_dump(mtxdb_engine, path, 10)
+        bad = self.restore.verify_dump(mtxdb_engine, sql, "sqlite3", path, 10)
 
         self.assertEqual(len(bad), 1)
         self.assertIn("refcount", bad[0])

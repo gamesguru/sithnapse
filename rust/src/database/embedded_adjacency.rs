@@ -78,37 +78,70 @@ pub fn adjacency_put(py: Python<'_>, rows: Vec<PutRow>, durable: bool) -> PyResu
     }
     let database = csr_writer()?;
     py.detach(|| {
-        // An event id has one room locator. Reject malformed cross-room edges
-        // before appending any CSR records, or publishing locators could move
-        // an existing event to the referencing event's room.
-        let mut expected_rooms: HashMap<String, String> = HashMap::new();
+        // Event rows have exactly one room, but malformed events may reference
+        // prev/auth events from another room. SQL kept those edges and room-
+        // scoped traversals filtered them out. In CSR, omit such references so
+        // they cannot move a locator or make the whole event write fail.
+        let mut event_rooms: HashMap<String, String> = HashMap::new();
+        let mut reference_rooms: HashMap<String, Option<String>> = HashMap::new();
+        let mut event_ids = Vec::new();
         for row in &rows {
-            for event_id in std::iter::once(&row.1).chain(&row.2).chain(&row.3) {
-                match expected_rooms.entry(event_id.clone()) {
+            match event_rooms.entry(row.1.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(row.0.clone());
+                }
+                std::collections::hash_map::Entry::Occupied(entry) if entry.get() != &row.0 => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "event {} is persisted in multiple rooms",
+                        row.1
+                    )));
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {}
+            }
+            event_ids.push(row.1.clone());
+            for event_id in row.2.iter().chain(&row.3) {
+                event_ids.push(event_id.clone());
+                match reference_rooms.entry(event_id.clone()) {
                     std::collections::hash_map::Entry::Vacant(entry) => {
-                        entry.insert(row.0.clone());
+                        entry.insert(Some(row.0.clone()));
                     }
-                    std::collections::hash_map::Entry::Occupied(entry) if entry.get() != &row.0 => {
-                        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                            "event {event_id} is referenced from multiple rooms"
-                        )));
+                    std::collections::hash_map::Entry::Occupied(mut entry)
+                        if entry.get().as_deref() != Some(&row.0) =>
+                    {
+                        entry.insert(None);
                     }
                     std::collections::hash_map::Entry::Occupied(_) => {}
                 }
             }
         }
-        let event_ids: Vec<String> = expected_rooms.keys().cloned().collect();
+        event_ids.sort_unstable();
+        event_ids.dedup();
         let existing_rooms = resolve_rooms(&event_ids)?;
-        for (event_id, existing_room) in event_ids.iter().zip(existing_rooms) {
-            if let Some(existing_room) = existing_room {
-                let expected_room = event_dag_room_id(&expected_rooms[event_id]);
-                if existing_room != expected_room {
+        let existing_rooms: HashMap<String, Option<[u8; 16]>> =
+            event_ids.into_iter().zip(existing_rooms).collect();
+        for (event_id, room_id) in &event_rooms {
+            if let Some(Some(existing_room)) = existing_rooms.get(event_id) {
+                let expected_room = event_dag_room_id(room_id);
+                if *existing_room != expected_room {
                     return Err(pyo3::exceptions::PyValueError::new_err(format!(
                         "event {event_id} already belongs to another room"
                     )));
                 }
             }
         }
+
+        let reference_belongs_to_room = |event_id: &str, room_id: &str| {
+            let expected_room = event_dag_room_id(room_id);
+            if let Some(Some(existing_room)) = existing_rooms.get(event_id) {
+                return *existing_room == expected_room;
+            }
+            if let Some(owner_room) = event_rooms.get(event_id) {
+                return owner_room == room_id;
+            }
+            reference_rooms
+                .get(event_id)
+                .is_some_and(|referencing_room| referencing_room.as_deref() == Some(room_id))
+        };
 
         let mut by_room: HashMap<String, Vec<&PutRow>> = HashMap::new();
         for row in &rows {
@@ -119,11 +152,21 @@ pub fn adjacency_put(py: Python<'_>, rows: Vec<PutRow>, durable: bool) -> PyResu
             let room_collection = event_dag_room_id(room_id);
             let prevs: Vec<Vec<&str>> = room_rows
                 .iter()
-                .map(|r| r.2.iter().map(String::as_str).collect())
+                .map(|r| {
+                    r.2.iter()
+                        .filter(|id| reference_belongs_to_room(id, room_id))
+                        .map(String::as_str)
+                        .collect()
+                })
                 .collect();
             let auths: Vec<Vec<&str>> = room_rows
                 .iter()
-                .map(|r| r.3.iter().map(String::as_str).collect())
+                .map(|r| {
+                    r.3.iter()
+                        .filter(|id| reference_belongs_to_room(id, room_id))
+                        .map(String::as_str)
+                        .collect()
+                })
                 .collect();
             let records: Vec<EventRecord<'_>> = room_rows
                 .iter()
@@ -157,14 +200,15 @@ pub fn adjacency_put(py: Python<'_>, rows: Vec<PutRow>, durable: bool) -> PyResu
                         pyo3::exceptions::PyRuntimeError::new_err(message)
                     }
                 })?;
-            // Even a durable append leaves its log entries to prune; the next
-            // flush checkpoints the log. Deferred appends also leave the tail
-            // for that flush to sync.
             mark_adjacency_tail_dirty();
-            // Locators for the event and every event it references, so reads
-            // can find the room even where a parent's body is still missing.
+            // Publish a room locator for each event and for each unambiguous,
+            // same-room reference whose body/edge row may arrive later.
             for row in room_rows {
-                for id in std::iter::once(&row.1).chain(&row.2).chain(&row.3) {
+                for id in std::iter::once(&row.1)
+                    .chain(&row.2)
+                    .chain(&row.3)
+                    .filter(|id| reference_belongs_to_room(id, room_id))
+                {
                     let identity = event_node_id(id);
                     locators
                         .entry(event_locator_collection_id(&identity))

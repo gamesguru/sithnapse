@@ -185,16 +185,27 @@ class EmbeddedAdjacencyTestCase(TestCase):
         other_room = f"!{uuid4().hex}:example.org"
         put_event_edges_batch([(other_room, self._eid("shared_parent"), None)])
 
-        with self.assertRaisesRegex(ValueError, "already belongs to another room"):
-            put_event_edges_batch(
-                [(self.room_id, self._eid("child"), self._eid("shared_parent"))]
-            )
+        # SQL kept malformed cross-room prev edges, but room-scoped traversal
+        # filtered them out. The CSR mirror should preserve that behavior by
+        # dropping the foreign reference while still storing the child row.
+        put_event_edges_batch(
+            [(self.room_id, self._eid("child"), self._eid("shared_parent"))]
+        )
 
+        self.assertEqual(
+            get_event_edges_backward_batch([self._eid("child")])[self._eid("child")],
+            [],
+        )
         self.assertEqual(
             get_event_edges_backward_batch([self._eid("shared_parent")])[
                 self._eid("shared_parent")
             ],
             [],
+        )
+        self.assertIsNone(
+            get_event_edges_forward_batch([self._eid("shared_parent")])[
+                self._eid("shared_parent")
+            ]
         )
 
     def test_sync_barrier_covers_event_dag_and_locator_pools(self) -> None:
