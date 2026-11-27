@@ -161,6 +161,29 @@ class PurgeTests(HomeserverTestCase):
         self.get_failure(self.store.get_event(third["event_id"]), NotFoundError)
         self.get_success(self.store.get_event(last["event_id"]))
 
+    def test_purge_history_in_unsupported_room_version(self) -> None:
+        """History of a room whose version we no longer support can be purged."""
+        self.helper.send(self.room_id, body="old")
+        last = self.helper.send(self.room_id, body="last")
+        self.get_success(
+            self.store.db_pool.simple_update_one(
+                table="rooms",
+                keyvalues={"room_id": self.room_id},
+                updatevalues={"room_version": "no-longer-supported"},
+                desc="test_set_unsupported_room_version",
+            )
+        )
+        token = self.get_success(
+            self.store.get_topological_token_for_event(last["event_id"])
+        )
+        token_str = self.get_success(token.to_string(self.store))
+
+        self.get_success(
+            self._storage_controllers.purge_events.purge_history(
+                self.room_id, token_str, True
+            )
+        )
+
     def test_embedded_purge_mirror_deletion_retries_contention(self) -> None:
         redaction_calls = 0
         event_json_calls = 0

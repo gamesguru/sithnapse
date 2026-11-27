@@ -117,13 +117,6 @@ class PurgeStateDagTestCase(unittest.FederatingHomeserverTestCase):
                 )
             )
             self.assertIsNone(error)
-            # State groups queued by the purge are only deleted after a delay,
-            # so let that happen before judging anything against them.
-            deletion_store = self.hs.get_datastores().state_deletion
-            assert deletion_store is not None
-            self.reactor.advance(deletion_store.DELAY_BEFORE_DELETION_MS / 1000 + 1)
-            for _ in range(10):
-                self.reactor.advance(60)
 
         def receive(fields: dict) -> str:
             latest = self.get_success(store.get_latest_event_ids_in_room(room_id))

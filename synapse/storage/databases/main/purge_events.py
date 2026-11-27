@@ -23,6 +23,7 @@ import logging
 from typing import Any, Callable, cast
 
 from synapse.api.errors import SynapseError
+from synapse.api.room_versions import KNOWN_ROOM_VERSIONS
 from synapse.logging.context import defer_to_thread
 from synapse.storage.database import (
     LoggingTransaction,
@@ -449,10 +450,22 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
         # retained state events must keep their state group, or servers which
         # have and haven't purged can reach different verdicts.
         unlink_sql = "SELECT event_id FROM events_to_purge"
-        if self.get_room_version_txn(txn, room_id).msc4242_state_dags:
+        # Not `get_room_version_txn`: that raises for versions we no longer
+        # support, whose history must still be purgeable.
+        room_version_id = self.db_pool.simple_select_one_onecol_txn(
+            txn,
+            table="rooms",
+            keyvalues={"room_id": room_id},
+            retcol="room_version",
+            allow_none=True,
+        )
+        room_version = KNOWN_ROOM_VERSIONS.get(room_version_id or "")
+        if room_version is not None and room_version.msc4242_state_dags:
             unlink_sql += (
-                " WHERE should_delete"
-                " OR event_id NOT IN (SELECT event_id FROM state_events)"
+                " WHERE should_delete OR NOT EXISTS ("
+                "    SELECT 1 FROM state_events AS s"
+                "    WHERE s.event_id = events_to_purge.event_id"
+                ")"
             )
 
         if getattr(self, "_embedded_event_json_enabled", False):
