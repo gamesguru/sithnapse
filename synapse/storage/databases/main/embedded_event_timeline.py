@@ -37,8 +37,9 @@ Eligible pages are unfiltered and use no multi-writer `instance_map`, since
 the index stores neither filter columns nor the persisting instance. Other
 pages always use SQL.
 
-History purges (`purge_history`) and single-event deletions do not remove
-index entries yet. A room purge does.
+History purges (`purge_history`) remove the deleted events from both ordered
+indexes after the SQL transaction commits. A room purge removes the whole room
+scope. Single-event deletion cleanup is not wired yet.
 """
 
 import logging

@@ -210,9 +210,7 @@ pub fn timeline_remove_rows(py: Python<'_>, rows: Vec<TimelineRow>) -> PyResult<
     let engine = event_dag_db()?;
     py.detach(|| {
         let write_error = |error: StorageError| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "timeline removal error: {error}"
-            ))
+            pyo3::exceptions::PyRuntimeError::new_err(format!("timeline removal error: {error}"))
         };
         let _guard = STAGE_LOCK.lock().map_err(|_| {
             pyo3::exceptions::PyRuntimeError::new_err("timeline stage lock poisoned")
@@ -261,9 +259,7 @@ pub fn timeline_remove_rows(py: Python<'_>, rows: Vec<TimelineRow>) -> PyResult<
                 let (topo, stream) = open_event_timeline_indexes(engine.as_ref());
                 for (collection, node_ids) in ids_by_collection {
                     for node_id in node_ids {
-                        let _ = engine
-                            .remove(&collection, &node_id)
-                            .map_err(write_error)?;
+                        let _ = engine.remove(&collection, &node_id).map_err(write_error)?;
                     }
                 }
                 topo.remove_untransactional(&topo_keys)

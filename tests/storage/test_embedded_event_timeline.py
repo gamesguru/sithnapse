@@ -192,7 +192,10 @@ class EmbeddedEventTimelineTestCase(HomeserverTestCase):
         self.assertIsNotNone(
             embedded_event_timeline.page_stream(self.room_id, None, None, True, 5)
         )
-        self.get_success(self.store.purge_room(self.room_id))
+        # Cleanup must run even when indexing is currently disabled: otherwise
+        # switching back to read mode could resurrect the purged room's rows.
+        with mock.patch.dict(os.environ, {"SYNAPSE_MTXDB_TIMELINE": "off"}):
+            self.get_success(self.store.purge_room(self.room_id))
         self.assertEqual(
             embedded_event_timeline.page_stream(self.room_id, None, None, True, 5), []
         )

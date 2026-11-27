@@ -43,7 +43,6 @@ from synapse.storage.databases.main.embedded_event_json import delete_event_json
 from synapse.storage.databases.main.embedded_event_timeline import (
     purge_room_timeline,
     remove_timeline_rows,
-    timeline_writes_enabled,
 )
 from synapse.storage.databases.main.embedded_event_to_state_group import (
     decrement_state_group_refcounts_batch,
@@ -580,13 +579,13 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
                 )
             )
         if timeline_rows:
-        cleanups.append(
-            (
-                "event timeline index",
-                lambda: remove_timeline_rows(timeline_rows),
+            cleanups.append(
+                (
+                    "event timeline index",
+                    lambda: remove_timeline_rows(timeline_rows),
+                )
             )
-        )
-post_commit.extend(cleanups)
+        post_commit.extend(cleanups)
 
         # Some of the `event_push_actions` we're about to delete may have already
         # been rotated into the aggregate `event_push_summary` counts. Deleting
@@ -911,7 +910,7 @@ post_commit.extend(cleanups)
                     lambda: purge_event_edges_room(room_id),
                 )
             )
-        if getattr(self, "_embedded_db_engine", None) and timeline_writes_enabled():
+        if getattr(self, "_embedded_db_engine", None) is not None:
             room_cleanups.append(
                 (
                     "event timeline index",
