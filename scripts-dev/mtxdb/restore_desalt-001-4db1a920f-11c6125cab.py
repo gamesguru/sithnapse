@@ -26,7 +26,6 @@ import sys
 from pathlib import Path
 from typing import Any, Iterator
 
-from _common import embedded_database
 from _desalt import (
     EVENT,
     EVENT_TO_STATE_GROUP,
@@ -253,6 +252,11 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    counts = count_records(read_dump(args.input))
+    print(f"dump is well formed: {counts}", file=sys.stderr)
+    if args.dry_run:
+        return 0
+
     # This dump predates status-bearing EventDag locators. Writing its event
     # records would create locators with every status flag cleared, silently
     # turning rejected, outlier and soft-failed events into normal ones. The
@@ -261,50 +265,6 @@ def main() -> int:
         "restore_desalt targets the pre-status event locator format and cannot "
         "restore event status; recreate the embedded store instead"
     )
-
-    counts = count_records(read_dump(args.input))
-    print(f"dump is well formed: {counts}", file=sys.stderr)
-    if args.dry_run:
-        return 0
-
-    from synapse.synapse_rust import mtxdb_engine as engine
-
-    _, db_path, _ = embedded_database(args.config)
-    # Probe using a read-only handle first. This avoids opening the store as a
-    # writer when the installed extension is the source build by mistake, and
-    # it runs before the old index is renamed so a wrong-build invocation has
-    # no side effects at all.
-    engine.open_client_read_only(str(db_path))
-    try:
-        require_new_build(engine)
-    finally:
-        engine.close_client()
-
-    if retire_old_room_index(db_path):
-        print("Moved room_index/ to room_index.pre-desalt", file=sys.stderr)
-
-    print(f"Writing mtxdb at {db_path}", file=sys.stderr)
-    engine.open_client(str(db_path))
-    try:
-        written = apply_dump(engine, args.input, args.batch_size)
-        engine.sync()
-        # room_index is an append-only side file outside mtxdb's WAL. Its
-        # sync() fsyncs shard contents; persist the directory entries too.
-        room_index_dir = db_path / "room_index"
-        if room_index_dir.exists():
-            _fsync_directory(room_index_dir)
-        _fsync_directory(db_path)
-        if written != counts:
-            raise RuntimeError(f"wrote {written}, dump holds {counts}")
-        bad = verify_dump(engine, args.input, args.batch_size)
-    finally:
-        engine.close_client()
-    if bad:
-        for line in bad[:20]:
-            print("  mismatch: " + line, file=sys.stderr)
-        raise RuntimeError(f"{len(bad)} records did not read back equal")
-    print(f"restored and verified {written}", file=sys.stderr)
-    return 0
 
 
 if __name__ == "__main__":
