@@ -108,6 +108,7 @@ def main() -> None:
                     "mtxdb",
                     [(event_id, room_id, "{}", body, 1)],
                     sync=False,
+                    locator_statuses={event_id: (False, False, False)},
                 )
                 reply = "ok"
             elif command == "event_json_get":
@@ -126,6 +127,7 @@ def main() -> None:
                     "mtxdb",
                     [(event_id, room_id, "{}", body, 1)],
                     transaction=transaction,
+                    locator_statuses={event_id: (False, False, False)},
                 )
                 reply = "ok"
             elif command == "txn_commit":

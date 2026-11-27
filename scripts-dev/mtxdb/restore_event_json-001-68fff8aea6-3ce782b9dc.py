@@ -17,9 +17,9 @@ import sqlite3  # noqa: F401
 import struct
 import sys
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
-from _common import embedded_database
+from _common import embedded_database, sql_connection
 
 EXPORT_FORMAT = "sithnapse-event-json-rewrite/v1"
 
@@ -129,6 +129,58 @@ def validate_dump(path: Path, namespace: str) -> int:
     return count
 
 
+def write_batch(
+    mtxdb_engine: Any,
+    sql: Any,
+    sql_name: str,
+    batch: list[dict[str, object]],
+) -> None:
+    """Write bodies first, then locators carrying the SQL status.
+
+    `event_json_put` is the initial-persist path and writes status flags off,
+    which would drop outlier/rejected state on a restore. Bodies go first so a
+    failure leaves the previous locators resolvable and a retry safe.
+    """
+    ids = [str(row["event_id"]) for row in batch]
+    mark = "%s" if sql_name == "psycopg2" else "?"
+    placeholders = ", ".join(mark for _ in ids)
+    cursor = sql.cursor()
+    cursor.execute(
+        "SELECT e.event_id, e.outlier, "
+        "(r.event_id IS NOT NULL OR e.rejection_reason IS NOT NULL) "
+        "FROM events AS e LEFT JOIN rejections AS r USING (event_id) "
+        f"WHERE e.event_id IN ({placeholders})",
+        ids,
+    )
+    statuses = {
+        str(event_id): (bool(outlier), bool(rejected))
+        for event_id, outlier, rejected in cursor.fetchall()
+    }
+    missing = [event_id for event_id in ids if event_id not in statuses]
+    if missing:
+        raise RuntimeError(
+            f"no SQL event row for {missing[0]}; cannot restore its status"
+        )
+    mtxdb_engine.event_json_body_put(
+        [
+            (str(row["room_id"]), str(row["event_id"]), encode_record(row))
+            for row in batch
+        ]
+    )
+    mtxdb_engine.event_locator_put(
+        [
+            (
+                str(row["room_id"]),
+                str(row["event_id"]),
+                statuses[str(row["event_id"])][0],
+                statuses[str(row["event_id"])][1],
+                bool(json.loads(str(row["internal_metadata"])).get("soft_failed")),
+            )
+            for row in batch
+        ]
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -189,26 +241,24 @@ def main() -> int:
     from synapse.synapse_rust import mtxdb_engine
 
     mtxdb_engine.open_client(str(db_path))
-    batch: list[tuple[str, str, bytes]] = []
+    sql_name, sql = sql_connection(args.config)
+    batch: list[dict[str, object]] = []
     written = 0
     rows = read_dump(args.input)
     next(rows)  # Revalidated header; the first pass checked the full dump.
-    for row in rows:
-        batch.append(
-            (
-                str(row["room_id"]),
-                str(row["event_id"]),
-                encode_record(row),
-            )
-        )
-        if len(batch) >= args.batch_size:
-            mtxdb_engine.event_json_put(batch)
+    try:
+        for row in rows:
+            batch.append(row)
+            if len(batch) >= args.batch_size:
+                write_batch(mtxdb_engine, sql, sql_name, batch)
+                written += len(batch)
+                print(f"Rewrote {written}/{count} events", file=sys.stderr)
+                batch = []
+        if batch:
+            write_batch(mtxdb_engine, sql, sql_name, batch)
             written += len(batch)
-            print(f"Rewrote {written}/{count} events", file=sys.stderr)
-            batch.clear()
-    if batch:
-        mtxdb_engine.event_json_put(batch)
-        written += len(batch)
+    finally:
+        sql.close()
     if written != count:
         raise RuntimeError(
             f"restore coverage failed: wrote {written}, expected {count}"

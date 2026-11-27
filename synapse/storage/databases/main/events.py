@@ -89,6 +89,10 @@ from synapse.storage.databases.main.embedded_event_json import (
     open_embedded_event_json_engine,
     put_event_json_batch,
 )
+from synapse.storage.databases.main.embedded_event_status import (
+    get_event_statuses,
+    patch_event_statuses,
+)
 from synapse.storage.databases.main.embedded_event_timeline import (
     put_timeline_rows,
     timeline_rows_for_events,
@@ -98,11 +102,6 @@ from synapse.storage.databases.main.embedded_event_to_state_group import (
     get_state_group_for_events_batch,
     increment_state_group_refcounts_batch,
     put_event_to_state_group_batch,
-)
-from synapse.storage.databases.main.embedded_event_verdict import (
-    get_event_verdicts,
-    put_event_verdicts,
-    verdict_for_event,
 )
 from synapse.storage.databases.main.embedded_redactions import (
     put_redaction_batch,
@@ -963,7 +962,7 @@ class PersistEventsStore:
         """Filter the supplied list of event_ids to get those which are prev_events of
         existing events that are not outliers, rejected, or soft-failed.
 
-        Edges and event verdicts both come from mtxdb; storage errors propagate.
+        Edges and event statuses both come from mtxdb; storage errors propagate.
 
         Args:
             event_ids: event ids to filter
@@ -991,10 +990,10 @@ class PersistEventsStore:
                 return found
 
             _t = time.monotonic()
-            verdicts = get_event_verdicts(list(parents_by_child))
-            ffi_timing("persist_prevs_mtxdb_verdicts", time.monotonic() - _t)
-            for child_id, verdict in verdicts.items():
-                if verdict.outlier or verdict.rejected or verdict.soft_failed:
+            statuses = get_event_statuses(list(parents_by_child))
+            ffi_timing("persist_prevs_mtxdb_statuses", time.monotonic() - _t)
+            for child_id, status in statuses.items():
+                if status.outlier or status.rejected or status.soft_failed:
                     continue
                 found.extend(parents_by_child[child_id])
             return found
@@ -1022,7 +1021,7 @@ class PersistEventsStore:
         events and, when enabled, soft-failed events. Recurse through those
         predecessors while they meet the same criteria. Only non-outlier events
         with stored edges are traversed; a starting ID is not included merely
-        because it is rejected or soft-failed. Edges and verdicts both come from
+        because it is rejected or soft-failed. Edges and statuses both come from
         mtxdb, and storage errors propagate.
 
         This is used to find extremities that are ancestors of new events, but
@@ -1047,18 +1046,16 @@ class PersistEventsStore:
                 backward = get_event_edges_backward_batch(to_check)
                 ffi_timing("persist_rejected_mtxdb_backward", time.monotonic() - _t)
                 # An edge row can outlive its event, or precede a persist that
-                # never committed. An event with no verdict is not stored.
-                verdicts = get_event_verdicts(
+                # never committed. An event with no status is not stored.
+                statuses = get_event_statuses(
                     [event_id for event_id in to_check if backward.get(event_id)]
                 )
 
                 to_check = []
-                for event_id, verdict in verdicts.items():
-                    if verdict.outlier:
+                for event_id, status in statuses.items():
+                    if status.outlier:
                         continue
-                    if verdict.rejected or (
-                        include_soft_failed and verdict.soft_failed
-                    ):
+                    if status.rejected or (include_soft_failed and status.soft_failed):
                         for prev_event_id in backward[event_id]:
                             if prev_event_id not in found:
                                 found.add(prev_event_id)
@@ -1324,7 +1321,7 @@ class PersistEventsStore:
                 transaction=mtxdb_txn,
             )
             # The event keeps whatever rejection it was stored with.
-            stored = get_event_verdicts(
+            stored = get_event_statuses(
                 [event.event_id for event, _ in de_outliered_events]
             )
             missing = [
@@ -1334,18 +1331,15 @@ class PersistEventsStore:
             ]
             if missing:
                 raise RuntimeError(
-                    f"no mtxdb verdict record for stored outlier events {missing}"
+                    f"no mtxdb status record for stored outlier events {missing}"
                 )
-            put_event_verdicts(
-                {
-                    event.event_id: verdict_for_event(event, None)._replace(
-                        outlier=False,
-                        rejection_code=stored[event.event_id].rejection_code,
-                    )
-                    for event, _ in de_outliered_events
-                },
-                transaction=mtxdb_txn,
-            )
+            for event, _ in de_outliered_events:
+                patch_event_statuses(
+                    [event.event_id],
+                    outlier=False,
+                    soft_failed=event.internal_metadata.is_soft_failed(),
+                    transaction=mtxdb_txn,
+                )
 
             if publishes_at_commit():
                 txn.call_after(mark_dirty, Pool.EVENT_DAG)
@@ -3207,13 +3201,14 @@ class PersistEventsStore:
                 # the persist pays a single fsync instead of one per stage.
                 sync=False,
                 transaction=mtxdb_txn,
-            )
-            put_event_verdicts(
-                {
-                    event.event_id: verdict_for_event(event, context.rejected)
+                locator_statuses={
+                    event.event_id: (
+                        event.internal_metadata.is_outlier(),
+                        bool(context.rejected),
+                        event.internal_metadata.is_soft_failed(),
+                    )
                     for event, context in events_and_contexts
                 },
-                transaction=mtxdb_txn,
             )
             if publishes_at_commit():
                 # Exclusive event JSON must be visible before its SQL row, never

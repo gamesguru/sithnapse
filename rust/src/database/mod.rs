@@ -10,7 +10,6 @@
 
 pub mod embedded_adjacency;
 pub mod embedded_timeline;
-pub mod embedded_verdict;
 pub mod hamt_store;
 pub mod mtxdb_syn;
 pub mod postgres;

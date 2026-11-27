@@ -20,7 +20,7 @@ use once_cell::sync::OnceCell;
 use pyo3::{create_exception, exceptions::PyException, prelude::*, PyTypeInfo};
 use sha2::{Digest, Sha256};
 
-use super::{embedded_timeline, embedded_verdict};
+use super::embedded_timeline;
 
 create_exception!(
     synapse.synapse_rust.mtxdb_engine,
@@ -145,6 +145,10 @@ static WRITE_MODE: Mutex<Option<bool>> = Mutex::new(None);
 /// writer handle, while this closes the read/check/write window between local
 /// Python workers sharing the process.
 static STATE_HAMT_ROOT_WRITE_LOCK: OnceCell<Mutex<()>> = OnceCell::new();
+/// Serializes no-WAL updates to the EventDag event-locator values. In that
+/// mode Synapse has one writer process; this closes the read/modify/write
+/// window between its local workers.
+static EVENT_LOCATOR_WRITE_LOCK: Mutex<()> = Mutex::new(());
 /// The pid that actually opened `DBS`, recorded alongside it. `DBS` is a
 /// process-global slot; under a fork()-based worker launcher a
 /// child that inherits an already-`Some` `DBS` from its parent's address
@@ -3121,6 +3125,71 @@ const EVENT_LOCATOR_BUCKETS: u32 = 256;
 /// opaque per-event value the Python side packs (`format_version +
 /// metadata_len + internal_metadata + json`); `None` on a miss.
 type EventJsonGetRow = (String, Option<Vec<u8>>);
+/// `(room_id, event_id, outlier, rejected, soft_failed)`.
+type EventStatusRow = (String, String, bool, bool, bool);
+type EventStatusPatch = (String, NodeId, u8, u8);
+
+fn event_status_flags(outlier: bool, rejected: bool, soft_failed: bool) -> u8 {
+    (u8::from(outlier) * EVENT_STATUS_OUTLIER)
+        | (u8::from(rejected) * EVENT_STATUS_REJECTED)
+        | (u8::from(soft_failed) * EVENT_STATUS_SOFT_FAILED)
+}
+type EventStatusValue = (bool, bool, bool);
+
+const EVENT_LOCATOR_VERSION: u8 = 1;
+const EVENT_STATUS_OUTLIER: u8 = 1;
+const EVENT_STATUS_REJECTED: u8 = 1 << 1;
+const EVENT_STATUS_SOFT_FAILED: u8 = 1 << 2;
+const EVENT_STATUS_FLAGS: u8 =
+    EVENT_STATUS_OUTLIER | EVENT_STATUS_REJECTED | EVENT_STATUS_SOFT_FAILED;
+
+/// EventDag locator v1: version, flags, 16-byte room collection, u16 event-id
+/// length, event-id bytes. Including the complete id detects 128-bit key
+/// collisions. State-pool locators intentionally keep their legacy room-only
+/// encoding.
+fn encode_event_locator(
+    event_id: &str,
+    room_collection: &[u8; 16],
+    flags: u8,
+) -> PyResult<Vec<u8>> {
+    if flags & !EVENT_STATUS_FLAGS != 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "event locator contains unknown status flags",
+        ));
+    }
+    let id = event_id.as_bytes();
+    let len = u16::try_from(id.len())
+        .map_err(|_| pyo3::exceptions::PyValueError::new_err("event id is too long for locator"))?;
+    let mut value = Vec::with_capacity(20 + id.len());
+    value.push(EVENT_LOCATOR_VERSION);
+    value.push(flags);
+    value.extend_from_slice(room_collection);
+    value.extend_from_slice(&len.to_le_bytes());
+    value.extend_from_slice(id);
+    Ok(value)
+}
+
+fn decode_event_locator(value: &[u8], expected_event_id: &str) -> PyResult<([u8; 16], u8)> {
+    if value.len() < 20 || value[0] != EVENT_LOCATOR_VERSION {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "invalid or legacy EventDag event locator for {expected_event_id}; recreate the embedded store"
+        )));
+    }
+    let flags = value[1];
+    if flags & !EVENT_STATUS_FLAGS != 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "unknown status flags in EventDag locator for {expected_event_id}"
+        )));
+    }
+    let room: [u8; 16] = value[2..18].try_into().expect("fixed locator room width");
+    let id_len = u16::from_le_bytes([value[18], value[19]]) as usize;
+    if value.len() != 20 + id_len || &value[20..] != expected_event_id.as_bytes() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "EventDag locator id/length mismatch for {expected_event_id}"
+        )));
+    }
+    Ok((room, flags))
+}
 
 /// 128-bit identity for an event inside the mirror, derived exactly the way
 /// every other `NodeId` in this adapter is (first 16 bytes of SHA-256 over a
@@ -3308,24 +3377,28 @@ fn validate_event_json_rows(rows: &[(String, String, Vec<u8>)]) -> PyResult<()> 
 /// only ever be a miss, never a pointer to a body that isn't there. The direct
 /// and the transactional write paths both use this, so they cannot disagree
 /// about a record's key.
-fn event_json_puts(rows: Vec<(String, String, Vec<u8>)>) -> (EventJsonPuts, EventJsonPuts) {
-    let mut locator_puts: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
+fn event_json_body_puts(rows: Vec<(String, String, Vec<u8>)>) -> EventJsonPuts {
     let mut dag_puts: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
     for (room_id, event_id, record) in rows {
         let identity = event_node_id(&event_id);
         let room_collection = event_dag_room_id(&room_id);
-        let locator_collection = event_locator_collection_id(&identity);
         let puts = dag_puts.entry(room_collection).or_default();
         puts.push((identity, NodeData::new(bytes::Bytes::from(record))));
-        locator_puts.entry(locator_collection).or_default().push((
-            identity,
-            NodeData::new(bytes::Bytes::copy_from_slice(&room_collection)),
-        ));
     }
-    (
-        dag_puts.into_iter().collect(),
-        locator_puts.into_iter().collect(),
-    )
+    dag_puts.into_iter().collect()
+}
+
+fn event_locator_puts(rows: Vec<(String, String, u8)>) -> PyResult<EventJsonPuts> {
+    let mut puts: HashMap<[u8; 16], Vec<(NodeId, NodeData)>> = HashMap::new();
+    for (room_id, event_id, flags) in rows {
+        let identity = event_node_id(&event_id);
+        let room_collection = event_dag_room_id(&room_id);
+        let value = encode_event_locator(&event_id, &room_collection, flags)?;
+        puts.entry(event_locator_collection_id(&identity))
+            .or_default()
+            .push((identity, NodeData::new(bytes::Bytes::from(value))));
+    }
+    Ok(puts.into_iter().collect())
 }
 
 /// Put event_json records into the room-aware mirror: a locator entry
@@ -3338,11 +3411,18 @@ fn event_json_puts(rows: Vec<(String, String, Vec<u8>)>) -> (EventJsonPuts, Even
 /// `format_version(i32 BE, -1 = NULL) + metadata_len(u32 BE) +
 /// internal_metadata + json`) and preserved byte-for-byte.
 ///
-/// Writes are plain `put_many` (idempotent overwrite -- censoring, expiry, and
-/// re-signing replace the body in place through this same call). Room bodies
-/// are persisted BEFORE their locators are published: a reader that races
-/// between the two sees a miss and falls back to SQL, never a locator
-/// pointing at a not-yet-written body.
+/// Bodies are written with `put_many`, which replaces an existing value, so
+/// censoring, expiry and re-signing can update a body in place.
+///
+/// Locators are **create-only**: an existing locator (and therefore its room
+/// and status flags) is preserved byte-for-byte, and a differing room is
+/// rejected. Rewriting an existing locator here would let a body-only caller
+/// clear a verdict, or resurrect a locator a purge had just deleted. Status
+/// changes go through `event_status_patch`/`event_locator_put` instead.
+///
+/// Room bodies are persisted BEFORE their locators are published: a reader
+/// that races between the two sees a miss and falls back to SQL, never a
+/// locator pointing at a not-yet-written body.
 ///
 /// Like the old `batch_put` path, writes are deliberately not fsynced by
 /// default -- the Python caller decides via `maybe_sync`, and a lost unflushed
@@ -3355,10 +3435,271 @@ pub fn event_json_put(py: Python<'_>, rows: Vec<(String, String, Vec<u8>)>) -> P
     validate_event_json_rows(&rows)?;
     py.detach(|| {
         let engine = event_dag_db()?;
-        let (dag_puts, locator_puts) = event_json_puts(rows);
-        for (collection, pairs) in dag_puts.into_iter().chain(locator_puts) {
+        let _guard = EVENT_LOCATOR_WRITE_LOCK.lock().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err("event locator lock poisoned")
+        })?;
+        // Read the locators this batch would create before writing anything.
+        // The read and the write share EVENT_LOCATOR_WRITE_LOCK, so a local
+        // RMW cannot interleave; a purge from another process is not covered,
+        // but this entry point is the offline/repair path, not live persist.
+        let mut wanted: HashMap<[u8; 16], Vec<(usize, NodeId)>> = HashMap::new();
+        for (position, (_, event_id, _)) in rows.iter().enumerate() {
+            let node = event_node_id(event_id);
+            wanted
+                .entry(event_locator_collection_id(&node))
+                .or_default()
+                .push((position, node));
+        }
+        let mut exists = vec![false; rows.len()];
+        for (collection, entries) in &wanted {
+            let nodes: Vec<NodeId> = entries.iter().map(|(_, node)| *node).collect();
+            let found = engine
+                .get_read_committed(collection, &nodes)
+                .map_err(map_read_storage_error)?;
+            for ((position, _), record) in entries.iter().zip(found) {
+                let Some(data) = record.filter(|data| !data.bytes.is_empty()) else {
+                    continue;
+                };
+                let (room, _flags) = decode_event_locator(&data.bytes, &rows[*position].1)?;
+                if room != event_dag_room_id(&rows[*position].0) {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "EventDag locator for {} already belongs to a different room",
+                        rows[*position].1
+                    )));
+                }
+                exists[*position] = true;
+            }
+        }
+        for (collection, pairs) in event_json_body_puts(rows.clone()) {
             engine.put_many(&collection, &pairs).map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {e}"))
+            })?;
+        }
+        let missing: Vec<(String, String, u8)> = rows
+            .into_iter()
+            .enumerate()
+            .filter(|(position, _)| !exists[*position])
+            .map(|(_, (room, event, _))| (room, event, 0))
+            .collect();
+        for (collection, pairs) in event_locator_puts(missing)? {
+            engine.put_many(&collection, &pairs).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb locator put error: {e}"))
+            })?;
+        }
+        Ok(())
+    })
+}
+
+/// Replace event bodies without touching their EventDag locators or status.
+/// Used by censor/expiry/re-sign paths and outlier body refreshes.
+#[pyfunction]
+pub fn event_json_body_put(py: Python<'_>, rows: Vec<(String, String, Vec<u8>)>) -> PyResult<()> {
+    assert_writable()?;
+    validate_event_json_rows(&rows)?;
+    py.detach(|| {
+        let engine = event_dag_db()?;
+        for (collection, pairs) in event_json_body_puts(rows) {
+            engine.put_many(&collection, &pairs).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb body put error: {e}"))
+            })?;
+        }
+        Ok(())
+    })
+}
+
+/// Write complete, authoritative EventDag locator headers on initial
+/// persistence. State-pool locators are separate and remain room-only.
+#[pyfunction]
+pub fn event_locator_put(py: Python<'_>, rows: Vec<EventStatusRow>) -> PyResult<()> {
+    assert_writable()?;
+    py.detach(|| {
+        let engine = event_dag_db()?;
+        let _guard = EVENT_LOCATOR_WRITE_LOCK.lock().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err("event locator lock poisoned")
+        })?;
+        let puts = event_locator_puts(
+            rows.into_iter()
+                .map(|(room, event, outlier, rejected, soft_failed)| {
+                    let flags = event_status_flags(outlier, rejected, soft_failed);
+                    (room, event, flags)
+                })
+                .collect(),
+        )?;
+        for (collection, pairs) in puts {
+            engine.put_many(&collection, &pairs).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("event locator put error: {e}"))
+            })?;
+        }
+        Ok(())
+    })
+}
+
+/// Return event status from EventDag locator headers. Missing locators return
+/// `None`; legacy or malformed values are errors so status cannot silently
+/// default to accepted.
+#[pyfunction]
+pub fn event_status_get(
+    py: Python<'_>,
+    event_ids: Vec<String>,
+) -> PyResult<Vec<(String, Option<EventStatusValue>)>> {
+    py.detach(|| {
+        let engine = event_dag_db()?;
+        let nodes: Vec<NodeId> = event_ids.iter().map(|id| event_node_id(id)).collect();
+        let mut by_collection: HashMap<[u8; 16], Vec<usize>> = HashMap::new();
+        for (position, node) in nodes.iter().enumerate() {
+            by_collection
+                .entry(event_locator_collection_id(node))
+                .or_default()
+                .push(position);
+        }
+        let mut values = vec![None; event_ids.len()];
+        for (collection, positions) in by_collection {
+            let wanted: Vec<NodeId> = positions.iter().map(|&position| nodes[position]).collect();
+            let mut records = engine
+                .get_read_committed(&collection, &wanted)
+                .map_err(map_read_storage_error)?;
+            if opened_read_only() && records.iter().any(Option::is_none) {
+                engine.refresh_collection(&collection).map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "mtxdb refresh event locator error: {e}"
+                    ))
+                })?;
+                records = engine
+                    .get_read_committed(&collection, &wanted)
+                    .map_err(map_read_storage_error)?;
+            }
+            for (position, record) in positions.into_iter().zip(records) {
+                let Some(data) = record.filter(|record| !record.bytes.is_empty()) else {
+                    continue;
+                };
+                let (_, flags) = decode_event_locator(&data.bytes, &event_ids[position])?;
+                values[position] = Some((
+                    flags & EVENT_STATUS_OUTLIER != 0,
+                    flags & EVENT_STATUS_REJECTED != 0,
+                    flags & EVENT_STATUS_SOFT_FAILED != 0,
+                ));
+            }
+        }
+        Ok(event_ids.into_iter().zip(values).collect())
+    })
+}
+
+/// Patch status bits without disturbing room/id fields or other status bits.
+/// Shared-WAL mode uses record-version expectations; direct mode serializes
+/// the RMW under the single-writer process lock.
+#[pyfunction]
+pub fn event_status_patch(py: Python<'_>, rows: Vec<(String, u8, u8)>) -> PyResult<()> {
+    assert_writable()?;
+    for (_, mask, values) in &rows {
+        if mask & !EVENT_STATUS_FLAGS != 0 || values & !mask != 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "invalid event status patch",
+            ));
+        }
+    }
+    py.detach(|| {
+        let _guard = EVENT_LOCATOR_WRITE_LOCK.lock().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err("event locator lock poisoned")
+        })?;
+        let mut grouped: HashMap<[u8; 16], Vec<EventStatusPatch>> = HashMap::new();
+        for (event_id, mask, values) in rows {
+            let node = event_node_id(&event_id);
+            grouped
+                .entry(event_locator_collection_id(&node))
+                .or_default()
+                .push((event_id, node, mask, values));
+        }
+        let pools = pools()?;
+        if let Some(database) = pools.shared_database.as_ref() {
+            for (collection, entries) in grouped {
+                let mut committed = false;
+                for _ in 0..64 {
+                    let transaction = database.begin_transaction();
+                    let nodes: Vec<NodeId> = entries.iter().map(|entry| entry.1).collect();
+                    let (records, versions) = transaction
+                        .get_with_record_versions(ShardType::EventDag, &collection, &nodes)
+                        .map_err(|e| map_transaction_error("read event status", e))?;
+                    let mut writes = Vec::new();
+                    for (((event_id, node, mask, values), record), version) in
+                        entries.iter().zip(records).zip(versions)
+                    {
+                        // A locator can already be gone: a delete raced this
+                        // patch, or the row was never mirrored. There is no
+                        // record to carry status, so leave it absent instead of
+                        // failing a purge or sticky update.
+                        let Some(data) = record.filter(|data| !data.bytes.is_empty()) else {
+                            continue;
+                        };
+                        let (room, old_flags) = decode_event_locator(&data.bytes, event_id)?;
+                        let new_flags = (old_flags & !mask) | values;
+                        let new_value = encode_event_locator(event_id, &room, new_flags)?;
+                        transaction
+                            .expect_record_version(ShardType::EventDag, collection, *node, version)
+                            .map_err(|e| map_transaction_io_error("expect event status", e))?;
+                        transaction
+                            .put(
+                                ShardType::EventDag,
+                                collection,
+                                *node,
+                                &NodeData::new(bytes::Bytes::from(new_value)),
+                            )
+                            .map_err(|e| map_transaction_io_error("stage event status", e))?;
+                        writes.push(());
+                    }
+                    if writes.is_empty() {
+                        committed = true;
+                        break;
+                    }
+                    match transaction.commit() {
+                        Ok(()) => {
+                            committed = true;
+                            break;
+                        }
+                        Err(error) if error.is_stale_read() || is_retryable_contention(&error) => {
+                            continue;
+                        }
+                        Err(error) => {
+                            return Err(map_transaction_error("commit event status", error))
+                        }
+                    }
+                }
+                if !committed {
+                    return Err(pyo3::exceptions::PyBlockingIOError::new_err(
+                        "event status update exceeded retry limit",
+                    ));
+                }
+            }
+            return Ok(());
+        }
+
+        let engine = event_dag_db()?;
+        for (collection, entries) in grouped {
+            let nodes: Vec<NodeId> = entries.iter().map(|entry| entry.1).collect();
+            let records = engine
+                .get_read_committed(&collection, &nodes)
+                .map_err(map_read_storage_error)?;
+            let mut writes = Vec::new();
+            for ((event_id, node, mask, values), record) in entries.iter().zip(records) {
+                // See the shared-WAL branch: an absent locator has no status to
+                // carry, so skip it instead of failing the caller.
+                let Some(data) = record.filter(|data| !data.bytes.is_empty()) else {
+                    continue;
+                };
+                let (room, old_flags) = decode_event_locator(&data.bytes, event_id)?;
+                writes.push((
+                    *node,
+                    NodeData::new(bytes::Bytes::from(encode_event_locator(
+                        event_id,
+                        &room,
+                        (old_flags & !mask) | values,
+                    )?)),
+                ));
+            }
+            if writes.is_empty() {
+                continue;
+            }
+            engine.put_many(&collection, &writes).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("event status patch error: {e}"))
             })?;
         }
         Ok(())
@@ -3581,8 +3922,17 @@ impl PyMtxdbTransaction {
     fn event_json_put(&self, py: Python<'_>, rows: Vec<(String, String, Vec<u8>)>) -> PyResult<()> {
         validate_event_json_rows(&rows)?;
         py.detach(|| {
-            let (dag_puts, locator_puts) = event_json_puts(rows);
-            for (collection, pairs) in dag_puts.into_iter().chain(locator_puts) {
+            let locator_rows: Vec<_> = rows
+                .iter()
+                .map(|(room, event, _)| (room.clone(), event.clone(), 0))
+                .collect();
+            let _guard = EVENT_LOCATOR_WRITE_LOCK.lock().map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err("event locator lock poisoned")
+            })?;
+            for (collection, pairs) in event_json_body_puts(rows)
+                .into_iter()
+                .chain(event_locator_puts(locator_rows)?)
+            {
                 for (node, data) in pairs {
                     self.inner
                         .put(ShardType::EventDag, collection, node, &data)
@@ -3593,13 +3943,93 @@ impl PyMtxdbTransaction {
         })
     }
 
-    /// Stage what `event_verdict_put` would write.
-    fn event_verdict_put(
+    /// Stage an event body replacement without rewriting its locator.
+    fn event_json_body_put(
         &self,
         py: Python<'_>,
-        rows: Vec<embedded_verdict::VerdictRow>,
+        rows: Vec<(String, String, Vec<u8>)>,
     ) -> PyResult<()> {
-        py.detach(|| embedded_verdict::stage_verdicts(&self.inner, rows))
+        validate_event_json_rows(&rows)?;
+        py.detach(|| {
+            for (collection, pairs) in event_json_body_puts(rows) {
+                for (node, data) in pairs {
+                    self.inner
+                        .put(ShardType::EventDag, collection, node, &data)
+                        .map_err(|e| map_transaction_io_error("stage event body", e))?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Stage status-bearing EventDag locators with the event body transaction.
+    fn event_locator_put(&self, rows: Vec<EventStatusRow>) -> PyResult<()> {
+        let puts = event_locator_puts(
+            rows.into_iter()
+                .map(|(room, event, outlier, rejected, soft_failed)| {
+                    let flags = event_status_flags(outlier, rejected, soft_failed);
+                    (room, event, flags)
+                })
+                .collect(),
+        )?;
+        for (collection, pairs) in puts {
+            for (node, data) in pairs {
+                self.inner
+                    .put(ShardType::EventDag, collection, node, &data)
+                    .map_err(|e| map_transaction_io_error("stage event locator", e))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Stage status bits after reading the locator under a record-version
+    /// expectation, preserving its room and event ID.
+    fn event_status_patch(&self, rows: Vec<(String, u8, u8)>) -> PyResult<()> {
+        let mut grouped: HashMap<[u8; 16], Vec<EventStatusPatch>> = HashMap::new();
+        for (event_id, mask, values) in rows {
+            if mask & !EVENT_STATUS_FLAGS != 0 || values & !mask != 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "invalid event status patch",
+                ));
+            }
+            let node = event_node_id(&event_id);
+            grouped
+                .entry(event_locator_collection_id(&node))
+                .or_default()
+                .push((event_id, node, mask, values));
+        }
+        for (collection, entries) in grouped {
+            let nodes: Vec<NodeId> = entries.iter().map(|entry| entry.1).collect();
+            let (records, versions) = self
+                .inner
+                .get_with_record_versions(ShardType::EventDag, &collection, &nodes)
+                .map_err(|e| map_transaction_error("read staged event status", e))?;
+            for (((event_id, node, mask, values), record), version) in
+                entries.iter().zip(records).zip(versions)
+            {
+                let data = record
+                    .filter(|data| !data.bytes.is_empty())
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "missing EventDag locator for status update: {event_id}"
+                        ))
+                    })?;
+                let (room, old_flags) = decode_event_locator(&data.bytes, event_id)?;
+                self.inner
+                    .expect_record_version(ShardType::EventDag, collection, *node, version)
+                    .map_err(|e| map_transaction_io_error("expect event status", e))?;
+                let value = encode_event_locator(event_id, &room, (old_flags & !mask) | values)?;
+                self.inner
+                    .put(
+                        ShardType::EventDag,
+                        collection,
+                        *node,
+                        &NodeData::new(bytes::Bytes::from(value)),
+                    )
+                    .map_err(|e| map_transaction_io_error("stage event status", e))?;
+            }
+        }
+        Ok(())
     }
 
     /// Stage outbound auth edges and their inbound child index in the
@@ -3792,9 +4222,8 @@ pub fn event_json_get(py: Python<'_>, event_ids: Vec<String>) -> PyResult<Vec<Ev
             for ((position, _), value) in ids.into_iter().zip(found) {
                 if let Some(data) = value {
                     if !data.bytes.is_empty() {
-                        if let Ok(room) = <[u8; 16]>::try_from(data.bytes.as_ref()) {
-                            room_collections[position] = Some(room);
-                        }
+                        let (room, _) = decode_event_locator(&data.bytes, &event_ids[position])?;
+                        room_collections[position] = Some(room);
                     }
                 }
             }
@@ -3851,6 +4280,9 @@ pub fn event_json_get(py: Python<'_>, event_ids: Vec<String>) -> PyResult<Vec<Ev
 pub fn event_json_delete(py: Python<'_>, event_ids: Vec<String>) -> PyResult<()> {
     assert_writable()?;
     py.detach(|| {
+        let _guard = EVENT_LOCATOR_WRITE_LOCK.lock().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err("event locator lock poisoned")
+        })?;
         let engine = event_dag_db()?;
         let node_ids: Vec<NodeId> = event_ids.iter().map(|id| event_node_id(id)).collect();
 
@@ -3871,9 +4303,8 @@ pub fn event_json_delete(py: Python<'_>, event_ids: Vec<String>) -> PyResult<()>
             for ((position, _), value) in ids.into_iter().zip(found) {
                 if let Some(data) = value {
                     if !data.bytes.is_empty() {
-                        if let Ok(room) = <[u8; 16]>::try_from(data.bytes.as_ref()) {
-                            room_collections[position] = Some(room);
-                        }
+                        let (room, _) = decode_event_locator(&data.bytes, &event_ids[position])?;
+                        room_collections[position] = Some(room);
                     }
                 }
             }
@@ -3898,12 +4329,16 @@ pub fn event_json_delete(py: Python<'_>, event_ids: Vec<String>) -> PyResult<()>
                     .push((identity, NodeData::new(bytes::Bytes::new())));
             }
         }
-        for (collection, pairs) in locator_tombs {
+        // Tombstone the room-local record before its locator. The locator is
+        // the only thing that can find that record again, so removing it first
+        // would strand an unreadable body if the process stopped between the
+        // two writes and the delete was retried.
+        for (collection, pairs) in dag_tombs {
             engine.put_many(&collection, &pairs).map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {e}"))
             })?;
         }
-        for (collection, pairs) in dag_tombs {
+        for (collection, pairs) in locator_tombs {
             engine.put_many(&collection, &pairs).map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("mtxdb put error: {e}"))
             })?;
@@ -5044,11 +5479,11 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(batch_get, m)?)?;
     m.add_function(wrap_pyfunction!(batch_put, m)?)?;
     m.add_function(wrap_pyfunction!(batch_delete, m)?)?;
-    m.add_function(wrap_pyfunction!(embedded_verdict::event_rejection_code, m)?)?;
-    m.add_function(wrap_pyfunction!(embedded_verdict::event_verdict_put, m)?)?;
-    m.add_function(wrap_pyfunction!(embedded_verdict::event_verdict_get, m)?)?;
-    m.add_function(wrap_pyfunction!(embedded_verdict::event_verdict_delete, m)?)?;
     m.add_function(wrap_pyfunction!(event_json_put, m)?)?;
+    m.add_function(wrap_pyfunction!(event_json_body_put, m)?)?;
+    m.add_function(wrap_pyfunction!(event_locator_put, m)?)?;
+    m.add_function(wrap_pyfunction!(event_status_get, m)?)?;
+    m.add_function(wrap_pyfunction!(event_status_patch, m)?)?;
     m.add_function(wrap_pyfunction!(event_json_get, m)?)?;
     m.add_function(wrap_pyfunction!(event_json_delete, m)?)?;
     m.add_function(wrap_pyfunction!(event_json_purge_room, m)?)?;

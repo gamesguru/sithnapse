@@ -30,7 +30,7 @@ from synapse.replication.tcp.streams._base import StickyEventStreamPosition
 from synapse.rest import admin
 from synapse.rest.client import login, register, room, sync
 from synapse.server import HomeServer
-from synapse.storage.databases.main.embedded_event_verdict import get_event_verdicts
+from synapse.storage.databases.main.embedded_event_status import get_event_statuses
 from synapse.types import JsonDict, MultiWriterStreamToken, RoomID, create_requester
 from synapse.util.clock import Clock
 from synapse.util.duration import Duration
@@ -770,7 +770,7 @@ class StickyEventsTestCase(unittest.HomeserverTestCase):
 
         # Whilst it is soft-failed, the event isn't shown to clients.
         self.assertEqual(self._get_visible_sticky_event_ids(), set())
-        self.assertTrue(get_event_verdicts([event_id])[event_id].soft_failed)
+        self.assertTrue(get_event_statuses([event_id])[event_id].soft_failed)
 
         # Change the room's power levels to voice user2 back.
         # This triggers the soft-fail re-evaluation and also allows the soft-failed sticky
@@ -788,7 +788,7 @@ class StickyEventsTestCase(unittest.HomeserverTestCase):
         # ...and the soft-failure flag has been cleared.
         event = self.get_success(self.store.get_event(event_id))
         self.assertFalse(event.internal_metadata.is_soft_failed())
-        self.assertFalse(get_event_verdicts([event_id])[event_id].soft_failed)
+        self.assertFalse(get_event_statuses([event_id])[event_id].soft_failed)
 
     def test_soft_failure_cleared_when_sender_membership_changes(self) -> None:
         """
@@ -816,7 +816,7 @@ class StickyEventsTestCase(unittest.HomeserverTestCase):
 
         # Whilst it is soft-failed, the event isn't shown to clients.
         self.assertEqual(self._get_visible_sticky_event_ids(), set())
-        self.assertTrue(get_event_verdicts([event_id])[event_id].soft_failed)
+        self.assertTrue(get_event_statuses([event_id])[event_id].soft_failed)
 
         # Check that an irrelevant user's membership changing doesn't affect the event
         user3_id = self.register_user("user3", "pass")
@@ -830,7 +830,7 @@ class StickyEventsTestCase(unittest.HomeserverTestCase):
         # ...and the soft-failure has been cleared from the event itself.
         event = self.get_success(self.store.get_event(event_id))
         self.assertFalse(event.internal_metadata.is_soft_failed())
-        self.assertFalse(get_event_verdicts([event_id])[event_id].soft_failed)
+        self.assertFalse(get_event_statuses([event_id])[event_id].soft_failed)
 
 
 class StickyEventsFederationBacklogTestCase(unittest.HomeserverTestCase):

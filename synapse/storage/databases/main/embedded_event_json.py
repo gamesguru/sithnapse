@@ -157,6 +157,7 @@ def put_event_json_batch(
     *,
     sync: bool = False,
     transaction: MtxdbTransaction | None = None,
+    locator_statuses: dict[str, tuple[bool, bool, bool]] | None = None,
 ) -> None:
     """`rows`: `(event_id, room_id, internal_metadata, json, format_version)`.
 
@@ -191,7 +192,7 @@ def put_event_json_batch(
     fsyncing per event is a whole-device cache flush each time.
     """
     with mirror_timing("event_json_put"):
-        from synapse.synapse_rust.mtxdb_engine import event_json_put
+        from synapse.synapse_rust.mtxdb_engine import event_json_body_put
 
         tuples = [
             (
@@ -203,10 +204,26 @@ def put_event_json_batch(
         ]
         _et = time.monotonic()
         if transaction is not None:
-            transaction.event_json_put(tuples)
+            transaction.event_json_body_put(tuples)
+            if locator_statuses is not None:
+                transaction.event_locator_put(
+                    [
+                        (room_id, event_id, *locator_statuses[event_id])
+                        for event_id, room_id, *_ in rows
+                    ]
+                )
             ffi_timing("ffi_event_json_put", time.monotonic() - _et)
             return
-        event_json_put(tuples)
+        event_json_body_put(tuples)
+        if locator_statuses is not None:
+            from synapse.synapse_rust.mtxdb_engine import event_locator_put
+
+            event_locator_put(
+                [
+                    (room_id, event_id, *locator_statuses[event_id])
+                    for event_id, room_id, *_ in rows
+                ]
+            )
         ffi_timing("ffi_event_json_put", time.monotonic() - _et)
 
         if sync or _FORCE_SYNC_EVENT_JSON:

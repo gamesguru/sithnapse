@@ -98,9 +98,8 @@ from synapse.storage.databases.main.embedded_event_json import (
     get_event_json_batch,
     open_embedded_event_json_engine,
 )
-from synapse.storage.databases.main.embedded_event_verdict import (
-    rejection_code,
-    update_event_verdicts,
+from synapse.storage.databases.main.embedded_event_status import (
+    patch_event_statuses,
 )
 from synapse.storage.databases.main.embedded_redactions import get_redactions_batch
 from synapse.storage.util.id_generators import (
@@ -2986,7 +2985,7 @@ class EventsWorkerStore(SQLBaseStore):
         This can happen, for example, when resyncing state during a faster join.
 
         Update SQL rejection data and schedule local event-cache invalidation.
-        When embedded event JSON is enabled, the event's mtxdb verdict is
+        When embedded event JSON is enabled, the event's mtxdb status is
         updated before the SQL commit.
 
         It is the caller's responsibility to ensure that other workers are
@@ -3034,10 +3033,7 @@ class EventsWorkerStore(SQLBaseStore):
         )
 
         if self._embedded_event_json_enabled:
-            code = rejection_code(rejection_reason)
-            update_event_verdicts(
-                [event_id], lambda verdict: verdict._replace(rejection_code=code)
-            )
+            patch_event_statuses([event_id], rejected=bool(rejection_reason))
             txn.call_after(mark_dirty, Pool.EVENT_DAG)
 
         self.invalidate_get_event_cache_after_txn(txn, event_id)

@@ -12,7 +12,7 @@
 # <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
 
-"""mtxdb event verdicts, and the extremity traversal that reads them."""
+"""mtxdb event statuses, and the extremity traversal that reads them."""
 
 from twisted.internet.testing import MemoryReactor
 
@@ -20,18 +20,18 @@ from synapse.api.constants import EventTypes
 from synapse.rest import admin
 from synapse.rest.client import login, room
 from synapse.server import HomeServer
-from synapse.storage.databases.main.embedded_event_verdict import (
-    delete_event_verdicts,
-    get_event_verdicts,
-    update_event_verdicts,
+from synapse.storage.databases.main.embedded_event_json import delete_event_json_batch
+from synapse.storage.databases.main.embedded_event_status import (
+    get_event_statuses,
+    patch_event_statuses,
 )
 from synapse.util.clock import Clock
 
-from tests.storage.event_verdicts import assert_verdicts_match_sql
+from tests.storage.event_status import assert_statuses_match_sql
 from tests.unittest import HomeserverTestCase
 
 
-class EmbeddedEventVerdictTestCase(HomeserverTestCase):
+class EmbeddedEventStatusTestCase(HomeserverTestCase):
     servlets = [
         admin.register_servlets_for_client_rest_resource,
         room.register_servlets,
@@ -46,9 +46,9 @@ class EmbeddedEventVerdictTestCase(HomeserverTestCase):
         assert persist_events is not None
         self.persist_events = persist_events
 
-        self.register_user("verdict", "pass")
-        self.tok = self.login("verdict", "pass")
-        self.room_id = self.helper.create_room_as("verdict", tok=self.tok)
+        self.register_user("status", "pass")
+        self.tok = self.login("status", "pass")
+        self.room_id = self.helper.create_room_as("status", tok=self.tok)
         # A linear chain: each event's only prev is the one before it.
         self.chain = [
             self.helper.send_event(
@@ -82,13 +82,19 @@ class EmbeddedEventVerdictTestCase(HomeserverTestCase):
             )
         )
 
-    def test_persist_writes_a_verdict(self) -> None:
-        verdicts = get_event_verdicts(self.chain)
-        self.assertEqual(set(verdicts), set(self.chain))
-        for verdict in verdicts.values():
-            self.assertFalse(verdict.outlier)
-            self.assertFalse(verdict.rejected)
-            self.assertFalse(verdict.soft_failed)
+    def test_persist_writes_a_status(self) -> None:
+        statuses = get_event_statuses(self.chain)
+        self.assertEqual(set(statuses), set(self.chain))
+        for status in statuses.values():
+            self.assertFalse(status.outlier)
+            self.assertFalse(status.rejected)
+            self.assertFalse(status.soft_failed)
+
+    def test_patching_an_absent_locator_is_a_no_op(self) -> None:
+        # A delete can win the race against a purge or sticky update. There is
+        # no locator left to carry status, so patching must not raise.
+        patch_event_statuses(["$missing:example.com"], outlier=True)
+        self.assertEqual(get_event_statuses(["$missing:example.com"]), {})
 
     def test_accepted_start_is_not_traversed(self) -> None:
         self.assertEqual(self._prevs(), set())
@@ -103,13 +109,11 @@ class EmbeddedEventVerdictTestCase(HomeserverTestCase):
         self.assertEqual(self._prevs(), {self.chain[2]})
 
     def test_soft_failed_only_when_included(self) -> None:
-        update_event_verdicts(
-            [self.chain[3]], lambda verdict: verdict._replace(soft_failed=True)
-        )
+        patch_event_statuses([self.chain[3]], soft_failed=True)
         self.assertEqual(self._prevs(), {self.chain[2]})
         self.assertEqual(self._prevs(include_soft_failed=False), set())
 
-    def test_which_are_prevs_uses_verdicts(self) -> None:
+    def test_which_are_prevs_uses_statuses(self) -> None:
         # chain[0] is a prev of the accepted chain[1], and chain[3] has no child.
         self.assertEqual(self._which_are_prevs([self.chain[0]]), [self.chain[0]])
         self.assertEqual(self._which_are_prevs([self.chain[3]]), [])
@@ -118,38 +122,33 @@ class EmbeddedEventVerdictTestCase(HomeserverTestCase):
         self.assertEqual(self._which_are_prevs([self.chain[0]]), [])
 
         self._mark_rejected(self.chain[1], None)
-        update_event_verdicts(
-            [self.chain[1]], lambda verdict: verdict._replace(outlier=True)
-        )
+        patch_event_statuses([self.chain[1]], outlier=True)
         self.assertEqual(self._which_are_prevs([self.chain[0]]), [])
 
-        update_event_verdicts(
-            [self.chain[1]],
-            lambda verdict: verdict._replace(outlier=False, soft_failed=True),
-        )
+        patch_event_statuses([self.chain[1]], outlier=False, soft_failed=True)
         self.assertEqual(self._which_are_prevs([self.chain[0]]), [])
 
-        update_event_verdicts(
-            [self.chain[1]], lambda verdict: verdict._replace(soft_failed=False)
-        )
+        patch_event_statuses([self.chain[1]], soft_failed=False)
         self.assertEqual(self._which_are_prevs([self.chain[0]]), [self.chain[0]])
 
-        # An edge row with no verdict is not a stored child.
-        delete_event_verdicts([self.chain[1]])
+        # An edge row with no status is not a stored child.
+        delete_event_json_batch(
+            self.hs.config.database.embedded_db_engine, [self.chain[1]]
+        )
         self.assertEqual(self._which_are_prevs([self.chain[0]]), [])
 
     def test_outlier_and_missing_events_are_not_traversed(self) -> None:
         self._mark_rejected(self.chain[3], "auth_error")
-        update_event_verdicts(
-            [self.chain[3]], lambda verdict: verdict._replace(outlier=True)
+        patch_event_statuses([self.chain[3]], outlier=True)
+        self.assertEqual(self._prevs(), set())
+
+        delete_event_json_batch(
+            self.hs.config.database.embedded_db_engine, [self.chain[3]]
         )
         self.assertEqual(self._prevs(), set())
+        self.assertEqual(get_event_statuses([self.chain[3]]), {})
 
-        delete_event_verdicts([self.chain[3]])
-        self.assertEqual(self._prevs(), set())
-        self.assertEqual(get_event_verdicts([self.chain[3]]), {})
-
-    def test_history_purge_updates_verdicts(self) -> None:
+    def test_history_purge_updates_statuses(self) -> None:
         token = self.get_success(
             self.store.get_topological_token_for_event(self.chain[3])
         )
@@ -159,12 +158,12 @@ class EmbeddedEventVerdictTestCase(HomeserverTestCase):
                 self.room_id, token_str, True
             )
         )
-        verdicts = get_event_verdicts(self.chain)
+        statuses = get_event_statuses(self.chain)
         # Messages before the token are deleted; the one at it is untouched.
-        self.assertEqual(set(verdicts), {self.chain[3]})
-        self.assertFalse(verdicts[self.chain[3]].outlier)
+        self.assertEqual(set(statuses), {self.chain[3]})
+        self.assertFalse(statuses[self.chain[3]].outlier)
         # The purge keeps state events but turns the old ones into outliers.
-        assert_verdicts_match_sql(self, self.hs, self.room_id)
+        assert_statuses_match_sql(self, self.hs, self.room_id)
         self.assertTrue(self._room_has_outlier())
 
     def _room_has_outlier(self) -> bool:
@@ -173,4 +172,4 @@ class EmbeddedEventVerdictTestCase(HomeserverTestCase):
                 "events", {"room_id": self.room_id}, "event_id"
             )
         )
-        return any(v.outlier for v in get_event_verdicts(event_ids).values())
+        return any(v.outlier for v in get_event_statuses(event_ids).values())

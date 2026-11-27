@@ -47,11 +47,11 @@ from synapse.storage.databases.main.embedded_event_auth_chains import (
     get_or_create_short_ids,
     resolve_short_ids_to_event_ids,
 )
-from synapse.storage.databases.main.embedded_event_verdict import get_event_verdicts
+from synapse.storage.databases.main.embedded_event_status import get_event_statuses
 from synapse.types import StateMap
 from synapse.util.clock import Clock
 
-from tests.storage.event_verdicts import assert_verdicts_match_sql
+from tests.storage.event_status import assert_statuses_match_sql
 from tests.test_utils.event_builders import make_test_event, make_test_pdu_event
 from tests.unittest import HomeserverTestCase, skip_unless
 from tests.utils import EMBEDDED_DB_ENGINE
@@ -231,8 +231,8 @@ class EventsTestCase(HomeserverTestCase):
         for call in outlier_barrier.call_args_list:
             self.assertNotIn(Pool.STATE, call.kwargs.get("pools", []))
 
-        assert_verdicts_match_sql(self, self.hs, room_id)
-        self.assertTrue(get_event_verdicts([event.event_id])[event.event_id].outlier)
+        assert_statuses_match_sql(self, self.hs, room_id)
+        self.assertTrue(get_event_statuses([event.event_id])[event.event_id].outlier)
 
         # Now the live copy arrives and de-outliers it. Its embedded mapping
         # must be visible before this returns.
@@ -256,8 +256,8 @@ class EventsTestCase(HomeserverTestCase):
         ):
             self.get_success(persistence.persist_event(event, live_context))
 
-        assert_verdicts_match_sql(self, self.hs, room_id)
-        self.assertFalse(get_event_verdicts([event.event_id])[event.event_id].outlier)
+        assert_statuses_match_sql(self, self.hs, room_id)
+        self.assertFalse(get_event_statuses([event.event_id])[event.event_id].outlier)
 
         if publish_at_commit:
             # The mapping is visible as soon as it is journaled; durability is
@@ -552,7 +552,10 @@ class EventsTestCase(HomeserverTestCase):
                 },
             )
             embedded_event_json.put_event_json_batch(
-                engine, [(event_id, room_id, "{}", body, 1)], sync=False
+                engine,
+                [(event_id, room_id, "{}", body, 1)],
+                sync=False,
+                locator_statuses={event_id: (False, False, False)},
             )
             raise RuntimeError("simulated persist rollback")
 
@@ -584,6 +587,7 @@ class EventsTestCase(HomeserverTestCase):
                 "mtxdb",
                 [(event_id, room_id, "{}", json.dumps({"body": event_id}), 1)],
                 transaction=kwargs["mtxdb_txn"],  # type: ignore[arg-type]
+                locator_statuses={event_id: (False, False, False)},
             )
             if fail:
                 raise RuntimeError("simulated persist failure")

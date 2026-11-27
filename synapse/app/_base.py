@@ -691,19 +691,10 @@ async def start(hs: "HomeServer", *, freeze: bool = True) -> None:
         AuthChainBackendMismatchError,
         check_backend as check_auth_chain_backend,
     )
-    from synapse.storage.databases.main.embedded_event_verdict import (
-        EventVerdictBackfillIncompleteError,
-        check_backfill as check_event_verdict_backfill,
-    )
 
     try:
         await check_auth_chain_backend(hs)
     except AuthChainBackendMismatchError as e:
-        quit_with_error(str(e))
-
-    try:
-        await check_event_verdict_backfill(hs)
-    except EventVerdictBackfillIncompleteError as e:
         quit_with_error(str(e))
 
     # We want to use a separate thread pool for the resolver so that large
