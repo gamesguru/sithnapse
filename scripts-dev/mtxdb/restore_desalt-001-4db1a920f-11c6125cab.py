@@ -2,6 +2,9 @@
 # Migration 4db1a920f -> 11c6125cab: see the sibling dump script.
 """Write a de-salt dump into an mtxdb directory with the NEW build.
 
+Retired: event status now lives in the EventDag locator, which this dump does
+not carry, so the script refuses to run rather than clearing status flags.
+
 Run with the build being deployed installed, the service stopped, and a
 snapshot of the mtxdb directory taken. Every record is written under the
 unsalted keys, then read back and compared with the dump; any mismatch exits
@@ -249,6 +252,15 @@ def main() -> int:
         help="Validate the dump's framing and counts; open and write nothing",
     )
     args = parser.parse_args()
+
+    # This dump predates status-bearing EventDag locators. Writing its event
+    # records would create locators with every status flag cleared, silently
+    # turning rejected, outlier and soft-failed events into normal ones. The
+    # dump carries no status to restore, so refuse instead of corrupting.
+    raise RuntimeError(
+        "restore_desalt targets the pre-status event locator format and cannot "
+        "restore event status; recreate the embedded store instead"
+    )
 
     counts = count_records(read_dump(args.input))
     print(f"dump is well formed: {counts}", file=sys.stderr)
