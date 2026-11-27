@@ -148,7 +148,7 @@ static STATE_HAMT_ROOT_WRITE_LOCK: OnceCell<Mutex<()>> = OnceCell::new();
 /// Serializes no-WAL updates to the EventDag event-locator values. In that
 /// mode Synapse has one writer process; this closes the read/modify/write
 /// window between its local workers.
-static EVENT_LOCATOR_WRITE_LOCK: Mutex<()> = Mutex::new(());
+pub(crate) static EVENT_LOCATOR_WRITE_LOCK: Mutex<()> = Mutex::new(());
 /// The pid that actually opened `DBS`, recorded alongside it. `DBS` is a
 /// process-global slot; under a fork()-based worker launcher a
 /// child that inherits an already-`Some` `DBS` from its parent's address

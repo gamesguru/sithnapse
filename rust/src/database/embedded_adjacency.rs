@@ -30,7 +30,7 @@ use pyo3::prelude::*;
 use super::mtxdb_syn::{
     csr_reader, csr_writer, event_body_rooms, event_dag_room_id, event_locator_collection_id,
     event_node_id, flush_adjacency_tails_io, is_retryable_contention, map_read_storage_error,
-    mark_adjacency_tail_dirty, state_db,
+    mark_adjacency_tail_dirty, state_db, EVENT_LOCATOR_WRITE_LOCK,
 };
 
 /// One event's adjacency row as the caller supplies it.
@@ -118,6 +118,16 @@ pub fn adjacency_put(py: Python<'_>, rows: Vec<PutRow>, durable: bool) -> PyResu
             }
         }
 
+        // The State locator update is a read-modify-write, and threads in this
+        // writer process persist different rooms concurrently while mtxdb
+        // releases the GIL. Hold the same process lock the EventDag locator
+        // writes use from the reads below through publishing the assignments,
+        // so a reference cannot overwrite the room a real body just assigned.
+        // Cross-process writers are excluded by the single events writer.
+        let locator_guard = EVENT_LOCATOR_WRITE_LOCK.lock().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err("event locator lock poisoned")
+        })?;
+
         let mut event_ids: Vec<String> = Vec::new();
         for row in &rows {
             event_ids.push(row.1.clone());
@@ -172,6 +182,24 @@ pub fn adjacency_put(py: Python<'_>, rows: Vec<PutRow>, durable: bool) -> PyResu
             }
         }
 
+        let engine = state_db()?;
+        for (collection, pairs) in locators {
+            let pairs: Vec<(NodeId, NodeData)> = pairs.into_iter().collect();
+            engine.put_many(&collection, &pairs).map_err(|e| {
+                let message = format!("mtxdb locator put error: {e}");
+                if is_retryable_contention(&e) {
+                    pyo3::exceptions::PyBlockingIOError::new_err(message)
+                } else {
+                    pyo3::exceptions::PyRuntimeError::new_err(message)
+                }
+            })?;
+        }
+        // Publish the assignments before appending edge rows, so the lock is
+        // not held across a durable CSR write. A reader that sees a locator
+        // first only misses the adjacency row; the SQL COMMIT still follows
+        // both writes.
+        drop(locator_guard);
+
         let mut by_room: HashMap<String, Vec<&PutRow>> = HashMap::new();
         for row in &rows {
             by_room.entry(row.0.clone()).or_default().push(row);
@@ -219,18 +247,6 @@ pub fn adjacency_put(py: Python<'_>, rows: Vec<PutRow>, durable: bool) -> PyResu
                     }
                 })?;
             mark_adjacency_tail_dirty();
-        }
-        let engine = state_db()?;
-        for (collection, pairs) in locators {
-            let pairs: Vec<(NodeId, NodeData)> = pairs.into_iter().collect();
-            engine.put_many(&collection, &pairs).map_err(|e| {
-                let message = format!("mtxdb locator put error: {e}");
-                if is_retryable_contention(&e) {
-                    pyo3::exceptions::PyBlockingIOError::new_err(message)
-                } else {
-                    pyo3::exceptions::PyRuntimeError::new_err(message)
-                }
-            })?;
         }
         Ok(())
     })
