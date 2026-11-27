@@ -23,8 +23,10 @@ collection id, with two maintained families:
 
 There are no per-edge records and no namespace salt: an event's id is its
 address (`sha256("event:" + event_id)`), and the room comes from the event
-locator published by `event_json_put` and re-published by `adjacency_put` for
-every event an edge touches.
+locator. `adjacency_put` publishes the event's own room, plus a provisional
+room for a reference to an event whose body has not arrived yet. The
+authoritative EventDag locator is published by `event_json_put`; a reference
+never overrides an event's own room.
 
 CSR rows are immutable once written. An individually deleted (retention)
 event's rows stay; every reader resolves the ids it gets back against the SQL

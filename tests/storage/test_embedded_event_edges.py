@@ -181,20 +181,20 @@ class EmbeddedAdjacencyTestCase(TestCase):
             [self._eid("b")],
         )
 
-    def test_cross_room_parent_does_not_overwrite_its_locator(self) -> None:
+    def test_cross_room_reference_keeps_its_edge_but_not_its_room(self) -> None:
         other_room = f"!{uuid4().hex}:example.org"
         put_event_edges_batch([(other_room, self._eid("shared_parent"), None)])
 
         # SQL kept malformed cross-room prev edges, but room-scoped traversal
-        # filtered them out. The CSR mirror should preserve that behavior by
-        # dropping the foreign reference while still storing the child row.
+        # filtered them out. The CSR mirror keeps the edge in the referencing
+        # room's graph and leaves the parent's own room untouched.
         put_event_edges_batch(
             [(self.room_id, self._eid("child"), self._eid("shared_parent"))]
         )
 
         self.assertEqual(
             get_event_edges_backward_batch([self._eid("child")])[self._eid("child")],
-            [],
+            [self._eid("shared_parent")],
         )
         self.assertEqual(
             get_event_edges_backward_batch([self._eid("shared_parent")])[
@@ -202,10 +202,85 @@ class EmbeddedAdjacencyTestCase(TestCase):
             ],
             [],
         )
+        # The parent resolves to the other room, so a forward read from it
+        # cannot see the cross-room child.
         self.assertIsNone(
             get_event_edges_forward_batch([self._eid("shared_parent")])[
                 self._eid("shared_parent")
             ]
+        )
+
+    def test_reference_does_not_pin_an_event_to_the_wrong_room(self) -> None:
+        room_a = self.room_id
+        room_b = f"!{uuid4().hex}:example.org"
+
+        # Room B sees the id first, as a cross-room prev, before its body.
+        put_event_edges_batch([(room_b, self._eid("b_child"), self._eid("x"))])
+        self.assertEqual(
+            get_event_edges_backward_batch([self._eid("b_child")])[
+                self._eid("b_child")
+            ],
+            [self._eid("x")],
+        )
+
+        # The real event then arrives in room A. Its own room wins over the
+        # locator the reference published.
+        put_event_edges_batch([(room_a, self._eid("x"), None)])
+        put_event_edges_batch([(room_a, self._eid("a_child"), self._eid("x"))])
+
+        self.assertEqual(
+            get_event_edges_backward_batch([self._eid("a_child")])[
+                self._eid("a_child")
+            ],
+            [self._eid("x")],
+        )
+        # Both rooms keep the edge to X...
+        self.assertEqual(
+            get_event_edges_backward_batch([self._eid("b_child")])[
+                self._eid("b_child")
+            ],
+            [self._eid("x")],
+        )
+        # ...but a forward read from X only sees room A's child.
+        self.assertEqual(
+            get_event_edges_forward_batch([self._eid("x")])[self._eid("x")],
+            [self._eid("a_child")],
+        )
+
+    def test_references_from_two_rooms_keep_both_edges(self) -> None:
+        room_a = self.room_id
+        room_b = f"!{uuid4().hex}:example.org"
+
+        put_event_edges_batch(
+            [
+                (room_a, self._eid("a_child"), self._eid("y")),
+                (room_b, self._eid("b_child"), self._eid("y")),
+            ]
+        )
+
+        self.assertEqual(
+            get_event_edges_backward_batch([self._eid("a_child")])[
+                self._eid("a_child")
+            ],
+            [self._eid("y")],
+        )
+        self.assertEqual(
+            get_event_edges_backward_batch([self._eid("b_child")])[
+                self._eid("b_child")
+            ],
+            [self._eid("y")],
+        )
+
+        # The provisional locator picks one room; a forward read from Y must
+        # not mix that room's children with the other room's.
+        forward = get_event_edges_forward_batch([self._eid("y")])[self._eid("y")] or []
+        self.assertEqual(len(forward), 1)
+
+        # The body's room is authoritative and replaces the reference guess.
+        put_event_edges_batch([(room_a, self._eid("y"), None)])
+        self.assertEqual(
+            get_event_edges_forward_batch([self._eid("y")])[self._eid("y")],
+            [self._eid("a_child")],
         )
 
     def test_sync_barrier_covers_event_dag_and_locator_pools(self) -> None:

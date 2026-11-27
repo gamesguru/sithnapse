@@ -3201,6 +3201,40 @@ fn decode_event_locator(value: &[u8], expected_event_id: &str) -> PyResult<([u8;
     Ok((room, flags))
 }
 
+/// Resolve each event id's room from its **EventDag** locator, when one has
+/// been published. Unlike the State-pool locator, this one is only written
+/// with the event's body, so it is authoritative rather than a reference's
+/// guess about where a not-yet-seen event belongs.
+pub(crate) fn event_body_rooms(event_ids: &[String]) -> PyResult<Vec<Option<[u8; 16]>>> {
+    if event_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let engine = event_dag_db()?;
+    let node_ids: Vec<NodeId> = event_ids.iter().map(|id| event_node_id(id)).collect();
+    let mut by_collection: HashMap<[u8; 16], Vec<(usize, NodeId)>> = HashMap::new();
+    for (position, node_id) in node_ids.iter().enumerate() {
+        by_collection
+            .entry(event_locator_collection_id(node_id))
+            .or_default()
+            .push((position, *node_id));
+    }
+    let mut rooms: Vec<Option<[u8; 16]>> = vec![None; event_ids.len()];
+    for (collection, entries) in by_collection {
+        let only_ids: Vec<NodeId> = entries.iter().map(|(_, id)| *id).collect();
+        let found = engine
+            .get_read_committed(&collection, &only_ids)
+            .map_err(map_read_storage_error)?;
+        for ((position, _), value) in entries.into_iter().zip(found) {
+            let Some(data) = value.filter(|data| !data.bytes.is_empty()) else {
+                continue;
+            };
+            let (room, _flags) = decode_event_locator(&data.bytes, &event_ids[position])?;
+            rooms[position] = Some(room);
+        }
+    }
+    Ok(rooms)
+}
+
 /// 128-bit identity for an event inside the mirror, derived exactly the way
 /// every other `NodeId` in this adapter is (first 16 bytes of SHA-256 over a
 /// domain-separated key -- see `kv_node_id`/`chain_node_id`/`root_node_id`).

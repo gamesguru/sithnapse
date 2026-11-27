@@ -8,15 +8,18 @@
 //! - forward (`children_of`): the events naming it in `prev_events`, a point
 //!   read of the maintained reverse row.
 //!
-//! Reads find a room from an event id through the event locator
-//! (`event_id -> room collection`), which `event_json_put` publishes and
-//! `adjacency_put` re-publishes for every event a row touches, so an edge to a
-//! parent whose body has not arrived still resolves.
+//! Reads find a room from an event id through the event locator. The State-pool
+//! locator is a hint: `event_json_put` publishes the authoritative one with the
+//! body, and `adjacency_put` publishes the event's own room plus a provisional
+//! room for references to events whose bodies have not arrived yet. A
+//! reference never overrides an event's own room, and a cross-room reference
+//! stays in the referencing event's room graph like it did in SQL; room-scoped
+//! traversals still cannot cross into the other room.
 //!
 //! CSR rows are immutable once written. Retention deletes leave them; a room
 //! purge drops the room's whole scope (`adjacency_purge_room`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use mtxdb::csr_adjacency::{AppendDurability, CsrAdjacency, EventRecord};
 use mtxdb::edge_log::EdgeLog;
@@ -25,8 +28,8 @@ use mtxdb::{NodeData, NodeId, StorageEngine};
 use pyo3::prelude::*;
 
 use super::mtxdb_syn::{
-    csr_reader, csr_writer, event_dag_room_id, event_locator_collection_id, event_node_id,
-    flush_adjacency_tails_io, is_retryable_contention, map_read_storage_error,
+    csr_reader, csr_writer, event_body_rooms, event_dag_room_id, event_locator_collection_id,
+    event_node_id, flush_adjacency_tails_io, is_retryable_contention, map_read_storage_error,
     mark_adjacency_tail_dirty, state_db,
 };
 
@@ -35,6 +38,22 @@ type PutRow = (String, String, Vec<String>, Vec<String>); // room_id, event_id, 
 
 fn adjacency_for(room_collection: &[u8; 16]) -> CsrAdjacency {
     CsrAdjacency::for_collection(room_collection)
+}
+
+/// Stage one State-pool locator: `event_id -> room collection`.
+fn write_locator(
+    locators: &mut HashMap<[u8; 16], HashMap<NodeId, NodeData>>,
+    event_id: &str,
+    room_collection: &[u8; 16],
+) {
+    let identity = event_node_id(event_id);
+    locators
+        .entry(event_locator_collection_id(&identity))
+        .or_default()
+        .insert(
+            identity,
+            NodeData::new(bytes::Bytes::copy_from_slice(room_collection)),
+        );
 }
 
 /// Resolve each event id's room collection through its locator; `None` when no
@@ -78,13 +97,12 @@ pub fn adjacency_put(py: Python<'_>, rows: Vec<PutRow>, durable: bool) -> PyResu
     }
     let database = csr_writer()?;
     py.detach(|| {
-        // Event rows have exactly one room, but malformed events may reference
-        // prev/auth events from another room. SQL kept those edges and room-
-        // scoped traversals filtered them out. In CSR, omit such references so
-        // they cannot move a locator or make the whole event write fail.
+        // An event row has exactly one room. A prev/auth reference may name an
+        // event from another room: SQL kept those edges and room-scoped
+        // traversals filtered them out, so the CSR row keeps them too. A
+        // reference must never decide a room, though; it may only supply a
+        // provisional locator when nothing else has.
         let mut event_rooms: HashMap<String, String> = HashMap::new();
-        let mut reference_rooms: HashMap<String, Option<String>> = HashMap::new();
-        let mut event_ids = Vec::new();
         for row in &rows {
             match event_rooms.entry(row.1.clone()) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
@@ -98,31 +116,30 @@ pub fn adjacency_put(py: Python<'_>, rows: Vec<PutRow>, durable: bool) -> PyResu
                 }
                 std::collections::hash_map::Entry::Occupied(_) => {}
             }
+        }
+
+        let mut event_ids: Vec<String> = Vec::new();
+        for row in &rows {
             event_ids.push(row.1.clone());
-            for event_id in row.2.iter().chain(&row.3) {
-                event_ids.push(event_id.clone());
-                match reference_rooms.entry(event_id.clone()) {
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        entry.insert(Some(row.0.clone()));
-                    }
-                    std::collections::hash_map::Entry::Occupied(mut entry)
-                        if entry.get().as_deref() != Some(&row.0) =>
-                    {
-                        entry.insert(None);
-                    }
-                    std::collections::hash_map::Entry::Occupied(_) => {}
-                }
-            }
+            event_ids.extend(row.2.iter().cloned());
+            event_ids.extend(row.3.iter().cloned());
         }
         event_ids.sort_unstable();
         event_ids.dedup();
-        let existing_rooms = resolve_rooms(&event_ids)?;
-        let existing_rooms: HashMap<String, Option<[u8; 16]>> =
-            event_ids.into_iter().zip(existing_rooms).collect();
+        let state_rooms = resolve_rooms(&event_ids)?;
+        let state_rooms: HashMap<String, Option<[u8; 16]>> =
+            event_ids.iter().cloned().zip(state_rooms).collect();
+        let body_rooms = event_body_rooms(&event_ids)?;
+        let body_rooms: HashMap<String, Option<[u8; 16]>> =
+            event_ids.iter().cloned().zip(body_rooms).collect();
+
+        // A body already stored in another room is a duplicate event id, not a
+        // cross-room reference. Reject it before publishing a locator: the
+        // persist will fail on the body anyway, and overwriting the locator
+        // first would corrupt later adjacency lookups for the real event.
         for (event_id, room_id) in &event_rooms {
-            if let Some(Some(existing_room)) = existing_rooms.get(event_id) {
-                let expected_room = event_dag_room_id(room_id);
-                if *existing_room != expected_room {
+            if let Some(Some(body_room)) = body_rooms.get(event_id) {
+                if *body_room != event_dag_room_id(room_id) {
                     return Err(pyo3::exceptions::PyValueError::new_err(format!(
                         "event {event_id} already belongs to another room"
                     )));
@@ -130,43 +147,44 @@ pub fn adjacency_put(py: Python<'_>, rows: Vec<PutRow>, durable: bool) -> PyResu
             }
         }
 
-        let reference_belongs_to_room = |event_id: &str, room_id: &str| {
-            let expected_room = event_dag_room_id(room_id);
-            if let Some(Some(existing_room)) = existing_rooms.get(event_id) {
-                return *existing_room == expected_room;
+        let mut locators: HashMap<[u8; 16], HashMap<NodeId, NodeData>> = HashMap::new();
+        // An event's own row decides its room, even over a locator that a
+        // reference to the same id published earlier.
+        for (event_id, room_id) in &event_rooms {
+            write_locator(&mut locators, event_id, &event_dag_room_id(room_id));
+        }
+        // References only fill a missing locator. A body locator is
+        // authoritative, so it may also correct a reference's bad guess; the
+        // first reference in the batch wins a tie.
+        let mut seen_references: HashSet<String> = HashSet::new();
+        for row in &rows {
+            for event_id in row.2.iter().chain(&row.3) {
+                if event_rooms.contains_key(event_id) || !seen_references.insert(event_id.clone()) {
+                    continue;
+                }
+                if let Some(Some(body_room)) = body_rooms.get(event_id) {
+                    if state_rooms.get(event_id).copied().flatten() != Some(*body_room) {
+                        write_locator(&mut locators, event_id, body_room);
+                    }
+                } else if state_rooms.get(event_id).copied().flatten().is_none() {
+                    write_locator(&mut locators, event_id, &event_dag_room_id(&row.0));
+                }
             }
-            if let Some(owner_room) = event_rooms.get(event_id) {
-                return owner_room == room_id;
-            }
-            reference_rooms
-                .get(event_id)
-                .is_some_and(|referencing_room| referencing_room.as_deref() == Some(room_id))
-        };
+        }
 
         let mut by_room: HashMap<String, Vec<&PutRow>> = HashMap::new();
         for row in &rows {
             by_room.entry(row.0.clone()).or_default().push(row);
         }
-        let mut locators: HashMap<[u8; 16], HashMap<NodeId, NodeData>> = HashMap::new();
         for (room_id, room_rows) in &by_room {
             let room_collection = event_dag_room_id(room_id);
             let prevs: Vec<Vec<&str>> = room_rows
                 .iter()
-                .map(|r| {
-                    r.2.iter()
-                        .filter(|id| reference_belongs_to_room(id, room_id))
-                        .map(String::as_str)
-                        .collect()
-                })
+                .map(|r| r.2.iter().map(String::as_str).collect())
                 .collect();
             let auths: Vec<Vec<&str>> = room_rows
                 .iter()
-                .map(|r| {
-                    r.3.iter()
-                        .filter(|id| reference_belongs_to_room(id, room_id))
-                        .map(String::as_str)
-                        .collect()
-                })
+                .map(|r| r.3.iter().map(String::as_str).collect())
                 .collect();
             let records: Vec<EventRecord<'_>> = room_rows
                 .iter()
@@ -201,24 +219,6 @@ pub fn adjacency_put(py: Python<'_>, rows: Vec<PutRow>, durable: bool) -> PyResu
                     }
                 })?;
             mark_adjacency_tail_dirty();
-            // Publish a room locator for each event and for each unambiguous,
-            // same-room reference whose body/edge row may arrive later.
-            for row in room_rows {
-                for id in std::iter::once(&row.1)
-                    .chain(&row.2)
-                    .chain(&row.3)
-                    .filter(|id| reference_belongs_to_room(id, room_id))
-                {
-                    let identity = event_node_id(id);
-                    locators
-                        .entry(event_locator_collection_id(&identity))
-                        .or_default()
-                        .insert(
-                            identity,
-                            NodeData::new(bytes::Bytes::copy_from_slice(&room_collection)),
-                        );
-                }
-            }
         }
         let engine = state_db()?;
         for (collection, pairs) in locators {
