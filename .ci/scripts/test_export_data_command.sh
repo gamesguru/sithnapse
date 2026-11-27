@@ -54,6 +54,11 @@ echo "--- Prepare the mtxdb fixture for export"
 uv run synapse_auth_edges_migrate --config "$SQLITE_EXPORT_CONFIG"
 uv run python .ci/scripts/prepare_export_data_mtxdb.py --config "$SQLITE_EXPORT_CONFIG"
 
+# Event status is recorded in the EventDag locator headers, and admin_cmd's
+# startup gate refuses a store that predates the status migration. The fixture
+# is older than that gate, so migrate it before the first export.
+uv run synapse_event_status_migrate --config "$SQLITE_EXPORT_CONFIG"
+
 # Run the export-data command on the sqlite test database
 uv run python -m synapse.app.admin_cmd -c "$SQLITE_EXPORT_CONFIG" export-data @anon-20191002_181700-832:localhost:8800 \
 --output-directory /tmp/export_data
@@ -79,6 +84,10 @@ uv run synapse_port_db --sqlite-database .ci/test_db.db --postgres-config .ci/po
 # state-root backfill when those roots live in the shared mtxdb, so finish that
 # update under the export config before starting admin_cmd.
 uv run update_synapse_database --database-config "$POSTGRES_EXPORT_CONFIG" --run-background-updates
+
+# The completion marker lives in SQL: confirm it survived the SQLite -> Postgres
+# port before admin_cmd's startup gate reads it.
+uv run synapse_event_status_migrate --config "$POSTGRES_EXPORT_CONFIG"
 
 # Run the export-data command on postgres database
 uv run python -m synapse.app.admin_cmd -c "$POSTGRES_EXPORT_CONFIG" export-data @anon-20191002_181700-832:localhost:8800 \
