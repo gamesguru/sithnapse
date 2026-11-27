@@ -444,6 +444,17 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
 
         logger.info("[purge] finding state groups referenced by purge-set events")
 
+        # In MSC4242 rooms a later event may cite any older state event in its
+        # `prev_state_events`, and is authorised against the state there. So
+        # retained state events must keep their state group, or servers which
+        # have and haven't purged can reach different verdicts.
+        unlink_sql = "SELECT event_id FROM events_to_purge"
+        if self.get_room_version_txn(txn, room_id).msc4242_state_dags:
+            unlink_sql += (
+                " WHERE should_delete"
+                " OR event_id NOT IN (SELECT event_id FROM state_events)"
+            )
+
         if getattr(self, "_embedded_event_json_enabled", False):
             # Exclusive by configured engine, not a dual-write -- see
             # embedded_event_to_state_group.py. This is the *forward*
@@ -452,7 +463,8 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             # it is not the reverse "is state_group X still referenced
             # elsewhere" question (that's get_referenced_state_groups,
             # backed by the separate refcount).
-            purge_set_event_ids = [event_id for event_id, _should_delete in event_rows]
+            txn.execute(unlink_sql)
+            purge_set_event_ids = [event_id for (event_id,) in txn]
 
             # Rows not yet migrated from SQL (the migration deletes each row once
             # copied) may reference state groups too. Delete them *before*
@@ -462,18 +474,17 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             # it wrote) or can no longer select these rows. Otherwise it could
             # re-insert a stale mapping for a purged event.
             txn.execute(
-                """
-                SELECT DISTINCT state_group FROM events_to_purge
-                INNER JOIN event_to_state_groups USING (event_id)
-            """
+                "SELECT DISTINCT state_group FROM event_to_state_groups "
+                "WHERE event_id IN (%s)" % (unlink_sql,)
             )
             referenced_state_groups = {sg for (sg,) in txn}
             logger.info("[purge] removing events from event_to_state_groups")
-            # State events retained as outliers must also stop referencing their
-            # state groups, even though their event rows are kept.
+            # Events retained as outliers must also stop referencing their state
+            # groups, even though their event rows are kept (see `unlink_sql`
+            # for the exception).
             txn.execute(
-                "DELETE FROM event_to_state_groups "
-                "WHERE event_id IN (SELECT event_id from events_to_purge)"
+                "DELETE FROM event_to_state_groups WHERE event_id IN (%s)"
+                % (unlink_sql,)
             )
 
             # Only mtxdb entries are refcounted, so only those are decremented.
@@ -510,10 +521,8 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             # Get all state groups that are referenced by events that are to be
             # deleted.
             txn.execute(
-                """
-                SELECT DISTINCT state_group FROM events_to_purge
-                INNER JOIN event_to_state_groups USING (event_id)
-            """
+                "SELECT DISTINCT state_group FROM event_to_state_groups "
+                "WHERE event_id IN (%s)" % (unlink_sql,)
             )
 
             referenced_state_groups = {sg for (sg,) in txn}
@@ -523,8 +532,8 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
 
             logger.info("[purge] removing events from event_to_state_groups")
             txn.execute(
-                "DELETE FROM event_to_state_groups "
-                "WHERE event_id IN (SELECT event_id from events_to_purge)"
+                "DELETE FROM event_to_state_groups WHERE event_id IN (%s)"
+                % (unlink_sql,)
             )
 
         # Capture redaction targets before deleting the redactions rows by their

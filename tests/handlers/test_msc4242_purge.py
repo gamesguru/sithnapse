@@ -117,6 +117,13 @@ class PurgeStateDagTestCase(unittest.FederatingHomeserverTestCase):
                 )
             )
             self.assertIsNone(error)
+            # State groups queued by the purge are only deleted after a delay,
+            # so let that happen before judging anything against them.
+            deletion_store = self.hs.get_datastores().state_deletion
+            assert deletion_store is not None
+            self.reactor.advance(deletion_store.DELAY_BEFORE_DELETION_MS / 1000 + 1)
+            for _ in range(10):
+                self.reactor.advance(60)
 
         def receive(fields: dict) -> str:
             latest = self.get_success(store.get_latest_event_ids_in_room(room_id))
@@ -173,14 +180,3 @@ class PurgeStateDagTestCase(unittest.FederatingHomeserverTestCase):
     @unittest.override_config({"experimental_features": {"msc4242_enabled": True}})
     def test_joined_sender_accepted_after_purge(self) -> None:
         self.assertIsNone(self._judge(purge=True, branch_a="join"))
-
-
-# Trial's todo marker records these known failures as expected failures, and
-# reports an unexpected success once they are fixed.
-for _test in (
-    PurgeStateDagTestCase.test_banned_sender_rejected_after_purge,
-    PurgeStateDagTestCase.test_joined_sender_accepted_after_purge,
-):
-    _test.__dict__["todo"] = (
-        "history purge drops the state of retained MSC4242 state events"
-    )
