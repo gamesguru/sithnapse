@@ -283,6 +283,68 @@ class EmbeddedAdjacencyTestCase(TestCase):
             [self._eid("a_child")],
         )
 
+    def test_same_room_child_before_and_after_the_body_stays_visible(self) -> None:
+        room_a = self.room_id
+        room_b = f"!{uuid4().hex}:example.org"
+
+        # Room B sees X first, as a cross-room prev.
+        put_event_edges_batch([(room_b, self._eid("b_child"), self._eid("x"))])
+        # A child references X before X's body arrives.
+        put_event_edges_batch([(room_a, self._eid("a_before"), self._eid("x"))])
+        self.assertEqual(
+            get_event_edges_backward_batch([self._eid("a_before")])[
+                self._eid("a_before")
+            ],
+            [self._eid("x")],
+        )
+        # Until the body lands, X resolves to the provisional room, so its
+        # forward row lives in B.
+        self.assertEqual(
+            get_event_edges_forward_batch([self._eid("x")])[self._eid("x")],
+            [self._eid("b_child")],
+        )
+
+        # The real X arrives in A; only A's children remain visible from it.
+        put_event_edges_batch([(room_a, self._eid("x"), None)])
+        self.assertEqual(
+            get_event_edges_forward_batch([self._eid("x")])[self._eid("x")],
+            [self._eid("a_before")],
+        )
+
+        # A late reference from B must not move X back, and an A child that
+        # references X after the body is visible alongside the earlier one.
+        put_event_edges_batch([(room_b, self._eid("b_late"), self._eid("x"))])
+        put_event_edges_batch([(room_a, self._eid("a_after"), self._eid("x"))])
+        self.assertCountEqual(
+            get_event_edges_forward_batch([self._eid("x")])[self._eid("x")] or [],
+            [self._eid("a_before"), self._eid("a_after")],
+        )
+        self.assertEqual(
+            get_event_edges_backward_batch([self._eid("b_late")])[self._eid("b_late")],
+            [self._eid("x")],
+        )
+
+    def test_duplicate_event_id_is_rejected_same_batch_and_later(self) -> None:
+        from synapse.synapse_rust.mtxdb_engine import event_locator_put
+
+        room_a = self.room_id
+        room_b = f"!{uuid4().hex}:example.org"
+
+        with self.assertRaisesRegex(ValueError, "persisted in multiple rooms"):
+            put_event_edges_batch(
+                [
+                    (room_a, self._eid("dup"), None),
+                    (room_b, self._eid("dup"), None),
+                ]
+            )
+
+        # A committed body locator records the first room; a later row in
+        # another room is a duplicate, not a cross-room reference.
+        event_locator_put([(room_a, self._eid("dup2"), False, False, False)])
+        put_event_edges_batch([(room_a, self._eid("dup2"), None)])
+        with self.assertRaisesRegex(ValueError, "already belongs to another room"):
+            put_event_edges_batch([(room_b, self._eid("dup2"), None)])
+
     def test_sync_barrier_covers_event_dag_and_locator_pools(self) -> None:
         with mock.patch.object(embedded_event_edges_module, "sync_now") as sync_now:
             put_event_edges_batch(
