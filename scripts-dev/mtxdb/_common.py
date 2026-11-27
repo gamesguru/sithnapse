@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import struct
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterable
 
 from synapse.config import find_config_files
 from synapse.config._base import read_config_files
@@ -61,6 +63,115 @@ def event_meta_node_id(namespace: str, event_id: str) -> bytes:
         + event_id.encode("utf-8")
     ).digest()
     return digest[:16]
+
+
+def decode_record_metadata(record: bytes) -> str:
+    """Return the `internal_metadata` string from a combined event record."""
+    if len(record) < 8:
+        raise RuntimeError("event record is too short to carry metadata")
+    _format_version, metadata_len = struct.unpack(">iI", record[:8])
+    end = 8 + metadata_len
+    if end > len(record):
+        raise RuntimeError("event record metadata length runs past the record")
+    return record[8:end].decode("utf-8")
+
+
+def soft_failed_from_record(record: bytes) -> bool:
+    metadata = json.loads(decode_record_metadata(record))
+    if not isinstance(metadata, dict):
+        raise RuntimeError("event internal_metadata is not a JSON object")
+    return bool(metadata.get("soft_failed"))
+
+
+def sql_event_statuses(
+    sql: Any, sql_name: str, event_ids: Iterable[str]
+) -> dict[str, tuple[bool, bool]]:
+    """Read `(outlier, rejected)` for every id from the authoritative SQL rows.
+
+    A missing SQL row is an error: writing a locator without its status would
+    silently turn a rejected or outlier event into a normal one.
+    """
+    ids = list(event_ids)
+    if not ids:
+        return {}
+    mark = "%s" if sql_name == "psycopg2" else "?"
+    placeholders = ", ".join(mark for _ in ids)
+    cursor = sql.cursor()
+    cursor.execute(
+        "SELECT e.event_id, e.outlier, "
+        "(r.event_id IS NOT NULL OR e.rejection_reason IS NOT NULL) "
+        "FROM events AS e LEFT JOIN rejections AS r USING (event_id) "
+        f"WHERE e.event_id IN ({placeholders})",
+        ids,
+    )
+    statuses = {
+        str(event_id): (bool(outlier), bool(rejected))
+        for event_id, outlier, rejected in cursor.fetchall()
+    }
+    missing = [event_id for event_id in ids if event_id not in statuses]
+    if missing:
+        raise RuntimeError(
+            f"no SQL event row for {missing[0]}; cannot restore its status"
+        )
+    return statuses
+
+
+def write_event_batch(
+    engine: Any,
+    sql: Any,
+    sql_name: str,
+    rows: Iterable[tuple[str, str, bytes]],
+    *,
+    soft_failed_for_record: Callable[[bytes], bool] = soft_failed_from_record,
+) -> int:
+    """Write bodies first, then locators carrying the SQL status.
+
+    `event_json_put` is the initial-persist path and creates locators with
+    every status flag cleared, which would drop outlier/rejected/soft-failed
+    state on a restore. Bodies go first so a failure leaves the previous
+    locators resolvable and a retry safe.
+    """
+    batch = list(rows)
+    if not batch:
+        return 0
+    statuses = sql_event_statuses(sql, sql_name, (event_id for _, event_id, _ in batch))
+    engine.event_json_body_put(
+        [(room_id, event_id, record) for room_id, event_id, record in batch]
+    )
+    engine.event_locator_put(
+        [
+            (
+                room_id,
+                event_id,
+                statuses[event_id][0],
+                statuses[event_id][1],
+                soft_failed_for_record(record),
+            )
+            for room_id, event_id, record in batch
+        ]
+    )
+    return len(batch)
+
+
+def mark_event_status_locators_complete(sql: Any, sql_name: str) -> None:
+    """Record that every locator in this store carries its status flags."""
+    mark = "%s" if sql_name == "psycopg2" else "?"
+    cursor = sql.cursor()
+    cursor.execute(
+        "CREATE TABLE IF NOT EXISTS event_status_locator_backfill ("
+        " lock TEXT NOT NULL,"
+        " completed INTEGER NOT NULL DEFAULT 0,"
+        " last_event_id TEXT NOT NULL DEFAULT '',"
+        " PRIMARY KEY (lock))"
+    )
+    cursor.execute(
+        "INSERT INTO event_status_locator_backfill"
+        " (lock, completed, last_event_id)"
+        f" VALUES ({mark}, 1, '')"
+        " ON CONFLICT (lock) DO UPDATE SET completed = 1, last_event_id = ''",
+        ("X",),
+    )
+    sql.commit()
 
 
 def _main_database_config(config: dict[str, Any]) -> dict[str, Any]:

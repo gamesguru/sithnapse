@@ -230,6 +230,26 @@ def put_event_json_batch(
             sync_event_dag_now()
 
 
+def get_event_json_body_batch(
+    rows: list[tuple[str, str]],
+) -> dict[str, tuple[str, str, int | None]]:
+    """Read bodies by `(room_id, event_id)`, never through the locator.
+
+    The offline status migration uses this because a pre-status store's
+    EventDag locators carry only the room and the normal reader rejects them.
+    """
+    if not rows:
+        return {}
+    from synapse.synapse_rust.mtxdb_engine import event_json_body_get
+
+    records = event_json_body_get(rows)
+    result: dict[str, tuple[str, str, int | None]] = {}
+    for (_, event_id), record in zip(rows, records):
+        if record is not None:
+            result[event_id] = _decode_event_json_record(record)
+    return result
+
+
 def get_event_json_batch(
     engine_name: str | None, event_ids: list[str]
 ) -> dict[str, tuple[str, str, int | None]]:

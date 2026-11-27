@@ -2,8 +2,11 @@
 # Migration 4db1a920f -> 11c6125cab: see the sibling dump script.
 """Write a de-salt dump into an mtxdb directory with the NEW build.
 
-Retired: event status now lives in the EventDag locator, which this dump does
-not carry, so the script refuses to run rather than clearing status flags.
+Event records are written with their bodies first and then status-bearing
+EventDag locators. The dump predates the locator status header, so outlier and
+rejected come from SQL (`events`, `rejections`) and soft-failed from each
+record's own `internal_metadata`. Every locator is read back and compared with
+SQL after writing.
 
 Run with the build being deployed installed, the service stopped, and a
 snapshot of the mtxdb directory taken. Every record is written under the
@@ -26,6 +29,14 @@ import sys
 from pathlib import Path
 from typing import Any, Iterator
 
+from _common import (
+    embedded_database,
+    mark_event_status_locators_complete,
+    soft_failed_from_record,
+    sql_connection,
+    sql_event_statuses,
+    write_event_batch,
+)
 from _desalt import (
     EVENT,
     EVENT_TO_STATE_GROUP,
@@ -108,20 +119,22 @@ def _counter(value: bytes, where: str) -> bytes:
     return value
 
 
-def apply_dump(engine: Any, path: Path, batch_size: int) -> dict[str, int]:
+def apply_dump(
+    engine: Any, sql: Any, sql_name: str, path: Path, batch_size: int
+) -> dict[str, int]:
     """Write every record under the new keys. Returns per-type written counts."""
     written = dict.fromkeys(RECORD_TYPES, 0)
 
     for batch in batched(_rows(path, EVENT), batch_size):
-        # The FFI row order is (room_id, event_id, record), whatever the .pyi
-        # parameter names say; `embedded_event_json.py` builds it the same way.
-        engine.event_json_put(
+        written[EVENT] += write_event_batch(
+            engine,
+            sql,
+            sql_name,
             [
                 (_text(r, "room_id"), _text(r, "event_id"), unb64(r["value"], EVENT))
                 for r in batch
-            ]
+            ],
         )
-        written[EVENT] += len(batch)
 
     for batch in batched(_rows(path, EVENT_TO_STATE_GROUP), batch_size):
         engine.batch_put(
@@ -173,7 +186,9 @@ def apply_dump(engine: Any, path: Path, batch_size: int) -> dict[str, int]:
     return written
 
 
-def verify_dump(engine: Any, path: Path, batch_size: int) -> list[str]:
+def verify_dump(
+    engine: Any, sql: Any, sql_name: str, path: Path, batch_size: int
+) -> list[str]:
     """Read every record back through the new build; return the mismatches."""
     bad: list[str] = []
 
@@ -187,6 +202,15 @@ def verify_dump(engine: Any, path: Path, batch_size: int) -> list[str]:
         for event_id, body in found_bodies:
             if body is None or bytes(body) != expected[event_id]:
                 bad.append(f"event {event_id}")
+
+        statuses = sql_event_statuses(sql, sql_name, expected)
+        found_statuses = dict(engine.event_status_get(list(expected)))
+        for event_id, record in expected.items():
+            outlier, rejected = statuses[event_id]
+            wanted = (outlier, rejected, soft_failed_from_record(record))
+            got = found_statuses.get(event_id)
+            if got is None or tuple(got) != wanted:
+                bad.append(f"status {event_id}: wrote {wanted}, read {got}")
 
     for batch in batched(_rows(path, EVENT_TO_STATE_GROUP), batch_size):
         expected_kv = {
@@ -257,14 +281,47 @@ def main() -> int:
     if args.dry_run:
         return 0
 
-    # This dump predates status-bearing EventDag locators. Writing its event
-    # records would create locators with every status flag cleared, silently
-    # turning rejected, outlier and soft-failed events into normal ones. The
-    # dump carries no status to restore, so refuse instead of corrupting.
-    raise RuntimeError(
-        "restore_desalt targets the pre-status event locator format and cannot "
-        "restore event status; recreate the embedded store instead"
-    )
+    from synapse.synapse_rust import mtxdb_engine as engine
+
+    _, db_path, _ = embedded_database(args.config)
+    # Probe using a read-only handle first. This avoids opening the store as a
+    # writer when the installed extension is the source build by mistake, and
+    # it runs before the old index is renamed so a wrong-build invocation has
+    # no side effects at all.
+    engine.open_client_read_only(str(db_path))
+    try:
+        require_new_build(engine)
+    finally:
+        engine.close_client()
+
+    if retire_old_room_index(db_path):
+        print("Moved room_index/ to room_index.pre-desalt", file=sys.stderr)
+
+    sql_name, sql = sql_connection(args.config)
+    print(f"Writing mtxdb at {db_path}", file=sys.stderr)
+    engine.open_client(str(db_path))
+    try:
+        written = apply_dump(engine, sql, sql_name, args.input, args.batch_size)
+        engine.sync()
+        # room_index is an append-only side file outside mtxdb's WAL. Its
+        # sync() fsyncs shard contents; persist the directory entries too.
+        room_index_dir = db_path / "room_index"
+        if room_index_dir.exists():
+            _fsync_directory(room_index_dir)
+        _fsync_directory(db_path)
+        if written != counts:
+            raise RuntimeError(f"wrote {written}, dump holds {counts}")
+        bad = verify_dump(engine, sql, sql_name, args.input, args.batch_size)
+        mark_event_status_locators_complete(sql, sql_name)
+    finally:
+        sql.close()
+        engine.close_client()
+    if bad:
+        for line in bad[:20]:
+            print("  mismatch: " + line, file=sys.stderr)
+        raise RuntimeError(f"{len(bad)} records did not read back equal")
+    print(f"restored and verified {written}", file=sys.stderr)
+    return 0
 
 
 if __name__ == "__main__":

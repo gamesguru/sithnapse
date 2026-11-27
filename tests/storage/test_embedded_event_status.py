@@ -20,9 +20,13 @@ from synapse.api.constants import EventTypes
 from synapse.rest import admin
 from synapse.rest.client import login, room
 from synapse.server import HomeServer
+from synapse.storage.database import LoggingTransaction
 from synapse.storage.databases.main.embedded_event_json import delete_event_json_batch
 from synapse.storage.databases.main.embedded_event_status import (
+    EventStatusBackfillIncompleteError,
+    check_backfill,
     get_event_statuses,
+    migrate_event_statuses,
     patch_event_statuses,
 )
 from synapse.util.clock import Clock
@@ -173,3 +177,78 @@ class EmbeddedEventStatusTestCase(HomeserverTestCase):
             )
         )
         return any(v.outlier for v in get_event_statuses(event_ids).values())
+
+    def _set_backfill_completed(self, completed: bool) -> None:
+        def _txn(txn: LoggingTransaction) -> None:
+            txn.execute(
+                "UPDATE event_status_locator_backfill SET completed = ?,"
+                " last_event_id = '' WHERE lock = 'X'",
+                (1 if completed else 0,),
+            )
+
+        self.get_success(self.store.db_pool.runInteraction("set_marker", _txn))
+
+    def test_startup_requires_completed_locator_status(self) -> None:
+        self._set_backfill_completed(False)
+        self.get_failure(check_backfill(self.hs), EventStatusBackfillIncompleteError)
+
+        self.get_success(migrate_event_statuses(self.hs))
+        self.get_success(check_backfill(self.hs))
+
+    def test_dry_run_after_completion_still_verifies(self) -> None:
+        self._set_backfill_completed(False)
+        first = self.get_success(migrate_event_statuses(self.hs))
+        self.assertGreater(first["events"], 0)
+        self.assertEqual(first["mismatched"], 0)
+
+        # A real run is a fast no-op once the marker is complete.
+        again = self.get_success(migrate_event_statuses(self.hs))
+        self.assertEqual(again["already_migrated"], 1)
+
+        # A dry run still scans and compares every event.
+        checked = self.get_success(migrate_event_statuses(self.hs, dry_run=True))
+        self.assertEqual(checked["events"], first["events"])
+        self.assertEqual(checked["mismatched"], 0)
+
+    def test_status_migration_preserves_rejected_and_soft_failed(self) -> None:
+        self._mark_rejected(self.chain[2], "auth_error")
+        patch_event_statuses([self.chain[3]], soft_failed=True)
+        self._set_backfill_completed(False)
+        self.get_success(migrate_event_statuses(self.hs))
+
+        statuses = get_event_statuses(self.chain)
+        self.assertTrue(statuses[self.chain[2]].rejected)
+        self.assertTrue(statuses[self.chain[3]].soft_failed)
+        assert_statuses_match_sql(self, self.hs, self.room_id)
+
+
+class EventStatusBackfillEmptyDatabaseTestCase(HomeserverTestCase):
+    def prepare(
+        self, reactor: MemoryReactor, clock: Clock, homeserver: HomeServer
+    ) -> None:
+        self.store = homeserver.get_datastores().main
+
+    def test_empty_database_adopts_the_marker(self) -> None:
+        def _txn(txn: LoggingTransaction) -> None:
+            txn.execute(
+                "UPDATE event_status_locator_backfill SET completed = 0,"
+                " last_event_id = '' WHERE lock = 'X'"
+            )
+
+        self.get_success(self.store.db_pool.runInteraction("set_marker", _txn))
+        self.get_success(check_backfill(self.hs))
+
+        def _read(txn: LoggingTransaction) -> tuple[int, str]:
+            txn.execute(
+                "SELECT completed, last_event_id FROM"
+                " event_status_locator_backfill WHERE lock = 'X'"
+            )
+            row = txn.fetchone()
+            assert row is not None
+            return int(row[0]), str(row[1])
+
+        completed, last_event_id = self.get_success(
+            self.store.db_pool.runInteraction("read_marker", _read)
+        )
+        self.assertEqual(completed, 1)
+        self.assertEqual(last_event_id, "")

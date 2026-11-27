@@ -1757,11 +1757,15 @@ mod room_index {
             put(&[(group_at(7), b"NEWPREFX".to_vec())]).expect("overwrite");
             put(&[(group_at(8), b"KEEPPFX1".to_vec())]).expect("put");
             put(&[(group_at(8), Vec::new())]).expect("zero record");
-            // A torn trailing partial record is ignored.
+            // A torn trailing partial record is ignored. Truncate it back
+            // afterwards: shard 0 is shared with the other tests in this
+            // module, and a later append would otherwise land after the
+            // fragment and misalign every record that follows.
             let path = index_path(shard_for(base), false).expect("path");
+            let clean_len = std::fs::metadata(&path).expect("metadata").len();
             OpenOptions::new()
                 .append(true)
-                .open(path)
+                .open(&path)
                 .and_then(|mut f| f.write_all(b"torn"))
                 .expect("append torn tail");
 
@@ -1779,6 +1783,12 @@ mod room_index {
             assert_eq!(got[2], Some(b"KEEPPFX1".to_vec()));
             assert_eq!(got[3], Some(b"OLDPREFX".to_vec()));
             assert_eq!(got[4], None, "never-written group is a miss");
+
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .and_then(|f| f.set_len(clean_len))
+                .expect("truncate torn tail");
         }
 
         fn layout_check_file(bytes: &[u8]) -> PyResult<()> {
@@ -3504,6 +3514,39 @@ pub fn event_json_body_put(py: Python<'_>, rows: Vec<(String, String, Vec<u8>)>)
             })?;
         }
         Ok(())
+    })
+}
+
+/// Read event bodies directly by `(room_id, event_id)`, without consulting
+/// the EventDag locator. The offline status migration uses this because a
+/// pre-status store has 16-byte locators that the normal reader rejects.
+#[pyfunction]
+pub fn event_json_body_get(
+    py: Python<'_>,
+    rows: Vec<(String, String)>,
+) -> PyResult<Vec<Option<Vec<u8>>>> {
+    py.detach(|| {
+        let engine = event_dag_db()?;
+        let mut grouped: HashMap<[u8; 16], Vec<(usize, NodeId)>> = HashMap::new();
+        for (position, (room_id, event_id)) in rows.iter().enumerate() {
+            grouped
+                .entry(event_dag_room_id(room_id))
+                .or_default()
+                .push((position, event_node_id(event_id)));
+        }
+        let mut out: Vec<Option<Vec<u8>>> = vec![None; rows.len()];
+        for (collection, entries) in grouped {
+            let nodes: Vec<NodeId> = entries.iter().map(|(_, node)| *node).collect();
+            let records = engine
+                .get_read_committed(&collection, &nodes)
+                .map_err(map_read_storage_error)?;
+            for ((position, _), record) in entries.into_iter().zip(records) {
+                if let Some(data) = record.filter(|data| !data.bytes.is_empty()) {
+                    out[position] = Some(data.bytes.to_vec());
+                }
+            }
+        }
+        Ok(out)
     })
 }
 
@@ -5481,6 +5524,7 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(batch_delete, m)?)?;
     m.add_function(wrap_pyfunction!(event_json_put, m)?)?;
     m.add_function(wrap_pyfunction!(event_json_body_put, m)?)?;
+    m.add_function(wrap_pyfunction!(event_json_body_get, m)?)?;
     m.add_function(wrap_pyfunction!(event_locator_put, m)?)?;
     m.add_function(wrap_pyfunction!(event_status_get, m)?)?;
     m.add_function(wrap_pyfunction!(event_status_patch, m)?)?;
