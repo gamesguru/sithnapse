@@ -43,6 +43,9 @@ from synapse.storage.databases.main.embedded_event_json import (
     get_event_json_batch,
     put_event_json_batch,
 )
+from synapse.storage.databases.main.embedded_event_verdict import (
+    update_event_verdicts,
+)
 from synapse.storage.databases.main.events import DeltaState
 from synapse.storage.databases.main.state import StateGroupWorkerStore
 from synapse.storage.engines import PostgresEngine, Sqlite3Engine
@@ -885,6 +888,11 @@ class StickyEventsWorkerStore(StateGroupWorkerStore, CacheInvalidationWorkerStor
                     self._embedded_db_engine,
                     mirror_rows,
                 )
+
+            update_event_verdicts(
+                list(sticky_event_ids),
+                lambda verdict: verdict._replace(soft_failed=False),
+            )
 
         # Invalidate caches as a result
         for event_id in sticky_event_ids:

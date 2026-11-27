@@ -20,7 +20,7 @@ use once_cell::sync::OnceCell;
 use pyo3::{create_exception, exceptions::PyException, prelude::*, PyTypeInfo};
 use sha2::{Digest, Sha256};
 
-use super::embedded_timeline;
+use super::{embedded_timeline, embedded_verdict};
 
 create_exception!(
     synapse.synapse_rust.mtxdb_engine,
@@ -163,7 +163,7 @@ static OPENED_ROOT: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 /// comment for why this must be the single choke point, not a per-caller
 /// guard.
 /// True when this process opened the store read-only.
-fn opened_read_only() -> bool {
+pub(crate) fn opened_read_only() -> bool {
     matches!(WRITE_MODE.lock().map(|mode| *mode), Ok(Some(false)))
 }
 
@@ -3593,6 +3593,15 @@ impl PyMtxdbTransaction {
         })
     }
 
+    /// Stage what `event_verdict_put` would write.
+    fn event_verdict_put(
+        &self,
+        py: Python<'_>,
+        rows: Vec<embedded_verdict::VerdictRow>,
+    ) -> PyResult<()> {
+        py.detach(|| embedded_verdict::stage_verdicts(&self.inner, rows))
+    }
+
     /// Stage outbound auth edges and their inbound child index in the
     /// persistence transaction that stages the event JSON and DAG edges.
     fn auth_chain_edges_put(
@@ -5035,6 +5044,10 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(batch_get, m)?)?;
     m.add_function(wrap_pyfunction!(batch_put, m)?)?;
     m.add_function(wrap_pyfunction!(batch_delete, m)?)?;
+    m.add_function(wrap_pyfunction!(embedded_verdict::event_rejection_code, m)?)?;
+    m.add_function(wrap_pyfunction!(embedded_verdict::event_verdict_put, m)?)?;
+    m.add_function(wrap_pyfunction!(embedded_verdict::event_verdict_get, m)?)?;
+    m.add_function(wrap_pyfunction!(embedded_verdict::event_verdict_delete, m)?)?;
     m.add_function(wrap_pyfunction!(event_json_put, m)?)?;
     m.add_function(wrap_pyfunction!(event_json_get, m)?)?;
     m.add_function(wrap_pyfunction!(event_json_delete, m)?)?;

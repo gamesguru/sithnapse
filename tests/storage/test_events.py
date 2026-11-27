@@ -47,9 +47,11 @@ from synapse.storage.databases.main.embedded_event_auth_chains import (
     get_or_create_short_ids,
     resolve_short_ids_to_event_ids,
 )
+from synapse.storage.databases.main.embedded_event_verdict import get_event_verdicts
 from synapse.types import StateMap
 from synapse.util.clock import Clock
 
+from tests.storage.event_verdicts import assert_verdicts_match_sql
 from tests.test_utils.event_builders import make_test_event, make_test_pdu_event
 from tests.unittest import HomeserverTestCase, skip_unless
 from tests.utils import EMBEDDED_DB_ENGINE
@@ -229,6 +231,9 @@ class EventsTestCase(HomeserverTestCase):
         for call in outlier_barrier.call_args_list:
             self.assertNotIn(Pool.STATE, call.kwargs.get("pools", []))
 
+        assert_verdicts_match_sql(self, self.hs, room_id)
+        self.assertTrue(get_event_verdicts([event.event_id])[event.event_id].outlier)
+
         # Now the live copy arrives and de-outliers it. Its embedded mapping
         # must be visible before this returns.
         event.internal_metadata.outlier = False
@@ -250,6 +255,9 @@ class EventsTestCase(HomeserverTestCase):
             mock.patch.object(events_module, "maybe_sync") as de_outlier_barrier,
         ):
             self.get_success(persistence.persist_event(event, live_context))
+
+        assert_verdicts_match_sql(self, self.hs, room_id)
+        self.assertFalse(get_event_verdicts([event.event_id])[event.event_id].outlier)
 
         if publish_at_commit:
             # The mapping is visible as soon as it is journaled; durability is

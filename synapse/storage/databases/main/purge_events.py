@@ -49,6 +49,10 @@ from synapse.storage.databases.main.embedded_event_to_state_group import (
     delete_event_to_state_group_batch,
     get_state_group_for_events_batch,
 )
+from synapse.storage.databases.main.embedded_event_verdict import (
+    delete_event_verdicts,
+    update_event_verdicts,
+)
 from synapse.storage.databases.main.embedded_redactions import delete_redactions_batch
 from synapse.storage.databases.main.state import StateGroupWorkerStore
 from synapse.storage.engines import PostgresEngine
@@ -77,6 +81,8 @@ def _delete_purge_event_mirrors(
             # a crash cannot bring back a redaction mirror for events whose
             # event_json is already gone.
             sync_now(pools=[Pool.STATE])
+        # Synced by the event_json delete below, which uses the same pool.
+        delete_event_verdicts(deleted_event_ids)
         delete_event_json_batch(engine_name, deleted_event_ids)
 
     retry_on_contention(delete, label="purge_mirrors")
@@ -578,6 +584,19 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
                     ),
                 )
             )
+        retained_ids = [
+            event_id for event_id, should_delete in event_rows if not should_delete
+        ]
+        if retained_ids and getattr(self, "_embedded_event_json_enabled", False):
+
+            def mark_outliers() -> None:
+                # Retained events become outliers, as in `events` above.
+                update_event_verdicts(
+                    retained_ids, lambda verdict: verdict._replace(outlier=True)
+                )
+                sync_now(pools=[Pool.EVENT_DAG])
+
+            cleanups.append(("event verdicts", mark_outliers))
         if timeline_rows:
             cleanups.append(
                 (

@@ -83,7 +83,11 @@ from synapse.storage.database import (
     LoggingTransaction,
     make_tuple_in_list_sql_clause,
 )
-from synapse.storage.databases.main.embedded_common import ffi_count
+from synapse.storage.databases.main.embedded_common import (
+    Pool,
+    ffi_count,
+    mark_dirty,
+)
 from synapse.storage.databases.main.embedded_event_edges import (
     embedded_event_edges_is_writable,
     open_embedded_event_edges_engine,
@@ -93,6 +97,10 @@ from synapse.storage.databases.main.embedded_event_edges import (
 from synapse.storage.databases.main.embedded_event_json import (
     get_event_json_batch,
     open_embedded_event_json_engine,
+)
+from synapse.storage.databases.main.embedded_event_verdict import (
+    rejection_code,
+    update_event_verdicts,
 )
 from synapse.storage.databases.main.embedded_redactions import get_redactions_batch
 from synapse.storage.util.id_generators import (
@@ -2978,9 +2986,8 @@ class EventsWorkerStore(SQLBaseStore):
         This can happen, for example, when resyncing state during a faster join.
 
         Update SQL rejection data and schedule local event-cache invalidation.
-        When embedded event JSON is enabled, mirror the rejection change after
-        SQL commit without syncing the embedded engine. Mirror errors propagate
-        from the post-commit callback through runInteraction.
+        When embedded event JSON is enabled, the event's mtxdb verdict is
+        updated before the SQL commit.
 
         It is the caller's responsibility to ensure that other workers are
         sent a notification so that they call `_invalidate_local_get_event_cache()`.
@@ -3025,6 +3032,13 @@ class EventsWorkerStore(SQLBaseStore):
             keyvalues={"event_id": event_id},
             updatevalues={"rejection_reason": rejection_reason},
         )
+
+        if self._embedded_event_json_enabled:
+            code = rejection_code(rejection_reason)
+            update_event_verdicts(
+                [event_id], lambda verdict: verdict._replace(rejection_code=code)
+            )
+            txn.call_after(mark_dirty, Pool.EVENT_DAG)
 
         self.invalidate_get_event_cache_after_txn(txn, event_id)
 

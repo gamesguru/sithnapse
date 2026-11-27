@@ -28,7 +28,8 @@ every event an edge touches.
 
 CSR rows are immutable once written. An individually deleted (retention)
 event's rows stay; every reader resolves the ids it gets back against the SQL
-`events` table, so a missing row cannot resurrect a purged event. A room purge
+`events` table or the event's mtxdb verdict, both removed with the event, so a
+leftover row cannot resurrect a purged event. A room purge
 drops the room's whole scope with `adjacency_purge_room`.
 
 Write ordering: `put_event_edges_batch` runs inside event persistence, before

@@ -56,6 +56,7 @@ from synapse.events import (
 )
 from synapse.events.py_protocol import MSC4242Event, supports_msc4242_state_dag
 from synapse.events.snapshot import EventPersistencePair
+from synapse.logging.context import defer_to_thread
 from synapse.logging.opentracing import trace
 from synapse.metrics import SERVER_NAME_LABEL
 from synapse.storage._base import db_to_json, make_in_list_sql_clause
@@ -97,6 +98,11 @@ from synapse.storage.databases.main.embedded_event_to_state_group import (
     get_state_group_for_events_batch,
     increment_state_group_refcounts_batch,
     put_event_to_state_group_batch,
+)
+from synapse.storage.databases.main.embedded_event_verdict import (
+    get_event_verdicts,
+    put_event_verdicts,
+    verdict_for_event,
 )
 from synapse.storage.databases.main.embedded_redactions import (
     put_redaction_batch,
@@ -957,27 +963,20 @@ class PersistEventsStore:
         """Filter the supplied list of event_ids to get those which are prev_events of
         existing events that are not outliers, rejected, or soft-failed.
 
-        Missing child metadata is treated as not soft-failed after an optional
-        embedded lookup. Storage and metadata decoding errors propagate.
+        Edges and event verdicts both come from mtxdb; storage errors propagate.
 
         Args:
             event_ids: event ids to filter
-            room_id: room the candidates belong to, used for the embedded
-                forward-index lookup
+            room_id: unused; kept for call-site compatibility
 
         Returns:
             Matching event IDs, possibly repeated and in no guaranteed order.
         """
         results: list[str] = []
 
-        def _get_events_which_are_prevs_txn(
-            txn: LoggingTransaction, batch: Collection[str]
-        ) -> None:
-            """Append IDs from ``batch`` referenced by eligible child events to results.
-
-            Exclude outlier, rejected, and soft-failed children. Missing metadata
-            is treated as not soft-failed after an optional embedded lookup.
-            """
+        def _get_events_which_are_prevs_batch(batch: Collection[str]) -> list[str]:
+            """IDs from ``batch`` referenced by eligible child events."""
+            found: list[str] = []
             _t = time.monotonic()
             forward = get_event_edges_forward_batch(list(batch))
             ffi_timing("persist_prevs_mtxdb_forward", time.monotonic() - _t)
@@ -989,45 +988,25 @@ class PersistEventsStore:
                     parents_by_child.setdefault(child_id, []).append(parent_id)
             if not parents_by_child:
                 ffi_count("persist_prevs_mtxdb_empty", len(batch))
-                return
+                return found
 
-            clause, args = make_in_list_sql_clause(
-                self.database_engine, "event_id", list(parents_by_child)
-            )
             _t = time.monotonic()
-            txn.execute(
-                f"""
-                SELECT events.event_id, event_json.internal_metadata
-                FROM events
-                    LEFT JOIN rejections USING (event_id)
-                    LEFT JOIN event_json USING (event_id)
-                WHERE
-                    NOT events.outlier
-                    AND rejections.event_id IS NULL
-                    AND {clause}
-                """,
-                args,
-            )
-            rows = txn.fetchall()
-            ffi_timing("persist_prevs_sql_exec", time.monotonic() - _t)
-            ffi_count("persist_prevs_sql_rows", len(rows))
-            if not rows:
-                return
-
-            missing_meta_ids = [event_id for event_id, meta in rows if meta is None]
-            meta_by_id = self._get_embedded_event_metadata(txn, missing_meta_ids)
-
-            for event_id, meta in rows:
-                if meta is None:
-                    meta = meta_by_id.get(event_id)
-                if not meta or not db_to_json(meta).get("soft_failed"):
-                    results.extend(parents_by_child.get(event_id, ()))
-            return
+            verdicts = get_event_verdicts(list(parents_by_child))
+            ffi_timing("persist_prevs_mtxdb_verdicts", time.monotonic() - _t)
+            for child_id, verdict in verdicts.items():
+                if verdict.outlier or verdict.rejected or verdict.soft_failed:
+                    continue
+                found.extend(parents_by_child[child_id])
+            return found
 
         for chunk in batch_iter(event_ids, 100):
             _t = time.monotonic()
-            await self.db_pool.runInteraction(
-                "_get_events_which_are_prevs", _get_events_which_are_prevs_txn, chunk
+            results.extend(
+                await defer_to_thread(
+                    self.hs.get_reactor(),
+                    _get_events_which_are_prevs_batch,
+                    chunk,
+                )
             )
             ffi_timing("persist_prevs_total", time.monotonic() - _t)
             ffi_count("persist_prevs_candidates", len(chunk))
@@ -1043,8 +1022,8 @@ class PersistEventsStore:
         events and, when enabled, soft-failed events. Recurse through those
         predecessors while they meet the same criteria. Only non-outlier events
         with stored edges are traversed; a starting ID is not included merely
-        because it is rejected or soft-failed. Storage and metadata decoding
-        errors propagate.
+        because it is rejected or soft-failed. Edges and verdicts both come from
+        mtxdb, and storage errors propagate.
 
         This is used to find extremities that are ancestors of new events, but
         are separated by soft failed events.
@@ -1059,81 +1038,44 @@ class PersistEventsStore:
             where traversal stops.
         """
 
+        def _get_prevs_before_rejected_batch(batch: Collection[str]) -> set[str]:
+            found: set[str] = set()
+            to_check = list(batch)
+
+            while to_check:
+                _t = time.monotonic()
+                backward = get_event_edges_backward_batch(to_check)
+                ffi_timing("persist_rejected_mtxdb_backward", time.monotonic() - _t)
+                # An edge row can outlive its event, or precede a persist that
+                # never committed. An event with no verdict is not stored.
+                verdicts = get_event_verdicts(
+                    [event_id for event_id in to_check if backward.get(event_id)]
+                )
+
+                to_check = []
+                for event_id, verdict in verdicts.items():
+                    if verdict.outlier:
+                        continue
+                    if verdict.rejected or (
+                        include_soft_failed and verdict.soft_failed
+                    ):
+                        for prev_event_id in backward[event_id]:
+                            if prev_event_id not in found:
+                                found.add(prev_event_id)
+                                to_check.append(prev_event_id)
+
+            return found
+
         # The set of event_ids to return. This includes all soft-failed events
         # and their prev events.
         existing_prevs: set[str] = set()
 
-        def _get_prevs_before_rejected_txn(
-            txn: LoggingTransaction, batch: Collection[str]
-        ) -> None:
-            """Add predecessors reached through rejected or enabled soft-failed events.
-
-            Start from ``batch`` and update existing_prevs, traversing only
-            non-outlier events with stored edges.
-            """
-            to_recursively_check = list(batch)
-
-            while to_recursively_check:
-                _t = time.monotonic()
-                backward = get_event_edges_backward_batch(to_recursively_check)
-                ffi_timing("persist_rejected_mtxdb_backward", time.monotonic() - _t)
-                present = [
-                    event_id
-                    for event_id in to_recursively_check
-                    if backward.get(event_id) is not None
-                ]
-                if not present:
-                    break
-
-                clause, args = make_in_list_sql_clause(
-                    self.database_engine, "event_id", present
-                )
-                _t = time.monotonic()
-                txn.execute(
-                    f"""
-                    SELECT
-                        events.event_id, event_json.internal_metadata,
-                        rejections.event_id IS NOT NULL
-                    FROM events
-                        LEFT JOIN rejections USING (event_id)
-                        LEFT JOIN event_json USING (event_id)
-                    WHERE
-                        NOT events.outlier
-                        AND {clause}
-                    """,
-                    args,
-                )
-                rows = txn.fetchall()
-                ffi_timing("persist_rejected_sql_exec", time.monotonic() - _t)
-                ffi_count("persist_rejected_sql_rows", len(rows))
-                to_recursively_check = []
-
-                missing_meta_ids = [
-                    event_id for event_id, meta, _ in rows if meta is None
-                ]
-                meta_by_id = self._get_embedded_event_metadata(txn, missing_meta_ids)
-
-                for event_id, metadata, rejected in rows:
-                    edges = backward.get(event_id)
-                    if not edges:
-                        continue
-                    if metadata is None:
-                        metadata = meta_by_id.get(event_id)
-
-                    soft_failed = (
-                        db_to_json(metadata).get("soft_failed") if metadata else False
-                    )
-                    if (include_soft_failed and soft_failed) or rejected:
-                        for prev_event_id in edges:
-                            if prev_event_id in existing_prevs:
-                                continue
-                            to_recursively_check.append(prev_event_id)
-                            existing_prevs.add(prev_event_id)
-
         for chunk in batch_iter(event_ids, 100):
             _t = time.monotonic()
-            await self.db_pool.runInteraction(
-                "_get_prevs_before_rejected", _get_prevs_before_rejected_txn, chunk
+            existing_prevs.update(
+                await defer_to_thread(
+                    self.hs.get_reactor(), _get_prevs_before_rejected_batch, chunk
+                )
             )
             ffi_timing("persist_rejected_total", time.monotonic() - _t)
             ffi_count("persist_rejected_candidates", len(chunk))
@@ -1379,6 +1321,29 @@ class PersistEventsStore:
                     for event, _ in de_outliered_events
                 ],
                 sync=False,
+                transaction=mtxdb_txn,
+            )
+            # The event keeps whatever rejection it was stored with.
+            stored = get_event_verdicts(
+                [event.event_id for event, _ in de_outliered_events]
+            )
+            missing = [
+                event.event_id
+                for event, _ in de_outliered_events
+                if event.event_id not in stored
+            ]
+            if missing:
+                raise RuntimeError(
+                    f"no mtxdb verdict record for stored outlier events {missing}"
+                )
+            put_event_verdicts(
+                {
+                    event.event_id: verdict_for_event(event, None)._replace(
+                        outlier=False,
+                        rejection_code=stored[event.event_id].rejection_code,
+                    )
+                    for event, _ in de_outliered_events
+                },
                 transaction=mtxdb_txn,
             )
 
@@ -3241,6 +3206,13 @@ class PersistEventsStore:
                 # with the state and auth-chain writes that come after it, so
                 # the persist pays a single fsync instead of one per stage.
                 sync=False,
+                transaction=mtxdb_txn,
+            )
+            put_event_verdicts(
+                {
+                    event.event_id: verdict_for_event(event, context.rejected)
+                    for event, context in events_and_contexts
+                },
                 transaction=mtxdb_txn,
             )
             if publishes_at_commit():
