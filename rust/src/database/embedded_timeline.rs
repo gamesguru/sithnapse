@@ -24,7 +24,7 @@
 use std::ops::Bound as RangeBound;
 use std::sync::Mutex;
 
-use mtxdb::ordered_timeline::{
+use mtxdb::event_timeline::{
     open_event_timeline_indexes, stage_event_timeline_batch, stage_purge_room_timeline,
     stage_remove_event_timeline_batch, EventStreamKey, EventTimelineEntry, EventTopoKey,
     ReadCommittedEngine,
