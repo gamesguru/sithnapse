@@ -375,7 +375,23 @@
         font-weight: 600;
         color: #ffffff;
         letter-spacing: 0.02em;
-        white-space: nowrap;
+        min-width: 0;
+        white-space: normal;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+        line-height: 1.2;
+      }
+
+      .telemetry-pair {
+        display: flex;
+        align-items: baseline;
+        gap: 0.45rem;
+        flex-wrap: wrap;
+        min-width: 0;
+      }
+
+      .telemetry-pair .telemetry-value {
+        font-size: 1.1rem;
       }
 
       .telemetry-sub {
@@ -383,78 +399,11 @@
         font-size: 0.62rem;
         color: var(--accent);
         opacity: 0.85;
-        white-space: nowrap;
-      }
-
-      .sync-bar {
-        display: flex;
-        align-items: center;
-        gap: 0.75rem;
-        background: rgba(0, 0, 0, 0.4);
-        border: 1px dashed var(--border);
-        border-radius: 4px;
-        padding: 0.6rem 1rem;
-        font-family: var(--font-mono);
-        font-size: 0.75rem;
-        color: var(--text-muted);
-      }
-
-      .sync-input {
-        background: rgba(255, 255, 255, 0.05);
-        border: 1px solid var(--border);
-        color: #fff;
-        font-family: var(--font-mono);
-        font-size: 0.75rem;
-        padding: 0.35rem 0.6rem;
-        border-radius: 3px;
-        flex: 1;
-        outline: none;
-        transition: border-color 0.2s;
-      }
-
-      .sync-input:focus {
-        border-color: var(--accent);
-      }
-
-      .sync-btn {
-        background: var(--accent);
-        border: none;
-        color: #fff;
-        font-family: var(--font-mono);
-        font-size: 0.7rem;
-        font-weight: 600;
-        letter-spacing: 0.05em;
-        padding: 0.4rem 0.8rem;
-        border-radius: 3px;
-        cursor: pointer;
-        transition:
-          opacity 0.2s,
-          transform 0.1s;
-      }
-
-      .sync-btn:hover {
-        opacity: 0.9;
-      }
-
-      .sync-btn:active {
-        transform: scale(0.97);
-      }
-
-      .sync-toggle-btn {
-        background: transparent;
-        border: 1px solid var(--border);
-        color: var(--text-muted);
-        font-family: var(--font-mono);
-        font-size: 0.7rem;
-        padding: 0.3rem 0.6rem;
-        border-radius: 3px;
-        cursor: pointer;
-        transition: all 0.2s ease;
-      }
-
-      .sync-toggle-btn:hover {
-        border-color: var(--accent);
-        color: #fff;
+        min-width: 0;
+        white-space: normal;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+        line-height: 1.35;
       }
 
       footer {
@@ -491,7 +440,7 @@
       <header>
         <div class="node-title" id="server-title">
           <span id="server-title-text"
-            >Sithnapse (Synapse Dark... but runs like it's lite)</span
+            >Sithnapse (Synapse Dark, but runs lite)</span
           >
         </div>
         <div class="node-status">
@@ -526,62 +475,84 @@
       <!-- Dark Telemetry Dashboard Section -->
       <section class="telemetry-grid">
         <div class="telemetry-card">
-          <span class="telemetry-label">Souls Corrupted</span>
-          <span class="telemetry-value" id="stat-souls">...</span>
-          <span class="telemetry-sub" id="stat-souls-sub"
-            >REGISTERED DB SOULS</span
+          <span class="telemetry-label"
+            >Galactic Mesh &amp;<br />Dark Sanctums</span
+          >
+          <span class="telemetry-pair">
+            <span class="telemetry-value" id="stat-galactic">...</span>
+            <span class="telemetry-sub">SERVERS</span>
+          </span>
+          <span class="telemetry-pair">
+            <span class="telemetry-value" id="stat-sanctums">...</span>
+            <span class="telemetry-sub">FED. ROOMS</span>
+          </span>
+        </div>
+
+        <div class="telemetry-card">
+          <span class="telemetry-label">Members of the Order</span>
+          <span class="telemetry-pair">
+            <span class="telemetry-value" id="stat-jedi">--</span>
+            <span class="telemetry-sub" id="stat-jedi-sub">GALACTIC POP.</span>
+          </span>
+          <span class="telemetry-pair">
+            <span class="telemetry-value" id="stat-jedi-local">--</span>
+            <span class="telemetry-sub">RESIDENT SITH</span>
+          </span>
+        </div>
+
+        <div class="telemetry-card">
+          <span class="telemetry-label">Holocron Vault</span>
+          <span class="telemetry-pair">
+            <span class="telemetry-value" id="stat-postgres">...</span>
+            <span class="telemetry-sub">PSQL (DISK)</span>
+          </span>
+          <span class="telemetry-pair">
+            <span class="telemetry-value" id="stat-postgres-memory">...</span>
+            <span class="telemetry-sub">PSQL (MEM / PSS)</span>
+          </span>
+          <span class="telemetry-pair">
+            <span class="telemetry-value" id="stat-mtxdb">...</span>
+            <span class="telemetry-sub">MTXDB (DISK)</span>
+          </span>
+          <span class="telemetry-pair">
+            <span class="telemetry-value" id="stat-mtxdb-index">...</span>
+            <span class="telemetry-sub">MTXDB (INDEX)</span>
+          </span>
+          <span class="telemetry-pair">
+            <span class="telemetry-value" id="stat-mtxdb-wal">...</span>
+            <span class="telemetry-sub">MTXDB (WAL)</span>
+          </span>
+          <span class="telemetry-sub" id="stat-mtxdb-sub"
+            >EVENTS · STATE · ON DISK</span
           >
         </div>
 
         <div class="telemetry-card">
-          <span class="telemetry-label">Galactic Mesh</span>
-          <span class="telemetry-value" id="stat-galactic">...</span>
-          <span class="telemetry-sub" id="stat-galactic-sub"
-            >FEDERATED PEERS</span
+          <span class="telemetry-label"
+            >Force Resonance &amp;<br />Force Latency</span
           >
-        </div>
-
-        <div class="telemetry-card">
-          <span class="telemetry-label">Dark Sanctums</span>
-          <span class="telemetry-value" id="stat-sanctums">...</span>
-          <span class="telemetry-sub" id="stat-sanctums-sub">KNOWN ROOMS</span>
-        </div>
-
-        <div class="telemetry-card">
-          <span class="telemetry-label">Force Latency</span>
-          <span class="telemetry-value" id="stat-latency">-- ms</span>
-          <span class="telemetry-sub">DARK SIDE ROUND TRIP</span>
+          <span class="telemetry-pair">
+            <span class="telemetry-value" id="stat-memory">--</span>
+            <span class="telemetry-sub">PROC MEM · RSS</span>
+          </span>
+          <span class="telemetry-pair">
+            <span class="telemetry-value" id="stat-latency">-- ms</span>
+            <span class="telemetry-sub">DARK SIDE ROUND TRIP</span>
+          </span>
+          <span class="telemetry-pair">
+            <span class="telemetry-value" id="stat-uptime">--</span>
+            <span class="telemetry-sub">UPTIME · SINCE RESTART</span>
+          </span>
         </div>
 
         <div class="telemetry-card">
           <span class="telemetry-label">Matrix Protocol</span>
           <span class="telemetry-value" id="stat-spec">...</span>
           <span class="telemetry-sub" id="stat-engine-sub"
-            >SERVER SPEC LEVEL</span
+            >SITHNAPSE VERSION</span
           >
         </div>
       </section>
-
-      <!-- Admin Token Synchronization Bar -->
-      <div class="sync-bar" id="sync-container" style="display: none">
-        <label for="admin-token-input">⚡ ADMIN DB PROBE:</label>
-        <input
-          type="password"
-          id="admin-token-input"
-          class="sync-input"
-          placeholder="Paste Synapse Admin Access Token for live DB metrics"
-        />
-        <button type="button" class="sync-btn" onclick="saveAdminToken()">
-          SYNC STATS
-        </button>
-        <button
-          type="button"
-          class="sync-toggle-btn"
-          onclick="clearAdminToken()"
-        >
-          CLEAR
-        </button>
-      </div>
 
       <section class="secondary-section">
         <div class="secondary-header">
@@ -595,32 +566,27 @@
           >
             ◈ ROTATE MANUSCRIPT (<span id="manuscript-index">1</span>/<span
               id="manuscript-total"
-              >9</span
+              >13</span
             >)
           </button>
         </div>
         <div class="secondary-quote quote-fade" id="manuscript-quote">
-          From the purely biological point of view it is unfortunate that the
-          destructive side of technique has advanced so very much more rapidly
-          than the creative side. In one moment a man may kill 500,000 people,
-          but he cannot have children any quicker than in the days of our savage
-          ancestors. If a man could have 500,000 children as quickly as by an
-          atomic bomb he can destroy 500,000 enemies, we might, at the cost of
-          enormous suffering, leave the biological problem to the struggle for
-          existence and the survival of the fittest. But in the modern world the
-          old mechanism of evolution can no longer be relied upon.
+          He knew by his skill in the stars while it was yet winter that there
+          would be a great harvest of olives in the coming year; so, having a
+          little money, he gave deposits for the use of all the olive-presses in
+          Chios and Miletus, which he hired at a low price because no one bid
+          against him. When the harvest time came, and many were wanted all at
+          once and of a sudden, he let them out at any rate which he pleased,
+          and made a quantity of money. Thus he showed the world that
+          philosophers can easily be rich if they like, but that their ambition
+          is of another sort.
         </div>
         <div class="secondary-author quote-fade" id="manuscript-author">
-          ~ Bertrand Russell, 1949: "Authority and the Individual"
+          ~ Bertrand Russell, 1945: "A History of Western Philosophy", Chapter 1
         </div>
       </section>
 
       <footer>
-        <div>
-          <button class="sync-toggle-btn" onclick="toggleSyncBar()">
-            ⚡ SYNC LIVE DB METRICS
-          </button>
-        </div>
         <div>
           <a
             href="https://matrix.org/ecosystem/clients/"
@@ -641,18 +607,21 @@
     <script>
       const MANUSCRIPTS = [
         {
+          quote: `He knew by his skill in the stars while it was yet winter that there would be a great harvest of olives in the coming year; so, having a little money, he gave deposits for the use of all the olive-presses in Chios and Miletus, which he hired at a low price because no one bid against him. When the harvest time came, and many were wanted all at once and of a sudden, he let them out at any rate which he pleased, and made a quantity of money. Thus he showed the world that philosophers can easily be rich if they like, but that their ambition is of another sort.`,
+          author:
+            '~ Bertrand Russell, 1945: "A History of Western Philosophy", Chapter 1',
+        },
+        {
           quote: `From the purely biological point of view it is unfortunate that the destructive side of technique has advanced so very much more rapidly than the creative side. In one moment a man may kill 500,000 people, but he cannot have children any quicker than in the days of our savage ancestors. If a man could have 500,000 children as quickly as by an atomic bomb he can destroy 500,000 enemies, we might, at the cost of enormous suffering, leave the biological problem to the struggle for existence and the survival of the fittest. But in the modern world the old mechanism of evolution can no longer be relied upon.`,
           author: '~ Bertrand Russell, 1949: "Authority and the Individual"',
         },
-        {
-          quote: `See, I'm not a monster. I'm just ahead of the curve.`,
-          author: '~ The Joker, 2008: "The Dark Knight"',
-        },
-        {
-          quote: `For countless ages the hot nebula whirled aimlessly through space. At length it began to take shape, the central mass threw off planets, the planets cooled, boiling seas and burning mountains heaved and tossed, from black masses of cloud hot sheets of rain deluged the barely solid crust. And now the first germ of life grew in the depths of the ocean, and developed rapidly in the fructifying warmth into vast forest trees, huge ferns springing from the damp mould, sea monsters breeding, fighting, devouring, and passing away. And from the monsters, as the play unfolded itself, Man was born, with the power of thought, the knowledge of good and evil... proudly defiant of the irresistible forces that tolerate, for a moment, his knowledge and his condemnation, to sustain alone, a weary but unyielding Atlas, the world that his own ideals have fashioned despite the trampling march of unconscious power.`,
-          author: '~ Bertrand Russell, 1903: "A Free Man\'s Worship"',
-          link: "https://www.freddoso.com/courses/264/fmw.htm",
-        },
+        /* Disabled manuscript
+          {
+            quote: `For countless ages the hot nebula whirled aimlessly through space. At length it began to take shape, the central mass threw off planets, the planets cooled, boiling seas and burning mountains heaved and tossed, from black masses of cloud hot sheets of rain deluged the barely solid crust. And now the first germ of life grew in the depths of the ocean, and developed rapidly in the fructifying warmth into vast forest trees, huge ferns springing from the damp mould, sea monsters breeding, fighting, devouring, and passing away. And from the monsters, as the play unfolded itself, Man was born, with the power of thought, the knowledge of good and evil... proudly defiant of the irresistible forces that tolerate, for a moment, his knowledge and his condemnation, to sustain alone, a weary but unyielding Atlas, the world that his own ideals have fashioned despite the trampling march of unconscious power.`,
+            author: '~ Bertrand Russell, 1903: "A Free Man\'s Worship"',
+            link: "https://www.freddoso.com/courses/264/fmw.htm",
+          },
+        */
         {
           quote: `The surest way to corrupt a youth is to instruct him to hold in higher esteem those who think alike than those who think differently.`,
           author: '~ Friedrich Nietzsche, 1881: "Daybreak (The Dawn)"',
@@ -675,22 +644,30 @@
             '~ Roger Williams, 1994: "The Metamorphosis of Prime Intellect: a novel of the singularity"',
           link: "https://en.wikipedia.org/wiki/The_Metamorphosis_of_Prime_Intellect",
         },
-        {
-          quote: `Man is a rational animal—so at least I have been told. Throughout a long life, I have looked diligently for evidence in favour of this statement, but so far I have not had the good fortune to come across it, though I have searched in many countries spread over three continents.`,
-          author: '~ Bertrand Russell, 1950: "Unpopular Essays"',
-          link: "https://en.wikipedia.org/wiki/Unpopular_Essays",
-        },
+        /* Disabled manuscript
+          {
+            quote: `Man is a rational animal—so at least I have been told. Throughout a long life, I have looked diligently for evidence in favour of this statement, but so far I have not had the good fortune to come across it, though I have searched in many countries spread over three continents.`,
+            author: '~ Bertrand Russell, 1950: "Unpopular Essays"',
+            link: "https://en.wikipedia.org/wiki/Unpopular_Essays",
+          },
+        */
         {
           quote: `The great majority of men and women, in ordinary times, pass through life without ever contemplating or criticising, as a whole, either their own conditions or those of the world at large. They find themselves born into a certain place in society, and they accept what each day brings forth, without any effort of thought beyond what the immediate present requires. Almost as instinctively as the beasts of the field, they seek the satisfaction of the needs of the moment, without much forethought, and without considering that by sufficient effort the whole conditions of their lives could be changed. A certain percentage, guided by personal ambition, make the effort of thought and will which is necessary to place themselves among the more fortunate members of the community; but very few among these are seriously concerned to secure for all the advantages which they seek for themselves. It is only a few rare and exceptional men who have that kind of love toward mankind at large that makes them unable to endure patiently the general mass of evil and suffering, regardless of any relation it may have to their own lives.`,
           author:
             '~ Bertrand Russell, 1918: "Proposed Roads to Freedom: Socialism, Anarchism and Syndicalism"',
           link: "https://www.gutenberg.org/ebooks/690",
         },
+        /* Disabled manuscript
+          {
+            quote: `The formulae... defeated me completely; I had never seen anything in the least like them before. A single look at them is enough to show that they could only have been written by a mathematician of the highest class. They must be true because, if they were not true, no one would have the imagination to invent them.`,
+            author:
+              '~ G. H. Hardy, 1940: "Ramanujan: Twelve Lectures on Subjects Suggested by His Life and Work"',
+            link: "https://en.wikipedia.org/wiki/Srinivasa_Ramanujan",
+          },
+        */
         {
-          quote: `The formulae... defeated me completely; I had never seen anything in the least like them before. A single look at them is enough to show that they could only have been written by a mathematician of the highest class. They must be true because, if they were not true, no one would have the imagination to invent them.`,
-          author:
-            '~ G. H. Hardy, 1940: "Ramanujan: Twelve Lectures on Subjects Suggested by His Life and Work"',
-          link: "https://en.wikipedia.org/wiki/Srinivasa_Ramanujan",
+          quote: `See, I'm not a monster. I'm just ahead of the curve.`,
+          author: '~ The Joker, 2008: "The Dark Knight"',
         },
         {
           quote: `Man is the only creature who refuses to be what he is.`,
@@ -705,6 +682,16 @@
           quote: `Those who can make you believe absurdities can make you commit atrocities.`,
           author: '~ Voltaire, 1765: "Questions sur les miracles"',
           link: "https://en.wikiquote.org/wiki/Voltaire",
+        },
+        {
+          quote: `The bitterness of poor quality remains long after the sweetness of low price is forgotten.`,
+          author: "~ Benjamin Franklin (attributed): Goodreads",
+          link: "https://www.goodreads.com/quotes/8373797-the-bitterness-of-poor-quality-remains-long-after-the-sweetness",
+        },
+        {
+          quote: `Perfection is achieved, not when there is nothing more to add, but when there is nothing left to take away.`,
+          author: '~ Antoine de Saint-Exupéry, 1939: "Terre des hommes"',
+          link: "https://www.goodreads.com/quotes/19905-perfection-is-achieved-not-when-there-is-nothing-more-to",
         },
       ];
 
@@ -760,83 +747,154 @@
       // Initialize with a random manuscript on load
       renderManuscript(currentManuscriptIdx);
 
-      function toggleSyncBar() {
-        const el = document.getElementById("sync-container");
-        if (el)
-          el.style.display = el.style.display === "none" ? "flex" : "none";
-      }
-
-      let adminToken = "";
-
-      function saveAdminToken() {
-        const input = document.getElementById("admin-token-input");
-        if (!input) return;
-        const token = input.value.trim();
-        if (token) {
-          adminToken = token;
-          measureTelemetry();
+      function formatBytes(bytes) {
+        if (typeof bytes !== "number" || !isFinite(bytes)) return "...";
+        if (bytes < 1024) return `${bytes} B`;
+        const units = ["KB", "MB", "GB", "TB"];
+        let value = bytes / 1024;
+        let unit = 0;
+        while (value >= 1024 && unit < units.length - 1) {
+          value /= 1024;
+          unit++;
         }
+        return `${value.toFixed(value >= 100 ? 0 : 1)} ${units[unit]}`;
       }
 
-      function clearAdminToken() {
-        adminToken = "";
-        const input = document.getElementById("admin-token-input");
-        if (input) input.value = "";
-        measureTelemetry();
+      function formatUptime(seconds) {
+        if (typeof seconds !== "number" || !isFinite(seconds)) return "--";
+        const d = Math.floor(seconds / 86400);
+        const h = Math.floor((seconds % 86400) / 3600);
+        const m = Math.floor((seconds % 3600) / 60);
+        if (d > 0) return `${d}d ${h}h`;
+        if (h > 0) return `${h}h ${m}m`;
+        return `${m}m`;
+      }
+
+      function formatCompact(value) {
+        if (typeof value !== "number" || !isFinite(value)) return "...";
+        return new Intl.NumberFormat(undefined, {
+          notation: "compact",
+          maximumFractionDigits: 1,
+        }).format(value);
+      }
+
+      function renderServerVersion(version) {
+        if (typeof version !== "string" || !version.trim()) return;
+        const cleanVersion = version.trim().replace(/^Synapse\//, "");
+        const versionEl = document.getElementById("stat-engine-sub");
+        if (versionEl)
+          versionEl.textContent = `Sithnapse v${cleanVersion.replace(/^v/, "")}`;
       }
 
       async function measureTelemetry() {
         const startTime = performance.now();
-        const token = adminToken;
 
-        // 1. Optional authenticated server DB stats endpoint. It is disabled by
-        // default and requires both an admin token and stats.server_stats_endpoint_enabled.
-        let dbStatsLoaded = false;
-        try {
-          const statsRes = token
-            ? await fetch("/_synapse/client/server_stats", {
-                headers: { Authorization: `Bearer ${token}` },
-              })
-            : null;
-          if (statsRes && statsRes.ok) {
-            const stats = await statsRes.json();
-            dbStatsLoaded = true;
+        // 1. Public aggregate stats.
+        let publicRoomsLoaded = false;
+        // Optional and independent: it must not delay the core versions
+        // request below, so it is not awaited and is bounded.
+        (async () => {
+          try {
+            const publicStatsRes = await fetch(
+              "/_synapse/client/public_stats",
+              {
+                signal: AbortSignal.timeout(5000),
+              },
+            );
+            if (publicStatsRes.ok) {
+              const stats = await publicStatsRes.json();
 
-            const soulsEl = document.getElementById("stat-souls");
-            const soulsSubEl = document.getElementById("stat-souls-sub");
-            if (soulsEl && typeof stats.total_users === "number") {
-              soulsEl.textContent = stats.total_users.toLocaleString();
-              if (soulsSubEl) soulsSubEl.textContent = "REGISTERED DB SOULS";
+              if (typeof stats.server_version === "string") {
+                renderServerVersion(stats.server_version);
+              }
+
+              if (typeof stats.total_destinations === "number") {
+                const galacticEl = document.getElementById("stat-galactic");
+                if (galacticEl)
+                  galacticEl.textContent =
+                    stats.total_destinations.toLocaleString();
+              }
+              if (
+                stats.database &&
+                typeof stats.database.ever_seen_users === "number"
+              ) {
+                const jediEl = document.getElementById("stat-jedi");
+                if (jediEl)
+                  jediEl.textContent =
+                    stats.database.ever_seen_users.toLocaleString();
+              }
+              if (
+                stats.database &&
+                typeof stats.database.local_users === "number"
+              ) {
+                const jediLocalEl = document.getElementById("stat-jedi-local");
+                if (jediLocalEl)
+                  jediLocalEl.textContent =
+                    stats.database.local_users.toLocaleString();
+              }
+              if (typeof stats.total_rooms === "number") {
+                const sanctumsEl = document.getElementById("stat-sanctums");
+                if (sanctumsEl)
+                  sanctumsEl.textContent = stats.total_rooms.toLocaleString();
+                publicRoomsLoaded = true;
+              }
+              const db = stats.database;
+              if (db && typeof db === "object") {
+                if (typeof db.postgres_bytes === "number") {
+                  const pgEl = document.getElementById("stat-postgres");
+                  if (pgEl) pgEl.textContent = formatBytes(db.postgres_bytes);
+                }
+                if (typeof db.postgres_pss_bytes === "number") {
+                  const pgMemoryEl = document.getElementById(
+                    "stat-postgres-memory",
+                  );
+                  if (pgMemoryEl)
+                    pgMemoryEl.textContent = formatBytes(db.postgres_pss_bytes);
+                }
+                if (typeof db.mtxdb_bytes === "number") {
+                  const mtxdbEl = document.getElementById("stat-mtxdb");
+                  if (mtxdbEl)
+                    mtxdbEl.textContent = formatBytes(db.mtxdb_bytes);
+                }
+                if (typeof db.mtxdb_index_bytes === "number") {
+                  const indexEl = document.getElementById("stat-mtxdb-index");
+                  if (indexEl)
+                    indexEl.textContent = formatBytes(db.mtxdb_index_bytes);
+                }
+                if (typeof db.mtxdb_wal_bytes === "number") {
+                  const walEl = document.getElementById("stat-mtxdb-wal");
+                  if (walEl)
+                    walEl.textContent = formatBytes(db.mtxdb_wal_bytes);
+                }
+
+                const dbParts = [];
+                if (typeof db.events === "number")
+                  dbParts.push(`${formatCompact(db.events)} EVENTS`);
+                if (typeof db.state_events === "number")
+                  dbParts.push(`${formatCompact(db.state_events)} STATE`);
+                if (dbParts.length) {
+                  const subEl = document.getElementById("stat-mtxdb-sub");
+                  if (subEl) subEl.textContent = dbParts.join(" · ");
+                }
+              }
+
+              const uptimeEl = document.getElementById("stat-uptime");
+              if (uptimeEl)
+                uptimeEl.textContent = formatUptime(stats.uptime_seconds);
+
+              const memory = stats.memory;
+              if (
+                memory &&
+                typeof memory === "object" &&
+                typeof memory.rss_bytes === "number"
+              ) {
+                const memoryEl = document.getElementById("stat-memory");
+                if (memoryEl)
+                  memoryEl.textContent = formatBytes(memory.rss_bytes);
+              }
             }
-
-            const galacticEl = document.getElementById("stat-galactic");
-            const galacticSubEl = document.getElementById("stat-galactic-sub");
-            if (galacticEl && typeof stats.total_destinations === "number") {
-              galacticEl.textContent =
-                stats.total_destinations.toLocaleString();
-              if (galacticSubEl) galacticSubEl.textContent = "FEDERATED PEERS";
-            }
-
-            const sanctumsEl = document.getElementById("stat-sanctums");
-            const sanctumsSubEl = document.getElementById("stat-sanctums-sub");
-            if (sanctumsEl && typeof stats.total_rooms === "number") {
-              sanctumsEl.textContent = stats.total_rooms.toLocaleString();
-              if (sanctumsSubEl)
-                sanctumsSubEl.textContent = "ACTIVE DATABASE SANCTUMS";
-            }
-
-            if (stats.server_version) {
-              const vStr = stats.server_version.startsWith("v")
-                ? stats.server_version
-                : `v${stats.server_version}`;
-              const titleEl = document.getElementById("server-title-text");
-              const engineEl = document.getElementById("stat-engine-sub");
-              if (titleEl)
-                titleEl.textContent = `Sithnapse ${vStr} (Synapse Dark... but runs like it's lite)`;
-              if (engineEl) engineEl.textContent = `Sithnapse ${vStr}`;
-            }
-          }
-        } catch (e) {}
+          } catch (e) {}
+        })();
 
         // 2. Matrix Spec & Core Ping
         try {
@@ -859,128 +917,57 @@
           }
         } catch (err) {
           const latencyEl = document.getElementById("stat-latency");
-          const specEl = document.getElementById("stat-spec");
-          if (latencyEl) latencyEl.textContent = "unavailable";
-          if (specEl) specEl.textContent = "unavailable";
+          if (latencyEl) latencyEl.textContent = "-- ms";
         }
 
-        // 3. Fallback discovery if server_stats endpoint is not available
-        if (!dbStatsLoaded) {
-          try {
-            const fedRes = await fetch("/_matrix/federation/v1/version");
-            if (fedRes.ok) {
-              const fedData = await fedRes.json();
-              if (fedData.server && fedData.server.version) {
-                const vStr = fedData.server.version.startsWith("v")
-                  ? fedData.server.version
-                  : `v${fedData.server.version}`;
-                const titleEl = document.getElementById("server-title-text");
-                const engineEl = document.getElementById("stat-engine-sub");
-                if (titleEl)
-                  titleEl.textContent = `Sithnapse ${vStr} (Synapse Dark... but runs like it's lite)`;
-                if (engineEl) engineEl.textContent = `Sithnapse ${vStr}`;
-              }
-            }
-          } catch (e) {}
+        // 3. Fallback discovery if public stats are not available
+        try {
+          const fedRes = await fetch("/_matrix/federation/v1/version");
+          if (fedRes.ok) {
+            const fedData = await fedRes.json();
+            if (fedData.server && fedData.server.version)
+              renderServerVersion(fedData.server.version);
+          }
+        } catch (e) {}
 
-          try {
-            const roomsRes = await fetch(
-              "/_matrix/client/v3/publicRooms?limit=1",
-            );
-            const sanctumsEl = document.getElementById("stat-sanctums");
-            if (roomsRes.ok) {
-              const roomsData = await roomsRes.json();
-              const count =
-                typeof roomsData.total_room_count_estimate === "number"
-                  ? roomsData.total_room_count_estimate
-                  : 0;
-              if (sanctumsEl && sanctumsEl.textContent === "...") {
-                sanctumsEl.textContent = count.toLocaleString();
-              }
-            }
-          } catch (e) {}
-        }
-
-        // 4. Authenticated Admin Database Override (if token explicitly supplied)
-        if (token) {
-          const authHeaders = { Authorization: `Bearer ${token}` };
-
-          try {
-            const usersRes = await fetch("/_synapse/admin/v2/users?limit=1", {
-              headers: authHeaders,
-            });
-            if (usersRes.ok) {
-              const usersData = await usersRes.json();
-              if (typeof usersData.total === "number") {
-                const soulsEl = document.getElementById("stat-souls");
-                const soulsSubEl = document.getElementById("stat-souls-sub");
-                if (soulsEl)
-                  soulsEl.textContent = usersData.total.toLocaleString();
-                if (soulsSubEl)
-                  soulsSubEl.textContent = "EXACT DB REGISTERED USERS";
-              }
-            }
-          } catch (e) {}
-
-          try {
-            const allRoomsRes = await fetch(
-              "/_synapse/admin/v1/rooms?limit=1",
-              {
-                headers: authHeaders,
-              },
-            );
-            if (allRoomsRes.ok) {
-              const allRoomsData = await allRoomsRes.json();
-              if (typeof allRoomsData.total_rooms === "number") {
-                const sanctumsEl = document.getElementById("stat-sanctums");
-                const sanctumsSubEl =
-                  document.getElementById("stat-sanctums-sub");
-                if (sanctumsEl)
-                  sanctumsEl.textContent =
-                    allRoomsData.total_rooms.toLocaleString();
-                if (sanctumsSubEl)
-                  sanctumsSubEl.textContent = "TOTAL DB ROOMS (ALL)";
-              }
-            }
-          } catch (e) {}
-
-          try {
-            const destRes = await fetch(
-              "/_synapse/admin/v1/federation/destinations?limit=1",
-              { headers: authHeaders },
-            );
-            if (destRes.ok) {
-              const destData = await destRes.json();
-              if (typeof destData.total === "number") {
-                const galacticEl = document.getElementById("stat-galactic");
-                const galacticSubEl =
-                  document.getElementById("stat-galactic-sub");
-                if (galacticEl)
-                  galacticEl.textContent = destData.total.toLocaleString();
-                if (galacticSubEl)
-                  galacticSubEl.textContent = "EXACT FEDERATED PEERS";
-              }
-            }
-          } catch (e) {}
-        } else if (!dbStatsLoaded) {
-          const soulsEl = document.getElementById("stat-souls");
-          const soulsSubEl = document.getElementById("stat-souls-sub");
-          const galacticEl = document.getElementById("stat-galactic");
-          const galacticSubEl = document.getElementById("stat-galactic-sub");
+        try {
+          const roomsRes = await fetch(
+            "/_matrix/client/v3/publicRooms?limit=1",
+          );
           const sanctumsEl = document.getElementById("stat-sanctums");
+          if (roomsRes.ok) {
+            const roomsData = await roomsRes.json();
+            const count =
+              typeof roomsData.total_room_count_estimate === "number"
+                ? roomsData.total_room_count_estimate
+                : 0;
+            if (
+              sanctumsEl &&
+              !publicRoomsLoaded &&
+              sanctumsEl.textContent === "..."
+            ) {
+              sanctumsEl.textContent = count.toLocaleString();
+            }
+          }
+        } catch (e) {}
 
-          if (soulsEl && soulsEl.textContent === "...") {
-            soulsEl.textContent = "LOCKED";
-            if (soulsSubEl)
-              soulsSubEl.textContent = "AUTH REQUIRED FOR DB COUNT";
-          }
-          if (galacticEl && galacticEl.textContent === "...") {
-            galacticEl.textContent = "0";
-            if (galacticSubEl) galacticSubEl.textContent = "FEDERATED PEERS";
-          }
-          if (sanctumsEl && sanctumsEl.textContent === "...") {
-            sanctumsEl.textContent = "0";
-          }
+        // Counts that never arrived are shown as unavailable rather than 0, so
+        // a disabled endpoint is not mistaken for a real empty database.
+        for (const [id, fallback] of [
+          ["stat-galactic", "--"],
+          ["stat-jedi", "--"],
+          ["stat-jedi-local", "--"],
+          ["stat-sanctums", "--"],
+          ["stat-postgres", "--"],
+          ["stat-postgres-memory", "--"],
+          ["stat-mtxdb", "--"],
+          ["stat-mtxdb-index", "--"],
+          ["stat-mtxdb-wal", "--"],
+          ["stat-memory", "--"],
+          ["stat-spec", "--"],
+        ]) {
+          const el = document.getElementById(id);
+          if (el && el.textContent === "...") el.textContent = fallback;
         }
       }
 

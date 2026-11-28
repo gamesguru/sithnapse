@@ -367,7 +367,6 @@ class RedactionTestCase(unittest.HomeserverTestCase):
 
             found = get_event_json_batch(
                 self.store._embedded_db_engine,
-                self.store._embedded_db_namespace,
                 [msg_event.event_id],
             )
             event_json = found[msg_event.event_id][1]
@@ -397,7 +396,6 @@ class RedactionTestCase(unittest.HomeserverTestCase):
 
             found = get_event_json_batch(
                 self.store._embedded_db_engine,
-                self.store._embedded_db_namespace,
                 [msg_event.event_id],
             )
             event_json = found[msg_event.event_id][1]
@@ -426,20 +424,20 @@ class RedactionTestCase(unittest.HomeserverTestCase):
         such row -- the stored JSON is the only source of truth -- so it's
         the case that actually exercises _censor_event_txn's write.
         """
-        import shutil
-        import tempfile
-
-        from synapse.synapse_rust import mtxdb_engine
-
-        tmpdir = tempfile.mkdtemp(prefix="test-expire-embedded-")
-        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
-        mtxdb_engine.open_client(tmpdir)
         self.store._embedded_event_json_enabled = True
         self.store._embedded_db_engine = "mtxdb"
         persist_store = self.hs.get_datastores().persist_events
         assert persist_store is not None
         persist_store._embedded_event_json_enabled = True
         persist_store._embedded_db_engine = "mtxdb"
+
+        # Create the room after enabling the mirror, so its create event and
+        # HAMT roots are written through it rather than relying on whether the
+        # homeserver's config had the mirror on when `prepare` ran.
+        self.room1 = RoomID.from_string("!expire-embedded:test")
+        self.get_success(
+            create_room(self.hs, self.room1.to_string(), self.u_alice.to_string())
+        )
 
         self.inject_room_member(self.room1, self.u_alice, Membership.JOIN)
         msg_event = self.inject_message(self.room1, self.u_alice, "t")

@@ -380,6 +380,134 @@ class RoomMemberMasterHandlerTestCase(HomeserverTestCase):
         """Tests that a user cannot forget a room that they are still in."""
         self.get_failure(self.handler.forget(self.alice_ID, self.room_id), SynapseError)
 
+    def test_retried_room_upgrade_does_not_overwrite_changed_tags(self) -> None:
+        """A retry of a completed upgrade transfer leaves new-room tags alone."""
+        account_data_handler = self.hs.get_account_data_handler()
+        tag = "m.favourite"
+        old_tag_content = {"order": 0.5}
+        self.get_success(
+            account_data_handler.add_tag_to_room(
+                self.alice, self.room_id, tag, old_tag_content
+            )
+        )
+
+        new_room_id = self.helper.create_room_as(self.alice, tok=self.alice_token)
+        self.get_success(
+            self.handler.transfer_room_state_on_room_upgrade(self.room_id, new_room_id)
+        )
+
+        new_tag_content = {"order": 0.9}
+        self.get_success(
+            account_data_handler.add_tag_to_room(
+                self.alice, new_room_id, tag, new_tag_content
+            )
+        )
+
+        # Retry the transfer, as a client retrying the tombstone would.
+        self.get_success(
+            self.handler.transfer_room_state_on_room_upgrade(self.room_id, new_room_id)
+        )
+
+        tags = self.get_success(self.store.get_tags_for_room(self.alice, new_room_id))
+        self.assertEqual(tags[tag], new_tag_content)
+
+    def test_partial_room_upgrade_tag_copy_preserves_later_edits(self) -> None:
+        """A failed tag copy can resume without overwriting a copied tag edit."""
+        account_data_handler = self.hs.get_account_data_handler()
+        source_tags = {
+            "m.favourite": {"order": 0.5},
+            "m.lowpriority": {"order": 0.8},
+        }
+        for tag, content in source_tags.items():
+            self.get_success(
+                account_data_handler.add_tag_to_room(
+                    self.alice, self.room_id, tag, content
+                )
+            )
+
+        new_room_id = self.helper.create_room_as(self.alice, tok=self.alice_token)
+        real_add_tag = account_data_handler.add_tag_to_room
+        written_tags: list[str] = []
+
+        async def fail_on_second_tag(
+            user_id: str, room_id: str, tag: str, content: dict
+        ) -> int:
+            if written_tags:
+                raise RuntimeError("simulated partial tag-copy failure")
+            written_tags.append(tag)
+            return await real_add_tag(user_id, room_id, tag, content)
+
+        with patch.object(
+            account_data_handler, "add_tag_to_room", side_effect=fail_on_second_tag
+        ):
+            self.get_success(
+                self.handler.transfer_room_state_on_room_upgrade(
+                    self.room_id, new_room_id
+                )
+            )
+
+        self.assertEqual(len(written_tags), 1)
+        copied_tag = written_tags[0]
+        edited_content = {"order": 0.9}
+        self.get_success(
+            account_data_handler.add_tag_to_room(
+                self.alice, new_room_id, copied_tag, edited_content
+            )
+        )
+
+        self.get_success(
+            self.handler.transfer_room_state_on_room_upgrade(self.room_id, new_room_id)
+        )
+
+        destination_tags = self.get_success(
+            self.store.get_tags_for_room(self.alice, new_room_id)
+        )
+        self.assertEqual(destination_tags[copied_tag], edited_content)
+        missing_tag = next(tag for tag in source_tags if tag != copied_tag)
+        self.assertEqual(destination_tags[missing_tag], source_tags[missing_tag])
+
+    def test_room_upgrade_transfer_resumes_unfinished_work(self) -> None:
+        """A retry skips completed user state but finishes unfinished work."""
+        account_data_handler = self.hs.get_account_data_handler()
+        tag = "m.favourite"
+        self.get_success(
+            account_data_handler.add_tag_to_room(
+                self.alice, self.room_id, tag, {"order": 0.5}
+            )
+        )
+
+        new_room_id = self.helper.create_room_as(self.alice, tok=self.alice_token)
+
+        # Simulate an attempt that copied tags but failed before copying push
+        # rules, then a user edit to the copied tag.
+        self.get_success(
+            self.store.mark_room_upgrade_user_transfer_progress(
+                self.room_id,
+                new_room_id,
+                self.alice,
+                tags_transferred=True,
+            )
+        )
+        new_tag_content = {"order": 0.9}
+        self.get_success(
+            account_data_handler.add_tag_to_room(
+                self.alice, new_room_id, tag, new_tag_content
+            )
+        )
+
+        self.get_success(
+            self.handler.transfer_room_state_on_room_upgrade(self.room_id, new_room_id)
+        )
+
+        tags = self.get_success(self.store.get_tags_for_room(self.alice, new_room_id))
+        self.assertEqual(tags[tag], new_tag_content)
+        progress = self.get_success(
+            self.store.get_room_upgrade_user_transfer_progress(
+                self.room_id, new_room_id
+            )
+        )
+        self.assertEqual(progress[self.alice], (True, True))
+
     def test_nonlocal_room_user_action(self) -> None:
         """
         Test that non-local user ids cannot perform room actions through

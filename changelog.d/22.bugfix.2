@@ -1,0 +1,1 @@
+Stop `/notifications` from returning a `next_token` when a page holds fewer results than the requested limit. Clients following the token would fetch an empty page on every refresh, which made the notification inbox flicker.

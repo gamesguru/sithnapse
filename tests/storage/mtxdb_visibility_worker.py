@@ -6,7 +6,7 @@
 #
 """Line-driven mtxdb process for `test_mtxdb_journal_visibility.py`.
 
-    python mtxdb_visibility_worker.py {writer|reader} <store dir> [namespace]
+    python mtxdb_visibility_worker.py {writer|reader} <store dir>
 
 mtxdb's Python binding owns process-global pools, so a writer and a read-only
 worker cannot share an interpreter: the test drives each in its own process.
@@ -66,13 +66,12 @@ def _fsyncs() -> int:
     stats = mtxdb_engine.stats()
     return sum(
         int((stats.get(pool) or {}).get("sync_totals", {}).get("calls", 0))
-        for pool in ("state", "event_dag", "auth_chain")
+        for pool in ("state", "event_dag", "server_info")
     )
 
 
 def main() -> None:
     role, path = sys.argv[1], sys.argv[2]
-    namespace = sys.argv[3] if len(sys.argv) > 3 else "vis"
     # Importing Synapse is the slow part of starting this process. Report it
     # done, then wait for "open": the test starts several processes at once so
     # their imports overlap, while still opening the writer before any reader.
@@ -107,13 +106,13 @@ def main() -> None:
                 room_id, event_id, body = args
                 put_event_json_batch(
                     "mtxdb",
-                    namespace,
                     [(event_id, room_id, "{}", body, 1)],
                     sync=False,
+                    locator_statuses={event_id: (False, False, False)},
                 )
                 reply = "ok"
             elif command == "event_json_get":
-                found_json = get_event_json_batch("mtxdb", namespace, [args[0]])
+                found_json = get_event_json_batch("mtxdb", [args[0]])
                 reply = json.dumps(
                     found_json[args[0]][1] if args[0] in found_json else None
                 )
@@ -126,9 +125,9 @@ def main() -> None:
                 room_id, event_id, body = args
                 put_event_json_batch(
                     "mtxdb",
-                    namespace,
                     [(event_id, room_id, "{}", body, 1)],
                     transaction=transaction,
+                    locator_statuses={event_id: (False, False, False)},
                 )
                 reply = "ok"
             elif command == "txn_commit":
@@ -139,27 +138,15 @@ def main() -> None:
                 assert transaction is not None
                 transaction.abort()
                 reply = "ok"
-            elif command == "edges_publish":
-                # edges_publish <room_id> <generation> <published_version>
-                #                <event_id> <prev_event_id>
-                room_id, generation, published, event_id, prev_event_id = args
-                mtxdb_engine.event_edges_apply_forward_outbox(
-                    namespace,
-                    room_id,
-                    int(generation),
-                    int(published),
-                    [(event_id, prev_event_id, "insert")],
-                )
+            elif command == "edges_put":
+                # edges_put <room_id> <event_id> <prev_event_id>
+                room_id, event_id, prev_event_id = args
+                mtxdb_engine.adjacency_put([(room_id, event_id, [prev_event_id], [])])
                 reply = "ok"
             elif command == "edges_get":
-                # edges_get <room_id> <expected_version> <prev_event_id>
-                room_id, expected, prev_event_id = args
-                forward = get_event_edges_forward_batch(
-                    namespace,
-                    room_id,
-                    int(expected),
-                    [prev_event_id],
-                )
+                # edges_get <prev_event_id>
+                (prev_event_id,) = args
+                forward = get_event_edges_forward_batch([prev_event_id])
                 reply = json.dumps(forward)
             elif command == "fsyncs":
                 reply = str(_fsyncs())

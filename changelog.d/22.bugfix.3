@@ -1,0 +1,1 @@
+Fix `/sync` returning a stream-only `prev_batch` for an initial or newly-joined timeline that was selected by topological order. In rooms with backfilled history, paging `/messages` from that token could repeat events already in the timeline window and skip others whose stream positions fall on the other side of the cutoff.

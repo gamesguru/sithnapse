@@ -21,7 +21,10 @@ jobs:
   # end result, even when background updates or complex schema deltas are present.
   show-schema-diff:
     name: Show schema diff
-    runs-on: ubuntu-latest
+    # Pin to 24.04: `ubuntu-latest` moved to 26.04, where the runner image no
+    # longer resolves the `faketime` package this job installs. Revisit when
+    # the 26.04 migration settles and `faketime` installs reliably there.
+    runs-on: ubuntu-24.04
 
     permissions:
       pull-requests: write
@@ -61,11 +64,17 @@ jobs:
           fetch-depth: 0
 
       - name: Install PostgreSQL client and faketime
-        run: sudo apt-get -qq install postgresql-client faketime
+        run: |
+          sudo apt-get update
+          sudo apt-get -qq install postgresql-client faketime
 
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v7.0.0
         with:
-          python-version: "3.x"
+          # Pin rather than use "3.x": 3.15 is newer than the latest Python
+          # pydantic-core's PyO3 supports (3.14), so `uv sync` fails to build
+          # the extension from source there. Bump once pydantic-core supports
+          # the next Python.
+          python-version: "3.14"
 
       - name: Set up uv
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
@@ -91,10 +100,11 @@ jobs:
       - name: Stop postgres
         cancel: postgres
 
-      # If the generation step failed, write an error message so the sticky
-      # comment step still has a file to read.
+      # If the generation step failed (or was cancelled before it produced
+      # anything), write an error message so the sticky comment step always
+      # has a file to read.
       - name: Ensure output file exists on failure
-        if: always() && steps.schema_diff.outcome == 'failure'
+        if: always() && steps.schema_diff.outcome != 'success'
         run: |
           echo "⚠️ Schema diff generation failed. See job logs for details." \
             > "${{ runner.temp }}/schema_diff.md"

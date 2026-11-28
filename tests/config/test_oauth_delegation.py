@@ -173,6 +173,11 @@ class MasAuthDelegation(TestCase):
         # which should raise as the module tries to register an auth provider
         config = self.parse_config()
         reactor, clock = get_clock()
+        # Setup opens the global mtxdb store before the module raises; release
+        # it so later homeservers can open their own roots.
+        from synapse.synapse_rust import mtxdb_engine
+
+        self.addCleanup(mtxdb_engine.close_client, durable=False)
         with self.assertRaises(ConfigError):
             setup_test_homeserver(
                 cleanup_func=self.addCleanup,

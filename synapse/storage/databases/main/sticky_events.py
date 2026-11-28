@@ -43,6 +43,9 @@ from synapse.storage.databases.main.embedded_event_json import (
     get_event_json_batch,
     put_event_json_batch,
 )
+from synapse.storage.databases.main.embedded_event_status import (
+    patch_event_statuses,
+)
 from synapse.storage.databases.main.events import DeltaState
 from synapse.storage.databases.main.state import StateGroupWorkerStore
 from synapse.storage.engines import PostgresEngine, Sqlite3Engine
@@ -288,7 +291,6 @@ class StickyEventsWorkerStore(StateGroupWorkerStore, CacheInvalidationWorkerStor
         if missing_meta_ids and getattr(self, "_embedded_event_json_enabled", False):
             found = get_event_json_batch(
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 missing_meta_ids,
             )
             for eid, (m, _, _) in found.items():
@@ -370,7 +372,6 @@ class StickyEventsWorkerStore(StateGroupWorkerStore, CacheInvalidationWorkerStor
         if missing_ids and getattr(self, "_embedded_event_json_enabled", False):
             found = get_event_json_batch(
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 missing_ids,
             )
             for eid, (m, _, _) in found.items():
@@ -790,7 +791,6 @@ class StickyEventsWorkerStore(StateGroupWorkerStore, CacheInvalidationWorkerStor
         ):
             found = get_event_json_batch(
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 possibly_soft_failed_ids,
             )
             for eid, (m, _, _) in found.items():
@@ -852,7 +852,6 @@ class StickyEventsWorkerStore(StateGroupWorkerStore, CacheInvalidationWorkerStor
         if getattr(self, "_embedded_event_json_enabled", False):
             found = get_event_json_batch(
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 list(sticky_event_ids),
             )
             mirror_rows: list[tuple[str, str, str, str, int | None]] = []
@@ -887,9 +886,10 @@ class StickyEventsWorkerStore(StateGroupWorkerStore, CacheInvalidationWorkerStor
             if mirror_rows:
                 put_event_json_batch(
                     self._embedded_db_engine,
-                    self._embedded_db_namespace,
                     mirror_rows,
                 )
+
+            patch_event_statuses(list(sticky_event_ids), soft_failed=False)
 
         # Invalidate caches as a result
         for event_id in sticky_event_ids:

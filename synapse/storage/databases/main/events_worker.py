@@ -83,12 +83,13 @@ from synapse.storage.database import (
     LoggingTransaction,
     make_tuple_in_list_sql_clause,
 )
-from synapse.storage.databases.main.embedded_common import ffi_count
+from synapse.storage.databases.main.embedded_common import (
+    Pool,
+    ffi_count,
+    mark_dirty,
+)
 from synapse.storage.databases.main.embedded_event_edges import (
-    classify_event_edge_fallback,
-    drain_edge_index_outbox,
     embedded_event_edges_is_writable,
-    gc_retired_forward_generations,
     open_embedded_event_edges_engine,
     record_event_edge_read,
     register_publish_signal_gauge,
@@ -97,17 +98,14 @@ from synapse.storage.databases.main.embedded_event_json import (
     get_event_json_batch,
     open_embedded_event_json_engine,
 )
-from synapse.storage.databases.main.embedded_redactions import get_redactions_batch
-from synapse.storage.databases.main.embedded_rejections import (
-    delete_rejections_batch,
-    put_rejection_batch,
+from synapse.storage.databases.main.embedded_event_status import (
+    patch_event_statuses,
 )
-from synapse.storage.types import Cursor
+from synapse.storage.databases.main.embedded_redactions import get_redactions_batch
 from synapse.storage.util.id_generators import (
     AbstractStreamIdGenerator,
     MultiWriterIdGenerator,
 )
-from synapse.storage.util.sequence import build_sequence_generator
 from synapse.types import JsonDict, get_domain_from_id
 from synapse.types.state import StateFilter
 from synapse.types.storage import _BackgroundUpdates
@@ -273,15 +271,6 @@ class EventsWorkerStore(SQLBaseStore):
             # Only read-only handles map the writer's publish signal.
             register_publish_signal_gauge(hs)
         self._embedded_db_engine = hs.config.database.embedded_db_engine
-        # Namespaces event_to_state_group/refcount keys in the embedded
-        # engine -- see embedded_event_to_state_group.py's module docstring.
-        # Independent from (but must agree with) the state datastore's own
-        # hamt_namespace property: both default to the server name unless
-        # embedded_db.namespace is set in config, so they naturally agree
-        # without needing to share an instance.
-        self._embedded_db_namespace = (
-            hs.config.database.embedded_db_namespace or hs.hostname
-        )
 
         txn = db_conn.cursor()
         txn.execute("SELECT event_id FROM un_partial_stated_event_stream")
@@ -339,17 +328,6 @@ class EventsWorkerStore(SQLBaseStore):
         )
 
         if hs.config.worker.run_background_tasks:
-            if embedded_event_edges_is_writable(hs):
-                self.clock.looping_call(
-                    lambda: drain_edge_index_outbox(
-                        self, namespace=self._embedded_db_namespace
-                    ),
-                    Duration(seconds=1),
-                )
-                self.clock.looping_call(
-                    lambda: gc_retired_forward_generations(self),
-                    Duration(minutes=5),
-                )
             # We periodically clean out old transaction ID mappings
             self.clock.looping_call(
                 self._cleanup_old_transaction_ids,
@@ -387,22 +365,6 @@ class EventsWorkerStore(SQLBaseStore):
         self._event_fetch_ongoing = 0
         event_fetch_ongoing_gauge.labels(**{SERVER_NAME_LABEL: self.server_name}).set(
             self._event_fetch_ongoing
-        )
-
-        # We define this sequence here so that it can be referenced from both
-        # the DataStore and PersistEventStore.
-        def get_chain_id_txn(txn: Cursor) -> int:
-            txn.execute("SELECT COALESCE(max(chain_id), 0) FROM event_auth_chains")
-            return cast(tuple[int], txn.fetchone())[0]
-
-        self.event_chain_id_gen = build_sequence_generator(
-            db_conn,
-            database.engine,
-            get_chain_id_txn,
-            "event_auth_chain_id",
-            table="event_auth_chains",
-            id_column="chain_id",
-            db_is_fresh=database.is_fresh,
         )
 
         self._un_partial_stated_events_stream_id_gen: AbstractStreamIdGenerator
@@ -576,7 +538,6 @@ class EventsWorkerStore(SQLBaseStore):
         if getattr(self, "_embedded_event_json_enabled", False):
             found = get_redactions_batch(
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 [event_id],
             )
             if event_id in found:
@@ -1748,9 +1709,7 @@ class EventsWorkerStore(SQLBaseStore):
         found: dict[str, tuple[str, str, int | None]] = {}
         still_missing = event_ids
         if self._embedded_event_json_enabled:
-            found = get_event_json_batch(
-                self._embedded_db_engine, self._embedded_db_namespace, event_ids
-            )
+            found = get_event_json_batch(self._embedded_db_engine, event_ids)
             still_missing = [e for e in event_ids if e not in found]
 
         if still_missing:
@@ -2143,6 +2102,28 @@ class EventsWorkerStore(SQLBaseStore):
             "get_current_state_event_counts",
             self._get_current_state_event_counts_txn,
             room_id,
+        )
+
+    async def get_event_counts(self) -> tuple[int, int]:
+        """Get the total number of events and current-state events stored.
+
+        Returns:
+            A tuple of (events, current_state_events).
+        """
+
+        def _get_event_counts_txn(txn: LoggingTransaction) -> tuple[int, int]:
+            txn.execute("SELECT COUNT(*) FROM events")
+            row = txn.fetchone()
+            events = int(row[0]) if row else 0
+
+            txn.execute("SELECT COUNT(*) FROM current_state_events")
+            row = txn.fetchone()
+            state_events = int(row[0]) if row else 0
+
+            return events, state_events
+
+        return await self.db_pool.runInteraction(
+            "get_event_counts", _get_event_counts_txn
         )
 
     async def get_room_complexity(self, room_id: str) -> dict[str, float]:
@@ -2583,6 +2564,35 @@ class EventsWorkerStore(SQLBaseStore):
             _cleanup_old_transaction_ids_txn,
         )
 
+    async def get_backward_extremities_among(
+        self, room_id: str, event_ids: Collection[str]
+    ) -> set[str]:
+        """Return which of `event_ids` are still backward extremities of the room.
+
+        Unlike `have_seen_events`, an extremity that we hold only as an outlier
+        (for example one persisted from a join's state, or a rejected event that
+        can never be de-outliered) is still reported: it stays in
+        `event_backward_extremities` until it is persisted as a non-outlier, so
+        it is the right test for whether a backfill actually resolved a gap.
+        """
+        if not event_ids:
+            return set()
+
+        def get_backward_extremities_among_txn(txn: LoggingTransaction) -> set[str]:
+            clause, args = make_in_list_sql_clause(
+                self.database_engine, "event_id", list(event_ids)
+            )
+            txn.execute(
+                "SELECT event_id FROM event_backward_extremities"
+                f" WHERE room_id = ? AND {clause}",
+                [room_id] + args,
+            )
+            return {event_id for (event_id,) in txn}
+
+        return await self.db_pool.runInteraction(
+            "get_backward_extremities_among", get_backward_extremities_among_txn
+        )
+
     async def is_event_next_to_backward_gap(self, event: EventBase) -> bool:
         """Check if the given event is next to a backward gap of missing events.
         <latest messages> A(False)--->B(False)--->C(True)--->  <gap, unknown events> <oldest messages>
@@ -2660,15 +2670,6 @@ class EventsWorkerStore(SQLBaseStore):
             "This function relies on `event_edges` and `event_forward_extremities` which won't be filled in for `outliers`."
         )
 
-        # Resolved before runInteraction: the txn closure below is sync. A
-        # completed legacy background update does not prove FWD completeness;
-        # only the offline verifier's marker can authorize this read path.
-        from synapse.storage.databases.main.embedded_event_edges import (
-            event_edges_fwd_is_authoritative,
-        )
-
-        embedded_edges_trustworthy = await event_edges_fwd_is_authoritative(self)
-
         def is_event_next_to_gap_txn(txn: LoggingTransaction) -> bool:
             # If the event in question is a forward extremity, we will just
             # consider any potential forward gap as not a gap since it's one of
@@ -2703,70 +2704,35 @@ class EventsWorkerStore(SQLBaseStore):
             if txn.fetchone():
                 return False
 
-            if not embedded_edges_trustworthy:
-                record_event_edge_read(self.server_name, "gap", "sql_only")
-            if embedded_edges_trustworthy:
-                from synapse.storage.databases.main.embedded_event_edges import (
-                    get_event_edges_forward_batch,
-                )
+            from synapse.storage.databases.main.embedded_event_edges import (
+                get_event_edges_forward_batch,
+            )
 
-                txn.execute(
-                    "SELECT source_version FROM room_edge_source_version WHERE room_id = ?",
-                    (event.room_id,),
-                )
-                source_version_row = txn.fetchone()
-                source_version = int(source_version_row[0]) if source_version_row else 0
-                forward_map = get_event_edges_forward_batch(
-                    self._embedded_db_namespace,
-                    event.room_id,
-                    source_version,
-                    [event.event_id],
-                )
-                children = (
-                    None if forward_map.stale else forward_map.get(event.event_id)
-                )
-                if children is not None:
-                    ffi_count("event_edges_gap_hits", 1)
-                    record_event_edge_read(self.server_name, "gap", "hit")
-                    if not children:
-                        return True
-                    clause, args = make_in_list_sql_clause(
-                        self.database_engine, "event_id", children
-                    )
-                    txn.execute(f"SELECT event_id FROM rejections WHERE {clause}", args)
-                    rejected_children = {r[0] for r in txn}
-                    if any(c not in rejected_children for c in children):
-                        return False
-                    return True
-                ffi_count("event_edges_gap_fallbacks", 1)
-                record_event_edge_read(
-                    self.server_name, "gap", classify_event_edge_fallback(forward_map)
-                )
-
-            # Check to see whether the event in question is already referenced
-            # by another event. If we don't see any edges, we're next to a
-            # forward gap.
-            forward_edge_query = """
-                SELECT 1 FROM event_edges
-                /* Check to make sure the event referencing our event in question is not rejected */
-                LEFT JOIN rejections ON event_edges.event_id = rejections.event_id
-                WHERE
-                    event_edges.prev_event_id = ?
-                    /* It's not a valid edge if the event referencing our event in
-                     * question is rejected.
-                     */
-                    AND rejections.event_id IS NULL
-                LIMIT 1
-            """
-
-            # If there are no forward edges to the event in question (another
-            # event hasn't referenced this event in their prev_events), then we
-            # assume there is a forward gap in the history.
-            txn.execute(forward_edge_query, (event.event_id,))
-            if not txn.fetchone():
+            forward_map = get_event_edges_forward_batch([event.event_id])
+            children = forward_map.get(event.event_id)
+            if children is None:
+                ffi_count("event_edges_gap_misses", 1)
+                record_event_edge_read(self.server_name, "gap", "miss")
                 return True
-
-            return False
+            ffi_count("event_edges_gap_hits", 1)
+            record_event_edge_read(self.server_name, "gap", "hit")
+            if not children:
+                return True
+            # The forward index can name children that have no committed
+            # row in `events`; only a committed, non-outlier, non-rejected
+            # child suppresses the gap.
+            clause, args = make_in_list_sql_clause(
+                self.database_engine, "e.event_id", children
+            )
+            txn.execute(
+                "SELECT 1 FROM events AS e "
+                "LEFT JOIN rejections AS r ON r.event_id = e.event_id "
+                f"WHERE r.event_id IS NULL AND NOT e.outlier AND {clause} LIMIT 1",
+                args,
+            )
+            if txn.fetchone():
+                return False
+            return True
 
         return await self.db_pool.runInteraction(
             "is_event_next_to_gap_txn",
@@ -2913,9 +2879,8 @@ class EventsWorkerStore(SQLBaseStore):
             room_id,
         )
 
-    @staticmethod
     def _get_partial_state_events_batch_txn(
-        txn: LoggingTransaction, room_id: str
+        self, txn: LoggingTransaction, room_id: str
     ) -> list[str]:
         # we want to work through the events from oldest to newest, so
         # we only want events whose prev_events do *not* have partial state - hence
@@ -2930,22 +2895,84 @@ class EventsWorkerStore(SQLBaseStore):
         # hard to do much about.
         #
         # See also: https://github.com/matrix-org/synapse/issues/13001
-        txn.execute(
-            """
-            SELECT event_id FROM partial_state_events AS pse
-                JOIN events USING (event_id)
-            WHERE pse.room_id = ? AND
-               NOT EXISTS(
-                  SELECT 1 FROM event_edges AS ee
-                     JOIN partial_state_events AS prev_pse ON (prev_pse.event_id=ee.prev_event_id)
-                     WHERE ee.event_id=pse.event_id
-               )
-            ORDER BY events.stream_ordering
-            LIMIT 100
-            """,
-            (room_id,),
+        from synapse.storage.databases.main.embedded_event_edges import (
+            get_event_edges_backward_batch,
         )
-        return [row[0] for row in txn]
+
+        ready: list[str] = []
+        # Keyset cursor (stream_ordering, event_id): rows removed
+        # concurrently cannot shift unseen candidates past the cursor.
+        cursor_stream: int | None = None
+        cursor_event_id = ""
+        while True:
+            if cursor_stream is None:
+                txn.execute(
+                    """
+                    SELECT pse.event_id, events.stream_ordering
+                    FROM partial_state_events AS pse
+                        JOIN events USING (event_id)
+                    WHERE pse.room_id = ?
+                    ORDER BY events.stream_ordering, pse.event_id
+                    LIMIT 1000
+                    """,
+                    (room_id,),
+                )
+            else:
+                txn.execute(
+                    """
+                    SELECT pse.event_id, events.stream_ordering
+                    FROM partial_state_events AS pse
+                        JOIN events USING (event_id)
+                    WHERE pse.room_id = ?
+                        AND (events.stream_ordering > ?
+                             OR (events.stream_ordering = ? AND pse.event_id > ?))
+                    ORDER BY events.stream_ordering, pse.event_id
+                    LIMIT 1000
+                    """,
+                    (room_id, cursor_stream, cursor_stream, cursor_event_id),
+                )
+            page = [(row[0], row[1]) for row in txn]
+            if not page:
+                break
+            candidates = [event_id for event_id, _ in page]
+            cursor_event_id, cursor_stream = page[-1]
+
+            backward = get_event_edges_backward_batch(candidates)
+            prev_ids = {
+                prev_event_id
+                for event_id in candidates
+                for prev_event_id in (backward.get(event_id) or ())
+            }
+            partial_prevs: set[str] = set()
+            prev_id_list = list(prev_ids)
+            # Keep SQLite below its bind-variable limit even for events
+            # with unusually large predecessor sets.
+            for start in range(0, len(prev_id_list), 500):
+                clause, args = make_in_list_sql_clause(
+                    self.database_engine,
+                    "event_id",
+                    prev_id_list[start : start + 500],
+                )
+                txn.execute(
+                    f"SELECT event_id FROM partial_state_events WHERE {clause}",
+                    args,
+                )
+                partial_prevs.update(row[0] for row in txn)
+
+            for event_id in candidates:
+                if any(
+                    prev_event_id in partial_prevs
+                    for prev_event_id in (backward.get(event_id) or ())
+                ):
+                    continue
+                ready.append(event_id)
+                if len(ready) >= 100:
+                    break
+            # Return as soon as this page yielded anything; only keep
+            # scanning when nothing here was ready.
+            if ready:
+                break
+        return ready
 
     def mark_event_rejected_txn(
         self,
@@ -2958,9 +2985,8 @@ class EventsWorkerStore(SQLBaseStore):
         This can happen, for example, when resyncing state during a faster join.
 
         Update SQL rejection data and schedule local event-cache invalidation.
-        When embedded event JSON is enabled, mirror the rejection change after
-        SQL commit without syncing the embedded engine. Mirror errors propagate
-        from the post-commit callback through runInteraction.
+        When embedded event JSON is enabled, the event's mtxdb status is
+        updated before the SQL commit.
 
         It is the caller's responsibility to ensure that other workers are
         sent a notification so that they call `_invalidate_local_get_event_cache()`.
@@ -2980,13 +3006,6 @@ class EventsWorkerStore(SQLBaseStore):
                 "rejections",
                 keyvalues={"event_id": event_id},
             )
-            if self._embedded_event_json_enabled:
-                txn.call_after(
-                    delete_rejections_batch,
-                    self._embedded_db_engine,
-                    self._embedded_db_namespace,
-                    [event_id],
-                )
         else:
             logger.info(
                 "Marking previously-processed event %s as rejected(%s)",
@@ -3006,19 +3025,16 @@ class EventsWorkerStore(SQLBaseStore):
                     "last_check": last_check,
                 },
             )
-            if self._embedded_event_json_enabled:
-                txn.call_after(
-                    put_rejection_batch,
-                    self._embedded_db_engine,
-                    self._embedded_db_namespace,
-                    [(event_id, rejection_reason, last_check)],
-                )
         self.db_pool.simple_update_txn(
             txn,
             table="events",
             keyvalues={"event_id": event_id},
             updatevalues={"rejection_reason": rejection_reason},
         )
+
+        if self._embedded_event_json_enabled:
+            patch_event_statuses([event_id], rejected=bool(rejection_reason))
+            txn.call_after(mark_dirty, Pool.EVENT_DAG)
 
         self.invalidate_get_event_cache_after_txn(txn, event_id)
 

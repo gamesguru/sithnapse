@@ -69,6 +69,7 @@ from synapse.storage.databases.main.event_push_actions import EventPushActionsSt
 from synapse.storage.databases.main.events_bg_updates import (
     EventsBackgroundUpdatesStore,
 )
+from synapse.storage.databases.main.keys import KeyBackgroundUpdateStore
 from synapse.storage.databases.main.media_repository import (
     MediaRepositoryBackgroundUpdateStore,
 )
@@ -298,6 +299,7 @@ class Store(
     UserDirectoryBackgroundUpdateStore,
     EndToEndKeyBackgroundStore,
     EndToEndRoomKeyBackgroundStore,
+    KeyBackgroundUpdateStore,
     StatsStore,
     AccountDataWorkerStore,
     FilteringWorkerStore,
@@ -770,6 +772,22 @@ class Porter:
         # 0 means off. 1 means full. 2 means incremental.
         return autovacuum_setting != 0
 
+    @staticmethod
+    def _events_live_outside_sql(txn: LoggingTransaction) -> bool:
+        """Whether the source has events whose JSON is not in SQL.
+
+        A SQL-backed database has an `event_json` row for every event. Any event
+        without one means its body lives in mtxdb (including a source that is
+        only partly migrated, where some bodies are still in SQL), so a copy
+        would be incomplete. An empty source has no such event and is accepted.
+        """
+        txn.execute(
+            "SELECT 1 FROM events AS e"
+            " LEFT JOIN event_json AS j ON j.event_id = e.event_id"
+            " WHERE j.event_id IS NULL LIMIT 1"
+        )
+        return txn.fetchone() is not None
+
     async def remove_ignored_background_updates_from_database(self) -> None:
         def _remove_delete_unreferenced_state_groups_bg_updates(
             txn: LoggingTransaction,
@@ -799,6 +817,28 @@ class Porter:
                 DatabaseConnectionConfig("master-sqlite", self.sqlite_config),
                 allow_outdated_version=True,
             )
+
+            # Events and edges owned by the embedded engine (mtxdb) are not in
+            # the SQLite tables this script copies, so a port would silently
+            # produce a database missing them. Refuse rather than report success.
+            if self.hs.config.database.embedded_db_engine:
+                end_error = (
+                    "The configuration enables the embedded (mtxdb) engine, which"
+                    " owns event data that this script does not copy. Porting"
+                    " only the SQLite tables would produce an incomplete database,"
+                    " so refusing."
+                )
+                return
+            if await self.sqlite_store.db_pool.runInteraction(
+                "sqlite_events_live_outside_sql", self._events_live_outside_sql
+            ):
+                end_error = (
+                    "The SQLite database has events but no event_json rows: the"
+                    " event bodies are stored in the embedded (mtxdb) engine,"
+                    " which this script does not copy. Refusing to port an"
+                    " incomplete database."
+                )
+                return
 
             # For safety, ensure auto_vacuums are disabled.
             if await self.sqlite_store.db_pool.runInteraction(
@@ -915,7 +955,6 @@ class Porter:
                     ("presence_stream", "stream_id"),
                 ],
             )
-            await self._setup_auth_chain_sequence()
             await self._setup_sequence(
                 "application_services_txn_id_seq",
                 [
@@ -1407,30 +1446,6 @@ class Porter:
         return await self.postgres_store.db_pool.runInteraction(
             "_pg_get_serial_sequence", r
         )
-
-    async def _setup_auth_chain_sequence(self) -> None:
-        curr_chain_id: (
-            int | None
-        ) = await self.sqlite_store.db_pool.simple_select_one_onecol(
-            table="event_auth_chains",
-            keyvalues={},
-            retcol="MAX(chain_id)",
-            allow_none=True,
-        )
-
-        def r(txn: LoggingTransaction) -> None:
-            # Presumably there is at least one row in event_auth_chains.
-            assert curr_chain_id is not None
-            txn.execute(
-                "ALTER SEQUENCE event_auth_chain_id RESTART WITH %s",
-                (curr_chain_id + 1,),
-            )
-
-        if curr_chain_id is not None:
-            await self.postgres_store.db_pool.runInteraction(
-                "_setup_event_auth_chain_id",
-                r,
-            )
 
 
 ##############################################

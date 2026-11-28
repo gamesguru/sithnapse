@@ -20,6 +20,7 @@
 #
 
 import abc
+import hashlib
 import logging
 import time
 from contextlib import ExitStack
@@ -48,12 +49,21 @@ from synapse.api.errors import (
 from synapse.config.key import TrustedKeyServer
 from synapse.events import EventBase
 from synapse.http.matrixfederationclient import StrictJsonParser
-from synapse.logging.context import make_deferred_yieldable, run_in_background
-from synapse.storage.keys import FetchKeyResult
+from synapse.logging.context import (
+    PreserveLoggingContext,
+    make_deferred_yieldable,
+    run_in_background,
+)
+from synapse.storage.keys import FetchKeyResult, merge_fetch_key_results
 from synapse.synapse_rust.events import redact_event
 from synapse.types import JsonDict
 from synapse.util import unwrapFirstError
-from synapse.util.async_helpers import yieldable_gather_results
+from synapse.util.async_helpers import (
+    concurrently_execute,
+    stop_cancellation,
+    timeout_deferred,
+    yieldable_gather_results,
+)
 from synapse.util.batching_queue import BatchingQueue
 from synapse.util.clock import Clock
 from synapse.util.retryutils import NotRetryingDestination
@@ -67,6 +77,14 @@ logger = logging.getLogger(__name__)
 # malformed rather than truncated.
 MAX_ACTIVE_VERIFY_KEYS_PER_RESPONSE = 50
 MAX_OLD_VERIFY_KEYS_PER_RESPONSE = 3000
+
+# `Keyring.prefetch_keys` tuning. These are starting points to be tuned by
+# benchmarking (see docs/development-gg/2026-11-20-join-key-prefetch-refactor.md):
+# at most this many origins are looked up at once (which also caps how many
+# origins end up in one notary query / are probed directly at the same time),
+# and we stop waiting for the prefetch after this long.
+PREFETCH_CONCURRENCY = 100
+PREFETCH_TIMEOUT_SECONDS = 30.0
 
 # How far in the future an `old_verify_keys` entry's `expired_ts` may be before it
 # is treated as malformed, to allow for clock skew.
@@ -100,12 +118,20 @@ class VerifyJsonRequest:
             be valid. (0 implies we don't care)
 
         key_ids: The set of key_ids to that could be used to verify the JSON object
+
+        event_id: The event being verified, when this request is for an event.
+            Only used for diagnostics.
+
+        room_id: The room of the event being verified, when known. Only used for
+            diagnostics.
     """
 
     server_name: str
     get_json_object: Callable[[], JsonDict]
     minimum_valid_until_ts: int
     key_ids: list[str]
+    event_id: str | None = None
+    room_id: str | None = None
 
     @staticmethod
     def from_json_object(
@@ -151,6 +177,8 @@ class VerifyJsonRequest:
             lambda: redact_event(event).get_pdu_json(),
             minimum_valid_until_ms,
             key_ids=key_ids,
+            event_id=event.event_id,
+            room_id=event.room_id,
         )
 
 
@@ -282,6 +310,7 @@ class Keyring:
         # Clean-up to avoid partial initialization leaving behind references.
         with ExitStack() as exit:
             self.server_name = hs.hostname
+            self._clock = hs.get_clock()
 
             self._key_fetchers: list[KeyFetcher] = []
             if test_only_key_fetchers is None:
@@ -416,6 +445,83 @@ class Keyring:
             )
         )
 
+    async def prefetch_keys(
+        self, requests: Iterable[tuple[str, Iterable[str], int]]
+    ) -> None:
+        """Best-effort warm-up of the key cache for a known batch of verifications.
+
+        Callers that are about to verify many signed objects (e.g. the state and
+        auth chain of a `/send_join` response) can pass the whole set of needed
+        keys up front. We de-duplicate them, look each origin up through the
+        normal fetcher chain (store, then notaries, then the origin itself) with
+        bounded concurrency, and let the fetchers persist what they find. The
+        verifications that follow then hit the store instead of the network.
+
+        This never changes what is trusted: it only fills the store, and
+        verification still goes through `process_request`. Failures and
+        timeouts are swallowed (the later verification will report them), and a
+        failed direct fetch is recorded once by the existing negative cache, so
+        the later verification fails fast rather than counting it again.
+
+        Args:
+            requests: (server_name, key_ids, minimum_valid_until_ts) triples, as
+                would be used for `VerifyJsonRequest`.
+        """
+        # The maximum validity requirement is tracked per (server, key id), so one
+        # key's stricter requirement doesn't raise another key's.
+        wanted: dict[str, dict[str, int]] = {}
+        for server_name, key_ids, minimum_valid_until_ts in requests:
+            if self._is_mine_server_name(server_name):
+                continue
+            by_key = wanted.setdefault(server_name, {})
+            for key_id in key_ids:
+                by_key[key_id] = max(by_key.get(key_id, 0), minimum_valid_until_ts)
+
+        items = [(name, by_key) for name, by_key in wanted.items() if by_key]
+        if not items:
+            return
+
+        async def _prefetch_one(item: tuple[str, dict[str, int]]) -> None:
+            server_name, by_key = item
+            # One request per distinct validity requirement for this origin.
+            by_ts: dict[int, list[str]] = {}
+            for key_id, ts in by_key.items():
+                by_ts.setdefault(ts, []).append(key_id)
+
+            async def _queue(ts: int) -> None:
+                try:
+                    await self._fetch_keys_queue.add_to_queue(
+                        _FetchKeyRequest(
+                            server_name=server_name,
+                            minimum_valid_until_ts=ts,
+                            key_ids=sorted(by_ts[ts]),
+                        ),
+                        key=server_name,
+                    )
+                except Exception as e:
+                    logger.debug("Key prefetch for %s failed: %s", server_name, e)
+
+            await yieldable_gather_results(_queue, list(by_ts))
+
+        logger.info("Prefetching signing keys for %d servers", len(items))
+        done = run_in_background(
+            concurrently_execute, _prefetch_one, items, PREFETCH_CONCURRENCY
+        )
+        try:
+            with PreserveLoggingContext():
+                await timeout_deferred(
+                    deferred=stop_cancellation(done),
+                    timeout=PREFETCH_TIMEOUT_SECONDS,
+                    clock=self._clock,
+                )
+        except defer.TimeoutError:
+            # Don't cancel: the lookups keep warming the cache in the background.
+            logger.info(
+                "Key prefetch for %d servers still running after %.0fs; continuing",
+                len(items),
+                PREFETCH_TIMEOUT_SECONDS,
+            )
+
     async def process_request(self, verify_request: VerifyJsonRequest) -> None:
         """Processes the `VerifyJsonRequest`. Raises if the object is not signed
         by the server, the signatures don't match or we failed to fetch the
@@ -456,37 +562,65 @@ class Keyring:
             # from other servers, so we pull out only the ones we care about.
             found_keys.update(found_keys_by_server.get(verify_request.server_name, {}))
 
-        # Verify each signature we got valid keys for, raising if we can't
-        # verify any of them.
+        # Try every authenticated body we have for each ID. Some servers
+        # reused a key ID for a different body, and older events still carry
+        # signatures made by the earlier key.
         verified = False
+        last_signature_error: SynapseError | None = None
+        banned_key_error: SynapseError | None = None
         for key_id in verify_request.key_ids:
             key_result = found_keys.get(key_id)
             if not key_result:
                 continue
+            for verify_key, valid_until_ts in key_result.candidates():
+                if valid_until_ts < verify_request.minimum_valid_until_ts:
+                    continue
 
-            if key_result.valid_until_ts < verify_request.minimum_valid_until_ts:
-                continue
-
-            key = encode_verify_key_base64(key_result.verify_key)
-            if key in BANNED_SERVER_SIGNING_KEYS:
-                raise SynapseError(
-                    HTTPStatus.UNAUTHORIZED,
-                    "Server signing key %s:%s for server %s has been banned by this server"
-                    % (
-                        key_result.verify_key.alg,
-                        key_result.verify_key.version,
+                if verify_key.encode() != key_result.verify_key.encode():
+                    logger.warning(
+                        "MSC4499: verifying %s in %s from %s with a retained "
+                        "alternate key body for %s (sha256 %s)",
+                        verify_request.event_id or "a signed object",
+                        verify_request.room_id or "an unknown room",
                         verify_request.server_name,
-                    ),
-                    Codes.UNAUTHORIZED,
-                )
+                        key_id,
+                        hashlib.sha256(verify_key.encode()).hexdigest(),
+                    )
 
-            await self.process_json(key_result.verify_key, verify_request)
-            verified = True
+                key = encode_verify_key_base64(verify_key)
+                if key in BANNED_SERVER_SIGNING_KEYS:
+                    banned_key_error = SynapseError(
+                        HTTPStatus.UNAUTHORIZED,
+                        "Server signing key %s:%s for server %s has been banned by this server"
+                        % (
+                            verify_key.alg,
+                            verify_key.version,
+                            verify_request.server_name,
+                        ),
+                        Codes.UNAUTHORIZED,
+                    )
+                    continue
+
+                try:
+                    await self.process_json(verify_key, verify_request)
+                except SynapseError as e:
+                    last_signature_error = e
+                    continue
+                verified = True
+                break
+
+            if verified:
+                break
 
         if not verified:
+            if last_signature_error is not None:
+                raise last_signature_error
+            if banned_key_error is not None:
+                raise banned_key_error
             raise SynapseError(
                 401,
-                f"Failed to find any key to satisfy: {key_request}",
+                "Failed to find any key to satisfy signature from %s"
+                % verify_request.server_name,
                 Codes.UNAUTHORIZED,
             )
 
@@ -573,8 +707,11 @@ class Keyring:
             to_return_by_server = to_return.setdefault(request.server_name, {})
             for key_id, key_result in results.items():
                 existing = to_return_by_server.get(key_id)
-                if not existing or existing.valid_until_ts < key_result.valid_until_ts:
-                    to_return_by_server[key_id] = key_result
+                to_return_by_server[key_id] = (
+                    merge_fetch_key_results(existing, key_result)
+                    if existing is not None
+                    else key_result
+                )
 
         return to_return
 
@@ -622,8 +759,8 @@ class Keyring:
                 # If we already have a result for the given key ID, we keep the
                 # one with the highest `valid_until_ts`.
                 existing_key = found_keys.get(key_id)
-                if existing_key and existing_key.valid_until_ts > key.valid_until_ts:
-                    continue
+                if existing_key is not None:
+                    key = merge_fetch_key_results(existing_key, key)
 
                 # Check if this key's expiry timestamp is valid for the verify request.
                 if key.valid_until_ts >= verify_request.minimum_valid_until_ts:
@@ -897,25 +1034,88 @@ class PerspectivesKeyFetcher(BaseV2KeyFetcher):
         self, keys_to_fetch: list[_FetchKeyRequest]
     ) -> dict[str, dict[str, FetchKeyResult]]:
         """see KeyFetcher._fetch_keys"""
+        # Size of this batch, for the latency logging below. This is the number
+        # of (origin server, key id) pairs being asked of every notary at once.
+        requested_key_count = sum(len(request.key_ids) for request in keys_to_fetch)
+        fanout_started = time.perf_counter()
+        notary_elapsed: dict[str, float] = {}
+        notary_failures: set[str] = set()
+        # notary -> (origin server, key id) -> valid_until_ts, for diagnosing a
+        # fan-out where no notary returned a key that covers the requested event.
+        notary_windows: dict[str, dict[tuple[str, str], int]] = {}
 
         async def get_key(key_server: TrustedKeyServer) -> dict:
+            notary_started = time.perf_counter()
             try:
-                return await self.get_server_verify_key_v2_indirect(
+                result = await self.get_server_verify_key_v2_indirect(
                     keys_to_fetch, key_server
                 )
             except KeyLookupError as e:
+                elapsed = time.perf_counter() - notary_started
+                notary_elapsed[key_server.server_name] = elapsed
+                notary_failures.add(key_server.server_name)
                 logger.warning(
-                    "Key lookup failed from %r: %s", key_server.server_name, e
-                )
-            except Exception as e:
-                logger.exception(
-                    "Unable to get key from %r: %s %s",
+                    "Key lookup failed from %r after %.3fs: %s",
                     key_server.server_name,
+                    elapsed,
+                    e,
+                )
+                return {}
+            except Exception as e:
+                elapsed = time.perf_counter() - notary_started
+                notary_elapsed[key_server.server_name] = elapsed
+                notary_failures.add(key_server.server_name)
+                logger.exception(
+                    "Unable to get key from %r after %.3fs: %s %s",
+                    key_server.server_name,
+                    elapsed,
                     type(e).__name__,
                     str(e),
                 )
+                return {}
 
-            return {}
+            elapsed = time.perf_counter() - notary_started
+            notary_elapsed[key_server.server_name] = elapsed
+            returned_key_count = sum(len(keys) for keys in result.values())
+            windows = {
+                (server_name, key_id): key.valid_until_ts
+                for server_name, server_keys in result.items()
+                for key_id, key in server_keys.items()
+            }
+            notary_windows[key_server.server_name] = windows
+            window_parts = sorted(
+                f"{server_name}/{key_id}={valid_until_ts}"
+                for (server_name, key_id), valid_until_ts in windows.items()
+            )
+            windows_text = ", ".join(window_parts[:20])
+            if len(window_parts) > 20:
+                windows_text += f", … ({len(window_parts) - 20} more)"
+
+            # Per-notary latency. A slow notary gates the whole fan-out
+            # (we wait for all of them so the most lenient answer wins), so
+            # surface the slow ones at INFO; the rest are debug-only.
+            if elapsed >= 0.5:
+                logger.info(
+                    "Slow notary key response from %r: %.3fs for %d requested "
+                    "key(s), returned %d; candidate windows: %s",
+                    key_server.server_name,
+                    elapsed,
+                    requested_key_count,
+                    returned_key_count,
+                    windows_text or "none",
+                )
+            else:
+                logger.debug(
+                    "Notary key response from %r: %.3fs for %d requested "
+                    "key(s), returned %d; candidate windows: %s",
+                    key_server.server_name,
+                    elapsed,
+                    requested_key_count,
+                    returned_key_count,
+                    windows_text or "none",
+                )
+
+            return result
 
         results = await make_deferred_yieldable(
             defer.gatherResults(
@@ -927,7 +1127,96 @@ class PerspectivesKeyFetcher(BaseV2KeyFetcher):
         union_of_keys: dict[str, dict[str, FetchKeyResult]] = {}
         for result in results:
             for server_name, keys in result.items():
-                union_of_keys.setdefault(server_name, {}).update(keys)
+                merged = union_of_keys.setdefault(server_name, {})
+                for key_id, key in keys.items():
+                    existing = merged.get(key_id)
+                    if existing is None:
+                        merged[key_id] = key
+                    else:
+                        # Notaries may return different bodies for a reused
+                        # ID. Preserve each body and its validity window.
+                        logger.debug(
+                            "Merging notary key candidates for %s %s: %d vs %d",
+                            server_name,
+                            key_id,
+                            existing.valid_until_ts,
+                            key.valid_until_ts,
+                        )
+                        merged[key_id] = merge_fetch_key_results(existing, key)
+
+        fanout_elapsed = time.perf_counter() - fanout_started
+        if notary_elapsed:
+            slowest_notary, slowest_elapsed = max(
+                notary_elapsed.items(), key=lambda item: item[1]
+            )
+        else:
+            slowest_notary, slowest_elapsed = None, 0.0
+
+        def _format_windows(
+            windows: dict[tuple[str, str], int],
+            only: tuple[str, str] | None = None,
+        ) -> str:
+            parts = sorted(
+                f"{server_name}/{key_id}={valid_until_ts}"
+                for (server_name, key_id), valid_until_ts in windows.items()
+                if only is None or (server_name, key_id) == only
+            )
+            text = ", ".join(parts[:20])
+            if len(parts) > 20:
+                text += f", … ({len(parts) - 20} more)"
+            return text
+
+        # A key that no notary can satisfy is the failure mode that used to be
+        # silent: the fan-out succeeds as a request, but verification later
+        # fails because every candidate window ends before the event. Report
+        # the per-notary windows for exactly those keys so the disagreement is
+        # visible in the log even when every notary answered 200.
+        unsatisfied: list[str] = []
+        for request in keys_to_fetch:
+            for key_id in request.key_ids:
+                merged_key = union_of_keys.get(request.server_name, {}).get(key_id)
+                if (
+                    merged_key is None
+                    or merged_key.valid_until_ts < request.minimum_valid_until_ts
+                ):
+                    candidates = "; ".join(
+                        f"{notary}: "
+                        f"{_format_windows(windows, (request.server_name, key_id)) or 'missing'}"
+                        for notary, windows in sorted(notary_windows.items())
+                    )
+                    unsatisfied.append(
+                        f"{request.server_name}/{key_id} needs >= "
+                        f"{request.minimum_valid_until_ts}, best merged "
+                        f"{merged_key.valid_until_ts if merged_key else 'none'}; "
+                        f"candidates [{candidates}]"
+                    )
+
+        if unsatisfied:
+            logger.warning(
+                "Notary key fan-out could not satisfy %d requested key(s): %s",
+                len(unsatisfied),
+                " | ".join(unsatisfied),
+            )
+
+        # The fan-out cost is the *slowest* notary, not the sum, because the
+        # requests run concurrently. Logging both makes it obvious when one
+        # notary is inflating join/verification latency.
+        log = logger.info if fanout_elapsed >= 0.5 or notary_failures else logger.debug
+        log(
+            "Notary key fan-out for %d key(s) across %d notary(s) took %.3fs; "
+            "slowest %s at %.3fs; %d notary(s) failed; candidate windows: %s",
+            requested_key_count,
+            len(self.key_servers),
+            fanout_elapsed,
+            slowest_notary,
+            slowest_elapsed,
+            len(notary_failures),
+            "; ".join(
+                f"{notary}: {_format_windows(windows)}"
+                for notary, windows in sorted(notary_windows.items())
+            )
+            or "none",
+        )
 
         return union_of_keys
 
@@ -1030,15 +1319,10 @@ class PerspectivesKeyFetcher(BaseV2KeyFetcher):
                         key,
                     )
 
-                    if already_present_key.valid_until_ts > key.valid_until_ts:
-                        # Favour the entry with the largest valid_until_ts,
-                        # as `old_verify_keys` are also collected from this
-                        # response.
-                        continue
+                    key = merge_fetch_key_results(already_present_key, key)
 
                 added_keys[dict_key] = key
-
-            keys.setdefault(server_name, {}).update(processed_response)
+                keys.setdefault(server_name, {})[key_id] = key
 
         return keys
 

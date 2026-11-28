@@ -32,7 +32,6 @@ from synapse.events.snapshot import (
 )
 from synapse.http.server import HttpServer
 from synapse.replication.http._base import ReplicationEndpoint
-from synapse.storage.databases.state.store import MAX_MIRROR_STATE_ENTRIES
 from synapse.types import JsonDict, StateMap
 from synapse.util.metrics import Measure
 
@@ -129,6 +128,11 @@ class ReplicationFederationSendEventsRestServlet(ReplicationEndpoint):
     async def _handle_request(  # type: ignore[override]
         self, request: Request, content: JsonDict
     ) -> tuple[int, JsonDict]:
+        # Imported here: `synapse.storage` imports the replication modules
+        # while it initializes, so a module-level import of the state store
+        # closes a cycle for callers that load the streams package first.
+        from synapse.storage.databases.state.store import MAX_MIRROR_STATE_ENTRIES
+
         with Measure(
             self.clock, name="repl_fed_send_events_parse", server_name=self.server_name
         ):

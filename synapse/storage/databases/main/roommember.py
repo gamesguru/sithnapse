@@ -132,33 +132,87 @@ class RoomMemberWorkerStore(EventsWorkerStore, CacheInvalidationWorkerStore):
         The statistic is stored on the class for the
         `synapse_federation_known_servers` LaterGauge to collect.
         """
-
-        def _transact(txn: LoggingTransaction) -> int:
-            if isinstance(self.database_engine, Sqlite3Engine):
-                query = """
-                    SELECT COUNT(DISTINCT substr(out.user_id, pos+1))
-                    FROM (
-                        SELECT rm.user_id as user_id, instr(rm.user_id, ':')
-                            AS pos FROM room_memberships as rm
-                        INNER JOIN current_state_events as c ON rm.event_id = c.event_id
-                        WHERE c.type = 'm.room.member'
-                    ) as out
-                """
-            else:
-                query = """
-                    SELECT COUNT(DISTINCT split_part(state_key, ':', 2))
-                    FROM current_state_events
-                    WHERE type = 'm.room.member' AND membership = 'join';
-                """
-            txn.execute(query)
-            return list(txn)[0][0]
-
-        count = await self.db_pool.runInteraction("get_known_servers", _transact)
+        count = await self.get_known_servers_count()
 
         # We always know about ourselves, even if we have nothing in
         # room_memberships (for example, the server is new).
         self._known_servers_count = max([count, 1])
         return self._known_servers_count
+
+    async def get_known_servers_count(self) -> int:
+        """Counts the distinct server names with at least one currently joined
+        member, including the local server.
+
+        Unlike the `destinations` table (which only contains servers we have
+        attempted to send transactions to), this includes every server that is
+        present in the state of a room this server stores (including rooms we
+        have left).
+        """
+
+        def _transact(txn: LoggingTransaction) -> int:
+            if isinstance(self.database_engine, Sqlite3Engine):
+                query = """
+                    SELECT DISTINCT substr(state_key, instr(state_key, ':') + 1)
+                    FROM current_state_events
+                    WHERE type = 'm.room.member' AND membership = 'join';
+                """
+            else:
+                query = """
+                    SELECT DISTINCT substring(state_key FROM '@[^:]*:(.*)$')
+                    FROM current_state_events
+                    WHERE type = 'm.room.member' AND membership = 'join';
+                """
+            txn.execute(query)
+            servers = {row[0] for row in txn if row[0] is not None}
+            servers.add(self.server_name)
+            return len(servers)
+
+        return await self.db_pool.runInteraction("get_known_servers_count", _transact)
+
+    async def get_joined_member_counts(self) -> tuple[int, int]:
+        """Count currently joined memberships across all rooms and locally.
+
+        Returns `(joined_members, local_joined_members)`. These are membership
+        rows, not distinct users: a user joined to three rooms counts three
+        times. `local_current_membership` already contains only users local to
+        this homeserver.
+        """
+
+        def _transact(txn: LoggingTransaction) -> tuple[int, int]:
+            txn.execute(
+                "SELECT COUNT(*) FROM current_state_events"
+                " WHERE type = ? AND membership = ?",
+                (EventTypes.Member, Membership.JOIN),
+            )
+            row = txn.fetchone()
+            joined_members = int(row[0]) if row and row[0] is not None else 0
+
+            txn.execute(
+                "SELECT COUNT(*) FROM local_current_membership WHERE membership = ?",
+                (Membership.JOIN,),
+            )
+            row = txn.fetchone()
+            local_joined_members = int(row[0]) if row and row[0] is not None else 0
+
+            return joined_members, local_joined_members
+
+        return await self.db_pool.runInteraction("get_joined_member_counts", _transact)
+
+    async def get_ever_seen_user_count(self) -> int:
+        """Count distinct user ids with any membership in a room we hold.
+
+        This includes remote users and users who have since left or been
+        banned, so it is a "users ever seen" figure rather than a current
+        membership count. It reads `room_memberships`, which keeps history,
+        and is served by the `room_memberships_user_id` index.
+        """
+
+        def _transact(txn: LoggingTransaction) -> int:
+            txn.execute("SELECT COUNT(DISTINCT user_id) FROM room_memberships")
+            row = txn.fetchone()
+            return int(row[0] or 0) if row is not None else 0
+
+        return await self.db_pool.runInteraction("get_ever_seen_user_count", _transact)
 
     @cached(max_entries=100000, iterable=True)
     async def get_users_in_room(self, room_id: str) -> Sequence[str]:
@@ -2142,7 +2196,6 @@ class RoomMemberBackgroundUpdateStore(SQLBaseStore):
             ):
                 found = get_event_json_batch(
                     self._embedded_db_engine,
-                    self._embedded_db_namespace,
                     missing_json_ids,
                 )
                 for eid, (_, j, _) in found.items():

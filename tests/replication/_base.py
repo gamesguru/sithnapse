@@ -18,6 +18,8 @@
 #
 #
 import logging
+import shutil
+import tempfile
 from collections import defaultdict
 from typing import Any, cast
 
@@ -43,7 +45,7 @@ from synapse.util.clock import Clock
 from synapse.util.duration import Duration
 
 from tests import unittest
-from tests.server import FakeTransport
+from tests.server import FakeTransport, ThreadedMemoryReactorClock
 from tests.utils import USE_POSTGRES_FOR_TESTS
 
 hiredis: Any = None
@@ -129,7 +131,6 @@ class BaseStreamTestCase(unittest.HomeserverTestCase):
             config["embedded_db"] = {
                 "engine": self.hs.config.database.embedded_db_engine,
                 "path": self.hs.config.database.embedded_db_path,
-                "namespace": self.hs.config.database.embedded_db_namespace,
                 "no_sync": self.hs.config.database.embedded_db_no_sync,
                 "flush_delay_secs": self.hs.config.database.embedded_db_flush_delay_secs,
             }
@@ -277,9 +278,48 @@ class BaseMultiWorkerStreamTestCase(unittest.HomeserverTestCase):
         base = super().default_config()
         base["redis"] = {"enabled": True}
         base["instance_map"] = {"main": {"host": "testserv", "port": 8765}}
+        # `setUp` opens `_shared_embedded_path` before `prepare()` runs, because
+        # `prepare()` persists events and event adjacency has no SQL fallback.
+        # Point the main homeserver at that same root instead of the per-
+        # homeserver uuid root `super().default_config()` chose; a second,
+        # different root cannot be opened in one process.
+        shared_path = getattr(self, "_shared_embedded_path", None)
+        if shared_path is not None and "embedded_db" in base:
+            base["embedded_db"] = {**base["embedded_db"], "path": shared_path}
         return base
 
+    def make_homeserver(
+        self, reactor: ThreadedMemoryReactorClock, clock: Clock
+    ) -> HomeServer:
+        hs = super().make_homeserver(reactor, clock)
+        # `setUp` opened `_shared_embedded_path` for this test, but building a
+        # homeserver closes whatever client is open (it must, so that a
+        # homeserver can open its own root), and this worker-shaped main
+        # homeserver does not reopen it. Reopen the shared root, which the
+        # fake workers also use, before `prepare()` creates rooms. This works
+        # around a one-store-per-process limit that exists only because the
+        # fixture runs master and workers in one process; it is not a product
+        # fix (real workers are separate processes).
+        from synapse.synapse_rust import mtxdb_engine
+
+        mtxdb_engine.open_client(self._shared_embedded_path)
+        # `prepare()` runs right after this returns and creates rooms, so the
+        # edge backend must already be writable when it does.
+        self._enable_embedded_edges(hs)
+        return hs
+
     def setUp(self) -> None:
+        # Worker-shaped configs cannot carry `embedded_db` (WorkerConfig rejects
+        # it in production), yet `prepare()` runs inside `super().setUp()` and
+        # persists events, which need a CSR store. Event adjacency has no SQL
+        # fallback, so open one shared in-process root first; these fake
+        # workers share this process and so share the global client.
+        from synapse.synapse_rust import mtxdb_engine
+
+        self._shared_embedded_path = tempfile.mkdtemp(prefix="test-multiworker-mtxdb-")
+        self.addCleanup(shutil.rmtree, self._shared_embedded_path, ignore_errors=True)
+        mtxdb_engine.open_client(self._shared_embedded_path)
+
         super().setUp()
 
         # Worker homeservers created via `make_worker_hs` are otherwise only
@@ -348,6 +388,21 @@ class BaseMultiWorkerStreamTestCase(unittest.HomeserverTestCase):
 
         return resource
 
+    @staticmethod
+    def _enable_embedded_edges(hs: HomeServer) -> None:
+        """Route a test homeserver's event adjacency through the open client.
+
+        Config-level `embedded_db` is absent on worker-shaped test configs, so
+        the stores were constructed with the edges backend disabled. The CSR
+        reader is unconditional, so the writer gate must be opened too or
+        persisted events would have no adjacency to read.
+        """
+        datastores = hs.get_datastores()
+        for store in (datastores.main, datastores.persist_events):
+            if store is not None:
+                store._embedded_event_edges_enabled = True
+                store._embedded_event_edges_writable = True
+
     def make_worker_hs(
         self, worker_app: str, extra_config: dict | None = None, **kwargs: Any
     ) -> HomeServer:
@@ -377,6 +432,7 @@ class BaseMultiWorkerStreamTestCase(unittest.HomeserverTestCase):
         # Keep this worker HS alive for the duration of the test -- see the
         # comment on `self._worker_homeservers` in `setUp`.
         self._worker_homeservers.append(worker_hs)
+        self._enable_embedded_edges(worker_hs)
 
         # If the instance is in the `instance_map` config then workers may try
         # and send HTTP requests to it, so we register it with
@@ -443,7 +499,6 @@ class BaseMultiWorkerStreamTestCase(unittest.HomeserverTestCase):
             config["embedded_db"] = {
                 "engine": self.hs.config.database.embedded_db_engine,
                 "path": self.hs.config.database.embedded_db_path,
-                "namespace": self.hs.config.database.embedded_db_namespace,
                 "no_sync": self.hs.config.database.embedded_db_no_sync,
                 "flush_delay_secs": self.hs.config.database.embedded_db_flush_delay_secs,
             }

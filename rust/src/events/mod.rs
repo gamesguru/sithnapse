@@ -750,7 +750,14 @@ impl Event {
             origin_server_ts,
             depth,
             prev_events: self.prev_event_ids(),
-            auth_events: self.auth_event_ids()?,
+            // MSC4242 has no wire `auth_events`; state resolution uses
+            // `prev_state_events` directly. Avoid forcing their derived auth
+            // event IDs to be calculated merely to build resolver input.
+            auth_events: if self.room_version.msc4242_state_dags {
+                Vec::new()
+            } else {
+                self.auth_event_ids()?
+            },
             prev_state_events: self.prev_state_events().unwrap_or_default(),
             msc4242_state_dags: self.room_version.msc4242_state_dags,
             content,

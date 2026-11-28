@@ -206,6 +206,44 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
             self._flag_existing_quarantined_media,
         )
 
+    async def get_room_upgrade_user_transfer_progress(
+        self, old_room_id: str, new_room_id: str
+    ) -> dict[str, tuple[bool, bool]]:
+        rows = await self.db_pool.simple_select_list(
+            table="room_upgrade_user_transfers",
+            keyvalues={"old_room_id": old_room_id, "new_room_id": new_room_id},
+            retcols=("user_id", "tags_transferred", "push_rules_transferred"),
+            desc="get_room_upgrade_user_transfer_progress",
+        )
+        return {
+            user_id: (tags_done, push_done) for user_id, tags_done, push_done in rows
+        }
+
+    async def mark_room_upgrade_user_transfer_progress(
+        self,
+        old_room_id: str,
+        new_room_id: str,
+        user_id: str,
+        *,
+        tags_transferred: bool | None = None,
+        push_rules_transferred: bool | None = None,
+    ) -> None:
+        values = {}
+        if tags_transferred is not None:
+            values["tags_transferred"] = tags_transferred
+        if push_rules_transferred is not None:
+            values["push_rules_transferred"] = push_rules_transferred
+        await self.db_pool.simple_upsert(
+            table="room_upgrade_user_transfers",
+            keyvalues={
+                "old_room_id": old_room_id,
+                "new_room_id": new_room_id,
+                "user_id": user_id,
+            },
+            values=values,
+            desc="mark_room_upgrade_user_transfer_progress",
+        )
+
     async def _flag_existing_quarantined_media(
         self, progress: JsonDict, batch_size: int
     ) -> int:
@@ -397,7 +435,6 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
                     "creator": room_creator_user_id,
                     "is_public": is_public,
                     "room_version": room_version.identifier,
-                    "has_auth_chain_index": True,
                 },
                 desc="store_room",
             )
@@ -413,23 +450,26 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
         Returns:
             A tuple containing the room information:
                 * True if the room is public
-                * True if the room has an auth chain index
+                * True if the room has an auth graph (SQL or mtxdb)
 
             or None if the room is unknown.
         """
         row = cast(
-            tuple[int | bool | None, int | bool | None] | None,
+            tuple[int | bool | None] | None,
             await self.db_pool.simple_select_one(
                 table="rooms",
                 keyvalues={"room_id": room_id},
-                retcols=("is_public", "has_auth_chain_index"),
+                retcols=("is_public",),
                 desc="get_room",
                 allow_none=True,
             ),
         )
         if row is None:
             return row
-        return bool(row[0]), bool(row[1])
+        # The old second value represented availability of the SQL chain-cover
+        # index. That index is retired; both supported backends traverse their
+        # direct auth graph, so preserve the tuple API with a constant True.
+        return bool(row[0]), True
 
     async def get_room_with_stats(self, room_id: str) -> RoomStats | None:
         """Retrieve room with statistics.
@@ -1233,7 +1273,6 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
             ):
                 found = get_event_json_batch(
                     self._embedded_db_engine,
-                    self._embedded_db_namespace,
                     missing_json_ids,
                 )
                 for eid, (_, j, _) in found.items():
@@ -2026,6 +2065,46 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
             _get_un_partial_stated_rooms_between_txn,
         )
 
+    async def get_rooms_un_partial_stated_after(self, stream_id: int) -> set[str]:
+        """Get the rooms that became fully-stated after `stream_id`.
+
+        Unlike `get_un_partial_stated_rooms_between`, the upper bound is the
+        database, not a (possibly lagging) stream token: this is used to find
+        rooms whose partial-state resync completed after the sync response's
+        token was captured.
+
+        The caller intersects the result with the rooms it cares about. Doing
+        that in Python rather than with an `IN` clause keeps this safe for a
+        user who is joined to thousands of rooms (SQLite has a bound-variable
+        limit). The `stream_id` predicate is a primary-key range scan whose
+        tail is normally empty.
+
+        Args:
+            stream_id: The un-partial-stated-rooms stream position to compare
+                against (exclusive).
+
+        Returns:
+            Every room with an un-partial-stated stream row after `stream_id`.
+        """
+
+        def _get_rooms_un_partial_stated_after_txn(
+            txn: LoggingTransaction,
+        ) -> set[str]:
+            txn.execute(
+                """
+                SELECT DISTINCT room_id FROM un_partial_stated_room_stream
+                WHERE stream_id > ?
+                """,
+                (stream_id,),
+            )
+
+            return {r[0] for r in txn}
+
+        return await self.db_pool.runInteraction(
+            "get_rooms_un_partial_stated_after",
+            _get_rooms_un_partial_stated_after_txn,
+        )
+
     async def get_un_partial_stated_rooms_from_stream(
         self, instance_name: str, last_id: int, current_id: int, limit: int
     ) -> tuple[list[tuple[int, tuple[str]]], int, bool]:
@@ -2126,7 +2205,6 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
             ):
                 found = get_event_json_batch(
                     self._embedded_db_engine,
-                    self._embedded_db_namespace,
                     [event_id],
                 )
                 if event_id in found:
@@ -2472,37 +2550,6 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
                 desc="set_room_is_public_appservice_false",
             )
 
-    async def has_auth_chain_index(self, room_id: str) -> bool:
-        """Check if the room has (or can have) a chain cover index.
-
-        Defaults to True if we don't have an entry in `rooms` table nor any
-        events for the room.
-        """
-
-        has_auth_chain_index = await self.db_pool.simple_select_one_onecol(
-            table="rooms",
-            keyvalues={"room_id": room_id},
-            retcol="has_auth_chain_index",
-            desc="has_auth_chain_index",
-            allow_none=True,
-        )
-
-        if has_auth_chain_index:
-            return True
-
-        # It's possible that we already have events for the room in our DB
-        # without a corresponding room entry. If we do then we don't want to
-        # mark the room as having an auth chain cover index.
-        max_ordering = await self.db_pool.simple_select_one_onecol(
-            table="events",
-            keyvalues={"room_id": room_id},
-            retcol="MAX(stream_ordering)",
-            allow_none=True,
-            desc="has_auth_chain_index_fallback",
-        )
-
-        return max_ordering is None
-
     async def maybe_store_room_on_outlier_membership(
         self, room_id: str, room_version: RoomVersion
     ) -> None:
@@ -2510,11 +2557,6 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
         When we receive an invite or any other event over federation that may relate to a room
         we are not in, store the version of the room if we don't already know the room version.
         """
-        # It's possible that we already have events for the room in our DB
-        # without a corresponding room entry. If we do then we don't want to
-        # mark the room as having an auth chain cover index.
-        has_auth_chain_index = await self.has_auth_chain_index(room_id)
-
         await self.db_pool.simple_upsert(
             desc="maybe_store_room_on_outlier_membership",
             table="rooms",
@@ -2527,7 +2569,6 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
                 # we don't process any messages in a room while a user is
                 # invited (only after the join).
                 "creator": "",
-                "has_auth_chain_index": has_auth_chain_index,
             },
         )
 
@@ -2694,7 +2735,6 @@ class RoomBackgroundUpdateStore(RoomWorkerStore):
             if missing_ids and getattr(self, "_embedded_event_json_enabled", False):
                 found = get_event_json_batch(
                     self._embedded_db_engine,
-                    self._embedded_db_namespace,
                     missing_ids,
                 )
                 for eid, (_, j, _) in found.items():
@@ -2901,7 +2941,6 @@ class RoomBackgroundUpdateStore(RoomWorkerStore):
             if missing_ids and getattr(self, "_embedded_event_json_enabled", False):
                 found = get_event_json_batch(
                     self._embedded_db_engine,
-                    self._embedded_db_namespace,
                     missing_ids,
                 )
                 for eid, (_, j, _) in found.items():
@@ -2986,7 +3025,6 @@ class RoomBackgroundUpdateStore(RoomWorkerStore):
             if missing_ids and getattr(self, "_embedded_event_json_enabled", False):
                 found = get_event_json_batch(
                     self._embedded_db_engine,
-                    self._embedded_db_namespace,
                     missing_ids,
                 )
                 for eid, (_, j, _) in found.items():
@@ -3061,11 +3099,6 @@ class RoomStore(RoomBackgroundUpdateStore, RoomWorkerStore):
         Called when we join a room over federation, and overwrites any room version
         currently in the table.
         """
-        # It's possible that we already have events for the room in our DB
-        # without a corresponding room entry. If we do then we don't want to
-        # mark the room as having an auth chain cover index.
-        has_auth_chain_index = await self.has_auth_chain_index(room_id)
-
         create_event = None
         for e in state_events:
             if (e.type, e.state_key) == (EventTypes.Create, ""):
@@ -3096,7 +3129,6 @@ class RoomStore(RoomBackgroundUpdateStore, RoomWorkerStore):
             insertion_values={
                 "is_public": False,
                 "creator": room_creator,
-                "has_auth_chain_index": has_auth_chain_index,
             },
         )
 

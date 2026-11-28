@@ -8,7 +8,8 @@
 //!   `mtxdb_syn` is the driver implementing `hamt_store::NodeStore` over
 //!   mtxdb's append-only content-addressed packfiles.
 
-pub mod embedded_edges;
+pub mod embedded_adjacency;
+pub mod embedded_timeline;
 pub mod hamt_store;
 pub mod mtxdb_syn;
 pub mod postgres;
@@ -21,7 +22,8 @@ use pyo3::types::PyModule;
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let child_module = PyModule::new(py, "mtxdb_engine")?;
     mtxdb_syn::register_module(&child_module)?;
-    embedded_edges::register_module(&child_module)?;
+    embedded_adjacency::register_module(&child_module)?;
+    embedded_timeline::register_module(&child_module)?;
 
     m.add_submodule(&child_module)?;
 

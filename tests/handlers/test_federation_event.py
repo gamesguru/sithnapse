@@ -18,12 +18,19 @@
 # [This file includes modifications made by New Vector Limited]
 #
 #
+from typing import cast
 from unittest import mock
 
 from twisted.internet.testing import MemoryReactor
 
 from synapse.api.constants import EventTypes
-from synapse.api.errors import AuthError, StoreError
+from synapse.api.errors import (
+    AuthError,
+    HttpResponseException,
+    PartialStateConflictError,
+    RequestSendFailed,
+    StoreError,
+)
 from synapse.api.room_versions import RoomVersion, RoomVersions
 from synapse.event_auth import (
     check_state_dependent_auth_rules,
@@ -33,7 +40,11 @@ from synapse.events import EventBase
 from synapse.events.py_protocol import MSC4242Event, supports_msc4242_state_dag
 from synapse.events.snapshot import EventContext
 from synapse.federation.transport.client import StateRequestResponse
-from synapse.handlers.federation_event import is_state_dag_connected
+from synapse.handlers.federation_event import (
+    BACKFILL_BATCH_MAX_EVENTS,
+    BACKFILL_BATCH_STATE_LOOKUP_CONCURRENCY,
+    is_state_dag_connected,
+)
 from synapse.logging.context import LoggingContext
 from synapse.rest import admin
 from synapse.rest.client import login, room
@@ -41,6 +52,7 @@ from synapse.server import HomeServer
 from synapse.state import StateResolutionStore
 from synapse.state.v2 import _mainline_sort, _reverse_topological_power_sort
 from synapse.types import JsonDict
+from synapse.util.async_helpers import concurrently_execute
 from synapse.util.clock import Clock
 
 from tests import unittest
@@ -66,6 +78,51 @@ class FederationEventHandlerTests(unittest.FederatingHomeserverTestCase):
         self.mock_federation_transport_client.backfill = mock.AsyncMock()
         return super().setup_test_homeserver(
             federation_transport_client=self.mock_federation_transport_client
+        )
+
+    def test_partial_state_lookup_is_not_cached(self) -> None:
+        handler = self.hs.get_federation_event_handler()
+        room_id = "!room:test"
+        event_id = "$partial-state-gap"
+        state_event_id = "$available-state"
+        missing_state_event_id = "$missing-state"
+        # The transport layer returns the raw /state_ids payload; the client
+        # unwraps `pdu_ids` before handing the tuple to the handler.
+        self.mock_federation_transport_client.get_room_state_ids.return_value = {
+            "pdu_ids": [state_event_id, missing_state_event_id],
+            "auth_chain_ids": [],
+        }
+        metadata = mock.Mock(
+            room_id=room_id,
+            event_type=EventTypes.Name,
+            state_key="",
+        )
+
+        with (
+            mock.patch.object(
+                handler._store,
+                "have_seen_events",
+                new=mock.AsyncMock(return_value=set()),
+            ),
+            mock.patch.object(
+                handler._store,
+                "get_metadata_for_events",
+                new=mock.AsyncMock(return_value={state_event_id: metadata}),
+            ),
+            mock.patch.object(
+                handler._store, "get_event", new=mock.AsyncMock(return_value=None)
+            ),
+            mock.patch.object(handler, "_get_state_and_persist", new=mock.AsyncMock()),
+        ):
+            state_map = self.get_success(
+                handler._get_state_ids_after_missing_prev_event(
+                    "remote", room_id, event_id
+                )
+            )
+
+        self.assertEqual(state_map, {(EventTypes.Name, ""): state_event_id})
+        self.assertIsNone(
+            handler._incomplete_state_lookups.get(("remote", room_id, event_id))
         )
 
     def test_inbound_pdu_batch_falls_back_for_rejected_event(self) -> None:
@@ -231,6 +288,482 @@ class FederationEventHandlerTests(unittest.FederatingHomeserverTestCase):
         )
         self.assertEqual(encrypted_handlers_saw_persisted, [True, True])
 
+    def _run_pulled_batch_with_state_probe(
+        self,
+        state_probe: mock.AsyncMock,
+    ) -> tuple[bool, mock.AsyncMock]:
+        """Run a two-event pulled batch with one unaccounted gap parent."""
+        room_id = "!room:test"
+        first_event = mock.Mock(room_id=room_id, event_id="$first")
+        first_event.is_state.return_value = False
+        first_event.prev_event_ids.return_value = ("$first-prev",)
+        first_event.internal_metadata.is_outlier.return_value = False
+
+        second_event = mock.Mock(room_id=room_id, event_id="$second")
+        second_event.is_state.return_value = False
+        second_event.prev_event_ids.return_value = ("$first", "$gap")
+        second_event.internal_metadata.is_outlier.return_value = False
+
+        first_context = mock.Mock(rejected=False, state_group=1, partial_state=False)
+        second_context = mock.Mock(rejected=False)
+
+        handler = self.hs.get_federation_event_handler()
+        store = self.hs.get_datastores().main
+        persist_events_and_notify = mock.AsyncMock()
+
+        with (
+            mock.patch.object(handler, "_sanity_check_event"),
+            mock.patch.object(
+                store,
+                "have_events_in_timeline",
+                new=mock.AsyncMock(return_value=set()),
+            ),
+            mock.patch.object(
+                handler._federation_client,
+                "get_room_state_ids",
+                new=state_probe,
+            ),
+            mock.patch.object(
+                handler,
+                "_compute_event_context_with_maybe_missing_prevs",
+                new=mock.AsyncMock(return_value=first_context),
+            ),
+            mock.patch.object(EventContext, "with_state", return_value=second_context),
+            mock.patch.object(handler, "_check_event_auth", new=mock.AsyncMock()),
+            mock.patch.object(handler, "_check_for_soft_fail", new=mock.AsyncMock()),
+            mock.patch.object(
+                store, "get_min_depth", new=mock.AsyncMock(return_value=None)
+            ),
+            mock.patch.object(
+                handler._bulk_push_rule_evaluator,
+                "action_for_events_by_user",
+                new=mock.AsyncMock(),
+            ),
+            mock.patch.object(
+                handler, "persist_events_and_notify", new=persist_events_and_notify
+            ),
+            mock.patch.object(handler, "_handle_encrypted_event", new=mock.AsyncMock()),
+        ):
+            result = self.get_success(
+                handler._try_process_pulled_events_as_batch(
+                    "remote", [first_event, second_event]
+                )
+            )
+
+        return result, persist_events_and_notify
+
+    def _backfilled_run(
+        self, count: int = 3, state_at: int | None = None
+    ) -> list[mock.Mock]:
+        """A depth-ordered run: each event has the previous one and a gap parent."""
+        events = []
+        for i in range(count):
+            event = mock.Mock(room_id="!room:test", event_id=f"$e{i}", depth=2 * i)
+            event.is_state.return_value = state_at == i
+            prevs = [f"$gap{i}"] + ([f"$e{i - 1}"] if i else ["$before"])
+            event.prev_event_ids.return_value = prevs
+            event.internal_metadata.is_outlier.return_value = False
+            event.room_version.msc4242_state_dags = False
+            events.append(event)
+        return events
+
+    def _run_backfilled_batch(
+        self,
+        events: list[mock.Mock],
+        *,
+        cached_failures: bool = True,
+        known_prevs: set[str] | None = None,
+        probe: mock.AsyncMock | None = None,
+        persist_error: Exception | None = None,
+        in_backoff: dict[str, int] | None = None,
+        reject: str | None = None,
+    ) -> tuple[bool, mock.AsyncMock, dict[str, mock.AsyncMock]]:
+        handler = self.hs.get_federation_event_handler()
+        store = self.hs.get_datastores().main
+        first_context = mock.Mock(rejected=False, state_group=1, partial_state=False)
+        persist = mock.AsyncMock(side_effect=persist_error)
+
+        async def check_event_auth(
+            origin: str, event: EventBase, context: EventContext
+        ) -> None:
+            if event.event_id == reject:
+                context.rejected = "auth_error"
+
+        guards = {
+            "soft_fail": mock.AsyncMock(),
+            "push": mock.AsyncMock(),
+            "encrypted": mock.AsyncMock(),
+        }
+        if probe is None:
+            probe = mock.AsyncMock(
+                side_effect=HttpResponseException(404, "Not Found", b"")
+            )
+        self.probe = probe
+        if cached_failures:
+            for event in events:
+                for prev in event.prev_event_ids():
+                    if prev.startswith("$gap"):
+                        handler._incomplete_state_lookups[
+                            ("remote", "!room:test", prev)
+                        ] = "no state"
+
+        with (
+            mock.patch.object(handler, "_sanity_check_event"),
+            mock.patch.object(
+                handler, "_get_state_ids_after_missing_prev_event", new=probe
+            ),
+            mock.patch.object(
+                store,
+                "get_event_ids_to_not_pull_from_backoff",
+                new=mock.AsyncMock(return_value=in_backoff or {}),
+            ),
+            mock.patch.object(
+                store,
+                "have_events_in_timeline",
+                new=mock.AsyncMock(return_value=known_prevs or set()),
+            ),
+            mock.patch.object(
+                handler,
+                "_compute_event_context_with_maybe_missing_prevs",
+                new=mock.AsyncMock(return_value=first_context),
+            ),
+            mock.patch.object(
+                EventContext,
+                "with_state",
+                side_effect=lambda **kw: mock.Mock(rejected=False, **kw),
+            ),
+            mock.patch.object(
+                handler,
+                "_check_event_auth",
+                new=mock.AsyncMock(side_effect=check_event_auth),
+            ),
+            mock.patch.object(handler, "_check_for_soft_fail", new=guards["soft_fail"]),
+            mock.patch.object(
+                handler._bulk_push_rule_evaluator,
+                "action_for_events_by_user",
+                new=guards["push"],
+            ),
+            mock.patch.object(
+                handler, "_handle_encrypted_event", new=guards["encrypted"]
+            ),
+            mock.patch.object(handler, "persist_events_and_notify", new=persist),
+        ):
+            result = self.get_success(
+                handler._try_process_backfilled_events_as_batch(
+                    "remote", cast(list[EventBase], events)
+                )
+            )
+        return result, persist, guards
+
+    def test_backfilled_run_is_persisted_in_one_call_like_the_serial_path(self) -> None:
+        events = self._backfilled_run()
+        result, persist, guards = self._run_backfilled_batch(events)
+
+        self.assertTrue(result)
+        persist.assert_awaited_once()
+        call = persist.await_args
+        assert call is not None
+        args, kwargs = call
+        self.assertEqual([e.event_id for e, _ in args[1]], ["$e0", "$e1", "$e2"])
+        # Backfilled persistence: negative stream orderings, no current-state or
+        # forward-extremity changes.
+        self.assertIs(kwargs["backfilled"], True)
+        # Everything the serial backfill path skips is skipped here too.
+        guards["soft_fail"].assert_not_awaited()
+        guards["push"].assert_not_awaited()
+        guards["encrypted"].assert_not_awaited()
+        # Every event shares the first event's state group.
+        self.assertEqual({c.state_group for _, c in args[1]}, {1})
+
+    def test_backfilled_run_probes_each_unknown_gap_parent_once_and_batches(
+        self,
+    ) -> None:
+        """A cold cache is not a reason to decline: ask, like the serial path."""
+        result, persist, _ = self._run_backfilled_batch(
+            self._backfilled_run(), cached_failures=False
+        )
+        self.assertTrue(result)
+        persist.assert_awaited_once()
+        # Each gap parent beyond the first event's own is asked about once.
+        asked = sorted(call.args[2] for call in self.probe.await_args_list)
+        self.assertEqual(asked, ["$gap1", "$gap2"])
+        # The failures are remembered, so the serial path would skip them too.
+        handler = self.hs.get_federation_event_handler()
+        for gap in ("$gap1", "$gap2"):
+            self.assertIsNotNone(
+                handler._incomplete_state_lookups.get(("remote", "!room:test", gap))
+            )
+
+    def test_backfilled_run_declines_on_transient_gap_probe_error(self) -> None:
+        probe = mock.AsyncMock(side_effect=RuntimeError("temporary lookup failure"))
+        result, persist, _ = self._run_backfilled_batch(
+            self._backfilled_run(), cached_failures=False, probe=probe
+        )
+
+        self.assertFalse(result)
+        persist.assert_not_awaited()
+        handler = self.hs.get_federation_event_handler()
+        self.assertIsNone(
+            handler._incomplete_state_lookups.get(("remote", "!room:test", "$gap1"))
+        )
+
+    def test_backfilled_run_probes_a_bounded_number_of_gap_parents_at_once(
+        self,
+    ) -> None:
+        events = self._backfilled_run(count=30)
+        recorded: list[int] = []
+
+        async def recording_execute(func: object, args: object, limit: int) -> None:
+            recorded.append(limit)
+            await concurrently_execute(func, args, limit)  # type: ignore[arg-type]
+
+        with mock.patch(
+            "synapse.handlers.federation_event.concurrently_execute",
+            new=recording_execute,
+        ):
+            result, _, _ = self._run_backfilled_batch(events, cached_failures=False)
+
+        self.assertTrue(result)
+        self.assertEqual(recorded, [BACKFILL_BATCH_STATE_LOOKUP_CONCURRENCY])
+        self.assertLess(BACKFILL_BATCH_STATE_LOOKUP_CONCURRENCY, 29)
+
+    def test_backfilled_run_falls_back_if_the_room_is_un_partial_stated(self) -> None:
+        """The serial path retries this with a fresh context, so the batch must not
+        let it escape as an error."""
+        result, persist, _ = self._run_backfilled_batch(
+            self._backfilled_run(),
+            persist_error=PartialStateConflictError(),
+        )
+        self.assertFalse(result)
+        persist.assert_awaited_once()
+
+    def test_backfilled_run_larger_than_a_persist_chunk_falls_back(self) -> None:
+        """Persistence commits every 100 events, so only a smaller run is atomic."""
+        for count, batched in (
+            (BACKFILL_BATCH_MAX_EVENTS, True),
+            (BACKFILL_BATCH_MAX_EVENTS + 1, False),
+        ):
+            result, persist, _ = self._run_backfilled_batch(
+                self._backfilled_run(count=count)
+            )
+            self.assertEqual(result, batched, count)
+            self.assertEqual(persist.await_count, 1 if batched else 0, count)
+
+    def test_backfilled_run_does_not_probe_remembered_failures(self) -> None:
+        result, persist, _ = self._run_backfilled_batch(self._backfilled_run())
+        self.assertTrue(result)
+        self.probe.assert_not_awaited()
+
+    def test_backfilled_run_falls_back_when_a_gap_parent_has_state(self) -> None:
+        """State at a gap parent has to be resolved into the context."""
+        result, persist, _ = self._run_backfilled_batch(
+            self._backfilled_run(),
+            cached_failures=False,
+            probe=mock.AsyncMock(return_value={}),
+        )
+        self.assertFalse(result)
+        persist.assert_not_awaited()
+
+    def test_backfilled_run_with_a_known_extra_parent_falls_back(self) -> None:
+        """A known extra parent has state of its own, so it needs resolving."""
+        result, persist, _ = self._run_backfilled_batch(
+            self._backfilled_run(), known_prevs={"$gap1"}
+        )
+        self.assertFalse(result)
+        persist.assert_not_awaited()
+
+    def test_backfilled_run_with_a_gap_parent_in_pull_backoff_falls_back(self) -> None:
+        """The serial path skips an event whose missing parent is in backoff."""
+        result, persist, _ = self._run_backfilled_batch(
+            self._backfilled_run(), in_backoff={"$gap1": 1}
+        )
+        self.assertFalse(result)
+        persist.assert_not_awaited()
+
+    def test_backfilled_run_with_a_state_event_falls_back(self) -> None:
+        for state_at in (0, 1):
+            result, persist, _ = self._run_backfilled_batch(
+                self._backfilled_run(state_at=state_at)
+            )
+            self.assertFalse(result)
+            persist.assert_not_awaited()
+
+    def test_backfilled_run_with_a_rejected_event_falls_back(self) -> None:
+        result, persist, _ = self._run_backfilled_batch(
+            self._backfilled_run(), reject="$e2"
+        )
+        self.assertFalse(result)
+        persist.assert_not_awaited()
+
+    def test_backfilled_run_that_is_not_linear_falls_back(self) -> None:
+        events = self._backfilled_run()
+        events[2].prev_event_ids.return_value = ["$gap2", "$elsewhere"]
+        result, persist, _ = self._run_backfilled_batch(events)
+        self.assertFalse(result)
+        persist.assert_not_awaited()
+
+    def test_pulled_batch_allows_confirmed_gap_parent(self) -> None:
+        """A 404 for an extra predecessor means it is a gap, not a state fork."""
+        state_probe = mock.AsyncMock(
+            side_effect=HttpResponseException(404, "Not Found", b"")
+        )
+        result, persist_events_and_notify = self._run_pulled_batch_with_state_probe(
+            state_probe
+        )
+
+        self.assertTrue(result)
+        persist_events_and_notify.assert_awaited_once()
+        state_probe.assert_awaited_once()
+
+    def test_pulled_batch_falls_back_when_gap_parent_has_state(self) -> None:
+        """If the remote can serve the extra predecessor's state, use serial."""
+        state_probe = mock.AsyncMock(return_value=([], []))
+        result, persist_events_and_notify = self._run_pulled_batch_with_state_probe(
+            state_probe
+        )
+
+        self.assertFalse(result)
+        persist_events_and_notify.assert_not_awaited()
+        state_probe.assert_awaited_once()
+
+    def test_pulled_batch_declines_5xx_gap_parent(self) -> None:
+        """A 5xx probe is transient, not a confirmed gap."""
+        state_probe = mock.AsyncMock(
+            side_effect=HttpResponseException(502, "Bad Gateway", b"")
+        )
+        result, persist_events_and_notify = self._run_pulled_batch_with_state_probe(
+            state_probe
+        )
+
+        self.assertFalse(result)
+        persist_events_and_notify.assert_not_awaited()
+        state_probe.assert_awaited_once()
+
+    def _run_inbound_batch_with_gap_probe(
+        self, state_probe: mock.AsyncMock
+    ) -> tuple[bool, mock.AsyncMock]:
+        """Run an inbound batch whose second event has one gap parent."""
+        room_id = "!room:test"
+        first_event = mock.Mock(room_id=room_id, event_id="$first", depth=1)
+        first_event.is_state.return_value = False
+        first_event.prev_event_ids.return_value = ("$known",)
+        first_event.internal_metadata.outlier = False
+
+        second_event = mock.Mock(room_id=room_id, event_id="$second", depth=2)
+        second_event.is_state.return_value = False
+        second_event.prev_event_ids.return_value = ("$first", "$gap")
+        second_event.internal_metadata.outlier = False
+
+        first_context = mock.Mock(rejected=False, state_group=1, partial_state=False)
+        second_context = mock.Mock(rejected=False)
+
+        async def have_events_in_timeline(event_ids: object) -> set[str]:
+            if "$known" in event_ids:  # type: ignore[operator]
+                return {"$known"}
+            return set()
+
+        handler = self.hs.get_federation_event_handler()
+        store = self.hs.get_datastores().main
+        persist_events_and_notify = mock.AsyncMock()
+
+        with (
+            mock.patch.object(
+                handler._event_auth_handler,
+                "is_host_in_room",
+                new=mock.AsyncMock(return_value=True),
+            ),
+            mock.patch.object(
+                store, "get_event", new=mock.AsyncMock(return_value=None)
+            ),
+            mock.patch.object(
+                store,
+                "have_events_in_timeline",
+                new=mock.AsyncMock(side_effect=have_events_in_timeline),
+            ),
+            mock.patch.object(
+                store,
+                "get_latest_event_ids_in_room",
+                new=mock.AsyncMock(return_value=[]),
+            ),
+            mock.patch.object(
+                store, "get_min_depth", new=mock.AsyncMock(return_value=None)
+            ),
+            mock.patch.object(
+                handler._federation_client,
+                "get_pdu",
+                new=mock.AsyncMock(return_value=None),
+            ),
+            mock.patch.object(
+                handler._federation_client,
+                "get_room_state_ids",
+                new=state_probe,
+            ),
+            mock.patch.object(handler, "_sanity_check_event"),
+            mock.patch.object(
+                handler._state_handler,
+                "compute_event_context",
+                new=mock.AsyncMock(return_value=first_context),
+            ),
+            mock.patch.object(EventContext, "with_state", return_value=second_context),
+            mock.patch.object(handler, "_check_event_auth", new=mock.AsyncMock()),
+            mock.patch.object(handler, "_check_for_soft_fail", new=mock.AsyncMock()),
+            mock.patch.object(
+                handler._bulk_push_rule_evaluator,
+                "action_for_events_by_user",
+                new=mock.AsyncMock(),
+            ),
+            mock.patch.object(
+                handler, "persist_events_and_notify", new=persist_events_and_notify
+            ),
+            mock.patch.object(handler, "_handle_encrypted_event", new=mock.AsyncMock()),
+        ):
+            result = self.get_success(
+                handler.try_on_receive_pdu_batch(
+                    [("remote", first_event), ("remote", second_event)]
+                )
+            )
+
+        return result, persist_events_and_notify
+
+    def test_inbound_batch_allows_404_gap_parent(self) -> None:
+        """A 404 when probing a gap parent means it is genuinely unavailable."""
+        state_probe = mock.AsyncMock(
+            side_effect=HttpResponseException(404, "Not Found", b"")
+        )
+        result, persist_events_and_notify = self._run_inbound_batch_with_gap_probe(
+            state_probe
+        )
+
+        self.assertTrue(result)
+        persist_events_and_notify.assert_awaited_once()
+        state_probe.assert_awaited_once()
+
+    def test_inbound_batch_declines_transient_gap_probe_error(self) -> None:
+        """A transient state lookup failure must not be treated as a gap."""
+        state_probe = mock.AsyncMock(
+            side_effect=RequestSendFailed(Exception("timeout"), can_retry=True)
+        )
+        result, persist_events_and_notify = self._run_inbound_batch_with_gap_probe(
+            state_probe
+        )
+
+        self.assertFalse(result)
+        persist_events_and_notify.assert_not_awaited()
+        state_probe.assert_awaited_once()
+
+    def test_inbound_batch_declines_5xx_gap_probe(self) -> None:
+        """A 5xx state lookup failure must not be treated as a gap."""
+        state_probe = mock.AsyncMock(
+            side_effect=HttpResponseException(500, "Internal Server Error", b"")
+        )
+        result, persist_events_and_notify = self._run_inbound_batch_with_gap_probe(
+            state_probe
+        )
+
+        self.assertFalse(result)
+        persist_events_and_notify.assert_not_awaited()
+        state_probe.assert_awaited_once()
+
     def _update_state_for_flipped_membership(
         self, cached_devices: dict[str, JsonDict], last_stream_id: str | None
     ) -> mock.AsyncMock:
@@ -323,6 +856,50 @@ class FederationEventHandlerTests(unittest.FederatingHomeserverTestCase):
         as we expect.
         """
         return self._test_process_pulled_event_with_missing_state(False)
+
+    def test_unfetchable_state_event_is_not_requested_again_immediately(self) -> None:
+        """A failed state-event fetch is cached for the short negative TTL."""
+        user_id = self.register_user("kermit", "test")
+        tok = self.login("kermit", "test")
+        room_id = self.helper.create_room_as(room_creator=user_id, tok=tok)
+        handler = self.hs.get_federation_event_handler()
+        federation_client = self.hs.get_federation_client()
+
+        with mock.patch.object(
+            federation_client,
+            "get_pdu",
+            new=mock.AsyncMock(return_value=None),
+        ) as get_pdu:
+            self.get_success(
+                handler._get_events_and_persist(
+                    self.OTHER_SERVER_NAME, room_id, {"$unfetchable"}
+                )
+            )
+            self.get_success(
+                handler._get_events_and_persist(
+                    self.OTHER_SERVER_NAME, room_id, {"$unfetchable"}
+                )
+            )
+
+            get_pdu.assert_awaited_once()
+
+            # It remains cached until its 60-second TTL, then the next cache
+            # prune tick removes it.
+            self.reactor.advance(59)
+            self.get_success(
+                handler._get_events_and_persist(
+                    self.OTHER_SERVER_NAME, room_id, {"$unfetchable"}
+                )
+            )
+            get_pdu.assert_awaited_once()
+
+            self.reactor.advance(31)
+            self.get_success(
+                handler._get_events_and_persist(
+                    self.OTHER_SERVER_NAME, room_id, {"$unfetchable"}
+                )
+            )
+            self.assertEqual(get_pdu.await_count, 2)
 
     def test_process_pulled_event_with_missing_state_where_prev_is_outlier(
         self,

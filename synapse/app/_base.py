@@ -674,18 +674,36 @@ async def start(hs: "HomeServer", *, freeze: bool = True) -> None:
     server_name = hs.hostname
     reactor = hs.get_reactor()
 
-    # Fatal precondition for the (not-yet-shipped) release that removes the
-    # SQL event_edges insert -- a no-op today, see
-    # embedded_event_edges.EVENT_EDGES_SQL_INSERT_REMOVED and
-    # res/docs/2026-09-28-event-edges-sql-removal-plan.md's "Blocker 1".
-    from synapse.storage.databases.main.embedded_event_edges import (
-        EventEdgesMigrationIncompleteError,
-        check_event_edges_migration_complete,
+    # Event adjacency now lives only in mtxdb's CSR store: the SQL
+    # `event_edges` path (and its fallback reads) was removed, and ordinary
+    # room creation reads the forward index. Without a store those reads fail
+    # with "mtxdb not opened" at the first event, long after startup. Refuse to
+    # start instead, with the fix in the message.
+    if not hs.config.database.embedded_db_engine:
+        quit_with_error(
+            "embedded_db.engine must be set to 'mtxdb': event adjacency, "
+            "event JSON and state groups live in the embedded store, and the "
+            "SQL fallbacks were removed. Set embedded_db.engine: mtxdb and "
+            "embedded_db.path to a persistent directory."
+        )
+
+    from synapse.storage.databases.main.embedded_event_auth_chains import (
+        AuthChainBackendMismatchError,
+        check_backend as check_auth_chain_backend,
+    )
+    from synapse.storage.databases.main.embedded_event_status import (
+        EventStatusBackfillIncompleteError,
+        check_backfill as check_event_status_backfill,
     )
 
     try:
-        await check_event_edges_migration_complete(hs)
-    except EventEdgesMigrationIncompleteError as e:
+        await check_auth_chain_backend(hs)
+    except AuthChainBackendMismatchError as e:
+        quit_with_error(str(e))
+
+    try:
+        await check_event_status_backfill(hs)
+    except EventStatusBackfillIncompleteError as e:
         quit_with_error(str(e))
 
     # We want to use a separate thread pool for the resolver so that large

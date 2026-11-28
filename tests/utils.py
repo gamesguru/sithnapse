@@ -107,11 +107,13 @@ def get_postgres_clone_strategy() -> tuple[str, str]:
 # DB to disk and query it with the sqlite CLI.
 SQLITE_PERSIST_DB = os.environ.get("SYNAPSE_TEST_PERSIST_SQLITE_DB") is not None
 
-# When set, every test homeserver runs its HAMT state store through the
-# embedded engine (mtxdb) instead of plain SQL -- the trial-embedded
-# CI job's whole purpose. The embedded engine is just a local file, so no
-# "is a server reachable" check is needed here -- config/database.py opens
-# it directly.
+# Every test homeserver runs with the embedded engine (mtxdb). Event
+# adjacency now lives only in mtxdb's CSR store -- the SQL `event_edges` path
+# was removed -- and the forward lookup runs during ordinary room creation, so
+# a homeserver that never opened a store fails with "mtxdb not opened". The
+# engine is just a local file, so no "is a server reachable" check is needed;
+# config/database.py opens it directly. Tests of the missing-engine config
+# error exercise DatabaseConfig directly instead of creating a homeserver.
 #
 # Deliberately *not* falling back to the bare deployment switches
 # (SYNAPSE_EMBEDDED_DB_ENGINE / SYNAPSE_EMBEDDED_DB_PATH / SYNAPSE_MTXDB):
@@ -121,12 +123,15 @@ SQLITE_PERSIST_DB = os.environ.get("SYNAPSE_TEST_PERSIST_SQLITE_DB") is not None
 # store. Only the SYNAPSE_TEST_-prefixed, test-only variables are honoured
 # here. SYNAPSE_TEST_MTXDB is a shorthand alias for
 # the common case of just wanting the mtxdb engine, without spelling out the name.
-EMBEDDED_DB_ENGINE = os.environ.get("SYNAPSE_TEST_EMBEDDED_DB_ENGINE")
-if EMBEDDED_DB_ENGINE is None and os.environ.get("SYNAPSE_TEST_MTXDB"):
+# Event adjacency is CSR-backed and has no SQL fallback, so every test
+# homeserver must have an mtxdb store even when a test run did not explicitly
+# opt into exercising the embedded state/event-json backend.
+EMBEDDED_DB_ENGINE = os.environ.get("SYNAPSE_TEST_EMBEDDED_DB_ENGINE", "mtxdb")
+if os.environ.get("SYNAPSE_TEST_MTXDB"):
     EMBEDDED_DB_ENGINE = "mtxdb"
 
 EMBEDDED_DB_PATH = os.environ.get("SYNAPSE_TEST_EMBEDDED_DB_PATH")
-_embedded_db_path_is_tmp = EMBEDDED_DB_PATH is None and EMBEDDED_DB_ENGINE
+_embedded_db_path_is_tmp = EMBEDDED_DB_PATH is None
 if _embedded_db_path_is_tmp:
     EMBEDDED_DB_PATH = tempfile.mkdtemp()
 elif EMBEDDED_DB_PATH is not None:
@@ -251,6 +256,71 @@ if _embedded_db_path_is_tmp and not os.environ.get(
     assert EMBEDDED_DB_PATH is not None
     atexit.register(_cleanup_embedded_db, EMBEDDED_DB_PATH)
 
+# Roots handed to individual test homeservers (see `default_config`). An
+# explicitly-configured `SYNAPSE_TEST_EMBEDDED_DB_PATH` is never removed as a
+# whole, so without this a long-lived worker would accumulate one root per
+# homeserver forever.
+_EMBEDDED_DB_PER_HOMESERVER_ROOTS: list[str] = []
+if EMBEDDED_DB_ENGINE:
+    import shutil
+
+    def _cleanup_per_homeserver_roots() -> None:
+        for root in _EMBEDDED_DB_PER_HOMESERVER_ROOTS:
+            shutil.rmtree(root, ignore_errors=True)
+
+    atexit.register(_cleanup_per_homeserver_roots)
+
+_EMBEDDED_DB_TEMPLATE: str | None = None
+_EMBEDDED_DB_TEMPLATE_FAILED = False
+
+
+def _embedded_db_template(parent: str) -> str | None:
+    """An empty, closed mtxdb root, created once per process in a subprocess.
+
+    Creating a store fsyncs its descriptor, WAL and their directories (about
+    8 syncs, ~95ms on a slow disk), and every test homeserver needs its own
+    root. Copying a pre-built empty root costs no fsyncs. The subprocess keeps
+    the template out of this process's global store handle.
+    """
+    global _EMBEDDED_DB_TEMPLATE, _EMBEDDED_DB_TEMPLATE_FAILED
+    if _EMBEDDED_DB_TEMPLATE is not None or _EMBEDDED_DB_TEMPLATE_FAILED:
+        return _EMBEDDED_DB_TEMPLATE
+    import subprocess
+
+    template = os.path.join(parent, ".empty-template")
+    try:
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import sys;"
+                "from synapse.synapse_rust import mtxdb_engine as e;"
+                "e.open_client(sys.argv[1]);e.close_client()",
+                template,
+            ],
+            check=True,
+            capture_output=True,
+            timeout=120,
+        )
+    except Exception:
+        # Fall back to letting each homeserver create its own root.
+        _EMBEDDED_DB_TEMPLATE_FAILED = True
+        return None
+    _EMBEDDED_DB_TEMPLATE = template
+    return template
+
+
+def _new_embedded_homeserver_root(parent: str) -> str:
+    """A fresh per-homeserver root, copied from the empty template when possible."""
+    root = os.path.join(parent, uuid.uuid4().hex)
+    template = _embedded_db_template(parent)
+    if template is not None:
+        import shutil
+
+        shutil.copytree(template, root)
+    return root
+
+
 # the dbname we will connect to in order to create the base database.
 POSTGRES_DBNAME_FOR_INITIAL_CREATE = "postgres"
 
@@ -323,6 +393,15 @@ def _drain_template_background_updates_postgres() -> None:
         time.sleep(0.001)
         reactor.advance(0.01)
     stc.successResultOf(d_sd)
+
+    # The drain homeserver is a one-off and does not go through
+    # `HomeserverTestCase.tearDown`, so release its embedded store here.
+    # Otherwise the first real test would find this root already open and
+    # (correctly) refuse to open its own.
+    if EMBEDDED_DB_ENGINE:
+        from synapse.synapse_rust import mtxdb_engine
+
+        mtxdb_engine.close_client(durable=False)
 
 
 def setupdb() -> None:
@@ -551,16 +630,16 @@ def default_config(
     }
 
     if EMBEDDED_DB_ENGINE and EMBEDDED_DB_PATH:
-        # Many test homeservers (each with their own fresh SQL database, so
-        # each restarting its state_group id sequence at 1) can share this
-        # one mtxdb file across a whole trial worker process. Without a
-        # unique namespace per homeserver, two different tests' state_group
-        # 1 would collide on the same mtxdb keys and silently read each
-        # other's data.
+        # Each test homeserver has its own fresh SQL database, so its
+        # state_group sequence restarts at 1. Give each one its own mtxdb
+        # root so those ids cannot collide now that keys are unsalted.
+        # `HomeserverTestCase.tearDown` closes the global client after every
+        # test, so the next homeserver actually opens this path.
+        homeserver_root = _new_embedded_homeserver_root(EMBEDDED_DB_PATH)
+        _EMBEDDED_DB_PER_HOMESERVER_ROOTS.append(homeserver_root)
         config_dict["embedded_db"] = {
             "engine": EMBEDDED_DB_ENGINE,
-            "path": EMBEDDED_DB_PATH,
-            "namespace": f"trial-{os.getpid()}-{uuid.uuid4().hex}",
+            "path": homeserver_root,
             "no_sync": EMBEDDED_DB_NO_SYNC,
             # Tests rely on FLUSH_DELAY_SECS to know exactly how far to
             # advance the reactor to drain the coalescer. Pin the runtime

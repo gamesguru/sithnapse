@@ -519,8 +519,8 @@ For more details on each chunk, read [the Matrix specification](https://spec.mat
       }
     }
   ],
-  "end": "t47409-4357353_219380_26003_2265",
-  "start": "t47429-4392820_219380_26003_2265"
+  "end": "t47409.1700000000000.4357353_219380_26003_2265",
+  "start": "t47429.1700000001000.4392820_219380_26003_2265"
 }
 ```
 
@@ -1017,7 +1017,7 @@ Example response:
 
 ```json
 {
-  "end": "t29-57_2_0_2",
+  "end": "t29.1700000000000.57_2_0_2",
   "events_after": [
     {
       "content": {
@@ -1079,7 +1079,7 @@ Example response:
       }
     }
   ],
-  "start": "t27-54_2_0_2",
+  "start": "t27.1700000000000.54_2_0_2",
   "state": [
     {
       "content": {

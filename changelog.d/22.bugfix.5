@@ -1,0 +1,1 @@
+Fix a 500 error from `/messages` when a worker's event cache still held an event as an outlier while a concurrent backfill had already de-outliered it in the database. Stale cached copies are now reloaded before gap detection.

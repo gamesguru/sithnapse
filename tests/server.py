@@ -234,7 +234,6 @@ _RESET_SEQUENCES_SQL = """
 -- These four sequences have a fresh-schema initial value of 1 with is_called
 -- false, so the first allocated ID is 1.
 SELECT setval('application_services_txn_id_seq', 1, false);
-SELECT setval('event_auth_chain_id', 1, false);
 SELECT setval('instance_map_instance_id_seq', 1, false);
 SELECT setval('user_id_seq', 1, false);
 SELECT setval('thread_subscriptions_sequence', 2, true);
@@ -2086,6 +2085,12 @@ def setup_test_homeserver(
 
     If no datastore is supplied, one is created and given to the homeserver.
 
+    Only one non-worker homeserver may own its embedded mtxdb store at a time:
+    the engine client is process-global, so setting up another non-worker
+    homeserver closes the previous one's client (the previous homeserver's
+    store-backed calls then fail). Worker homeservers share the main
+    homeserver's client and may be created freely.
+
     Args:
         cleanup_func: The function used to register a cleanup routine for
             after the test. If the function returns a Deferred, the
@@ -2409,6 +2414,25 @@ def setup_test_homeserver(
 
     if os.environ.get("SYNAPSE_PG_TIMINGS"):
         set_pg_timing_callback(_pg_timing)
+
+    # The mtxdb client is process-global and each test homeserver gets its own
+    # root. Close one left open by an earlier test before opening this one (a
+    # plain unittest.TestCase has no HomeserverTestCase teardown), and close
+    # this one when the test ends. Without this, a test that builds a
+    # homeserver outside HomeserverTestCase leaves the store open, and the next
+    # homeserver's open fails because a different root is already open in this
+    # process.
+    from synapse.synapse_rust import mtxdb_engine
+
+    def _close_embedded_client() -> None:
+        mtxdb_engine.close_client(durable=False)
+
+    # A worker homeserver shares the process-global client its test opened for
+    # the main homeserver; closing it here would leave the worker re-opening
+    # the store read-only and every later write failing.
+    if not config.worker.worker_app:
+        mtxdb_engine.close_client(durable=False)
+        cleanup_func(_close_embedded_client)
 
     with patch("synapse.storage.database.make_pool", side_effect=make_fake_db_pool):
         hs.setup()

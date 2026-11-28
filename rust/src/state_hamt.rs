@@ -250,8 +250,7 @@ fn build_typed_root_nodes_and_lattice(
     let mut seen = HashSet::new();
     for (event_type, type_entries) in by_type {
         let subtree_key = typed_subtree_key(&room_key, &event_type);
-        let subtree = rezzy::hamt::build_hamt(&subtree_key, type_entries)
-            .map_err(|e| format!("Failed to build typed HAMT subtree: {e:?}"))?;
+        let subtree = rezzy::hamt::build_hamt(&subtree_key, type_entries);
         let subtree_hash = subtree.structural_hash;
         collect_persisted_nodes(subtree, &mut seen, &mut nodes);
         directory.push((event_type, subtree_hash));
@@ -388,8 +387,7 @@ fn build_root_handle_nodes_and_lattice(
             )
         });
     let (root_handle, root_node) =
-        rezzy::hamt::build_hamt_root_handle(&structural_key, &lattice, entries)
-            .map_err(|e| format!("Failed to build HAMT root: {e:?}"))?;
+        rezzy::hamt::build_hamt_root_handle(&structural_key, &lattice, entries);
 
     let mut seen = HashSet::new();
     let mut nodes = Vec::new();
@@ -537,10 +535,8 @@ fn apply_flat_state_updates_impl(
                     Err(rezzy::hamt::HamtMutateError::Resolve(missing_hash)) => {
                         return Ok(ApplyOutcome::Missing(HashSet::from([missing_hash])));
                     }
-                    Err(rezzy::hamt::HamtMutateError::HashCollision { depth, bucket_size }) => {
-                        return Err(format!(
-                            "hash collision at depth {depth} with bucket size {bucket_size}"
-                        ));
+                    Err(rezzy::hamt::HamtMutateError::CorruptNode(reason)) => {
+                        return Err(format!("HAMT corrupt node: {reason}"));
                     }
                     Err(rezzy::hamt::HamtMutateError::MaxDepthExceeded { depth }) => {
                         return Err(format!("HAMT maximum depth exceeded at depth {depth}"));
@@ -696,8 +692,7 @@ fn apply_typed_state_updates_impl(
                 Some(node) => node,
                 None => return Ok(ApplyTypedOutcome::Missing(HashSet::from([*hash]))),
             },
-            None => rezzy::hamt::build_hamt(&subtree_key, Vec::<(String, String)>::new())
-                .map_err(|e| format!("Failed to build empty typed subtree: {e:?}"))?,
+            None => rezzy::hamt::build_hamt(&subtree_key, Vec::<(String, String)>::new()),
         };
 
         for (state_key, new_event_id) in type_updates {
@@ -713,10 +708,8 @@ fn apply_typed_state_updates_impl(
                         Err(rezzy::hamt::HamtMutateError::Resolve(missing_hash)) => {
                             return Ok(ApplyTypedOutcome::Missing(HashSet::from([missing_hash])));
                         }
-                        Err(rezzy::hamt::HamtMutateError::HashCollision { depth, bucket_size }) => {
-                            return Err(format!(
-                                "hash collision at depth {depth} with bucket size {bucket_size}"
-                            ));
+                        Err(rezzy::hamt::HamtMutateError::CorruptNode(reason)) => {
+                            return Err(format!("HAMT corrupt node: {reason}"));
                         }
                         Err(rezzy::hamt::HamtMutateError::MaxDepthExceeded { depth }) => {
                             return Err(format!("HAMT maximum depth exceeded at depth {depth}"));
@@ -896,12 +889,14 @@ pub(crate) fn materialize_from_node_map(
             .ok_or_else(|| format!("Missing persisted HAMT node: {hash:02x?}"))
     };
 
-    root_node.visit_entries(&mut resolver, &mut |key, value| {
-        let (event_type, state_key): (String, String) = serde_json::from_str(key)
-            .map_err(|e| format!("Failed to decode HAMT state key: {e}"))?;
-        entries.push((event_type, state_key, value.clone()));
-        Ok::<(), String>(())
-    })?;
+    root_node
+        .visit_entries(&mut resolver, &mut |key, value| {
+            let (event_type, state_key): (String, String) = serde_json::from_str(key)
+                .map_err(|e| format!("Failed to decode HAMT state key: {e}"))?;
+            entries.push((event_type, state_key, value.clone()));
+            Ok::<(), String>(())
+        })
+        .map_err(|e| e.to_string())?;
 
     Ok(entries)
 }
@@ -924,20 +919,22 @@ fn pack_materialized_from_node_map(
             .cloned()
             .ok_or_else(|| format!("Missing persisted HAMT node: {hash:02x?}"))
     };
-    root_node.visit_entries(&mut resolver, &mut |key, value| {
-        let (event_type, state_key): (String, String) = serde_json::from_str(key)
-            .map_err(|e| format!("Failed to decode HAMT state key: {e}"))?;
-        for field in [&event_type, &state_key, value] {
-            let length = u32::try_from(field.len())
-                .map_err(|_| "state entry field is too long".to_owned())?;
-            output.extend_from_slice(&length.to_le_bytes());
-            output.extend_from_slice(field.as_bytes());
-        }
-        count = count
-            .checked_add(1)
-            .ok_or_else(|| "too many state entries".to_owned())?;
-        Ok::<(), String>(())
-    })?;
+    root_node
+        .visit_entries(&mut resolver, &mut |key, value| {
+            let (event_type, state_key): (String, String) = serde_json::from_str(key)
+                .map_err(|e| format!("Failed to decode HAMT state key: {e}"))?;
+            for field in [&event_type, &state_key, value] {
+                let length = u32::try_from(field.len())
+                    .map_err(|_| "state entry field is too long".to_owned())?;
+                output.extend_from_slice(&length.to_le_bytes());
+                output.extend_from_slice(field.as_bytes());
+            }
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| "too many state entries".to_owned())?;
+            Ok::<(), String>(())
+        })
+        .map_err(|e| e.to_string())?;
     output[1..5].copy_from_slice(&count.to_le_bytes());
     Ok(output)
 }
@@ -1781,7 +1778,6 @@ mod tests {
             &typed_subtree_key(&room_typed_key(room_id), "m.room.join_rules"),
             Vec::<(String, String)>::new(),
         )
-        .expect("empty typed subtree should build")
         .structural_hash;
 
         let applied = expect_applied_typed(

@@ -47,6 +47,7 @@ from tests.federation.transport.test_knocking import (
 from tests.rest.client.test_rooms import make_request_with_cancellation_test
 from tests.server import FakeChannel, TimedOutException
 from tests.test_utils.event_injection import (
+    create_event,
     inject_event,
     inject_member_event,
     persist_message_and_state_event_in_one_batch,
@@ -2138,3 +2139,272 @@ class SyncLazyLoadedMembersCacheTestCase(unittest.HomeserverTestCase):
         response = self._sync(use_state_after, t0, timeline_limit=1)
         self.assertNotIn(kick["event_id"], self._timeline_ids(response))
         self.assertIn(kick["event_id"], self._state_ids(response, use_state_after))
+
+
+class InitialSyncBackfilledPrevBatchTestCase(unittest.HomeserverTestCase):
+    """The `prev_batch` of a limited sync must page by topological order.
+
+    Initial and newly joined rooms pick their timeline window by topological
+    order. Backfilled events get negative stream orderings that run opposite to
+    their position in the room, so a stream-only `prev_batch` makes `/messages`
+    repeat events already in the window and skip older ones.
+
+    Incremental syncs of an already-joined room select by stream order and are
+    not covered here.
+    """
+
+    servlets = [
+        synapse.rest.admin.register_servlets_for_client_rest_resource,
+        room.register_servlets,
+        login.register_servlets,
+        sync.register_servlets,
+    ]
+
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
+        self.store = hs.get_datastores().main
+        self.alice = self.register_user("alice", "pass")
+        self.alice_tok = self.login("alice", "pass")
+        self.room_id = self.helper.create_room_as(self.alice, tok=self.alice_tok)
+        self.message_ids = [
+            self.helper.send(self.room_id, f"message {i}", tok=self.alice_tok)[
+                "event_id"
+            ]
+            for i in range(12)
+        ]
+
+        # Model backfill: the older an event is in the room, the *newer* its
+        # stream position. The newest event stays put because sliding-sync
+        # tables reference it.
+        def reverse_stream_orderings(txn) -> None:  # type: ignore[no-untyped-def]
+            for i, event_id in enumerate(self.message_ids[:-1]):
+                txn.execute(
+                    "UPDATE events SET stream_ordering = ? WHERE event_id = ?",
+                    (-1000 - i, event_id),
+                )
+
+        self.get_success(
+            self.store.db_pool.runInteraction(
+                "reverse_streams", reverse_stream_orderings
+            )
+        )
+        for event_id in self.message_ids:
+            self.store._invalidate_local_get_event_cache(event_id)
+
+    def _room_event_ids(self) -> list[str]:
+        rows = self.get_success(
+            self.store.db_pool.simple_select_list(
+                "events", {"room_id": self.room_id}, ["event_id"]
+            )
+        )
+        return [row[0] for row in rows]
+
+    def _assert_prev_batch_covers_room(
+        self, timeline: JsonDict, access_token: str, visible_ids: list[str]
+    ) -> None:
+        """Page back from `prev_batch`; the window plus pages must be exactly
+        `visible_ids`, each once."""
+        self.assertTrue(timeline["limited"], timeline)
+        seen = [e["event_id"] for e in timeline["events"]]
+        self.assertEqual(len(seen), 5)
+
+        from_token = timeline["prev_batch"]
+        for _ in range(20):
+            channel = self.make_request(
+                "GET",
+                f"/rooms/{self.room_id}/messages?dir=b&limit=4&from={from_token}",
+                access_token=access_token,
+            )
+            self.assertEqual(channel.code, 200, channel.json_body)
+            seen.extend(e["event_id"] for e in channel.json_body["chunk"])
+            from_token = channel.json_body.get("end")
+            if not from_token:
+                break
+
+        self.assertEqual(len(seen), len(set(seen)), f"duplicated events: {seen}")
+        self.assertCountEqual(seen, visible_ids)
+
+    def test_initial_sync(self) -> None:
+        channel = self.make_request(
+            "GET",
+            "/sync?filter=" + json.dumps({"room": {"timeline": {"limit": 5}}}),
+            access_token=self.alice_tok,
+        )
+        self.assertEqual(channel.code, 200, channel.json_body)
+        timeline = channel.json_body["rooms"]["join"][self.room_id]["timeline"]
+        self.assertEqual(
+            [e["event_id"] for e in timeline["events"]], self.message_ids[-5:]
+        )
+        self._assert_prev_batch_covers_room(
+            timeline, self.alice_tok, self._room_event_ids()
+        )
+
+    def test_newly_joined_room(self) -> None:
+        self.helper.send_state(
+            self.room_id,
+            "m.room.history_visibility",
+            {"history_visibility": "shared"},
+            tok=self.alice_tok,
+        )
+        bob = self.register_user("bob", "pass")
+        bob_tok = self.login("bob", "pass")
+        channel = self.make_request("GET", "/sync", access_token=bob_tok)
+        since = channel.json_body["next_batch"]
+
+        self.helper.join(self.room_id, bob, tok=bob_tok)
+
+        channel = self.make_request(
+            "GET",
+            f"/sync?since={since}&filter="
+            + json.dumps({"room": {"timeline": {"limit": 5}}}),
+            access_token=bob_tok,
+        )
+        self.assertEqual(channel.code, 200, channel.json_body)
+        timeline = channel.json_body["rooms"]["join"][self.room_id]["timeline"]
+        self._assert_prev_batch_covers_room(timeline, bob_tok, self._room_event_ids())
+
+
+class IncrementalSyncStreamCursorTestCase(unittest.HomeserverTestCase):
+    """Check the stream-token contract of an incremental limited sync.
+
+    Incremental sync selects its window by stream order and emits a stream-only
+    `prev_batch`. `/messages` then pages topologically, so this test checks that
+    every event at or before the cursor stays reachable when a live fork crosses
+    the window edge. Events above the cursor may be repeated once `/messages`
+    switches to topological continuation tokens; clients deduplicate those by
+    event ID.
+    """
+
+    servlets = [
+        synapse.rest.admin.register_servlets_for_client_rest_resource,
+        room.register_servlets,
+        login.register_servlets,
+        sync.register_servlets,
+    ]
+
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
+        self.store = hs.get_datastores().main
+        self.persistence = hs.get_storage_controllers().persistence
+        assert self.persistence is not None
+
+        self.alice = self.register_user("alice", "pass")
+        self.alice_tok = self.login("alice", "pass")
+        self.room_id = self.helper.create_room_as(self.alice, tok=self.alice_tok)
+
+        channel = self.make_request("GET", "/sync", access_token=self.alice_tok)
+        self.since = channel.json_body["next_batch"]
+
+        base_id = self.helper.send(self.room_id, "base", tok=self.alice_tok)["event_id"]
+
+        # Two live branches from the same base, persisted so branch A's second
+        # event arrives before branch B's first. Stream order then crosses the
+        # DAG order at the incremental window edge.
+        a1, a1_ctx = self.get_success(
+            create_event(
+                hs,
+                room_id=self.room_id,
+                sender=self.alice,
+                type=EventTypes.Message,
+                content={"msgtype": "m.text", "body": "a1"},
+                prev_event_ids=[base_id],
+            )
+        )
+        self.get_success(self.persistence.persist_event(a1, a1_ctx))
+
+        a2, a2_ctx = self.get_success(
+            create_event(
+                hs,
+                room_id=self.room_id,
+                sender=self.alice,
+                type=EventTypes.Message,
+                content={"msgtype": "m.text", "body": "a2"},
+                prev_event_ids=[a1.event_id],
+            )
+        )
+        self.get_success(self.persistence.persist_event(a2, a2_ctx))
+
+        b1, b1_ctx = self.get_success(
+            create_event(
+                hs,
+                room_id=self.room_id,
+                sender=self.alice,
+                type=EventTypes.Message,
+                content={"msgtype": "m.text", "body": "b1"},
+                prev_event_ids=[base_id],
+            )
+        )
+        self.get_success(self.persistence.persist_event(b1, b1_ctx))
+
+        b2, b2_ctx = self.get_success(
+            create_event(
+                hs,
+                room_id=self.room_id,
+                sender=self.alice,
+                type=EventTypes.Message,
+                content={"msgtype": "m.text", "body": "b2"},
+                prev_event_ids=[b1.event_id],
+            )
+        )
+        self.get_success(self.persistence.persist_event(b2, b2_ctx))
+
+        self.branch_ids = [a1.event_id, a2.event_id, b1.event_id, b2.event_id]
+
+    def _event_ids_at_or_before(self, stream_ordering: int) -> set[str]:
+        rows = self.get_success(
+            self.store.db_pool.execute(
+                "test_events_at_or_before_cursor",
+                "SELECT event_id FROM events"
+                " WHERE room_id = ? AND stream_ordering <= ?",
+                self.room_id,
+                stream_ordering,
+            )
+        )
+        return {row[0] for row in rows}
+
+    def test_prev_batch_boundary(self) -> None:
+        channel = self.make_request(
+            "GET",
+            f"/sync?since={self.since}&filter="
+            + json.dumps({"room": {"timeline": {"limit": 2}}}),
+            access_token=self.alice_tok,
+        )
+        self.assertEqual(channel.code, 200, channel.json_body)
+        timeline = channel.json_body["rooms"]["join"][self.room_id]["timeline"]
+        self.assertTrue(timeline["limited"], timeline)
+
+        window_ids = {e["event_id"] for e in timeline["events"]}
+        self.assertEqual(len(window_ids), 2)
+        # The window is the newest two by stream order. A2 is older by stream
+        # position than the boundary event B1, but deeper in the DAG. It must
+        # still be available from the stream-bounded /messages walk.
+        self.assertTrue(window_ids.issubset(set(self.branch_ids)), window_ids)
+
+        prev_batch = timeline["prev_batch"]
+        cursor = int(prev_batch.split("_", 1)[0][1:])
+        expected = self._event_ids_at_or_before(cursor)
+
+        # The sync window sits strictly above the cursor.
+        self.assertTrue(window_ids.isdisjoint(expected))
+
+        paged: list[str] = []
+        from_token = prev_batch
+        for _ in range(20):
+            channel = self.make_request(
+                "GET",
+                f"/rooms/{self.room_id}/messages?dir=b&limit=2&from={from_token}",
+                access_token=self.alice_tok,
+            )
+            self.assertEqual(channel.code, 200, channel.json_body)
+            paged.extend(e["event_id"] for e in channel.json_body["chunk"])
+            from_token = channel.json_body.get("end")
+            if not from_token:
+                break
+
+        # The crossed branch event A2 must be included despite being deeper
+        # topologically than B1, which is in the sync window. Older events can
+        # repeat after /messages switches to topological continuation tokens;
+        # the client deduplicates those by event ID.
+        self.assertIn(self.branch_ids[1], expected)
+        self.assertLessEqual(expected, set(paged), f"paged={paged} expected={expected}")
+
+        all_room_ids = set(self._event_ids_at_or_before(2**62))
+        self.assertEqual(set(paged) | window_ids, all_room_ids)

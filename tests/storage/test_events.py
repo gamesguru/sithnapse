@@ -42,9 +42,16 @@ from synapse.storage.databases.main import (
     state as state_module,
 )
 from synapse.storage.databases.main.embedded_common import Pool, SyncTier
+from synapse.storage.databases.main.embedded_event_auth_chains import (
+    get_embedded_auth_edges_batch,
+    get_or_create_short_ids,
+    resolve_short_ids_to_event_ids,
+)
+from synapse.storage.databases.main.embedded_event_status import get_event_statuses
 from synapse.types import StateMap
 from synapse.util.clock import Clock
 
+from tests.storage.event_status import assert_statuses_match_sql
 from tests.test_utils.event_builders import make_test_event, make_test_pdu_event
 from tests.unittest import HomeserverTestCase, skip_unless
 from tests.utils import EMBEDDED_DB_ENGINE
@@ -73,23 +80,9 @@ class EventsTestCase(HomeserverTestCase):
         proves the embedded-engine fast path is actually taken, not a
         silent SQL fallback.
 
-        Note: `mtxdb_engine.open_client` is backed by a process-global
-        `OnceCell` on the Rust side (one mtxdb handle per process, matching
-        how Synapse itself only ever opens one), so this call is a no-op
-        if any earlier test in this process already opened a client --
-        this test then exercises whatever database is already open, not
-        necessarily `tmpdir`. That's fine here since event_ids are random
-        per test run, but don't rely on this call for real isolation.
+        The test homeserver already has a fresh mtxdb root, so use that root
+        throughout the test. The base case tearDown closes the client.
         """
-        import shutil
-        import tempfile
-
-        from synapse.synapse_rust import mtxdb_engine
-
-        tmpdir = tempfile.mkdtemp(prefix="test-embedded-event-json-")
-        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
-        mtxdb_engine.open_client(tmpdir)
-
         persist_store = self.hs.get_datastores().persist_events
         assert persist_store is not None
         persist_store._embedded_event_json_enabled = True
@@ -119,6 +112,53 @@ class EventsTestCase(HomeserverTestCase):
         event = self.get_success(self._store.get_event(event_id))
         self.assertEqual(event.event_id, event_id)
         self.assertEqual(event.content.get("body"), "hello embedded mtxdb")
+
+    @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
+    def test_persist_writes_auth_edges_to_mtxdb_only(self) -> None:
+        """Persisting state events writes auth edges to mtxdb, not SQL.
+
+        This is the ownership switch: the SQL `event_auth` table is no longer
+        written when the embedded engine is configured, so a missing mtxdb
+        row would mean a committed state event with no auth chain.
+        """
+        persist_store = self.hs.get_datastores().persist_events
+        assert persist_store is not None
+        self.assertTrue(persist_store._embedded_event_json_enabled)
+        engine = persist_store._embedded_db_engine
+        if engine is None:
+            self.skipTest("embedded engine not configured")
+
+        user = self.register_user("auth_edges_user", "pass")
+        token = self.login("auth_edges_user", "pass")
+        room_id = self.helper.create_room_as(user, tok=token)
+
+        state_ids = self.get_success(
+            self.hs.get_storage_controllers().state.get_current_state_ids(room_id)
+        )
+        state_event_id = state_ids[(EventTypes.RoomHistoryVisibility, "")]
+        state_event = self.get_success(self._store.get_event(state_event_id))
+        expected_auth_ids = set(state_event.auth_event_ids())
+        self.assertTrue(expected_auth_ids)
+
+        # The SQL table must not receive the new rows any more.
+        sql_rows = self.get_success(
+            self._store.db_pool.simple_select_list(
+                table="event_auth",
+                keyvalues={"room_id": room_id},
+                retcols=("event_id", "auth_id"),
+                desc="test_persist_writes_auth_edges_to_mtxdb_only",
+            )
+        )
+        self.assertEqual(sql_rows, [])
+
+        # The mtxdb outbound edges carry the same direct auth events.
+        short_id = get_or_create_short_ids(engine, room_id, [state_event_id])[0]
+        edges = get_embedded_auth_edges_batch(engine, room_id, [short_id])[short_id]
+        self.assertIsNotNone(edges)
+        resolved = resolve_short_ids_to_event_ids(engine, room_id, list(edges or []))
+        self.assertEqual(
+            {event_id for event_id in resolved if event_id}, expected_auth_ids
+        )
 
     def _check_de_outlier_state_barrier(self, *, publish_at_commit: bool) -> None:
         """De-outliering an already-persisted outlier must schedule an immediate
@@ -191,6 +231,9 @@ class EventsTestCase(HomeserverTestCase):
         for call in outlier_barrier.call_args_list:
             self.assertNotIn(Pool.STATE, call.kwargs.get("pools", []))
 
+        assert_statuses_match_sql(self, self.hs, room_id)
+        self.assertTrue(get_event_statuses([event.event_id])[event.event_id].outlier)
+
         # Now the live copy arrives and de-outliers it. Its embedded mapping
         # must be visible before this returns.
         event.internal_metadata.outlier = False
@@ -212,6 +255,9 @@ class EventsTestCase(HomeserverTestCase):
             mock.patch.object(events_module, "maybe_sync") as de_outlier_barrier,
         ):
             self.get_success(persistence.persist_event(event, live_context))
+
+        assert_statuses_match_sql(self, self.hs, room_id)
+        self.assertFalse(get_event_statuses([event.event_id])[event.event_id].outlier)
 
         if publish_at_commit:
             # The mapping is visible as soon as it is journaled; durability is
@@ -321,13 +367,6 @@ class EventsTestCase(HomeserverTestCase):
         # Nothing is left for the reactor thread.
         self.assertNotIn(("call_after_sync_now", ([Pool.STATE],)), calls)
         self.assertFalse([call for call in calls if call[0] == "call_after_sync_now"])
-        # In the transaction: the barrier is issued before the post-commit
-        # durability marks that the same block registers. (An earlier
-        # `mark_dirty(EVENT_DAG)` is the edge writes' own coalescing.)
-        self.assertLess(
-            calls.index(barriers[0]),
-            calls.index(("call_after_mark_dirty", (Pool.AUTH_CHAIN,))),
-        )
 
     @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
     def test_auth_event_leaves_durability_to_the_coalescer_at_commit(self) -> None:
@@ -343,7 +382,7 @@ class EventsTestCase(HomeserverTestCase):
             publish_at_commit=True, action="join"
         )
 
-        for pool in (Pool.STATE, Pool.AUTH_CHAIN, Pool.EVENT_DAG):
+        for pool in (Pool.STATE, Pool.EVENT_DAG):
             self.assertIn(
                 ("call_after_mark_dirty", (pool,)),
                 calls,
@@ -357,14 +396,14 @@ class EventsTestCase(HomeserverTestCase):
 
     @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
     def test_auth_event_takes_one_in_txn_barrier_by_default(self) -> None:
-        """`always` covers an auth event with one barrier over all three pools."""
+        """`always` covers an auth event with one barrier over both pools."""
         calls, _ = self._persist_message_recording_event_json_sync(
             publish_at_commit=False, action="join"
         )
 
         self.assertEqual(
             [call for call in calls if call[0] == "sync"],
-            [("sync", (Pool.STATE, Pool.AUTH_CHAIN, Pool.EVENT_DAG))],
+            [("sync", (Pool.STATE, Pool.EVENT_DAG))],
         )
         self.assertFalse([call for call in calls if call[0] == "call_after_sync_now"])
 
@@ -482,7 +521,6 @@ class EventsTestCase(HomeserverTestCase):
         path that learns an id (``get_event``) cannot find it.
         """
         self.assertTrue(self._store._embedded_event_json_enabled)
-        namespace = self._store._embedded_db_namespace
         engine = self._store._embedded_db_engine
         user = self.register_user("orphan_json_user", "pass")
         token = self.login("orphan_json_user", "pass")
@@ -514,7 +552,10 @@ class EventsTestCase(HomeserverTestCase):
                 },
             )
             embedded_event_json.put_event_json_batch(
-                engine, namespace, [(event_id, room_id, "{}", body, 1)], sync=False
+                engine,
+                [(event_id, room_id, "{}", body, 1)],
+                sync=False,
+                locator_statuses={event_id: (False, False, False)},
             )
             raise RuntimeError("simulated persist rollback")
 
@@ -525,7 +566,7 @@ class EventsTestCase(HomeserverTestCase):
         self.assertEqual(str(failure.value), "simulated persist rollback")
 
         # The JSON record survives the rollback in mtxdb ...
-        found = embedded_event_json.get_event_json_batch(engine, namespace, [event_id])
+        found = embedded_event_json.get_event_json_batch(engine, [event_id])
         self.assertEqual(found[event_id][1], body)
 
         # ... but is unreachable: with no committed row there is no id for a
@@ -539,15 +580,14 @@ class EventsTestCase(HomeserverTestCase):
         expects the `RuntimeError` when `fail`."""
         persist_store = self.hs.get_datastores().persist_events
         assert persist_store is not None
-        namespace = persist_store._embedded_db_namespace
         room_id = "!staged:test"
 
         def body(txn: LoggingTransaction, **kwargs: object) -> None:
             embedded_event_json.put_event_json_batch(
                 "mtxdb",
-                namespace,
                 [(event_id, room_id, "{}", json.dumps({"body": event_id}), 1)],
                 transaction=kwargs["mtxdb_txn"],  # type: ignore[arg-type]
+                locator_statuses={event_id: (False, False, False)},
             )
             if fail:
                 raise RuntimeError("simulated persist failure")
@@ -560,7 +600,6 @@ class EventsTestCase(HomeserverTestCase):
                 inhibit_local_membership_updates=False,
                 state_delta_for_room=None,
                 new_forward_extremities=None,
-                new_event_links={},
                 sliding_sync_table_changes=None,
             )
 
@@ -581,9 +620,7 @@ class EventsTestCase(HomeserverTestCase):
     def _json_present(self, event_id: str) -> bool:
         persist_store = self.hs.get_datastores().persist_events
         assert persist_store is not None
-        found = embedded_event_json.get_event_json_batch(
-            "mtxdb", persist_store._embedded_db_namespace, [event_id]
-        )
+        found = embedded_event_json.get_event_json_batch("mtxdb", [event_id])
         return event_id in found
 
     @skip_unless(bool(EMBEDDED_DB_ENGINE), "requires embedded DB engine")
@@ -676,6 +713,62 @@ class EventsTestCase(HomeserverTestCase):
             self._store.get_senders_for_event_ids(list(event_ids_to_senders.keys()))
         )
         self.assert_dict(event_ids_to_senders, response)
+
+
+class BackwardExtremityTestCase(HomeserverTestCase):
+    servlets = [
+        admin.register_servlets,
+        room.register_servlets,
+        login.register_servlets,
+    ]
+
+    def prepare(
+        self, reactor: MemoryReactor, clock: Clock, homeserver: HomeServer
+    ) -> None:
+        self._store = self.hs.get_datastores().main
+        persist_events_store = self.hs.get_datastores().persist_events
+        assert persist_events_store is not None
+        self._persist_events_store = persist_events_store
+
+    def test_persisting_event_without_prevs_clears_its_backward_extremity(
+        self,
+    ) -> None:
+        """An event with no `prev_events` (a room's create event) that is
+        persisted on its own must be removed from `event_backward_extremities`.
+
+        A child can be persisted before the create event arrives, which records
+        the create event as a gap. Persisting the create event alone yields no
+        new potential extremities, and used to return before the cleanup ran.
+        """
+        user_id = self.register_user("creator", "pass")
+        token = self.login("creator", "pass")
+        room_id = self.helper.create_room_as(user_id, tok=token)
+        create_event = self.get_success(self._store.get_create_event_for_room(room_id))
+        self.assertEqual(create_event.prev_event_ids(), [])
+
+        self.get_success(
+            self._store.db_pool.simple_insert(
+                "event_backward_extremities",
+                {"room_id": room_id, "event_id": create_event.event_id},
+            )
+        )
+
+        self.get_success(
+            self._store.db_pool.runInteraction(
+                "update_backward_extremities",
+                self._persist_events_store._update_backward_extremeties,
+                [create_event],
+            )
+        )
+
+        remaining = self.get_success(
+            self._store.db_pool.simple_select_onecol(
+                "event_backward_extremities",
+                {"room_id": room_id},
+                "event_id",
+            )
+        )
+        self.assertNotIn(create_event.event_id, remaining)
 
 
 class ExtremPruneTestCase(HomeserverTestCase):

@@ -63,6 +63,10 @@ EMPTY_DATABASE_ON_WORKER_ERROR = (
     "schema before starting worker processes."
 )
 
+EMPTY_DATABASE_READ_ONLY_ERROR = (
+    "Uninitialised database: refusing to create the schema in read-only mode."
+)
+
 UNAPPLIED_DELTA_ON_WORKER_ERROR = (
     "Database schema delta %s has not been applied: run the main synapse process to "
     "upgrade the database schema before starting worker processes."
@@ -97,6 +101,7 @@ def prepare_database(
     config: HomeServerConfig | None,
     databases: Collection[str] = ("main", "state"),
     db_is_fresh: bool = False,
+    read_only: bool = False,
 ) -> None:
     """Prepares a physical database for usage. Will either create all necessary tables
     or upgrade from an older schema version.
@@ -116,6 +121,9 @@ def prepare_database(
             only run _apply_module_schemas so config-specific module schemas are
             applied.  Must only be set by the test harness immediately after
             CREATE DATABASE ... WITH TEMPLATE.
+        read_only: If True, never change the schema: refuse (rather than apply) any
+            unapplied delta, an outdated schema version, or an empty database. Used
+            by diagnostic and repair tools that must not migrate a live database.
     Raises:
         ValueError: Passing `config=None` when a database already has a schema raises
             `ValueError`, as we can't upgrade an existing database without the config.
@@ -150,7 +158,7 @@ def prepare_database(
                 databases,
             )
             if config is not None:
-                _apply_module_schemas(cur, database_engine, config)
+                _apply_module_schemas(cur, database_engine, config, read_only=read_only)
         else:
             logger.info("%r: Checking existing schema version", databases)
             version_info = _get_or_create_schema_state(cur, database_engine)
@@ -179,10 +187,14 @@ def prepare_database(
                     database_engine,
                     config,
                     databases=databases,
+                    read_only=read_only,
                 )
 
             else:
                 logger.info("%r: Initialising new database", databases)
+
+                if read_only:
+                    raise UpgradeDatabaseException(EMPTY_DATABASE_READ_ONLY_ERROR)
 
                 # if it's a worker app, refuse to upgrade the database, to avoid multiple
                 # workers doing it at once.
@@ -193,7 +205,7 @@ def prepare_database(
 
             # check if any of our configured dynamic modules want a database
             if config is not None:
-                _apply_module_schemas(cur, database_engine, config)
+                _apply_module_schemas(cur, database_engine, config, read_only=read_only)
 
         cur.close()
         db_conn.commit()
@@ -332,6 +344,7 @@ def _upgrade_existing_database(
     config: HomeServerConfig | None,
     databases: Collection[str],
     is_empty: bool = False,
+    read_only: bool = False,
 ) -> None:
     """Upgrades an existing physical database.
 
@@ -389,7 +402,7 @@ def _upgrade_existing_database(
     else:
         assert config
 
-    is_worker = config and config.worker.worker_app is not None
+    is_worker = (config and config.worker.worker_app is not None) or read_only
 
     # If the schema version needs to be updated, and we are on a worker, we immediately
     # know to bail out as workers cannot update the database schema. Only one process
@@ -414,6 +427,15 @@ def _upgrade_existing_database(
 
     # some of the deltas assume that server_name is set correctly, so now
     # is a good time to run the sanity check.
+    if not is_empty:
+        # Each physical database (main, and a separate state database) has its
+        # own queue and its own delta that discards retired entries.
+        from synapse.storage.databases.main import (
+            check_retired_migrations_before_upgrade,
+        )
+
+        check_retired_migrations_before_upgrade(cur, database_engine)
+
     if not is_empty and "main" in databases:
         from synapse.storage.databases.main import check_database_before_upgrade
 
@@ -422,7 +444,7 @@ def _upgrade_existing_database(
 
     # update schema_compat_version before we run any upgrades, so that if synapse
     # gets downgraded again, it won't try to run against the upgraded database.
-    if (
+    if not read_only and (
         current_schema_state.compat_version is None
         or current_schema_state.compat_version < SCHEMA_COMPAT_VERSION
     ):
@@ -589,7 +611,10 @@ def _upgrade_existing_database(
 
 
 def _apply_module_schemas(
-    txn: Cursor, database_engine: BaseDatabaseEngine, config: HomeServerConfig
+    txn: Cursor,
+    database_engine: BaseDatabaseEngine,
+    config: HomeServerConfig,
+    read_only: bool = False,
 ) -> None:
     """Apply the module schemas for the dynamic modules, if any
 
@@ -597,6 +622,7 @@ def _apply_module_schemas(
         cur: database cursor
         database_engine:
         config: application config
+        read_only: if True, raise rather than apply any unapplied module schema
     """
     # This is the old way for password_auth_provider modules to make changes
     # to the database. This should instead be done using the module API
@@ -605,7 +631,11 @@ def _apply_module_schemas(
             continue
         modname = ".".join((mod.__module__, mod.__name__))
         _apply_module_schema_files(
-            txn, database_engine, modname, mod.get_db_schema_files()
+            txn,
+            database_engine,
+            modname,
+            mod.get_db_schema_files(),
+            read_only=read_only,
         )
 
 
@@ -614,6 +644,7 @@ def _apply_module_schema_files(
     database_engine: BaseDatabaseEngine,
     modname: str,
     names_and_streams: Iterable[tuple[str, TextIO]],
+    read_only: bool = False,
 ) -> None:
     """Apply the module schemas for a single module
 
@@ -622,6 +653,7 @@ def _apply_module_schema_files(
         database_engine: synapse database engine class
         modname: fully qualified name of the module
         names_and_streams: the names and streams of schemas to be applied
+        read_only: if True, raise before executing any unapplied schema file
     """
     cur.execute(
         "SELECT file FROM applied_module_schemas WHERE module_name = ?",
@@ -631,6 +663,12 @@ def _apply_module_schema_files(
     for name, stream in names_and_streams:
         if name in applied_deltas:
             continue
+
+        if read_only:
+            raise PrepareDatabaseException(
+                "Module schema %s for %s has not been applied, and this process "
+                "is read-only so will not apply it." % (name, modname)
+            )
 
         root_name, ext = os.path.splitext(name)
         if ext != ".sql":

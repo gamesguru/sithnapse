@@ -182,7 +182,9 @@ class PurgeHistoryRestServlet(RestServlet):
             # RoomStreamToken expects [int] not [int | None]
             assert event.internal_metadata.stream_ordering is not None
             room_token = RoomStreamToken(
-                topological=event.depth, stream=event.internal_metadata.stream_ordering
+                topological=event.depth,
+                timestamp=event.origin_server_ts,
+                stream=event.internal_metadata.stream_ordering,
             )
             token = await room_token.to_string(self.store)
 
@@ -213,8 +215,8 @@ class PurgeHistoryRestServlet(RestServlet):
                     "there is no event to be purged",
                     errcode=Codes.NOT_FOUND,
                 )
-            (stream, topo, _event_id) = r
-            token = "t%d-%d" % (topo, stream)
+            (stream, topo, _event_id, origin_ts) = r
+            token = "t%d.%d.%d" % (topo, origin_ts, stream)
             logger.info(
                 "[purge] purging up to token %s (received_ts %i => stream_ordering %i)",
                 token,

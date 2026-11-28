@@ -58,11 +58,9 @@ from synapse.storage.databases.main.embedded_common import (
     sync_now,
 )
 from synapse.storage.databases.main.embedded_event_to_state_group import (
-    decrement_state_group_refcounts_batch,
     get_referenced_state_groups_batch,
     get_state_group_for_events_batch,
-    increment_state_group_refcounts_batch,
-    put_event_to_state_group_batch,
+    repoint_event_state_group,
 )
 from synapse.storage.databases.main.events_worker import EventsWorkerStore
 from synapse.storage.databases.main.roommember import RoomMemberWorkerStore
@@ -699,7 +697,6 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
         if getattr(self, "_embedded_event_json_enabled", False):
             found = get_state_group_for_events_batch(
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 [event_id],
                 purpose="read_point",
             )
@@ -772,7 +769,6 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
                 )
             res = get_state_group_for_events_batch(
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 event_ids,
                 purpose="read_batch",
             )
@@ -826,7 +822,6 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
                     res.update(
                         get_state_group_for_events_batch(
                             self._embedded_db_engine,
-                            self._embedded_db_namespace,
                             list(still_missing),
                             purpose="read_batch_after_sql_fallback",
                         )
@@ -880,7 +875,6 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             state_groups = list(state_groups)
             referenced = get_referenced_state_groups_batch(
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 state_groups,
             )
             # Rows not yet migrated from SQL aren't in the refcount, but still
@@ -903,7 +897,6 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
                 if remaining:
                     referenced = referenced | get_referenced_state_groups_batch(
                         self._embedded_db_engine,
-                        self._embedded_db_namespace,
                         list(remaining),
                     )
             return referenced
@@ -921,6 +914,48 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
         )
 
         return {row[0] for row in rows}
+
+    async def repoint_event_state_group(self, event_id: str, state_group: int) -> None:
+        """Point an already-persisted event at a different state group.
+
+        Used by the offline `synapse_state_repair` tool to move a forward
+        extremity onto a repaired state group. The old state group is left in
+        place (only its reference count moves) so that the repair can be
+        audited or rolled back.
+        """
+        await self.db_pool.runInteraction(
+            "repoint_event_state_group",
+            self._repoint_event_state_group_txn,
+            event_id,
+            state_group,
+        )
+
+    def _repoint_event_state_group_txn(
+        self, txn: LoggingTransaction, event_id: str, state_group: int
+    ) -> None:
+        if getattr(self, "_embedded_event_json_enabled", False):
+            # Drop any not-yet-migrated SQL row first, for the same reason as in
+            # `_update_state_for_partial_state_event_txn`.
+            self.db_pool.simple_delete_txn(
+                txn, table="event_to_state_groups", keyvalues={"event_id": event_id}
+            )
+            repoint_event_state_group(
+                self._embedded_db_engine,
+                event_id,
+                state_group,
+            )
+            if publishes_at_commit():
+                txn.call_after(mark_dirty, Pool.STATE)
+            else:
+                txn.call_after(sync_now, [Pool.STATE])
+        else:
+            self.db_pool.simple_update_one_txn(
+                txn,
+                table="event_to_state_groups",
+                keyvalues={"event_id": event_id},
+                updatevalues={"state_group": state_group},
+            )
+        txn.call_after(self._get_state_group_for_event_sql.invalidate, (event_id,))
 
     async def update_state_for_partial_state_event(
         self,
@@ -962,57 +997,30 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
         assert state_group is not None
 
         if getattr(self, "_embedded_event_json_enabled", False):
-            # Update the mtxdb mapping and refcounts. Unlike
-            # put_event_to_state_group_batch's
-            # initial-insert callers, this is a genuine rewrite of the state
-            # group for this event: the old one loses a reference and the new
-            # one gains one, so the refcount must move with it, not just get
-            # incremented again (that would double-count the old group's
-            # reference forever, since a partial-state event's placeholder
-            # group is never otherwise decremented).
+            # Update the mtxdb mapping and refcounts atomically. This is a
+            # genuine rewrite of the state group for this event: the old one
+            # loses a reference and the new one gains one, so the refcount must
+            # move with it, not just get incremented again (that would
+            # double-count the old group's reference forever, since a
+            # partial-state event's placeholder group is never otherwise
+            # decremented).
+            #
             # Drop any not-yet-migrated SQL row first. A migration batch holds
             # a row lock on it (`FOR UPDATE` on Postgres) while it copies the
             # row to mtxdb, so this waits for that batch to commit, or makes it
             # skip the row: it can't overwrite the rewrite with the stale
-            # placeholder group. It must precede the mtxdb read below, which
-            # then sees the migrated mapping if the batch won.
+            # placeholder group. It must precede the mtxdb rewrite, which then
+            # sees the migrated mapping if the batch won.
             self.db_pool.simple_delete_txn(
                 txn,
                 table="event_to_state_groups",
                 keyvalues={"event_id": event.event_id},
             )
-            old = get_state_group_for_events_batch(
+            repoint_event_state_group(
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
-                [event.event_id],
-                purpose="partial_state_rewrite",
+                event.event_id,
+                state_group,
             )
-            put_event_to_state_group_batch(
-                self._embedded_db_engine,
-                self._embedded_db_namespace,
-                [(event.event_id, state_group)],
-            )
-            old_state_group = old.get(event.event_id)
-            if old_state_group is None:
-                # There is no embedded mapping or refcount to move, so only
-                # the new mapping needs a reference. This also covers an
-                # unmigrated SQL-only mapping.
-                increment_state_group_refcounts_batch(
-                    self._embedded_db_engine,
-                    self._embedded_db_namespace,
-                    [state_group],
-                )
-            elif old_state_group != state_group:
-                decrement_state_group_refcounts_batch(
-                    self._embedded_db_engine,
-                    self._embedded_db_namespace,
-                    [old_state_group],
-                )
-                increment_state_group_refcounts_batch(
-                    self._embedded_db_engine,
-                    self._embedded_db_namespace,
-                    [state_group],
-                )
             # The mapping is already visible in mtxdb. In interval/off mode,
             # durability is handled separately by the coalescer; always mode
             # retains the strict barrier.

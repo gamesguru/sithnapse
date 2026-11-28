@@ -27,14 +27,11 @@ functions for the exact derivations):
   256 deterministic bucket collections derived from the event's 128-bit
   identity hash, so no single index accumulates the server's whole event
   history.
-- The room's `EventDag` collection holds two physically separate records per
-  event: the **body** (`format_version + json`, `event_node_id`) and
-  **`internal_metadata`** (`event_meta_node_id`) -- matching SQL's own
-  `event_json` table, which has always carried `internal_metadata` and
-  `json` as separate columns rather than one combined blob. Both coexist
-  safely because their node ids are derived from differently tagged keys,
-  and both resolve via the same locator, so no second lookup is needed to
-  find the metadata record.
+- The room's `EventDag` collection holds one record per event
+  (`event_node_id`): `format_version + metadata_len + internal_metadata +
+  json` (see `_encode_event_json_record`). Keeping them together halves the
+  room collection's index entries and means a raw `mtxdb get` shows one
+  self-describing value.
 
 When the embedded engine is enabled it is the only store for new events'
 `event_json`: `_persist_events_txn` does not insert into the SQL `event_json`
@@ -67,8 +64,8 @@ Reuses the same `embedded_db_engine`/`embedded_db_path` config and mtxdb
 keyspace the state store already opens (one flat keyspace, prefixed keys --
 `hamt:node:...`, `hamt:root:...`, `event_json:...` -- rather than a second
 mtxdb directory/config knob), and is on whenever that is -- see
-`open_embedded_event_json_engine`. Namespacing via `embedded_db_namespace`
-keeps multiple homeservers sharing one mtxdb file from colliding on event_id.
+`open_embedded_event_json_engine`. Event ids are globally unique, so the
+keys are unsalted.
 """
 
 from __future__ import annotations
@@ -111,58 +108,56 @@ def open_embedded_event_json_engine(hs: "HomeServer") -> bool:
     on whenever the embedded engine itself is (`embedded_db_engine` +
     `embedded_db_path` configured), same as every other embedded mirror.
 
-    Keys are namespaced by `embedded_db_namespace` (see `_event_json_key`),
-    same scheme `embedded_event_to_state_group.py`/
-    `embedded_event_auth_chain_links.py` already use, so multiple
-    homeservers sharing one mtxdb file don't collide on event_id.
+    Event ids are globally unique, so the keys carry no namespace salt.
     """
     return bool(
         hs.config.database.embedded_db_engine and hs.config.database.embedded_db_path
     )
 
 
-def _encode_event_json_body(json: str, format_version: int | None) -> bytes:
-    """Encode the event_json body record: `format_version + json`. Stored as
-    its own physically separate mtxdb record from `internal_metadata` (see
-    `_encode_event_json_metadata`) -- matching SQL's own `event_json` table,
-    which has always carried `internal_metadata` and `json` as separate
-    columns (see `full_schemas/72/full.sql.sqlite`)."""
-    # format_version is nullable in the schema (older rows); encode as a
-    # signed int with -1 standing in for NULL rather than adding a presence
-    # flag byte.
-    return struct.pack(
-        ">i", -1 if format_version is None else format_version
-    ) + json.encode("utf-8")
+def _encode_event_json_record(
+    internal_metadata: str, json: str, format_version: int | None
+) -> bytes:
+    """Encode the single per-event record:
+    `format_version(i32 BE, -1 = NULL) + metadata_len(u32 BE) + internal_metadata
+    + json`, both strings utf-8. One record per event keeps the room
+    collection's index cost at one entry per event; the metadata is a few
+    bytes and is needed by every read that needs the body."""
+    metadata_bytes = internal_metadata.encode("utf-8")
+    # format_version is nullable in the schema (older rows); -1 stands in for
+    # NULL rather than adding a presence flag byte.
+    return (
+        struct.pack(
+            ">iI",
+            -1 if format_version is None else format_version,
+            len(metadata_bytes),
+        )
+        + metadata_bytes
+        + json.encode("utf-8")
+    )
 
 
-def _decode_event_json_body(value: bytes) -> tuple[str, int | None]:
-    """Decode an event_json body payload returned by `event_json_get`."""
-    if len(value) < 4:
-        raise RuntimeError("truncated event_json body record")
-    (format_version_raw,) = struct.unpack(">i", value[0:4])
-    json_str = value[4:].decode("utf-8")
+def _decode_event_json_record(value: bytes) -> tuple[str, str, int | None]:
+    """Decode a record from `event_json_get` into
+    `(internal_metadata, json, format_version)`."""
+    if len(value) < 8:
+        raise RuntimeError("truncated event_json record")
+    format_version_raw, metadata_len = struct.unpack(">iI", value[0:8])
+    if len(value) < 8 + metadata_len:
+        raise RuntimeError("truncated event_json record")
+    internal_metadata = value[8 : 8 + metadata_len].decode("utf-8")
+    json_str = value[8 + metadata_len :].decode("utf-8")
     format_version = None if format_version_raw == -1 else format_version_raw
-    return json_str, format_version
-
-
-def _encode_event_json_metadata(internal_metadata: str) -> bytes:
-    """Encode the event_json metadata record: `internal_metadata` verbatim,
-    utf-8, with no framing -- it's its own record now, not packed alongside
-    the body."""
-    return internal_metadata.encode("utf-8")
-
-
-def _decode_event_json_metadata(value: bytes) -> str:
-    return value.decode("utf-8")
+    return internal_metadata, json_str, format_version
 
 
 def put_event_json_batch(
     engine_name: str | None,
-    namespace: str,
     rows: list[tuple[str, str, str, str, int | None]],
     *,
     sync: bool = False,
     transaction: MtxdbTransaction | None = None,
+    locator_statuses: dict[str, tuple[bool, bool, bool]] | None = None,
 ) -> None:
     """`rows`: `(event_id, room_id, internal_metadata, json, format_version)`.
 
@@ -197,54 +192,85 @@ def put_event_json_batch(
     fsyncing per event is a whole-device cache flush each time.
     """
     with mirror_timing("event_json_put"):
-        from synapse.synapse_rust.mtxdb_engine import event_json_put
+        from synapse.synapse_rust.mtxdb_engine import event_json_body_put
 
         tuples = [
             (
                 room_id,
                 event_id,
-                _encode_event_json_metadata(internal_metadata),
-                _encode_event_json_body(json, format_version),
+                _encode_event_json_record(internal_metadata, json, format_version),
             )
             for event_id, room_id, internal_metadata, json, format_version in rows
         ]
         _et = time.monotonic()
         if transaction is not None:
-            transaction.event_json_put(namespace, tuples)
+            transaction.event_json_body_put(tuples)
+            if locator_statuses is not None:
+                transaction.event_locator_put(
+                    [
+                        (room_id, event_id, *locator_statuses[event_id])
+                        for event_id, room_id, *_ in rows
+                    ]
+                )
             ffi_timing("ffi_event_json_put", time.monotonic() - _et)
             return
-        event_json_put(namespace, tuples)
+        event_json_body_put(tuples)
+        if locator_statuses is not None:
+            from synapse.synapse_rust.mtxdb_engine import event_locator_put
+
+            event_locator_put(
+                [
+                    (room_id, event_id, *locator_statuses[event_id])
+                    for event_id, room_id, *_ in rows
+                ]
+            )
         ffi_timing("ffi_event_json_put", time.monotonic() - _et)
 
         if sync or _FORCE_SYNC_EVENT_JSON:
             sync_event_dag_now()
 
 
+def get_event_json_body_batch(
+    rows: list[tuple[str, str]],
+) -> dict[str, tuple[str, str, int | None]]:
+    """Read bodies by `(room_id, event_id)`, never through the locator.
+
+    The offline status migration uses this because a pre-status store's
+    EventDag locators carry only the room and the normal reader rejects them.
+    """
+    if not rows:
+        return {}
+    from synapse.synapse_rust.mtxdb_engine import event_json_body_get
+
+    records = event_json_body_get(rows)
+    result: dict[str, tuple[str, str, int | None]] = {}
+    for (_, event_id), record in zip(rows, records):
+        if record is not None:
+            result[event_id] = _decode_event_json_record(record)
+    return result
+
+
 def get_event_json_batch(
-    engine_name: str | None, namespace: str, event_ids: list[str]
+    engine_name: str | None, event_ids: list[str]
 ) -> dict[str, tuple[str, str, int | None]]:
     """Returns `event_id -> (internal_metadata, json, format_version)` for
     every id found in the embedded engine; a missing id is simply absent
-    from the result (the caller falls back to SQL for it). `internal_metadata`
-    and `json`/`format_version` are stored as two physically separate mtxdb
-    records (see `event_json_put` on the Rust side); both must be present to
-    count as a hit -- a partial write (which `event_json_put` never produces,
-    since both are written in the same `put_many` call) would otherwise
-    silently serve a mismatched pair.
+    from the result (the caller falls back to SQL for it). Each event is one
+    mtxdb record holding `internal_metadata`, `json` and `format_version`
+    together (see `_encode_event_json_record`), so a hit is always a
+    consistent triple.
     """
     with mirror_timing("event_json_get"):
         from synapse.synapse_rust.mtxdb_engine import event_json_get
 
         _et = time.monotonic()
-        found = event_json_get(namespace, event_ids)
+        found = event_json_get(event_ids)
         ffi_timing("ffi_event_json_get", time.monotonic() - _et)
         result: dict[str, tuple[str, str, int | None]] = {}
-        for event_id, metadata_record, body_record in found:
-            if metadata_record is None or body_record is None:
+        for event_id, record in found:
+            if record is None:
                 continue
-            internal_metadata = _decode_event_json_metadata(metadata_record)
-            json_str, format_version = _decode_event_json_body(body_record)
-            result[event_id] = (internal_metadata, json_str, format_version)
+            result[event_id] = _decode_event_json_record(record)
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(
             "[mtxdb-trace] event-json read requested=%d returned=%d missing=%s",
@@ -255,9 +281,7 @@ def get_event_json_batch(
     return result
 
 
-def delete_event_json_batch(
-    engine_name: str | None, namespace: str, event_ids: list[str]
-) -> None:
+def delete_event_json_batch(engine_name: str | None, event_ids: list[str]) -> None:
     """Removes `event_id`s from the embedded mirror. Must be called wherever
     `event_json` rows are deleted from SQL (purge_events.py) so the mirror
     doesn't retain data the user asked to be purged -- see also
@@ -268,5 +292,5 @@ def delete_event_json_batch(
         return
     from synapse.synapse_rust.mtxdb_engine import event_json_delete
 
-    event_json_delete(namespace, event_ids)
+    event_json_delete(event_ids)
     sync_now(pools=[Pool.EVENT_DAG])

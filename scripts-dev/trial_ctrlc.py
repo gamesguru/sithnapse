@@ -953,6 +953,17 @@ def _print_mtxdb_engine_stats(timings_dir: str) -> None:
         "max_commit_records": 0,
         "staged_publish_refused": 0,
     }
+    # Process-global CSR read-path counters (one set per process, not per pool).
+    csr_read: dict[str, float] = {
+        "read_lock_waits": 0,
+        "read_lock_wait_nanos": 0,
+        "tail_reads": 0,
+        "tail_full_decodes": 0,
+        "tail_decoded_bytes": 0,
+        "tail_decode_nanos": 0,
+        "segment_listings": 0,
+        "segment_listing_nanos": 0,
+    }
     processes = 0
     for fname in sorted(os.listdir(timings_dir)):
         if not (fname.startswith("mtxdb_") and fname.endswith(".json")):
@@ -964,6 +975,12 @@ def _print_mtxdb_engine_stats(timings_dir: str) -> None:
             print(f"Warning: failed to read {fname}: {e}", file=sys.stderr)
             continue
         processes += 1
+        csr = data.get("csr_read")
+        if isinstance(csr, dict):
+            for key in csr_read:
+                value = csr.get(key, 0)
+                if isinstance(value, (int, float)):
+                    csr_read[key] += value
         # RuntimeStats exposes the same JournalCoordinator through each pool
         # when the pools share a WAL. Use one representative pool per process;
         # summing all three would triple-count every journal-wide counter.
@@ -1024,6 +1041,10 @@ def _print_mtxdb_engine_stats(timings_dir: str) -> None:
                 "index_clone_time_us",
                 "index_grow_count",
                 "index_rebuild_count",
+                "read_refreshes",
+                "read_refresh_bytes",
+                "read_refresh_sleeps",
+                "read_refresh_sleep_micros",
             ):
                 acc[key] += ps.get(key, 0) or 0
             for key, value in (ps.get("sync_totals") or {}).items():
@@ -1043,12 +1064,13 @@ def _print_mtxdb_engine_stats(timings_dir: str) -> None:
     print(
         f"\n=== mtxdb runtime stats (summed over {processes} process(es)) ===", file=err
     )
-    for pool in ("state", "event_dag", "auth_chain", "server_info"):
+    for pool in ("state", "event_dag", "server_info"):
         pool_totals = totals.get(pool)
         if not pool_totals:
             continue
-        # The stats keys keep their older names; the report says `event`/`edges`.
-        label = {"event_dag": "event", "auth_chain": "edges"}.get(pool, pool)
+        # The stats keys keep their older names; the report says `event`.
+        # Auth-chain and previous-event edges share the state pool.
+        label = {"event_dag": "event"}.get(pool, pool)
         print(f"\n  [{label}]", file=err)
         print(
             f"    get: {pool_totals['get_calls']:,.0f} calls, {pool_totals['get_misses']:,.0f} misses"
@@ -1118,6 +1140,38 @@ def _print_mtxdb_engine_stats(timings_dir: str) -> None:
                 f" checkpoint={fmt(pool_totals.get('sync_checkpoint_us', 0))}",
                 file=err,
             )
+        refreshes = pool_totals.get("read_refreshes", 0)
+        refresh_sleeps = pool_totals.get("read_refresh_sleeps", 0)
+        if refreshes or refresh_sleeps:
+            print(
+                f"    reads: journal refreshes={refreshes:,.0f}"
+                f" scanned={pool_totals.get('read_refresh_bytes', 0):,.0f}B"
+                f" | refresh retry sleeps={refresh_sleeps:,.0f}"
+                f" total={fmt(pool_totals.get('read_refresh_sleep_micros', 0))}",
+                file=err,
+            )
+    if csr_read["tail_reads"] or csr_read["read_lock_waits"]:
+        print(
+            f"\n  [csr reads; process-wide, summed over {processes} process(es)]",
+            file=err,
+        )
+        print(
+            f"    store lock: {csr_read['read_lock_waits']:,.0f} acquisitions"
+            f" wait total={fmt(csr_read['read_lock_wait_nanos'] / 1000)}",
+            file=err,
+        )
+        print(
+            f"    tail: {csr_read['tail_reads']:,.0f} reads,"
+            f" {csr_read['tail_full_decodes']:,.0f} full decodes (byte 0),"
+            f" decoded={csr_read['tail_decoded_bytes']:,}B"
+            f" total={fmt(csr_read['tail_decode_nanos'] / 1000)}",
+            file=err,
+        )
+        print(
+            f"    segment listings: {csr_read['segment_listings']:,.0f}"
+            f" total={fmt(csr_read['segment_listing_nanos'] / 1000)}",
+            file=err,
+        )
     if (
         any(durability[key] for key in durability if key != "durable_wait")
         or durability["durable_wait"]["calls"]

@@ -833,8 +833,9 @@ class RoomStreamToken(AbstractMultiWriterStreamToken):
     `stream_ordering` (when they arrived at the homeserver).
 
     When traversing historic events, events are first ordered by their `depth`
-    (`topological_ordering` in the event graph) and tie-broken by
-    `stream_ordering` (when the event arrived at the homeserver).
+    (`topological_ordering` in the event graph), then by `origin_server_ts`
+    (so concurrent events at the same depth read chronologically), and finally
+    tie-broken by `stream_ordering` (when the event arrived at the homeserver).
 
     If you're looking for more info about what a token with all of the
     underscores means, ex.
@@ -855,11 +856,13 @@ class RoomStreamToken(AbstractMultiWriterStreamToken):
 
     Historic tokens start with a "t" followed by the `depth`
     (`topological_ordering` in the event graph) of the event that comes before
-    the position of the token, followed by "-", followed by the
-    `stream_ordering` of the event that comes before the position of the token.
+    the position of the token, followed by ".", the `origin_server_ts` of that
+    event, ".", and the `stream_ordering` of the event that comes before the
+    position of the token. Any of the numbers may be negative (backfilled events
+    have negative stream orderings, and timestamps are sender supplied).
     An example token is:
 
-        t426-2633508
+        t426.1775640000000.2633508
 
     ---
 
@@ -899,13 +902,26 @@ class RoomStreamToken(AbstractMultiWriterStreamToken):
         kw_only=True,
         default=None,
     )
+    # The `origin_server_ts` of the event the token points after. Always set
+    # together with `topological`, never on live tokens.
+    timestamp: int | None = attr.ib(
+        validator=attr.validators.optional(attr.validators.instance_of(int)),
+        kw_only=True,
+        default=None,
+    )
 
     def __attrs_post_init__(self) -> None:
-        """Validates that both `topological` and `instance_map` aren't set."""
+        """Validates that both `topological` and `instance_map` aren't set, and
+        that `topological` and `timestamp` are set together."""
 
         if self.instance_map and self.topological:
             raise ValueError(
                 "Cannot set both 'topological' and 'instance_map' on 'RoomStreamToken'."
+            )
+
+        if (self.topological is None) != (self.timestamp is None):
+            raise ValueError(
+                "'topological' and 'timestamp' must be set together on 'RoomStreamToken'."
             )
 
         super().__attrs_post_init__()
@@ -921,8 +937,14 @@ class RoomStreamToken(AbstractMultiWriterStreamToken):
             if string[0] == "s":
                 return cls(topological=None, stream=int(string[1:]))
             if string[0] == "t":
-                parts = string[1:].split("-", 1)
-                return cls(topological=int(parts[0]), stream=int(parts[1]))
+                parts = string[1:].split(".")
+                if len(parts) != 3:
+                    raise ValueError("historic token needs 3 parts")
+                return cls(
+                    topological=int(parts[0]),
+                    timestamp=int(parts[1]),
+                    stream=int(parts[2]),
+                )
             if string[0] == "m":
                 parts = string[1:].split("~")
                 stream = int(parts[0])
@@ -969,22 +991,32 @@ class RoomStreamToken(AbstractMultiWriterStreamToken):
         the other token, then its after the returned token too.
         """
 
-        if self.topological or other.topological:
+        if self.topological is not None or other.topological is not None:
             raise Exception("Can't advance topological tokens")
 
         return super().copy_and_advance(other)
 
-    def as_historical_tuple(self) -> tuple[int, int]:
-        """Returns a tuple of `(topological, stream)` for historical tokens.
+    def is_before_or_eq(self, other_token: "RoomStreamToken") -> bool:
+        """Compare tokens using their historical ordering when both are historical."""
+        if self.topological is not None and other_token.topological is not None:
+            return self.as_historical_tuple() <= other_token.as_historical_tuple()
+
+        # Live tokens are still ordered by their stream positions. A mixed
+        # historical/live comparison keeps the established stream comparison.
+        return super().is_before_or_eq(other_token)
+
+    def as_historical_tuple(self) -> tuple[int, int, int]:
+        """Returns a tuple of `(topological, timestamp, stream)` for historical
+        tokens.
 
         Raises if not an historical token (i.e. doesn't have a topological part).
         """
-        if self.topological is None:
+        if self.topological is None or self.timestamp is None:
             raise Exception(
                 "Cannot call `RoomStreamToken.as_historical_tuple` on live token"
             )
 
-        return self.topological, self.stream
+        return self.topological, self.timestamp, self.stream
 
     def get_stream_pos_for_instance(self, instance_name: str) -> int:
         """Get the stream position that the given writer was at at this token.
@@ -1002,7 +1034,8 @@ class RoomStreamToken(AbstractMultiWriterStreamToken):
         """See class level docstring for information about the format."""
 
         if self.topological is not None:
-            return "t%d-%d" % (self.topological, self.stream)
+            assert self.timestamp is not None
+            return "t%d.%d.%d" % (self.topological, self.timestamp, self.stream)
         elif self.instance_map:
             entries = []
             for name, pos in self.instance_map.items():
@@ -1034,6 +1067,7 @@ class RoomStreamToken(AbstractMultiWriterStreamToken):
         instances = ", ".join(f"{k}: {v}" for k, v in sorted(self.instance_map.items()))
         return (
             f"RoomStreamToken(stream: {self.stream}, topological: {self.topological}, "
+            f"timestamp: {self.timestamp}, "
             f"instances: {{{instances}}})"
         )
 
@@ -1265,7 +1299,7 @@ class StreamToken:
 
     ex. `s2633508_17_338_6732159_1082514_541479_274711_265584_1_379_4242_4141_4343_4444`
         1. `room_key`: `s2633508` which is a `RoomStreamToken`
-           - `RoomStreamToken`'s can also look like `t426-2633508` or `m56~2.58~3.59`
+           - `RoomStreamToken`'s can also look like `t426.1775640000000.2633508` or `m56~2.58~3.59`
            - See the docstring for `RoomStreamToken` for more details.
         2. `presence_key`: `17`
         3. `typing_key`: `338`

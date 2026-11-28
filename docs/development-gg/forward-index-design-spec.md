@@ -1,10 +1,15 @@
 # Design Specification: Forward-Index Engine (`embedded_edges.rs`)
 
-> **Superseded direction (pending revision).** This spec keeps SQL `event_edges`
-> authoritative and drains `edge_index_outbox` into mtxdb. The agreed direction
-> (`perf-track-b.md` B2) is mtxdb-authoritative edges rebuilt from canonical
-> event JSON, with the SQL edge write, outbox and version gate removed. Revise
-> this spec before implementing anything from it.
+> **Historical and superseded — do not implement.** This document describes a
+> rejected SQL-outbox/generation design. The current implementation selects
+> exactly one edge backend per config (SQL or mtxdb), with no dual-write and no
+> SQL fallback. mtxdb edge writes are staged in the persist transaction with
+> event JSON (or written directly before SQL COMMIT without a shared WAL). There
+> is no `edge_index_outbox`, source-version clock, active generation,
+> retired-generation GC, or forward-read SQL fallback. Backend changes use the
+> manual `synapse_event_edges_migrate --to sql|mtxdb` command, and startup
+> refuses a marker/config mismatch. The sections below are kept only as design
+> history.
 
 ---
 

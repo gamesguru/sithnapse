@@ -43,14 +43,21 @@ class DatabaseConfigTestCase(unittest.TestCase):
         }
 
         self.assertEqual(conf["database"], expected_database_conf)
+        # The generated config must satisfy the required embedded engine, or a
+        # freshly generated homeserver would refuse to start.
+        self.assertEqual(
+            conf["embedded_db"],
+            {"engine": "mtxdb", "path": "/data_dir_path/mtxdb"},
+        )
 
     def _read_config(
         self, embedded_db: dict | None = None, env: dict[str, str] | None = None
     ) -> DatabaseConfig:
         """Helper: build a minimal config dict and parse it via DatabaseConfig."""
         config: dict = {"database": {"name": "sqlite3", "args": {}}}
-        if embedded_db is not None:
-            config["embedded_db"] = embedded_db
+        if embedded_db is None:
+            embedded_db = {"engine": "mtxdb", "path": "/tmp/test"}
+        config["embedded_db"] = embedded_db
 
         old_env = os.environ.copy()
         # These tests assert on the embedded-engine *environment* handling, so
@@ -85,16 +92,32 @@ class DatabaseConfigTestCase(unittest.TestCase):
         self.assertEqual(dc.embedded_db_sync_mode, "interval")
 
     def test_sync_mode_always_is_still_selectable(self) -> None:
-        dc = self._read_config(embedded_db={"sync_mode": "always"})
+        dc = self._read_config(
+            embedded_db={
+                "engine": "mtxdb",
+                "path": "/tmp/test",
+                "sync_mode": "always",
+            }
+        )
         self.assertEqual(dc.embedded_db_sync_mode, "always")
 
     def test_sync_mode_from_config_and_env(self) -> None:
-        dc = self._read_config(embedded_db={"sync_mode": "Interval"})
+        dc = self._read_config(
+            embedded_db={
+                "engine": "mtxdb",
+                "path": "/tmp/test",
+                "sync_mode": "Interval",
+            }
+        )
         self.assertEqual(dc.embedded_db_sync_mode, "interval")
 
         # The environment overrides the config file, as for the other switches.
         dc = self._read_config(
-            embedded_db={"sync_mode": "interval"},
+            embedded_db={
+                "engine": "mtxdb",
+                "path": "/tmp/test",
+                "sync_mode": "interval",
+            },
             env={"SYNAPSE_MTXDB_SYNC": "off"},
         )
         self.assertEqual(dc.embedded_db_sync_mode, "off")
@@ -122,6 +145,7 @@ class DatabaseConfigTestCase(unittest.TestCase):
 
         with self.assertRaises(ConfigError):
             self._read_config(
+                embedded_db={},
                 env={"SYNAPSE_EMBEDDED_DB_ENGINE": "mtxdb"},
             )
 
@@ -157,8 +181,9 @@ class DatabaseConfigTestCase(unittest.TestCase):
         self.assertEqual(dc.embedded_db_path, "/tmp/test")
 
     def test_neither_set_ok(self) -> None:
-        """engine + path both unset → no error."""
-        dc = self._read_config()
+        """DatabaseConfig permits both unset; app/_base.py rejects that at
+        startup, which is where the CSR edge store becomes mandatory."""
+        dc = self._read_config(embedded_db={})
         self.assertIsNone(dc.embedded_db_engine)
         self.assertIsNone(dc.embedded_db_path)
 

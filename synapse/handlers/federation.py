@@ -46,6 +46,7 @@ from twisted.internet.defer import CancelledError
 from synapse import event_auth
 from synapse.api.constants import (
     MAX_DEPTH,
+    Direction,
     EventContentFields,
     EventTypes,
     Membership,
@@ -159,6 +160,18 @@ The number of events we try to backfill from other servers in a single request.
 """
 
 
+MAX_BACKFILL_EXTREMITIES = 50
+"""
+The number of backward extremities asked about in a single backfill request.
+
+Each one adds a `v=` event ID to the `/backfill` query string, so this is kept
+small enough that the request URI stays well under common 8 KiB limits (see
+`tests/handlers/test_federation.py`). A room with many open gaps needs about
+one round of `/messages` per this many extremities, so a low value makes
+catching up slow without making any single request cheaper.
+"""
+
+
 # TODO: We can refactor this away now that there is only one backfill point again
 class _BackfillPointType(Enum):
     # a regular backwards extremity (ie, an event which we don't yet have, but which
@@ -269,6 +282,7 @@ class FederationHandler:
         limit: int,
         record_time: bool = True,
         force: bool = False,
+        direction: Direction | None = None,
     ) -> bool:
         """Checks the database to see if we should backfill before paginating,
         and if so do.
@@ -284,6 +298,10 @@ class FederationHandler:
             record_time: Whether to record the time it takes to backfill.
             force: Whether to force backfilling even if the depth heuristic would
                 otherwise skip it (e.g. when there are not enough local events).
+            direction: The direction the client is paginating in. A backward
+                request must not fall back to backfill points which are newer
+                than its cursor, as those would return events the client has
+                already paged past.
 
         Returns:
             True if we actually tried to backfill something, otherwise False.
@@ -320,6 +338,12 @@ class FederationHandler:
                     limit,
                     processing_start_time=processing_start_time,
                     force=force,
+                    # A foreground backward page must not block on backfill
+                    # points newer than its cursor: the events they reveal are
+                    # outside the page the client asked for. Background
+                    # backfill may still fetch them for eventual consistency
+                    # (the pagination window keeps them out of the response).
+                    allow_later_points=(direction != Direction.BACKWARDS or not force),
                 )
 
     @trace
@@ -332,6 +356,7 @@ class FederationHandler:
         *,
         processing_start_time: int | None,
         force: bool = False,
+        allow_later_points: bool = True,
     ) -> bool:
         """
         Checks whether the `current_depth` is at or approaching any backfill
@@ -357,7 +382,18 @@ class FederationHandler:
                 room_id=room_id,
                 # Per the docstring, it's best to pad the `current_depth` by the
                 # number of messages you plan to backfill from these points.
-                nearby_depth=current_depth + NUMBER_OF_EVENTS_TO_BACKFILL,
+                #
+                # A foreground backward request only pads by the page size: an
+                # extremity further ahead than that can only reveal events
+                # newer than the client's cursor, which the page cannot
+                # contain. Background requests still use the full padding so
+                # that branches merging ahead of a stale cursor are persisted
+                # for eventual consistency.
+                nearby_depth=(
+                    current_depth + NUMBER_OF_EVENTS_TO_BACKFILL
+                    if allow_later_points
+                    else current_depth + limit
+                ),
                 # We only need to end up with 5 extremities combined with the
                 # insertion event extremities to make the `/backfill` request
                 # but fetch an order of magnitude more to make sure there is
@@ -415,6 +451,12 @@ class FederationHandler:
         # and it's within the `NUMBER_OF_EVENTS_TO_BACKFILL` events that are returned
         # from `/backfill`.
         if not sorted_backfill_points and current_depth != MAX_DEPTH:
+            if not allow_later_points:
+                # A backward request must not backfill from extremities which
+                # are newer than its cursor: the events they reveal are newer
+                # than the page the client is asking for.
+                return False
+
             # Check that we actually have later backfill points, if not just return.
             have_later_backfill_points = await self.store.get_backfill_points_in_room(
                 room_id=room_id,
@@ -437,6 +479,7 @@ class FederationHandler:
                 # force flag into it, or an unrelated newer extremity can
                 # make the request block on federation.
                 force=False,
+                allow_later_points=allow_later_points,
             )
 
         # Even after recursing with `MAX_DEPTH`, we didn't find any
@@ -475,7 +518,8 @@ class FederationHandler:
         # of resources to get redacted events. We check each extremity in turn and
         # ignore those which users on our server wouldn't be able to see.
         #
-        # Additionally, we limit ourselves to backfilling from at most 5 extremities,
+        # Additionally, we limit ourselves to backfilling from at most
+        # `MAX_BACKFILL_EXTREMITIES` extremities,
         # for two reasons:
         #
         # - The check which determines if we can see an extremity's events can be
@@ -492,7 +536,7 @@ class FederationHandler:
 
         extremities_to_request: list[str] = []
         for bp in sorted_backfill_points:
-            if len(extremities_to_request) >= 5:
+            if len(extremities_to_request) >= MAX_BACKFILL_EXTREMITIES:
                 break
 
             # For regular backwards extremities, we don't have the extremity events
@@ -570,6 +614,14 @@ class FederationHandler:
             # backfill request with 4xx codes before we give up.
             max_denied_count = 5
 
+            # Extremities no peer has resolved yet, and whether any peer
+            # answered successfully. A peer that returns nothing for an
+            # extremity must not stop us asking the remaining peers.
+            remaining = list(extremities_to_request)
+            any_success = False
+            successful_peers = 0
+            max_successful_peers = 3
+
             for dom in domains:
                 # We don't want to ask our own server for information we don't have
                 if self.is_mine_server_name(dom):
@@ -580,12 +632,20 @@ class FederationHandler:
                         dom,
                         room_id,
                         limit=NUMBER_OF_EVENTS_TO_BACKFILL,
-                        extremities=extremities_to_request,
+                        extremities=remaining,
                     )
-                    # If this succeeded then we probably already have the
-                    # appropriate stuff.
-                    # TODO: We can probably do something more intelligent here.
-                    return True
+                    any_success = True
+                    successful_peers += 1
+                    # An extremity we hold only as an outlier is still a gap: it
+                    # stays a backward extremity until persisted as a non-outlier.
+                    remaining = list(
+                        await self.store.get_backward_extremities_among(
+                            room_id, remaining
+                        )
+                    )
+                    if not remaining or successful_peers >= max_successful_peers:
+                        return True
+                    continue
                 except NotRetryingDestination as e:
                     logger.info("_maybe_backfill_inner: %s", e)
                     continue
@@ -609,7 +669,7 @@ class FederationHandler:
                         )
                         denied_count += 1
                         if denied_count >= max_denied_count:
-                            return False
+                            return any_success
                         continue
 
                     logger.info("Failed to backfill from %s because %s", dom, e)
@@ -625,7 +685,7 @@ class FederationHandler:
                         )
                         denied_count += 1
                         if denied_count >= max_denied_count:
-                            return False
+                            return any_success
                         continue
 
                     logger.info("Failed to backfill from %s because %s", dom, e)
@@ -637,7 +697,7 @@ class FederationHandler:
                     logger.exception("Failed to backfill from %s because %s", dom, e)
                     continue
 
-            return False
+            return any_success
 
         # If we have the `processing_start_time`, then we can make an
         # observation. We wouldn't have the `processing_start_time` in the case
@@ -651,6 +711,25 @@ class FederationHandler:
 
         success = await try_backfill(likely_domains)
         if success:
+            # Remember the extremities the remote could not provide. The store
+            # consults `event_failed_pull_attempts` before offering a backfill
+            # point again, so a permanently missing gap is not re-requested on
+            # every page and cannot starve the other gaps out of the batch.
+            #
+            # "Resolved" means no longer a backward extremity, not merely "seen":
+            # an extremity held as an outlier that was rejected, or whose own
+            # prev_event cannot be fetched (e.g. its signature never verifies),
+            # is seen yet is never de-outliered. Without a recorded attempt it is
+            # re-offered on every request and the same batch is re-downloaded.
+            unresolved = await self.store.get_backward_extremities_among(
+                room_id, extremities_to_request
+            )
+            for event_id in unresolved:
+                await self.store.record_event_failed_pull_attempt(
+                    room_id,
+                    event_id,
+                    "Backfill did not resolve the extremity",
+                )
             return True
 
         # TODO: we could also try servers which were previously in the room, but
@@ -789,7 +868,10 @@ class FederationHandler:
                     # There's a race where we leave the room, then perform a full join
                     # anyway. This should end up being fast anyway, since we would
                     # already have the full room state and auth chain persisted.
-                    partial_state=not is_host_joined or already_partial_state_room,
+                    partial_state=(
+                        self.hs.config.federation.allow_partial_state
+                        and (not is_host_joined or already_partial_state_room)
+                    ),
                 )
 
                 event = ret.event

@@ -2549,7 +2549,7 @@ class RoomMessagesTestCase(unittest.HomeserverTestCase):
 
     def test_topo_token_is_accepted(self) -> None:
         """Test Topo Token is accepted."""
-        token = "t1-0_0_0_0_0_0_0_0_0_0_0_0_0_0"
+        token = "t1.0.0_0_0_0_0_0_0_0_0_0_0_0_0_0"
         channel = self.make_request(
             "GET",
             "/_synapse/admin/v1/rooms/%s/messages?from=%s" % (self.room_id, token),

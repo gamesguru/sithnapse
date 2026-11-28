@@ -38,6 +38,7 @@ from twisted.internet.defer import Deferred, ensureDeferred
 from twisted.internet.testing import MemoryReactor
 
 from synapse.api.errors import HttpResponseException, SynapseError
+from synapse.config.key import TrustedKeyServer
 from synapse.crypto import keyring
 from synapse.crypto.keyring import (
     KeyLookupError,
@@ -352,6 +353,42 @@ class KeyringTestCase(unittest.HomeserverTestCase):
         d = kr.verify_json_for_server(self.hs.hostname, json1, 0)
         self.get_success(d)
 
+    def test_retained_alternate_body_verifies_and_warns(self) -> None:
+        """A body retained under a reused key ID verifies historical signatures,
+        and the use is logged at warning level."""
+        primary = signedjson.key.generate_signing_key("reuse")
+        alternate = signedjson.key.generate_signing_key("reuse")
+        primary_verify = get_verify_key(primary)
+        alternate_verify = get_verify_key(alternate)
+        self.assertNotEqual(primary_verify.encode(), alternate_verify.encode())
+        key_id = get_key_id(primary)
+
+        async def get_keys(
+            server_name: str, key_ids: list[str], minimum_valid_until_ts: int
+        ) -> dict[str, FetchKeyResult]:
+            return {
+                key_id: FetchKeyResult(
+                    primary_verify,
+                    1200,
+                    ((alternate_verify, 1200),),
+                )
+            }
+
+        mock_fetcher = Mock()
+        mock_fetcher.get_keys = Mock(side_effect=get_keys)
+        kr = keyring.Keyring(self.hs, test_only_key_fetchers=[mock_fetcher])
+
+        json1: JsonDict = {}
+        signedjson.sign.sign_json(json1, "server1", alternate)
+
+        with self.assertLogs("synapse.crypto.keyring", level="WARNING") as logs:
+            self.get_success(kr.verify_json_for_server("server1", json1, 0))
+
+        self.assertIn(
+            "retained alternate key body",
+            "\n".join(logs.output),
+        )
+
     def test_verify_json_dedupes_key_requests(self) -> None:
         """Two requests for the same key should be deduped."""
         key1 = signedjson.key.generate_signing_key("1")
@@ -448,6 +485,102 @@ class KeyringTestCase(unittest.HomeserverTestCase):
         # there should have been a single call to each fetcher
         mock_fetcher1.get_keys.assert_called_once()
         mock_fetcher2.get_keys.assert_called_once()
+
+    def test_prefetch_keys_dedupes_and_bounds_requests(self) -> None:
+        """prefetch_keys de-duplicates requests, takes the maximum validity per
+        key, and skips our own server."""
+        calls: list[tuple[str, list[str], int]] = []
+
+        async def get_keys(
+            server_name: str, key_ids: list[str], minimum_valid_until_ts: int
+        ) -> dict[str, FetchKeyResult]:
+            calls.append((server_name, sorted(key_ids), minimum_valid_until_ts))
+            return {}
+
+        mock_fetcher = Mock()
+        mock_fetcher.get_keys = Mock(side_effect=get_keys)
+        kr = keyring.Keyring(self.hs, test_only_key_fetchers=[mock_fetcher])
+
+        self.get_success(
+            kr.prefetch_keys(
+                [
+                    ("server1", ["ed25519:a"], 100),
+                    ("server1", ["ed25519:b", "ed25519:a"], 300),
+                    ("server2", ["ed25519:c"], 50),
+                    (self.hs.hostname, ["ed25519:own"], 10),
+                ]
+            )
+        )
+
+        self.assertCountEqual(
+            calls,
+            [
+                # one lookup per (server, key id), each with the max validity
+                ("server1", ["ed25519:a"], 300),
+                ("server1", ["ed25519:b"], 300),
+                ("server2", ["ed25519:c"], 50),
+            ],
+        )
+
+    def test_prefetch_keys_swallows_fetch_errors(self) -> None:
+        """A failing lookup must not make prefetch_keys raise, nor stop other
+        origins from being looked up."""
+        seen: list[str] = []
+
+        async def get_keys(
+            server_name: str, key_ids: list[str], minimum_valid_until_ts: int
+        ) -> dict[str, FetchKeyResult]:
+            seen.append(server_name)
+            if server_name == "bad":
+                raise RuntimeError("boom")
+            return {}
+
+        mock_fetcher = Mock()
+        mock_fetcher.get_keys = Mock(side_effect=get_keys)
+        kr = keyring.Keyring(self.hs, test_only_key_fetchers=[mock_fetcher])
+
+        self.get_success(
+            kr.prefetch_keys([("bad", ["ed25519:x"], 0), ("good", ["ed25519:y"], 0)])
+        )
+        self.assertCountEqual(seen, ["bad", "good"])
+
+    def test_prefetch_keys_respects_concurrency_limit(self) -> None:
+        """No more than PREFETCH_CONCURRENCY origins are looked up at once."""
+        in_flight = 0
+        peak = 0
+        gates: list[Deferred] = []
+
+        async def get_keys(
+            server_name: str, key_ids: list[str], minimum_valid_until_ts: int
+        ) -> dict[str, FetchKeyResult]:
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            d: Deferred = Deferred()
+            gates.append(d)
+            await make_deferred_yieldable(d)
+            in_flight -= 1
+            return {}
+
+        mock_fetcher = Mock()
+        mock_fetcher.get_keys = Mock(side_effect=get_keys)
+        kr = keyring.Keyring(self.hs, test_only_key_fetchers=[mock_fetcher])
+
+        total = keyring.PREFETCH_CONCURRENCY * 3
+        d_all = defer.ensureDeferred(
+            kr.prefetch_keys([(f"s{i}", ["ed25519:k"], 0) for i in range(total)])
+        )
+        # Release lookups until everything has completed.
+        for _ in range(total * 2):
+            self.pump()
+            while gates:
+                gates.pop().callback(None)
+            self.pump()
+            if d_all.called:
+                break
+        self.get_success(d_all)
+        self.assertLessEqual(peak, keyring.PREFETCH_CONCURRENCY)
+        self.assertGreater(peak, 1)
 
     def test_retired_key_eviction_keeps_previously_active_keys(self) -> None:
         """Keys seen active before retirement are evicted after never-active ones."""
@@ -966,6 +1099,167 @@ class PerspectivesKeyFetcherTestCase(unittest.HomeserverTestCase):
         # finally, ensure that only one request was sent
         self.assertEqual(self.http_client.post_json.call_count, 1)
 
+    def test_most_lenient_notary_wins(self) -> None:
+        """Notaries disagreeing on a key's validity window: the furthest-future
+        (most lenient) answer must win, regardless of notary order.
+
+        This guards against a stale/expired notary view shortening the window
+        for a key that another notary in the same fan-out still reports as
+        valid further into the future.
+        """
+        self.reactor.advance(100)
+
+        # A second notary, with its own signing key, so both responses can be
+        # individually validated.
+        other_notary = MockPerspectiveServer()
+        other_notary.server_name = "mock_server_2"
+
+        def trusted(notary: MockPerspectiveServer) -> "TrustedKeyServer":
+            verify_key = get_verify_key(notary.key)
+            return TrustedKeyServer(
+                server_name=notary.server_name,
+                verify_keys={get_key_id(verify_key): verify_key},
+            )
+
+        SERVER_NAME = "server2"
+        testkey = signedjson.key.generate_signing_key("ver1")
+        testverifykey = get_verify_key(testkey)
+        testverifykey_id = get_key_id(testkey)
+
+        SHORT_TS = 100 * 1000
+        LONG_TS = 300 * 1000
+
+        def build_response(
+            notary: MockPerspectiveServer, valid_until_ts: int
+        ) -> JsonDict:
+            response = {
+                "server_name": SERVER_NAME,
+                "old_verify_keys": {},
+                "valid_until_ts": valid_until_ts,
+                "verify_keys": {
+                    testverifykey_id: {"key": encode_verify_key_base64(testverifykey)}
+                },
+            }
+            signedjson.sign.sign_json(response, SERVER_NAME, testkey)
+            notary.sign_response(response)
+            return response
+
+        responses = {
+            self.mock_perspective_server.server_name: build_response(
+                self.mock_perspective_server, SHORT_TS
+            ),
+            other_notary.server_name: build_response(other_notary, LONG_TS),
+        }
+
+        async def post_json(
+            destination: str, path: str, data: JsonDict, **kwargs: Any
+        ) -> JsonDict:
+            self.assertEqual(path, "/_matrix/key/v2/query")
+            return {"server_keys": [responses[destination]]}
+
+        self.http_client.post_json.side_effect = post_json
+
+        # Exercise both fan-out orders. Each notary's response is controlled
+        # directly above, so a last-write-wins merge cannot pass by accident.
+        for key_servers in (
+            [trusted(self.mock_perspective_server), trusted(other_notary)],
+            [trusted(other_notary), trusted(self.mock_perspective_server)],
+        ):
+            fetcher = PerspectivesKeyFetcher(self.hs)
+            fetcher.key_servers = key_servers
+
+            keys = self.get_success(
+                fetcher.get_keys(SERVER_NAME, [testverifykey_id], 0)
+            )
+
+            self.assertIn(testverifykey_id, keys)
+            self.assertEqual(keys[testverifykey_id].valid_until_ts, LONG_TS)
+            self.assertEqual(keys[testverifykey_id].verify_key, testverifykey)
+
+    def test_logs_candidate_windows_when_no_notary_covers_minimum(self) -> None:
+        """When no notary can satisfy the requested minimum, log every
+        notary's candidate window for that key.
+
+        This is the failure mode that used to be silent: all notaries answer
+        200, the merge succeeds, and only a later signature check reports
+        that the key had expired before the event.
+        """
+        self.reactor.advance(100)
+
+        other_notary = MockPerspectiveServer()
+        other_notary.server_name = "mock_server_2"
+
+        def trusted(notary: MockPerspectiveServer) -> "TrustedKeyServer":
+            verify_key = get_verify_key(notary.key)
+            return TrustedKeyServer(
+                server_name=notary.server_name,
+                verify_keys={get_key_id(verify_key): verify_key},
+            )
+
+        fetcher = PerspectivesKeyFetcher(self.hs)
+        fetcher.key_servers = [
+            trusted(self.mock_perspective_server),
+            trusted(other_notary),
+        ]
+
+        SERVER_NAME = "server2"
+        testkey = signedjson.key.generate_signing_key("ver1")
+        testverifykey = get_verify_key(testkey)
+        testverifykey_id = get_key_id(testkey)
+
+        EARLY_TS = 100 * 1000
+        LATER_TS = 150 * 1000
+        MINIMUM_TS = 200 * 1000
+
+        def build_response(
+            notary: MockPerspectiveServer, valid_until_ts: int
+        ) -> JsonDict:
+            response = {
+                "server_name": SERVER_NAME,
+                "old_verify_keys": {},
+                "valid_until_ts": valid_until_ts,
+                "verify_keys": {
+                    testverifykey_id: {"key": encode_verify_key_base64(testverifykey)}
+                },
+            }
+            signedjson.sign.sign_json(response, SERVER_NAME, testkey)
+            notary.sign_response(response)
+            return response
+
+        responses = {
+            self.mock_perspective_server.server_name: build_response(
+                self.mock_perspective_server, EARLY_TS
+            ),
+            other_notary.server_name: build_response(other_notary, LATER_TS),
+        }
+
+        async def post_json(
+            destination: str, path: str, data: JsonDict, **kwargs: Any
+        ) -> JsonDict:
+            self.assertEqual(path, "/_matrix/key/v2/query")
+            return {"server_keys": [responses[destination]]}
+
+        self.http_client.post_json.side_effect = post_json
+
+        with self.assertLogs("synapse.crypto.keyring", level="WARNING") as logs:
+            keys = self.get_success(
+                fetcher.get_keys(SERVER_NAME, [testverifykey_id], MINIMUM_TS)
+            )
+
+        # The merged key is still returned (the caller decides what to do with
+        # it), but the log must show both notary windows and the minimum.
+        self.assertEqual(keys[testverifykey_id].valid_until_ts, LATER_TS)
+        warning = "\n".join(logs.output)
+        self.assertIn("could not satisfy", warning)
+        self.assertIn(f"{SERVER_NAME}/{testverifykey_id}", warning)
+        self.assertIn(str(MINIMUM_TS), warning)
+        self.assertIn(
+            f"{self.mock_perspective_server.server_name}: {SERVER_NAME}/", warning
+        )
+        self.assertIn(f"{other_notary.server_name}: {SERVER_NAME}/", warning)
+        self.assertIn(str(EARLY_TS), warning)
+        self.assertIn(str(LATER_TS), warning)
+
     def test_get_perspectives_own_key(self) -> None:
         """Check that we can get the perspectives server's own keys
 
@@ -1052,6 +1346,6 @@ class PerspectivesKeyFetcherTestCase(unittest.HomeserverTestCase):
         self.assertEqual(keys, {}, "Expected empty dict with missing origin server sig")
 
 
-def get_key_id(key: SigningKey) -> str:
+def get_key_id(key: SigningKey | VerifyKey) -> str:
     """Get the matrix ID tag for a given SigningKey or VerifyKey"""
     return "%s:%s" % (key.alg, key.version)

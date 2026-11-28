@@ -20,11 +20,15 @@
 #
 
 
-from typing import Any, Callable
+import threading
+import time
+from typing import Any, Callable, cast
 from unittest.case import SkipTest
 from unittest.mock import patch
 
+from twisted.internet import defer
 from twisted.internet.testing import MemoryReactor
+from twisted.python.threadpool import ThreadPool
 
 from synapse.api.constants import MAIN_TIMELINE, EventContentFields, RelationTypes
 from synapse.rest import admin
@@ -851,6 +855,325 @@ class EventPushActionsStoreTestCase(HomeserverTestCase):
         # held across both the bound and the delete.
         self.assertLess(lock, bound, statements)
         self.assertLess(bound, delete, statements)
+
+    def test_summary_writers_lock_rotation_watermark_first(self) -> None:
+        """Receipt processing and rotation serialize with purge's summary fix."""
+        if not isinstance(self.store.database_engine, PostgresEngine):
+            raise SkipTest("row locks only apply to Postgres")
+
+        user_id, _, _, other_token, room_id = self._create_users_and_room()
+        event_id = self.helper.send(room_id, body="msg", tok=other_token)["event_id"]
+        self.get_success(
+            self.store.insert_receipt(
+                room_id,
+                "m.read",
+                user_id=user_id,
+                event_ids=[event_id],
+                thread_id=None,
+                data={},
+            )
+        )
+
+        def assert_locked_before(
+            statements: list[str], lock_sql: str, later_sql: str
+        ) -> None:
+            lock_index = next(
+                index for index, sql in enumerate(statements) if lock_sql in sql
+            )
+            later_index = next(
+                index for index, sql in enumerate(statements) if later_sql in sql
+            )
+            self.assertLess(lock_index, later_index, statements)
+
+        receipt_statements = self._record_statements(
+            lambda: self.get_success(
+                self.store.db_pool.runInteraction(
+                    "_handle_new_receipts_for_notifs_txn",
+                    self.store._handle_new_receipts_for_notifs_txn,
+                )
+            )
+        )
+        assert_locked_before(
+            receipt_statements,
+            "UPDATE event_push_summary_stream_ordering",
+            "FROM receipts_linearized AS r",
+        )
+
+        rotation_statements = self._record_statements(
+            lambda: self.get_success(
+                self.store.db_pool.runInteraction(
+                    "_rotate_notifs", self.store._rotate_notifs_txn
+                )
+            )
+        )
+        # The lock precedes every push-action access, including the OFFSET
+        # query that bounds the batch.
+        assert_locked_before(
+            rotation_statements,
+            "event_push_summary_stream_ordering FOR UPDATE",
+            "FROM event_push_actions",
+        )
+
+    def _use_real_db_threads(self) -> None:
+        """Run this test's database interactions on real threads.
+
+        `HomeserverTestCase` runs every transaction synchronously on the reactor
+        thread, so one transaction can never wait on a lock held by another. The
+        lock-ordering checks below need two genuinely concurrent transactions.
+        Results come back through `callFromThread`, which the test reactor only
+        delivers when it is pumped (see `_pump_until`).
+        """
+        # The adbapi pool underneath `DatabasePool`; `tests.server` gave it a
+        # threadless thread pool.
+        pool = self.store.db_pool._db_pool
+        original = pool.threadpool
+        real = ThreadPool(minthreads=2, maxthreads=4, name="test-db")
+        real.start()
+        pool.threadpool = real
+
+        def restore() -> None:
+            pool.threadpool = original
+            real.stop()
+
+        self.addCleanup(restore)
+
+    def _pump_until(self, condition: Callable[[], bool], timeout: float) -> bool:
+        """Pump the reactor, yielding real time to DB threads, until `condition`."""
+        deadline = time.monotonic() + timeout
+        while True:
+            self.reactor.advance(0)
+            if condition():
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.005)
+
+    def _wait_for_db_deferred(self, d: Any, timeout: float = 20.0) -> Any:
+        self.assertTrue(self._pump_until(lambda: d.called, timeout), "timed out")
+        return self.successResultOf(d)
+
+    def _assert_summary_writer_retries_after_purge_lock(
+        self,
+        writer_desc: str,
+        writer_func: Callable[[], Any],
+        writer_lock_sql: str,
+        add_receipt: bool,
+    ) -> None:
+        if not isinstance(self.store.database_engine, PostgresEngine):
+            raise SkipTest("repeatable-read row-lock retries only apply to Postgres")
+
+        user_id, _, _, other_token, room_id = self._create_users_and_room()
+        event_ids = [
+            self.helper.send(room_id, body=f"message {i}", tok=other_token)["event_id"]
+            for i in range(26)
+        ]
+        self.get_success(self.store._rotate_notifs())
+
+        if add_receipt:
+            self.get_success(
+                self.store.insert_receipt(
+                    room_id,
+                    "m.read",
+                    user_id=user_id,
+                    event_ids=[event_ids[-1]],
+                    thread_id=None,
+                    data={},
+                )
+            )
+
+        cutoff = self.get_success(
+            self.store.get_topological_token_for_event(event_ids[-1])
+        )
+        cutoff_str = self.get_success(cutoff.to_string(self.store))
+
+        purge_locked = threading.Event()
+        release_purge = threading.Event()
+        writer_started = threading.Event()
+        writer_lock_acquired = threading.Event()
+        attempts = [0]
+        lock_acquired_at = [0.0]
+        writer_started_at = [0.0]
+        writer_lock_acquired_at = [0.0]
+        purge_body_finished_at = [0.0]
+        observed: list[tuple[str, str]] = []
+
+        original_execute = LoggingTransaction.execute
+        purge_store = self.store
+        original_purge_txn = cast(Any, purge_store)._purge_history_txn
+
+        def timed_purge_txn(*args: Any, **kwargs: Any) -> Any:
+            result = original_purge_txn(*args, **kwargs)
+            purge_body_finished_at[0] = time.monotonic()
+            return result
+
+        def coordinate_execute(
+            txn: LoggingTransaction, sql: str, *args: Any, **kwargs: Any
+        ) -> Any:
+            normalized_sql = " ".join(sql.split()).lower()
+            if len(observed) < 100:
+                observed.append((txn.name, normalized_sql))
+            if txn.name.startswith("purge_history-") and normalized_sql.startswith(
+                "update event_push_summary_stream_ordering"
+            ):
+                result = original_execute(txn, sql, *args, **kwargs)
+                if not purge_locked.is_set():
+                    lock_acquired_at[0] = time.monotonic()
+                    purge_locked.set()
+                    if not release_purge.wait(10):
+                        raise TimeoutError("test did not release the purge watermark")
+                return result
+
+            if (
+                txn.name.startswith(f"{writer_desc}-")
+                and writer_lock_sql in normalized_sql
+            ):
+                attempts[0] += 1
+                writer_started_at[0] = writer_started_at[0] or time.monotonic()
+                writer_started.set()
+                result = original_execute(txn, sql, *args, **kwargs)
+                writer_lock_acquired_at[0] = time.monotonic()
+                writer_lock_acquired.set()
+                return result
+
+            return original_execute(txn, sql, *args, **kwargs)
+
+        # Only the concurrent section needs real threads; setup above relies on
+        # the harness's synchronous pool, and the checks below pump explicitly.
+        self._use_real_db_threads()
+
+        purge_deferred: Any = None
+        writer_deferred: Any = None
+        purge_completed = False
+        writer_completed = False
+        try:
+            with (
+                patch.object(LoggingTransaction, "execute", coordinate_execute),
+                patch.object(purge_store, "_purge_history_txn", timed_purge_txn),
+            ):
+                purge_deferred = defer.ensureDeferred(
+                    self.store.purge_history(
+                        room_id, cutoff_str, delete_local_events=True
+                    )
+                )
+                self.assertTrue(
+                    self._pump_until(purge_locked.is_set, 5),
+                    f"purge did not take the lock; statements: {observed!r}",
+                )
+
+                writer_deferred = defer.ensureDeferred(writer_func())
+                self.assertTrue(
+                    self._pump_until(writer_started.is_set, 5),
+                    "writer did not reach the lock",
+                )
+                # The writer must stay blocked behind the purge's held lock.
+                self.assertFalse(
+                    self._pump_until(writer_lock_acquired.is_set, 0.2),
+                    "summary writer passed the purge's held watermark lock",
+                )
+                release_purge.set()
+                self._wait_for_db_deferred(purge_deferred)
+                purge_completed = True
+                self._wait_for_db_deferred(writer_deferred)
+                writer_completed = True
+        finally:
+            release_purge.set()
+            if purge_deferred is not None and not purge_completed:
+                self._wait_for_db_deferred(purge_deferred)
+            if writer_deferred is not None and not writer_completed:
+                self._wait_for_db_deferred(writer_deferred)
+
+        self.assertGreaterEqual(
+            attempts[0], 2, "writer should retry its stale snapshot"
+        )
+        self.assertLessEqual(
+            lock_acquired_at[0],
+            purge_body_finished_at[0],
+            "purge body should finish after taking the watermark lock",
+        )
+        self.assertGreaterEqual(writer_lock_acquired_at[0], purge_body_finished_at[0])
+
+        aggregate_counts = self.get_success(
+            self.store.db_pool.runInteraction(
+                "get-aggregate-unread-counts-after-purge-race",
+                self.store._get_unread_counts_by_room_for_user_txn,
+                user_id,
+            )
+        )
+        self.assertEqual(aggregate_counts.get(room_id, 0), 0 if add_receipt else 1)
+
+    def test_rotation_retries_after_waiting_for_purge(self) -> None:
+        self._assert_summary_writer_retries_after_purge_lock(
+            "_rotate_notifs",
+            lambda: self.store.db_pool.runInteraction(
+                "_rotate_notifs", self.store._rotate_notifs_txn
+            ),
+            "for update",
+            False,
+        )
+
+    def test_receipts_retry_after_waiting_for_purge(self) -> None:
+        self._assert_summary_writer_retries_after_purge_lock(
+            "_handle_new_receipts_for_notifs_txn",
+            lambda: self.store.db_pool.runInteraction(
+                "_handle_new_receipts_for_notifs_txn",
+                self.store._handle_new_receipts_for_notifs_txn,
+            ),
+            "update event_push_summary_stream_ordering",
+            True,
+        )
+
+    def test_count_aggregation_after_purge_then_new_message(self) -> None:
+        user_id, _, _, other_token, room_id = self._create_users_and_room()
+
+        def _assert_count(notif_count: int) -> None:
+            aggregate_counts = self.get_success(
+                self.store.db_pool.runInteraction(
+                    "get-aggregate-unread-counts",
+                    self.store._get_unread_counts_by_room_for_user_txn,
+                    user_id,
+                )
+            )
+            self.assertEqual(aggregate_counts.get(room_id, 0), notif_count)
+
+        def _create_event() -> str:
+            result = self.helper.send_event(
+                room_id,
+                type="m.room.message",
+                content={"msgtype": "m.text", "body": "msg"},
+                tok=other_token,
+            )
+            return result["event_id"]
+
+        def _mark_read(event_id: str) -> None:
+            self.get_success(
+                self.store.insert_receipt(
+                    room_id,
+                    "m.read",
+                    user_id=user_id,
+                    event_ids=[event_id],
+                    thread_id=None,
+                    data={},
+                )
+            )
+
+        def _purge_before(event_id: str) -> None:
+            token = self.get_success(
+                self.store.get_topological_token_for_event(event_id)
+            )
+            token_str = self.get_success(token.to_string(self.store))
+            self.get_success(
+                self.store.purge_history(room_id, token_str, delete_local_events=True)
+            )
+
+        read_event_id = _create_event()
+        _mark_read(read_event_id)
+        events = [_create_event() for _ in range(10)]
+        self.get_success(self.store._rotate_notifs())
+        _purge_before(events[-1])
+        _assert_count(1)
+
+        _create_event()
+        _assert_count(2)
 
     def test_count_aggregation_threads(self) -> None:
         """

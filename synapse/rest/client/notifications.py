@@ -130,7 +130,20 @@ class NotificationsServlet(RestServlet):
             returned_push_actions.append(returned_pa)
             next_token = str(pa.stream_ordering)
 
-        return 200, {"notifications": returned_push_actions, "next_token": next_token}
+        # A page with fewer results than the limit is the last one: the query
+        # returns every remaining row, so there is nothing to ask for next.
+        # Handing out a token anyway makes clients fetch an empty page just to
+        # learn that (and re-do that on every refresh).
+        if len(push_actions) < limit:
+            next_token = None
+
+        response: JsonDict = {"notifications": returned_push_actions}
+        # `next_token` is absent, rather than null, when there are no more
+        # results: the spec types it as a string and uses its absence to mean
+        # the end of the list.
+        if next_token is not None:
+            response["next_token"] = next_token
+        return 200, response
 
 
 def register_servlets(hs: "HomeServer", http_server: HttpServer) -> None:

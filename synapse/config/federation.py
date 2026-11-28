@@ -20,7 +20,7 @@
 #
 from typing import Any
 
-from synapse.config._base import Config
+from synapse.config._base import Config, ConfigError
 from synapse.config._util import validate_config
 from synapse.types import JsonDict
 
@@ -60,6 +60,26 @@ class FederationConfig(Config):
 
         self.allow_device_name_lookup_over_federation = config.get(
             "allow_device_name_lookup_over_federation", False
+        )
+
+        # Partial-state joins reduce the amount of room state needed during
+        # federation joins. Some deployments may prefer to always request the
+        # full room state instead.
+        self.allow_partial_state = federation_config.get("allow_partial_state", True)
+
+        # Event IDs the operator has decided to accept even though their origin
+        # signature cannot be verified (see `_check_sigs_and_hash`).
+        accept_unverifiable = federation_config.get("accept_unverifiable_event_ids", [])
+        if not isinstance(accept_unverifiable, list) or not all(
+            isinstance(e, str) and e.startswith("$") for e in accept_unverifiable
+        ):
+            raise ConfigError(
+                "federation.accept_unverifiable_event_ids must be a list of "
+                "event IDs (strings starting with '$')",
+                ("federation", "accept_unverifiable_event_ids"),
+            )
+        self.accept_unverifiable_event_ids: frozenset[str] = frozenset(
+            accept_unverifiable
         )
 
         # Allow for the configuration of timeout, max request retries

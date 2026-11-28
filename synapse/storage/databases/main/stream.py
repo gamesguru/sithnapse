@@ -37,8 +37,8 @@ weak ordering of events based on the pdu graph.
 This means that we have to have two different types of tokens, depending on
 what sort order was used:
     - stream tokens are of the form: "s%d", which maps directly to the column
-    - topological tokems: "t%d-%d", where the integers map to the topological
-      and stream ordering columns respectively.
+    - topological tokens: "t%d.%d.%d", where the integers map to the topological,
+      origin_server_ts and stream ordering columns respectively.
 """
 
 import logging
@@ -72,6 +72,12 @@ from synapse.storage.database import (
     LoggingTransaction,
     make_in_list_sql_clause,
 )
+from synapse.storage.databases.main.embedded_event_timeline import (
+    page_stream,
+    page_topological,
+    report_mismatch,
+    timeline_reads_mode,
+)
 from synapse.storage.databases.main.events_worker import EventsWorkerStore
 from synapse.storage.engines import BaseDatabaseEngine, PostgresEngine, Sqlite3Engine
 from synapse.storage.roommember import RoomsForUserStateReset
@@ -89,6 +95,10 @@ logger = logging.getLogger(__name__)
 
 
 MAX_STREAM_SIZE = 1000
+
+# Upper bound on how many rows we will fetch to complete a topological depth
+# when a forward page ends on a backfilled event.
+_MAX_BACKFILL_BOUNDARY_FETCH = 10000
 
 
 _STREAM_TOKEN = "stream"
@@ -113,6 +123,7 @@ class _EventDictReturn:
     event_id: str
     topological_ordering: int | None
     stream_ordering: int
+    origin_server_ts: int | None = None
 
 
 @attr.s(slots=True, frozen=True, auto_attribs=True)
@@ -151,9 +162,9 @@ class CurrentStateDeltaMembership:
 
 def generate_pagination_where_clause(
     direction: Direction,
-    column_names: tuple[str, str],
-    from_token: tuple[int | None, int] | None,
-    to_token: tuple[int | None, int] | None,
+    column_names: tuple[str, str, str],
+    from_token: tuple[int | None, int | None, int] | None,
+    to_token: tuple[int | None, int | None, int] | None,
     engine: BaseDatabaseEngine,
 ) -> str:
     """Creates an SQL expression to bound the columns by the pagination
@@ -161,10 +172,10 @@ def generate_pagination_where_clause(
 
     For example creates an SQL expression like:
 
-        (6, 7) >= (topological_ordering, stream_ordering)
-        AND (5, 3) < (topological_ordering, stream_ordering)
+        (6, 1000, 7) >= (topological_ordering, origin_server_ts, stream_ordering)
+        AND (5, 900, 3) < (topological_ordering, origin_server_ts, stream_ordering)
 
-    would be generated for dir=b, from_token=(6, 7) and to_token=(5, 3).
+    would be generated for dir=b, from_token=(6, 1000, 7) and to_token=(5, 900, 3).
 
     Note that tokens are considered to be after the row they are in, e.g. if
     a row A has a token T, then we consider A to be before T. This convention
@@ -219,7 +230,11 @@ def generate_pagination_bounds(
     direction: Direction,
     from_token: RoomStreamToken | None,
     to_token: RoomStreamToken | None,
-) -> tuple[str, tuple[int | None, int] | None, tuple[int | None, int] | None]:
+) -> tuple[
+    str,
+    tuple[int | None, int | None, int] | None,
+    tuple[int | None, int | None, int] | None,
+]:
     """
     Generate a start and end point for this page of events.
 
@@ -234,8 +249,9 @@ def generate_pagination_bounds(
             ASC or DESC for sorting of the query.
 
             The starting position as a tuple of ints representing
-            (topological position, stream position) or None if no from_token was
-            provided. The topological position may be None for live tokens.
+            (topological position, timestamp, stream position) or None if no
+            from_token was provided. The topological position and timestamp
+            are None for live tokens.
 
             The end position in the same format as the starting position, or None
             if no to_token was provided.
@@ -254,32 +270,36 @@ def generate_pagination_bounds(
     # by fetching all events between the min stream token and the maximum
     # stream token (as returned by `RoomStreamToken.get_max_stream_pos`) and
     # then filtering the results.
-    from_bound: tuple[int | None, int] | None = None
+    from_bound: tuple[int | None, int | None, int] | None = None
     if from_token:
         if from_token.topological is not None:
             from_bound = from_token.as_historical_tuple()
         elif direction == Direction.BACKWARDS:
             from_bound = (
                 None,
+                None,
                 from_token.get_max_stream_pos(),
             )
         else:
             from_bound = (
                 None,
+                None,
                 from_token.stream,
             )
 
-    to_bound: tuple[int | None, int] | None = None
+    to_bound: tuple[int | None, int | None, int] | None = None
     if to_token:
         if to_token.topological is not None:
             to_bound = to_token.as_historical_tuple()
         elif direction == Direction.BACKWARDS:
             to_bound = (
                 None,
+                None,
                 to_token.stream,
             )
         else:
             to_bound = (
+                None,
                 None,
                 to_token.get_max_stream_pos(),
             )
@@ -288,7 +308,10 @@ def generate_pagination_bounds(
 
 
 def generate_next_token(
-    direction: Direction, last_topo_ordering: int | None, last_stream_ordering: int
+    direction: Direction,
+    last_topo_ordering: int | None,
+    last_origin_server_ts: int | None,
+    last_stream_ordering: int,
 ) -> RoomStreamToken:
     """
     Generate the next room stream token based on the currently returned data.
@@ -296,6 +319,8 @@ def generate_next_token(
     Args:
         direction: Whether pagination is going forwards or backwards.
         last_topo_ordering: The last topological ordering being returned.
+        last_origin_server_ts: The `origin_server_ts` of the last event being
+            returned.
         last_stream_ordering: The last stream ordering being returned.
 
     Returns:
@@ -308,19 +333,23 @@ def generate_next_token(
         # when we are going backwards so we subtract one from the
         # stream part.
         last_stream_ordering -= 1
-    return RoomStreamToken(topological=last_topo_ordering, stream=last_stream_ordering)
+    return RoomStreamToken(
+        topological=last_topo_ordering,
+        timestamp=last_origin_server_ts,
+        stream=last_stream_ordering,
+    )
 
 
 def _make_generic_sql_bound(
     bound: str,
-    column_names: tuple[str, str],
-    values: tuple[int | None, int],
+    column_names: tuple[str, str, str],
+    values: tuple[int | None, int | None, int],
     engine: BaseDatabaseEngine,
 ) -> str:
     """Create an SQL expression that bounds the given column names by the
-    values, e.g. create the equivalent of `(1, 2) < (col1, col2)`.
+    values, e.g. create the equivalent of `(1, 2, 3) < (col1, col2, col3)`.
 
-    Only works with two columns.
+    Only works with three columns.
 
     Older versions of SQLite don't support that syntax so we have to expand it
     out manually.
@@ -332,7 +361,7 @@ def _make_generic_sql_bound(
             as these get inserted directly into the SQL statement without
             escapes.
         values: The values to bound the columns by. If
-            the first value is None then only creates a bound on the second
+            the first value is None then only creates a bound on the last
             column.
         engine: The database engine to generate the SQL for
 
@@ -342,39 +371,63 @@ def _make_generic_sql_bound(
 
     assert bound in (">", "<", ">=", "<=")
 
-    name1, name2 = column_names
-    val1, val2 = values
+    name1, name2, name3 = column_names
+    val1, val2, val3 = values
 
     if val1 is None:
-        val2 = int(val2)
-        return "(%d %s %s)" % (val2, bound, name2)
+        val3 = int(val3)
+        return "(%d %s %s)" % (val3, bound, name3)
 
+    assert val2 is not None
     val1 = int(val1)
     val2 = int(val2)
+    val3 = int(val3)
 
     if isinstance(engine, PostgresEngine):
         # Postgres doesn't optimise ``(x < a) OR (x=a AND y<b)`` as well
         # as it optimises ``(x,y) < (a,b)`` on multicolumn indexes. So we
         # use the later form when running against postgres.
-        return "((%d,%d) %s (%s,%s))" % (val1, val2, bound, name1, name2)
+        return "((%d,%d,%d) %s (%s,%s,%s))" % (
+            val1,
+            val2,
+            val3,
+            bound,
+            name1,
+            name2,
+            name3,
+        )
 
     # We want to generate queries of e.g. the form:
     #
-    #   (val1 < name1 OR (val1 = name1 AND val2 <= name2))
+    #   (val1 < name1
+    #    OR (val1 = name1 AND (val2 < name2 OR (val2 = name2 AND val3 <= name3))))
     #
-    # which is equivalent to (val1, val2) < (name1, name2)
+    # which is equivalent to (val1, val2, val3) < (name1, name2, name3)
 
+    strict_bound = bound[0]  # The leading bounds must always be strict here
     return """(
         {val1:d} {strict_bound} {name1}
-        OR ({val1:d} = {name1} AND {val2:d} {bound} {name2})
+        OR ({val1:d} = {name1} AND (
+            {val2:d} {strict_bound} {name2}
+            OR ({val2:d} = {name2} AND {val3:d} {bound} {name3})
+        ))
     )""".format(
         name1=name1,
         val1=val1,
         name2=name2,
         val2=val2,
-        strict_bound=bound[0],  # The first bound must always be strict equality here
+        name3=name3,
+        val3=val3,
+        strict_bound=strict_bound,
         bound=bound,
     )
+
+
+def _tokens_without_instance_map(*tokens: RoomStreamToken | None) -> bool:
+    """Whether no token carries a multi-writer `instance_map`. The timeline
+    index stores no persisting instance, so it can only answer pages whose
+    bounds are plain positions."""
+    return all(token is None or not token.instance_map for token in tokens)
 
 
 def _filter_results(
@@ -383,9 +436,10 @@ def _filter_results(
     instance_name: str | None,
     topological_ordering: int,
     stream_ordering: int,
+    origin_server_ts: int | None = None,
 ) -> bool:
     """Returns True if the event persisted by the given instance at the given
-    topological/stream_ordering falls between the two tokens (taking a None
+    topological/origin_server_ts/stream_ordering falls between the two tokens (taking a None
     token to mean unbounded).
 
     Used to filter results from fetching events in the DB against the given
@@ -401,16 +455,17 @@ def _filter_results(
     if instance_name is None:
         instance_name = "master"
 
-    event_historical_tuple = (
-        topological_ordering,
-        stream_ordering,
-    )
+    def event_historical_tuple() -> tuple[int, int, int]:
+        # `origin_server_ts` is only needed to compare against historical tokens.
+        # Older rows can have a NULL origin_server_ts. Use 0 consistently in
+        # the query, index, and token comparator for those rows.
+        return (topological_ordering, origin_server_ts or 0, stream_ordering)
 
     if lower_token:
         if lower_token.topological is not None:
-            # If these are historical tokens we compare the `(topological, stream)`
-            # tuples.
-            if event_historical_tuple <= lower_token.as_historical_tuple():
+            # If these are historical tokens we compare the
+            # `(topological, timestamp, stream)` tuples.
+            if event_historical_tuple() <= lower_token.as_historical_tuple():
                 return False
 
         else:
@@ -423,7 +478,7 @@ def _filter_results(
 
     if upper_token:
         if upper_token.topological is not None:
-            if upper_token.as_historical_tuple() < event_historical_tuple:
+            if upper_token.as_historical_tuple() < event_historical_tuple():
                 return False
         else:
             if upper_token.get_stream_pos_for_instance(instance_name) < stream_ordering:
@@ -875,9 +930,9 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
 
         bounds = generate_pagination_where_clause(
             direction=direction,
-            # The empty string will shortcut downstream code to only use the
+            # The empty strings will shortcut downstream code to only use the
             # `stream_ordering` column
-            column_names=("", "stream_ordering"),
+            column_names=("", "", "stream_ordering"),
             from_token=from_bound,
             to_token=to_bound,
             engine=self.database_engine,
@@ -893,10 +948,32 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
                     AND {bounds}
                 ORDER BY stream_ordering {order} LIMIT ?
             """
-            txn.execute(sql, (room_id, 2 * limit))
-
-            # Get all the rows and check if we hit the limit.
-            fetched_rows = txn.fetchall()
+            index_rows = None
+            reads = timeline_reads_mode() if self._embedded_db_engine else "off"
+            if reads != "off" and _tokens_without_instance_map(from_key, to_key):
+                index_rows = page_stream(
+                    room_id,
+                    from_bound[2] if from_bound else None,
+                    to_bound[2] if to_bound else None,
+                    direction == Direction.BACKWARDS,
+                    2 * limit,
+                )
+            if reads == "read" and index_rows is not None:
+                fetched_rows = [
+                    (event_id, None, stream_ordering)
+                    for event_id, _topo, _ts, stream_ordering in index_rows
+                ]
+            else:
+                txn.execute(sql, (room_id, 2 * limit))
+                # Get all the rows and check if we hit the limit.
+                fetched_rows = txn.fetchall()
+                if index_rows is not None:
+                    report_mismatch(
+                        "paginate_room_events_by_stream_ordering",
+                        room_id,
+                        [(row[0], row[2]) for row in fetched_rows],
+                        [(row[0], row[3]) for row in index_rows],
+                    )
             limited = len(fetched_rows) >= 2 * limit
 
             rows = [
@@ -932,6 +1009,7 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
             next_key = generate_next_token(
                 direction=direction,
                 last_topo_ordering=None,
+                last_origin_server_ts=None,
                 last_stream_ordering=rows[-1].stream_ordering,
             )
         else:
@@ -1462,7 +1540,7 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
 
     async def get_room_event_before_stream_ordering(
         self, room_id: str, stream_ordering: int
-    ) -> tuple[int, int, str] | None:
+    ) -> tuple[int, int, str, int] | None:
         """Gets details of the first event in a room at or before a stream ordering
 
         Args:
@@ -1470,12 +1548,14 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
             stream_ordering:
 
         Returns:
-            A tuple of (stream ordering, topological ordering, event_id)
+            A tuple of (stream ordering, topological ordering, event_id,
+            origin_server_ts)
         """
 
-        def _f(txn: LoggingTransaction) -> tuple[int, int, str] | None:
+        def _f(txn: LoggingTransaction) -> tuple[int, int, str, int] | None:
             sql = """
-                SELECT stream_ordering, topological_ordering, event_id
+                SELECT stream_ordering, topological_ordering, event_id,
+                    COALESCE(origin_server_ts, 0)
                 FROM events
                 LEFT JOIN rejections USING (event_id)
                 WHERE room_id = ?
@@ -1486,7 +1566,7 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
                 LIMIT 1
             """
             txn.execute(sql, (room_id, stream_ordering))
-            return cast(tuple[int, int, str] | None, txn.fetchone())
+            return cast(tuple[int, int, str, int] | None, txn.fetchone())
 
         return await self.db_pool.runInteraction(
             "get_room_event_before_stream_ordering", _f
@@ -1848,10 +1928,10 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
     ) -> RoomStreamToken:
         """Returns the current position of the rooms stream (historic token)."""
         stream_ordering = self.get_room_max_stream_ordering()
-        topo = await self.db_pool.runInteraction(
+        topo, ts = await self.db_pool.runInteraction(
             "_get_max_topological_txn", self._get_max_topological_txn, room_id
         )
-        return RoomStreamToken(topological=topo, stream=stream_ordering)
+        return RoomStreamToken(topological=topo, timestamp=ts, stream=stream_ordering)
 
     @overload
     def get_stream_id_for_event_txn(
@@ -1908,10 +1988,39 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
         row = await self.db_pool.simple_select_one(
             table="events",
             keyvalues={"event_id": event_id},
-            retcols=("stream_ordering", "topological_ordering"),
+            retcols=("stream_ordering", "topological_ordering", "origin_server_ts"),
             desc="get_topological_token_for_event",
         )
-        return RoomStreamToken(topological=row[1], stream=row[0])
+        return RoomStreamToken(topological=row[1], timestamp=row[2] or 0, stream=row[0])
+
+    async def get_topological_token_for_stream_position(
+        self, room_id: str, stream_key: int
+    ) -> RoomStreamToken | None:
+        """Resolve a stream position in a room to a historic (topological) token.
+
+        Forward pagination from a stream-only token compares `stream_ordering`
+        alone, which can never return backfilled events (they have negative
+        stream orderings). Pinning the token to the newest timeline event at or
+        before the position lets the page compare `(topological, stream)`
+        instead.
+
+        Returns None if the room has no timeline event at or before the position.
+        """
+        rows = await self.db_pool.execute(
+            "get_topological_token_for_stream_position",
+            """
+            SELECT topological_ordering, COALESCE(origin_server_ts, 0), stream_ordering FROM events
+            WHERE room_id = ? AND stream_ordering <= ? AND NOT outlier
+            ORDER BY stream_ordering DESC, topological_ordering DESC LIMIT 1
+            """,
+            room_id,
+            stream_key,
+        )
+        if not rows:
+            return None
+        return RoomStreamToken(
+            topological=rows[0][0], timestamp=rows[0][1], stream=rows[0][2]
+        )
 
     async def get_current_topological_token(self, room_id: str, stream_key: int) -> int:
         """Gets the topological token in a room after or at the given stream
@@ -1958,18 +2067,29 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
         )
         return row[0][0] if row else 0
 
-    def _get_max_topological_txn(self, txn: LoggingTransaction, room_id: str) -> int:
+    def _get_max_topological_txn(
+        self, txn: LoggingTransaction, room_id: str
+    ) -> tuple[int, int]:
+        """Returns the largest `(topological_ordering, origin_server_ts)` in the
+        room, where the timestamp is the largest one at that depth, so that a
+        token built from it sorts at or after every event in the room."""
         txn.execute(
-            "SELECT MAX(topological_ordering) FROM events WHERE room_id = ?",
-            (room_id,),
+            """
+            SELECT topological_ordering, MAX(COALESCE(origin_server_ts, 0)) FROM events
+            WHERE room_id = ? AND topological_ordering = (
+                SELECT MAX(topological_ordering) FROM events WHERE room_id = ?
+            )
+            GROUP BY topological_ordering
+            """,
+            (room_id, room_id),
         )
 
         rows = txn.fetchall()
-        # An aggregate function like MAX() will always return one row per group
-        # so we can safely rely on the lookup here. For example, when a we
-        # lookup a `room_id` which does not exist, `rows` will look like
-        # `[(None,)]`
-        return rows[0][0] if rows[0][0] is not None else 0
+        # An empty room has no rows to group, so fall back to the smallest
+        # position.
+        if not rows or rows[0][0] is None:
+            return 0, 0
+        return rows[0][0], rows[0][1] if rows[0][1] is not None else 0
 
     async def get_events_around(
         self,
@@ -2035,19 +2155,25 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
             txn,
             "events",
             keyvalues={"event_id": event_id, "room_id": room_id},
-            retcols=("stream_ordering", "topological_ordering"),
+            retcols=("stream_ordering", "topological_ordering", "origin_server_ts"),
         )
         stream_ordering = int(row[0])
         topological_ordering = int(row[1])
+        origin_server_ts = int(row[2] or 0)
 
         # Paginating backwards includes the event at the token, but paginating
-        # forward doesn't.
+        # forward doesn't. So the token to go backwards from points just before
+        # the event, and the one to go forwards from points at it.
         before_token = RoomStreamToken(
-            topological=topological_ordering - 1, stream=stream_ordering
+            topological=topological_ordering,
+            timestamp=origin_server_ts,
+            stream=stream_ordering - 1,
         )
 
         after_token = RoomStreamToken(
-            topological=topological_ordering, stream=stream_ordering
+            topological=topological_ordering,
+            timestamp=origin_server_ts,
+            stream=stream_ordering,
         )
 
         rows, start_token, _ = self._paginate_room_events_by_topological_ordering_txn(
@@ -2232,6 +2358,8 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
         direction: Direction = Direction.BACKWARDS,
         limit: int = 0,
         event_filter: Filter | None = None,
+        live_from_key: RoomStreamToken | None = None,
+        live_cursor_key: RoomStreamToken | None = None,
     ) -> tuple[list[_EventDictReturn], RoomStreamToken, bool]:
         """Returns list of events before or after a given token.
 
@@ -2278,13 +2406,66 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
             direction, from_token, to_token
         )
 
-        bounds = generate_pagination_where_clause(
-            direction=direction,
-            column_names=("event.topological_ordering", "event.stream_ordering"),
-            from_token=from_bound,
-            to_token=to_bound,
-            engine=self.database_engine,
-        )
+        if direction == Direction.FORWARDS and live_from_key is not None:
+            # `from_token` is a topological anchor for backfilled events only;
+            # live events continue to use the caller's stream position.
+            _, live_from_bound, live_to_bound = generate_pagination_bounds(
+                direction, live_from_key, to_token
+            )
+            backfilled_bounds = generate_pagination_where_clause(
+                direction=direction,
+                column_names=(
+                    "event.topological_ordering",
+                    "COALESCE(event.origin_server_ts, 0)",
+                    "event.stream_ordering",
+                ),
+                from_token=from_bound,
+                to_token=to_bound,
+                engine=self.database_engine,
+            )
+            live_bounds = generate_pagination_where_clause(
+                direction=direction,
+                column_names=(
+                    "event.topological_ordering",
+                    "COALESCE(event.origin_server_ts, 0)",
+                    "event.stream_ordering",
+                ),
+                from_token=live_from_bound,
+                to_token=live_to_bound,
+                engine=self.database_engine,
+            )
+            if live_cursor_key is not None:
+                _, live_cursor_from_bound, live_cursor_to_bound = (
+                    generate_pagination_bounds(direction, live_cursor_key, to_token)
+                )
+                live_cursor_bounds = generate_pagination_where_clause(
+                    direction=direction,
+                    column_names=(
+                        "event.topological_ordering",
+                        "COALESCE(event.origin_server_ts, 0)",
+                        "event.stream_ordering",
+                    ),
+                    from_token=live_cursor_from_bound,
+                    to_token=live_cursor_to_bound,
+                    engine=self.database_engine,
+                )
+                live_bounds = f"({live_bounds}) AND ({live_cursor_bounds})"
+            bounds = (
+                f"((event.stream_ordering < 0 AND ({backfilled_bounds})) OR "
+                f"(event.stream_ordering >= 0 AND ({live_bounds})))"
+            )
+        else:
+            bounds = generate_pagination_where_clause(
+                direction=direction,
+                column_names=(
+                    "event.topological_ordering",
+                    "COALESCE(event.origin_server_ts, 0)",
+                    "event.stream_ordering",
+                ),
+                from_token=from_bound,
+                to_token=to_bound,
+                engine=self.database_engine,
+            )
 
         filter_clause, filter_args = filter_to_clause(event_filter)
 
@@ -2344,11 +2525,13 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
         sql = """
             %(select_keywords)s
                 event.event_id, event.instance_name,
-                event.topological_ordering, event.stream_ordering
+                event.topological_ordering, event.stream_ordering,
+                COALESCE(event.origin_server_ts, 0)
             FROM events AS event
             %(join_clause)s
             WHERE event.outlier = FALSE AND event.room_id = ? AND %(bounds)s
             ORDER BY event.topological_ordering %(order)s,
+            COALESCE(event.origin_server_ts, 0) %(order)s,
             event.stream_ordering %(order)s LIMIT ?
         """ % {
             "select_keywords": select_keywords,
@@ -2356,39 +2539,197 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
             "bounds": bounds,
             "order": order,
         }
-        txn.execute(sql, args)
+        index_rows = None
+        reads = timeline_reads_mode() if self._embedded_db_engine else "off"
+        if (
+            reads != "off"
+            and live_from_key is None
+            and not filter_clause
+            and not join_clause
+            and _tokens_without_instance_map(from_token, to_token)
+        ):
+            index_rows = page_topological(
+                room_id,
+                from_bound,
+                to_bound,
+                direction == Direction.BACKWARDS,
+                requested_limit,
+            )
+        if not (reads == "read" and index_rows is not None):
+            txn.execute(sql, args)
+
+        def _filter_fetched(
+            fetched_rows: list[tuple[Any, ...]],
+        ) -> list[_EventDictReturn]:
+            filtered_rows: list[_EventDictReturn] = []
+            for (
+                event_id,
+                instance_name,
+                topological_ordering,
+                stream_ordering,
+                origin_server_ts,
+            ) in fetched_rows:
+                lower_token: RoomStreamToken | None
+                upper_token: RoomStreamToken | None
+                if direction == Direction.BACKWARDS:
+                    lower_token = to_token
+                    upper_token = from_token
+                elif live_from_key is not None and stream_ordering >= 0:
+                    lower_token = live_from_key
+                    upper_token = to_token
+                else:
+                    lower_token = from_token
+                    upper_token = to_token
+
+                in_bounds = _filter_results(
+                    lower_token=lower_token,
+                    upper_token=upper_token,
+                    instance_name=instance_name,
+                    topological_ordering=topological_ordering,
+                    stream_ordering=stream_ordering,
+                    origin_server_ts=origin_server_ts,
+                )
+                if (
+                    in_bounds
+                    and direction == Direction.FORWARDS
+                    and live_cursor_key is not None
+                    and stream_ordering >= 0
+                ):
+                    in_bounds = _filter_results(
+                        lower_token=live_cursor_key,
+                        upper_token=to_token,
+                        instance_name=instance_name,
+                        topological_ordering=topological_ordering,
+                        stream_ordering=stream_ordering,
+                        origin_server_ts=origin_server_ts,
+                    )
+                if in_bounds:
+                    filtered_rows.append(
+                        _EventDictReturn(
+                            event_id,
+                            topological_ordering,
+                            stream_ordering,
+                            origin_server_ts,
+                        )
+                    )
+            return filtered_rows
 
         # Get all the rows and check if we hit the limit.
-        fetched_rows = txn.fetchall()
+        if reads == "read" and index_rows is not None:
+            fetched_rows = [
+                (event_id, None, topological, stream, ts)
+                for event_id, topological, ts, stream in index_rows
+            ]
+        else:
+            fetched_rows = txn.fetchall()
+            if index_rows is not None:
+                report_mismatch(
+                    "paginate_room_events_by_topological_ordering",
+                    room_id,
+                    [(row[0], row[2], row[4], row[3]) for row in fetched_rows],
+                    index_rows,
+                )
+        filtered_rows = _filter_fetched(fetched_rows)
+
+        # The tie-break handling below is only needed when the live bound is a
+        # real (non-negative) stream position, which cannot also be used to
+        # order backfilled events. A negative live bound lives in the same
+        # domain as backfilled stream orderings, so the ordinary
+        # `(topological, stream)` next token already breaks ties correctly.
+        carries_live_bound = live_from_key is not None and live_from_key.stream >= 0
+
+        if (
+            direction == Direction.FORWARDS
+            and carries_live_bound
+            and filtered_rows
+            and limit > 0
+        ):
+            boundary_index = min(int(limit), len(filtered_rows)) - 1
+            boundary = filtered_rows[boundary_index]
+            if boundary.stream_ordering < 0:
+                boundary_topo = boundary.topological_ordering
+
+                # The next token keeps the live stream position rather than the
+                # backfilled event's negative one, so a same-depth backfilled
+                # sibling would look already-seen. Fetch until every event at
+                # this topological depth is present, then include the whole
+                # depth in this page.
+                while (
+                    fetched_rows
+                    and len(fetched_rows) >= requested_limit
+                    and fetched_rows[-1][2] == boundary_topo
+                ):
+                    if requested_limit >= _MAX_BACKFILL_BOUNDARY_FETCH:
+                        logger.warning(
+                            "Pagination at room %s reached the %d-event fetch cap "
+                            "at topological depth %d; a same-depth sibling may be "
+                            "split across pages",
+                            room_id,
+                            _MAX_BACKFILL_BOUNDARY_FETCH,
+                            boundary_topo,
+                        )
+                        break
+
+                    requested_limit = min(
+                        requested_limit * 2, _MAX_BACKFILL_BOUNDARY_FETCH
+                    )
+                    txn.execute(sql, (*args[:-1], requested_limit))
+                    fetched_rows = txn.fetchall()
+                    filtered_rows = _filter_fetched(fetched_rows)
+                    boundary_index = min(boundary_index, len(filtered_rows) - 1)
+                    boundary = filtered_rows[boundary_index]
+                    if boundary.stream_ordering >= 0:
+                        break
+                    boundary_topo = boundary.topological_ordering
+
+                if boundary.stream_ordering < 0:
+                    end = boundary_index + 1
+                    while (
+                        end < len(filtered_rows)
+                        and filtered_rows[end].topological_ordering == boundary_topo
+                    ):
+                        end += 1
+                else:
+                    end = int(limit)
+            else:
+                end = int(limit)
+        else:
+            end = int(limit)
+
         limited = len(fetched_rows) >= requested_limit
-
-        # Filter the result set.
-        rows = [
-            _EventDictReturn(event_id, topological_ordering, stream_ordering)
-            for event_id, instance_name, topological_ordering, stream_ordering in fetched_rows
-            if _filter_results(
-                lower_token=(
-                    to_token if direction == Direction.BACKWARDS else from_token
-                ),
-                upper_token=(
-                    from_token if direction == Direction.BACKWARDS else to_token
-                ),
-                instance_name=instance_name,
-                topological_ordering=topological_ordering,
-                stream_ordering=stream_ordering,
-            )
-        ]
-
-        if len(rows) > limit:
+        if len(filtered_rows) > end:
             limited = True
 
-        rows = rows[:limit]
+        rows = filtered_rows[:end]
 
         if rows:
             assert rows[-1].topological_ordering is not None
-            next_token = generate_next_token(
-                direction, rows[-1].topological_ordering, rows[-1].stream_ordering
-            )
+            if (
+                direction == Direction.FORWARDS
+                and live_from_key is not None
+                and carries_live_bound
+                and rows[-1].stream_ordering < 0
+            ):
+                # Advancing past a backfilled event must not advance the live
+                # stream bound: later live events still start from the caller's
+                # original position.
+                #
+                # The page holds every backfilled event at this depth, ordered
+                # by timestamp, so the last row's timestamp is the largest one
+                # in the group: the next page then skips exactly what this one
+                # returned.
+                next_token = RoomStreamToken(
+                    topological=rows[-1].topological_ordering,
+                    timestamp=rows[-1].origin_server_ts,
+                    stream=live_from_key.stream,
+                )
+            else:
+                next_token = generate_next_token(
+                    direction,
+                    rows[-1].topological_ordering,
+                    rows[-1].origin_server_ts,
+                    rows[-1].stream_ordering,
+                )
         else:
             # TODO (erikj): We should work out what to do here instead.
             next_token = to_token if to_token else from_token
@@ -2406,6 +2747,8 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
         direction: Direction = Direction.BACKWARDS,
         limit: int = 0,
         event_filter: Filter | None = None,
+        live_from_key: RoomStreamToken | None = None,
+        live_cursor_key: RoomStreamToken | None = None,
     ) -> tuple[list[EventBase], RoomStreamToken, bool]:
         """
         Paginate events by `topological_ordering` (tie-break with `stream_ordering`) in
@@ -2421,6 +2764,13 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
                 from `from_key`.
             limit: Maximum number of events to return
             event_filter: If provided filters the events to those that match the filter.
+            live_from_key: For forwards pagination, the live stream position to
+                use for events with a non-negative stream ordering. `from_key`
+                then only anchors the topological position used for backfilled
+                events (which have negative stream orderings).
+            live_cursor_key: Optional additional forward cursor for live events.
+                When set, live events must be after both this cursor and
+                `live_from_key`; backfilled events continue to use `from_key`.
 
         Returns:
             - The results as a list of events;
@@ -2477,6 +2827,8 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
             direction,
             limit,
             event_filter,
+            live_from_key,
+            live_cursor_key,
         )
 
         events = await self.get_events_as_list(

@@ -27,7 +27,7 @@ from parameterized import parameterized
 from twisted.internet.testing import MemoryReactor
 
 from synapse.api.constants import EventTypes, Membership, StateDag
-from synapse.api.errors import Codes, FederationError
+from synapse.api.errors import Codes
 from synapse.api.room_versions import KNOWN_ROOM_VERSIONS, RoomVersions
 from synapse.config.server import DEFAULT_ROOM_VERSION
 from synapse.crypto.event_signing import add_hashes_and_signatures
@@ -825,10 +825,16 @@ class MessageAcceptTests(unittest.FederatingHomeserverTestCase):
             {self.remote_bad_user_join_event.event_id},
         )
 
-    def test_cant_hide_direct_ancestors(self) -> None:
+    def test_hidden_direct_ancestor_is_not_trusted(self) -> None:
         """
-        If you send a message, you must be able to provide the direct
-        prev_events that said event references.
+        A non-state event may reference a prev_event the sender cannot provide.
+
+        We do not require the sender to serve it: the event is admitted against
+        the prev_events we do have and the unfetchable prev_event is left as a
+        forward gap for backfill. Such an event is still subject to normal auth
+        checks, so one that cannot be authorised (as here, it has no
+        auth_events) is persisted as rejected rather than treated as live
+        history.
         """
 
         async def post_json(
@@ -875,25 +881,39 @@ class MessageAcceptTests(unittest.FederatingHomeserverTestCase):
             name="test-context",
             server_name=self.hs.hostname,
         ):
-            failure = self.get_failure(
+            self.get_success(
                 self.federation_event_handler.on_receive_pdu(
                     self.OTHER_SERVER_NAME, lying_event
-                ),
-                FederationError,
+                )
             )
 
-        # on_receive_pdu should throw an error
+        # The event is admitted against the prev_events we do have.
+        in_timeline = self.get_success(
+            self.store.have_events_in_timeline([lying_event.event_id])
+        )
         self.assertEqual(
-            failure.value.args[0],
-            (
-                "ERROR 403: Your server isn't divulging details about prev_events "
-                "referenced in this event."
-            ),
+            in_timeline,
+            {lying_event.event_id},
+            "event with a fetchable prev was not persisted",
         )
 
-        # Make sure the invalid event isn't there
+        row = self.get_success(
+            self.store.db_pool.simple_select_one(
+                table="events",
+                keyvalues={"event_id": lying_event.event_id},
+                retcols=("outlier", "rejection_reason"),
+                allow_none=True,
+                desc="test_hidden_direct_ancestor_rejection",
+            )
+        )
+        self.assertIsNotNone(row)
+        assert row is not None  # For mypy
+        # The event has no auth_events we can check, so it is rejected rather
+        # than trusted. It must not become part of the room's live timeline.
+        self.assertEqual(row[1], "auth_error")
+
         extrem = self.get_success(self.store.get_latest_event_ids_in_room(self.room_id))
-        self.assertEqual(extrem, {self.remote_bad_user_join_event.event_id})
+        self.assertNotIn(lying_event.event_id, extrem)
 
 
 class ServerACLsTestCase(unittest.TestCase):

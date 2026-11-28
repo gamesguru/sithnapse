@@ -1074,11 +1074,26 @@ class SyncHandler:
             if len(filtered_recents) > timeline_limit:
                 limited = True
                 filtered_recents = filtered_recents[-timeline_limit:]
-                assert filtered_recents[0].event.internal_metadata.stream_ordering
-                room_key = RoomStreamToken(
-                    stream=filtered_recents[0].event.internal_metadata.stream_ordering
-                    - 1
-                )
+                oldest_stream_ordering = filtered_recents[
+                    0
+                ].event.internal_metadata.stream_ordering
+                assert oldest_stream_ordering
+                if since_key is None:
+                    # This window was chosen by `topological_ordering`, so the
+                    # token must resume by it too. A stream-only token makes
+                    # `/messages` compare `stream_ordering` alone, which in a
+                    # backfilled room repeats events already in this window and
+                    # skips older events with a newer stream position.
+                    oldest_token = await self.store.get_topological_token_for_event(
+                        filtered_recents[0].event.event_id
+                    )
+                    room_key = RoomStreamToken(
+                        topological=oldest_token.topological,
+                        timestamp=oldest_token.timestamp,
+                        stream=oldest_stream_ordering - 1,
+                    )
+                else:
+                    room_key = RoomStreamToken(stream=oldest_stream_ordering - 1)
 
             prev_batch_token = upto_token.copy_and_replace(StreamKeyType.ROOM, room_key)
 
@@ -2320,15 +2335,55 @@ class SyncHandler:
             results = await self.store.is_partial_state_room_batched(
                 mutable_joined_room_ids
             )
-            mutable_rooms_to_exclude.update(
+            partially_stated_rooms = {
                 room_id
                 for room_id, is_partial_state in results.items()
                 if is_partial_state
-            )
+            }
+            mutable_rooms_to_exclude.update(partially_stated_rooms)
             membership_change_events = [
                 event
                 for event in membership_change_events
-                if not results.get(event.room_id, False)
+                if event.room_id not in partially_stated_rooms
+            ]
+
+        # A room may finish its partial-state resync after `now_token` was
+        # captured. The checks above then see it as fully-stated and would
+        # include its full state in this response, but the token we return
+        # still describes the room as possibly partial. The next sync would
+        # then treat the room as newly joined and deliver it a second time,
+        # which (among other things) adds the user who joined in the previous
+        # sync back to `device_lists.changed`.
+        #
+        # Exclude such rooms here; the next sync, whose token covers the
+        # transition, will deliver them once as newly-joined rooms.
+        #
+        # This must run after `is_partial_state_room_batched`. If it ran first,
+        # a room could finish its resync in the gap between the two calls: this
+        # query would not see the new stream row, and
+        # `is_partial_state_room_batched` would then see the room as
+        # fully-stated and include it, recreating the token mismatch.
+        #
+        # Lazy-loading syncs do not replay un-partial-stated rooms (see
+        # `forced_newly_joined_room_ids` below), so they have no duplicate to
+        # avoid; excluding the room there would instead drop its join for good,
+        # since the next sync starts after the join event.
+        raced_un_partial_rooms: set[str] = set()
+        if (
+            mutable_joined_room_ids
+            and not sync_config.filter_collection.lazy_load_members()
+        ):
+            raced_un_partial_rooms = mutable_joined_room_ids.intersection(
+                await self.store.get_rooms_un_partial_stated_after(
+                    now_token.un_partial_stated_rooms_key
+                )
+            )
+        if raced_un_partial_rooms:
+            mutable_rooms_to_exclude.update(raced_un_partial_rooms)
+            membership_change_events = [
+                event
+                for event in membership_change_events
+                if event.room_id not in raced_un_partial_rooms
             ]
 
         # Incremental eager syncs should additionally include rooms that
@@ -2351,7 +2406,7 @@ class SyncHandler:
             forced_newly_joined_room_ids.update(
                 room_id
                 for room_id, is_partial_state in results.items()
-                if not is_partial_state
+                if not is_partial_state and room_id not in mutable_rooms_to_exclude
             )
 
         # Now we have our list of joined room IDs, exclude as configured and freeze
@@ -2889,6 +2944,19 @@ class SyncHandler:
                     user_id, since_token.account_data_key
                 )
             )
+            # Rooms replayed because their partial-state resync finished were
+            # omitted from earlier eager syncs, so the client has none of
+            # their account data yet: send the full snapshot for them, not just
+            # updates since `since_token`.
+            if sync_result_builder.forced_newly_joined_room_ids:
+                snapshot = await self.store.get_room_account_data_for_user(user_id)
+                merged: dict[str, Mapping[str, JsonMapping]] = dict(
+                    account_data_by_room
+                )
+                for room_id in sync_result_builder.forced_newly_joined_room_ids:
+                    if room_id in snapshot:
+                        merged[room_id] = snapshot[room_id]
+                account_data_by_room = merged
         else:
             account_data_by_room = await self.store.get_room_account_data_for_user(
                 user_id

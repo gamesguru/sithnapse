@@ -169,3 +169,118 @@ Build the read-only `synapse_state_repair check-room` command that:
 The first write-capable milestone should only publish repaired HAMTs/state
 groups for one room while the homeserver is offline. Online organic repair
 should wait until room-scoped persistence fencing is explicit.
+
+## Narrow repair: `repair-member`
+
+For the case where a single member event was dropped at join time (for example a
+notary key-window problem made a `send_join` state event fail verification),
+`synapse_state_repair repair-member` repoints one `m.room.member` key without a
+full DAG replay:
+
+```
+synapse_state_repair --config homeserver.yaml repair-member \
+    --room '!room:id' --event-id '$leave' --via unredacted.org            # dry run
+synapse_state_repair --config homeserver.yaml --publish --homeserver-is-stopped \
+    repair-member --room '!room:id' --event-id '$leave' --via unredacted.org
+```
+
+It fetches the event through the normal federation client (signatures and hashes
+checked against the keyring), persists it as an outlier through the normal
+auth/rejection path, then for each distinct state group among the forward
+extremities stores a new group (`prev_group` plus a one-key delta), repoints the
+extremities at it, and recalculates current state with the normal persistence
+code. Patching `current_state_events` alone would not stick, because the next
+event inherits its state group from its prev events. Old state groups are left
+in place.
+
+It refuses when the room is partial-state or an MSC4242 state-DAG room, when the
+event is rejected or not a member event of that room, or when the current value
+for the key is not one of the replacement event's `auth_events` (i.e. the
+replacement does not supersede it). `--publish` requires
+`--homeserver-is-stopped`.
+
+## Importing a state diff: `repair-state import`
+
+`repair-member` fixes one known event. To find out _which_ keys were dropped,
+`repair-state import` compares local state with a remote server's state at the
+room's single forward extremity:
+
+```
+synapse_state_repair --config homeserver.yaml repair-state import \
+    --room '!room:id' --via unredacted.org                    # dry run
+synapse_state_repair --config homeserver.yaml --publish --homeserver-is-stopped \
+    repair-state import --room '!room:id' --via unredacted.org
+```
+
+It fetches `/_matrix/federation/v1/state_ids` at the extremity, diffs by event
+ID, and fetches only the symmetric difference. Remote events already held
+locally are reused; the rest go through `get_pdu`, so signatures and hashes are
+checked against the keyring. The report lists every differing key with the local
+and remote event, the action (`import`, `replace`, or `keep-local`), and the
+state-group rewrite plan.
+
+Publishing imports the missing/differing events through the normal outlier auth
+path and applies them to the forward extremities with the same state-group
+rewrite as `repair-member`. Keys that exist only locally are reported but never
+removed, so local-only memberships survive. It refuses partial-state and MSC4242
+rooms, a multi-extremity room without `--at-event`, and a diff larger than
+`--max-diff`. The remote's `/state_ids` answer is the state _before_ the
+comparison event; the tool adds the accepted event itself before comparing, and
+ignores the predecessor that event supersedes.
+
+An import whose seed state already matches the remote produces no plan and makes
+no changes. That includes re-running after a publish that stopped partway: the
+remaining forward-extremity groups are not reconciled automatically, because
+there is no recorded plan to resume and applying the seed's historical snapshot
+to another extremity could roll back state that legitimately changed after it.
+Re-seed at the affected extremity with `--at-event` instead.
+
+This is the import half, and it only finds differences at the seed event. A key
+that was wrong early and was overwritten later will not appear in its diff.
+
+### Propagating the diff: `--propagate`
+
+`repair-state import --propagate --at-event <join>` seeds the comparison at a
+historical event instead of the tip. Any local non-outlier event is accepted,
+including a non-extremity. After importing the missing events, every descendant
+state group that still holds the seed's value for a changed key is rewritten as
+`old_group + delta`, and the events on that group are repointed:
+
+```
+synapse_state_repair --config homeserver.yaml repair-state import \
+    --room '!room:id' --via unredacted.org \
+    --at-event '$local-join' --propagate                    # dry run
+```
+
+Descendant groups are found through `state_group_edges`, not by replaying the
+event DAG, so the repair works when the dropped event itself is only a stateless
+outlier. A group whose value for a key was legitimately changed later is left
+alone and reported under `stops`. Groups with no local event are counted but not
+rewritten. `--max-events` bounds the descendants considered (default 200000). An
+interrupted propagation has no durable resume record. If the seed already
+matches on a later invocation, the tool leaves other groups unchanged rather
+than applying the historical snapshot to forward extremities; review and plan a
+new repair explicitly.
+
+In the JSON report, `plan` is a list of step objects with group IDs, affected
+event IDs, and `changes`; the tuple-keyed internal delta is omitted. With
+`--propagate`, the same steps are also under `propagation.groups`. A propagation
+that could not finish reports `partial: true`, `published: false` and the
+unfinished work under `propagation.incomplete_work`; save the report, since it
+is the only record.
+
+A valid local non-outlier seed can still produce no publishable plan. If any
+planned group would repoint a state event to a group that replaces that event's
+own key with a different event ID, the store cannot keep both the historical and
+the repaired mapping, so `_import_state` refuses the entire plan, including in
+dry-run mode, and reports the offending events under `unrepresentable`.
+
+The report also lists events whose `auth_events` name the replaced event
+(`auth_review`), including their current rejection status. That list is
+report-only; published repairs never change existing rejections. The leave is
+still not inserted into the timeline at its historical position.
+
+The full `repair-state sweep` remains unimplemented. Unlike `--propagate`, it
+would recompute every event's state from its prev groups (with real state
+resolution at merges) and report auth decisions, rather than applying a known
+key delta to the groups that descend from one seed.

@@ -128,31 +128,38 @@ locks, device-list coordination, push queues, delayed events):
    fallback, scaffolding and table.
 3. `event_json`: backfill, convert remaining SQL joins, drop fallback and table.
    The SQL `events` table stays.
-4. `event_edges`, `edge_index_outbox`, `room_edge_source_version`: rebuild edges
-   in mtxdb from canonical event JSON; remove the SQL write, outbox and gate
-   once recovery is proven. `forward-index-design-spec.md` must be revised
-   first.
+4. `event_edges`: cut over to exactly one authoritative backend per config (SQL
+   or mtxdb), with a manual backend migration and a startup marker check. mtxdb
+   edge writes are staged with event JSON in the persist transaction when a
+   shared WAL is available, and otherwise written directly before the SQL
+   COMMIT; there is no SQL outbox, source-version clock, or runtime SQL
+   fallback. The SQL table remains as dead data in mtxdb mode until the
+   index/purge-list cleanup is done.
 5. `state_groups`, `state_group_edges`, `state_group_id_seq`
    ([family-5 state map](perf-track-b-family5-state-map.md),
    [state-groups-out-of-sql.md](state-groups-out-of-sql.md)): broadest change,
    last.
 
-The SQL `events` table is not a candidate yet. Event bodies are already in mtxdb
-for new events; `events` is the relational index (event/room IDs, stream and
-topological order, type, sender, depth, timestamps, state key, flags) behind
-pagination, federation, relations, membership, purging and stream queries (about
-197 SQL references in the main storage code). mtxdb offers point and batch
-lookups, not range scans or joins, so dropping it would mean building those
-indexes and query paths in Python/Rust. Revisit only after mapping its query
-patterns to mtxdb indexes and measuring the replacement cost.
+The SQL `events` table is now the largest measured SQL area and the next major
+target, but it is an index cutover, not a key-value one. Event bodies are
+already in mtxdb for new events; `events` is the relational index (event/room
+IDs, stream and topological order, type, sender, depth, timestamps, state key,
+flags) behind pagination, federation, relations, membership, purging and stream
+queries (about 150 direct references in main storage, including ~58 ordered
+scans). The pinned mtxdb includes a persistent ordered `TimelineIndex`, but
+Synapse's Rust adapter does not yet expose it. The replacement must integrate
+that index and prove its cursor/scope semantics against Synapse's per-room and
+global ordering contracts. See [`events-cutover.md`](events-cutover.md) for the
+query/mutation inventory and proposed records and indexes.
 
 SQL cost per family (`res/logs/2026-10-21-trial-tests-530s.log`, 5,767 tests,
 `-j4`, sync off, pin `0efca0a`; summed over 25 processes, total 494.9 s). This
 is a unit-test run, not a federation workload, and the log does not split reads
 from writes:
 
-- Family 4: `event_edges` 18.3 s (43,754 calls, 31,282 rows) plus
-  `edge_index_outbox` 4.5 s = 22.7 s (4.6%).
+- Family 4 (pre-cutover measurement): `event_edges` 18.3 s (43,754 calls, 31,282
+  rows) plus the now-removed `edge_index_outbox` 4.5 s = 22.7 s (4.6%). Current
+  code has no edge outbox.
 - Family 5: `state_groups` 12.8 s, `state_groups_persisting` 8.7 s,
   `state_groups_pending_deletion` 7.4 s (42,728 calls, 206 rows) = 28.9 s
   (5.8%). `state_group_edges` is under the top-30 cutoff (4.2 s).

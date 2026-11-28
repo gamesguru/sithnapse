@@ -582,11 +582,18 @@ class HomeserverTestCase(TestCase):
         hijacking the authentication system to return a fixed user, and then
         calling the prepare function.
         """
+        # The embedded client is process-global and each homeserver gets its
+        # own root. Register the close as a cleanup rather than relying only on
+        # `tearDown`, because subclasses regularly override `tearDown` without
+        # calling super() -- and an unclosed store would then make the next
+        # homeserver's open fail (or silently reuse this root).
+        from synapse.synapse_rust import mtxdb_engine
+
+        self.addCleanup(mtxdb_engine.close_client, durable=False)
+
         # We need to share the reactor between the homeserver and all of our test utils.
         self.reactor, self.clock = get_clock()
         self.hs = self.make_homeserver(self.reactor, self.clock)
-
-        self.hs.get_datastores().main.tests_allow_no_chain_cover_index = False
 
         # Honour the `use_frozen_dicts` config option. We have to do this
         # manually because this is taken care of in the app `start` code, which
@@ -664,7 +671,9 @@ class HomeserverTestCase(TestCase):
         # Reset to not use frozen dicts.
         events.USE_FROZEN_DICTS = False
 
-        if os.environ.get("SYNAPSE_TEST_MTXDB_REPACK_BETWEEN_TESTS") not in (
+        from synapse.synapse_rust import mtxdb_engine
+
+        if os.environ.get("SYNAPSE_TEST_MTXDB_REPACK_BETWEEN_TESTS") in (
             "1",
             "true",
             "True",
@@ -672,11 +681,15 @@ class HomeserverTestCase(TestCase):
             "on",
             "On",
         ):
-            return
+            mtxdb_engine.repack()
 
-        from synapse.synapse_rust import mtxdb_engine
-
-        mtxdb_engine.repack()
+        # The embedded engine's client is process-global, but each test
+        # homeserver is configured with its own root: keys are unsalted, so a
+        # shared store would make state-group ids (which restart at 1 in every
+        # fresh SQL database) collide. Open_client therefore no-ops while a
+        # root is already open, so close it here or the next homeserver would
+        # silently keep using this one's directory instead of its own.
+        mtxdb_engine.close_client(durable=False)
 
     def wait_for_background_updates(self) -> None:
         """Block until all background database updates have completed."""

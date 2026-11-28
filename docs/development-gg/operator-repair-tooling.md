@@ -19,20 +19,40 @@ The following are available today:
   room DAG.
 - The `synapse_state_repair` entry point provides read-only `check-room`,
   `list-rejected`, and `list-outliers` commands.
+- It also provides the narrow `repair-member` command, which imports one
+  signature-checked `m.room.member` event through the normal federation path and
+  repoints that state key without a leave/rejoin. It is dry-run by default and
+  only writes with `--publish --homeserver-is-stopped`.
+- `repair-state import` compares local state with a remote server's
+  `/_matrix/federation/v1/state_ids` at the room's forward extremity, reports
+  every differing key, and (when published) imports the missing or newer events
+  and applies those keys. Local-only keys are preserved. With `--at-event` and
+  `--propagate` it seeds at a historical event (such as the local join) and
+  rewrites every descendant state group that still holds the old value, so
+  historical `state-at-event` values are repaired too. Later legitimate changes
+  stop propagation for that key and are reported.
 - The Synapse manhole provides an SSH/TCP Python shell for low-level
   introspection. It is not a Unix-socket admin command console and should not be
   treated as a repeatable repair interface.
 
-The state-repair tool currently reports discovery information only. Its
-`--publish` option is reserved and intentionally not implemented.
+`repair-member` does not replay the room DAG or force an arbitrary remote state
+snapshot; it applies one known event to one state key. The general
+`state-force-set` and DAG-replay commands remain unimplemented.
 
 ## Not currently exposed
 
 Sithnapse does not currently provide supported commands for:
 
-- comparing a room's state with one or more remote servers;
-- resetting or force-setting room state from local or remote input;
-- rebuilding room state by replaying the persisted DAG;
+- comparing a room's state with several remote servers at once (a single-peer
+  comparison is available as `repair-state import` without `--publish`, which is
+  a dry run);
+- force-setting arbitrary room state from local or remote input (the narrow
+  `repair-member` and `repair-state import` commands apply only verified events
+  and preserve local-only keys);
+- a full historical state sweep that recomputes every event's state (including
+  real state resolution at merges) or rebuilds room state by replaying the
+  persisted DAG. `repair-state import --propagate` covers the narrower case of
+  carrying one seed diff down the stored state groups;
 - reordering or reindexing a room timeline topologically;
 - bulk backfill/export of a room DAG;
 - importing JSONL PDU/DAG files or outlier exports;

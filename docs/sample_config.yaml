@@ -40,6 +40,11 @@ database:
   name: sqlite3
   args:
     database: DATADIR/homeserver.db
+# Event adjacency, event JSON and state groups live in the embedded mtxdb
+# store, so it is required: the server refuses to start without it.
+embedded_db:
+  engine: mtxdb
+  path: DATADIR/mtxdb
 log_config: "CONFDIR/SERVERNAME.log.config"
 media_store_path: DATADIR/media_store
 signing_key_path: "CONFDIR/SERVERNAME.signing.key"

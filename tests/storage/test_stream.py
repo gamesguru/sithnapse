@@ -165,6 +165,397 @@ class PaginationTestCase(HomeserverTestCase):
 
         return [ev.event_id for ev in events]
 
+    def test_forward_pagination_keeps_same_depth_backfilled_events(self) -> None:
+        """A page boundary must not drop backfilled siblings at the same depth."""
+        persistence = self.hs.get_storage_controllers().persistence
+        assert persistence is not None
+        store = self.hs.get_datastores().main
+
+        backfilled_ids = []
+        for i in range(2):
+            event, context = self.get_success(
+                create_event(
+                    self.hs,
+                    room_id=self.room_id,
+                    sender=self.user_id,
+                    type=EventTypes.Message,
+                    content={"msgtype": "m.text", "body": f"backfilled {i}"},
+                    prev_event_ids=[self.event_id_none],
+                )
+            )
+            self.get_success(persistence.persist_event(event, context, backfilled=True))
+            backfilled_ids.append(event.event_id)
+
+        # Everything already delivered is live; the backfilled events are the
+        # only ones after this stream position.
+        live_key = self.get_success(
+            self.hs.get_event_sources().get_current_token_for_pagination(self.room_id)
+        ).room_key
+        pinned = self.get_success(
+            store.get_topological_token_for_stream_position(
+                self.room_id, live_key.stream
+            )
+        )
+        assert pinned is not None
+
+        first, next_key, _ = self.get_success(
+            store.paginate_room_events_by_topological_ordering(
+                room_id=self.room_id,
+                from_key=pinned,
+                to_key=None,
+                direction=Direction.FORWARDS,
+                limit=1,
+                live_from_key=live_key,
+            )
+        )
+
+        all_ids = [event.event_id for event in first]
+        while next_key.topological is not None:
+            second, next_key, _ = self.get_success(
+                store.paginate_room_events_by_topological_ordering(
+                    room_id=self.room_id,
+                    from_key=next_key,
+                    to_key=None,
+                    direction=Direction.FORWARDS,
+                    limit=1,
+                    live_from_key=RoomStreamToken(stream=next_key.stream),
+                )
+            )
+            all_ids.extend(event.event_id for event in second)
+            if not second:
+                break
+
+        self.assertEqual(sorted(all_ids), sorted(backfilled_ids))
+
+    def test_forward_pagination_mixed_backfilled_live_same_depth(self) -> None:
+        """A backfilled boundary also includes a live event at the same depth."""
+        persistence = self.hs.get_storage_controllers().persistence
+        assert persistence is not None
+        store = self.hs.get_datastores().main
+
+        live_key = RoomStreamToken(
+            stream=self.get_success(
+                self.hs.get_event_sources().get_current_token_for_pagination(
+                    self.room_id
+                )
+            ).room_key.stream
+        )
+        pinned = self.get_success(
+            store.get_topological_token_for_stream_position(
+                self.room_id, live_key.stream
+            )
+        )
+        assert pinned is not None
+
+        backfilled, backfilled_context = self.get_success(
+            create_event(
+                self.hs,
+                room_id=self.room_id,
+                sender=self.user_id,
+                type=EventTypes.Message,
+                content={"msgtype": "m.text", "body": "backfilled"},
+                prev_event_ids=[self.event_id_none],
+            )
+        )
+        self.get_success(
+            persistence.persist_event(backfilled, backfilled_context, backfilled=True)
+        )
+
+        live, live_context = self.get_success(
+            create_event(
+                self.hs,
+                room_id=self.room_id,
+                sender=self.user_id,
+                type=EventTypes.Message,
+                content={"msgtype": "m.text", "body": "live"},
+                prev_event_ids=[self.event_id_none],
+            )
+        )
+        self.get_success(persistence.persist_event(live, live_context))
+
+        events, _, _ = self.get_success(
+            store.paginate_room_events_by_topological_ordering(
+                room_id=self.room_id,
+                from_key=pinned,
+                to_key=None,
+                direction=Direction.FORWARDS,
+                limit=1,
+                live_from_key=live_key,
+            )
+        )
+
+        self.assertEqual(
+            {event.event_id for event in events},
+            {backfilled.event_id, live.event_id},
+        )
+
+    def test_same_depth_siblings_are_ordered_by_timestamp(self) -> None:
+        """Concurrent events at one depth read chronologically.
+
+        Two backfilled siblings share a parent and therefore a depth. The one
+        with the earlier timestamp is backfilled first, so it gets the *higher*
+        (less negative) stream ordering: ordering by `(depth, stream)` alone
+        puts it second. Paging one event at a time in both directions must put
+        it first, without skipping or repeating anything at the page boundary.
+        """
+        persistence = self.hs.get_storage_controllers().persistence
+        assert persistence is not None
+        store = self.hs.get_datastores().main
+
+        ids = {}
+        for name, ts in (("negative", -100), ("early", 1_000), ("late", 2_000)):
+            event, context = self.get_success(
+                create_event(
+                    self.hs,
+                    room_id=self.room_id,
+                    sender=self.user_id,
+                    type=EventTypes.Message,
+                    content={"msgtype": "m.text", "body": name},
+                    prev_event_ids=[self.event_id_none],
+                    origin_server_ts=ts,
+                )
+            )
+            self.get_success(persistence.persist_event(event, context, backfilled=True))
+            ids[name] = event.event_id
+
+        # Backfilled arrival order is the reverse of timestamp order here.
+        early_stream, late_stream = (
+            self.get_success(
+                store.db_pool.simple_select_one_onecol(
+                    "events", {"event_id": ids[name]}, "stream_ordering"
+                )
+            )
+            for name in ("early", "late")
+        )
+        self.assertGreater(early_stream, late_stream)
+
+        async def page_all(direction: Direction, key: RoomStreamToken) -> list[str]:
+            seen: list[str] = []
+            while True:
+                (
+                    events,
+                    key,
+                    _,
+                ) = await store.paginate_room_events_by_topological_ordering(
+                    room_id=self.room_id,
+                    from_key=key,
+                    to_key=None,
+                    direction=direction,
+                    limit=1,
+                )
+                if not events:
+                    return seen
+                seen.extend(event.event_id for event in events)
+
+        newest = self.get_success(
+            store.get_current_room_stream_token_for_room_id(self.room_id)
+        )
+        backwards = self.get_success(page_all(Direction.BACKWARDS, newest))
+        oldest = RoomStreamToken(topological=0, timestamp=-(2**63), stream=-(2**62))
+        forwards = self.get_success(page_all(Direction.FORWARDS, oldest))
+
+        self.assertEqual(len(backwards), len(set(backwards)))
+        self.assertEqual(forwards, list(reversed(backwards)))
+        self.assertLess(forwards.index(ids["negative"]), forwards.index(ids["early"]))
+        self.assertLess(forwards.index(ids["early"]), forwards.index(ids["late"]))
+        self.assertIn(self.event_id_none, forwards)
+
+        around = self.get_success(
+            store.get_events_around(
+                self.room_id,
+                ids["early"],
+                before_limit=10,
+                after_limit=10,
+            )
+        )
+        self.assertIn(
+            ids["negative"], [event.event_id for event in around.events_before]
+        )
+        self.assertIn(ids["late"], [event.event_id for event in around.events_after])
+
+    def test_forward_pagination_from_history_start_advances_at_limit_1(self) -> None:
+        """Paging forwards one event at a time from a "start of history" token
+        must advance rather than re-return the same backfilled event.
+
+        The token a client gets from paginating backwards to the start has a
+        negative stream part. Reusing that as the next token's stream part (the
+        live bound) put the cursor *below* the event just returned, so it was
+        returned again forever.
+        """
+        persistence = self.hs.get_storage_controllers().persistence
+        assert persistence is not None
+        store = self.hs.get_datastores().main
+
+        history_type = "org.example.history"
+        backfilled_ids = []
+        prev = self.event_id_none
+        for i in range(4):
+            event, context = self.get_success(
+                create_event(
+                    self.hs,
+                    room_id=self.room_id,
+                    sender=self.user_id,
+                    type=history_type,
+                    content={"n": i},
+                    prev_event_ids=[prev],
+                )
+            )
+            self.get_success(persistence.persist_event(event, context, backfilled=True))
+            backfilled_ids.append(event.event_id)
+            prev = event.event_id
+
+        oldest = self.get_success(
+            store.get_topological_token_for_event(backfilled_ids[0])
+        )
+        assert oldest.topological is not None
+        # What a backward /messages returns as its `end` at the start of history.
+        start = RoomStreamToken(
+            topological=oldest.topological,
+            timestamp=oldest.timestamp,
+            stream=oldest.stream - 1,
+        )
+        # Only the history events, as in a room whose live events all sort later.
+        event_filter = Filter(self.hs, {"types": [history_type]})
+
+        seen: list[str] = []
+        key = start
+        for _ in range(12):
+            events, key, _ = self.get_success(
+                store.paginate_room_events_by_topological_ordering(
+                    room_id=self.room_id,
+                    from_key=key,
+                    to_key=None,
+                    direction=Direction.FORWARDS,
+                    limit=1,
+                    event_filter=event_filter,
+                    live_from_key=RoomStreamToken(stream=key.stream),
+                )
+            )
+            if not events:
+                break
+            seen.extend(event.event_id for event in events)
+
+        self.assertEqual(seen, backfilled_ids, "each event exactly once, in order")
+
+    def test_forward_pagination_keeps_late_live_event_below_anchor(self) -> None:
+        """Live events after the stream bound are returned even at a lower depth."""
+        persistence = self.hs.get_storage_controllers().persistence
+        assert persistence is not None
+        store = self.hs.get_datastores().main
+
+        live_key = self.get_success(
+            self.hs.get_event_sources().get_current_token_for_pagination(self.room_id)
+        ).room_key
+        live_from_key = RoomStreamToken(stream=live_key.stream)
+        pinned = self.get_success(
+            store.get_topological_token_for_stream_position(
+                self.room_id, live_key.stream
+            )
+        )
+        assert pinned is not None
+
+        # This event arrives after the live bound but on an older branch, so its
+        # topological position is behind the pinned anchor.
+        event, context = self.get_success(
+            create_event(
+                self.hs,
+                room_id=self.room_id,
+                sender=self.user_id,
+                type=EventTypes.Message,
+                content={"msgtype": "m.text", "body": "late live event"},
+                prev_event_ids=[self.event_id_1],
+                origin_server_ts=1,
+            )
+        )
+        self.get_success(persistence.persist_event(event, context))
+
+        events, _, _ = self.get_success(
+            store.paginate_room_events_by_topological_ordering(
+                room_id=self.room_id,
+                from_key=pinned,
+                to_key=None,
+                direction=Direction.FORWARDS,
+                limit=10,
+                live_from_key=live_from_key,
+            )
+        )
+
+        token = self.get_success(store.get_topological_token_for_event(event.event_id))
+        self.assertIn(
+            event.event_id,
+            [e.event_id for e in events],
+            f"event token={token} live={live_from_key} pinned={pinned}",
+        )
+
+    def test_forward_live_cursor_keeps_original_stream_lower_bound(self) -> None:
+        """A later topo event survives even when its stream ID precedes the cursor."""
+        persistence = self.hs.get_storage_controllers().persistence
+        assert persistence is not None
+        store = self.hs.get_datastores().main
+        live_from_key = RoomStreamToken(
+            stream=self.get_success(
+                self.hs.get_event_sources().get_current_token_for_pagination(
+                    self.room_id
+                )
+            ).room_key.stream
+        )
+
+        first, first_context = self.get_success(
+            create_event(
+                self.hs,
+                room_id=self.room_id,
+                sender=self.user_id,
+                type=EventTypes.Message,
+                content={"msgtype": "m.text", "body": "first branch"},
+                prev_event_ids=[self.event_id_none],
+            )
+        )
+        self.get_success(persistence.persist_event(first, first_context))
+        later_topo, later_topo_context = self.get_success(
+            create_event(
+                self.hs,
+                room_id=self.room_id,
+                sender=self.user_id,
+                type=EventTypes.Message,
+                content={"msgtype": "m.text", "body": "deeper branch"},
+                prev_event_ids=[first.event_id],
+            )
+        )
+        self.get_success(persistence.persist_event(later_topo, later_topo_context))
+        cursor_event, cursor_context = self.get_success(
+            create_event(
+                self.hs,
+                room_id=self.room_id,
+                sender=self.user_id,
+                type=EventTypes.Message,
+                content={"msgtype": "m.text", "body": "later sibling"},
+                prev_event_ids=[self.event_id_none],
+            )
+        )
+        self.get_success(persistence.persist_event(cursor_event, cursor_context))
+
+        cursor = self.get_success(
+            store.get_topological_token_for_event(cursor_event.event_id)
+        )
+        self.assertGreater(later_topo.depth, cursor_event.depth)
+        later_stream = later_topo.internal_metadata.stream_ordering
+        cursor_stream = cursor_event.internal_metadata.stream_ordering
+        assert later_stream is not None and cursor_stream is not None
+        self.assertLess(later_stream, cursor_stream)
+        events, _, _ = self.get_success(
+            store.paginate_room_events_by_topological_ordering(
+                room_id=self.room_id,
+                from_key=cursor,
+                to_key=None,
+                direction=Direction.FORWARDS,
+                limit=10,
+                live_from_key=live_from_key,
+                live_cursor_key=cursor,
+            )
+        )
+        self.assertIn(later_topo.event_id, [event.event_id for event in events])
+        self.assertNotIn(cursor_event.event_id, [event.event_id for event in events])
+
     def test_filter_relation_senders(self) -> None:
         # Messages which second user reacted to.
         filter = {"related_by_senders": [self.second_user_id]}

@@ -18,6 +18,10 @@ import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
+# Files the base build takes from the head: the Rust extension sources and the
+# manifests and lockfile that resolve their dependencies.
+HEAD_RUST_PATHS = ["rust", "Cargo.toml", "Cargo.lock"]
 SCHEMA_DIR = "synapse/storage/schema"
 MAKE_FULL_SCHEMA_SCRIPT = REPO_ROOT / "scripts-dev" / "make_full_schema.sh"
 
@@ -243,6 +247,22 @@ def main() -> None:
         try:
             subprocess.run(["git", "checkout", args.base], cwd=REPO_ROOT, check=True)
 
+            # The base's Cargo.lock may pin a git dependency revision that has
+            # since been force-pushed or squashed away upstream, which makes
+            # its Rust build unresolvable. The schema does not depend on the
+            # Rust extension, so build the extension from the head's Rust
+            # sources and lockfile. Taking only the head's lockfile is not
+            # enough: when the head moves to newer mtxdb/rezzy APIs, the base's
+            # Rust sources no longer compile against it. The base's Python and
+            # schema deltas stay untouched. Use the saved SHA, not `head_ref`:
+            # CI checks out a detached HEAD, where `head_ref` is literally
+            # "HEAD" and this would restore the base's own files instead.
+            subprocess.run(
+                ["git", "checkout", after_sha, "--", *HEAD_RUST_PATHS],
+                cwd=REPO_ROOT,
+                check=True,
+            )
+
             # Refresh dependencies
             print("Installing dependencies for base commit...", file=sys.stderr)
             install_dependencies()
@@ -250,6 +270,14 @@ def main() -> None:
             run_make_full_schema(before_dir, schema_script)
         finally:
             print("Returning to HEAD...", file=sys.stderr)
+            # Drop the head's Rust sources and lockfile we installed for the
+            # base build; the stash (or the destination branch) owns any real
+            # local changes.
+            subprocess.run(
+                ["git", "checkout", after_sha, "--", *HEAD_RUST_PATHS],
+                cwd=REPO_ROOT,
+                check=True,
+            )
             subprocess.run(
                 [
                     "git",

@@ -250,6 +250,8 @@ serve_server_wellknown: true
 
 If this option is provided, it parses the given yaml to json and serves it on `/.well-known/matrix/client` endpoint alongside the standard properties.
 
+For example, to advertise a LiveKit SFU to clients that discover MatrixRTC from the well-known, set `org.matrix.msc4143.rtc_foci` to the same `livekit_service_url` configured under [`matrix_rtc`](#matrix_rtc).
+
 *Added in Synapse 1.62.0.*
 
 Example configuration:
@@ -257,6 +259,9 @@ Example configuration:
 extra_well_known_client_content:
   option1: value1
   option2: value2
+  org.matrix.msc4143.rtc_foci:
+  - type: livekit
+    livekit_service_url: https://matrix-rtc.example.com/livekit/jwt
 ```
 ---
 ### `soft_file_limit`
@@ -636,7 +641,7 @@ This setting has the following sub-options:
 
 * `ssh_priv_key_path` (string|null): The private SSH key used to encrypt the manhole traffic. If left unset, then hardcoded and non-secret keys are used, which could allow traffic to be intercepted if sent over a public network.
 
-* `ssh_pub_key_path` (string|null): The public SSH key corresponsing to `ssh_priv_key_path`. If left unset, a hardcoded key is used.
+* `ssh_pub_key_path` (string|null): The public SSH key corresponding to `ssh_priv_key_path`. If left unset, a hardcoded key is used.
 
 Example configuration:
 ```yaml
@@ -1067,7 +1072,7 @@ allowed_avatar_mimetypes:
 
 How long to keep redacted events in unredacted form in the database. After this period redacted events get replaced with their redacted form in the DB.
 
-Synapse will check whether the rentention period has concluded for redacted events every 5 minutes. Thus, even if this option is set to `0`, Synapse may still take up to 5 minutes to purge redacted events from the database. Set to `null` to disable.
+Synapse will check whether the retention period has concluded for redacted events every 5 minutes. Thus, even if this option is set to `0`, Synapse may still take up to 5 minutes to purge redacted events from the database. Set to `null` to disable.
 
 Defaults to `"7d"`.
 
@@ -1388,6 +1393,10 @@ The following options are related to configuring timeout and retry logic for one
 
 This setting has the following sub-options:
 
+* `allow_partial_state` (boolean): Whether to use partial-state federation joins when possible. When false, Synapse requests full room state during joins. Defaults to `true`.
+
+* `accept_unverifiable_event_ids` (array): Event IDs to accept even though the origin server's signature cannot be verified, for example because the origin reused a signing key ID for a different key and never published the old one. Operator-only: nothing received over federation can add to this list. Only applies to room versions whose event IDs are content hashes, so each ID pins that event's exact content; the content hash is still checked. The event is accepted on your say-so, not because anyone proved who wrote it. Each use is logged at warning level. Defaults to `[]`.
+
 * `client_timeout` (duration): Timeout for the federation requests. Defaults to `"60s"`.
 
 * `max_short_retry_delay` (duration): Maximum delay to be used for the short retry algo. Defaults to `"2s"`.
@@ -1633,6 +1642,45 @@ databases:
       port: 5432
       cp_min: 5
       cp_max: 10
+```
+---
+### `embedded_db`
+
+*(object)* Configures the embedded `mtxdb` storage engine, which holds event JSON, state groups and event edges outside the SQL database. This is required: event adjacency has no SQL fallback, so the server refuses to start without it. Both `engine` and `path` must be set; setting only one is a configuration error.
+
+Databases that still hold event edges only in SQL must have them migrated into mtxdb before upgrading to this schema version; the server has no SQL fallback, so skipping the migration leaves existing rooms without event adjacency.
+
+Worker deployments have extra requirements: the sole events writer must be `main`, only one events writer is allowed, `run_background_tasks_on` must be unset or select `main`, and the `SYNAPSE_MTXDB_WAL=1` environment variable must be set.
+
+Environment variables override these options: `SYNAPSE_EMBEDDED_DB_ENGINE`, `SYNAPSE_EMBEDDED_DB_PATH`, `SYNAPSE_MTXDB_SYNC`, `SYNAPSE_MTXDB_NO_SYNC` (a false value does not override `no_sync: true` in YAML; only a truthy value is applied) and `SYNAPSE_MTXDB_FLUSH_DELAY_SECS`. Setting `SYNAPSE_MTXDB=1` together with `SYNAPSE_MTXDB_PATH` (or `embedded_db.path`) is a shortcut that selects the `mtxdb` engine.
+
+This setting has the following sub-options:
+
+* `engine` (string): The embedded engine to use. Required; `mtxdb` is the only supported value.
+
+* `path` (string): Path of the mtxdb data file or directory. Required, and never placed in a temporary directory, so there is no default.
+
+* `sync_mode` (string): How persists make embedded writes visible and durable.
+
+  `interval` publishes writes to other workers at the commit boundary and lets a flush coalescer group the fsyncs. A crash can lose the writes of the last flush window (about 0.5s, or 2s on a rotational disk), and a committed SQL row can then be left without its mtxdb record.
+
+  `always` fsyncs before a persist returns. It is the strictest mode and is slow on a spinning disk.
+
+  `off` never fsyncs and is for tests and diagnostics only; worker deployments reject it.
+
+  Defaults to `"interval"`.
+
+* `no_sync` (boolean): Older spelling of `sync_mode: off`. Suppresses all durable fsyncs and reintroduces a silent data-loss window. Not for production use. Defaults to `false`.
+
+* `flush_delay_secs` (number|null): Flush coalescer window, in seconds. When unset, it is chosen from the disk that holds `path`: 2.0 for a rotational disk, 0.5 otherwise. Defaults to `null`.
+---
+### `setup_timings_path`
+
+*(string|null)* If set, the time spent in each database setup step is written as JSON to this path once the homeserver has finished setting up. It is intended for profiling start-up. The `SYNAPSE_DB_SETUP_TIMINGS_PATH` environment variable sets it too. Defaults to `null`.
+
+Example configuration:
+```yaml
+setup_timings_path: /tmp/synapse-setup-timings.json
 ```
 ---
 ## Logging
@@ -2696,7 +2744,11 @@ turn_allow_guests: false
 ---
 ### `matrix_rtc`
 
-*(object)* Options related to MatrixRTC. Defaults to `{}`.
+*(object)* Options related to MatrixRTC.
+
+With `experimental_features.msc4143_enabled`, these transports are served to authenticated clients at `/_matrix/client/unstable/org.matrix.msc4143/rtc/transports`. They are **not** added to `/.well-known/matrix/client`. Clients and tools that still discover the SFU from the well-known (for example `testmatrix`, which skips its MatrixRTC and delayed-events checks otherwise) need the `org.matrix.msc4143.rtc_foci` key set under [`extra_well_known_client_content`](#extra_well_known_client_content).
+
+Defaults to `{}`.
 
 This setting has the following sub-options:
 
@@ -2721,6 +2773,25 @@ matrix_rtc:
   - type: livekit
     url: wss://livekit.example.com
     livekit_service_url: https://matrix-rtc.example.com/livekit/jwt
+```
+---
+### `experimental_features`
+
+*(object)* Experimental features. These may change or be removed without notice; only the options needed for MatrixRTC (Element Call) are listed here. Defaults to `{}`.
+
+This setting has the following sub-options:
+
+* `msc4143_enabled` (boolean): Enable [MSC4143](https://github.com/matrix-org/matrix-spec-proposals/pull/4143) to advertise the MatrixRTC transports configured under [`matrix_rtc`](#matrix_rtc). Required for Element Call. Defaults to `false`.
+
+* `msc4075_enabled` (boolean): Enable [MSC4075](https://github.com/matrix-org/matrix-spec-proposals/pull/4075) MatrixRTC call invites and notifications. Defaults to `false`.
+
+* `msc4140_max_delayed_events_per_user` (integer): The maximum number of delayed events a user may have pending at once (MSC4140). Delayed events must also be enabled with [`max_event_delay_duration`](#max_event_delay_duration). Defaults to `100`.
+
+Example configuration:
+```yaml
+experimental_features:
+  msc4143_enabled: true
+  msc4075_enabled: true
 ```
 ---
 ## Registration
@@ -4147,6 +4218,8 @@ This setting has the following sub-options:
 * `enabled` (boolean): Set to false to disable room and user statistics. Note that doing so may cause certain features (such as the room directory) not to work correctly. Defaults to `true`.
 
 * `server_stats_endpoint_enabled` (boolean): Enable the authenticated `/_synapse/client/server_stats` endpoint. Requests require a server-admin access token. This is disabled by default. Defaults to `false`.
+
+* `public_stats_enabled` (boolean): Enable the unauthenticated `/_synapse/client/public_stats` endpoint, which exposes only aggregate counts: total registered users, known rooms, transacted federation peers, servers present in room state, local users and joined memberships, and a `database` object with event/state-event counts, PostgreSQL and embedded-engine on-disk sizes, plus the process's resident memory (`total_users`, `total_rooms`, `total_destinations`, `total_known_servers`, `database.events`, `database.state_events`, `database.local_users`, `database.joined_members`, `database.local_joined_members`, `database.postgres_bytes`, `database.mtxdb_bytes`, `database.mtxdb_index_bytes`, `database.mtxdb_wal_bytes`, and `memory.rss_bytes`). Joined member counts are membership rows, not distinct users. No identifiers are exposed. This is disabled by default. Defaults to `false`.
 
 Example configuration:
 ```yaml

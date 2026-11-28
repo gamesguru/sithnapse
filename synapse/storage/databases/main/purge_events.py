@@ -20,24 +20,40 @@
 #
 
 import logging
-from typing import Any, cast
+from typing import Any, Callable, cast
 
 from synapse.api.errors import SynapseError
-from synapse.storage.database import LoggingTransaction, user_is_local_like_pattern
+from synapse.api.room_versions import KNOWN_ROOM_VERSIONS
+from synapse.logging.context import defer_to_thread
+from synapse.storage.database import (
+    LoggingTransaction,
+    make_in_list_sql_clause,
+    user_is_local_like_pattern,
+)
 from synapse.storage.databases.main import CacheInvalidationWorkerStore
-from synapse.storage.databases.main.embedded_common import Pool, sync_now
+from synapse.storage.databases.main.embedded_common import (
+    Pool,
+    retry_on_contention,
+    sync_now,
+)
 from synapse.storage.databases.main.embedded_event_edges import (
-    delete_event_edges_batch,
-    record_edge_index_deletes_txn,
+    get_event_edges_forward_batch,
+    purge_event_edges_room,
 )
 from synapse.storage.databases.main.embedded_event_json import delete_event_json_batch
+from synapse.storage.databases.main.embedded_event_status import (
+    patch_event_statuses,
+)
+from synapse.storage.databases.main.embedded_event_timeline import (
+    purge_room_timeline,
+    remove_timeline_rows,
+)
 from synapse.storage.databases.main.embedded_event_to_state_group import (
     decrement_state_group_refcounts_batch,
     delete_event_to_state_group_batch,
     get_state_group_for_events_batch,
 )
 from synapse.storage.databases.main.embedded_redactions import delete_redactions_batch
-from synapse.storage.databases.main.embedded_rejections import delete_rejections_batch
 from synapse.storage.databases.main.state import StateGroupWorkerStore
 from synapse.storage.engines import PostgresEngine
 from synapse.storage.engines._base import IsolationLevel
@@ -46,15 +62,56 @@ from synapse.types import RoomStreamToken
 logger = logging.getLogger(__name__)
 
 
+def _delete_purge_event_mirrors(
+    engine_name: str | None,
+    redacted_event_ids: list[str],
+    deleted_event_ids: list[str],
+) -> None:
+    """Delete purge mirrors after SQL commit, retrying transient mtxdb contention.
+
+    Both deletes are idempotent, so retrying the pair is safe if the first
+    mirror was deleted before contention interrupted the second one.
+    """
+
+    def delete() -> None:
+        delete_redactions_batch(engine_name, redacted_event_ids)
+        if redacted_event_ids:
+            # Redaction tombstones live in the State pool, which the event_json
+            # delete below does not sync. Make their removal durable first, so
+            # a crash cannot bring back a redaction mirror for events whose
+            # event_json is already gone.
+            sync_now(pools=[Pool.STATE])
+        # Synced by the event_json delete below, which uses the same pool.
+        delete_event_json_batch(engine_name, deleted_event_ids)
+
+    retry_on_contention(delete, label="purge_mirrors")
+
+
+def _run_purge_cleanups(steps: list[tuple[str, Callable[[], None]]]) -> None:
+    """Run each post-commit purge cleanup even if an earlier one fails.
+
+    Run on a worker thread (see `_run_post_commit`): the steps delete mtxdb
+    entries and flush to disk, which must not block the reactor. A step that
+    raised would otherwise stop every later one. Each step is
+    isolated here and every failure is logged; the SQL purge has already
+    committed, so there is nothing to roll back.
+    """
+    for label, step in steps:
+        try:
+            step()
+        except Exception:
+            logger.exception(
+                "[purge] post-commit cleanup of %s failed; the SQL purge is "
+                "committed but this mirror may still hold purged data",
+                label,
+            )
+
+
 purge_room_tables_with_event_id_index = (
-    "event_auth",
-    "event_edges",
     "event_json",
     "event_push_actions_staging",
     "event_relations",
     "event_to_state_groups",
-    "event_auth_chains",
-    "event_auth_chain_to_calculate",
     "redactions",
     "rejections",
     "state_events",
@@ -143,13 +200,26 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
 
         parsed_token = await RoomStreamToken.parse(self, token)
 
-        return await self.db_pool.runInteraction(
+        post_commit: list[tuple[str, Callable[[], None]]] = []
+        referenced_state_groups = await self.db_pool.runInteraction(
             "purge_history",
             self._purge_history_txn,
             room_id,
             parsed_token,
             delete_local_events,
+            post_commit,
         )
+        await self._run_post_commit(post_commit)
+        return referenced_state_groups
+
+    async def _run_post_commit(
+        self, steps: list[tuple[str, Callable[[], None]]]
+    ) -> None:
+        """Run the mtxdb cleanups collected by a committed purge transaction on
+        a worker thread, so the blocking deletes and disk syncs do not stall the
+        reactor."""
+        if steps:
+            await defer_to_thread(self.hs.get_reactor(), _run_purge_cleanups, steps)
 
     def _purge_history_txn(
         self,
@@ -157,7 +227,10 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
         room_id: str,
         token: RoomStreamToken,
         delete_local_events: bool,
+        post_commit: list[tuple[str, Callable[[], None]]],
     ) -> set[int]:
+        # The transaction may be retried, so drop steps queued by a failed attempt.
+        post_commit.clear()
         # Tables that should be pruned:
         #     event_auth
         #     event_backward_extremities
@@ -263,6 +336,22 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
         txn.execute("SELECT event_id, should_delete FROM events_to_purge")
         event_rows = txn.fetchall()
 
+        timeline_rows: list[tuple[str, str, int, int, int]] = []
+        if getattr(self, "_embedded_db_engine", None) is not None:
+            txn.execute(
+                """
+                SELECT e.room_id, e.event_id, e.topological_ordering,
+                    COALESCE(e.origin_server_ts, 0), e.stream_ordering
+                FROM events AS e
+                INNER JOIN events_to_purge AS p USING (event_id)
+                WHERE p.should_delete
+                """
+            )
+            timeline_rows = [
+                (room, event_id, int(topo), int(ts), int(stream))
+                for room, event_id, topo, ts, stream in txn
+            ]
+
         if len(event_rows) == 0:
             logger.info("[purge] no events found to purge")
 
@@ -278,18 +367,69 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             sum(1 for e in event_rows if e[1]),
         )
 
+        # Take the summary watermark now: the purge is about to start its
+        # destructive work, and the row lock is held until this transaction
+        # commits. Rotation and receipt processing therefore cannot summarize
+        # rows we are about to delete. Doing this before the deletes matters on
+        # Postgres: the transaction snapshot is fixed at its first data
+        # statement, so a rotation that commits during a long purge would
+        # otherwise make a late write fail with a serialization error and redo
+        # every delete (the pool only retries a handful of times). The cost is
+        # that rotation and receipt summary updates wait for the purge to
+        # finish.
+        #
+        # Placing it after `events_to_purge` is populated skips the lock
+        # entirely for purges that find nothing to delete, and still catches
+        # serialization conflicts before any expensive work.
+        #
+        # This must be a write, not just `SELECT ... FOR UPDATE`: both sides run
+        # at REPEATABLE READ, so a lock that leaves the row unmodified would not
+        # make an older snapshot retry. SQLite commits on the temporary-table
+        # DDL above, so the write starts a fresh transaction here.
+        txn.execute(
+            "UPDATE event_push_summary_stream_ordering"
+            " SET stream_ordering = stream_ordering"
+        )
+        txn.execute("SELECT stream_ordering FROM event_push_summary_stream_ordering")
+        rotation_row = txn.fetchone()
+        if rotation_row is None:
+            raise RuntimeError("event push summary rotation watermark is missing")
+        rotated_upto = int(rotation_row[0])
+
         logger.info("[purge] Finding new backward extremities")
 
         # We calculate the new entries for the backward extremities by finding
         # events to be purged that are pointed to by events we're not going to
         # purge.
-        txn.execute(
-            "SELECT DISTINCT e.event_id FROM events_to_purge AS e"
-            " INNER JOIN event_edges AS ed ON e.event_id = ed.prev_event_id"
-            " LEFT JOIN events_to_purge AS ep2 ON ed.event_id = ep2.event_id"
-            " WHERE ep2.event_id IS NULL"
-        )
-        new_backwards_extrems = txn.fetchall()
+        purge_ids = {event_id for event_id, _ in event_rows}
+        forward = get_event_edges_forward_batch(list(purge_ids))
+        # The forward index can name children whose SQL rows are not
+        # committed (or were deleted); only a child that is outside the
+        # purge set and still has an events row keeps its parent.
+        candidate_children = {
+            child_id
+            for event_id in purge_ids
+            for child_id in (forward.get(event_id) or ())
+            if child_id not in purge_ids
+        }
+        existing_children: set[str] = set()
+        candidate_list = list(candidate_children)
+        for start in range(0, len(candidate_list), 500):
+            clause, args = make_in_list_sql_clause(
+                self.database_engine,
+                "event_id",
+                candidate_list[start : start + 500],
+            )
+            txn.execute(f"SELECT event_id FROM events WHERE {clause}", args)
+            existing_children.update(event_id for (event_id,) in txn)
+        new_backwards_extrems = [
+            (event_id,)
+            for event_id in purge_ids
+            if any(
+                child_id in existing_children
+                for child_id in (forward.get(event_id) or ())
+            )
+        ]
 
         logger.info("[purge] replacing backward extremities: %r", new_backwards_extrems)
 
@@ -305,6 +445,29 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
 
         logger.info("[purge] finding state groups referenced by purge-set events")
 
+        # In MSC4242 rooms a later event may cite any older state event in its
+        # `prev_state_events`, and is authorised against the state there. So
+        # retained state events must keep their state group, or servers which
+        # have and haven't purged can reach different verdicts.
+        unlink_sql = "SELECT event_id FROM events_to_purge"
+        # Not `get_room_version_txn`: that raises for versions we no longer
+        # support, whose history must still be purgeable.
+        room_version_id = self.db_pool.simple_select_one_onecol_txn(
+            txn,
+            table="rooms",
+            keyvalues={"room_id": room_id},
+            retcol="room_version",
+            allow_none=True,
+        )
+        room_version = KNOWN_ROOM_VERSIONS.get(room_version_id or "")
+        if room_version is not None and room_version.msc4242_state_dags:
+            unlink_sql += (
+                " WHERE should_delete OR NOT EXISTS ("
+                "    SELECT 1 FROM state_events AS s"
+                "    WHERE s.event_id = events_to_purge.event_id"
+                ")"
+            )
+
         if getattr(self, "_embedded_event_json_enabled", False):
             # Exclusive by configured engine, not a dual-write -- see
             # embedded_event_to_state_group.py. This is the *forward*
@@ -313,7 +476,8 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             # it is not the reverse "is state_group X still referenced
             # elsewhere" question (that's get_referenced_state_groups,
             # backed by the separate refcount).
-            purge_set_event_ids = [event_id for event_id, _should_delete in event_rows]
+            txn.execute(unlink_sql)
+            purge_set_event_ids = [event_id for (event_id,) in txn]
 
             # Rows not yet migrated from SQL (the migration deletes each row once
             # copied) may reference state groups too. Delete them *before*
@@ -323,24 +487,22 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             # it wrote) or can no longer select these rows. Otherwise it could
             # re-insert a stale mapping for a purged event.
             txn.execute(
-                """
-                SELECT DISTINCT state_group FROM events_to_purge
-                INNER JOIN event_to_state_groups USING (event_id)
-            """
+                "SELECT DISTINCT state_group FROM event_to_state_groups "
+                "WHERE event_id IN (%s)" % (unlink_sql,)
             )
             referenced_state_groups = {sg for (sg,) in txn}
             logger.info("[purge] removing events from event_to_state_groups")
-            # State events retained as outliers must also stop referencing their
-            # state groups, even though their event rows are kept.
+            # Events retained as outliers must also stop referencing their state
+            # groups, even though their event rows are kept (see `unlink_sql`
+            # for the exception).
             txn.execute(
-                "DELETE FROM event_to_state_groups "
-                "WHERE event_id IN (SELECT event_id from events_to_purge)"
+                "DELETE FROM event_to_state_groups WHERE event_id IN (%s)"
+                % (unlink_sql,)
             )
 
             # Only mtxdb entries are refcounted, so only those are decremented.
             event_id_to_state_group = get_state_group_for_events_batch(
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 purge_set_event_ids,
                 purpose="purge_traversal",
             )
@@ -349,27 +511,31 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
                 "[purge] found %i referenced state groups", len(referenced_state_groups)
             )
 
-            txn.call_after(
-                delete_event_to_state_group_batch,
-                self._embedded_db_engine,
-                self._embedded_db_namespace,
-                list(event_id_to_state_group.keys()),
+            state_group_keys = list(event_id_to_state_group.keys())
+            state_group_values = list(event_id_to_state_group.values())
+            post_commit.append(
+                (
+                    "event_to_state_group delete",
+                    lambda: delete_event_to_state_group_batch(
+                        self._embedded_db_engine, state_group_keys
+                    ),
+                )
             )
-            txn.call_after(
-                decrement_state_group_refcounts_batch,
-                self._embedded_db_engine,
-                self._embedded_db_namespace,
-                list(event_id_to_state_group.values()),
+            post_commit.append(
+                (
+                    "state group refcounts",
+                    lambda: decrement_state_group_refcounts_batch(
+                        self._embedded_db_engine, state_group_values
+                    ),
+                )
             )
-            txn.call_after(sync_now, pools=[Pool.STATE])
+            post_commit.append(("state sync", lambda: sync_now(pools=[Pool.STATE])))
         else:
             # Get all state groups that are referenced by events that are to be
             # deleted.
             txn.execute(
-                """
-                SELECT DISTINCT state_group FROM events_to_purge
-                INNER JOIN event_to_state_groups USING (event_id)
-            """
+                "SELECT DISTINCT state_group FROM event_to_state_groups "
+                "WHERE event_id IN (%s)" % (unlink_sql,)
             )
 
             referenced_state_groups = {sg for (sg,) in txn}
@@ -379,15 +545,12 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
 
             logger.info("[purge] removing events from event_to_state_groups")
             txn.execute(
-                "DELETE FROM event_to_state_groups "
-                "WHERE event_id IN (SELECT event_id from events_to_purge)"
+                "DELETE FROM event_to_state_groups WHERE event_id IN (%s)"
+                % (unlink_sql,)
             )
 
         # Capture redaction targets before deleting the redactions rows by their
         # own event IDs. The embedded redaction mirror is keyed by `redacts`.
-        purged_event_ids = [
-            event_id for event_id, should_delete in event_rows if should_delete
-        ]
         redacted_event_ids: list[str] = []
         if getattr(self, "_embedded_event_json_enabled", False):
             txn.execute(
@@ -398,9 +561,7 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             redacted_event_ids = [redacts for (redacts,) in txn if redacts is not None]
 
         # Delete all remote non-state events
-        record_edge_index_deletes_txn(self.db_pool, txn, purged_event_ids)
         for table in (
-            "event_edges",
             "events",
             "event_json",
             "event_auth",
@@ -418,41 +579,50 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
                 ")" % (table,)
             )
 
-        # Remove the corresponding flat-KV entries after the SQL rows have
-        # been deleted. Redactions use their target (`redacts`) as the key;
-        # rejections use the purged event ID.
-        if getattr(self, "_embedded_event_json_enabled", False):
-            delete_redactions_batch(
-                self._embedded_db_engine,
-                self._embedded_db_namespace,
-                redacted_event_ids,
-            )
-            delete_rejections_batch(
-                self._embedded_db_engine,
-                self._embedded_db_namespace,
-                purged_event_ids,
-            )
-
+        # Remove the corresponding flat-KV entries, keyed by the redaction's
+        # target (`redacts`). Like the edge mirror below, this runs only after
+        # the SQL transaction commits: it is not rolled back with the
+        # transaction, so doing it here could lose the mirror for events whose
+        # SQL rows survive a failed or retried purge.
         # The `event_json` DELETE above only removed the SQL rows; the
         # embedded mirror (if any) has its own copy under `event_json:<id>`
         # keys that must be removed too, or purged events keep serving their
         # pre-purge content forever from mtxdb -- see embedded_event_json.py.
+        # Deferred until after commit for the same reason as above.
+        deleted_ids = [
+            event_id for event_id, should_delete in event_rows if should_delete
+        ]
+        cleanups: list[tuple[str, Callable[[], None]]] = []
         if getattr(self, "_embedded_event_json_enabled", False):
-            delete_event_json_batch(
-                self._embedded_db_engine,
-                self._embedded_db_namespace,
-                [event_id for event_id, should_delete in event_rows if should_delete],
-            )
-        if getattr(self, "_embedded_event_edges_writable", False):
-            deleted_edge_ids = [
-                event_id for event_id, should_delete in event_rows if should_delete
-            ]
-            if deleted_edge_ids:
-                txn.call_after(
-                    delete_event_edges_batch,
-                    self._embedded_db_namespace,
-                    deleted_edge_ids,
+            cleanups.append(
+                (
+                    "event_json/redaction mirrors",
+                    lambda: _delete_purge_event_mirrors(
+                        self._embedded_db_engine,
+                        redacted_event_ids,
+                        deleted_ids,
+                    ),
                 )
+            )
+        retained_ids = [
+            event_id for event_id, should_delete in event_rows if not should_delete
+        ]
+        if retained_ids and getattr(self, "_embedded_event_json_enabled", False):
+
+            def mark_outliers() -> None:
+                # Retained events become outliers, as in `events` above.
+                patch_event_statuses(retained_ids, outlier=True)
+                sync_now(pools=[Pool.EVENT_DAG])
+
+            cleanups.append(("event statuses", mark_outliers))
+        if timeline_rows:
+            cleanups.append(
+                (
+                    "event timeline index",
+                    lambda: remove_timeline_rows(timeline_rows),
+                )
+            )
+        post_commit.extend(cleanups)
 
         # Some of the `event_push_actions` we're about to delete may have already
         # been rotated into the aggregate `event_push_summary` counts. Deleting
@@ -468,7 +638,12 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
         # yet (they're still counted live from `event_push_actions`), so deleting
         # them needs no adjustment here. This mirrors how rotation counts them in
         # `_rotate_notifs_before_txn`.
+        #
+        # `rotated_upto` was read while holding the watermark write lock before
+        # the deletes started, so rotation and receipt processing have not been
+        # able to add these rows to the summary since.
         logger.info("[purge] adjusting event_push_summary for deleted events")
+
         txn.execute(
             """
             SELECT epa.user_id, epa.thread_id,
@@ -480,16 +655,14 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
                 AND epa.event_id IN (
                     SELECT event_id FROM events_to_purge WHERE should_delete
                 )
-                AND epa.stream_ordering <= (
-                    SELECT stream_ordering FROM event_push_summary_stream_ordering
-                )
+                AND epa.stream_ordering <= ?
                 AND (
                     eps.last_receipt_stream_ordering IS NULL
                     OR epa.stream_ordering > eps.last_receipt_stream_ordering
                 )
             GROUP BY epa.user_id, epa.thread_id
             """,
-            (room_id,),
+            (room_id, rotated_upto),
         )
         summary_decrements = cast(list[tuple[str, str, int, int]], txn.fetchall())
 
@@ -545,18 +718,32 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
         # We do this by calculating the minimum depth of the backwards
         # extremities. However, the events in event_backward_extremities
         # are ones we don't have yet so we need to look at the events that
-        # point to it via event_edges table.
+        # point to them.
         txn.execute(
-            """
-            SELECT COALESCE(MIN(depth), 0)
-            FROM event_backward_extremities AS eb
-            INNER JOIN event_edges AS eg ON eg.prev_event_id = eb.event_id
-            INNER JOIN events AS e ON e.event_id = eg.event_id
-            WHERE eb.room_id = ?
-        """,
+            "SELECT event_id FROM event_backward_extremities WHERE room_id = ?",
             (room_id,),
         )
-        (min_depth,) = cast(tuple[int], txn.fetchone())
+        extremity_ids = [event_id for (event_id,) in txn]
+        forward = get_event_edges_forward_batch(extremity_ids)
+        child_ids = {
+            child_id for children in forward.values() for child_id in (children or ())
+        }
+        # Batch the IN list like the extremity lookup above. `MIN` is NULL
+        # for a batch with no matching rows; those are ignored, and the
+        # depth is 0 only if no batch matched anything.
+        child_list = list(child_ids)
+        batch_depths: list[int] = []
+        for start in range(0, len(child_list), 500):
+            clause, args = make_in_list_sql_clause(
+                self.database_engine,
+                "event_id",
+                child_list[start : start + 500],
+            )
+            txn.execute(f"SELECT MIN(depth) FROM events WHERE {clause}", args)
+            (batch_min,) = cast(tuple[int | None], txn.fetchone())
+            if batch_min is not None:
+                batch_depths.append(batch_min)
+        min_depth = min(batch_depths) if batch_depths else 0
 
         logger.info("[purge] updating room_depth to %d", min_depth)
 
@@ -615,23 +802,35 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
         # purge any of those rows which were added during the first.
 
         logger.info("[purge] Starting initial main purge of [1/2]")
+        post_commit: list[tuple[str, Callable[[], None]]] = []
         await self.db_pool.runInteraction(
             "purge_room",
             self._purge_room_txn,
             room_id=room_id,
+            post_commit=post_commit,
             isolation_level=IsolationLevel.READ_COMMITTED,
         )
+        await self._run_post_commit(post_commit)
 
         logger.info("[purge] Starting secondary main purge of [2/2]")
+        post_commit = []
         await self.db_pool.runInteraction(
             "purge_room",
             self._purge_room_txn,
             room_id=room_id,
+            post_commit=post_commit,
         )
+        await self._run_post_commit(post_commit)
 
         logger.info("[purge] Done with main purge")
 
-    def _purge_room_txn(self, txn: LoggingTransaction, room_id: str) -> None:
+    def _purge_room_txn(
+        self,
+        txn: LoggingTransaction,
+        room_id: str,
+        post_commit: list[tuple[str, Callable[[], None]]],
+    ) -> None:
+        post_commit.clear()
         # This collides with event persistence so we cannot write new events and metadata into
         # a room while deleting it or this transaction will fail.
         if isinstance(self.database_engine, PostgresEngine):
@@ -645,17 +844,53 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             # take a while!
             txn.execute("SET LOCAL statement_timeout = 0")
 
-        # Get all the auth chains that are referenced by events that are to be
-        # deleted.
+        # The auth-chain collections are keyed by room and have no foreign key
+        # to the SQL rows, so purge them alongside the room. Bump the in-process
+        # generation first so cached closures are discarded; the durable delete
+        # itself runs after the SQL commit, like the other mtxdb purge work.
+        room_cleanups: list[tuple[str, Callable[[], None]]] = []
+        if getattr(self, "_embedded_db_engine", None) is not None:
+            from synapse.storage.databases.main.embedded_event_auth_chains import (
+                bump_room_generation,
+                purge_room as purge_auth_chain_room,
+            )
+
+            bump_room_generation(room_id)
+
+            def purge_then_bump(engine_name: str | None, purged_room_id: str) -> None:
+                try:
+                    purge_auth_chain_room(engine_name, purged_room_id)
+                finally:
+                    # A closure computed between the bump above and this
+                    # durable delete was built from data that no longer
+                    # exists (the SQL purge has committed), and was cached
+                    # under the current generation. Advance it again so
+                    # such entries cannot be served, even when the delete
+                    # fails partway.
+                    bump_room_generation(purged_room_id)
+
+            # Isolated like the other mirrors: a failed auth-chain delete
+            # must not stop the event/edge/state-group cleanups below.
+            room_cleanups.append(
+                (
+                    "auth-chain index",
+                    lambda: purge_then_bump(self._embedded_db_engine, room_id),
+                )
+            )
+
+        # event_auth is still retained as an offline migration snapshot, so
+        # it may contain rows whose event rows are already absent (for
+        # example, after an earlier partial purge). Delete by its own room_id
+        # before removing events, rather than relying on an events subquery.
+        txn.execute("DELETE FROM event_auth WHERE room_id = ?", (room_id,))
+
+        # Keyed by (old_room_id, new_room_id, user_id) rather than a single
+        # room_id column, so it is not covered by the generic room_id sweep.
         txn.execute(
-            """
-            SELECT chain_id, sequence_number FROM events
-            LEFT JOIN event_auth_chains USING (event_id)
-            WHERE room_id = ?
-            """,
-            (room_id,),
+            "DELETE FROM room_upgrade_user_transfers "
+            "WHERE old_room_id = ? OR new_room_id = ?",
+            (room_id, room_id),
         )
-        referenced_chain_id_tuples = list(txn)
 
         room_event_ids: list[str] = []
         room_redacted_event_ids: list[str] = []
@@ -672,39 +907,7 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
                 redacts for (redacts,) in txn if redacts is not None
             ]
 
-        logger.info("[purge] removing from event_auth_chain_links")
-        if getattr(self, "_embedded_event_json_enabled", False):
-            # Exclusive by configured engine, not a dual-write -- see
-            # embedded_event_auth_chain_links.py. The `LEFT JOIN` above can
-            # yield `(None, None)` for events with no chain cover entry
-            # (e.g. non-state events); a raw SQL `WHERE origin_chain_id =
-            # NULL` matches nothing harmlessly, but building an mtxdb key
-            # from `None` would crash, so filter those out explicitly.
-            from synapse.storage.databases.main.embedded_event_auth_chain_links import (
-                delete_chain_links_batch,
-            )
-
-            delete_chain_links_batch(
-                self._embedded_db_engine,
-                self._embedded_db_namespace,
-                [
-                    (chain_id, sequence_number)
-                    for chain_id, sequence_number in referenced_chain_id_tuples
-                    if chain_id is not None
-                ],
-                sync=True,
-            )
-        else:
-            txn.executemany(
-                """
-                DELETE FROM event_auth_chain_links WHERE
-                origin_chain_id = ? AND origin_sequence_number = ?
-                """,
-                referenced_chain_id_tuples,
-            )
-
         # Now we delete tables which lack an index on `room_id` but have one on `event_id`
-        record_edge_index_deletes_txn(self.db_pool, txn, room_event_ids)
         for table in purge_room_tables_with_event_id_index:
             logger.info("[purge] removing from %s", table)
 
@@ -724,55 +927,65 @@ class PurgeEventsStore(StateGroupWorkerStore, CacheInvalidationWorkerStore):
             logger.info("[purge] removing from %s", table)
             txn.execute("DELETE FROM %s WHERE room_id=?" % (table,), (room_id,))
 
-        if room_event_ids:
-            delete_redactions_batch(
-                self._embedded_db_engine,
-                self._embedded_db_namespace,
-                room_redacted_event_ids,
-            )
-            delete_rejections_batch(
-                self._embedded_db_engine,
-                self._embedded_db_namespace,
-                room_event_ids,
-            )
-
-        # As in _purge_history_txn: the event_json DELETE above only cleared
-        # SQL, the embedded mirror needs its own delete pass.
-        if room_event_ids:
-            delete_event_json_batch(
-                self._embedded_db_engine,
-                self._embedded_db_namespace,
-                room_event_ids,
-            )
-            if getattr(self, "_embedded_event_edges_writable", False):
-                txn.call_after(
-                    delete_event_edges_batch,
-                    self._embedded_db_namespace,
-                    room_event_ids,
+        # As in _purge_history_txn, the mirrors are deleted only after the SQL
+        # purge commits. The callbacks retry transient mtxdb contention.
+        if room_event_ids and getattr(self, "_embedded_event_json_enabled", False):
+            room_cleanups.append(
+                (
+                    "event_json/redaction mirrors",
+                    lambda: _delete_purge_event_mirrors(
+                        self._embedded_db_engine,
+                        room_redacted_event_ids,
+                        room_event_ids,
+                    ),
                 )
+            )
+        if room_event_ids and getattr(self, "_embedded_event_edges_writable", False):
+            room_cleanups.append(
+                (
+                    "event edges",
+                    lambda: purge_event_edges_room(room_id),
+                )
+            )
+        if getattr(self, "_embedded_db_engine", None) is not None:
+            room_cleanups.append(
+                (
+                    "event timeline index",
+                    lambda: purge_room_timeline(room_id),
+                )
+            )
+        post_commit.extend(room_cleanups)
+        if room_event_ids:
             # Same for event_to_state_groups: fetch state_groups before
             # deleting so the refcount can be rebalanced.
             event_id_to_state_group = get_state_group_for_events_batch(
                 self._embedded_db_engine,
-                self._embedded_db_namespace,
                 room_event_ids,
                 purpose="purge_traversal",
             )
-            txn.call_after(
-                delete_event_to_state_group_batch,
-                self._embedded_db_engine,
-                self._embedded_db_namespace,
-                list(event_id_to_state_group.keys()),
+            room_state_group_keys = list(event_id_to_state_group.keys())
+            room_state_group_values = list(event_id_to_state_group.values())
+            post_commit.append(
+                (
+                    "event_to_state_group delete",
+                    lambda: delete_event_to_state_group_batch(
+                        self._embedded_db_engine, room_state_group_keys
+                    ),
+                )
             )
-            txn.call_after(
-                decrement_state_group_refcounts_batch,
-                self._embedded_db_engine,
-                self._embedded_db_namespace,
-                list(event_id_to_state_group.values()),
+            post_commit.append(
+                (
+                    "state group refcounts",
+                    lambda: decrement_state_group_refcounts_batch(
+                        self._embedded_db_engine, room_state_group_values
+                    ),
+                )
             )
             # One sync for the whole purge batch (event_json delete +
             # Immediate sync + clear dirty flags for event_dag and state.
-            txn.call_after(sync_now, pools=[Pool.EVENT_DAG, Pool.STATE])
+            post_commit.append(
+                ("state sync", lambda: sync_now(pools=[Pool.EVENT_DAG, Pool.STATE]))
+            )
 
         # Other tables we do NOT need to clear out:
         #

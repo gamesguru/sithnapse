@@ -1,0 +1,1 @@
+DROP SEQUENCE IF EXISTS event_auth_chain_id;

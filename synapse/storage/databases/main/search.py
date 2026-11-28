@@ -197,7 +197,6 @@ class SearchBackgroundUpdateStore(SearchWorkerStore):
             ):
                 found = get_event_json_batch(
                     self._embedded_db_engine,
-                    self._embedded_db_namespace,
                     missing_json_ids,
                 )
                 for eid, (_, j, _) in found.items():

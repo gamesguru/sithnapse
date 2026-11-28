@@ -88,6 +88,10 @@ fn synapse_rust(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         ));
     }
 
+    // Route `tracing` events (Rezzy's diagnostics) into Python logging.
+    lazy_static::initialize(&LOGGING_HANDLE);
+    logging::tracing_bridge::install();
+
     m.add_function(wrap_pyfunction!(sum_as_string, m)?)?;
     m.add_function(wrap_pyfunction!(get_rust_file_digest, m)?)?;
     m.add_function(wrap_pyfunction!(get_rustc_version, m)?)?;

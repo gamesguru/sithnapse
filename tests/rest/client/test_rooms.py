@@ -2298,7 +2298,7 @@ class RoomMessageListTestCase(RoomBase):
         self.room_id = self.helper.create_room_as(self.user_id)
 
     def test_topo_token_is_accepted(self) -> None:
-        token = "t1-0_0_0_0_0_0_0_0_0_0_0_0_0_0"
+        token = "t1.0.0_0_0_0_0_0_0_0_0_0_0_0_0_0"
         channel = self.make_request(
             "GET", "/rooms/%s/messages?access_token=x&from=%s" % (self.room_id, token)
         )
@@ -2504,6 +2504,47 @@ class RoomMessageListTestCase(RoomBase):
         self.fail(
             f"Exhausted backpagination attempts. Did not find {early_event_id} whilst backpaginating ({latest_event_id = }, {event_ids_in_pages = })"
         )
+
+
+class DepartedUserMessagesTestCase(unittest.HomeserverTestCase):
+    """/messages for a user who has left the room, with real authentication."""
+
+    servlets = [
+        admin.register_servlets,
+        login.register_servlets,
+        room.register_servlets,
+    ]
+
+    def test_departed_user_cannot_page_past_their_leave(self) -> None:
+        """A user who has left must not see events from after they left, even when
+        asking for the latest messages without a `from` token (sytest
+        "Can get rooms/{roomId}/messages for a departed room").
+        """
+        owner = self.register_user("owner", "pass")
+        owner_tok = self.login("owner", "pass")
+        other = self.register_user("other", "pass")
+        other_tok = self.login("other", "pass")
+
+        room_id = self.helper.create_room_as(owner, tok=owner_tok)
+        self.helper.join(room_id, other, tok=other_tok)
+        self.helper.send(room_id, "before leaving", tok=other_tok)
+        self.helper.leave(room_id, other, tok=other_tok)
+        # Sent by the remaining member after `other` has left.
+        self.helper.send(room_id, "after leaving", tok=owner_tok)
+
+        channel = self.make_request(
+            "GET",
+            f"/_matrix/client/v3/rooms/{room_id}/messages?dir=b&limit=2",
+            access_token=other_tok,
+        )
+        self.assertEqual(HTTPStatus.OK, channel.code, channel.result)
+        bodies = [
+            event["content"].get("body")
+            for event in channel.json_body["chunk"]
+            if event["type"] == "m.room.message"
+        ]
+        self.assertNotIn("after leaving", bodies)
+        self.assertEqual(bodies[:1], ["before leaving"])
 
 
 class RoomMessageFilterTestCase(RoomBase):

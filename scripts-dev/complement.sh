@@ -408,6 +408,10 @@ main() {
   complement_runtime_homeserver="${COMPLEMENT_RUNTIME_HOMESERVER:-sithnapse}"
   if [ -n "${COMPLEMENT_NO_BLACKLIST:-}" ]; then
     complement_runtime_homeserver=""
+  else
+    # Complement's runtime identity and runtime.SkipIf exclusions are
+    # initialised by this homeserver-specific build tag.
+    test_tags="${complement_runtime_homeserver}_blacklist"
   fi
 
   # It takes longer than 10m to run the whole suite.
@@ -483,7 +487,10 @@ main() {
   SYNAPSE_EMBEDDED_DB_ENGINE="${SYNAPSE_TEST_EMBEDDED_DB_ENGINE:-}"
   SYNAPSE_EMBEDDED_DB_PATH="${SYNAPSE_TEST_EMBEDDED_DB_PATH:-}"
 
-  if [[ -n "${SYNAPSE_MTXDB:-}" && -z "$SYNAPSE_EMBEDDED_DB_ENGINE" ]]; then
+  # Synapse refuses to start without an embedded store (event adjacency, event
+  # JSON and state groups live there; the SQL fallbacks were removed), so every
+  # run uses mtxdb. SQLite/Postgres only choose the relational database.
+  if [[ -z "$SYNAPSE_EMBEDDED_DB_ENGINE" ]]; then
     SYNAPSE_EMBEDDED_DB_ENGINE="mtxdb"
   fi
 
@@ -1180,7 +1187,15 @@ run_one_pattern() {
         eval "exec ${COMPLEMENT_RUN_LOCK_FD}>&-"
       fi
       set -m
-      "$_rt" events --filter 'event=start' --format '{{.ID}}' 2>/dev/null >"${_pg_timing_dir}/.events_stream" &
+      # Docker's events.Message exposes the container id as .Actor.ID; the old
+      # `{{.ID}}` template fails with "can't evaluate field ID", and because
+      # stderr is discarded the watcher died silently and captured no logs.
+      # Podman's event type has no .Actor, so it keeps `{{.ID}}`.
+      _event_id_template='{{.Actor.ID}}'
+      if [ "${CONTAINER_RUNTIME:-docker}" = "podman" ]; then
+        _event_id_template='{{.ID}}'
+      fi
+      "$_rt" events --filter 'event=start' --format "$_event_id_template" 2>/dev/null >"${_pg_timing_dir}/.events_stream" &
       declare -A _seen
       { "$_rt" ps -q 2>/dev/null; tail -n +1 -f "${_pg_timing_dir}/.events_stream" 2>/dev/null; } \
         | while IFS= read -r _cid; do
