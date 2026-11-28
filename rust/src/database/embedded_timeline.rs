@@ -48,6 +48,17 @@ pub(crate) type TimelineRow = (String, String, i64, i64, i64);
 /// stream_ordering)`, the columns Synapse's pagination SQL selects.
 type PageRow = (String, i64, i64, i64);
 
+/// One event's resolved id and positions:
+/// `(event_id, topological_ordering, origin_server_ts, stream_ordering)`.
+///
+/// Neither index key carries both positions: the topological key drops the
+/// stream ordering and the stream key drops depth and timestamp. Synapse's
+/// pagination needs all four, so the per-room id record keeps the full entry.
+type ResolvedEntry = (String, i64, i64, i64);
+
+const TIMELINE_ID_RECORD_VERSION: u8 = 1;
+const TIMELINE_ID_RECORD_HEADER: usize = 25;
+
 /// A Synapse pagination bound as `generate_pagination_bounds` returns it:
 /// `(topological, origin_server_ts, stream)`, where the first two are `None`
 /// for a live (stream-only) token.
@@ -65,6 +76,39 @@ const FILTER_STEP: usize = 256;
 pub(crate) fn event_id_collection(room_id: &str) -> [u8; 16] {
     let group = format!("sys:event-id:{room_id}");
     member_collection_id(*b"EVNT", &group_full_logical_id(group.as_bytes()))
+}
+
+/// Encode the per-event id record: version, all three positions, event id.
+///
+/// The positions are kept here rather than in the index keys because each key
+/// is a projection that omits the other direction.
+fn encode_timeline_id_record(
+    event_id: &str,
+    topological: i64,
+    origin_server_ts: i64,
+    stream: i64,
+) -> Vec<u8> {
+    let mut value = Vec::with_capacity(TIMELINE_ID_RECORD_HEADER + event_id.len());
+    value.push(TIMELINE_ID_RECORD_VERSION);
+    value.extend_from_slice(&topological.to_le_bytes());
+    value.extend_from_slice(&origin_server_ts.to_le_bytes());
+    value.extend_from_slice(&stream.to_le_bytes());
+    value.extend_from_slice(event_id.as_bytes());
+    value
+}
+
+fn decode_timeline_id_record(value: &[u8]) -> Option<ResolvedEntry> {
+    if value.first() != Some(&TIMELINE_ID_RECORD_VERSION) || value.len() < TIMELINE_ID_RECORD_HEADER
+    {
+        return None;
+    }
+    let topological = i64::from_le_bytes(value[1..9].try_into().ok()?);
+    let origin_server_ts = i64::from_le_bytes(value[9..17].try_into().ok()?);
+    let stream = i64::from_le_bytes(value[17..25].try_into().ok()?);
+    let event_id = std::str::from_utf8(&value[TIMELINE_ID_RECORD_HEADER..])
+        .ok()?
+        .to_owned();
+    Some((event_id, topological, origin_server_ts, stream))
 }
 
 /// Reject rows that cannot be indexed.
@@ -109,7 +153,12 @@ pub(crate) fn commit_with_timeline<T>(
                 ShardType::EventDag,
                 event_id_collection(room_id),
                 node,
-                &NodeData::new(bytes::Bytes::copy_from_slice(event_id.as_bytes())),
+                &NodeData::new(bytes::Bytes::from(encode_timeline_id_record(
+                    event_id,
+                    *topological,
+                    *origin_server_ts,
+                    *stream,
+                ))),
             )
             .map_err(io_error)?;
         entries.push(EventTimelineEntry::new(
@@ -164,7 +213,12 @@ pub fn event_timeline_put(py: Python<'_>, rows: Vec<TimelineRow>) -> PyResult<()
                 .or_default()
                 .push((
                     node,
-                    NodeData::new(bytes::Bytes::copy_from_slice(event_id.as_bytes())),
+                    NodeData::new(bytes::Bytes::from(encode_timeline_id_record(
+                        event_id,
+                        *topological,
+                        *origin_server_ts,
+                        *stream,
+                    ))),
                 ));
             entries.push(EventTimelineEntry::new(
                 event_dag_room_id(room_id),
@@ -273,33 +327,31 @@ pub fn timeline_remove_rows(py: Python<'_>, rows: Vec<TimelineRow>) -> PyResult<
     })
 }
 
-/// Resolve node ids to event ids through the room's id collection. `None`
-/// when any id is missing: the index and the id records are written together,
-/// so a gap means this room's index cannot be trusted.
-fn resolve_event_ids(
+/// Resolve node ids to their full event entries through the room's id
+/// collection. `None` when any id is missing or was written in an older
+/// id-only format: the caller must then use SQL.
+fn resolve_entries(
     engine: &PackfileStorage,
     room_id: &str,
     nodes: &[NodeId],
-) -> PyResult<Option<Vec<String>>> {
+) -> PyResult<Option<Vec<ResolvedEntry>>> {
     if nodes.is_empty() {
         return Ok(Some(Vec::new()));
     }
     let records = engine
         .get_read_committed(&event_id_collection(room_id), nodes)
         .map_err(map_read_storage_error)?;
-    let mut ids = Vec::with_capacity(records.len());
+    let mut entries = Vec::with_capacity(records.len());
     for record in records {
         let Some(data) = record else {
             return Ok(None);
         };
-        let Ok(id) = String::from_utf8(data.bytes.to_vec()) else {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "corrupt timeline event-id record",
-            ));
+        let Some(entry) = decode_timeline_id_record(&data.bytes) else {
+            return Ok(None);
         };
-        ids.push(id);
+        entries.push(entry);
     }
-    Ok(Some(ids))
+    Ok(Some(entries))
 }
 
 fn read_error(error: StorageError) -> PyErr {
@@ -320,18 +372,43 @@ fn passes_stream_bound(stream: i64, bound: i64, is_from: bool, backwards: bool) 
     }
 }
 
+/// Whether a resolved row passes one Synapse pagination bound. A full
+/// `(depth, ts, stream)` bound is a lexicographic comparison; a stream-only
+/// (live) bound compares the stream position alone.
+fn passes_topological_bound(
+    bound: PyBound,
+    topological: i64,
+    origin_server_ts: i64,
+    stream: i64,
+    is_from: bool,
+    backwards: bool,
+) -> bool {
+    match bound {
+        (Some(bound_topo), Some(bound_ts), bound_stream) => {
+            let row = (topological, origin_server_ts, stream);
+            let limit = (bound_topo, bound_ts, bound_stream);
+            match (is_from, backwards) {
+                (true, true) => row <= limit,
+                (true, false) => row > limit,
+                (false, true) => row > limit,
+                (false, false) => row <= limit,
+            }
+        }
+        _ => passes_stream_bound(stream, bound.2, is_from, backwards),
+    }
+}
+
 /// Room events in topological order between Synapse pagination bounds.
 ///
-/// `from_bound` and `to_bound` are `generate_pagination_bounds`' tuples.
-/// Full `(topological, ts, stream)` bounds become key ranges: forwards
-/// returns `from < x <= to`, backwards `from >= x > to`, as the SQL does. A
-/// stream-only bound (a live token) is a predicate on `stream_ordering`
-/// instead, since this index is not stream-ordered; rows are filtered while
-/// scanning, at most `scan_budget` index entries.
+/// `from_bound` and `to_bound` are `generate_pagination_bounds`' tuples, and
+/// the SQL order is `(depth, origin_server_ts, stream)`. The index orders by
+/// `(depth, origin_server_ts, node id)`, so a full bound seeks the whole
+/// boundary group and the exact stream comparison is applied after resolving
+/// the rows. A stream-only bound (a live token) filters while scanning.
 ///
 /// Returns up to `limit` rows in pagination order, or `None` when the scan
-/// budget ran out or an event id could not be resolved: the caller must then
-/// use SQL.
+/// budget ran out or an event entry could not be resolved: the caller must
+/// then use SQL.
 #[pyfunction]
 #[pyo3(signature = (room_id, from_bound, to_bound, backwards, limit, scan_budget=10_000))]
 pub fn timeline_page_topological(
@@ -344,83 +421,132 @@ pub fn timeline_page_topological(
     scan_budget: usize,
 ) -> PyResult<Option<Vec<PageRow>>> {
     py.detach(|| {
+        if limit == 0 {
+            return Ok(Some(Vec::new()));
+        }
         let engine = event_dag_db()?;
         let view = ReadCommittedEngine(&engine);
         let (topo, _) = open_event_timeline_indexes(&view);
         let room = event_dag_room_id(&room_id);
         let forward = !backwards;
-        let full = |bound: PyBound| match bound {
-            (Some(t), Some(ts), s) => Some(EventTopoKey::position_max(room, t, ts, s)),
-            _ => None,
-        };
-        let start = from_bound.and_then(full);
-        let end_key = to_bound.and_then(full);
-        let end = match (end_key, forward) {
-            (None, _) => RangeBound::Unbounded,
-            (Some(key), true) => RangeBound::Included(key),
-            (Some(key), false) => RangeBound::Excluded(key),
-        };
-        let from_stream = from_bound.filter(|b| full(*b).is_none()).map(|b| b.2);
-        let to_stream = to_bound.filter(|b| full(*b).is_none()).map(|b| b.2);
-        let filtered = from_stream.is_some() || to_stream.is_some();
 
         let Some((root, _)) = topo.head().map_err(read_error)? else {
             return Ok(Some(Vec::new()));
         };
-        let mut cursor = start
-            .map(|key| topo.cursor(root, key))
-            .transpose()
-            .map_err(read_error)?;
-        let mut kept: Vec<EventTopoKey> = Vec::with_capacity(limit);
+        let mut cursor = match from_bound {
+            Some((Some(t), Some(ts), _)) => {
+                // Start before (or after, backwards) the whole boundary group
+                // so no same-(depth, ts) sibling is skipped.
+                let key = if forward {
+                    EventTopoKey::position_min(room, t, ts)
+                } else {
+                    EventTopoKey::position_max(room, t, ts)
+                };
+                Some(topo.cursor(root, key).map_err(read_error)?)
+            }
+            _ => None,
+        };
+        // Include the whole boundary group; the predicate filters individual
+        // rows. In reverse the end is the lower bound, so seek the group's
+        // minimum rather than its maximum.
+        let end = match to_bound {
+            Some((Some(t), Some(ts), _)) => {
+                let key = if forward {
+                    EventTopoKey::position_max(room, t, ts)
+                } else {
+                    EventTopoKey::position_min(room, t, ts)
+                };
+                RangeBound::Included(key)
+            }
+            _ => RangeBound::Unbounded,
+        };
+        let filtered = !matches!(from_bound, Some((Some(_), Some(_), _)))
+            || !matches!(to_bound, Some((Some(_), Some(_), _)));
+
+        let mut kept: Vec<(EventTopoKey, ResolvedEntry)> = Vec::new();
         let mut scanned = 0usize;
-        while kept.len() < limit {
-            let step = if filtered {
+        loop {
+            let step = if filtered || kept.len() >= limit {
                 FILTER_STEP
             } else {
-                limit.saturating_sub(kept.len())
+                limit - kept.len()
             };
             let page = topo
                 .page_range(&room, cursor.as_ref(), forward, step, end)
                 .map_err(read_error)?;
             scanned = scanned.saturating_add(page.entries.len());
-            for key in &page.entries {
-                let keep = from_stream
-                    .is_none_or(|b| passes_stream_bound(key.stream_ordering, b, true, backwards))
-                    && to_stream.is_none_or(|b| {
-                        passes_stream_bound(key.stream_ordering, b, false, backwards)
-                    });
-                if keep {
-                    kept.push(*key);
-                    if kept.len() == limit {
-                        break;
-                    }
+            let nodes: Vec<NodeId> = page.entries.iter().map(|key| key.event_node_id).collect();
+            let Some(entries) = resolve_entries(&engine, &room_id, &nodes)? else {
+                return Ok(None);
+            };
+            for (key, entry) in page.entries.iter().zip(entries) {
+                let (_, topological, origin_server_ts, stream) = &entry;
+                let in_bounds = from_bound.is_none_or(|bound| {
+                    passes_topological_bound(
+                        bound,
+                        *topological,
+                        *origin_server_ts,
+                        *stream,
+                        true,
+                        backwards,
+                    )
+                }) && to_bound.is_none_or(|bound| {
+                    passes_topological_bound(
+                        bound,
+                        *topological,
+                        *origin_server_ts,
+                        *stream,
+                        false,
+                        backwards,
+                    )
+                });
+                if in_bounds {
+                    kept.push((*key, entry));
                 }
+            }
+            // Equal-`(depth, ts)` rows are ordered by node id in the index but
+            // by stream in SQL. Keep scanning until the group holding the
+            // limit-th row is complete, then sort that group by stream.
+            let done = if kept.len() >= limit {
+                let (_, group_topo, group_ts, _) = &kept[limit - 1].1;
+                match page.entries.last() {
+                    Some(last) => {
+                        let last_group = (last.topological_ordering, last.origin_server_ts);
+                        if forward {
+                            last_group > (*group_topo, *group_ts)
+                        } else {
+                            last_group < (*group_topo, *group_ts)
+                        }
+                    }
+                    None => true,
+                }
+            } else {
+                false
+            };
+            if done {
+                break;
             }
             match page.next_cursor {
-                Some(next) if kept.len() < limit => {
-                    if filtered && scanned >= scan_budget {
-                        return Ok(None);
-                    }
-                    cursor = Some(next);
-                }
-                _ => break,
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+            if scanned >= scan_budget {
+                return Ok(None);
             }
         }
-        let nodes: Vec<NodeId> = kept.iter().map(|key| key.event_node_id).collect();
-        let Some(ids) = resolve_event_ids(&engine, &room_id, &nodes)? else {
-            return Ok(None);
-        };
+        kept.sort_by(|a, b| {
+            let a_key = (a.1 .1, a.1 .2, a.1 .3);
+            let b_key = (b.1 .1, b.1 .2, b.1 .3);
+            if forward {
+                a_key.cmp(&b_key)
+            } else {
+                b_key.cmp(&a_key)
+            }
+        });
+        kept.truncate(limit);
         Ok(Some(
-            ids.into_iter()
-                .zip(kept)
-                .map(|(id, key)| {
-                    (
-                        id,
-                        key.topological_ordering,
-                        key.origin_server_ts,
-                        key.stream_ordering,
-                    )
-                })
+            kept.into_iter()
+                .map(|(_, (id, topo, ts, stream))| (id, topo, ts, stream))
                 .collect(),
         ))
     })
@@ -463,22 +589,10 @@ pub fn timeline_page_stream(
             .page_range(&room, cursor.as_ref(), forward, limit, end)
             .map_err(read_error)?;
         let nodes: Vec<NodeId> = page.entries.iter().map(|key| key.event_node_id).collect();
-        let Some(ids) = resolve_event_ids(&engine, &room_id, &nodes)? else {
+        let Some(entries) = resolve_entries(&engine, &room_id, &nodes)? else {
             return Ok(None);
         };
-        Ok(Some(
-            ids.into_iter()
-                .zip(page.entries)
-                .map(|(id, key)| {
-                    (
-                        id,
-                        key.topological_ordering,
-                        key.origin_server_ts,
-                        key.stream_ordering,
-                    )
-                })
-                .collect(),
-        ))
+        Ok(Some(entries))
     })
 }
 
@@ -700,6 +814,57 @@ mod tests {
             let after = timeline_page_stream(py, room.into(), None, None, false, 10).unwrap();
             assert_eq!(ids(&after), Vec::<String>::new());
             // Purging a room with no entries is a no-op.
+            timeline_purge_room(py, room.into()).unwrap();
+        });
+    }
+
+    /// The index orders equal-`(depth, ts)` rows by node id; the page must
+    /// still return them in stream order and not skip the boundary group.
+    #[test]
+    fn topological_page_orders_equal_depth_and_ts_by_stream() {
+        ensure_open();
+        let room = "!timeline-ties:example.org";
+        let rows = vec![
+            row(room, 1, 2, 100, 7),
+            row(room, 2, 2, 100, 3),
+            row(room, 3, 2, 100, 5),
+            row(room, 4, 3, 0, 8),
+        ];
+        Python::attach(|py| {
+            event_timeline_put(py, rows).unwrap();
+            let e = |n: i64| format!("$event-{room}-{n}");
+
+            // Tied depth/timestamp rows come back in stream order.
+            let all =
+                timeline_page_topological(py, room.into(), None, None, false, 10, 1000).unwrap();
+            assert_eq!(ids(&all), [e(2), e(3), e(1), e(4)]);
+
+            // A cursor inside the tied group must not skip the remaining rows.
+            let page = timeline_page_topological(
+                py,
+                room.into(),
+                Some((Some(2), Some(100), 3)),
+                None,
+                false,
+                10,
+                1000,
+            )
+            .unwrap();
+            assert_eq!(ids(&page), [e(3), e(1), e(4)]);
+
+            // Backwards keeps the from row and excludes the to row.
+            let page = timeline_page_topological(
+                py,
+                room.into(),
+                Some((Some(2), Some(100), 5)),
+                Some((Some(2), Some(100), 3)),
+                true,
+                10,
+                1000,
+            )
+            .unwrap();
+            assert_eq!(ids(&page), [e(3)]);
+
             timeline_purge_room(py, room.into()).unwrap();
         });
     }
