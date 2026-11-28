@@ -2249,8 +2249,17 @@ pub fn open_client(py: Python<'_>, path: String) -> PyResult<()> {
         // a full rescan) to rediscover nothing. Read-only workers keep the
         // default (refresh on) to observe records this writer appends. See
         // mtxdb-core's `PackfileStorage::set_refresh_on_miss`.
+        //
+        // Point reads are scattered by nature: one event body, one HAMT node,
+        // one ordered-index entry. On rotational media the kernel's sequential
+        // readahead turns a single cold ~200 KB page fault into tens of
+        // megabytes of physical reads (measured ~36 MB), because the file is
+        // read far ahead of the one page the caller touched. Serve point reads
+        // from mtxdb's separate `MADV_RANDOM` mapping; scans and batch reads
+        // keep the normal mapping, so sequential paths retain readahead.
         for store in [&state, &event_dag, &server_info] {
             store.set_refresh_on_miss(false);
+            store.set_point_random_mmap(true);
         }
         // The journal is the read-committed overlay's source of truth for
         // read-only workers: a committed group is visible to a worker's
@@ -2382,6 +2391,14 @@ pub fn open_client_read_only(py: Python<'_>, path: String) -> PyResult<()> {
         } else {
             open_pool(ShardType::ServerInfo, "server-info")?
         };
+        // A read-only worker performs the same scattered point reads (event
+        // bodies, HAMT nodes, ordered-index entries) as the writer. Use the
+        // separate `MADV_RANDOM` point mapping so one cold page doesn't pull
+        // tens of megabytes through the kernel's sequential readahead on
+        // rotational media; batch and scan paths keep the normal mapping.
+        for store in [&state, &event_dag, &server_info] {
+            store.set_point_random_mmap(true);
+        }
         // Deployment proof for the SQL-read-removal gate: every read-only
         // process role must log `true` here before SQL fallback reads can be
         // removed. In snapshot mode (WAL off) no overlay is installed, so the
@@ -5635,6 +5652,20 @@ pub(crate) mod auth_chain_closure_tests {
                     .expect("open_client should succeed");
             });
         });
+    }
+
+    #[test]
+    fn point_reads_use_the_random_advised_mapping() {
+        ensure_open();
+        for (name, store) in [
+            ("state", state_db().expect("state pool")),
+            ("event-dag", event_dag_db().expect("event dag pool")),
+        ] {
+            assert!(
+                store.read_plan_policy().point_random_mmap,
+                "{name} point reads must use the separate MADV_RANDOM mapping"
+            );
+        }
     }
 
     #[test]
